@@ -17,6 +17,22 @@
 > **Review gate:** standard. One independent opinion over the whole branch diff, once,
 > pre-push. No per-commit reviews.
 
+## A direct instruction overrides this file
+
+An instruction from the person running the work wins over every rule below. Follow it,
+record any lasting technical decision on the bead it belongs to, and continue. This file
+is the default, never a veto.
+
+## Never destroy work you did not create
+
+- **Deleting a file needs express permission**, including a file you created yourself in
+  this session. Ask, and wait for the answer.
+- `git reset --hard`, `git clean -fd`, `git checkout -- <path>`, `git push --force` and
+  `rm -rf` are not yours to run. When something has to be undone, say exactly what would
+  be removed and wait. "I think it is safe" is not a reason.
+- Under one shared tree these are not merely risky. Every one of them destroys work
+  belonging to a pane that is still running, and none of it is recoverable.
+
 ## Stack and commands
 
 - **Stack:** Rust, edition 2024. No async runtime, by decision.
@@ -133,6 +149,23 @@ goes on the bead rather than into a message.
 lives in the bead graph, the reservations and this file, never in another agent's context.
 An agent that stops is replaced, not recovered.
 
+## Changes you did not make are normal
+
+`git status` in a shared tree shows other panes' work, and it changes while you are
+reading it. That is the expected state of this repository during a swarm, not an anomaly
+worth reporting.
+
+- **Never stash, revert, overwrite or otherwise disturb a change you did not make.** Treat
+  a modified file you do not recognise exactly as you would treat one of your own.
+- **Do not stop to ask what an unexplained edit is.** The answer is always the same, and
+  the question costs one pane a work cycle to ask and another one to answer.
+- **Stage your own paths by name.** `git add -A` in a shared tree captures whatever is
+  mid-edit elsewhere, and a commit holding half of somebody else's change is worse than no
+  commit at all.
+- **A build that breaks on a file you never touched means somebody is inside it right
+  now.** Take a bead with a different edit surface, or wait. Do not fix it out from under
+  them: your fix and their next write cannot both survive.
+
 ## Picking up work
 
 1. Confirm the working tree and the branch. Do not create or switch to another.
@@ -152,6 +185,49 @@ An agent that stops is replaced, not recovered.
 
 Do not open a work cycle by broadcasting status. Coordination is what makes implementation
 safe; it is not a substitute for implementing.
+
+### One identifier, carried everywhere
+
+The bead id is the only correlation key this project has, so it travels into every
+artifact the work touches. Without it a reservation, a thread and a commit are three
+unrelated facts about the same change.
+
+| where | form |
+| --- | --- |
+| mail thread | the bead id, bare |
+| message subject | `[<id>] <what changed>` |
+| reservation reason | the bead id |
+| commit message | the bead id in the body |
+
+`.beads` is git-ignored here, so the tracker is machine state rather than repository
+history and it does not travel with a clone. That is a deliberate departure from the usual
+convention around this tracker, and it is why the id in the commit message is the only
+durable link from a line of code back to the reason it exists. `br` never runs a git
+command by itself, so nothing it writes reaches the history unless somebody commits it.
+
+## Editing discipline
+
+- **Change code by hand, not by script.** A regex sweep over source is brittle in a way
+  that surfaces later, somewhere else, as a bug nobody connects back to the sweep. Many
+  similar edits are many edits.
+- **Revise files in place.** No `parser_v2.rs`, no `client_improved.rs`, no
+  `report_new.rs`. A new file is for functionality that genuinely fits in no existing one,
+  and that bar is high. A swarm pulls harder against this rule than a lone agent does: a
+  pane that finds its file reserved is tempted to write a copy beside it, and that is how
+  one capability ends up with two implementations and no owner.
+- **Pre-1.0, no compatibility shims.** No wrapper kept for an API nobody calls, no
+  deprecated path living beside its replacement. Fix the call sites and remove the old
+  shape.
+
+## The tools this coordination runs on
+
+Named here because the rules above are useless to a reader who cannot find them.
+
+| tool | what it provides | where |
+| --- | --- | --- |
+| `br` | the bead graph: ready work, dependencies, claims, comments | <https://github.com/Dicklesworthstone/beads_rust> |
+| MCP Agent Mail | agent identity, threads, advisory file reservations, and the pre-commit reservation guard | <https://github.com/Dicklesworthstone/mcp_agent_mail> |
+| `ntm` | the tmux swarm: spawning panes, supervising them, `ntm health` | <https://github.com/Dicklesworthstone/ntm> |
 
 ## The baseline below, and what this project overrides
 
@@ -336,6 +412,21 @@ no worktrees*. Everything else in it holds as written.
   staged. If you spot one, STOP and report it. The gitleaks pre-commit hook is the
   deterministic backstop; this habit is the probabilistic one.
 - Real secrets stay out of git. Only `.env.example`, with fake values, is committed.
+
+## Landing a session
+
+Before ending a session, in this order. A session that skips a step leaves the swarm in a
+state the next pane has to reconstruct.
+
+1. **File a bead for anything left over.** Work that exists only in a session's memory
+   does not exist.
+2. **Run `bin/ci`** and report the result.
+3. **Update bead status.** Close what is done; leave `in_progress` only on work somebody
+   is still holding.
+4. **Release your reservations.** One that outlives its agent blocks a pane with no way to
+   find out why.
+5. **Commit your own paths and push.** An unpushed commit is invisible to every other
+   pane, which is indistinguishable from not having done the work.
 
 ## Post-implementation checklist (run before "done")
 
