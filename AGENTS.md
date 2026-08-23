@@ -2,6 +2,11 @@
 
 > Read before every interaction. Living spec: short, imperative. On every gotcha or
 > decision, append one line here.
+>
+> **After every context compaction, reread this file without waiting to be asked**, then
+> reread the active bead, its comment thread and the current reservation state before
+> resuming. Compaction drops the behavioural contract silently, and an agent that lost it
+> keeps working as if it still had it.
 
 > **What it is:** one ledger for LLM consumption, joining token spend read from local
 > agent transcripts with quota measured at the provider's own endpoints, so routing a
@@ -25,7 +30,8 @@
 - **Test:** `cargo test`
 - **Gate:** `bin/ci` (format, lint, test, dependency audit, prose guard)
 - **After clone, once:** `bin/install-hooks`
-- **New worktree:** `bin/worktree new <type>/<kebab-desc>`. Never work in the main tree.
+- **Working tree:** one, shared. No pane creates a worktree or a branch of its own. See
+  *One branch, no worktrees*.
 
 ## Scope (current)
 
@@ -59,6 +65,100 @@ five rules outrank convenience everywhere they meet it.
    output says which one and why. It never falls back to the last value silently, and it
    never substitutes zero, because a zero is indistinguishable from a real measurement of
    nothing.
+
+## How this project is built
+
+Development follows the agent flywheel: a ladder of representations where each rung turns
+the work into a form the next one can act on, and each has a gate. **A failed gate sends
+the work back a phase; it never sends it forward with a note attached.**
+
+| stage | in to out | what decides the gate here |
+| --- | --- | --- |
+| Intent shaping | goal to foundation bundle | `bin/ci` green and this file coherent |
+| Planning | foundation to a markdown plan | no command exists. The exit signal is convergence: a refinement round that stops changing much, not an answer for every open question |
+| Translation | plan to bead graph | no command exists. The audit is bidirectional and done by hand: every material plan element reaches a bead, and every bead traces back to the plan |
+| Execution prep | raw beads to launch-ready beads | `br lint` clean, `br dep cycles` empty, and every bead self-contained about its test obligations |
+| Swarm implementation | beads to code | `ntm health <session>` exits zero |
+| Hardening | implementation to tests and scans | `bin/ci` green, and the work that is left captured as beads rather than as prose |
+| Memory | real usage back into the tooling | no gate. It is the stage that makes the next project start better |
+
+Three of those gates have no command, and saying so beats a table that implies coverage.
+They are judgment, and the drop-back rule is the only thing holding them.
+
+Most of the effort belongs in planning, because reasoning is cheapest while the whole
+problem still fits in one context. The method's own illustrative figure is that rework
+costs one unit in plan space, five in bead space and twenty five in code space.
+
+**This project is at Planning.** No bead is created before the plan converges: a graph
+translated from an unconverged plan inherits every hole in it, and after translation the
+holes are invisible, because a hole in a plan is a bead that does not exist.
+
+## One branch, no worktrees
+
+Implementation runs as an `ntm` swarm: several agent panes, one shared working tree, one
+shared branch. That branch is a feature branch off `main`, not `main` itself, and it
+reaches `main` as a single pull request when the hardening gate passes. Nothing else about
+the swarm changes if that boundary moves; what does not move is that no pane creates a
+worktree and no pane creates a branch of its own.
+
+**This is a deliberate departure from the baseline in the block below**, which makes a
+worktree per session mandatory. That rule protects independent sessions, which cannot see
+each other and therefore cannot coordinate. A swarm is the opposite case: the panes are
+launched together and share a tracker and a reservation service, and worktree isolation
+would remove the thing the swarm exists for, which is several agents converging on one
+tree.
+
+**The trade is explicit: the isolation is replaced, not dropped.** Under one shared tree
+two panes editing one file clobber each other and nothing reports it, so the three
+protections below are conditions of implementing at all. A pane that cannot verify all
+three does not edit: it names the one that is down and stops.
+
+| protection | what it covers | how a pane gets it |
+| --- | --- | --- |
+| bead claim | who owns a unit of work | `br update <id> --claim --actor <pane>` |
+| file reservation | who owns an edit surface | reserve through Agent Mail before the first edit |
+| reservation guard | a commit touching a path somebody else reserved | the pre-commit hook refuses it |
+
+**The claim is not a lock.** `br update --claim` refuses only when a *different* actor
+holds the bead, and the default actor is the shell user. Two panes claiming under one
+identity therefore both succeed, with no error anywhere. Pass `--actor` with the pane's
+own name, every time. What actually prevents a second dispatch onto the same work is that
+a claimed bead leaves `br ready --unassigned`.
+
+**Mail is an outbox, not a mailbox.** Panes announce and do not reliably read, so anything
+that has to reach a working agent goes into its pane, and anything that has to survive
+goes on the bead rather than into a message.
+
+**No pane has a role.** Agents are interchangeable, and everything one needs to continue
+lives in the bead graph, the reservations and this file, never in another agent's context.
+An agent that stops is replaced, not recovered.
+
+## Picking up work
+
+1. Confirm the working tree and the branch. Do not create or switch to another.
+2. Register an identity with Agent Mail and use that name as the actor everywhere below.
+3. `br ready --unassigned`, and take one bead. A bead already in progress belongs to
+   somebody else: pick another. The only exception is a brief that says the bead was
+   already claimed for you, and only because it says so.
+4. Claim it before opening a single file: `br update <id> --claim --actor <name>`.
+5. Reserve the exact edit surface. Narrowest correct path set, and a TTL sized to the edit
+   rather than to the day. A reservation call can return a lease and still report
+   conflicts, so read the conflict list: a path somebody else holds is not yours because
+   the API answered.
+6. Implement, with the tests the bead asks for. One bead at a time.
+7. `bin/ci` green, then commit and push. Work that is not pushed does not exist to the
+   other panes.
+8. Release the reservation, record the outcome on the bead, close it.
+
+Do not open a work cycle by broadcasting status. Coordination is what makes implementation
+safe; it is not a substitute for implementing.
+
+## The baseline below, and what this project overrides
+
+The block that follows is the shared engineering baseline, stamped in verbatim from one
+source so it travels in the clone. It is not edited here. This project overrides exactly
+one rule in it, the mandatory worktree per session, for the reason given in *One branch,
+no worktrees*. Everything else in it holds as written.
 
 <!-- BEGIN universal-principles v3 -->
 ## Working principles
@@ -195,9 +295,13 @@ five rules outrank convenience everywhere they meet it.
 
 ## Small releases
 
-- Every commit on `main` passes `bin/ci` and is releasable. No broken commit fixed by the
-  next one.
-- Closed work is committed before switching tasks; flag it if it has not been.
+- Every commit on the shared branch passes `bin/ci` before it is pushed. Under one tree a
+  broken commit is not one agent's problem to fix next: it is the tree every other pane is
+  working in, so the next pane's failure is inherited and reads as its own.
+- `main` only ever receives a merged pull request whose checks are green, so every commit
+  on it is releasable.
+- Push as soon as a bead is green. An unpushed commit is invisible to the other panes,
+  which is the same as not having done the work.
 - A release is a `v*` tag. The workflow builds the platform matrix, emits checksums and
   publishes the GitHub Release. Nothing is uploaded by hand.
 
@@ -245,7 +349,10 @@ five rules outrank convenience everywhere they meet it.
 
 | hurdle | class | gate |
 |---|---|---|
-| A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the per-worktree isolation `bin/ci` sets up, so a binary out of `target/` can be another branch's | tripwire | pass `CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci` |
+| A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the isolation `bin/ci` sets up, so a binary out of `target/` can be another pane's build | tripwire | pass `CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci` |
+| A stray empty reservation database can appear in the repository root. An agent that queries it sees zero reservations and concludes every path is free, which is the worst failure an advisory system has | tripwire | before trusting an empty conflict list, confirm the store being read is the shared one and not a file in the tree |
+| `br update --claim` guards on identity, not on a lock. Under the default actor two panes claim the same bead and neither is told | tripwire | always pass `--actor` with the pane's own name |
+| A dispatch that dies before its agent starts leaves a bead held by nobody, and nothing expires it | prose | return it with `br update <id> --status open` and say what stopped it |
 | `br init` creates `.beads` mode 0755, and `bd` then prints a warning ahead of its version string, which the version probe parses as the version | tripwire | `chmod 700 .beads` immediately after any `br init` |
 | The prose gate refuses the em-dash in every tracked file, in the commit message and in the PR body. The commit message is the only one of the three nothing reads a second time | ci | `bin/ci` calls `bin/slop-guard`; the `commit-msg` hook covers the message |
 | A clone has no hooks until `bin/install-hooks` runs, so the secret scan is off on a fresh checkout | prose | run it once after cloning |
