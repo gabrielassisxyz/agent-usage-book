@@ -1,0 +1,21 @@
+[package]
+name = "agent-usage-book"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+description = "One ledger for LLM consumption: token spend read from local transcripts, quota measured at the provider."
+license = "MIT"
+repository = "https://github.com/gabrielassisxyz/agent-usage-book"
+readme = "README.md"
+keywords = ["llm", "quota", "tokens", "observability", "cli"]
+categories = ["command-line-utilities"]
+
+# The crate is named for what it is; the command is named for what gets typed.
+[[bin]]
+name = "aub"
+path = "src/main.rs"
+
+[dependencies]
+
+[profile.release]
+strip = true

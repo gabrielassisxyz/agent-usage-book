@@ -1,0 +1,17 @@
+# Git-ignored paths symlinked from the main tree into every new worktree.
+#
+# WHY this file exists. `git worktree add` materializes only TRACKED files, so a fresh
+# worktree starts without any of these — and the failure is silent: the session simply
+# works without the file and never learns it existed. Worse, anything CREATED at one of
+# these paths inside a worktree dies with it. `git worktree remove` refuses a dirty or
+# untracked worktree, which reads as "git will stop me", but ignored paths are excluded
+# from that check entirely and are deleted with no warning at all. A file was lost that
+# way. A symlink is what prevents it: removing the worktree then removes only the link.
+#
+# One path per line. `#` comments and blank lines are ignored. A path that does not
+# exist in the main tree is skipped, so listing an optional one costs nothing.
+local
+.beads
+.ai-jail
+config/deploy.env
+.env

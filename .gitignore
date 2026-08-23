@@ -1,0 +1,29 @@
+# Rust build output. CARGO_TARGET_DIR usually points elsewhere (see bin/ci), but a bare
+# `cargo build` still writes here.
+/target
+
+# >>> repo-harness:gitignore-private-boundary >>>
+# Maintainer notes — not part of the project; they live in the private notes repo,
+# reachable through the `local` symlink. NO trailing slash on any path in this block:
+# a worktree materializes these paths as SYMLINKS, and a `foo/` pattern matches a real
+# directory only — the ignore then keeps working in the main tree and silently fails
+# in every worktree.
+/local
+
+# Environment secrets and the per-machine agent sandbox config. `.env.*` covers the
+# variants a real session produces — `.env.local`, and above all the `.env.bak.<epoch>`
+# an editor or a script leaves behind. One of those sat untracked in a repo for weeks:
+# the pre-commit secret scan only reads what is staged, so a secret nobody stages is a
+# secret nobody scans, and `.env` alone does not match it.
+.env
+.env.*
+!.env.example
+.ai-jail
+# <<< repo-harness:gitignore-private-boundary <<<
+
+# The beads tracker's own directory. Everything in it is machine-local: the SQLite
+# database, its WAL and lock files, and the JSONL export beside them. Committing any of
+# it would put a binary database and a churn-heavy export into the history for no reader.
+# No trailing slash, for the reason the block above spells out: a worktree can
+# materialize this as a symlink.
+/.beads
