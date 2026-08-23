@@ -27,6 +27,17 @@ buys are about **units and freshness**, not about speed:
 - Where a source cannot be reached, the output says so. It does not fall back to the last
   value, and it does not print a zero.
 
+## Not in scope
+
+- **A server, a daemon or a container.** This is a binary that runs, answers and exits.
+- **An async runtime.** About three endpoints are called, concurrently and once. Blocking
+  requests in scoped threads cover that, and a runtime would be carried for nothing.
+- **Cost forecasting and budget enforcement.** Measuring what happened is a different
+  problem from predicting what will, and mixing them would make the measurement layer
+  answerable for a guess.
+- **Provider coverage for its own sake.** An endpoint is added when work is actually
+  being routed through it.
+
 ## Install
 
 Once the first release is tagged, download the archive for your platform from the
