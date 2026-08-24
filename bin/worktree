@@ -14,6 +14,7 @@
 #   worktree status [--strays]   per-worktree hygiene facts: dirty / unpushed / merged / behind N; --strays
 #                                 also lists merged branches with no worktree, local and remote (alias: st)
 #   worktree rm <branch|task>    remove a worktree (git refuses if it has unsaved work; -f to force)
+#   worktree adopt <path>        link the repo's git-ignored paths into an existing worktree
 #
 # Worktrees live OUTSIDE the repo, in ~/repositories/.worktrees/<repo>/<task>, so they
 # never pollute ~/repositories. Override the base dir with $WORKTREE_BASE.
@@ -131,6 +132,7 @@ worktree — isolated worktrees for $repo (default branch: $def)
   worktree status [--strays]   per-worktree hygiene: dirty / unpushed / merged / behind N; --strays also
                                 lists merged branches with no worktree (alias: st)
   worktree rm <branch|task>    remove a worktree (-f to force past unsaved work)
+  worktree adopt <path>        link the repo's git-ignored paths into an existing worktree
   worktree prune-merged [--yes] delete merged branches with no worktree (lists them without --yes)
 
 Worktrees live in $WORKTREE_BASE/$repo/<task>.
@@ -188,9 +190,15 @@ link_path() {
         linked+=("$rel")
         return 0
     fi
-    # Only two real directories can be merged. A symlink or a file at dst is left alone:
-    # it is either already linked or a tracked file, and neither may be shadowed.
-    [ -d "$src" ] && [ -d "$dst" ] && [ ! -L "$dst" ] || return 0
+    # A symlink or a file at dst is left alone: it is either already linked or a
+    # tracked file, and neither may be shadowed. A real directory is also left alone
+    # as a whole — but its missing children are still linked, because a listed
+    # directory can be MIXED (mostly ignored, with a stray tracked file inside).
+    if [ -L "$dst" ] || [ ! -d "$dst" ] || [ ! -d "$src" ]; then
+        skipped+=("$rel")
+        return 0
+    fi
+    skipped+=("$rel")
     shopt -s nullglob dotglob
     for child in "$src"/*; do
         link_path "$child" "$dst/${child##*/}" "$rel/${child##*/}"
@@ -230,14 +238,52 @@ verify_links_ignored() {
 
 link_ignored() {
     local dir="$1" rel
-    local -a linked=()
+    local -a linked=() skipped=()
     while IFS= read -r rel; do
         [ -e "$main_root/$rel" ] || continue
         link_path "$main_root/$rel" "$dir/$rel" "$rel"
     done < <(read_worktree_links)
+    [ ${#skipped[@]} -gt 0 ] && echo "==> left alone (already present): ${skipped[*]}"
     [ ${#linked[@]} -gt 0 ] || return 0
     echo "==> linked from the main tree: ${linked[*]}"
     verify_links_ignored "$dir" "${linked[@]}"
+}
+
+# Bring an existing worktree up to the shape `new` creates. A worktree made with a
+# plain `git worktree add` materializes only tracked files, so every git-ignored path
+# this repo links is absent — and the failure is silent until a gate trips on it. This
+# recreates the missing links in place, reusing the same link list and link_path() as
+# `new`, so the two can never drift apart. It never replaces or removes anything
+# already at a link path, and it refuses a path that is not a worktree of this repo.
+cmd_adopt() {
+    local dir="${1:-}"
+    [ -n "$dir" ] || { echo "usage: worktree adopt <path>" >&2; exit 2; }
+    dir="$(realpath -m -- "$dir")"
+    [ -d "$dir" ] || { echo "worktree: not a directory: $dir" >&2; exit 1; }
+
+    # Refuse anything that is not a registered worktree of THIS repo before creating
+    # a single link: scattering absolute symlinks into an arbitrary directory is
+    # exactly the damage a wrong path would do. `git worktree list` is the record —
+    # `git rev-parse --git-common-dir` alone cannot tell a worktree from a
+    # subdirectory of one, because it walks up to the same common dir.
+    local wt
+    while IFS= read -r wt; do
+        [ "$(realpath -m -- "$wt")" = "$dir" ] && { link_ignored "$dir"; return 0; }
+    done < <(git worktree list --porcelain | sed -n 's|^worktree ||p')
+
+    # Name the actual problem rather than just "no": a path with no git dir at all,
+    # a path in another repo, and a subdirectory of a worktree are three different
+    # mistakes and three different fixes.
+    local wt_common
+    wt_common="$(git -C "$dir" rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
+    if [ -z "$wt_common" ]; then
+        echo "worktree: $dir is not a git worktree of $repo (no .git directory)" >&2
+    elif [ "$(realpath -m -- "$wt_common")" != "$common" ]; then
+        echo "worktree: $dir is not a worktree of $repo (its git dir is $wt_common, not $common)" >&2
+    else
+        echo "worktree: $dir is inside $repo but is not a worktree root (run: git worktree list)" >&2
+    fi
+    exit 1
 }
 
 cmd_new() {
@@ -627,6 +673,17 @@ EOF
     else
         git worktree remove "$dir"
     fi
+    # The directory this process may be standing in has just been unlinked, and
+    # `cd <worktree> && bin/worktree rm <task>` is the natural end-of-task shape, so it
+    # usually IS standing in it. git refuses to do anything at all from a cwd that no longer
+    # exists — `fatal: Unable to read current working directory`, exit 128, before a single
+    # ref is read — and the mergedness probe below swallows stderr and reads any nonzero
+    # exit as "not merged". A branch that was merged then got reported as the only thing
+    # left holding its commits, the session believed it and skipped prune-merged, and the
+    # NEXT session's `bin/ci` went red over a branch it had never touched. Land in the main
+    # tree instead: it is the same repository, it is guaranteed to exist, and it makes every
+    # command after this point immune to the same trap.
+    cd "$main_root"
     echo "removed $dir"
     remove_cargo_target "$task"
 
@@ -719,6 +776,7 @@ case "${1:-}" in
     list|ls)         cmd_list ;;
     status|st)       shift; cmd_status "$@" ;;
     rm|remove)       shift; cmd_rm "$@" ;;
+    adopt)           shift; cmd_adopt "$@" ;;
     prune-merged)    shift; cmd_prune_merged "$@" ;;
     ""|-h|--help)    usage ;;
     *)               echo "unknown subcommand: $1" >&2; usage; exit 2 ;;
