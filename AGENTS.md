@@ -1,39 +1,63 @@
-# agent-usage-book: agent briefing
+# AGENTS.md - agent-usage-book
 
-> Read before every interaction. Living spec: short, imperative. On every gotcha or
-> decision, append one line here.
+> Guidelines for AI coding agents working in this Rust codebase.
 >
-> **After every context compaction, reread this file without waiting to be asked**, then
+> **Reread this file after every context compaction, without waiting to be asked**, then
 > reread the active bead, its comment thread and the current reservation state before
 > resuming. Compaction drops the behavioural contract silently, and an agent that lost it
 > keeps working as if it still had it.
 
-> **What it is:** one ledger for LLM consumption, joining token spend read from local
-> agent transcripts with quota measured at the provider's own endpoints, so routing a
-> model is decided from one number instead of five tools that disagree.
-> **Calibration:** Tier 2 · Phase: work. External stakes are contained (a local binary,
-> no server, no user data), personal stakes are high: this is the measurement layer that
-> feeds model-routing decisions, so a wrong number here is acted on elsewhere.
-> **Review gate:** standard. One independent opinion over the whole branch diff, once,
-> pre-push. No per-commit reviews.
+---
 
-## A direct instruction overrides this file
+## RULE 0: A DIRECT INSTRUCTION OVERRIDES THIS FILE
 
 An instruction from the person running the work wins over every rule below. Follow it,
 record any lasting technical decision on the bead it belongs to, and continue. This file
 is the default, never a veto.
 
-## Never destroy work you did not create
+## RULE 1: NO FILE DELETION
 
-- **Deleting a file needs express permission**, including a file you created yourself in
-  this session. Ask, and wait for the answer.
-- `git reset --hard`, `git clean -fd`, `git checkout -- <path>`, `git push --force` and
-  `rm -rf` are not yours to run. When something has to be undone, say exactly what would
-  be removed and wait. "I think it is safe" is not a reason.
-- Under one shared tree these are not merely risky. Every one of them destroys work
-  belonging to a pane that is still running, and none of it is recoverable.
+Deleting a file needs express permission, including a file you created yourself in this
+session. Say exactly what would be removed, and wait for the answer. Under one shared
+tree a deletion also destroys work belonging to a pane that is still running, and none of
+it is recoverable.
 
-## Stack and commands
+## RULE 2: NO WORKTREES, ONE SHARED TREE
+
+No pane creates a worktree. No pane creates a branch of its own. Every agent works in the
+same checkout, on the same branch, and coordinates through the three protections below
+rather than through filesystem isolation. The reasoning, and what replaces the isolation,
+is in *Coordination under one shared tree*.
+
+## Irreversible Git and Filesystem Actions - DO NOT EVER BREAK GLASS
+
+`git reset --hard`, `git clean -fd`, `git checkout -- <path>`, `git push --force`,
+rewriting a commit that is already pushed, and `rm -rf` are not yours to run. When
+something has to be undone, restate the exact command, name every path it would touch, and
+wait for explicit approval. "I think it is safe" is not a reason, and in a shared tree the thing
+you would discard is usually somebody else's uncommitted work.
+
+Before assuming a commit was lost, check rather than repair:
+`git merge-base --is-ancestor <sha> HEAD`.
+
+## Git Branch: ONLY `main`, NEVER `master`
+
+The default branch is `main`. Implementation runs on one shared feature branch off `main`,
+and that branch reaches `main` as a single pull request once the hardening gate passes.
+Nothing else about the swarm changes if that boundary moves.
+
+**This diverges from the method deliberately.** The method's own position is that agents
+commit straight to `main` with no pull request and no approval gate, on the argument that
+branch-per-agent is merge hell and a logical conflict surfaces faster on a shared branch.
+The first half is adopted here in full: one branch, all agents, no per-agent isolation.
+The second half is not, for one reason that does not apply to a private greenfield tree.
+This repository is public, so its history is the artifact, and a single reviewable pull
+request keeps the implementation revertable as one unit and puts `bin/ci` between the
+swarm and the branch anyone else reads. CI runs on pushes to `main` as well, so the gate
+is not the only thing the pull request buys, and this line gets revisited if the merge
+ever costs more than it protects.
+
+## Toolchain: Rust and Cargo
 
 - **Stack:** Rust, edition 2024. No async runtime, by decision.
 - **HTTP:** `ureq`, blocking, inside `std::thread::scope`. About three endpoints are
@@ -43,19 +67,57 @@ is the default, never a veto.
   decision belongs to the implementation plan and this line gets replaced when it lands.
 - **Build:** `cargo build --release`
 - **Run:** `cargo run -- <args>`
-- **Test:** `cargo test`
-- **Gate:** `bin/ci` (format, lint, test, dependency audit, prose guard)
 - **After clone, once:** `bin/install-hooks`
-- **Working tree:** one, shared. No pane creates a worktree or a branch of its own. See
-  *One branch, no worktrees*.
 
-## Scope (current)
+## Compiler Checks (CRITICAL)
 
-- **Current scope:** read token spend from local agent transcripts, measure quota windows
-  at provider endpoints, and report both from one command. Don't expand beyond it without
-  a present need; if a change drifts past it, STOP and flag it.
+```bash
+cargo check -p agent-usage-book        # the per-bead maximum during a code-first wave
+cargo clippy --all-targets -- -D warnings
+cargo fmt --check
+```
 
-## Correctness invariants
+`bin/ci` is the full gate: format, lint, test, dependency audit, prose guard. It is the
+exact thing CI runs, so green locally means green in CI.
+
+**A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the
+isolation `bin/ci` sets up.** A binary out of `target/` can be another pane's build. Pass
+`CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci`.
+
+**During a code-first wave the syntax gate is the maximum, and it is enforced.** See
+*Swarm operations*: the orchestrator kills per-agent test and full-build processes every
+tick, because N agents building the same crate is the bottleneck the wave model exists to
+remove.
+
+## Testing
+
+Code and its tests ship in the same bead. A test-only follow-up bead exists only for a
+cross-cutting integration suite, never as a way to close an implementation bead early.
+
+Every bead pre-specifies its key behavioural assertions, including at least one negative
+that a naive wrong implementation would fail. A planted negative is near-identical to its
+positive and differs only in the forbidden dimension. A test that asserts the code does
+whatever the code does is not a test.
+
+## agent-usage-book - This Project
+
+### What it does
+
+One ledger for LLM consumption: token spend read from local agent transcripts, joined with
+quota measured at the provider's own endpoints, so routing a model is decided from one
+number instead of five tools that disagree.
+
+**Calibration:** Tier 2, phase work. External stakes are contained (a local binary, no
+server, no user data). Personal stakes are high: this is the measurement layer that feeds
+model-routing decisions, so a wrong number here is acted on elsewhere.
+
+### Scope (current)
+
+Read token spend from local agent transcripts, measure quota windows at provider
+endpoints, and report both from one command. Do not expand beyond it without a present
+need. If a change drifts past it, stop and flag it.
+
+### Correctness invariants
 
 The dominant failure of this project is not being unavailable, it is **a wrong number
 reported as if it were right**: a stale reading rendered as fresh, or one unit printed in
@@ -82,11 +144,11 @@ five rules outrank convenience everywhere they meet it.
    never substitutes zero, because a zero is indistinguishable from a real measurement of
    nothing.
 
-## How this project is built
+## How This Project Is Built
 
-Development follows the agent flywheel: a ladder of representations where each rung turns
-the work into a form the next one can act on, and each has a gate. **A failed gate sends
-the work back a phase; it never sends it forward with a note attached.**
+Development follows a ladder of representations. Each rung turns the work into a form the
+next one can act on, and each has a gate. **A failed gate sends the work back a phase; it
+never sends it forward with a note attached.**
 
 | stage | in to out | what decides the gate here |
 | --- | --- | --- |
@@ -105,41 +167,150 @@ Most of the effort belongs in planning, because reasoning is cheapest while the 
 problem still fits in one context. The method's own illustrative figure is that rework
 costs one unit in plan space, five in bead space and twenty five in code space.
 
-**This project is at Planning.** No bead is created before the plan converges: a graph
-translated from an unconverged plan inherits every hole in it, and after translation the
-holes are invisible, because a hole in a plan is a bead that does not exist.
+### Which stage this project is in
 
-## One branch, no worktrees
+**Execution prep.** The plan converged and lives at `docs/PLAN.md`; translation produced
+the bead graph; what remains before the first wave is the launch readiness of the beads
+and of the coordination layer.
 
-Implementation runs as an `ntm` swarm: several agent panes, one shared working tree, one
-shared branch. That branch is a feature branch off `main`, not `main` itself, and it
-reaches `main` as a single pull request when the hardening gate passes. Nothing else about
-the swarm changes if that boundary moves; what does not move is that no pane creates a
-worktree and no pane creates a branch of its own.
+**Do not read that sentence as current.** A stage written by hand goes stale the moment
+the work moves, and this line said "Planning" for days after 187 beads existed. Derive it
+instead, and correct the line when the two disagree:
 
-**This is a deliberate departure from the baseline in the block below**, which makes a
-worktree per session mandatory. That rule protects independent sessions, which cannot see
-each other and therefore cannot coordinate. A swarm is the opposite case: the panes are
-launched together and share a tracker and a reservation service, and worktree isolation
-would remove the thing the swarm exists for, which is several agents converging on one
-tree.
+```bash
+br stats                  # a bead graph exists at all, and how much of it is closed
+br lint && br dep cycles  # the Execution-prep gate, in two commands
+br ready --unassigned     # what a wave would actually have to work on
+ntm health <session>      # a swarm is up and healthy, which means Swarm implementation
+```
 
-**The trade is explicit: the isolation is replaced, not dropped.** Under one shared tree
-two panes editing one file clobber each other and nothing reports it, so the three
-protections below are conditions of implementing at all. A pane that cannot verify all
-three does not edit: it names the one that is down and stops.
+**The gate that ends Execution prep here** is `br lint` clean, `br dep cycles` empty, every
+executable leaf carrying frozen acceptance criteria, and the three protections below
+verifiable by an agent that just booted. Until all four hold, no wave launches.
+
+### When something breaks, go back to the cheapest representation that can fix it
+
+| what broke | go back to |
+| --- | --- |
+| panes stepping on each other, or losing operational context | code space: stagger starts, force an explicit reservation, check claims |
+| a vague bead that let agents improvise into inconsistent implementations | bead space: rewrite the bead |
+| missing dependencies, or contradictory implementations from overlapping scope | bead space: fix the edges, add the missing bead, or revise bead boundaries |
+| a plan-level gap surfacing mid-swarm | plan space: update `docs/PLAN.md`, then generate the beads it implies |
+| an agent going in circles, usually after compaction dropped this file | force a reread of this file; restart the pane if it stays erratic |
+| busy agents, many commits, and the real gap to the goal not closing | stop. Ask whether the open beads actually close the gap, then revise the graph |
+
+**Heavy cognitive work during implementation is not a hard problem to push through.** It
+is a symptom that bead polishing was insufficient. Pause and go back to bead space.
+
+## Swarm Operations: Code-First Waves and Batch Verify
+
+N agents sharing one repository and one build backend are bottlenecked on builds, not on
+coding. Writing code is cheap and parallel; building and testing is expensive and
+serialized. So they are separated: all panes write real code at full speed without
+building, and the build runs once, centrally, over everyone's combined changes.
+
+### Phase 1: code-first wave (every pane, in parallel)
+
+1. Claim the highest-priority ready bead. `br ready --unassigned`, then
+   `br update <id> --claim --actor <your Agent Mail name>`.
+2. Reserve the exact edit surface before opening a file.
+3. Write the **real code and its real tests** in that same bead. No placeholders.
+   `todo!()` and `unimplemented!()` are banned in committed code.
+4. Run at most the syntax gate: `cargo check -p agent-usage-book`. No `cargo test`, no
+   full build, no waiting on proof.
+5. Commit immediately, naming the bead id and the touched scope.
+6. Move the bead to `batch_pending` **only when substantively complete**: code and tests
+   written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
+   concrete test, no known defect. `batch_pending` earns no capability credit; it frees
+   claim capacity.
+7. Release the reservation and take the next bead.
+
+Commit rate during a wave is a saturation signal for the orchestrator, never a per-agent
+score. The moment agents are scored on commits you get commit pumping.
+
+### Phase 2: batch verify and close (the orchestrator, once per wave)
+
+1. Flush the swarm's commits so the tree is consistent, and record the clean HEAD.
+2. Run **one** build and test pass over the union of touched scope, on a dedicated target
+   directory. Touched scope is derived from the `wave_base..verified_head` diff plus its
+   reverse dependents, never from what an agent declared.
+3. **Fix compile errors first.** One test-target compile error makes `cargo test` abort
+   early and report a misleadingly green prefix. Only a fully compiling run yields a true
+   pass and fail count.
+4. Cluster remaining failures by file and return each failing bead to `rework` for the
+   same assignee, with the exact assertion and location. The verifier triages; it does not
+   silently finish the work.
+5. Re-run until green. Every attempt is retained in the wave record; rerun-until-green is
+   not proof that a failure was flaky.
+6. Record the gate and close only green `batch_pending` beads, citing the run:
+
+   ```bash
+   br gate report <id> --gate batch_verify --provider batch-orchestrator \
+     --status pass --to closed --note "commit:<sha> suites:<...>"
+   br close <id> --reason "<evidence>" --transition-comment "<batch summary>"
+   ```
+
+The verification record is revision-bound: HEAD, toolchain and lockfile identity, the
+exact commands, the selected tests, and the exact bead list. Any movement of HEAD
+invalidates it. A gate result recorded against an earlier revision does not satisfy a
+later close after rework.
+
+**A green union suite must map every closing bead to the exact tests that exercised its
+behaviour.** Never close a wave off one broad green command.
+
+### When Phase 1 flips to Phase 2
+
+On the earliest of: the ready pool draining; the verification-debt ceiling being hit; an
+articulation-point bead becoming verifiable while its dependents starve; the touched scope
+growing past what is cheap to verify; an elapsed-time or risk bound. A dip in commit rate
+is one signal among several and never the only one, because with a large graph the ready
+pool may never drain.
+
+### Why closing is what refills the work
+
+A tracker unblocks a dependent only when its blocker is **closed**, not when it is
+committed and pending. So the ready pool drains during Phase 1 and refills in a burst at
+the Phase 2 close step. The loop is a pump: each verify pass closes a layer, which unblocks
+the next layer, which feeds the next wave. Periodic cycles keep the swarm fed; one giant
+pass at the end would starve it.
+
+### Enforcement
+
+Agents want to build, to prove their work. The model is enforced, not requested.
+
+- The orchestrator kills per-agent test and full-build processes every tick, scoped by
+  owned target directory. `cargo check` is exempt, as is the orchestrator's own verify
+  target directory.
+- Only the orchestrator closes a bead. A close by anyone else is reopened with an incident
+  comment on the record.
+- Genuinely incomplete work stays `in_progress` or `rework` with a comment. Never false
+  closed, never parked as "ready for validation" and forgotten.
+
+## Coordination Under One Shared Tree
+
+Under one shared tree two panes editing one file clobber each other and nothing reports
+it, so the three protections below are conditions of implementing at all. **A pane that
+cannot verify all three does not edit: it names the one that is down and stops.**
 
 | protection | what it covers | how a pane gets it |
 | --- | --- | --- |
-| bead claim | who owns a unit of work | `br update <id> --claim --actor <pane>` |
-| file reservation | who owns an edit surface | reserve through Agent Mail before the first edit |
-| reservation guard | a commit touching a path somebody else reserved | the pre-commit hook refuses it |
+| bead claim | who owns a unit of work | `br update <id> --claim --actor <name>` |
+| file reservation | who owns an edit surface | `file_reservation_paths` through Agent Mail, before the first edit |
+| reservation guard | a commit touching a path somebody else holds | the `pre-commit` hook refuses it |
 
 **The claim is not a lock.** `br update --claim` refuses only when a *different* actor
-holds the bead, and the default actor is the shell user. Two panes claiming under one
-identity therefore both succeed, with no error anywhere. Pass `--actor` with the pane's
-own name, every time. What actually prevents a second dispatch onto the same work is that
-a claimed bead leaves `br ready --unassigned`.
+holds the bead, and the default actor is the shell user, so two panes claiming under one
+identity both succeed with no error anywhere. Pass `--actor` with the pane's own name,
+every time. What actually prevents a second dispatch onto the same work is that a claimed
+bead leaves `br ready --unassigned`.
+
+**The reservation is advisory and expires on purpose.** A crashed pane must not be able to
+deadlock the tree, so a lease has a TTL and a dead agent's hold is reclaimed when it
+lapses. Reserve the narrowest correct path set, with a TTL sized to the edit rather than
+to the day, and put the bead id in the reason. A reservation call can return a lease and
+still report conflicts: read the conflict list, because a path somebody else holds is not
+yours just because the API answered. When a path is held, do not wait and do not escalate.
+Take a bead with a different edit surface.
 
 **Mail is an outbox, not a mailbox.** Panes announce and do not reliably read, so anything
 that has to reach a working agent goes into its pane, and anything that has to survive
@@ -149,39 +320,65 @@ goes on the bead rather than into a message.
 lives in the bead graph, the reservations and this file, never in another agent's context.
 An agent that stops is replaced, not recovered.
 
-## Changes you did not make are normal
+### Setup, once per machine
 
-`git status` in a shared tree shows other panes' work, and it changes while you are
-reading it. That is the expected state of this repository during a swarm, not an anomaly
-worth reporting.
+None of the three protections is self-installing, and two of them fail silently when they
+are not set up. Verify, do not assume.
 
-- **Never stash, revert, overwrite or otherwise disturb a change you did not make.** Treat
-  a modified file you do not recognise exactly as you would treat one of your own.
-- **Do not stop to ask what an unexplained edit is.** The answer is always the same, and
-  the question costs one pane a work cycle to ask and another one to answer.
-- **Stage your own paths by name.** `git add -A` in a shared tree captures whatever is
-  mid-edit elsewhere, and a commit holding half of somebody else's change is worse than no
-  commit at all.
-- **A build that breaks on a file you never touched means somebody is inside it right
-  now.** Take a bead with a different edit surface, or wait. Do not fix it out from under
-  them: your fix and their next write cannot both survive.
+1. **The mail server must be reachable from this repository.** `.mcp.json` at the root
+   declares it, and the bearer token comes from the environment rather than from the file,
+   because this repository is public:
 
-## Picking up work
+   ```bash
+   export AGENT_MAIL_TOKEN=<token>   # before launching any pane
+   ```
+
+   A pane with no `mcp-agent-mail` tools has no reservation layer. That is protection two
+   down, and Rule 2's trade is off.
+
+2. **Install the reservation guard into this checkout, once:**
+
+   ```bash
+   cd ~/.local/share/mcp_agent_mail
+   GIT_IDENTITY_ENABLED=1 .venv/bin/python3 -m mcp_agent_mail.cli \
+     guard install <project-key> /path/to/agent-usage-book
+   ```
+
+   It writes a generic chain runner to `.githooks/pre-commit`, preserves whatever hook was
+   there as `.githooks/pre-commit.orig` (which it runs last, so the secret scan survives),
+   and drops the project's guard plugin into
+   `.githooks/hooks.d/pre-commit/50-agent-mail.py`. The plugin carries absolute paths for
+   one machine and is therefore git-ignored: it is regenerated per machine by this command,
+   never committed.
+
+3. **Every pane exports its own identity before its first commit:**
+
+   ```bash
+   export GIT_IDENTITY_ENABLED=1
+   export AGENT_NAME=<the name Agent Mail assigned you>
+   ```
+
+4. **Canary it before the wave, because a hook is a claim until it refuses something.**
+   Reserve a path as one agent, stage that path, and attempt a commit as another. A guard
+   that does not refuse is not installed.
+
+### Picking up work
 
 1. Confirm the working tree and the branch. Do not create or switch to another.
-2. Register an identity with Agent Mail and use that name as the actor everywhere below.
-3. `br ready --unassigned`, and take one bead. A bead already in progress belongs to
+2. Register with Agent Mail and use the name it assigns as the actor everywhere below.
+   The name is disposable by design; no agent's identity is load-bearing.
+3. Export `GIT_IDENTITY_ENABLED=1` and `AGENT_NAME`, and confirm the guard refuses a
+   foreign reserved path before trusting it.
+4. `br ready --unassigned`, and take one bead. A bead already in progress belongs to
    somebody else: pick another. The only exception is a brief that says the bead was
    already claimed for you, and only because it says so.
-4. Claim it before opening a single file: `br update <id> --claim --actor <name>`.
-5. Reserve the exact edit surface. Narrowest correct path set, and a TTL sized to the edit
-   rather than to the day. A reservation call can return a lease and still report
-   conflicts, so read the conflict list: a path somebody else holds is not yours because
-   the API answered.
-6. Implement, with the tests the bead asks for. One bead at a time.
-7. `bin/ci` green, then commit and push. Work that is not pushed does not exist to the
+5. Claim it before opening a single file: `br update <id> --claim --actor <name>`.
+6. Reserve the exact edit surface.
+7. Implement, with the tests the bead asks for. One bead at a time.
+8. `cargo check`, then commit and push. Work that is not pushed does not exist to the
    other panes.
-8. Release the reservation, record the outcome on the bead, close it.
+9. Release the reservation, record the outcome on the bead, and move it to
+   `batch_pending`. Do not close it.
 
 Do not open a work cycle by broadcasting status. Coordination is what makes implementation
 safe; it is not a substitute for implementing.
@@ -205,7 +402,96 @@ convention around this tracker, and it is why the id in the commit message is th
 durable link from a line of code back to the reason it exists. `br` never runs a git
 command by itself, so nothing it writes reaches the history unless somebody commits it.
 
-## Editing discipline
+### Degraded coordination when Agent Mail is unavailable
+
+Do not block on it, and do not pretend the protection is still there. Fall back to bead
+assignee locking, and make the weaker state visible before touching code: claim with
+`--actor`, log the intended file scope as a comment on the bead, and say in the comment
+that the reservation layer was down. Treat the result as what it is, which is not a lock.
+
+## Changes You Did Not Make Are Normal
+
+`git status` in a shared tree shows other panes' work, and it changes while you are
+reading it. That is the expected state of this repository during a swarm, not an anomaly
+worth reporting.
+
+- **Never stash, revert, overwrite or otherwise disturb a change you did not make.** Treat
+  a modified file you do not recognise exactly as you would treat one of your own.
+- **Do not stop to ask what an unexplained edit is.** The answer is always the same, and
+  the question costs one pane a work cycle to ask and another one to answer.
+- **Stage your own paths by name.** `git add -A` in a shared tree captures whatever is
+  mid-edit elsewhere, and a commit holding half of somebody else's change is worse than no
+  commit at all.
+- **A build that breaks on a file you never touched means somebody is inside it right
+  now.** Take a bead with a different edit surface, or wait. Do not fix it out from under
+  them: your fix and their next write cannot both survive.
+
+## Honest Work and Anti-Ceremony (binding for agents and humans alike)
+
+The purpose of this swarm is working software delivered accretively in the shortest time
+compatible with correctness. Process exists to serve that outcome and must never become
+the product.
+
+**A process artifact may exist only when it is a hard gate for a named capability.** At
+creation it names a concrete consumer, the gate it enforces, the observed defect class
+that justifies it, and its retirement condition. The boundary test: if running code
+branches on it, it is product; if only humans and status reports read it, it is ceremony.
+Process work earns zero capability credit regardless of quality. A process artifact that
+gates nothing does not get created.
+
+**Honesty is absolute.** Never fake a test, present a fixture or a retained capture as
+live proof, weaken an assertion to make it pass, hard-code a success path, regenerate a
+golden to match broken output, or close work that is not done. A false close is reopened
+with an incident comment on the record, because silent reopening teaches nothing.
+
+**No self-certification.** Work is closed by the batch-verify orchestrator citing evidence
+bound to an exact revision. Peers never close each other's beads: closure is what unblocks
+dependents, so unilateral closing prints currency.
+
+**A typed refusal beats a fabricated result and is worth less than the real capability.**
+Implementing only the guard or refusal path never closes a positive-capability bead; label
+it and leave it open. The only exception is a bead whose contract *is* the refusal
+boundary, and even then it pairs every forbidden case with a near-identical permitted
+positive that proceeds.
+
+### Named patterns, so they can be called by name
+
+An agent that has read "commit pumping is forbidden and treated as reward hacking" behaves
+differently from one that has not. Cite these ids in beads, dispatches and incident
+comments.
+
+| id | the exploit | the countermeasure |
+| --- | --- | --- |
+| RH-1 | gate self-weakening: editing a validator or test gate so a failing check passes | gate code is reviewed as its own change, never bundled as an incidental fix |
+| RH-2 | proof-class inflation: a fixture, capture or mock presented as live proof | keep the hierarchy static, unit, capture, live, and let no lower class stand in for a higher one |
+| RH-3 | golden regeneration reflex: regenerating goldens instead of fixing the output | a golden change is its own marked commit with a semantic diff |
+| RH-4 | commit pumping: trivial or artificially split commits, or placeholder scaffolds that pass the syntax gate | placeholder macros are banned in committed code; commit rate is a saturation signal, never a score |
+| RH-5 | tautological tests: asserting the code does whatever the code does | every bead pre-specifies a planted negative a naive wrong implementation would fail |
+| RH-6 | easy-bead cherry-picking: claiming low-risk leaves while articulation points starve | claim the highest-priority ready bead; the orchestrator assigns critical-path work explicitly |
+| RH-7 | close pumping: closing beads to flood the ready pool | only the orchestrator closes; violations reopened with an incident comment |
+| RH-8 | scope splitting: types, then impl, then tests, as three closures | code and its tests ship in one bead |
+| RH-9 | follow-up laundering: moving an unmet acceptance condition into a new bead and closing the original | if it was in scope, the original stays open or is blocked by the follow-up |
+| RH-10 | spec editing as progress: weakening the plan instead of implementing it | plan edits never close an implementation bead |
+| RH-11 | dependency smuggling: vendoring or shimming around a banned dependency | the verify pass enforces the deny list mechanically |
+| RH-12 | demo-path hardcoding: special-casing the fixtures so the happy path passes | test subjects are selected at runtime and differ from development fixtures; sniffing for a test or CI environment is forbidden outright |
+
+### Measurement integrity
+
+This project's product **is** measurement, so a metric it reports about itself is held to
+the standard it holds its own output to.
+
+- **Every claimed metric predeclares its denominator and a countermetric.** No denominator
+  is edited after the result is known.
+- **A numeric quota is itself gameable.** "Under five percent process beads" invites
+  relabelling a validator as a feature. Use the consumer, gate, defect and retirement test
+  above instead, and report the process share as a diagnostic for the operator rather than
+  as a target for the swarm.
+- **Retries and correlated runs are not independent evidence.** Carry a cluster id and
+  count clusters, not attempts.
+- **Agreement between agents raises confidence, never authority.** Three panes repeating
+  one upstream claim is one datum.
+
+## Code Editing Discipline
 
 - **Change code by hand, not by script.** A regex sweep over source is brittle in a way
   that surfaces later, somewhere else, as a bug nobody connects back to the sweep. Many
@@ -218,235 +504,49 @@ command by itself, so nothing it writes reaches the history unless somebody comm
 - **Pre-1.0, no compatibility shims.** No wrapper kept for an API nobody calls, no
   deprecated path living beside its replacement. Fix the call sites and remove the old
   shape.
+- **Fix what you find.** A defect you trip over while working a bead gets diagnosed and
+  fixed or written down as a bead. "It was already broken" is not a disposition.
 
-## The tools this coordination runs on
+## The Tools This Coordination Runs On
 
 Named here because the rules above are useless to a reader who cannot find them.
 
 | tool | what it provides | where |
 | --- | --- | --- |
-| `br` | the bead graph: ready work, dependencies, claims, comments | <https://github.com/Dicklesworthstone/beads_rust> |
+| `br` | the bead graph: ready work, dependencies, claims, gates, comments | <https://github.com/Dicklesworthstone/beads_rust> |
 | MCP Agent Mail | agent identity, threads, advisory file reservations, and the pre-commit reservation guard | <https://github.com/Dicklesworthstone/mcp_agent_mail> |
 | `ntm` | the tmux swarm: spawning panes, supervising them, `ntm health` | <https://github.com/Dicklesworthstone/ntm> |
 
-## The baseline below, and what this project overrides
-
-The block that follows is the shared engineering baseline, stamped in verbatim from one
-source so it travels in the clone. It is not edited here. This project overrides exactly
-one rule in it, the mandatory worktree per session, for the reason given in *One branch,
-no worktrees*. Everything else in it holds as written.
-
-<!-- BEGIN universal-principles v3 -->
-## Working principles
-
-- **The human defines the WHAT; the agent decides the HOW.** Don't wait for line-by-line
-  dictation. Plan first for non-trivial tasks: show the plan + to-do list, wait for approval.
-- **Think before coding — don't assume, don't hide confusion.** State assumptions explicitly;
-  if multiple interpretations exist, present them — don't pick silently. If a simpler approach
-  exists, say so and push back. If a task is impossible under the stated constraints, or info
-  is missing, say so — don't guess. (For trivial tasks, use judgment; this is bias, not ritual.)
-- **Surgical changes — touch only what you must.** Every changed line traces to the task.
-  Don't "improve" adjacent code, reformat, or refactor what isn't broken; match existing style
-  even if you'd do it differently. Flag unrelated dead code — don't delete it. Remove only the
-  imports / variables / functions your own change orphaned.
-- **Chesterton's Fence — find the problem before undoing the decision.** A config, a flag, a
-  workaround that looks arbitrary is a **fence**: someone put it there, probably to fix
-  something that is invisible to you *because the fence is working*. You arrive with no
-  history, so absence of a visible reason is evidence of your ignorance, not of its
-  uselessness. When your fresh measurement contradicts what the human vaguely remembers
-  ("I changed this once, because of some problem"), **your measurement is the suspect first**
-  — it may be measuring the case that *isn't* failing. Go find the original problem, then
-  decide. *(A CIFS share was benchmarked with a big sequential `dd`, looked fast, and the
-  local-disk download dir was "fixed" away — while the actual failure was random writes:
-  par2, unrar, torrent piece-writes. Two wrong commits.)*
-- **Goal-driven execution — define the success check, then loop to it.** Turn the task into
-  something verifiable before coding: "add validation" → write tests for invalid inputs, then
-  pass them; "fix the bug" → write a failing repro test, then pass it; "refactor X" → tests
-  green before and after. For multi-step work, state a brief plan with a verify step each.
-- **"Flaky" is not a diagnosis — test in the environment the thing actually runs in.** A
-  component that fails *consistently* under automation is being **mis-invoked**, not being
-  unreliable; "it works when I run it by hand" is not evidence that it works. The shell you
-  test in has a TTY, a `$HOME`, an `ssh-agent`, an interactive stdin — the systemd unit, the
-  CI job and the scripted harness have none of those, so a passing manual run can be testing
-  a different program. Reproduce it *there* (start the unit, `env -u SSH_AUTH_SOCK`,
-  `</dev/null`, `--dry-run` to print the real command line) before accepting "unstable" as a
-  cause. **When a fix doesn't change the symptom, stop fixing and go look at what is actually
-  being executed.** *(An interactive-mode flag with no TTY made one harness fail every review
-  panel for weeks, written off as "flaky"; it was the wrong flag.)*
-- **KISS — don't solve a problem you don't have yet.** Simplicity isn't "write less code";
-  it's not building for a need that doesn't exist. Let structure emerge from the code.
-- **YAGNI & flat.** No preventive abstractions, no single-use interfaces. Interfaces for
-  real boundaries only. Architecture is *extracted* once a pattern proves itself in real
-  use — never designed up front for a user who doesn't exist yet. Need pulls architecture.
-- **Development cost is not your cost — don't let it pick the design.** Choosing between
-  technical options, weight quality, simplicity, robustness and long-term maintainability;
-  don't weight how long the work takes. The estimate comes out in human units — days,
-  weeks — because that is what the training data measured, and the cheaper option then
-  wins on a cost the agent does not pay. This is **not** licence to over-build: KISS and
-  YAGNI decide *whether* a thing is needed, and this decides *how well* it is built once
-  it is. "That would take a week" is not an argument here; "nothing needs this yet" is.
-- **Order: make it work → make it right → make it fast** (Kent Beck), in that order. Most
-  over-engineering is doing "right"/"fast" before a working thing exists to justify it.
-- **Flag scope creep — a standing duty, not a suggestion.** When a solo tool starts being
-  framed as a public / multi-user / multi-tenant / plugin-system / configurable-N-backends
-  platform before a real, present need exists, STOP and ask: "Is this needed now?" Justify
-  future-proofing against a need that exists *today*.
-- **No silent decisions (comprehension debt).** Never make a silent architectural or
-  design call — state it and record the rationale, so the reasoning is recoverable later.
-- **Real decisions are presented in the chat, in isolation — never via popup.** When a
-  design/architecture/scope/trade-off decision arises, surface it on its own: the options,
-  what each means, pros/cons/trade-offs, and a recommendation — then decide together.
-  Don't bury it mid-text or bundle it with other topics, and don't compress it into a
-  quick-pick widget (e.g. AskUserQuestion) — the widget skips the reasoning and overlays
-  the explanation. Widgets are for trivial short-answer picks only.
-
-## Git: branches, commits, PRs, comments
-
-- **Ask the repo for its default branch; never assume one.** Repos differ — `master` and `main`
-  are both common, often in the same person's account — and a wrong guess sends a PR to a branch
-  that does not exist, or, worse, has you "fixing" a URL that was right all along.
-  `git symbolic-ref --short refs/remotes/origin/HEAD | sed 's|^origin/||'`, or
-  `gh repo view --json defaultBranchRef -q .defaultBranchRef.name`.
-  Never commit directly to it: branch, then PR.
-- **A new repo starts on `main`.** That is the preferred name, and `init.defaultBranch` is
-  set to it, so `git init` produces it without anyone choosing. It settles new repos only:
-  an existing one keeps the branch it has, because renaming breaks open PRs, CI filters,
-  deploy hooks and every permalink into the tree, and buys nothing. The rule above still
-  governs everything already in existence — ask, never assume.
-- **Branches** — Conventional Branch (conventionalbranch.org): `<type>/<kebab-description>`,
-  types `feature/`, `bugfix/`, `hotfix/`, `chore/`, `release/`, `docs/`.
-- **Commits** — Conventional Commits (conventionalcommits.org): `<type>(scope): <description>`,
-  types `feat`, `fix`, `docs`, `refactor`, `test`, `chore`, `ci`, `build`, `perf`, `style`.
-  Breaking change → `!` after the type or a `BREAKING CHANGE:` footer.
-- **Atomic commits** — one logical change per commit, each independently green and
-  revertible. Never `git add .` blind; split unrelated changes.
-- **Always work in your own worktree — mandatory, not conditional.** Parallel sessions
-  are opened freely and nothing signals their existence to you, so a "check whether another
-  session is here first" step can never be reliable — the honest answer is always "maybe".
-  The only collision-proof arrangement is structural: keep the main working tree on the
-  default branch as a clean reference and **never work in it** — before your first write
-  (commit, branch, rebase, stash; read-only exploration is exempt), create your own worktree
-  and do everything there. **When the repo ships a worktree tool, that tool is the only correct
-  way to make one** — `bin/worktree new <type>/<kebab-desc>`, or whatever the repo calls it.
-  A raw `git worktree add` materialises tracked files and nothing else, so every git-ignored
-  path the repo links into a worktree is silently absent, and the tools that read those paths
-  fail inside it without saying why: a tracker whose database is git-ignored reports itself
-  uninitialised and offers to create a second one. Only where the repo ships no such tool is
-  `git worktree add ../<repo>-<task> -b <your-branch> <origin>/<default-branch>` the right
-  command. Do this **whether or not** you believe another agent is running — that belief is
-  exactly what you cannot verify. Report which worktree/branch you used; remove it once merged.
-  Only the human can see all the open sessions.
-- **Pull requests** — describe **what + why**. *What*: a 1–3 line summary. *Why* (the bulk):
-  decisions, trade-offs, rejected alternatives. The diff shows the what; the PR explains why.
-- **Comments** — always **WHY, not WHAT**: explain intent, never restate the obvious
-  mechanics. Keep existing comments; they carry intent.
-
-## Code style (baseline)
-
-- Functions: 4–40 lines, one thing each (SRP). Files: under ~500 lines, split by responsibility.
-- Names specific and unique — avoid `data`, `handler`, `Manager`, `util`.
-- Explicit types. Early returns over nested ifs; max ~2 levels of indentation.
-- Inject dependencies; wrap third-party libs behind a thin interface this project owns.
-- No duplication — but don't extract *too early*. Tolerate duplication while the pattern is
-  still forming; extract the abstraction *from* proven, repeated code, never ahead of it.
-- **Refactoring is not automatic.** After a large feature, list refactoring candidates
-  (files > ~500 lines, duplicated logic, long functions, hardcoded config) and ask before
-  pruning — the human decides, the tests are the safety net. Consolidate when the thing
-  works and the seams are obvious, not before.
-<!-- END universal-principles v3 -->
-
-## Tests (TDD)
-
-- Every feature is born with a test; every bugfix with a regression test.
-- Tests run with one command, no manual setup and no real credential. A test that cannot
-  run headless is wrong.
-- **A parser is tested against a captured fixture, never against a live file.** Transcript
-  formats and provider responses change without notice, so the fixture is what pins the
-  shape the code was written for, and a real file is what proves the fixture is still true.
-  Keep both, and keep them separate.
-- **The invariants above are tested as invariants**, not implied by a happy path: a stale
-  reading must be observable as stale in the output, and a unit mismatch must fail to
-  compile. Where a guard cannot fail, it is not a guard.
-- Before saying "done", run `bin/ci` and report the result.
-
-## Small releases
-
-- Every commit on the shared branch passes `bin/ci` before it is pushed. Under one tree a
-  broken commit is not one agent's problem to fix next: it is the tree every other pane is
-  working in, so the next pane's failure is inherited and reads as its own.
-- `main` only ever receives a merged pull request whose checks are green, so every commit
-  on it is releasable.
-- Push as soon as a bead is green. An unpushed commit is invisible to the other panes,
-  which is the same as not having done the work.
-- A release is a `v*` tag. The workflow builds the platform matrix, emits checksums and
-  publishes the GitHub Release. Nothing is uploaded by hand.
-
-## Security (habit, not a phase)
-
-- Provider credentials are read from the environment or from the machine's own credential
-  store. They are never written to the state directory, never logged, and never included
-  in an error message or a debug dump.
-- A response body from a provider is untrusted input: parse it, do not interpolate it into
-  a shell command or a path.
-- Dependency CVEs are caught by `cargo audit` in `bin/ci` and in CI.
-
-## Prose
-
-- No em-dash. Use a comma, a colon, a semicolon or a full stop. This is checked by
-  `bin/ci`, and it applies to Markdown, source comments, config, commit messages and PR
-  text alike.
-- Bold marks structure (a bullet lead-in, a table header), never emphasis in the middle
-  of a sentence. Same for italics: a term being introduced, not a word being stressed.
-- No process narration anywhere a stranger can read it: no task ids, no phase names, no
-  review rounds, no mention of who or what reviewed a diff, no reference to a session or
-  a conversation. Commit and PR text describe the problem and the change, never how the
-  work was organised.
-- No audience in the text. A README says what the software does, not who is going to
-  read it or why they are reading it.
-- Comment density is low by default: the non-obvious only, the why and not the what.
-  Long reasoning belongs in an ADR, not in a header comment.
-
-## Git and secrets
-
-- Before any commit, show `git status` and `git diff --cached`; confirm no secret is
-  staged. If you spot one, STOP and report it. The gitleaks pre-commit hook is the
-  deterministic backstop; this habit is the probabilistic one.
-- Real secrets stay out of git. Only `.env.example`, with fake values, is committed.
-
-## Landing a session
-
-Before ending a session, in this order. A session that skips a step leaves the swarm in a
-state the next pane has to reconstruct.
-
-1. **File a bead for anything left over.** Work that exists only in a session's memory
-   does not exist.
-2. **Run `bin/ci`** and report the result.
-3. **Update bead status.** Close what is done; leave `in_progress` only on work somebody
-   is still holding.
-4. **Release your reservations.** One that outlives its agent blocks a pane with no way to
-   find out why.
-5. **Commit your own paths and push.** An unpushed commit is invisible to every other
-   pane, which is indistinguishable from not having done the work.
-
-## Post-implementation checklist (run before "done")
-
-1. Commits small and well described.
-2. Refactoring candidates listed, if the change was large.
-3. Security risks flagged, if you touched a sensitive surface.
-4. This spec updated if behavior, setup or release flow changed, and any hurdle it gained
-   is classified rather than just appended.
-
-## Common hurdles
+## Common Hurdles
 
 | hurdle | class | gate |
 |---|---|---|
 | A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the isolation `bin/ci` sets up, so a binary out of `target/` can be another pane's build | tripwire | pass `CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci` |
-| A stray empty reservation database can appear in the repository root. An agent that queries it sees zero reservations and concludes every path is free, which is the worst failure an advisory system has | tripwire | before trusting an empty conflict list, confirm the store being read is the shared one and not a file in the tree |
+| The reservation guard exits 0 and checks nothing when neither `GIT_IDENTITY_ENABLED` nor `WORKTREES_ENABLED` is set in the committing shell. An unset variable looks exactly like a clean commit | tripwire | export it per pane, and canary the guard by staging a path somebody else holds |
+| `guard install` returns an empty hook path and installs nothing when the same gate is unset, printing an informational line rather than an error | tripwire | set `GIT_IDENTITY_ENABLED=1` on the install command itself, then confirm `.githooks/hooks.d/pre-commit/` is non-empty |
+| The mail server's database path is resolved relative to the current directory, so running its CLI from a repository creates an empty `storage.sqlite3` there. An agent that queries it sees zero reservations and concludes every path is free, which is the worst failure an advisory system has | tripwire | run that CLI only from its own install directory; before trusting an empty conflict list, confirm which store was read |
+| The guard plugin under `.githooks/hooks.d/` carries absolute paths for one machine | prose | it is git-ignored and regenerated per machine; never commit it |
 | `br update --claim` guards on identity, not on a lock. Under the default actor two panes claim the same bead and neither is told | tripwire | always pass `--actor` with the pane's own name |
 | A dispatch that dies before its agent starts leaves a bead held by nobody, and nothing expires it | prose | return it with `br update <id> --status open` and say what stopped it |
-| `br init` creates `.beads` mode 0755, and `bd` then prints a warning ahead of its version string, which the version probe parses as the version | tripwire | `chmod 700 .beads` immediately after any `br init` |
+| `br init` creates `.beads` mode 0755, and the version probe then parses the resulting warning as the version | tripwire | `chmod 700 .beads` immediately after any `br init` |
 | The prose gate refuses the em-dash in every tracked file, in the commit message and in the PR body. The commit message is the only one of the three nothing reads a second time | ci | `bin/ci` calls `bin/slop-guard`; the `commit-msg` hook covers the message |
 | A clone has no hooks until `bin/install-hooks` runs, so the secret scan is off on a fresh checkout | prose | run it once after cloning |
+| An aggregated test command that aborts early on a compile error reports a misleadingly green prefix as if it were the total | tripwire | fix compile errors first; only a fully compiling run yields a true count |
+| A rate-limit message persists in a pane buffer after the limit has lifted, and the CLI does not retry by itself | prose | nudge the pane and confirm before idling it |
 
 **A hurdle promoted to a gate is deleted from this table, not duplicated.** The gate is the
 instruction; a line here restating it only dilutes the ones still unguarded.
+
+## Landing the Plane (Session Completion)
+
+A session is not finished until the work is visible to everyone else.
+
+1. File the remaining work as beads rather than as prose in a message.
+2. Release every reservation you still hold.
+3. `bin/ci` green.
+4. Commit, then `git pull --rebase && git push`, and confirm `git status` reports the
+   branch up to date. Rebasing your own unpushed commits onto what the others landed is
+   the normal path; rewriting a commit that is already pushed is not, and a force push
+   never is.
+5. Record the outcome on each bead you touched. A bead left `in_progress` with no comment
+   is indistinguishable from an abandoned one.
