@@ -27,3 +27,13 @@
 # No trailing slash, for the reason the block above spells out: a worktree can
 # materialize this as a symlink.
 /.beads
+
+# bv (beads viewer) local config and caches
+.bv/
+
+# The Agent Mail reservation guard plugin. `guard install` generates it per machine with
+# absolute paths baked in (the mailbox store and this project's reservation directory), so
+# it is regenerated on each checkout rather than committed. The chain runner beside it
+# (`.githooks/pre-commit`) is generic and IS committed, as is the secret-scan hook it
+# preserves at `.githooks/pre-commit.orig`.
+/.githooks/hooks.d
