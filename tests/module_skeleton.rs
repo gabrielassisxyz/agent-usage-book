@@ -10,6 +10,18 @@ const LOWEST_LAYERS: [&str; 3] = ["domain", "evidence", "config"];
 /// The conversion-owning modules from PLAN.md section 9.
 const CONVERSION_MODULES: [&str; 3] = ["cost_model", "calibration", "valuation"];
 
+/// The clock module is the only place the system clock may be read.
+const CLOCK_MODULE: &str = "src/domain/time.rs";
+
+/// System-clock call sites that must live only in the clock module.
+const SYSTEM_CLOCK_PATTERNS: &[&str] = &[
+    "SystemTime::now",
+    "Instant::now",
+    "UNIX_EPOCH",
+    "std::time::SystemTime",
+    "std::time::Instant",
+];
+
 /// Crate families the lowest layers must not depend on (PLAN.md section 8.1).
 const FORBIDDEN_CRATES: &[&str] = &[
     // SQLite
@@ -152,6 +164,34 @@ fn is_code_item_keyword(line: &str) -> bool {
         || line.starts_with("impl<")
 }
 
+/// All `.rs` source files under a module, whether it is a single file
+/// (`src/{name}.rs`) or a directory (`src/{name}/`).
+fn module_source_files(name: &str) -> Vec<String> {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"));
+    let file = format!("{root}/src/{name}.rs");
+    if std::path::Path::new(&file).exists() {
+        return vec![file];
+    }
+    let mut files = Vec::new();
+    collect_rs_files(&format!("{root}/src/{name}"), &mut files);
+    files
+}
+
+/// Recursively collects `.rs` files under `dir` into `out`.
+fn collect_rs_files(dir: &str, out: &mut Vec<String>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path.to_string_lossy(), out);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("rs") {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+}
+
 #[test]
 fn manifest_declares_no_forbidden_crate() {
     let manifest = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
@@ -167,13 +207,31 @@ fn manifest_declares_no_forbidden_crate() {
 #[test]
 fn lowest_layers_reference_no_forbidden_crate() {
     for layer in LOWEST_LAYERS {
-        let path = format!("{}/src/{layer}.rs", env!("CARGO_MANIFEST_DIR"));
-        let source =
-            fs::read_to_string(&path).unwrap_or_else(|e| panic!("src/{layer}.rs must exist: {e}"));
-        for name in FORBIDDEN_CRATES {
+        for path in module_source_files(layer) {
+            let source = fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
+            for name in FORBIDDEN_CRATES {
+                assert!(
+                    !references_crate(&source, name),
+                    "{path} references forbidden crate {name}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn system_clock_calls_only_in_the_clock_module() {
+    let root = concat!(env!("CARGO_MANIFEST_DIR"));
+    let mut files = Vec::new();
+    collect_rs_files(&format!("{root}/src"), &mut files);
+    for path in files {
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
+        for pattern in SYSTEM_CLOCK_PATTERNS {
             assert!(
-                !references_crate(&source, name),
-                "src/{layer}.rs references forbidden crate {name}"
+                !source.contains(pattern) || path.ends_with(CLOCK_MODULE),
+                "{path} reads the system clock ({pattern}); only {CLOCK_MODULE} may"
             );
         }
     }

@@ -16,6 +16,7 @@ pub mod dedup;
 pub mod domain;
 pub mod error;
 pub mod evidence;
+pub mod logging;
 pub mod meter;
 pub mod presentation;
 pub mod projection;
@@ -29,13 +30,14 @@ pub mod valuation;
 mod tests {
     use std::fs;
 
-    /// The 20 modules from the design's module table (PLAN.md section 8).
-    const DESIGN_MODULES: [&str; 20] = [
+    /// The 21 modules from the design's module table plus diagnostics.
+    const DESIGN_MODULES: [&str; 21] = [
         "domain",
         "evidence",
         "config",
         "store",
         "meter",
+        "logging",
         "auth",
         "projection",
         "transcripts",
@@ -71,8 +73,10 @@ mod tests {
                 "module {name} is not declared in src/lib.rs"
             );
 
-            let path = format!("{}/src/{name}.rs", env!("CARGO_MANIFEST_DIR"));
-            let source = fs::read_to_string(&path)
+            let file_path = format!("{}/src/{name}.rs", env!("CARGO_MANIFEST_DIR"));
+            let dir_path = format!("{}/src/{name}/mod.rs", env!("CARGO_MANIFEST_DIR"));
+            let source = fs::read_to_string(&file_path)
+                .or_else(|_| fs::read_to_string(&dir_path))
                 .unwrap_or_else(|e| panic!("module {name} is missing: {e}"));
             assert!(
                 has_header_comment(&source),
