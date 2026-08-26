@@ -55,6 +55,61 @@ else
     fi
 fi
 
+# --- commit protocol: bin/checks/75-commit-protocol has a conformance half over AGENTS.md
+# and an integration half over a scratch git repository, and each half is mutated here.
+# A prose guard that keeps passing after its sentence is deleted is checking nothing, and
+# an integration assertion that keeps passing after the behaviour is inverted is worse,
+# because it reads as a proof. Both halves are grep and git only, so they run
+# unconditionally alongside format and the prose guard rather than behind the build flag.
+commit_protocol_mutant() {  # $1 = label, $2 = clone dir, $3 = expected substring in output
+    local label="$1" clone="$2" needle="$3" output
+    output="$( (cd "$clone" && bin/checks/75-commit-protocol) 2>&1 )"
+    if [ $? -eq 0 ]; then
+        note_fail "commit protocol: $label: expected the check to fail after the mutation"
+        return
+    fi
+    if ! printf '%s' "$output" | grep -qF -- "$needle"; then
+        note_fail "commit protocol: $label: failed, but never named '$needle'"
+        printf '%s\n' "$output" >&2
+    fi
+}
+
+clone="$scratch/commit-protocol-baseline"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+if ! (cd "$clone" && bin/checks/75-commit-protocol) >/tmp/ci-selftest-commit-protocol-baseline.log 2>&1; then
+    note_fail "commit protocol: baseline clone fails before any mutation; see /tmp/ci-selftest-commit-protocol-baseline.log"
+fi
+
+# Conformance, the sentence that six deadlocked panes were missing.
+clone="$scratch/commit-protocol-sentence"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+grep -v 'A foreign staged path is not a reason to stop' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
+mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
+commit_protocol_mutant "deleted sentence" "$clone" "a foreign staged path is not a reason to stop"
+
+# Conformance, the orchestrator's own rule, which lives in a different section and would
+# survive any mutation aimed at the pane protocol.
+clone="$scratch/commit-protocol-orchestrator"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+grep -v 'does not model file overlap' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
+mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
+commit_protocol_mutant "deleted orchestrator rule" "$clone" "sequences overlapping blast radii"
+
+# Integration, the path-scoped commit: a bare commit is the form the doctrine bans, and it
+# sweeps the foreign staged path in. If the assertion is live, the check says so.
+clone="$scratch/commit-protocol-bare-commit"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+sed -i 's/^git -C "\$scratch" commit --quiet -m "subject" -m "aub-me8b" -- mine.rs$/git -C "$scratch" commit --quiet -m "subject" -m "aub-me8b"/' \
+    "$clone/bin/checks/75-commit-protocol"
+commit_protocol_mutant "bare commit" "$clone" "carried more than its own paths"
+
+# Integration, the shared-file test: --cached compares the index, so it cannot see an
+# uncommitted foreign line, which is the whole reason the doctrine says HEAD.
+clone="$scratch/commit-protocol-cached-diff"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+sed -i 's/diff HEAD -- mod\.rs/diff --cached -- mod.rs/' "$clone/bin/checks/75-commit-protocol"
+commit_protocol_mutant "index-scoped diff" "$clone" "did not report the foreign line"
+
 # --- install-hooks: running it twice must be idempotent. ---
 clone="$scratch/hooks"
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone"

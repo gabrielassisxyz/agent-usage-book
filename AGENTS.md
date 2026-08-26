@@ -220,7 +220,9 @@ building, and the build runs once, centrally, over everyone's combined changes.
    `todo!()` and `unimplemented!()` are banned in committed code.
 4. Run at most the syntax gate: `cargo check -p agent-usage-book`. No `cargo test`, no
    full build, no waiting on proof.
-5. Commit immediately, naming the bead id and the touched scope.
+5. Commit immediately, naming the bead id and the touched scope. The form to use, and
+   the test to run before committing a shared file, are in *Committing into a shared
+   index*.
 6. Move the bead to `batch_pending` **only when substantively complete**: code and tests
    written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
    concrete test, no known defect. `batch_pending` earns no capability credit; it frees
@@ -251,6 +253,14 @@ score. The moment agents are scored on commits you get commit pumping.
      --status pass --to closed --note "commit:<sha> suites:<...>"
    br close <id> --reason "<evidence>" --transition-comment "<batch summary>"
    ```
+
+7. **Sequence the next wave by blast radius, not only by the dependency graph.** Closing a
+   layer refills the ready pool, and what leaves it is the orchestrator's choice. The
+   tracker models dependencies between beads and does not model file overlap, so two beads
+   with no edge between them can still be dispatched onto one file. Before releasing a
+   wave, read the blast radius of every bead in it and hold back the ones that collide on a
+   shared file from the table in *Committing into a shared index*. Overlap that cannot be
+   designed out is sequenced, never dispatched in parallel and repaired afterwards.
 
 The verification record is revision-bound: HEAD, toolchain and lockfile identity, the
 exact commands, the selected tests, and the exact bead list. Any movement of HEAD
@@ -322,6 +332,67 @@ goes on the bead rather than into a message.
 lives in the bead graph, the reservations and this file, never in another agent's context.
 An agent that stops is replaced, not recovered.
 
+### Committing into a shared index
+
+The reservation layer guards a file. It says nothing about the index, and one shared tree
+has exactly one index, so anything a pane stages is visible to every other pane's commit.
+This is the commit form, and it is not optional:
+
+```bash
+git add <your paths>
+git commit -m "<subject>" -m "<bead id>" -- <your paths>
+```
+
+Naming the paths commits the working-tree version of exactly those paths and leaves every
+other pane's staged work untouched. The `git add` is neither redundant nor optional:
+`git commit -- <path>` refuses a path git does not already track, so the new file a bead
+just wrote has to be staged before it can be named. Staging your own paths disturbs nobody,
+since the index holds everyone's and the commit that names yours leaves theirs staged. `git commit -a` sweeps every pane's uncommitted edits
+into your commit, and a bare `git commit` sweeps whatever they have staged. Both are
+banned, and banning them is useless without the form above: a rule shaped *never do X*
+leaves an agent with no move at all when X is the only form it knows.
+
+**A foreign staged path is not a reason to stop.** Six panes once deadlocked for thirty
+minutes on exactly that, each correctly refusing to run a form it had been told never to
+run, and none of them holding a third. Commit your own paths and carry on.
+
+**Before committing a shared file, check that its diff is yours.**
+
+```bash
+git diff HEAD -- <file>
+```
+
+The path-scoped commit protects you per path, and a shared file is one path with two
+authors, so the command that keeps another pane's *files* out of your commit will carry
+another pane's *lines* in. Read that diff before you commit the file. A line you did not
+write usually depends on a file that does not exist at this revision yet, and the gate then
+goes red on a bead that did nothing wrong: `pub mod window;` committed without
+`src/domain/window.rs` fails lint, test and rustfmt at once.
+
+The test is about the diff, never about the file. `src/domain/mod.rs` is never entirely one
+bead's work, because every bead in the layer appends a line to it. Once the other panes
+commit their lines, those lines leave your diff, and the file that was unsafe five minutes
+ago is safe now.
+
+**When the diff is not entirely yours**, commit your other paths, record on the bead which
+file is blocked and whose line is sitting in it, and take the next thing. Do not stand down
+holding everything, and do not wait on the file.
+
+**The shared files in this repository** are the ones that attract simultaneous editors:
+
+| file | why more than one bead touches it |
+| --- | --- |
+| `src/lib.rs` | the crate root, one `pub mod` line per module |
+| `src/config/mod.rs`, `src/domain/mod.rs`, `src/presentation/mod.rs`, `src/store/mod.rs` | the module declaration surface, one `pub mod` line per submodule |
+| `src/error.rs`, `src/problem_code.rs` | registries, one variant per failure a bead introduces |
+| `src/cli.rs` | the command enumeration and `Command::ALL` |
+| `Cargo.toml` | one dependency line per bead that needs one |
+
+That list is not closed. **A file is shared when a bead's normal work appends to it rather
+than rewriting it**: a declaration list, an enumeration, a registry, a manifest. Finding one
+that is not listed above is itself part of the work, so add it here in the commit that
+found it.
+
 ### Setup, once per machine
 
 None of the three protections is self-installing, and two of them fail silently when they
@@ -377,8 +448,8 @@ are not set up. Verify, do not assume.
 5. Claim it before opening a single file: `br update <id> --claim --actor <name>`.
 6. Reserve the exact edit surface.
 7. Implement, with the tests the bead asks for. One bead at a time.
-8. `cargo check`, then commit and push. Work that is not pushed does not exist to the
-   other panes.
+8. `cargo check`, then commit and push, with the path-scoped form in *Committing into a
+   shared index*. Work that is not pushed does not exist to the other panes.
 9. Release the reservation, record the outcome on the bead, and move it to
    `batch_pending`. Do not close it.
 

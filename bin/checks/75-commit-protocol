@@ -1,0 +1,136 @@
+#!/usr/bin/env bash
+# The commit-protocol guard (aub-me8b): the pane protocol in AGENTS.md must keep telling a
+# pane what to DO in a tree with one shared index, not only what to avoid. Six panes once
+# deadlocked for thirty minutes because the rule they held was a prohibition with no third
+# form beside it, so a later edit that trims this section back to a prohibition is exactly
+# the regression this check exists to catch.
+#
+# Two halves, both here rather than in a selftest, because the CI workflow runs bin/ci and
+# nothing else: a proof that lives in an on-demand script is a proof nobody runs.
+#
+#   conformance  the document still carries each rule, anchored on the command (which
+#                cannot be reworded) plus one phrase carrying the meaning (which is what a
+#                command anchor alone would let an editor delete)
+#   integration  the two behaviours those rules claim, replayed against a scratch git
+#                repository, so the document is checked against git rather than against
+#                itself
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+doc="AGENTS.md"
+fail=0
+
+# The section is the unit: an anchor found somewhere else in the file would pass while the
+# pane protocol itself had lost the rule.
+section="$(awk '
+    /^### Committing into a shared index$/ { grab = 1; next }
+    grab && /^### / { exit }
+    grab { print }
+' "$doc")"
+
+if [ -z "$section" ]; then
+    echo "$doc: no '### Committing into a shared index' section" >&2
+    exit 1
+fi
+
+# Each criterion is one command anchor plus one meaning anchor. Naming the criterion in the
+# failure is what makes it actionable: the reader has to learn which rule went missing, not
+# merely that a grep stopped matching.
+require() {  # $1 = criterion, $2 = haystack, $3.. = every substring that must be present
+    local criterion="$1" haystack="$2"
+    shift 2
+    local needle
+    for needle in "$@"; do
+        if ! printf '%s' "$haystack" | command grep -qF -- "$needle"; then
+            echo "$doc: $criterion: missing '$needle'" >&2
+            fail=1
+        fi
+    done
+}
+
+require "the explicit-path commit form" "$section" \
+    'git add <your paths>' \
+    'git commit -m "<subject>" -m "<bead id>" -- <your paths>' \
+    'refuses a path git does not already track' \
+    'leaves every'
+
+require "a foreign staged path is not a reason to stop" "$section" \
+    'A foreign staged path is not a reason to stop'
+
+require "the shared-file test" "$section" \
+    'git diff HEAD -- <file>' \
+    'check that its diff is yours'
+
+require "the shared-file list and what makes a file shared" "$section" \
+    'src/lib.rs' \
+    'src/domain/mod.rs' \
+    'src/error.rs' \
+    'src/cli.rs' \
+    'Cargo.toml' \
+    'A file is shared when a bead'
+
+require "what to do when the diff is not yours" "$section" \
+    'When the diff is not entirely yours'
+
+# The orchestrator's own phase, not the pane's: file overlap is invisible to the tracker's
+# dependency graph, so nothing else in the document would catch its removal.
+phase2="$(awk '
+    /^### Phase 2: batch verify and close/ { grab = 1; next }
+    grab && /^### / { exit }
+    grab { print }
+' "$doc")"
+
+require "the orchestrator sequences overlapping blast radii" "$phase2" \
+    'blast radius' \
+    'does not model file overlap'
+
+# --- Integration: the two behaviours, replayed against real git. ---
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-commit-protocol-XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+
+# The fixture is the bead's reproduction reduced to its two shapes: a file that belongs to
+# one pane alone, and the declaration file every pane in a layer appends to.
+git init --quiet "$scratch"
+git -C "$scratch" config user.email pane@example.invalid
+git -C "$scratch" config user.name pane
+git -C "$scratch" config commit.gpgsign false
+printf 'pub mod existing;\n' > "$scratch/mod.rs"
+printf 'placeholder\n' > "$scratch/existing.rs"
+git -C "$scratch" add mod.rs existing.rs
+git -C "$scratch" commit --quiet -m "base"
+
+# Scenario 1: a path another pane staged must not ride along in a path-scoped commit, and
+# must still be staged afterwards, since sweeping it away is the same loss by another name.
+printf 'foreign work\n' > "$scratch/foreign.rs"
+git -C "$scratch" add foreign.rs
+printf 'mine\n' > "$scratch/mine.rs"
+# Staged first, because `git commit -- <path>` refuses a path git does not track yet. This
+# is the doctrine's own two-command form, replayed exactly as a pane would run it.
+git -C "$scratch" add mine.rs
+git -C "$scratch" commit --quiet -m "subject" -m "aub-me8b" -- mine.rs
+committed="$(git -C "$scratch" show --name-only --pretty=format: HEAD | command grep -v '^$' | sort | tr '\n' ' ')"
+if [ "$committed" != "mine.rs " ]; then
+    echo "integration: the path-scoped commit carried more than its own paths: $committed" >&2
+    fail=1
+fi
+if ! git -C "$scratch" diff --cached --name-only | command grep -qx 'foreign.rs'; then
+    echo "integration: the foreign staged path did not survive the commit as staged work" >&2
+    fail=1
+fi
+
+# Scenario 2: the shared-file test must see a foreign uncommitted line in a shared file,
+# which is exactly what scenario 1's protection cannot see, a shared file being one path
+# with two authors.
+printf 'pub mod existing;\npub mod window;\n' > "$scratch/mod.rs"
+if ! git -C "$scratch" diff HEAD -- mod.rs | command grep -q '^+pub mod window;'; then
+    echo "integration: git diff HEAD -- <file> did not report the foreign line in the shared file" >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> commit-protocol FAILED" >&2
+    exit 1
+fi
+
+echo "commit-protocol: the pane protocol carries the commit form, the shared-file test and the orchestrator's sequencing rule."
