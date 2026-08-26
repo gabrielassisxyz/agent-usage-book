@@ -1,0 +1,13 @@
+error[E0369]: cannot add `QuotaFractionPpm` to `QuotaFractionPpm`
+ --> tests/compile_fail/quota_level_addition.rs:9:18
+  |
+9 |     let _sum = a + b;
+  |                - ^ - QuotaFractionPpm
+  |                |
+  |                QuotaFractionPpm
+  |
+note: `QuotaFractionPpm` does not implement `Add`
+ --> src/domain/quota.rs
+  |
+  | pub struct QuotaFractionPpm(u32);
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `QuotaFractionPpm` is defined in another crate

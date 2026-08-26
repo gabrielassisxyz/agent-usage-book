@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/quota_used_where_remaining_expected.rs:11:21
+   |
+11 |     takes_remaining(used);
+   |     --------------- ^^^^ expected `QuotaRemaining`, found `QuotaUsed`
+   |     |
+   |     arguments to this function are incorrect
+   |
+note: function defined here
+  --> tests/compile_fail/quota_used_where_remaining_expected.rs:7:4
+   |
+ 7 | fn takes_remaining(_: QuotaRemaining) {}
+   |    ^^^^^^^^^^^^^^^ -----------------
