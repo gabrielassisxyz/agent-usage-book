@@ -5,20 +5,27 @@
 #   credits-to-window relationship; a renderer that reaches either would compute a
 #   quantity instead of receiving a finished report object.
 # Detection: any reference to crate::store or crate::calibration in the presentation
-#   module source.
+#   module source, wherever it lives: the flat file when it is a file, every .rs under
+#   the directory when it is a directory. mod.rs is not special-cased.
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
-source_file="src/presentation.rs"
-if [ ! -r "$source_file" ]; then
-    echo "presentation must not import store or calibration: cannot read $source_file" >&2
+if [ -f "src/presentation.rs" ]; then
+    sources=(src/presentation.rs)
+elif [ -d "src/presentation" ]; then
+    sources=()
+    while IFS= read -r file; do
+        sources+=("$file")
+    done < <(find src/presentation -name '*.rs' -type f | sort)
+else
+    echo "presentation must not import store or calibration: no src/presentation.rs or src/presentation/ found" >&2
     exit 2
 fi
 
-matches="$(grep -nHE 'crate::(store|calibration)([^A-Za-z0-9_]|$)' "$source_file" 2>/dev/null || true)"
+matches="$(grep -nHE 'crate::(store|calibration)([^A-Za-z0-9_]|$)' "${sources[@]}" 2>/dev/null || true)"
 if [ -n "$matches" ]; then
     echo "presentation imports store or calibration:" >&2
     printf '%s\n' "$matches" >&2

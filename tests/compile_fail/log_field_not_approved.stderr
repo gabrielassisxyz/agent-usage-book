@@ -19,7 +19,7 @@ help: the following other types implement trait `logging::private::Sealed`
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Redacted`
 ...
   | impl private::Sealed for Quantity {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Quantity`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `agent_usage_book::logging::Quantity`
 note: required by a bound in `SafeDiagnosticValue`
  --> src/logging.rs
   |
@@ -52,7 +52,7 @@ help: the following other types implement trait `logging::private::Sealed`
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Redacted`
 ...
   | impl private::Sealed for Quantity {}
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `Quantity`
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `agent_usage_book::logging::Quantity`
   = note: required for `RawProviderBody` to implement `SafeDiagnosticValue`
 note: required by a bound in `LogField`
  --> src/logging.rs
