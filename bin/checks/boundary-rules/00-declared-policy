@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Boundary: every module declares its dependency policy.
+# Design: PLAN.md sections 8 and 8.1 (the //! header is where a module declares its
+#   responsibility and its "May not depend on:" direction).
+# Detection: every file under src/ except lib.rs and main.rs must open with a //! header
+#   comment. A module with no header is undeclared and fails the run rather than passing
+#   silently.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+fail=0
+for module in src/*.rs; do
+    case "$module" in
+        src/lib.rs|src/main.rs) continue ;;
+    esac
+
+    first_nonblank="$(awk 'NF {print; exit}' "$module")"
+    case "$first_nonblank" in
+        '//!'*) ;;
+        *)
+            echo "module $module declares no dependency policy (missing //! header)" >&2
+            fail=1
+            ;;
+    esac
+done
+
+[ "$fail" -eq 0 ] || exit 1
+exit 0

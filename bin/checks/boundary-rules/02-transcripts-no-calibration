@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Boundary: transcripts must not import calibration.
+# Design: PLAN.md section 8.2 ("transcripts importing calibration") and section 9
+#   ("The calibration layer never parses transcripts").
+# Detection: any reference to crate::calibration in the transcripts module source.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+source_file="src/transcripts.rs"
+if [ ! -r "$source_file" ]; then
+    echo "transcripts must not import calibration: cannot read $source_file" >&2
+    exit 2
+fi
+
+matches="$(grep -nHE 'crate::calibration([^A-Za-z0-9_]|$)' "$source_file" 2>/dev/null || true)"
+if [ -n "$matches" ]; then
+    echo "transcripts imports calibration (crate::calibration):" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+exit 0

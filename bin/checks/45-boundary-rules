@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Boundary-rule runner. Discovers every rule file under bin/checks/boundary-rules/,
+# runs them all, and reports every failure rather than stopping at the first. It is the
+# same discovery contract as bin/ci itself: a rule that is unreadable, non-executable or
+# that exits non-zero fails the run, never skipped silently.
+#
+# One rule is one file. A later bead that contributes a boundary rule drops a new file
+# into bin/checks/boundary-rules/ and edits nothing here, which is what keeps a dozen
+# beads off a shared file under a shared-tree swarm. See bin/ci-selftest for the
+# dispatcher mechanics this mirrors, and bin/boundary-rules-selftest for the
+# prove-it-can-fail script over the real rules.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+rules_dir="${BOUNDARY_RULES_DIR:-$repo_root/bin/checks/boundary-rules}"
+
+if [ ! -d "$rules_dir" ]; then
+    echo "boundary-rules: no $rules_dir directory" >&2
+    exit 1
+fi
+
+fail=0
+count=0
+while IFS= read -r -d '' rule; do
+    count=$((count + 1))
+    name="$(basename "$rule")"
+
+    if [ ! -x "$rule" ]; then
+        echo "==> boundary-rule $name: FAIL (not executable)"
+        fail=1
+        continue
+    fi
+    if [ ! -r "$rule" ]; then
+        echo "==> boundary-rule $name: FAIL (unreadable)"
+        fail=1
+        continue
+    fi
+
+    output="$("$rule" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "==> boundary-rule $name: PASS"
+    else
+        echo "==> boundary-rule $name: FAIL (exit $rc)"
+        if [ -n "$output" ]; then
+            printf '%s\n' "$output" | sed 's/^/    /'
+        fi
+        fail=1
+    fi
+done < <(find "$rules_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z)
+
+if [ "$count" -eq 0 ]; then
+    echo "boundary-rules: no rule files found in $rules_dir" >&2
+    exit 1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> boundary-rules FAILED"
+    exit 1
+fi
+
+echo "boundary-rules: $count rules pass."

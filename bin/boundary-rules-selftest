@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# Proves the boundary-rule runner and its rules catch the regression each one exists to
+# catch. Every scenario mutates a scratch copy of bin/ and src/ (never the live tree)
+# and asserts the runner's exit code and named output reflect the mutation.
+#
+# A scenario that cannot fail is not a test, only ceremony: each forbidden edge is
+# planted once and the runner must fail naming the rule and the file, and each runner
+# mechanic (unreadable rule, non-executable rule, undeclared module, new-file discovery)
+# is broken once and the runner must fail naming it.
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+fail=0
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+assert_exit() {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$actual" -ne "$expected" ]; then
+        echo "FAIL: $label: expected exit $expected, got $actual" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
+assert_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if ! printf '%s' "$haystack" | grep -qF -- "$needle"; then
+        echo "FAIL: $label: expected output to contain '$needle'" >&2
+        echo "--- actual output ---" >&2
+        printf '%s\n' "$haystack" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
+# A fresh scratch copy of bin/ and src/ with the repo's layout, so the runner and rules
+# resolve their paths from their own location and never touch the live tree.
+make_scenario() {
+    local dir="$scratch/$1"
+    mkdir -p "$dir"
+    cp -a "$repo_root/bin" "$dir/bin"
+    cp -a "$repo_root/src" "$dir/src"
+    printf '%s\n' "$dir"
+}
+
+runner_for() {
+    printf '%s/bin/checks/45-boundary-rules' "$1"
+}
+
+# --- clean run passes, and the whole set completes in under 5 seconds ---
+dir="$(make_scenario clean)"
+start="$(date +%s%N)"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+end="$(date +%s%N)"
+assert_exit "clean run exits 0" 0 "$rc"
+elapsed_ms=$(( (end - start) / 1000000 ))
+if [ "$elapsed_ms" -ge 5000 ]; then
+    echo "FAIL: perf: clean run took ${elapsed_ms}ms, expected under 5000ms" >&2
+    fail=1
+fi
+
+# --- each of the seven forbidden edges, planted once, names its rule and file ---
+violation() {
+    local label="$1" rule_name="$2" source_file="$3" injection="$4"
+    local dir out rc
+    dir="$(make_scenario "$label")"
+    printf '%s\n' "$injection" >> "$dir/$source_file"
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "$label exits 1" 1 "$rc"
+    assert_contains "$label names rule" "$rule_name" "$out"
+    assert_contains "$label names file" "$source_file" "$out"
+}
+
+violation "rule01" "01-presentation-no-provider-adapters" "src/presentation.rs" "use crate::meter;"
+violation "rule02" "02-transcripts-no-calibration" "src/transcripts.rs" "use crate::calibration;"
+violation "rule03" "03-meter-no-sqlite" "src/meter.rs" "use rusqlite::Connection;"
+violation "rule04" "04-cost-model-no-config" "src/cost_model.rs" "use crate::config;"
+violation "rule05" "05-advice-no-calibration" "src/advice.rs" "use crate::calibration;"
+violation "rule06" "06-status-no-http-transport" "src/projection.rs" "use ureq::get;"
+violation "rule07" "07-provider-adapters-no-credential-paths" "src/meter.rs" "use crate::auth;"
+
+# --- two rules violated in one run are BOTH named, not only the first ---
+dir="$(make_scenario two-fail)"
+printf 'use crate::meter;\n' >> "$dir/src/presentation.rs"
+printf 'use crate::calibration;\n' >> "$dir/src/transcripts.rs"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "two-fail exits 1" 1 "$rc"
+assert_contains "two-fail names first" "01-presentation-no-provider-adapters" "$out"
+assert_contains "two-fail names second" "02-transcripts-no-calibration" "$out"
+
+# --- a present, non-executable rule file fails the run rather than being skipped ---
+dir="$(make_scenario non-exec)"
+chmod 644 "$dir/bin/checks/boundary-rules/01-presentation-no-provider-adapters"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "non-exec exits 1" 1 "$rc"
+assert_contains "non-exec names rule" "01-presentation-no-provider-adapters" "$out"
+assert_contains "non-exec reason" "not executable" "$out"
+
+# --- a present, executable-but-unreadable rule fails rather than being skipped ---
+dir="$(make_scenario unreadable)"
+chmod 100 "$dir/bin/checks/boundary-rules/01-presentation-no-provider-adapters"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "unreadable exits 1" 1 "$rc"
+assert_contains "unreadable names rule" "01-presentation-no-provider-adapters" "$out"
+assert_contains "unreadable reason" "unreadable" "$out"
+
+# --- a new module with no declared dependency policy fails rather than passing ---
+dir="$(make_scenario undeclared)"
+printf 'pub fn unowned() {}\n' > "$dir/src/foo.rs"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "undeclared exits 1" 1 "$rc"
+assert_contains "undeclared names file" "src/foo.rs" "$out"
+assert_contains "undeclared names reason" "no dependency policy" "$out"
+
+# --- a rule added as a new file is discovered and run, with no edit to the runner ---
+dir="$(make_scenario new-rule)"
+cat > "$dir/bin/checks/boundary-rules/08-contributed" <<'EOF'
+#!/usr/bin/env bash
+set -uo pipefail
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+matches="$(grep -nHE 'crate::backup([^A-Za-z0-9_]|$)' src/advice.rs 2>/dev/null || true)"
+if [ -n "$matches" ]; then
+    echo "advice imports backup (crate::backup):" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+exit 0
+EOF
+chmod +x "$dir/bin/checks/boundary-rules/08-contributed"
+printf 'use crate::backup;\n' >> "$dir/src/advice.rs"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "new-rule exits 1" 1 "$rc"
+assert_contains "new-rule is discovered" "08-contributed" "$out"
+assert_contains "new-rule names file" "src/advice.rs" "$out"
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> boundary-rules-selftest FAILED"
+    exit 1
+fi
+
+echo "boundary-rules-selftest: all scenarios pass."
