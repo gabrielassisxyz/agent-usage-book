@@ -8,6 +8,7 @@
 //! horizon reads as collector interruption, not as "no attempt occurred" and never as a
 //! network timeout it never actually observed.
 
+use super::failure::FailureClass;
 use super::time::{MonotonicDuration, UtcTimestamp};
 
 /// Identifies one collection attempt across its two-stage lifecycle, correlating a
@@ -25,25 +26,6 @@ impl AttemptId {
     pub const fn value(self) -> u64 {
         self.0
     }
-}
-
-/// A minimal classification of why a collection attempt could not reach or trust its
-/// source.
-///
-/// Scoped to exactly what `AttemptOutcome` and `StaleReason` need in this bead;
-/// `aub-rif.13` ("Define the shared failure and authentication classifications") owns
-/// the full shared taxonomy across the codebase and may generalize or absorb this. It
-/// depends on this bead rather than the other way around, so that taxonomy does not
-/// exist yet, and inventing an early copy of it here would be exactly the kind of
-/// stand-in that proves nothing about the real, later, shared shape.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum FailureClass {
-    /// The command's maximum execution horizon elapsed with no response.
-    Timeout,
-    /// A response arrived but could not be parsed as the expected shape.
-    MalformedResponse,
-    /// The network could not be reached at all (DNS, connection refused, TLS, ...).
-    NetworkError,
 }
 
 /// What was actually persisted about one collection attempt: success, a credential
@@ -176,9 +158,9 @@ mod tests {
         let outcomes = [
             AttemptOutcome::Success,
             AttemptOutcome::AuthRequired,
-            AttemptOutcome::Unreachable(FailureClass::Timeout),
-            AttemptOutcome::Unreachable(FailureClass::MalformedResponse),
-            AttemptOutcome::Unreachable(FailureClass::NetworkError),
+            AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+            AttemptOutcome::Unreachable(FailureClass::MalformedBody),
+            AttemptOutcome::Unreachable(FailureClass::DnsFailure),
         ];
         for outcome in outcomes {
             let rendered = format!("{outcome:?}").to_lowercase();

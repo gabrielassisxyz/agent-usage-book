@@ -7,6 +7,7 @@
 
 pub mod attempt;
 pub mod credits;
+pub mod failure;
 pub mod freshness;
 pub mod ids;
 pub mod interval;

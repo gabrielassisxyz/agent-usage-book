@@ -75,7 +75,7 @@ impl<T> Observed<T> {
 pub enum StaleReason {
     AgeExceeded,
     NoSuccessfulObservation,
-    SourceUnreachable(super::attempt::FailureClass),
+    SourceUnreachable(super::failure::FailureClass),
     MalformedProviderResponse,
     RateLimited,
     SamplingGap,
@@ -91,11 +91,11 @@ impl StaleReason {
     /// pins this array's length so a reason added without updating it here is caught.
     #[allow(dead_code)] // used only by #[cfg(test)] below; a plain `cargo check` build never sees it.
     fn all() -> [StaleReason; 9] {
-        use super::attempt::FailureClass;
+        use super::failure::FailureClass;
         [
             StaleReason::AgeExceeded,
             StaleReason::NoSuccessfulObservation,
-            StaleReason::SourceUnreachable(FailureClass::Timeout),
+            StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
             StaleReason::MalformedProviderResponse,
             StaleReason::RateLimited,
             StaleReason::SamplingGap,
@@ -160,7 +160,7 @@ impl<T> Freshness<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::attempt::FailureClass;
+    use crate::domain::failure::FailureClass;
     use crate::domain::time::UtcTimestamp;
 
     fn observed(value: u64) -> Observed<u64> {
@@ -195,13 +195,13 @@ mod tests {
         let stale_after = Freshness::Stale {
             last_good: Some(last_good.clone()),
             latest_attempt: AttemptId::new(2),
-            reason: StaleReason::SourceUnreachable(FailureClass::NetworkError),
+            reason: StaleReason::SourceUnreachable(FailureClass::DnsFailure),
         };
 
         match stale_after {
             Freshness::Stale {
                 last_good: Some(good),
-                reason: StaleReason::SourceUnreachable(FailureClass::NetworkError),
+                reason: StaleReason::SourceUnreachable(FailureClass::DnsFailure),
                 ..
             } => {
                 assert_eq!(good, last_good);
@@ -221,7 +221,7 @@ mod tests {
         let stale = Freshness::<u64>::Stale {
             last_good: None,
             latest_attempt: AttemptId::new(1),
-            reason: StaleReason::SourceUnreachable(FailureClass::Timeout),
+            reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
         };
 
         match stale {
