@@ -11,6 +11,10 @@ keywords = ["llm", "quota", "tokens", "observability", "cli"]
 categories = ["command-line-utilities"]
 
 # The crate is named for what it is; the command is named for what gets typed.
+[lib]
+name = "agent_usage_book"
+path = "src/lib.rs"
+
 [[bin]]
 name = "aub"
 path = "src/main.rs"
