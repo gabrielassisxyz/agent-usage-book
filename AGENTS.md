@@ -91,10 +91,10 @@ bin/slop-guard
 ```
 
 `bin/ci` is the full gate: toolchain identity, format (`cargo fmt`), lint (`cargo clippy`),
-test, dependency audit, boundary rules, prose guard (`bin/slop-guard`), e2e, and
-quantity inventory. It is the exact thing CI runs, so green locally means green in CI,
-which is true only because the first check refuses to let the rest run under a different
-compiler.
+test, dependency audit, boundary rules, prose guard (`bin/slop-guard`), e2e,
+quantity inventory, commit protocol, pane work cycle, and gate coverage. It is the
+exact thing CI runs, so green locally means green in CI, which is true only because
+the first check refuses to let the rest run under a different compiler.
 
 **The pane runs a named subset, and the subset is chosen by measurement rather than by
 category.** Those three commands are what a pane runs before moving a bead to
