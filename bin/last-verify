@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+# bin/last-verify: Read or record the central verification verdict for this checkout (aub-ijph).
+#
+# A pane queries this command before committing to learn whether the last central
+# verification was green, and how many commits have landed since.
+#
+# Distinguishes three states in a single line of output:
+#   1. none: no central verification verdict recorded
+#   2. green at HEAD (<sha>)
+#   3. stale: green at <sha> (distance <N>)
+#
+# Usage:
+#   bin/last-verify             # query verdict
+#   bin/last-verify --record    # record current HEAD as green verdict
+#   bin/last-verify --record <commit> # record specified commit as green verdict
+set -euo pipefail
+
+repo_root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+verdict_file="${AUB_LAST_VERDICT_FILE:-${repo_root}/.beads/last-verify}"
+
+if [ "${1:-}" = "--record" ] || [ "${1:-}" = "record" ]; then
+    target_ref="${2:-HEAD}"
+    target_sha="$(git rev-parse --verify "${target_ref}^{commit}" 2>/dev/null)" || {
+        echo "last-verify: invalid commit reference '$target_ref'" >&2
+        exit 1
+    }
+    mkdir -p "$(dirname "$verdict_file")"
+    printf '%s\n' "$target_sha" > "$verdict_file"
+    target_short="$(git rev-parse --short "$target_sha")"
+    echo "recorded central verification verdict for $target_short"
+    exit 0
+fi
+
+if [ ! -f "$verdict_file" ] || [ ! -s "$verdict_file" ]; then
+    echo "none: no central verification verdict recorded"
+    exit 0
+fi
+
+recorded_sha="$(tr -d '[:space:]' < "$verdict_file")"
+if [ -z "$recorded_sha" ]; then
+    echo "none: no central verification verdict recorded"
+    exit 0
+fi
+
+if ! recorded_full="$(git rev-parse --verify "${recorded_sha}^{commit}" 2>/dev/null)"; then
+    echo "none: recorded commit '$recorded_sha' not found in history"
+    exit 0
+fi
+
+head_full="$(git rev-parse HEAD)"
+recorded_short="$(git rev-parse --short "$recorded_full")"
+
+if [ "$recorded_full" = "$head_full" ]; then
+    echo "green at HEAD ($recorded_short)"
+    exit 0
+fi
+
+# Verdict is older (or diverged) from HEAD. Calculate distance (commits since verdict).
+if git merge-base --is-ancestor "$recorded_full" HEAD 2>/dev/null; then
+    distance="$(git rev-list --count "${recorded_full}..HEAD")"
+else
+    distance="$(git rev-list --count "${recorded_full}..HEAD" 2>/dev/null || echo "unknown")"
+fi
+
+echo "stale: green at $recorded_short (distance $distance)"
+exit 0

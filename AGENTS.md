@@ -138,6 +138,14 @@ that a naive wrong implementation would fail. A planted negative is near-identic
 positive and differs only in the forbidden dimension. A test that asserts the code does
 whatever the code does is not a test.
 
+A compile-fail capture is a property of the crate's whole trait graph, not of its
+fixture: a bead that adds an impl anywhere can add a `help:` block to another bead's
+capture, with no dependency between the two. Regenerate captures with
+`cargo run --bin compile_fail_regenerate`, never with a bare `TRYBUILD=overwrite`. The
+guard refuses when the error code changed, naming both codes, because a changed code
+means the fixture fails for a different reason and blessing it destroys the test; it
+proceeds when the code is unchanged. `--override` is the explicit override.
+
 ## agent-usage-book - This Project
 
 ### What it does
@@ -287,15 +295,18 @@ panes at once is the bottleneck the whole model exists to remove.
 5. Commit, naming the bead id and the touched scope. The form to use, and the test to run
    before committing a shared file, are in *Committing into a shared index*.
 
-   **You have no way to know whether `main` is already red from lint, and nothing here
-   pretends otherwise.** The three commands above tell you about your own tree, not about
-   what landed before you: a clippy failure another pane committed is invisible to every
-   command you are allowed to run, and it stays invisible until the next batch verify. Do not
-   read a green subset as a clean `main`. `br list --status rework` does not answer this
-   either, because a bead only reaches `rework` after a verify has already run, which is the
-   delay itself rather than a warning about it. Commit anyway: stacking onto a tree that is
-   red from lint costs the orchestrator one central repair, and stopping the wave to guess
-   costs more.
+   **Check central verification before committing:** `bin/last-verify`. It reports in a
+   single line whether the last central verification was green and at which commit (`green
+   at HEAD`, `stale: green at <sha> (distance N)`, or `none: no central verification
+   verdict recorded`). It is machine-local (`.beads/last-verify`) and does not reach CI or
+   another clone. The three check commands above tell you about your own tree, while
+   `bin/last-verify` tells you whether `main` was clean when central verification last ran
+   and how many commits have landed since. Do not read a green subset as a clean `main` if
+   `bin/last-verify` reports a stale verdict or no verdict. `br list --status rework` does
+   not answer this either, because a bead only reaches `rework` after a verify has already
+   run, which is the delay itself rather than a warning about it. Commit anyway: stacking
+   onto a tree that is red from lint costs the orchestrator one central repair, and stopping
+   the wave to guess costs more.
 6. Move the bead to `batch_pending` **only when substantively complete**: code and tests
    written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
    concrete test, no known defect. `batch_pending` earns no capability credit; it frees
@@ -336,8 +347,24 @@ score. The moment agents are scored on commits you get commit pumping.
    ever returns a bead for lint. Formatting and prose are not exempt and are not repaired
    centrally: they are in the pane subset, so a failure in either means the work-cycle was
    not followed, and that bead goes back to `rework` like any other.
+
+   A compile-fail failure on a bead whose diff does not touch the fixture is a trait-graph
+   consequence, not that bead's rework: another bead's impl changed the compiler's output
+   under the same error code. Regenerate the capture with `cargo run --bin
+   compile_fail_regenerate`, which refuses if the code changed, and do not return the bead
+   to rework.
 5. Re-run until green. Every attempt is retained in the wave record; rerun-until-green is
    not proof that a failure was flaky.
+
+   **Record the central verification verdict when green:**
+
+   ```bash
+   bin/last-verify --record
+   ```
+
+   The verdict is recorded at step 5 after a green verification run and written to
+   `.beads/last-verify`. It is machine-local and does not reach CI or another clone, giving
+   panes a zero-compilation way to query central verification freshness.
 6. Close only green `batch_pending` beads, citing the verification run:
 
    ```bash
@@ -704,6 +731,7 @@ Named here because the rules above are useless to a reader who cannot find them.
 |---|---|---|
 | A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the isolation `bin/ci` sets up, so a binary out of `target/` can be another pane's build | tripwire | pass `CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci` |
 | The reservation guard exits 0 and checks nothing when neither `GIT_IDENTITY_ENABLED` nor `WORKTREES_ENABLED` is set in the committing shell. An unset variable looks exactly like a clean commit | tripwire | export it per pane, and canary the guard by staging a path somebody else holds |
+| A compile-fail capture breaks on a fixture nobody edited, because another bead's impl added a `help:` block to the error | tripwire | regenerate with `cargo run --bin compile_fail_regenerate`; a changed error code means the fixture fails for a different reason and the guard refuses |
 | `guard install` returns an empty hook path and installs nothing when the same gate is unset, printing an informational line rather than an error | tripwire | set `GIT_IDENTITY_ENABLED=1` on the install command itself, then confirm `.githooks/hooks.d/pre-commit/` is non-empty |
 | The mail server's database path is resolved relative to the current directory, so running its CLI from a repository creates an empty `storage.sqlite3` there. An agent that queries it sees zero reservations and concludes every path is free, which is the worst failure an advisory system has | tripwire | run that CLI only from its own install directory; before trusting an empty conflict list, confirm which store was read |
 | The guard plugin under `.githooks/hooks.d/` carries absolute paths for one machine | prose | it is git-ignored and regenerated per machine; never commit it |
