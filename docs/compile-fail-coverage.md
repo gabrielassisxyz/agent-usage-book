@@ -16,9 +16,11 @@ checked, so a case cannot be dropped from this document while remaining in the d
 | 7 | print quantity with bare Display | covered | domain_quantities_no_display.rs, money_display.rs |
 | 8 | construct WindowCalibration outside store/calibration module | deferred | aub-c0b.1 (create the calibration tables), with aub-c0b.14 (expose calibrated spend-to-window conversion) as the consumer that would trip it |
 | 9 | construct CostModel without an observed TokenKind term | deferred | aub-ai3.1 (create immutable cost model tables), with aub-ai3.2 (fail-closed usage-to-credits conversion) as the consumer |
-| 10 | combine Measured and Estimated evidence into Measured | covered | measured_estimated_into_measured.rs |
+| 10 | combine Measured and Estimated evidence into Measured | covered by unit tests | quality_combine_measured_and_estimated_is_mixed, quality_combine_never_recovers_measured_from_estimated (src/evidence.rs) |
 | 11 | read a Derivation::Unavailable as though it held a value | covered | derivation_unavailable_value.rs |
 | 12 | adding a new known TokenKind breaks exhaustive model construction sites | deferred | aub-ai3.2, and aub-wyu.2 (valuation and its exact-money suite) for the valuation side |
+
+Case 10 is not a compile-fail case: `combine` returns `EvidenceQuality<T>` at runtime, so the compiler cannot separate `Mixed` from `Measured`, and a `let` binding against either variant fails with the same E0005 refutable-pattern error, which is a fact about Rust's `let` and not about the lattice. The property is covered by the two unit tests named above, which fail when `combine` returns `Measured`.
 
 The three deferred cases are attributed to the bead that introduces the type, with the
 consumer that would trip the case named alongside, so the owning bead knows what it is
