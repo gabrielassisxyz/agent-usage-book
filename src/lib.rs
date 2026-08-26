@@ -25,6 +25,7 @@ pub mod evidence;
 pub mod logging;
 pub mod meter;
 pub mod presentation;
+pub mod problem_code;
 pub mod projection;
 pub mod report;
 pub mod sessions;
