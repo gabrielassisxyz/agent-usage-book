@@ -85,23 +85,48 @@ exist, or created one, which Rule 2 forbids in the line above.
 ## Compiler Checks (CRITICAL)
 
 ```bash
-cargo check -p agent-usage-book        # the per-bead maximum during a code-first wave
-cargo clippy --all-targets -- -D warnings
+cargo check -p agent-usage-book        # the pane check subset, all three of it
 cargo fmt --check
+bin/slop-guard
 ```
 
-`bin/ci` is the full gate: toolchain identity, format, lint, test, dependency audit, prose
-guard. It is the exact thing CI runs, so green locally means green in CI, which is true
-only because the first check refuses to let the rest run under a different compiler.
+`bin/ci` is the full gate: toolchain identity, format (`cargo fmt`), lint (`cargo clippy`),
+test, dependency audit, boundary rules, prose guard (`bin/slop-guard`), e2e, and
+quantity inventory. It is the exact thing CI runs, so green locally means green in CI,
+which is true only because the first check refuses to let the rest run under a different
+compiler.
+
+**The pane runs a named subset, and the subset is chosen by measurement rather than by
+category.** Those three commands are what a pane runs before moving a bead to
+`batch_pending`. Measured on this machine, warm:
+
+| command | cost | compiles? |
+| --- | --- | --- |
+| `cargo check -p agent-usage-book` | 2356 ms | yes |
+| `cargo fmt --check` | 100 ms | no |
+| `bin/slop-guard` | 831 ms | no |
+| `cargo clippy --all-targets -- -D warnings` | 4780 ms | yes |
+| the whole of `bin/ci` | 19 s | yes, repeatedly |
+
+**Formatting and prose are in the subset because they are nearly free.** They add 931 ms to
+a park that already costs 2356 ms, and neither compiles anything, so neither contends for
+the build backend that the wave model exists to protect. An earlier revision of this section
+put both with the orchestrator on a cost argument, citing the 19 seconds of the full gate.
+That number is real and it is the wrong number: the 19 seconds are test, e2e, audit and the
+conformance checks, none of which anyone proposed giving to a pane.
+
+**Clippy is not in the subset, and that is a deliberate hole with an owner.** It compiles,
+which is the one property the wave model cannot afford per pane, and it is the most expensive
+single check a pane could run. Lint failures therefore belong to the orchestrator, who
+repairs them centrally in Phase 2.
 
 **A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the
 isolation `bin/ci` sets up.** A binary out of `target/` can be another pane's build. Pass
 `CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci`.
 
-**During a code-first wave the syntax gate is the maximum, and it is enforced.** See
-*Swarm operations*: the orchestrator kills per-agent test and full-build processes every
-tick, because N agents building the same crate is the bottleneck the wave model exists to
-remove.
+**Beyond that subset, no pane builds, and it is enforced.** See *Swarm operations*: the
+orchestrator kills per-agent test and full-build processes every tick, because N agents
+building the same crate is the bottleneck the wave model exists to remove.
 
 ## Testing
 
@@ -242,11 +267,35 @@ panes at once is the bottleneck the whole model exists to remove.
 2. Reserve the exact edit surface before opening a file.
 3. Write the **real code and its real tests** in that same bead. No placeholders.
    `todo!()` and `unimplemented!()` are banned in committed code.
-4. Run at most the syntax gate: `cargo check -p agent-usage-book`. No `cargo test`, no
-   full build, no waiting on proof.
-5. Commit immediately, naming the bead id and the touched scope. The form to use, and
-   the test to run before committing a shared file, are in *Committing into a shared
-   index*.
+4. Run the pane check subset, which is these three and nothing else:
+
+   ```bash
+   cargo check -p agent-usage-book
+   cargo fmt --check
+   bin/slop-guard
+   ```
+
+   No `cargo test`, no full build, no waiting on proof. Costs and the reason the subset is
+   these three are in *Compiler Checks*.
+
+   **One class of gate failure is invisible to you, and it is lint.** `cargo clippy` is not
+   in your subset because it compiles, and running it per pane is the bottleneck this whole
+   model exists to remove. So following this work-cycle to the letter will not surface a
+   clippy failure before `batch_pending`, and you are not held responsible for one. The
+   orchestrator catches and repairs lint in Phase 2, and no rework note ever returns a bead
+   for it.
+5. Commit, naming the bead id and the touched scope. The form to use, and the test to run
+   before committing a shared file, are in *Committing into a shared index*.
+
+   **You have no way to know whether `main` is already red from lint, and nothing here
+   pretends otherwise.** The three commands above tell you about your own tree, not about
+   what landed before you: a clippy failure another pane committed is invisible to every
+   command you are allowed to run, and it stays invisible until the next batch verify. Do not
+   read a green subset as a clean `main`. `br list --status rework` does not answer this
+   either, because a bead only reaches `rework` after a verify has already run, which is the
+   delay itself rather than a warning about it. Commit anyway: stacking onto a tree that is
+   red from lint costs the orchestrator one central repair, and stopping the wave to guess
+   costs more.
 6. Move the bead to `batch_pending` **only when substantively complete**: code and tests
    written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
    concrete test, no known defect. `batch_pending` earns no capability credit; it frees
@@ -281,7 +330,12 @@ score. The moment agents are scored on commits you get commit pumping.
    pass and fail count.
 4. Cluster remaining failures by file and return each failing bead to `rework` for the
    same assignee, with the exact assertion and location. The verifier triages; it does not
-   silently finish the work.
+   silently finish the work. **Lint failures are exempt:** `cargo clippy` is the one gate
+   class outside the pane check subset, because it compiles, so the orchestrator repairs a
+   lint defect directly during batch verify rather than returning the bead. No rework note
+   ever returns a bead for lint. Formatting and prose are not exempt and are not repaired
+   centrally: they are in the pane subset, so a failure in either means the work-cycle was
+   not followed, and that bead goes back to `rework` like any other.
 5. Re-run until green. Every attempt is retained in the wave record; rerun-until-green is
    not proof that a failure was flaky.
 6. Record the gate and close only green `batch_pending` beads, citing the run:
@@ -488,8 +542,10 @@ are not set up. Verify, do not assume.
 5. Claim it before opening a single file: `br update <id> --claim --actor <name>`.
 6. Reserve the exact edit surface.
 7. Implement, with the tests the bead asks for. One bead at a time.
-8. `cargo check`, then commit and push, with the path-scoped form in *Committing into a
-   shared index*. Work that is not pushed does not exist to the other panes.
+8. Run the pane check subset from *Compiler Checks*: `cargo check -p agent-usage-book`,
+   `cargo fmt --check`, `bin/slop-guard`. Then commit and push, with the path-scoped form in
+   *Committing into a shared index*. Work that is not pushed does not exist to the other
+   panes.
 9. Release the reservation, record the outcome on the bead, and move it to
    `batch_pending`. Do not close it.
 

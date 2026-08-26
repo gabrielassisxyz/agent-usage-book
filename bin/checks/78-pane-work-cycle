@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# The pane work-cycle and gate-ownership guard (aub-x5bo): AGENTS.md must name the checks a
+# pane runs before moving a bead to batch_pending, name the owner of the one gate class left
+# outside that subset, and say plainly that a pane cannot detect a main already red from it.
+# A pane must never be held answerable for a class it is forbidden to run.
+#
+# Two halves, following the pattern of bin/checks/75-commit-protocol:
+#   conformance  asserts the document names the subset, names lint's owner, states that a
+#                pane is not answerable for lint and cannot see a red main, and records the
+#                measurement the subset was chosen from rather than a category argument.
+#   integration  runs the written subset as a unit against a scratch checkout and checks it
+#                behaves as the document claims: blind to a lint-only defect, which clippy,
+#                the named owner, does catch; stopped by a formatting violation and by a
+#                prose violation; and still stopped by a real syntax error.
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+repo_root="$(pwd)"
+
+doc="AGENTS.md"
+fail=0
+
+# Extract sections
+phase1="$(awk '
+    /^### Phase 1: code-first wave/ { grab = 1; next }
+    grab && /^### / { exit }
+    grab { print }
+' "$doc")"
+
+if [ -z "$phase1" ]; then
+    echo "$doc: no '### Phase 1: code-first wave' section" >&2
+    exit 1
+fi
+
+phase2="$(awk '
+    /^### Phase 2: batch verify and close/ { grab = 1; next }
+    grab && /^### / { exit }
+    grab { print }
+' "$doc")"
+
+if [ -z "$phase2" ]; then
+    echo "$doc: no '### Phase 2: batch verify and close' section" >&2
+    exit 1
+fi
+
+compiler_checks="$(awk '
+    /^## Compiler Checks \(CRITICAL\)/ { grab = 1; next }
+    grab && /^## / { exit }
+    grab { print }
+' "$doc")"
+
+if [ -z "$compiler_checks" ]; then
+    echo "$doc: no '## Compiler Checks (CRITICAL)' section" >&2
+    exit 1
+fi
+
+require() {  # $1 = criterion, $2 = haystack, $3.. = substrings required
+    local criterion="$1" haystack="$2"
+    shift 2
+    local h_norm n_norm needle
+    h_norm="$(printf '%s' "$haystack" | tr '\n\t' ' ' | tr -s ' ')"
+    for needle in "$@"; do
+        n_norm="$(printf '%s' "$needle" | tr '\n\t' ' ' | tr -s ' ')"
+        if ! printf '%s' "$h_norm" | command grep -qF -- "$n_norm"; then
+            echo "$doc: $criterion: missing '$needle'" >&2
+            fail=1
+        fi
+    done
+}
+
+# --- Conformance checks ---
+
+# Criterion 1: the work-cycle names the check set a pane runs, in full.
+require "the pane check subset" "$phase1" \
+    'cargo check -p agent-usage-book' \
+    'cargo fmt --check' \
+    'bin/slop-guard' \
+    'which is these three and nothing else'
+
+# Criterion 2: the one class outside the subset is named, with its owner, and with the
+# statement that the pane is not answerable for it. Naming the owner is what the bead accepts
+# in place of coverage, so it is the sentence that must not be lost.
+require "lint is outside the subset and has an owner" "$phase1" \
+    'One class of gate failure is invisible to you, and it is lint' \
+    'you are not held responsible for one' \
+    'The orchestrator catches and repairs lint in Phase 2'
+
+require "the orchestrator repairs lint without a rework note" "$phase2" \
+    'Lint failures are exempt' \
+    'No rework note ever returns a bead for lint' \
+    'Formatting and prose are not exempt'
+
+# Criterion 4: the pane is told plainly that it cannot detect a red main, rather than being
+# handed a probe that answers a different question. Both false signals an earlier revision
+# offered are named here so neither can quietly return.
+require "the pane is told it cannot see a red main" "$phase1" \
+    'You have no way to know whether `main` is already red from lint' \
+    'Do not read a green subset as a clean `main`' \
+    'br list --status rework` does not answer this either'
+
+# Criteria 3 and 5: the choice is recorded with the measurement that decided it, not with a
+# category argument. The costs are what let the next reader re-derive the subset instead of
+# reopening the question.
+require "the subset is justified by measurement" "$compiler_checks" \
+    'chosen by measurement rather than by category' \
+    'Formatting and prose are in the subset because they are nearly free' \
+    'Clippy is not in the subset, and that is a deliberate hole with an owner' \
+    '2356 ms' \
+    '100 ms' \
+    '831 ms' \
+    '4780 ms'
+
+# --- Integration: run the written work-cycle and check it does what the document claims ---
+#
+# The bead's closing condition is that planting a clippy violation and a formatting violation
+# in a pane's own files, then following the work-cycle to the letter, either surfaces both or
+# the document says which one it will not surface and who catches it. That is what the three
+# phases below replay: the subset is run as a unit, in the order the document gives it, rather
+# than each tool being asked about on its own.
+#
+# One clone and one target directory across all three phases, deliberately. Every extra target
+# directory is another cold build of the crate, and this check runs inside bin/ci.
+
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-work-cycle-XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+
+git clone --quiet --local --no-hardlinks "$repo_root" "$scratch"
+export CARGO_TARGET_DIR="$scratch/target"
+
+# The pane check subset as one unit, exactly as the document writes it. Non-zero when any of
+# the three would stop a pane.
+run_subset() {
+    (cd "$scratch" && cargo check -p agent-usage-book) >/dev/null 2>&1 || return 1
+    (cd "$scratch" && cargo fmt --check) >/dev/null 2>&1 || return 1
+    (cd "$scratch" && bin/slop-guard) >/dev/null 2>&1 || return 1
+    return 0
+}
+
+# --- Phase A: a lint-only defect, which is the declared hole and the reason the document has
+# to name an owner instead of claiming coverage. This is the aub-vcx.3 shape verbatim: a
+# collapsible if let in a test file, which reached main and left the gate red for two commits.
+cat >> "$scratch/tests/module_skeleton.rs" << 'EOF2'
+
+#[test]
+fn aub_vcx_3_collapsible_if_let_regression() {
+    if let Some(x) = Some(1) {
+        if let Some(y) = Some(x) {
+            assert_eq!(y, 1);
+        }
+    }
+}
+EOF2
+
+if ! run_subset; then
+    echo "integration: the pane subset failed on a lint-only defect, but the document tells a pane it will not see one" >&2
+    fail=1
+fi
+
+# The owner the document names must actually have something to catch. A hole nobody covers is
+# a different document from the one this check is guarding.
+if (cd "$scratch" && cargo clippy --all-targets -- -D warnings) >/dev/null 2>&1; then
+    echo "integration: clippy did not catch the planted collapsible if let, so the class the document hands to the orchestrator is not real" >&2
+    fail=1
+fi
+
+# --- Phase B: formatting and prose, which the document puts INSIDE the subset. A pane
+# following the work-cycle has to be stopped by each one before batch_pending.
+printf '\n\n\n' >> "$scratch/src/build_info.rs"
+if (cd "$scratch" && cargo fmt --check) >/dev/null 2>&1; then
+    echo "integration: cargo fmt --check did not catch the planted formatting violation" >&2
+    fail=1
+fi
+if run_subset; then
+    echo "integration: the pane subset passed with a formatting violation planted, so a pane would park that bead" >&2
+    fail=1
+fi
+
+printf '\n// Em-dash: \xe2\x80\x94\n' >> "$scratch/AGENTS.md"
+if (cd "$scratch" && bin/slop-guard) >/dev/null 2>&1; then
+    echo "integration: bin/slop-guard did not catch the planted prose em-dash" >&2
+    fail=1
+fi
+
+# --- Phase C: discrimination. If the subset refused everything regardless, every assertion
+# above would pass for the wrong reason, so a real syntax error must still be the thing
+# cargo check is there for.
+printf 'fn syntax_error_probe(\n' >> "$scratch/src/lib.rs"
+if (cd "$scratch" && cargo check -p agent-usage-book) >/dev/null 2>&1; then
+    echo "integration: cargo check did not catch a real syntax error" >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> pane-work-cycle FAILED" >&2
+    exit 1
+fi
+
+echo "pane-work-cycle: the subset is named and measured, lint is owned by the orchestrator, and the written work-cycle behaves as the document claims."
