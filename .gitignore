@@ -37,3 +37,9 @@
 # (`.githooks/pre-commit`) is generic and IS committed, as is the secret-scan hook it
 # preserves at `.githooks/pre-commit.orig`.
 /.githooks/hooks.d
+
+# ntm's per-project runtime state, written by the swarm tooling when it drives this repository:
+# `logs/` and `pids/` for the panes it spawns, and `rate_limits.json` for what it has observed of
+# the upstream accounts. All three are facts about one machine at one moment, so committing them
+# would put another machine's pane ids and one afternoon's rate-limit counters in every checkout.
+/.ntm
