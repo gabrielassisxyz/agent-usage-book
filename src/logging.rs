@@ -80,15 +80,25 @@ impl RunId {
 pub enum DiagnosticEvent {
     RunStarted,
     ReportRendered,
+    /// A network request was about to be made. Emitted only after a state-directory
+    /// readiness check has already passed (`crate::store::startup`), so its absence
+    /// from a run's log is itself the proof that a refused run never reached the
+    /// network.
+    RequestAttempted,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 2] = [Self::RunStarted, Self::ReportRendered];
+    pub const ALL: [Self; 3] = [
+        Self::RunStarted,
+        Self::ReportRendered,
+        Self::RequestAttempted,
+    ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::RunStarted => "run_started",
             Self::ReportRendered => "report_rendered",
+            Self::RequestAttempted => "request_attempted",
         }
     }
 
@@ -100,6 +110,7 @@ impl DiagnosticEvent {
         match self {
             Self::RunStarted => "command",
             Self::ReportRendered => "report_kind",
+            Self::RequestAttempted => "command",
         }
     }
 }

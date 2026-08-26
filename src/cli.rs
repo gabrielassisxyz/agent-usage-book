@@ -12,6 +12,121 @@ use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
 use crate::report::ReportEnvelope;
 
+/// Every command the CLI exposes.
+///
+/// The exhaustive match in [`Command::flag_policy`] is what makes the shared flag
+/// policy a compile-time obligation: adding a command means adding a variant, and
+/// the match refuses to compile until that variant declares its policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Command {
+    Status,
+    Config,
+    LoggingFixture,
+    StateCheck,
+    ExitClass,
+}
+
+/// Whether a command accepts a shared flag, and the reason it does not when it
+/// rejects it. The reason is what help prints, so a rejection is never silent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlagSupport {
+    Accepted,
+    Rejected { reason: &'static str },
+}
+
+/// A command's shared-flag policy: which global flags it accepts and which it
+/// explicitly rejects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlagPolicy {
+    pub format: FlagSupport,
+    pub explain: FlagSupport,
+    pub account: FlagSupport,
+    pub no_color: FlagSupport,
+    pub verbosity: FlagSupport,
+}
+
+impl Command {
+    /// The shared-flag policy for this command: which global flags it accepts
+    /// and which it explicitly rejects.
+    ///
+    /// The match is exhaustive with no wildcard arm, so adding a variant to
+    /// [`Command`] breaks compilation here until that variant declares its
+    /// policy.
+    pub fn flag_policy(self) -> FlagPolicy {
+        match self {
+            Command::Status => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "status reports no derived quantity",
+                },
+                account: FlagSupport::Accepted,
+                no_color: FlagSupport::Rejected {
+                    reason: "status prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Config => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "config prints provenance, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "config derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "config prints every account at once",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "config prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::LoggingFixture => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "logging-fixture derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "logging-fixture takes no account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "logging-fixture prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::StateCheck => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "state-check prints a readiness line, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "state-check derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "state-check takes no account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "state-check prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::ExitClass => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "exit-class returns an exit code, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "exit-class derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "exit-class takes no account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "exit-class prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+        }
+    }
+}
+
 /// Parse the early command surface and route it to bounded workflows.
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     let mut args = args.into_iter();
@@ -39,6 +154,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Some("status") => status(&RealClock::new(), level),
         Some("config") => config_command(args),
         Some("__logging-fixture") => logging_fixture(&RealClock::new(), level),
+        Some("__state-check") => state_check(&RealClock::new(), level),
         Some("__exit-class") => {
             let class = args
                 .next()
@@ -166,6 +282,55 @@ fn logging_fixture(clock: &impl Clock, level: Level) -> Result<(), Error> {
         })
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     println!("{}", envelope.as_json());
+    Ok(())
+}
+
+/// Test-only surface: resolves configuration for real, then proves the
+/// state-directory readiness check (`crate::store::startup`) runs, and runs before
+/// any network-touching code, ahead of the mutating commands that will own this call
+/// for real (`aub-eun.6`'s `aub sample` and its kin). Not part of the shipping
+/// command surface: `tests/e2e/command-surface.txt` deliberately excludes every
+/// `__`-prefixed hook, matching `__exit-class`/`__logging-fixture`.
+fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("__state-check");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run);
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    // The closure below stands in for a real command's first network-touching call.
+    // `run_after_state_check` never invokes it unless the check above already
+    // succeeded, which is what makes the ordering provable rather than assumed.
+    let emit_request_attempted = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            logger.emit(
+                clock.now(),
+                DiagnosticEvent::RequestAttempted,
+                &[("command", &command)],
+            )
+        },
+    )?;
+    emit_request_attempted
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    println!("state directory ready");
     Ok(())
 }
 

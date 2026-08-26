@@ -11,3 +11,4 @@ render as `[REDACTED]`. Quantities are JSON objects with `value` and `unit`.
 |---|---|---|
 | run_started | info | command |
 | report_rendered | info | report_kind |
+| request_attempted | info | command |

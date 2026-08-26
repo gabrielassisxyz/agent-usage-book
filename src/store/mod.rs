@@ -6,3 +6,5 @@
 //! - provider adapters
 //!
 //! This is the only module that knows SQLite.
+
+pub mod startup;
