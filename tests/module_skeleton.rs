@@ -51,24 +51,37 @@ const FORBIDDEN_CRATES: &[&str] = &[
     "termcolor",
 ];
 
-/// True when the `[dependencies]` table of `manifest` declares the crate named `name`.
+/// True when the `[dependencies]` or `[target.<target>.dependencies]` table of `manifest`
+/// declares the crate named `name`, or when `manifest` cannot be parsed as valid TOML (failing
+/// closed so an unreadable manifest is never silently treated as clean).
+///
+/// `[dev-dependencies]` and `[build-dependencies]` are deliberately out of scope:
+/// - dev-dependencies are test-only harnesses and are not compiled into the shipping library.
+/// - build-dependencies are host build-script tools and do not enter the runtime crate.
 fn declares_dependency(manifest: &str, name: &str) -> bool {
-    let mut in_dependencies = false;
-    for line in manifest.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') {
-            in_dependencies = trimmed == "[dependencies]";
-            continue;
-        }
-        if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if let Some((dep, _)) = trimmed.split_once('=')
-            && dep.trim() == name
-        {
-            return true;
+    let Ok(table) = toml::from_str::<toml::Table>(manifest) else {
+        return true;
+    };
+
+    if let Some(deps) = table.get("dependencies").and_then(toml::Value::as_table)
+        && deps.contains_key(name)
+    {
+        return true;
+    }
+
+    if let Some(targets) = table.get("target").and_then(toml::Value::as_table) {
+        for target in targets.values() {
+            if let Some(deps) = target
+                .as_table()
+                .and_then(|t| t.get("dependencies"))
+                .and_then(toml::Value::as_table)
+                && deps.contains_key(name)
+            {
+                return true;
+            }
         }
     }
+
     false
 }
 
@@ -251,16 +264,73 @@ fn audit_rejects_a_planted_forbidden_dependency() {
 
 #[test]
 fn dependency_check_rejects_a_planted_forbidden_dependency() {
+    // Empty dependencies table.
     assert!(!declares_dependency("[dependencies]\n", "rusqlite"));
+
+    // Inline dependency under [dependencies].
     assert!(declares_dependency(
         "[dependencies]\nrusqlite = \"0.31\"\n",
         "rusqlite"
     ));
-    // A forbidden crate in dev-dependencies is out of scope for the library's tree.
-    assert!(!declares_dependency(
-        "[dependencies]\n\n[dev-dependencies]\nrusqlite = \"0.31\"\n",
+
+    // Sub-table dependency declaration under [dependencies.<name>].
+    assert!(declares_dependency(
+        "[dependencies.rusqlite]\nversion = \"0.31\"\n",
         "rusqlite"
     ));
+
+    // A forbidden crate in dev-dependencies is out of scope for the library's tree.
+    assert!(!declares_dependency(
+        "[dev-dependencies]\nrusqlite = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(!declares_dependency(
+        "[dev-dependencies.rusqlite]\nversion = \"0.31\"\n",
+        "rusqlite"
+    ));
+
+    // A forbidden crate in build-dependencies is out of scope (host build tooling only).
+    assert!(!declares_dependency(
+        "[build-dependencies]\nrusqlite = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(!declares_dependency(
+        "[build-dependencies.rusqlite]\nversion = \"0.31\"\n",
+        "rusqlite"
+    ));
+
+    // Target-specific dependencies are in scope for library code.
+    assert!(declares_dependency(
+        "[target.'cfg(unix)'.dependencies]\nrusqlite = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(declares_dependency(
+        "[target.'cfg(unix)'.dependencies.rusqlite]\nversion = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(!declares_dependency(
+        "[target.'cfg(unix)'.dev-dependencies]\nrusqlite = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(!declares_dependency(
+        "[target.'cfg(unix)'.dev-dependencies.rusqlite]\nversion = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(!declares_dependency(
+        "[target.'cfg(unix)'.build-dependencies]\nrusqlite = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(!declares_dependency(
+        "[target.'cfg(unix)'.build-dependencies.rusqlite]\nversion = \"0.31\"\n",
+        "rusqlite"
+    ));
+
+    // Malformed manifest fails closed.
+    assert!(declares_dependency(
+        "[dependencies\nrusqlite = \"0.31\"\n",
+        "rusqlite"
+    ));
+    assert!(declares_dependency("not valid toml [[[", "rusqlite"));
 }
 
 #[test]
