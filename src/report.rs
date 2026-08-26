@@ -5,6 +5,14 @@
 //! - terminal-formatting crates
 //! - provider adapters
 
+pub mod models;
+
+pub use models::{
+    BackupReport, CalibrateReport, CoverageReport, DoctorReport, ExportReport, IngestReport,
+    IngestionGeneration, LedgerGeneration, MeterAccount, NowReport, ReportMetadata, SampleAttempt,
+    SampleReport, SpendGroup, SpendReport, StatusReport, TaskReport,
+};
+
 use crate::logging::RunId;
 
 /// Metadata shared by every rendered report format.
