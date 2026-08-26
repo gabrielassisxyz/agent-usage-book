@@ -63,8 +63,10 @@ ever costs more than it protects.
 - **HTTP:** `ureq`, blocking, inside `std::thread::scope`. About three endpoints are
   called, concurrently and once. `reqwest` with the `blocking` feature is not the same
   thing: it starts tokio underneath, which is a runtime this binary has no other use for.
-- **Persistence:** undecided. `rusqlite` with the `bundled` feature is the candidate; the
-  decision belongs to the implementation plan and this line gets replaced when it lands.
+- **Persistence:** one bundled SQLite database in WAL mode on a local filesystem, with
+  `synchronous = FULL` for the irreplaceable meter writes. The build is bundled so
+  behaviour does not depend on the host's SQLite version. The state directory must be
+  local; `doctor` rejects known network-filesystem cases.
 - **Build:** `cargo build --release`
 - **Run:** `cargo run -- <args>`
 - **After clone, once:** `bin/install-hooks`
