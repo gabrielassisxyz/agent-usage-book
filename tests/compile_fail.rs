@@ -43,7 +43,9 @@ fn every_fixture_has_captured_output() {
 
 /// The regeneration procedure must be documented next to the fixtures, so a future
 /// agent can refresh the captured output after changing a fixture or the toolchain
-/// without reverse-engineering the harness.
+/// without reverse-engineering the harness. The procedure must name the checked
+/// guard and the error-code rule, because a bare overwrite is how a fixture that
+/// now fails for a different reason gets blessed (aub-tojp).
 #[test]
 fn regeneration_procedure_is_documented() {
     let readme = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/compile_fail/README.md");
@@ -52,6 +54,14 @@ fn regeneration_procedure_is_documented() {
     assert!(
         contents.contains("TRYBUILD=overwrite"),
         "the regeneration procedure must name the TRYBUILD=overwrite command"
+    );
+    assert!(
+        contents.contains("compile_fail_regenerate"),
+        "the regeneration procedure must name the checked guard command"
+    );
+    assert!(
+        contents.contains("error code"),
+        "the regeneration procedure must state the error-code rule"
     );
 }
 

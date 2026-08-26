@@ -138,6 +138,14 @@ that a naive wrong implementation would fail. A planted negative is near-identic
 positive and differs only in the forbidden dimension. A test that asserts the code does
 whatever the code does is not a test.
 
+A compile-fail capture is a property of the crate's whole trait graph, not of its
+fixture: a bead that adds an impl anywhere can add a `help:` block to another bead's
+capture, with no dependency between the two. Regenerate captures with
+`cargo run --bin compile_fail_regenerate`, never with a bare `TRYBUILD=overwrite`. The
+guard refuses when the error code changed, naming both codes, because a changed code
+means the fixture fails for a different reason and blessing it destroys the test; it
+proceeds when the code is unchanged. `--override` is the explicit override.
+
 ## agent-usage-book - This Project
 
 ### What it does
@@ -336,6 +344,12 @@ score. The moment agents are scored on commits you get commit pumping.
    ever returns a bead for lint. Formatting and prose are not exempt and are not repaired
    centrally: they are in the pane subset, so a failure in either means the work-cycle was
    not followed, and that bead goes back to `rework` like any other.
+
+   A compile-fail failure on a bead whose diff does not touch the fixture is a trait-graph
+   consequence, not that bead's rework: another bead's impl changed the compiler's output
+   under the same error code. Regenerate the capture with `cargo run --bin
+   compile_fail_regenerate`, which refuses if the code changed, and do not return the bead
+   to rework.
 5. Re-run until green. Every attempt is retained in the wave record; rerun-until-green is
    not proof that a failure was flaky.
 6. Close only green `batch_pending` beads, citing the verification run:
@@ -704,6 +718,7 @@ Named here because the rules above are useless to a reader who cannot find them.
 |---|---|---|
 | A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the isolation `bin/ci` sets up, so a binary out of `target/` can be another pane's build | tripwire | pass `CARGO_TARGET_DIR` yourself before trusting anything built outside `bin/ci` |
 | The reservation guard exits 0 and checks nothing when neither `GIT_IDENTITY_ENABLED` nor `WORKTREES_ENABLED` is set in the committing shell. An unset variable looks exactly like a clean commit | tripwire | export it per pane, and canary the guard by staging a path somebody else holds |
+| A compile-fail capture breaks on a fixture nobody edited, because another bead's impl added a `help:` block to the error | tripwire | regenerate with `cargo run --bin compile_fail_regenerate`; a changed error code means the fixture fails for a different reason and the guard refuses |
 | `guard install` returns an empty hook path and installs nothing when the same gate is unset, printing an informational line rather than an error | tripwire | set `GIT_IDENTITY_ENABLED=1` on the install command itself, then confirm `.githooks/hooks.d/pre-commit/` is non-empty |
 | The mail server's database path is resolved relative to the current directory, so running its CLI from a repository creates an empty `storage.sqlite3` there. An agent that queries it sees zero reservations and concludes every path is free, which is the worst failure an advisory system has | tripwire | run that CLI only from its own install directory; before trusting an empty conflict list, confirm which store was read |
 | The guard plugin under `.githooks/hooks.d/` carries absolute paths for one machine | prose | it is git-ignored and regenerated per machine; never commit it |

@@ -99,6 +99,14 @@ require "batch-verify evidence location and audit" "$phase2" \
     'br show <id>' \
     'close_reason'
 
+# Criterion 6: a compile-fail failure on a bead whose diff does not touch the fixture is a
+# trait-graph consequence, not that bead's rework, so the orchestrator does not attribute it
+# to the wrong bead (aub-tojp).
+require "compile-fail failures are trait-graph consequences, not rework" "$phase2" \
+    'compile-fail failure on a bead whose diff does not touch the fixture' \
+    'trait-graph consequence' \
+    'compile_fail_regenerate'
+
 # --- Integration: drive a bead batch_pending -> closed on a scratch tracker ---
 #
 # The integration half needs the `br` binary, and CI runners do not have it. A check that fails
