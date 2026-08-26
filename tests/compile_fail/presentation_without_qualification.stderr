@@ -1,0 +1,15 @@
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+ --> tests/compile_fail/presentation_without_qualification.rs:8:13
+  |
+8 |     let _ = render_quantity("42", "tokens", TOKENS);
+  |             ^^^^^^^^^^^^^^^------------------------ argument #4 of type `Qualification` is missing
+  |
+note: function defined here
+ --> src/presentation/render.rs
+  |
+  | pub fn render_quantity(
+  |        ^^^^^^^^^^^^^^^
+help: provide the argument
+  |
+8 |     let _ = render_quantity("42", "tokens", TOKENS, /* Qualification */);
+  |                                                   +++++++++++++++++++++
