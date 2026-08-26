@@ -12,13 +12,35 @@ use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
 use crate::report::ReportEnvelope;
 
-/// Every command the CLI exposes.
-///
-/// The exhaustive match in [`Command::flag_policy`] is what makes the shared flag
-/// policy a compile-time obligation: adding a command means adding a variant, and
-/// the match refuses to compile until that variant declares its policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Command {
+/// Declares [`Command`] and the derived list of its variants from one token list, so
+/// the list cannot drift from the enum: a variant joins both at once. [`Command::ALL`]
+/// stays a separate, hand-written literal, and the test module pins it against the
+/// derived list, so a variant that joins the enum without joining `ALL` fails a test
+/// that names it.
+macro_rules! aub_command_enum {
+    ($($variant:ident),+ $(,)?) => {
+        /// Every command the CLI exposes.
+        ///
+        /// The exhaustive match in [`Command::flag_policy`] is what makes the shared
+        /// flag policy a compile-time obligation: adding a command means adding a
+        /// variant, and the match refuses to compile until that variant declares
+        /// its policy.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub enum Command {
+            $($variant),+
+        }
+
+        impl Command {
+            /// Every variant, derived from the enum's own declaration by
+            /// [`macro_rules@aub_command_enum`]: declaration order is list order, so
+            /// a variant is never added in only one place. [`Command::ALL`] is a
+            /// separate literal the tests pin against this list.
+            pub const DECLARED_VARIANTS: &'static [Self] = &[$(Self::$variant),+];
+        }
+    };
+}
+
+aub_command_enum! {
     Status,
     Config,
     LoggingFixture,
@@ -47,8 +69,10 @@ pub struct FlagPolicy {
 
 impl Command {
     /// Every command, in one place: the enumeration test drives from this rather
-    /// than keeping its own private list, so there is exactly one array to update
-    /// when a variant is added, not two.
+    /// than keeping its own private list. `all_lists_every_declared_variant` pins
+    /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
+    /// declaration derives, so a variant that joins the enum without joining this
+    /// array fails a test that names it.
     pub const ALL: [Self; 5] = [
         Self::Status,
         Self::Config,
@@ -349,6 +373,28 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::config::FakeEnv;
+
+    /// `Command::ALL` must name every variant the enum declares. `DECLARED_VARIANTS`
+    /// is derived from the enum's own declaration by [`aub_command_enum`], so the
+    /// two can only disagree when a variant joined the enum without joining `ALL`;
+    /// the failure names it. The equality assert after it pins identity and order
+    /// together, so a shortened or reordered `ALL` is loud, not silent.
+    #[test]
+    fn all_lists_every_declared_variant() {
+        let missing: Vec<_> = Command::DECLARED_VARIANTS
+            .iter()
+            .filter(|variant| !Command::ALL.contains(variant))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "variant(s) missing from Command::ALL: {missing:?}"
+        );
+        assert_eq!(
+            Command::ALL.to_vec(),
+            Command::DECLARED_VARIANTS.to_vec(),
+            "Command::ALL must keep the enum's declaration order"
+        );
+    }
 
     /// Every command declares a shared-flag policy, and the policy is well-formed:
     /// verbosity is accepted everywhere, and a rejected `--format` states why rather
