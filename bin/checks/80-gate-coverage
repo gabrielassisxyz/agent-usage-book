@@ -25,6 +25,7 @@ declared_checks=(
     70-quantity-inventory
     75-commit-protocol
     78-pane-work-cycle
+    80-batch-verify-close
     80-gate-coverage
 )
 
@@ -54,6 +55,7 @@ agents_doc_names=(
     "70-quantity-inventory:quantity inventory"
     "75-commit-protocol:commit protocol"
     "78-pane-work-cycle:pane work cycle"
+    "80-batch-verify-close:batch-verify close"
     "80-gate-coverage:gate coverage"
 )
 
