@@ -63,6 +63,19 @@ fn regeneration_procedure_is_documented() {
         contents.contains("error code"),
         "the regeneration procedure must state the error-code rule"
     );
+
+    // The same rule must be stated in AGENTS.md, where a pane reads testing doctrine
+    // before it ever reaches for a regeneration command (aub-tojp).
+    let agents = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("AGENTS.md"))
+        .expect("AGENTS.md must be readable");
+    assert!(
+        agents.contains("compile_fail_regenerate"),
+        "AGENTS.md must name the checked regeneration guard"
+    );
+    assert!(
+        agents.contains("never with a bare `TRYBUILD=overwrite`"),
+        "AGENTS.md must forbid the bare overwrite"
+    );
 }
 
 /// The coverage list must name every case in design section 34.1, so a case cannot be
