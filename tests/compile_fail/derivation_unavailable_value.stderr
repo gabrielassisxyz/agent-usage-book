@@ -1,0 +1,5 @@
+error[E0599]: no method named `value` found for enum `Derivation<T>` in the current scope
+  --> tests/compile_fail/derivation_unavailable_value.rs:12:37
+   |
+12 |     let _: TokenCount = unavailable.value();
+   |                                     ^^^^^ method not found in `Derivation<TokenCount>`

@@ -9,6 +9,10 @@
 //! side, built from an explicit context; nothing here reaches for one.
 
 use std::collections::BTreeMap;
+use std::ops::{Mul, Sub};
+
+use crate::domain::interval::DomainQuantity;
+use crate::evidence::{CoverageCompleteness, EvidenceQuality};
 
 /// The finite set of token classes this project bills and calibrates against.
 ///
@@ -78,6 +82,36 @@ token_newtype!(
     InputTokens,
     "Tokens consumed as the prompt/input side of a request."
 );
+
+impl Sub for TokenCount {
+    type Output = Self;
+
+    fn sub(self, other: Self) -> Self {
+        Self(self.0.saturating_sub(other.0))
+    }
+}
+
+impl Mul for TokenCount {
+    type Output = Self;
+
+    fn mul(self, other: Self) -> Self {
+        Self(self.0.saturating_mul(other.0))
+    }
+}
+
+impl DomainQuantity for TokenCount {
+    fn unit() -> &'static str {
+        "tokens"
+    }
+
+    fn to_f64(self) -> f64 {
+        self.0 as f64
+    }
+
+    fn from_f64(value: f64) -> Self {
+        Self(value.max(0.0).min(u64::MAX as f64) as u64)
+    }
+}
 token_newtype!(
     OutputTokens,
     "Tokens produced as the completion/output side of a request."
@@ -177,21 +211,29 @@ impl std::ops::Add for KnownTokenVector {
 /// unknown set is meant to block complete conversion to credits or money until a cost
 /// model explicitly defines the class.
 ///
-/// Deliberately carries no coverage or evidence-quality field yet. Those lattice types
-/// belong to `aub-rif.8` ("Define the coverage and evidence-quality lattice"), which is
-/// not a declared dependency of this bead and had not landed when this was written.
-/// Adding a placeholder type here in its place would prove nothing about the real
-/// wiring; wiring `UsageVector` to the real lattice is left for whichever bead closes
-/// that gap.
+/// Coverage and evidence quality are independent witnesses. An aggregate can have missing
+/// components and still contain estimates among the components it did receive.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UsageVector {
     known: KnownTokenVector,
     unknown: BTreeMap<String, TokenCount>,
+    coverage: CoverageCompleteness,
+    quality: EvidenceQuality<TokenCount>,
 }
 
 impl UsageVector {
-    pub fn new(known: KnownTokenVector, unknown: BTreeMap<String, TokenCount>) -> Self {
-        Self { known, unknown }
+    pub fn new(
+        known: KnownTokenVector,
+        unknown: BTreeMap<String, TokenCount>,
+        coverage: CoverageCompleteness,
+        quality: EvidenceQuality<TokenCount>,
+    ) -> Self {
+        Self {
+            known,
+            unknown,
+            coverage,
+            quality,
+        }
     }
 
     pub const fn known(&self) -> KnownTokenVector {
@@ -200,6 +242,14 @@ impl UsageVector {
 
     pub fn unknown(&self) -> &BTreeMap<String, TokenCount> {
         &self.unknown
+    }
+
+    pub fn coverage(&self) -> &CoverageCompleteness {
+        &self.coverage
+    }
+
+    pub fn quality(&self) -> &EvidenceQuality<TokenCount> {
+        &self.quality
     }
 
     /// True when at least one component was reported under a key none of the four known
@@ -214,6 +264,7 @@ impl UsageVector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::evidence::{ComponentKind, EstimatorId};
 
     #[test]
     fn token_kind_all_has_exactly_four_variants() {
@@ -308,7 +359,12 @@ mod tests {
         let mut unknown = BTreeMap::new();
         unknown.insert("reasoning_tokens".to_string(), TokenCount::new(99));
 
-        let usage = UsageVector::new(known, unknown);
+        let usage = UsageVector::new(
+            known,
+            unknown,
+            CoverageCompleteness::partial([ComponentKind::new("transcript")]),
+            EvidenceQuality::estimated([EstimatorId::new("characters")], None),
+        );
 
         assert!(usage.has_unknown_components());
         assert_eq!(
@@ -320,6 +376,11 @@ mod tests {
         // is no expression anywhere in this crate that reads a TokenCount out of this
         // map and hands it to something expecting InputTokens or any other known kind.
         assert_eq!(usage.known().input().value(), 1);
+        assert!(matches!(
+            usage.coverage(),
+            CoverageCompleteness::Partial { .. }
+        ));
+        assert!(matches!(usage.quality(), EvidenceQuality::Estimated { .. }));
     }
 
     #[test]
@@ -331,7 +392,12 @@ mod tests {
         // an explicit test here rather than slipping in unnoticed.
         let mut unknown = BTreeMap::new();
         unknown.insert("unmodeled".to_string(), TokenCount::new(1));
-        let usage = UsageVector::new(sample_vector(0, 0, 0, 0), unknown);
+        let usage = UsageVector::new(
+            sample_vector(0, 0, 0, 0),
+            unknown,
+            CoverageCompleteness::Complete,
+            EvidenceQuality::Measured,
+        );
         assert!(usage.has_unknown_components());
     }
 }
