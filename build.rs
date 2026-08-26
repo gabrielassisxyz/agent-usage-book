@@ -1,6 +1,6 @@
 //! Records the provenance a calibration result or schema migration persists: the git
-//! revision and the pinned toolchain version that produced this binary. A fit that cannot
-//! say which source revision or which compiler built its fitter has a hole in its
+//! revision and the toolchain version that actually produced this binary. A fit that
+//! cannot say which source revision or which compiler built its fitter has a hole in its
 //! reproducibility claim.
 //!
 //! No `rerun-if-changed` is emitted, so cargo reruns this script on every build. The
@@ -23,23 +23,53 @@ fn main() {
 
     println!("cargo:rustc-env=AUB_GIT_REVISION={revision}");
 
-    let toolchain = toolchain_channel();
+    let toolchain = toolchain_version();
     println!("cargo:rustc-env=AUB_TOOLCHAIN_VERSION={toolchain}");
 }
 
-/// Reads the `channel` value out of `rust-toolchain.toml`'s `[toolchain]` table, so the
-/// build metadata records the pin rather than whatever compiler happened to be on the
-/// host. Falls back to the sentinel `"unknown"` when the file cannot be read or parsed;
-/// the test in `src/build_info.rs` rejects that sentinel, so a build whose toolchain
-/// version cannot be determined fails `cargo test` instead of shipping a provenance
-/// field nothing can verify.
-fn toolchain_channel() -> String {
+/// The toolchain version the binary was actually built with: the version `rustc --version`
+/// reports, cross-checked against the channel pinned in `rust-toolchain.toml`. The two
+/// agree only while rustup honours the pin, and they diverge exactly when provenance
+/// matters, so a disagreement fails the build rather than recording the pin and looking
+/// correct.
+fn toolchain_version() -> String {
+    let pinned = channel_from_toolchain_file()
+        .unwrap_or_else(|| panic!("rust-toolchain.toml does not declare a [toolchain] channel"));
+    let reported = rustc_reported_version();
+    if pinned != reported {
+        panic!(
+            "toolchain mismatch: rustc reports {reported} but rust-toolchain.toml pins {pinned}"
+        );
+    }
+    reported
+}
+
+/// Runs `rustc --version` and returns the version token from its output, e.g. `1.97.1`
+/// out of `rustc 1.97.1 (8bab26f4f 2026-08-14)`.
+fn rustc_reported_version() -> String {
+    let output = Command::new("rustc")
+        .args(["--version"])
+        .output()
+        .expect("rustc --version must run");
+    assert!(
+        output.status.success(),
+        "rustc --version failed with status {}",
+        output.status
+    );
+    let stdout = String::from_utf8(output.stdout).expect("rustc --version output must be UTF-8");
+    stdout
+        .split_whitespace()
+        .nth(1)
+        .expect("rustc --version output must contain a version token")
+        .to_string()
+}
+
+/// Reads `rust-toolchain.toml` and returns the `channel` value from its `[toolchain]`
+/// table, or `None` when the file cannot be read or the key is absent.
+fn channel_from_toolchain_file() -> Option<String> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-toolchain.toml");
-    std::fs::read_to_string(path)
-        .ok()
-        .as_deref()
-        .and_then(channel_from_toolchain_toml)
-        .unwrap_or_else(|| "unknown".to_string())
+    let contents = std::fs::read_to_string(path).ok()?;
+    channel_from_toolchain_toml(&contents)
 }
 
 /// Parses the `channel` value from the `[toolchain]` table of a `rust-toolchain.toml`

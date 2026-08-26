@@ -25,16 +25,15 @@ pub fn source_revision() -> &'static str {
     env!("AUB_GIT_REVISION")
 }
 
-/// The toolchain version the binary was built with, as pinned by `rust-toolchain.toml`.
+/// The toolchain version the binary was actually built with.
 ///
-/// Set by `build.rs` at compile time from the `channel` value in `rust-toolchain.toml`;
-/// never derived at runtime, since a binary cannot see the toolchain that built it once
-/// it is running elsewhere. `build.rs` falls back to the sentinel `"unknown"` when the
-/// file cannot be read, but that sentinel can never justify a calibration record's
-/// provenance claim, so the tests below bind the reported value to the on-disk pin and
-/// reject the sentinel: a build whose toolchain version cannot be determined fails
-/// `cargo test`, which is `bin/ci`'s gate, instead of shipping a provenance field nothing
-/// can verify.
+/// Set by `build.rs` at compile time from the version `rustc --version` reports,
+/// cross-checked against the `channel` pinned in `rust-toolchain.toml`; never derived at
+/// runtime, since a binary cannot see the toolchain that built it once it is running
+/// elsewhere. `build.rs` fails the build when the two disagree, so a build made with an
+/// overridden toolchain stops instead of recording the pin and looking correct. The
+/// tests below bind the reported value to the on-disk pin and to the shape `rustc`
+/// reports.
 pub fn toolchain_version() -> &'static str {
     env!("AUB_TOOLCHAIN_VERSION")
 }
@@ -107,16 +106,19 @@ mod tests {
     }
 
     #[test]
-    fn toolchain_version_is_a_version_not_a_sentinel() {
+    fn toolchain_version_has_the_shape_rustc_reports() {
         let version = toolchain_version();
-        assert!(!version.is_empty(), "toolchain version must not be empty");
-        assert_ne!(
-            version, "unknown",
-            "toolchain version must not be the sentinel"
+        let components: Vec<&str> = version.split('.').collect();
+        assert_eq!(
+            components.len(),
+            3,
+            "expected major.minor.patch, got {version:?}"
         );
-        assert!(
-            version.chars().all(|c| c.is_ascii_digit() || c == '.'),
-            "expected a version like 1.97.1, got {version:?}"
-        );
+        for component in &components {
+            assert!(
+                !component.is_empty() && component.chars().all(|c| c.is_ascii_digit()),
+                "expected numeric components, got {version:?}"
+            );
+        }
     }
 }
