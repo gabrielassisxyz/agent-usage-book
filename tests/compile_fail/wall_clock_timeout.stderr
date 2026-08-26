@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/compile_fail/wall_clock_timeout.rs:8:26
+  |
+8 |     let _ = Timeout::new(std::time::Duration::from_secs(5));
+  |             ------------ ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `MonotonicDuration`, found `Duration`
+  |             |
+  |             arguments to this function are incorrect
+  |
+note: associated function defined here
+ --> src/domain/time.rs
+  |
+  |     pub fn new(duration: MonotonicDuration) -> Self {
+  |            ^^^
