@@ -347,10 +347,12 @@ Naming the paths commits the working-tree version of exactly those paths and lea
 other pane's staged work untouched. The `git add` is neither redundant nor optional:
 `git commit -- <path>` refuses a path git does not already track, so the new file a bead
 just wrote has to be staged before it can be named. Staging your own paths disturbs nobody,
-since the index holds everyone's and the commit that names yours leaves theirs staged. `git commit -a` sweeps every pane's uncommitted edits
-into your commit, and a bare `git commit` sweeps whatever they have staged. Both are
-banned, and banning them is useless without the form above: a rule shaped *never do X*
-leaves an agent with no move at all when X is the only form it knows.
+since the index holds everyone's and the commit that names yours leaves theirs staged.
+
+`git commit -a` sweeps every pane's uncommitted edits into your commit, and a bare
+`git commit` sweeps whatever they have staged. Both are banned, and banning them is useless
+without the form above: a rule shaped *never do X* leaves an agent with no move at all when
+X is the only form it knows.
 
 **A foreign staged path is not a reason to stop.** Six panes once deadlocked for thirty
 minutes on exactly that, each correctly refusing to run a form it had been told never to
