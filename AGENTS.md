@@ -70,6 +70,13 @@ ever costs more than it protects.
 - **Build:** `cargo build --release`
 - **Run:** `cargo run -- <args>`
 - **After clone, once:** `bin/install-hooks`
+- **The toolchain is pinned in `rust-toolchain.toml` and must be resolved through rustup.**
+  The pin only binds a rustup proxy, so a distribution's `/usr/bin/rustc` ignores it while
+  reporting the same version number, and `bin/checks/05-toolchain` fails when that is what
+  is on PATH. This is not pedantry: two builds of one release render diagnostics
+  differently, and a compile-fail fixture captured against the wrong one made CI red for 38
+  consecutive runs while `bin/ci` was green on the machine that produced every commit in
+  them. Put `~/.cargo/bin` ahead of the distribution's directories on PATH.
 
 ## Compiler Checks (CRITICAL)
 
@@ -79,8 +86,9 @@ cargo clippy --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-`bin/ci` is the full gate: format, lint, test, dependency audit, prose guard. It is the
-exact thing CI runs, so green locally means green in CI.
+`bin/ci` is the full gate: toolchain identity, format, lint, test, dependency audit, prose
+guard. It is the exact thing CI runs, so green locally means green in CI, which is true
+only because the first check refuses to let the rest run under a different compiler.
 
 **A bare `cargo test` or `cargo run` reads `build.target-dir` and is not covered by the
 isolation `bin/ci` sets up.** A binary out of `target/` can be another pane's build. Pass

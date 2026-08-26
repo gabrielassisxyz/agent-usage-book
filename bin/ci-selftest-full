@@ -29,6 +29,52 @@ note_fail() {
     fail=1
 }
 
+# --- toolchain: the gate that catches a compiler which reports the pinned version and is
+# not the pinned build. Both mutations shadow a binary rather than touching the machine's
+# real toolchain, the same technique the audit scenario uses further down, so this runs
+# unconditionally and changes nothing outside the scratch directory.
+toolchain_shadow="$scratch/toolchain-shadow"
+mkdir -p "$toolchain_shadow"
+
+# A distribution rustc: reports the pinned version, and a sysroot that is not the pin's.
+cat > "$toolchain_shadow/rustc" <<'EOF'
+#!/usr/bin/env bash
+case "${1:-}" in
+    --print) [ "${2:-}" = sysroot ] && { echo /usr; exit 0; } ;;
+    --version) echo "rustc 1.97.1 (8bab26f4f 2026-07-14) (Distro Linux rust 1:1.97.1-1)"; exit 0 ;;
+esac
+exit 0
+EOF
+chmod +x "$toolchain_shadow/rustc"
+
+clone="$scratch/toolchain-distro"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+output="$( (cd "$clone" && PATH="$toolchain_shadow:$PATH" bin/checks/05-toolchain) 2>&1 )"
+if [ $? -eq 0 ]; then
+    note_fail "toolchain: expected the check to reject a rustc whose sysroot is not the pin's"
+elif ! printf '%s' "$output" | grep -qF -- "is not the pinned toolchain"; then
+    note_fail "toolchain: rejected the shadowed rustc without naming the mismatch"
+    printf '%s\n' "$output" >&2
+fi
+
+# No rustup at all: the pin cannot be resolved, so the check must say so rather than
+# quietly comparing a compiler against itself.
+norustup="$scratch/toolchain-norustup"
+mkdir -p "$norustup"
+for tool in rustc cargo git awk sed grep head; do
+    real="$(command -v "$tool")"
+    [ -n "$real" ] && ln -sf "$real" "$norustup/$tool"
+done
+clone="$scratch/toolchain-missing-rustup"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+output="$( (cd "$clone" && PATH="$norustup" bin/checks/05-toolchain) 2>&1 )"
+if [ $? -eq 0 ]; then
+    note_fail "toolchain: expected the check to fail when rustup is absent"
+elif ! printf '%s' "$output" | grep -qF -- "rustup is not on PATH"; then
+    note_fail "toolchain: failed without rustup, but never named rustup"
+    printf '%s\n' "$output" >&2
+fi
+
 # --- format: a stray run of blank lines is a real cargo-fmt violation. Checked against
 # a baseline first, so a pre-existing formatting problem elsewhere in an actively edited
 # shared tree is reported as itself rather than misread as this scenario's result. ---

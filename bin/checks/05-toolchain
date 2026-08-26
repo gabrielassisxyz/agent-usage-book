@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# The toolchain-identity gate: the compiler this machine is about to run the rest of the
+# gate with must be the one `rust-toolchain.toml` pins, resolved through rustup, which is
+# what the workflow runs. It is numbered first so that a mismatch is read before the
+# results it would otherwise explain away.
+#
+# A version number is not an identity. This repository was red in CI for 38 consecutive
+# runs while `bin/ci` was green on every machine that produced those commits, because two
+# builds of rustc 1.97.1 rendered one diagnostic differently: a distribution package built
+# with the standard library's paths remapped emits `library/core/src/option.rs:1090:4`,
+# where the upstream build emits a path trybuild normalises to `$RUST/core/src/option.rs`.
+# The compile-fail fixture was captured against the first and could only ever pass there.
+# build.rs already binds the reported version to the pinned channel; that check cannot see
+# this, since both compilers report the same version.
+#
+# So the comparison is the sysroot and the cargo banner, not the version: those are what
+# actually differ between two builds of one release.
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+fail=0
+pin_file="rust-toolchain.toml"
+
+if [ ! -f "$pin_file" ]; then
+    echo "no $pin_file: this check exists to compare against a pinned toolchain" >&2
+    exit 1
+fi
+
+channel="$(command grep -E '^[[:space:]]*channel[[:space:]]*=' "$pin_file" | head -1 | sed -E 's/.*=[[:space:]]*"([^"]+)".*/\1/')"
+if [ -z "$channel" ]; then
+    echo "$pin_file declares no channel" >&2
+    exit 1
+fi
+
+if ! command -v rustup >/dev/null 2>&1; then
+    echo "rustup is not on PATH, so the toolchain $pin_file pins cannot be resolved." >&2
+    echo "Install it from https://rustup.rs and re-run: the pin is the contract this" >&2
+    echo "repository builds under, and a distribution package is a different compiler." >&2
+    exit 1
+fi
+
+pinned_sysroot="$(rustup run "$channel" rustc --print sysroot 2>/dev/null)"
+if [ -z "$pinned_sysroot" ]; then
+    echo "rustup has no toolchain $channel installed." >&2
+    echo "Install it: rustup toolchain install $channel" >&2
+    exit 1
+fi
+
+active_sysroot="$(rustc --print sysroot 2>/dev/null)"
+if [ -z "$active_sysroot" ]; then
+    echo "no rustc on PATH" >&2
+    exit 1
+fi
+
+if [ "$active_sysroot" != "$pinned_sysroot" ]; then
+    echo "rustc on PATH is not the pinned toolchain." >&2
+    echo "  on PATH: $(command -v rustc) (sysroot $active_sysroot)" >&2
+    echo "           $(rustc --version 2>/dev/null)" >&2
+    echo "  pinned:  $pinned_sysroot" >&2
+    echo "           $(rustup run "$channel" rustc --version 2>/dev/null)" >&2
+    fail=1
+fi
+
+# cargo has no --print sysroot, and comparing proxy paths would report a mismatch in the
+# setup this check is asking for, since the rustup proxy is never the toolchain binary.
+# The banner carries the packager's own suffix, which is the difference that matters.
+active_cargo="$(cargo --version 2>/dev/null)"
+pinned_cargo="$(rustup run "$channel" cargo --version 2>/dev/null)"
+if [ -n "$active_cargo" ] && [ "$active_cargo" != "$pinned_cargo" ]; then
+    echo "cargo on PATH is not the pinned toolchain's." >&2
+    echo "  on PATH: $(command -v cargo): $active_cargo" >&2
+    echo "  pinned:  $pinned_cargo" >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo >&2
+    echo "Green here would not mean green in CI, which is the one promise bin/ci makes." >&2
+    echo "Put the rustup proxies ahead of the distribution's on PATH:" >&2
+    echo "    export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >&2
+    echo "or run the whole gate through the pin: rustup run $channel bin/ci" >&2
+    echo "==> toolchain FAILED" >&2
+    exit 1
+fi
+
+echo "toolchain: rustc and cargo on PATH are the pinned $channel ($pinned_sysroot)."
