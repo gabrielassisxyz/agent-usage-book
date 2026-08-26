@@ -16,8 +16,8 @@ that checks it (`bin/checks/70-quantity-inventory`), cover exactly those four fi
 
 `src/domain/time.rs`, `src/domain/interval.rs`, `src/domain/ids.rs` and
 `src/domain/provenance.rs` (from `aub-rif.5`, `aub-rif.6`, `aub-rif.7` and
-`aub-rif.11`) already exist in the tree — the domain wave batched more beads than this
-one's formal dependency edge names — but are **not yet covered** by this inventory or
+`aub-rif.11`) already exist in the tree, since the domain wave batched more beads than
+this one's formal dependency edge names, but are **not yet covered** by this inventory or
 its guard script. That is a real, visible gap, not an oversight papered over: extending
 the guard's file list and this document to include them is exactly the kind of growth
 the guard below exists to force, the first time someone runs it against those files.
@@ -105,12 +105,12 @@ Two properties are structural consequences of Rust's privacy rules rather than a
 per-type risk that varies by which quantity owns the field, so they are proven once per
 distinct *shape* rather than once per every type name above:
 
-- **Direct field/tuple construction outside the owning module** —
+- **Direct field/tuple construction outside the owning module**:
   `domain_quantity_direct_construction.rs` covers one tuple-struct-over-a-primitive
   (`InputTokens`), one tuple-struct-over-a-newtype (`QuotaUsed`), one
   multi-field brace struct (`KnownTokenVector`), and one generic struct
   (`Money<Usd>`).
-- **`unwrap_or_default()` on `Option<Quantity>`** —
+- **`unwrap_or_default()` on `Option<Quantity>`**:
   `domain_quantities_unwrap_or_default.rs` covers `InputTokens`, `Credits`,
   `QuotaFractionPpm`, `Money<Usd>` and `PercentagePoints`. The underlying missing
   `Default` impl is already proven exhaustively by
