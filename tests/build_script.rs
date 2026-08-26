@@ -178,6 +178,49 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
         );
     });
 
+    // The panic for a genuinely missing file must name the path that was tried, so
+    // the next reader is not sent to a file that is correct. Run the cached
+    // build-script binary with a manifest directory that has no toolchain file.
+    let empty_manifest = tmp.join("empty-manifest");
+    std::fs::create_dir_all(&empty_manifest).expect("empty manifest dir must be creatable");
+    let script = find_build_script_binary(&shared);
+    let out = Command::new(&script)
+        .env("CARGO_MANIFEST_DIR", &empty_manifest)
+        .output()
+        .expect("build script binary must run");
+    assert!(
+        !out.status.success(),
+        "build script must fail without a toolchain file"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let expected = format!(
+        "cannot read {}/rust-toolchain.toml",
+        empty_manifest.display()
+    );
+    assert!(
+        stderr.contains(&expected),
+        "panic must name the path that was tried, got:\n{stderr}"
+    );
+
     drop(guard);
     std::fs::remove_dir_all(&tmp).expect("temp dir must be removable");
+}
+
+/// The compiled build-script binary under a shared target directory. The build
+/// output directory holds several `agent-usage-book-*` entries; the binary is the
+/// one that carries `build-script-build`.
+fn find_build_script_binary(shared_target: &Path) -> PathBuf {
+    let build_dir = shared_target.join("debug/build");
+    let mut found = None;
+    for entry in std::fs::read_dir(&build_dir).expect("build dir must exist") {
+        let entry = entry.expect("build dir must be readable");
+        let name = entry.file_name();
+        if name.to_string_lossy().starts_with("agent-usage-book-") {
+            let candidate = entry.path().join("build-script-build");
+            if candidate.is_file() {
+                found = Some(candidate);
+            }
+        }
+    }
+    found.expect("a build-script-build binary must exist under the shared target dir")
 }
