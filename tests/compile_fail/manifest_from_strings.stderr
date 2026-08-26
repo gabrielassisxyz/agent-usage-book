@@ -1,0 +1,15 @@
+error[E0271]: type mismatch resolving `<Vec<String> as IntoIterator>::Item == EvidenceId`
+ --> tests/compile_fail/manifest_from_strings.rs:8:9
+  |
+7 |     let _ = ProvenanceManifest::new(
+  |             ----------------------- required by a bound introduced by this call
+8 |         vec!["session-1".to_string()],
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `EvidenceId`, found `String`
+  |
+note: required by a bound in `ProvenanceManifest::new`
+ --> src/domain/provenance.rs
+  |
+  |     pub fn new(
+  |            --- required by a bound in this associated function
+  |         inputs: impl IntoIterator<Item = EvidenceId>,
+  |                                   ^^^^^^^^^^^^^^^^^ required by this bound in `ProvenanceManifest::new`

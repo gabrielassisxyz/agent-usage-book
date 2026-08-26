@@ -1,0 +1,15 @@
+error[E0061]: this function takes 2 arguments but 1 argument was supplied
+ --> tests/compile_fail/derived_without_manifest.rs:8:13
+  |
+8 |     let _ = Derived::new(42u64);
+  |             ^^^^^^^^^^^^------- argument #2 of type `ProvenanceManifest` is missing
+  |
+note: associated function defined here
+ --> src/domain/provenance.rs
+  |
+  |     pub fn new(value: T, manifest: ProvenanceManifest) -> Self {
+  |            ^^^
+help: provide the argument
+  |
+8 |     let _ = Derived::new(42u64, /* ProvenanceManifest */);
+  |                               ++++++++++++++++++++++++++
