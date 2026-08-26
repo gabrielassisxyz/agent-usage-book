@@ -1,0 +1,13 @@
+error[E0369]: cannot add `SessionId` to `SessionId`
+  --> tests/compile_fail/ids_arithmetic.rs:10:18
+   |
+10 |     let _sum = a + b;
+   |                - ^ - SessionId
+   |                |
+   |                SessionId
+   |
+note: `SessionId` does not implement `Add`
+  --> src/domain/ids.rs
+   |
+   | pub struct SessionId {
+   | ^^^^^^^^^^^^^^^^^^^^ `SessionId` is defined in another crate

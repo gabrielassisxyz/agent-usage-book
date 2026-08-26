@@ -1,0 +1,13 @@
+error[E0369]: binary operation `<` cannot be applied to type `MeterSemanticsId`
+  --> tests/compile_fail/ids_ordering.rs:10:22
+   |
+10 |     let _ordered = a < b;
+   |                    - ^ - MeterSemanticsId
+   |                    |
+   |                    MeterSemanticsId
+   |
+note: `MeterSemanticsId` does not implement `PartialOrd`
+  --> src/domain/ids.rs
+   |
+   | pub struct MeterSemanticsId(String);
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^ `MeterSemanticsId` is defined in another crate
