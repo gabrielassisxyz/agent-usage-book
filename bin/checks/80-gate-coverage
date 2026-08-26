@@ -1,0 +1,353 @@
+#!/usr/bin/env bash
+# Gate coverage and inventory guard (aub-8kq0): asserts that the gate's coverage
+# has not shrunk, that every check and boundary rule matches the declared inventory,
+# that AGENTS.md stays in sync with that inventory, that scope overrides are not
+# abused, and that no check has been neutered with an early exit 0.
+#
+# Unlike a git-diff check that fails on any edit to bin/ci, this guard checks WHAT the
+# gate covers rather than whether files were edited.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+# Declared inventory: every check and boundary rule expected to run in CI.
+# Adding or removing a check requires updating this declared inventory.
+declared_checks=(
+    05-toolchain
+    10-format
+    20-lint
+    30-test
+    40-audit
+    45-boundary-rules
+    50-prose-guard
+    60-e2e
+    70-quantity-inventory
+    75-commit-protocol
+    78-pane-work-cycle
+    80-batch-verify-close
+    80-gate-coverage
+)
+
+declared_boundary_rules=(
+    00-declared-policy
+    01-presentation-no-provider-adapters
+    02-transcripts-no-calibration
+    03-meter-no-sqlite
+    04-cost-model-no-config
+    05-advice-no-calibration
+    06-status-no-http-transport
+    07-provider-adapters-no-credential-paths
+    08-window-selection-ownership
+    09-presentation-no-store-or-calibration
+)
+
+# Mapping of check filenames to their required descriptive phrase in AGENTS.md:93-95
+agents_doc_names=(
+    "05-toolchain:toolchain identity"
+    "10-format:format (\`cargo fmt\`)"
+    "20-lint:lint (\`cargo clippy\`)"
+    "30-test:test"
+    "40-audit:dependency audit"
+    "45-boundary-rules:boundary rules"
+    "50-prose-guard:prose guard (\`bin/slop-guard\`)"
+    "60-e2e:e2e"
+    "70-quantity-inventory:quantity inventory"
+    "75-commit-protocol:commit protocol"
+    "78-pane-work-cycle:pane work cycle"
+    "80-batch-verify-close:batch-verify close"
+    "80-gate-coverage:gate coverage"
+)
+
+check_gate_coverage() {
+    local target_root="$1"
+    local fail_count=0
+
+    local checks_dir="$target_root/bin/checks"
+    local boundary_dir="$target_root/bin/checks/boundary-rules"
+    local doc="$target_root/AGENTS.md"
+
+    # --- 1. Inventory conformance for bin/checks ---
+    if [ ! -d "$checks_dir" ]; then
+        echo "gate-coverage: missing checks directory: $checks_dir" >&2
+        return 1
+    fi
+
+    local actual_checks=()
+    while IFS= read -r -d '' f; do
+        actual_checks+=("$(basename "$f")")
+    done < <(find "$checks_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z)
+
+    for exp in "${declared_checks[@]}"; do
+        [ -n "$exp" ] || continue
+        local path="$checks_dir/$exp"
+        if [ ! -f "$path" ]; then
+            echo "gate-coverage: declared check missing from filesystem: $exp" >&2
+            fail_count=$((fail_count + 1))
+        elif [ ! -x "$path" ]; then
+            echo "gate-coverage: check is not executable: $exp" >&2
+            fail_count=$((fail_count + 1))
+        elif [ ! -r "$path" ]; then
+            echo "gate-coverage: check is not readable: $exp" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    for act in "${actual_checks[@]}"; do
+        local found=0
+        for exp in "${declared_checks[@]}"; do
+            if [ "$act" = "$exp" ]; then
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "gate-coverage: undeclared check found on filesystem: $act (update declared inventory)" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    # --- 2. Inventory conformance for boundary-rules ---
+    if [ ! -d "$boundary_dir" ]; then
+        echo "gate-coverage: missing boundary-rules directory: $boundary_dir" >&2
+        return 1
+    fi
+
+    local actual_rules=()
+    while IFS= read -r -d '' f; do
+        actual_rules+=("$(basename "$f")")
+    done < <(find "$boundary_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z)
+
+    for exp in "${declared_boundary_rules[@]}"; do
+        [ -n "$exp" ] || continue
+        local path="$boundary_dir/$exp"
+        if [ ! -f "$path" ]; then
+            echo "gate-coverage: declared boundary rule missing from filesystem: $exp" >&2
+            fail_count=$((fail_count + 1))
+        elif [ ! -x "$path" ]; then
+            echo "gate-coverage: boundary rule is not executable: $exp" >&2
+            fail_count=$((fail_count + 1))
+        elif [ ! -r "$path" ]; then
+            echo "gate-coverage: boundary rule is not readable: $exp" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    for act in "${actual_rules[@]}"; do
+        local found=0
+        for exp in "${declared_boundary_rules[@]}"; do
+            if [ "$act" = "$exp" ]; then
+                found=1
+                break
+            fi
+        done
+        if [ "$found" -eq 0 ]; then
+            echo "gate-coverage: undeclared boundary rule found on filesystem: $act (update declared inventory)" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    # --- 3. Conformance with AGENTS.md:93-95 ---
+    if [ ! -f "$doc" ]; then
+        echo "gate-coverage: AGENTS.md missing at $doc" >&2
+        fail_count=$((fail_count + 1))
+    else
+        local gate_sentence
+        gate_sentence="$(awk '
+            /`bin\/ci` is the full gate:/ { grab = 1 }
+            grab { printf "%s ", $0; if (/\./) exit }
+        ' "$doc")"
+
+        if [ -z "$gate_sentence" ]; then
+            echo "gate-coverage: AGENTS.md missing '\`bin/ci\` is the full gate:' sentence" >&2
+            fail_count=$((fail_count + 1))
+        else
+            for entry in "${agents_doc_names[@]}"; do
+                local check_file="${entry%%:*}"
+                local phrase="${entry#*:}"
+                if ! printf '%s' "$gate_sentence" | grep -qF -- "$phrase"; then
+                    echo "gate-coverage: AGENTS.md does not name $check_file ('$phrase')" >&2
+                    fail_count=$((fail_count + 1))
+                fi
+            done
+        fi
+    fi
+
+    # --- 4. Assert scope overrides and callers ---
+    # CI_CHECKS_DIR: only sanctioned caller is bin/ci-selftest (and definition in bin/ci)
+    if [ "$target_root" = "$repo_root" ] && [ -n "${CI_CHECKS_DIR:-}" ]; then
+        echo "gate-coverage: CI_CHECKS_DIR is set in active environment; only bin/ci-selftest may set it" >&2
+        fail_count=$((fail_count + 1))
+    fi
+    local unsanctioned_ci_dir
+    unsanctioned_ci_dir="$(grep -rnE 'CI_CHECKS_DIR=' "$target_root/bin/checks" 2>/dev/null | grep -v '80-gate-coverage:' || true)"
+    if [ -n "$unsanctioned_ci_dir" ]; then
+        echo "gate-coverage: unsanctioned CI_CHECKS_DIR override in checks:" >&2
+        printf '%s\n' "$unsanctioned_ci_dir" >&2
+        fail_count=$((fail_count + 1))
+    fi
+
+    # BOUNDARY_RULES_DIR: only sanctioned caller is bin/boundary-rules-selftest
+    if [ "$target_root" = "$repo_root" ] && [ -n "${BOUNDARY_RULES_DIR:-}" ]; then
+        echo "gate-coverage: BOUNDARY_RULES_DIR is set in active environment; only bin/boundary-rules-selftest may set it" >&2
+        fail_count=$((fail_count + 1))
+    fi
+    local unsanctioned_boundary_dir
+    unsanctioned_boundary_dir="$(grep -rnE 'BOUNDARY_RULES_DIR=' "$target_root/bin/checks" 2>/dev/null | grep -vE '(45-boundary-rules:|80-gate-coverage:)' || true)"
+    if [ -n "$unsanctioned_boundary_dir" ]; then
+        echo "gate-coverage: unsanctioned BOUNDARY_RULES_DIR override in checks:" >&2
+        printf '%s\n' "$unsanctioned_boundary_dir" >&2
+        fail_count=$((fail_count + 1))
+    fi
+
+    # E2E_BUDGET_SECONDS: budget ceiling must not exceed 120s
+    if [ -n "${E2E_BUDGET_SECONDS:-}" ]; then
+        if [ "$E2E_BUDGET_SECONDS" -gt 120 ] 2>/dev/null; then
+            echo "gate-coverage: E2E_BUDGET_SECONDS raised past budget: ${E2E_BUDGET_SECONDS}s > 120s" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    fi
+    if [ -f "$checks_dir/60-e2e" ]; then
+        local e2e_default
+        e2e_default="$(grep -oE 'E2E_BUDGET_SECONDS:-[0-9]+' "$checks_dir/60-e2e" | cut -d- -f2 || true)"
+        if [ -z "$e2e_default" ] || [ "$e2e_default" -gt 120 ]; then
+            echo "gate-coverage: 60-e2e default budget missing or raised past 120s (found '${e2e_default:-missing}')" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    fi
+
+    # bin/slop-guard call site in bin/checks/50-prose-guard: must be whole-tree (no --diff / --stdin)
+    if [ -f "$checks_dir/50-prose-guard" ]; then
+        if grep -qE 'bin/slop-guard[[:space:]]+--' "$checks_dir/50-prose-guard"; then
+            echo "gate-coverage: 50-prose-guard call site is narrowed with flags; whole-tree scan required" >&2
+            fail_count=$((fail_count + 1))
+        elif ! grep -qE '(^|[[:space:]])bin/slop-guard($|[[:space:]])' "$checks_dir/50-prose-guard"; then
+            echo "gate-coverage: 50-prose-guard does not invoke bin/slop-guard" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    fi
+
+    # --- 5. Neutering check: early / unconditional exit 0 forbidden ---
+    for exp in "${declared_checks[@]}"; do
+        [ -n "$exp" ] || continue
+        local path="$checks_dir/$exp"
+        [ -f "$path" ] || continue
+        # Checks in bin/checks must not contain exit 0
+        if grep -qE '^[[:space:]]*exit 0' "$path"; then
+            echo "gate-coverage: $exp is neutered with exit 0" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    for exp in "${declared_boundary_rules[@]}"; do
+        [ -n "$exp" ] || continue
+        local path="$boundary_dir/$exp"
+        [ -f "$path" ] || continue
+        # Boundary rules may have exit 0 only as their last non-empty line
+        local non_trailing_exit
+        non_trailing_exit="$(head -n -1 "$path" 2>/dev/null | grep -nE '^[[:space:]]*exit 0' || true)"
+        if [ -n "$non_trailing_exit" ]; then
+            echo "gate-coverage: boundary rule $exp has early exit 0:" >&2
+            printf '%s\n' "$non_trailing_exit" >&2
+            fail_count=$((fail_count + 1))
+        fi
+    done
+
+    [ "$fail_count" -eq 0 ] || return 1
+    return 0
+}
+
+# If an argument is provided, execute check on that specific directory and exit
+if [ "$#" -gt 0 ]; then
+    check_gate_coverage "$1"
+    exit $?
+fi
+
+# Run live check against repository root
+if ! check_gate_coverage "$repo_root"; then
+    echo "==> gate-coverage FAILED" >&2
+    exit 1
+fi
+
+# --- Integration and mutation assertions against a scratch copy ---
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-gate-coverage-XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+
+make_scenario() {
+    local dir="$scratch/$1"
+    mkdir -p "$dir"
+    cp -a "$repo_root/bin" "$dir/bin"
+    cp -a "$repo_root/AGENTS.md" "$dir/AGENTS.md"
+    printf '%s\n' "$dir"
+}
+
+assert_mutation_caught() {
+    local target_dir="$1" label="$2" expected_err="$3"
+    local out rc
+    out="$("$target_dir/bin/checks/80-gate-coverage" "$target_dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "FAIL: integration: $label: mutation was not caught (exited 0)" >&2
+        return 1
+    fi
+    if ! printf '%s' "$out" | grep -qF -- "$expected_err"; then
+        echo "FAIL: integration: $label: expected error containing '$expected_err', got:" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    return 0
+}
+
+integration_failed=0
+
+# Integration 1: adding exit 0 at top of any check makes check fail
+dir="$(make_scenario neuter-check)"
+sed -i '2i exit 0' "$dir/bin/checks/10-format"
+assert_mutation_caught "$dir" "exit 0 in 10-format" "10-format is neutered with exit 0" || integration_failed=1
+
+# Integration 2: widening slop-guard call site to --diff makes check fail
+dir="$(make_scenario slop-diff)"
+sed -i 's|bin/slop-guard|bin/slop-guard --diff origin/main|' "$dir/bin/checks/50-prose-guard"
+assert_mutation_caught "$dir" "widening slop-guard to --diff" "50-prose-guard call site is narrowed" || integration_failed=1
+
+# Integration 3: raising E2E_BUDGET_SECONDS past 120s makes check fail
+dir="$(make_scenario e2e-budget)"
+sed -i 's/E2E_BUDGET_SECONDS:-120/E2E_BUDGET_SECONDS:-300/' "$dir/bin/checks/60-e2e"
+assert_mutation_caught "$dir" "raising 60-e2e default budget" "60-e2e default budget missing or raised past 120s" || integration_failed=1
+
+dir="$(make_scenario e2e-env)"
+out="$(E2E_BUDGET_SECONDS=300 "$dir/bin/checks/80-gate-coverage" "$dir" 2>&1)"
+if ! printf '%s' "$out" | grep -qF "E2E_BUDGET_SECONDS raised past budget: 300s > 120s"; then
+    echo "FAIL: integration: env E2E_BUDGET_SECONDS=300 was not caught" >&2
+    integration_failed=1
+fi
+
+# Regression: modifying bin/ci with coverage intact must stay green
+dir="$(make_scenario clean-edit)"
+printf '\n# legitimate edit to bin/ci\n' >> "$dir/bin/ci"
+if ! "$dir/bin/checks/80-gate-coverage" "$dir" >/dev/null 2>&1; then
+    echo "FAIL: regression: modifying bin/ci caused check_gate_coverage to fail" >&2
+    integration_failed=1
+fi
+
+# Mutation: remove one declared check from inventory in guard
+dir="$(make_scenario undeclared-check)"
+sed -i 's/10-format//' "$dir/bin/checks/80-gate-coverage"
+assert_mutation_caught "$dir" "undeclared check in filesystem" "undeclared check found on filesystem: 10-format" || integration_failed=1
+
+# Mutation: delete check file from filesystem
+dir="$(make_scenario missing-check)"
+rm "$dir/bin/checks/10-format"
+assert_mutation_caught "$dir" "missing check file" "declared check missing from filesystem: 10-format" || integration_failed=1
+
+# Mutation: remove check name from AGENTS.md
+dir="$(make_scenario agents-drift)"
+sed -i 's/format (`cargo fmt`), //' "$dir/AGENTS.md"
+assert_mutation_caught "$dir" "AGENTS.md drift" "AGENTS.md does not name 10-format" || integration_failed=1
+
+if [ "$integration_failed" -ne 0 ]; then
+    echo "==> gate-coverage integration/mutation tests FAILED" >&2
+    exit 1
+fi
+
+echo "gate-coverage: gate coverage, declared inventory, scope overrides and AGENTS.md agree."
