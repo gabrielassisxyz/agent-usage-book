@@ -1,0 +1,417 @@
+//! Provider quota-window semantics and selection.
+//!
+//! May not depend on:
+//! - calibration fitting or persistence
+//! - advice, status, or presentation
+//!
+//! A provider can impose several independently calibrated constraints on one model.
+//! Display selects the lowest remaining fraction; workload advice selects the smallest
+//! calibrated credit headroom. Keeping both selections here prevents a percentage from
+//! silently standing in for capacity.
+
+use std::collections::BTreeMap;
+
+use super::{
+    credits::{Credits, CreditsPerPercentagePoint},
+    quota::{PercentagePoints, QuotaFractionPpm, QuotaRemaining, QuotaUsed},
+    time::UtcTimestamp,
+};
+
+/// A stable provider-defined key for one quota constraint.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowSemanticKey(String);
+
+impl WindowSemanticKey {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A provider model identifier used to match model-scoped quota constraints.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ModelId(String);
+
+impl ModelId {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The scope kind a provider reports for a quota constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowScopeKind {
+    AccountWide,
+    ModelSpecific,
+}
+
+/// Which models a quota constraint can constrain.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowScope {
+    AccountWide,
+    ModelSpecific(ModelId),
+}
+
+impl WindowScope {
+    pub fn kind(&self) -> WindowScopeKind {
+        match self {
+            Self::AccountWide => WindowScopeKind::AccountWide,
+            Self::ModelSpecific(_) => WindowScopeKind::ModelSpecific,
+        }
+    }
+
+    pub fn scoped_model(&self) -> Option<&ModelId> {
+        match self {
+            Self::AccountWide => None,
+            Self::ModelSpecific(model) => Some(model),
+        }
+    }
+
+    fn constrains(&self, model: &ModelId) -> bool {
+        match self {
+            Self::AccountWide => true,
+            Self::ModelSpecific(scoped_model) => scoped_model == model,
+        }
+    }
+}
+
+/// Smallest provider-reported increment of quota usage, in parts per million.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReportedResolution(QuotaFractionPpm);
+
+impl ReportedResolution {
+    /// Constructs a non-zero resolution. A zero-width measurement has no resolution
+    /// semantics and would make quantization claims meaningless.
+    pub fn new(ppm: QuotaFractionPpm) -> Option<Self> {
+        (ppm.get() != 0).then_some(Self(ppm))
+    }
+
+    pub fn as_ppm(self) -> QuotaFractionPpm {
+        self.0
+    }
+}
+
+/// How a provider maps an underlying value onto its reported resolution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuantizationSemantics {
+    Exact,
+    RoundedToNearest,
+    RoundedDown,
+    RoundedUp,
+    Unknown,
+}
+
+/// Nominal length of a provider quota window, in nanoseconds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NominalWindowDuration(u64);
+
+impl NominalWindowDuration {
+    pub fn from_nanos(nanos: u64) -> Self {
+        Self(nanos)
+    }
+
+    pub fn as_nanos(self) -> u64 {
+        self.0
+    }
+}
+
+/// A normalized provider quota constraint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeterWindow {
+    semantic_key: WindowSemanticKey,
+    scope: WindowScope,
+    quota_used: QuotaUsed,
+    reported_resolution: ReportedResolution,
+    quantization: QuantizationSemantics,
+    resets_at: UtcTimestamp,
+    nominal_duration: NominalWindowDuration,
+}
+
+impl MeterWindow {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        semantic_key: WindowSemanticKey,
+        scope: WindowScope,
+        quota_used: QuotaUsed,
+        reported_resolution: ReportedResolution,
+        quantization: QuantizationSemantics,
+        resets_at: UtcTimestamp,
+        nominal_duration: NominalWindowDuration,
+    ) -> Self {
+        Self {
+            semantic_key,
+            scope,
+            quota_used,
+            reported_resolution,
+            quantization,
+            resets_at,
+            nominal_duration,
+        }
+    }
+
+    pub fn semantic_key(&self) -> &WindowSemanticKey {
+        &self.semantic_key
+    }
+
+    pub fn scope(&self) -> &WindowScope {
+        &self.scope
+    }
+
+    pub fn quota_used(&self) -> QuotaUsed {
+        self.quota_used
+    }
+
+    pub fn reported_resolution(&self) -> ReportedResolution {
+        self.reported_resolution
+    }
+
+    pub fn quantization(&self) -> QuantizationSemantics {
+        self.quantization
+    }
+
+    pub fn resets_at(&self) -> UtcTimestamp {
+        self.resets_at
+    }
+
+    pub fn nominal_duration(&self) -> NominalWindowDuration {
+        self.nominal_duration
+    }
+
+    /// True before the provider's stated reset instant. At that instant this reading
+    /// belongs to the completed window and must not be treated as current.
+    pub fn is_active_at(&self, now: UtcTimestamp) -> bool {
+        now < self.resets_at
+    }
+
+    pub fn remaining_fraction(&self) -> QuotaRemaining {
+        self.quota_used.complement()
+    }
+
+    fn constrains(&self, model: &ModelId) -> bool {
+        self.scope.constrains(model)
+    }
+
+    fn remaining_percentage_points(&self) -> PercentagePoints {
+        self.remaining_fraction().as_ppm() - zero_fraction()
+    }
+}
+
+/// The display selection: applicable window with least remaining fraction.
+///
+/// Calibration intentionally is not an input here. A caller deciding whether work fits
+/// must use [`limiting_credit_headroom_window`] instead.
+pub fn lowest_remaining_fraction_window<'a>(
+    windows: &'a [MeterWindow],
+    model: &ModelId,
+) -> Option<&'a MeterWindow> {
+    windows
+        .iter()
+        .filter(|window| window.constrains(model))
+        .min_by_key(|window| window.remaining_fraction().as_ppm().get())
+}
+
+/// Result of selecting the workload constraint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreditHeadroomSelection<'a> {
+    Known {
+        window: &'a MeterWindow,
+        headroom: Credits,
+    },
+    Unknown {
+        uncalibrated_window: &'a MeterWindow,
+    },
+}
+
+impl<'a> CreditHeadroomSelection<'a> {
+    pub fn window(self) -> &'a MeterWindow {
+        match self {
+            Self::Known { window, .. }
+            | Self::Unknown {
+                uncalibrated_window: window,
+            } => window,
+        }
+    }
+}
+
+/// The workload-advice selection: applicable window with least calibrated credits.
+///
+/// Every applicable window must have its own calibration. Missing calibration returns
+/// [`CreditHeadroomSelection::Unknown`] rather than silently discarding a constraint.
+pub fn limiting_credit_headroom_window<'a>(
+    windows: &'a [MeterWindow],
+    model: &ModelId,
+    calibrations: &BTreeMap<WindowSemanticKey, CreditsPerPercentagePoint>,
+) -> Option<CreditHeadroomSelection<'a>> {
+    let mut limiting: Option<(&MeterWindow, Credits)> = None;
+
+    for window in windows.iter().filter(|window| window.constrains(model)) {
+        let Some(calibration) = calibrations.get(window.semantic_key()) else {
+            return Some(CreditHeadroomSelection::Unknown {
+                uncalibrated_window: window,
+            });
+        };
+        let headroom = *calibration * window.remaining_percentage_points();
+        if limiting.is_none_or(|(_, current)| headroom.micros() < current.micros()) {
+            limiting = Some((window, headroom));
+        }
+    }
+
+    limiting.map(|(window, headroom)| CreditHeadroomSelection::Known { window, headroom })
+}
+
+fn zero_fraction() -> QuotaFractionPpm {
+    QuotaFractionPpm::new(0).expect("zero is in quota fraction range")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window(key: &str, scope: WindowScope, used_ppm: i32, reset_nanos: i64) -> MeterWindow {
+        MeterWindow::new(
+            WindowSemanticKey::new(key),
+            scope,
+            QuotaUsed::new(QuotaFractionPpm::new(used_ppm).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::RoundedToNearest,
+            UtcTimestamp::from_unix_nanos(reset_nanos),
+            NominalWindowDuration::from_nanos(1_000_000_000),
+        )
+    }
+
+    fn calibration(
+        key: &str,
+        micros_per_point: i64,
+    ) -> (WindowSemanticKey, CreditsPerPercentagePoint) {
+        (
+            WindowSemanticKey::new(key),
+            CreditsPerPercentagePoint::from_micros_per_point(micros_per_point),
+        )
+    }
+
+    #[test]
+    fn display_and_advice_select_different_windows_when_calibrations_diverge() {
+        let model = ModelId::new("model-a");
+        let windows = [
+            window("account", WindowScope::AccountWide, 800_000, 100),
+            window(
+                "model",
+                WindowScope::ModelSpecific(model.clone()),
+                600_000,
+                100,
+            ),
+        ];
+        let calibrations = BTreeMap::from([calibration("account", 100), calibration("model", 10)]);
+
+        assert_eq!(
+            lowest_remaining_fraction_window(&windows, &model)
+                .unwrap()
+                .semantic_key()
+                .as_str(),
+            "account"
+        );
+        assert_eq!(
+            limiting_credit_headroom_window(&windows, &model, &calibrations)
+                .unwrap()
+                .window()
+                .semantic_key()
+                .as_str(),
+            "model"
+        );
+    }
+
+    #[test]
+    fn unrelated_model_window_does_not_constrain_selected_model() {
+        let selected = ModelId::new("model-a");
+        let windows = [
+            window("account", WindowScope::AccountWide, 400_000, 100),
+            window(
+                "other",
+                WindowScope::ModelSpecific(ModelId::new("model-b")),
+                990_000,
+                100,
+            ),
+        ];
+
+        assert_eq!(
+            lowest_remaining_fraction_window(&windows, &selected)
+                .unwrap()
+                .semantic_key()
+                .as_str(),
+            "account"
+        );
+    }
+
+    #[test]
+    fn reset_boundary_excludes_the_completed_window_at_its_reset_instant() {
+        let window = window("account", WindowScope::AccountWide, 400_000, 100);
+
+        assert!(window.is_active_at(UtcTimestamp::from_unix_nanos(99)));
+        assert!(!window.is_active_at(UtcTimestamp::from_unix_nanos(100)));
+        assert!(!window.is_active_at(UtcTimestamp::from_unix_nanos(101)));
+    }
+
+    #[test]
+    fn missing_applicable_calibration_is_unknown_not_a_skipped_constraint() {
+        let model = ModelId::new("model-a");
+        let windows = [
+            window("account", WindowScope::AccountWide, 400_000, 100),
+            window(
+                "model",
+                WindowScope::ModelSpecific(model.clone()),
+                900_000,
+                100,
+            ),
+        ];
+        let calibrations = BTreeMap::from([calibration("account", 100)]);
+
+        assert!(matches!(
+            limiting_credit_headroom_window(&windows, &model, &calibrations),
+            Some(CreditHeadroomSelection::Unknown {
+                uncalibrated_window
+            }) if uncalibrated_window.semantic_key().as_str() == "model"
+        ));
+    }
+
+    #[test]
+    fn adding_a_tighter_window_never_raises_selected_headroom() {
+        let model = ModelId::new("model-a");
+        for remaining_ppm in (100_000..=900_000).step_by(100_000) {
+            let base = window("base", WindowScope::AccountWide, 500_000, 100);
+            let tighter = window(
+                "tighter",
+                WindowScope::ModelSpecific(model.clone()),
+                1_000_000 - remaining_ppm,
+                100,
+            );
+            let calibrations =
+                BTreeMap::from([calibration("base", 100), calibration("tighter", 1)]);
+            let before_windows = [base.clone()];
+            let after_windows = [base, tighter];
+            let before =
+                limiting_credit_headroom_window(&before_windows, &model, &calibrations).unwrap();
+            let after =
+                limiting_credit_headroom_window(&after_windows, &model, &calibrations).unwrap();
+            let CreditHeadroomSelection::Known {
+                headroom: before, ..
+            } = before
+            else {
+                panic!("base calibration is present");
+            };
+            let CreditHeadroomSelection::Known {
+                headroom: after, ..
+            } = after
+            else {
+                panic!("both calibrations are present");
+            };
+            assert!(after.micros() <= before.micros());
+        }
+    }
+}

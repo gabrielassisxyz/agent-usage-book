@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Boundary: window minima belong only to src/domain/window.rs.
+# Design: PLAN.md sections 7.3 and 26.4 require one named display selector and one
+# calibrated advice selector, so status and advice cannot re-derive either minimum.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+matches="$(grep -R -n -E --include='*.rs' '(^|[^[:alnum:]_])(lowest_remaining_fraction_window|limiting_credit_headroom_window)[[:space:]]*\(' src \
+    | grep -v '^src/domain/window.rs:' || true)"
+if [ -n "$matches" ]; then
+    echo "window selection is recomputed outside src/domain/window.rs:" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+
+exit 0
