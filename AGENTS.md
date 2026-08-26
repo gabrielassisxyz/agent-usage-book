@@ -160,6 +160,11 @@ five rules outrank convenience everywhere they meet it.
 
 ## How This Project Is Built
 
+> **Read this, do not run it.** Deciding which stage the work is in, and whether a gate has
+> been passed, belongs to whoever is running the swarm. A pane needs the shape to understand
+> why its bead is written the way it is, and never acts on this section: its own instructions
+> are *Picking up work* and Phase 1.
+
 Development follows a ladder of representations. Each rung turns the work into a form the
 next one can act on, and each has a gate. **A failed gate sends the work back a phase; it
 never sends it forward with a note attached.**
@@ -223,6 +228,13 @@ coding. Writing code is cheap and parallel; building and testing is expensive an
 serialized. So they are separated: all panes write real code at full speed without
 building, and the build runs once, centrally, over everyone's combined changes.
 
+**Of everything under this heading, Phase 1 is the only part a pane performs.** The rest
+belongs to whoever is running the swarm: when the wave flips, what gets verified, what gets
+closed, what is killed, and which representation broken work drops back to. A pane reads
+those to know what will happen to its bead and what its build may not do; it does not act on
+them. This division is unusual and it is load-bearing here, because one crate built by N
+panes at once is the bottleneck the whole model exists to remove.
+
 ### Phase 1: code-first wave (every pane, in parallel)
 
 1. Claim the highest-priority ready bead. `br ready --unassigned`, then
@@ -251,6 +263,14 @@ Commit rate during a wave is a saturation signal for the orchestrator, never a p
 score. The moment agents are scored on commits you get commit pumping.
 
 ### Phase 2: batch verify and close (the orchestrator, once per wave)
+
+> **Not yours if you are a pane.** Every step below is run once per wave by whoever is
+> running the swarm, and step 6 closes beads, which *Honest Work and Anti-Ceremony* forbids
+> anyone else to do. A pane that works through this list because it read the file top to
+> bottom would close its own work, and that close is reverted with an incident comment. Your
+> wave ends at Phase 1 step 7, with the bead in `batch_pending` and the reservation
+> released. Read Phase 2 to know what will be done to your bead and what evidence it will be
+> judged on; do not perform it.
 
 1. Flush the swarm's commits so the tree is consistent, and record the clean HEAD.
 2. Run **one** build and test pass over the union of touched scope, on a dedicated target
