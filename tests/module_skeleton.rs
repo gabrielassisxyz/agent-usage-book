@@ -51,10 +51,10 @@ fn declares_dependency(manifest: &str, name: &str) -> bool {
         if !in_dependencies || trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        if let Some((dep, _)) = trimmed.split_once('=') {
-            if dep.trim() == name {
-                return true;
-            }
+        if let Some((dep, _)) = trimmed.split_once('=')
+            && dep.trim() == name
+        {
+            return true;
         }
     }
     false
