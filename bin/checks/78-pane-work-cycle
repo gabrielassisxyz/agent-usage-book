@@ -1,17 +1,20 @@
 #!/usr/bin/env bash
-# The pane work-cycle and gate-ownership guard (aub-x5bo): AGENTS.md must name the checks a
-# pane runs before moving a bead to batch_pending, name the owner of the one gate class left
-# outside that subset, and say plainly that a pane cannot detect a main already red from it.
-# A pane must never be held answerable for a class it is forbidden to run.
+# The pane work-cycle and central verification guard (aub-x5bo, aub-ijph):
+# AGENTS.md must name the checks a pane runs before moving a bead to batch_pending,
+# name the owner of the one gate class left outside that subset, document the
+# bin/last-verify command for panes to query central verification freshness before
+# committing, and document orchestrator verdict recording in Phase 2.
 #
-# Two halves, following the pattern of bin/checks/75-commit-protocol:
-#   conformance  asserts the document names the subset, names lint's owner, states that a
-#                pane is not answerable for lint and cannot see a red main, and records the
-#                measurement the subset was chosen from rather than a category argument.
-#   integration  runs the written subset as a unit against a scratch checkout and checks it
-#                behaves as the document claims: blind to a lint-only defect, which clippy,
-#                the named owner, does catch; stopped by a formatting violation and by a
-#                prose violation; and still stopped by a real syntax error.
+# Three parts:
+#   conformance  asserts the document names the subset, names lint's owner, documents
+#                bin/last-verify and its three states (green at HEAD, stale with distance,
+#                none), documents Phase 2 verdict recording, and records the subset
+#                measurements.
+#   unit         verifies bin/last-verify handles all three states and distance
+#                calculation accurately without compilation and in under 250 ms.
+#   integration  runs the written subset against a scratch checkout (blind to lint,
+#                stopped by formatting/prose/syntax) and exercises the record -> commit ->
+#                stale with distance 1 cycle against a real tree.
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -68,6 +71,18 @@ require() {  # $1 = criterion, $2 = haystack, $3.. = substrings required
     done
 }
 
+forbid() {  # $1 = criterion, $2 = haystack, $3.. = substrings forbidden
+    local criterion="$1" haystack="$2"
+    shift 2
+    local needle
+    for needle in "$@"; do
+        if printf '%s' "$haystack" | command grep -qF -- "$needle"; then
+            echo "$doc: $criterion: forbidden '$needle' present" >&2
+            fail=1
+        fi
+    done
+}
+
 # --- Conformance checks ---
 
 # Criterion 1: the work-cycle names the check set a pane runs, in full.
@@ -78,8 +93,7 @@ require "the pane check subset" "$phase1" \
     'which is these three and nothing else'
 
 # Criterion 2: the one class outside the subset is named, with its owner, and with the
-# statement that the pane is not answerable for it. Naming the owner is what the bead accepts
-# in place of coverage, so it is the sentence that must not be lost.
+# statement that the pane is not answerable for it.
 require "lint is outside the subset and has an owner" "$phase1" \
     'One class of gate failure is invisible to you, and it is lint' \
     'you are not held responsible for one' \
@@ -90,17 +104,29 @@ require "the orchestrator repairs lint without a rework note" "$phase2" \
     'No rework note ever returns a bead for lint' \
     'Formatting and prose are not exempt'
 
-# Criterion 4: the pane is told plainly that it cannot detect a red main, rather than being
-# handed a probe that answers a different question. Both false signals an earlier revision
-# offered are named here so neither can quietly return.
-require "the pane is told it cannot see a red main" "$phase1" \
-    'You have no way to know whether `main` is already red from lint' \
+# Criterion 4: the pane is given bin/last-verify to check central verification, and the
+# unknowable main sentence is replaced.
+forbid "the unknowable main sentence is dropped" "$phase1" \
+    'You have no way to know whether `main` is already red from lint'
+
+require "the pane is given bin/last-verify and its three states" "$phase1" \
+    'bin/last-verify' \
+    'green at HEAD' \
+    'stale: green at <sha> (distance N)' \
+    'none: no central verification verdict recorded' \
+    '.beads/last-verify' \
+    'machine-local' \
     'Do not read a green subset as a clean `main`' \
     'br list --status rework` does not answer this either'
 
+require "the orchestrator documents central verification verdict recording in Phase 2" "$phase2" \
+    'bin/last-verify --record' \
+    '.beads/last-verify' \
+    'step 5' \
+    'machine-local'
+
 # Criteria 3 and 5: the choice is recorded with the measurement that decided it, not with a
-# category argument. The costs are what let the next reader re-derive the subset instead of
-# reopening the question.
+# category argument.
 require "the subset is justified by measurement" "$compiler_checks" \
     'chosen by measurement rather than by category' \
     'Formatting and prose are in the subset because they are nearly free' \
@@ -110,25 +136,118 @@ require "the subset is justified by measurement" "$compiler_checks" \
     '831 ms' \
     '4780 ms'
 
-# --- Integration: run the written work-cycle and check it does what the document claims ---
-#
-# The bead's closing condition is that planting a clippy violation and a formatting violation
-# in a pane's own files, then following the work-cycle to the letter, either surfaces both or
-# the document says which one it will not surface and who catches it. That is what the three
-# phases below replay: the subset is run as a unit, in the order the document gives it, rather
-# than each tool being asked about on its own.
-#
-# One clone and one target directory across all three phases, deliberately. Every extra target
-# directory is another cold build of the crate, and this check runs inside bin/ci.
+# --- Unit tests: bin/last-verify states and performance ---
+scratch_unit="$(mktemp -d "${TMPDIR:-/tmp}/aub-last-verify-unit-XXXXXX")"
+trap 'rm -rf "$scratch_unit"' EXIT
 
+git init --quiet "$scratch_unit"
+git -C "$scratch_unit" config user.email test@example.invalid
+git -C "$scratch_unit" config user.name test
+git -C "$scratch_unit" config commit.gpgsign false
+
+printf 'base\n' > "$scratch_unit/file.txt"
+git -C "$scratch_unit" add file.txt
+git -C "$scratch_unit" commit --quiet -m "commit 1"
+c1="$(git -C "$scratch_unit" rev-parse HEAD)"
+c1_short="$(git -C "$scratch_unit" rev-parse --short HEAD)"
+
+# State 1: no verdict recorded
+out="$(cd "$scratch_unit" && "$repo_root/bin/last-verify")"
+if [ "$out" != "none: no central verification verdict recorded" ]; then
+    echo "unit: expected 'none: no central verification verdict recorded', got: '$out'" >&2
+    fail=1
+fi
+
+# State 2: green at HEAD
+mkdir -p "$scratch_unit/.beads"
+printf '%s\n' "$c1" > "$scratch_unit/.beads/last-verify"
+out="$(cd "$scratch_unit" && "$repo_root/bin/last-verify")"
+if [ "$out" != "green at HEAD ($c1_short)" ]; then
+    echo "unit: expected 'green at HEAD ($c1_short)', got: '$out'" >&2
+    fail=1
+fi
+
+# State 3: stale with distance 1
+printf 'c2\n' >> "$scratch_unit/file.txt"
+git -C "$scratch_unit" commit --quiet -am "commit 2"
+c2="$(git -C "$scratch_unit" rev-parse HEAD)"
+c2_short="$(git -C "$scratch_unit" rev-parse --short HEAD)"
+
+out="$(cd "$scratch_unit" && "$repo_root/bin/last-verify")"
+if [ "$out" != "stale: green at $c1_short (distance 1)" ]; then
+    echo "unit: expected 'stale: green at $c1_short (distance 1)', got: '$out'" >&2
+    fail=1
+fi
+
+# State 3: stale with distance 3
+printf 'c3\n' >> "$scratch_unit/file.txt"
+git -C "$scratch_unit" commit --quiet -am "commit 3"
+printf 'c4\n' >> "$scratch_unit/file.txt"
+git -C "$scratch_unit" commit --quiet -am "commit 4"
+out="$(cd "$scratch_unit" && "$repo_root/bin/last-verify")"
+if [ "$out" != "stale: green at $c1_short (distance 3)" ]; then
+    echo "unit: expected 'stale: green at $c1_short (distance 3)', got: '$out'" >&2
+    fail=1
+fi
+
+# --- Integration: real tree record, commit, stale distance 1, latency, and zero compilation ---
+scratch_tree="$(mktemp -d "${TMPDIR:-/tmp}/aub-last-verify-tree-XXXXXX")"
+trap 'rm -rf "$scratch_unit" "$scratch_tree"' EXIT
+
+git clone --quiet --local --no-hardlinks "$repo_root" "$scratch_tree"
+cp -a "$repo_root/bin/last-verify" "$scratch_tree/bin/last-verify"
+git -C "$scratch_tree" config user.email test@example.invalid
+git -C "$scratch_tree" config user.name test
+git -C "$scratch_tree" config commit.gpgsign false
+
+# Record verdict at HEAD
+(cd "$scratch_tree" && bin/last-verify --record >/dev/null)
+head_short="$(git -C "$scratch_tree" rev-parse --short HEAD)"
+
+# Read back green at HEAD and measure latency
+start_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+out_head="$(cd "$scratch_tree" && bin/last-verify)"
+end_ms="$(date +%s%3N 2>/dev/null || echo 0)"
+
+if [ "$out_head" != "green at HEAD ($head_short)" ]; then
+    echo "integration: after record, expected 'green at HEAD ($head_short)', got: '$out_head'" >&2
+    fail=1
+fi
+
+if [ "$start_ms" -ne 0 ] && [ "$end_ms" -ne 0 ]; then
+    elapsed_ms=$(( end_ms - start_ms ))
+    if [ "$elapsed_ms" -gt 250 ]; then
+        echo "integration: bin/last-verify took ${elapsed_ms}ms (budget: 250ms)" >&2
+        fail=1
+    fi
+fi
+
+# Land a commit on top of the recorded verdict
+printf '\n# a new commit\n' >> "$scratch_tree/AGENTS.md"
+git -C "$scratch_tree" commit --quiet -am "commit on top of verify"
+
+# Read back: must report stale with distance 1
+out_stale="$(cd "$scratch_tree" && bin/last-verify)"
+if [ "$out_stale" != "stale: green at $head_short (distance 1)" ]; then
+    echo "integration: after new commit, expected 'stale: green at $head_short (distance 1)', got: '$out_stale'" >&2
+    fail=1
+fi
+
+# Assert nothing was compiled (no target directory created by bin/last-verify)
+if [ -d "$scratch_tree/target" ]; then
+    echo "integration: bin/last-verify created target directory, violating zero-compilation invariant" >&2
+    fail=1
+fi
+
+# --- Integration: run the written work-cycle and check it does what the document claims ---
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-work-cycle-XXXXXX")"
-trap 'rm -rf "$scratch"' EXIT
+trap 'rm -rf "$scratch_unit" "$scratch_tree" "$scratch"' EXIT
 
 git clone --quiet --local --no-hardlinks "$repo_root" "$scratch"
+cp -a "$repo_root/bin/last-verify" "$scratch/bin/last-verify"
+cp -a "$repo_root/AGENTS.md" "$scratch/AGENTS.md"
 export CARGO_TARGET_DIR="$scratch/target"
 
-# The pane check subset as one unit, exactly as the document writes it. Non-zero when any of
-# the three would stop a pane.
 run_subset() {
     (cd "$scratch" && cargo check -p agent-usage-book) >/dev/null 2>&1 || return 1
     (cd "$scratch" && cargo fmt --check) >/dev/null 2>&1 || return 1
@@ -136,9 +255,7 @@ run_subset() {
     return 0
 }
 
-# --- Phase A: a lint-only defect, which is the declared hole and the reason the document has
-# to name an owner instead of claiming coverage. This is the aub-vcx.3 shape verbatim: a
-# collapsible if let in a test file, which reached main and left the gate red for two commits.
+# --- Phase A: a lint-only defect, which is the declared hole
 cat >> "$scratch/tests/module_skeleton.rs" << 'EOF2'
 
 #[test]
@@ -156,15 +273,12 @@ if ! run_subset; then
     fail=1
 fi
 
-# The owner the document names must actually have something to catch. A hole nobody covers is
-# a different document from the one this check is guarding.
 if (cd "$scratch" && cargo clippy --all-targets -- -D warnings) >/dev/null 2>&1; then
     echo "integration: clippy did not catch the planted collapsible if let, so the class the document hands to the orchestrator is not real" >&2
     fail=1
 fi
 
-# --- Phase B: formatting and prose, which the document puts INSIDE the subset. A pane
-# following the work-cycle has to be stopped by each one before batch_pending.
+# --- Phase B: formatting and prose
 printf '\n\n\n' >> "$scratch/src/build_info.rs"
 if (cd "$scratch" && cargo fmt --check) >/dev/null 2>&1; then
     echo "integration: cargo fmt --check did not catch the planted formatting violation" >&2
@@ -181,9 +295,7 @@ if (cd "$scratch" && bin/slop-guard) >/dev/null 2>&1; then
     fail=1
 fi
 
-# --- Phase C: discrimination. If the subset refused everything regardless, every assertion
-# above would pass for the wrong reason, so a real syntax error must still be the thing
-# cargo check is there for.
+# --- Phase C: discrimination
 printf 'fn syntax_error_probe(\n' >> "$scratch/src/lib.rs"
 if (cd "$scratch" && cargo check -p agent-usage-book) >/dev/null 2>&1; then
     echo "integration: cargo check did not catch a real syntax error" >&2

@@ -287,15 +287,18 @@ panes at once is the bottleneck the whole model exists to remove.
 5. Commit, naming the bead id and the touched scope. The form to use, and the test to run
    before committing a shared file, are in *Committing into a shared index*.
 
-   **You have no way to know whether `main` is already red from lint, and nothing here
-   pretends otherwise.** The three commands above tell you about your own tree, not about
-   what landed before you: a clippy failure another pane committed is invisible to every
-   command you are allowed to run, and it stays invisible until the next batch verify. Do not
-   read a green subset as a clean `main`. `br list --status rework` does not answer this
-   either, because a bead only reaches `rework` after a verify has already run, which is the
-   delay itself rather than a warning about it. Commit anyway: stacking onto a tree that is
-   red from lint costs the orchestrator one central repair, and stopping the wave to guess
-   costs more.
+   **Check central verification before committing:** `bin/last-verify`. It reports in a
+   single line whether the last central verification was green and at which commit (`green
+   at HEAD`, `stale: green at <sha> (distance N)`, or `none: no central verification
+   verdict recorded`). It is machine-local (`.beads/last-verify`) and does not reach CI or
+   another clone. The three check commands above tell you about your own tree, while
+   `bin/last-verify` tells you whether `main` was clean when central verification last ran
+   and how many commits have landed since. Do not read a green subset as a clean `main` if
+   `bin/last-verify` reports a stale verdict or no verdict. `br list --status rework` does
+   not answer this either, because a bead only reaches `rework` after a verify has already
+   run, which is the delay itself rather than a warning about it. Commit anyway: stacking
+   onto a tree that is red from lint costs the orchestrator one central repair, and stopping
+   the wave to guess costs more.
 6. Move the bead to `batch_pending` **only when substantively complete**: code and tests
    written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
    concrete test, no known defect. `batch_pending` earns no capability credit; it frees
@@ -338,6 +341,16 @@ score. The moment agents are scored on commits you get commit pumping.
    not followed, and that bead goes back to `rework` like any other.
 5. Re-run until green. Every attempt is retained in the wave record; rerun-until-green is
    not proof that a failure was flaky.
+
+   **Record the central verification verdict when green:**
+
+   ```bash
+   bin/last-verify --record
+   ```
+
+   The verdict is recorded at step 5 after a green verification run and written to
+   `.beads/last-verify`. It is machine-local and does not reach CI or another clone, giving
+   panes a zero-compilation way to query central verification freshness.
 6. Close only green `batch_pending` beads, citing the verification run:
 
    ```bash
