@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# The persistent quantity-inventory guard (aub-rif.12): fails when one of the four
+# scoped domain files (docs/domain-quantity-inventory.md explains the scope, and why it
+# is these four and not every file under src/domain/) declares a public struct or enum
+# that is not named in that document's tables. A new quantity type is meant to force a
+# reader here, not slip past silently with no Default/Display coverage.
+#
+# This only checks that the DOCUMENT is complete relative to the SOURCE. It says
+# nothing about whether Default/Display are actually absent: that is
+# tests/compile_fail/domain_quantities_no_default.rs and
+# ..._no_display.rs's job, run by bin/checks/30-test.
+set -euo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+doc="docs/domain-quantity-inventory.md"
+files=(
+    src/domain/tokens.rs
+    src/domain/credits.rs
+    src/domain/quota.rs
+    src/domain/money.rs
+)
+
+# Every backtick-quoted, uppercase-starting identifier anywhere in the document: table
+# entries and the "excluded" bullet lists alike, one pass. Anchoring on an uppercase
+# first letter is what keeps this from also matching backticked prose like
+# `pub(crate)`, `default()` or a file name like `money.rs` (none start uppercase), while
+# still stopping at the first non-identifier character, so `Money<Usd>` contributes
+# `Money` and `Type::default()` contributes `Type`.
+inventoried=$(command grep -oE '`[A-Z][A-Za-z0-9_]*' "$doc" | sed -E 's/^`//' | sort -u)
+
+fail=0
+for f in "${files[@]}"; do
+    declared=$(command grep -oE '^pub (struct|enum) [A-Za-z0-9_]+' "$f" | awk '{print $3}' | sort -u)
+    while IFS= read -r name; do
+        [ -z "$name" ] && continue
+        if ! printf '%s\n' "$inventoried" | command grep -qx "$name"; then
+            echo "not in $doc: $name ($f)" >&2
+            fail=1
+        fi
+    done <<< "$declared"
+done
+
+if [ "$fail" -ne 0 ]; then
+    echo "quantity-inventory: FAILED - extend $doc (and the compile-fail fixtures it" >&2
+    echo "describes) to cover the type(s) named above before this check can pass." >&2
+    exit 1
+fi
+
+echo "quantity-inventory: every pub struct/enum in the scoped files is documented."

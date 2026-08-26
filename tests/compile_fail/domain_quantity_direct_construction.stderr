@@ -1,0 +1,38 @@
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/domain_quantity_direct_construction.rs:19:13
+   |
+19 |     let _ = InputTokens(5);
+   |             ^^^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/domain/tokens.rs
+   |
+   |           pub struct $name(u64);
+   |                            ^^^ private field
+...
+   | / token_newtype!(
+   | |     InputTokens,
+   | |     "Tokens consumed as the prompt/input side of a request."
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `token_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
+help: you might have meant to use the `new` associated function
+   |
+19 |     let _ = InputTokens::new(5);
+   |                        +++++
+
+error[E0423]: cannot initialize a tuple struct which contains private fields
+  --> tests/compile_fail/domain_quantity_direct_construction.rs:23:13
+   |
+23 |     let _ = QuotaUsed(inner);
+   |             ^^^^^^^^^
+   |
+note: constructor is not visible here due to private fields
+  --> src/domain/quota.rs
+   |
+   | pub struct QuotaUsed(QuotaFractionPpm);
+   |                      ^^^^^^^^^^^^^^^^ private field
+help: you might have meant to use the `new` associated function
+   |
+23 |     let _ = QuotaUsed::new(inner);
+   |                      +++++

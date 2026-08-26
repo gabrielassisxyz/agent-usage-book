@@ -1,0 +1,10 @@
+error[E0624]: associated function `from_micros_per_million_tokens` is private
+  --> tests/compile_fail/credits_per_token_construction_outside_boundary.rs:12:30
+   |
+12 |     let _ = CreditsPerToken::from_micros_per_million_tokens(1);
+   |                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/domain/credits.rs
+   |
+   |     pub(crate) const fn from_micros_per_million_tokens(micros_per_million_tokens: i64) -> Self {
+   |     ------------------------------------------------------------------------------------------ private associated function defined here

@@ -1,0 +1,203 @@
+error[E0599]: no associated function or constant named `default` found for struct `InputTokens` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:15:26
+   |
+15 |     let _ = InputTokens::default();
+   |                          ^^^^^^^ associated function or constant not found in `InputTokens`
+   |
+note: if you're trying to build a new `InputTokens`, consider using `InputTokens::new` which returns `InputTokens`
+  --> src/domain/tokens.rs
+   |
+   |               pub const fn new(value: u64) -> Self {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   | / token_newtype!(
+   | |     InputTokens,
+   | |     "Tokens consumed as the prompt/input side of a request."
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `token_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no associated function or constant named `default` found for struct `OutputTokens` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:16:27
+   |
+16 |     let _ = OutputTokens::default();
+   |                           ^^^^^^^ associated function or constant not found in `OutputTokens`
+   |
+note: if you're trying to build a new `OutputTokens`, consider using `OutputTokens::new` which returns `OutputTokens`
+  --> src/domain/tokens.rs
+   |
+   |               pub const fn new(value: u64) -> Self {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   | / token_newtype!(
+   | |     OutputTokens,
+   | |     "Tokens produced as the completion/output side of a request."
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `token_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no associated function or constant named `default` found for struct `CacheReadTokens` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:17:30
+   |
+17 |     let _ = CacheReadTokens::default();
+   |                              ^^^^^^^ associated function or constant not found in `CacheReadTokens`
+   |
+note: if you're trying to build a new `CacheReadTokens`, consider using `CacheReadTokens::new` which returns `CacheReadTokens`
+  --> src/domain/tokens.rs
+   |
+   |               pub const fn new(value: u64) -> Self {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   | / token_newtype!(
+   | |     CacheReadTokens,
+   | |     "Tokens served from a provider's prompt cache."
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `token_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no associated function or constant named `default` found for struct `CacheWriteTokens` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:18:31
+   |
+18 |     let _ = CacheWriteTokens::default();
+   |                               ^^^^^^^ associated function or constant not found in `CacheWriteTokens`
+   |
+note: if you're trying to build a new `CacheWriteTokens`, consider using `CacheWriteTokens::new` which returns `CacheWriteTokens`
+  --> src/domain/tokens.rs
+   |
+   |               pub const fn new(value: u64) -> Self {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   | / token_newtype!(
+   | |     CacheWriteTokens,
+   | |     "Tokens written into a provider's prompt cache."
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `token_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no associated function or constant named `default` found for struct `TokenCount` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:19:25
+   |
+19 |     let _ = TokenCount::default();
+   |                         ^^^^^^^ associated function or constant not found in `TokenCount`
+   |
+note: if you're trying to build a new `TokenCount`, consider using `TokenCount::new` which returns `TokenCount`
+  --> src/domain/tokens.rs
+   |
+   |               pub const fn new(value: u64) -> Self {
+   |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+   | / token_newtype!(
+   | |     TokenCount,
+   | |     "A count of tokens outside the four known per-kind newtypes.\n\nExists so \
+   | |      `UsageVector` can carry a provider- or CLI-reported component this project has not \
+...  |
+   | |      make once the source is understood, never an automatic conversion."
+   | | );
+   | |_- in this macro invocation
+   = note: this error originates in the macro `token_newtype` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+error[E0599]: no associated function or constant named `default` found for struct `KnownTokenVector` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:20:31
+   |
+20 |     let _ = KnownTokenVector::default();
+   |                               ^^^^^^^ associated function or constant not found in `KnownTokenVector`
+   |
+note: if you're trying to build a new `KnownTokenVector`, consider using `KnownTokenVector::new` which returns `KnownTokenVector`
+  --> src/domain/tokens.rs
+   |
+   | /     pub const fn new(
+   | |         input: InputTokens,
+   | |         output: OutputTokens,
+   | |         cache_read: CacheReadTokens,
+   | |         cache_write: CacheWriteTokens,
+   | |     ) -> Self {
+   | |_____________^
+
+error[E0599]: no associated function or constant named `default` found for struct `UsageVector` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:21:26
+   |
+21 |     let _ = UsageVector::default();
+   |                          ^^^^^^^ associated function or constant not found in `UsageVector`
+   |
+note: if you're trying to build a new `UsageVector`, consider using `UsageVector::new` which returns `UsageVector`
+  --> src/domain/tokens.rs
+   |
+   | /     pub fn new(
+   | |         known: KnownTokenVector,
+   | |         unknown: BTreeMap<String, TokenCount>,
+   | |         coverage: CoverageCompleteness,
+   | |         quality: EvidenceQuality<TokenCount>,
+   | |     ) -> Self {
+   | |_____________^
+
+error[E0599]: no associated function or constant named `default` found for struct `QuotaFractionPpm` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:22:31
+   |
+22 |     let _ = QuotaFractionPpm::default();
+   |                               ^^^^^^^ associated function or constant not found in `QuotaFractionPpm`
+   |
+note: if you're trying to build a new `QuotaFractionPpm`, consider using `QuotaFractionPpm::new` which returns `Option<QuotaFractionPpm>`
+  --> src/domain/quota.rs
+   |
+   |     pub fn new(value: i32) -> Option<Self> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `QuotaUsed` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:23:24
+   |
+23 |     let _ = QuotaUsed::default();
+   |                        ^^^^^^^ associated function or constant not found in `QuotaUsed`
+   |
+note: if you're trying to build a new `QuotaUsed`, consider using `QuotaUsed::new` which returns `QuotaUsed`
+  --> src/domain/quota.rs
+   |
+   |     pub fn new(ppm: QuotaFractionPpm) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `QuotaRemaining` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:24:29
+   |
+24 |     let _ = QuotaRemaining::default();
+   |                             ^^^^^^^ associated function or constant not found in `QuotaRemaining`
+   |
+note: if you're trying to build a new `QuotaRemaining`, consider using `QuotaRemaining::new` which returns `QuotaRemaining`
+  --> src/domain/quota.rs
+   |
+   |     pub fn new(ppm: QuotaFractionPpm) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `PercentagePoints` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:25:31
+   |
+25 |     let _ = PercentagePoints::default();
+   |                               ^^^^^^^ associated function or constant not found in `PercentagePoints`
+   |
+note: if you're trying to build a new `PercentagePoints`, consider using `PercentagePoints::new` which returns `Option<PercentagePoints>`
+  --> src/domain/quota.rs
+   |
+   |     pub fn new(value: i32) -> Option<Self> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `Money<C>` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:26:27
+   |
+26 |     let _ = Money::<Usd>::default();
+   |                           ^^^^^^^ associated function or constant not found in `Money<Usd>`
+   |
+note: if you're trying to build a new `Money<Usd>`, consider using `Money::<C>::from_micros` which returns `Money<_>`
+  --> src/domain/money.rs
+   |
+   |     pub const fn from_micros(micros: i64) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+error[E0599]: no associated function or constant named `default` found for struct `MoneyPerMillionTokens<C>` in the current scope
+  --> tests/compile_fail/domain_quantities_no_default.rs:27:43
+   |
+27 |     let _ = MoneyPerMillionTokens::<Usd>::default();
+   |                                           ^^^^^^^ associated function or constant not found in `MoneyPerMillionTokens<Usd>`
+   |
+note: if you're trying to build a new `MoneyPerMillionTokens<Usd>`, consider using `MoneyPerMillionTokens::<C>::from_micros_per_million` which returns `MoneyPerMillionTokens<_>`
+  --> src/domain/money.rs
+   |
+   |     pub const fn from_micros_per_million(micros_per_million: i64) -> Self {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
