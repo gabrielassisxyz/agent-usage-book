@@ -338,13 +338,25 @@ score. The moment agents are scored on commits you get commit pumping.
    not followed, and that bead goes back to `rework` like any other.
 5. Re-run until green. Every attempt is retained in the wave record; rerun-until-green is
    not proof that a failure was flaky.
-6. Record the gate and close only green `batch_pending` beads, citing the run:
+6. Close only green `batch_pending` beads, citing the verification run:
 
    ```bash
-   br gate report <id> --gate batch_verify --provider batch-orchestrator \
-     --status pass --to closed --note "commit:<sha> suites:<...>"
    br close <id> --reason "<evidence>" --transition-comment "<batch summary>"
    ```
+
+   **Batch-verify evidence lives directly in `--reason` and `--transition-comment`.**
+   The close reason captures the revision-bound proof (`commit:<sha> suites:<...>`),
+   and `--transition-comment` records the batch summary atomically on the bead.
+   Evidence is retrieved with `br show <id>` (or `br show --json <id>`, `br list --status closed`),
+   and an auditor greps for `close_reason` or the commit SHA.
+
+   **Why structured gate reporting (`br gate report`) was dropped instead of configured:**
+   Enforcing a `batch_verify` gate through `.beads/policy.yaml` would change close semantics
+   on a live tracker during an active unattended swarm run. Furthermore, external automated
+   dispatchers (`bin/swarm-dispatch`) close beads without writing gate records today.
+   Recording verification evidence directly in `--reason` and `--transition-comment` ensures every
+   close carries durable, queryable evidence on the bead itself without risking tracker refusal
+   under in-flight runs.
 
 7. **Sequence the next wave by blast radius, not only by the dependency graph.** Closing a
    layer refills the ready pool, and what leaves it is the orchestrator's choice. The
@@ -356,7 +368,7 @@ score. The moment agents are scored on commits you get commit pumping.
 
 The verification record is revision-bound: HEAD, toolchain and lockfile identity, the
 exact commands, the selected tests, and the exact bead list. Any movement of HEAD
-invalidates it. A gate result recorded against an earlier revision does not satisfy a
+invalidates it. Verification evidence recorded against an earlier revision does not satisfy a
 later close after rework.
 
 **A green union suite must map every closing bead to the exact tests that exercised its

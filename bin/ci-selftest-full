@@ -160,6 +160,53 @@ git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
 sed -i 's/diff HEAD -- mod\.rs/diff --cached -- mod.rs/' "$clone/bin/checks/75-commit-protocol"
 commit_protocol_mutant "index-scoped diff" "$clone" "did not report the foreign line"
 
+# --- batch-verify close protocol: bin/checks/80-batch-verify-close guards Phase 2 close procedure
+# conformance over AGENTS.md and integration on a scratch tracker. Mutate each half here.
+batch_verify_close_mutant() {  # $1 = label, $2 = clone dir, $3 = expected substring in output
+    local label="$1" clone="$2" needle="$3" output
+    output="$( (cd "$clone" && bin/checks/80-batch-verify-close) 2>&1 )"
+    if [ $? -eq 0 ]; then
+        note_fail "batch-verify close: $label: expected the check to fail after the mutation"
+        return
+    fi
+    if ! printf '%s' "$output" | grep -qF -- "$needle"; then
+        note_fail "batch-verify close: $label: failed, but never named '$needle'"
+        printf '%s\n' "$output" >&2
+    fi
+}
+
+clone="$scratch/batch-verify-close-baseline"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+if ! (cd "$clone" && bin/checks/80-batch-verify-close) >/tmp/ci-selftest-batch-verify-close-baseline.log 2>&1; then
+    note_fail "batch-verify close: baseline clone fails before any mutation; see /tmp/ci-selftest-batch-verify-close-baseline.log"
+fi
+
+# Conformance, planting the refused br gate report command back into AGENTS.md
+clone="$scratch/batch-verify-close-gate-report"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+sed -i 's/br close <id>/br gate report <id> --gate batch_verify --provider batch-orchestrator --status pass --to closed\nbr close <id>/' "$clone/AGENTS.md"
+batch_verify_close_mutant "re-introduced gate report" "$clone" "forbidden 'br gate report <id>' present"
+
+# Conformance, deleting the reason for dropping structured gates
+clone="$scratch/batch-verify-close-rationale"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+grep -v 'Why structured gate reporting' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
+mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
+batch_verify_close_mutant "deleted rationale" "$clone" "reason for dropping structured gate"
+
+# Conformance, deleting the evidence location and audit description
+clone="$scratch/batch-verify-close-evidence"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+grep -v 'Batch-verify evidence lives directly in' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
+mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
+batch_verify_close_mutant "deleted evidence description" "$clone" "batch-verify evidence location and audit"
+
+# Integration, corrupting the scratch close command
+clone="$scratch/batch-verify-close-bad-command"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+sed -i 's/br close "\$bead_id"/br close "\$bead_id" --nonexistent-unsupported-flag/' "$clone/bin/checks/80-batch-verify-close"
+batch_verify_close_mutant "corrupted close command" "$clone" "documented close command failed"
+
 # --- install-hooks: running it twice must be idempotent. ---
 clone="$scratch/hooks"
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
