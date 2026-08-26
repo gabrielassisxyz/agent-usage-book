@@ -12,7 +12,7 @@
 # (clippy and test compile the crate; audit resolves and reads the advisory database;
 # the fresh-clone scenario runs the whole bin/ci, which runs all of the above). Under
 # this project's code-first swarm discipline a pane runs `cargo check` only and leaves
-# building to the batch-verify pass — and a per-pane build against a shared tree that
+# building to the batch-verify pass, and a per-pane build against a shared tree that
 # other panes are actively editing can fail for reasons that have nothing to do with
 # this bead. Those four scenarios are SKIPPED unless CI_SELFTEST_RUN_BUILD=1, which is
 # what CI and the batch-verify pass are expected to set.

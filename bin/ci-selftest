@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Proves bin/ci's DISPATCHER MECHANICS: discovery order, multi-failure reporting, and
 # the non-executable/unreadable cases. Deliberately does not touch cargo, so it runs in
-# a fraction of a second and carries no build cost — a mutation to the dispatcher itself
+# a fraction of a second and carries no build cost. A mutation to the dispatcher itself
 # is what this catches, not a regression in cargo fmt/clippy/test/audit or the prose
 # guard, which bin/ci-selftest-full covers against the real bin/checks/ and a real
 # build.
