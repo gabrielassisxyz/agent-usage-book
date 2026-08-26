@@ -67,15 +67,24 @@ forbid "the refused gate report command is dropped" "$phase2" \
 require "the supported close command is printed" "$phase2" \
     'br close <id> --reason "<evidence>" --transition-comment "<batch summary>"'
 
-# Verify that the flags documented in AGENTS.md are accepted by the installed `br`
-br_close_help="$(br close --help 2>&1 || true)"
-if ! printf '%s' "$br_close_help" | command grep -qF -- "--reason"; then
-    echo "installed br close does not accept --reason" >&2
-    fail=1
-fi
-if ! printf '%s' "$br_close_help" | command grep -qF -- "--transition-comment"; then
-    echo "installed br close does not accept --transition-comment" >&2
-    fail=1
+# Verify that the flags documented in AGENTS.md are accepted by the installed `br`.
+#
+# Only where `br` is installed. A CI runner has no tracker, and `br close --help` there produces
+# no output at all, so an unguarded probe reports "installed br close does not accept --reason"
+# about a `br` that is not installed at all. That is a false finding of exactly the kind this
+# check exists to prevent, and it would fire against a perfectly correct document.
+if command -v br >/dev/null 2>&1; then
+    br_close_help="$(br close --help 2>&1 || true)"
+    if ! printf '%s' "$br_close_help" | command grep -qF -- "--reason"; then
+        echo "installed br close does not accept --reason" >&2
+        fail=1
+    fi
+    if ! printf '%s' "$br_close_help" | command grep -qF -- "--transition-comment"; then
+        echo "installed br close does not accept --transition-comment" >&2
+        fail=1
+    fi
+else
+    echo "br flag conformance: SKIPPED, br is not installed here"
 fi
 
 # Criterion 2: The reason for dropping structured gates is recorded so the next reader does not reopen it.
@@ -91,6 +100,17 @@ require "batch-verify evidence location and audit" "$phase2" \
     'close_reason'
 
 # --- Integration: drive a bead batch_pending -> closed on a scratch tracker ---
+#
+# The integration half needs the `br` binary, and CI runners do not have it. A check that fails
+# because the environment lacks the tool under test reports a defect that does not exist: it
+# would fail identically against a perfectly correct document. So the conformance half above,
+# which reads only the document, runs everywhere, and this half runs where the tracker exists.
+# It says out loud when it is skipped, because a silent skip is how a check quietly stops
+# meaning anything.
+if ! command -v br >/dev/null 2>&1; then
+    echo "integration: SKIPPED, br is not installed here (the document conformance above still ran)"
+    exit "$fail"
+fi
 
 scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-batch-verify-close-XXXXXX")"
 trap 'rm -rf "$scratch"' EXIT
