@@ -1,0 +1,125 @@
+#!/usr/bin/env bash
+# Proves the REAL bin/checks/ commands catch the regression each one exists to catch,
+# plus two whole-repo integration scenarios (install-hooks idempotence, a fresh clone is
+# green with no manual step). Complements bin/ci-selftest, which proves the dispatcher's
+# own mechanics against synthetic stub checks and never touches cargo.
+#
+# format and the prose guard are grep/syntax-only: no compilation, so they run
+# unconditionally and cheaply, each against its own fresh local clone so a mutation in
+# one scenario can never leak into another.
+#
+# lint, test, audit and the fresh-clone scenario each require a real cargo build
+# (clippy and test compile the crate; audit resolves and reads the advisory database;
+# the fresh-clone scenario runs the whole bin/ci, which runs all of the above). Under
+# this project's code-first swarm discipline a pane runs `cargo check` only and leaves
+# building to the batch-verify pass — and a per-pane build against a shared tree that
+# other panes are actively editing can fail for reasons that have nothing to do with
+# this bead. Those four scenarios are SKIPPED unless CI_SELFTEST_RUN_BUILD=1, which is
+# what CI and the batch-verify pass are expected to set.
+set -uo pipefail
+
+repo_root="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
+fail=0
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+run_build_scenarios="${CI_SELFTEST_RUN_BUILD:-0}"
+
+note_fail() {
+    echo "FAIL: $1" >&2
+    fail=1
+}
+
+# --- format: a stray run of blank lines is a real cargo-fmt violation. Checked against
+# a baseline first, so a pre-existing formatting problem elsewhere in an actively edited
+# shared tree is reported as itself rather than misread as this scenario's result. ---
+clone="$scratch/format"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+if ! (cd "$clone" && cargo fmt --check) >/tmp/ci-selftest-format-baseline.log 2>&1; then
+    note_fail "format: baseline clone is not fmt-clean before any mutation; see /tmp/ci-selftest-format-baseline.log"
+else
+    printf '\n\n\n' >> "$clone/src/build_info.rs"
+    if (cd "$clone" && cargo fmt --check) >/tmp/ci-selftest-format.log 2>&1; then
+        note_fail "format: expected cargo fmt --check to reject the injected blank lines"
+    fi
+fi
+
+# --- prose guard: an em-dash is exactly what bin/slop-guard exists to catch. ---
+clone="$scratch/prose"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+if ! (cd "$clone" && bin/slop-guard) >/tmp/ci-selftest-prose-baseline.log 2>&1; then
+    note_fail "prose guard: baseline clone is not slop-clean before any mutation; see /tmp/ci-selftest-prose-baseline.log"
+else
+    printf '\n// An em dash for the guard to catch \xe2\x80\x94 nothing else.\n' >> "$clone/src/build_info.rs"
+    if (cd "$clone" && bin/slop-guard) >/tmp/ci-selftest-prose.log 2>&1; then
+        note_fail "prose guard: expected bin/slop-guard to reject the injected em-dash"
+    fi
+fi
+
+# --- install-hooks: running it twice must be idempotent. ---
+clone="$scratch/hooks"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+(cd "$clone" && bin/install-hooks) >/tmp/ci-selftest-hooks1.log 2>&1 || note_fail "install-hooks: first run failed"
+(cd "$clone" && bin/install-hooks) >/tmp/ci-selftest-hooks2.log 2>&1 || note_fail "install-hooks: second run failed"
+hooks_path="$(cd "$clone" && git config --get core.hooksPath || true)"
+[ "$hooks_path" = ".githooks" ] || note_fail "install-hooks: core.hooksPath is '$hooks_path', expected .githooks"
+for h in commit-msg pre-commit; do
+    [ -x "$clone/.githooks/$h" ] || note_fail "install-hooks: $h is not executable after two runs"
+done
+
+if [ "$run_build_scenarios" != 1 ]; then
+    echo "CI_SELFTEST_RUN_BUILD is not 1: skipping lint, test, audit and the fresh-clone scenario."
+    echo "These require a real cargo build and are left to CI / batch-verify."
+else
+    # --- lint: an unused local is a real clippy warning under -D warnings. ---
+    clone="$scratch/lint"
+    git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+    cat >> "$clone/src/build_info.rs" <<'EOF'
+
+#[allow(dead_code)]
+fn ci_selftest_unused_variable_mutant() {
+    let unused = 1;
+}
+EOF
+    if (cd "$clone" && cargo clippy --all-targets -- -D warnings) >/tmp/ci-selftest-lint.log 2>&1; then
+        note_fail "lint: expected clippy -D warnings to reject the unused variable"
+    fi
+
+    # --- test: a deliberately wrong assertion is a real test failure. ---
+    clone="$scratch/test"
+    git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+    sed -i 's/assert_eq!(crate_version(), version_from_manifest());/assert_eq!(crate_version(), "not-the-real-version");/' \
+        "$clone/src/build_info.rs"
+    if (cd "$clone" && cargo test) >/tmp/ci-selftest-test.log 2>&1; then
+        note_fail "test: expected the mutated assertion to fail cargo test"
+    fi
+
+    # --- audit: proves cargo audit's exit code reaches bin/ci, by shadowing the binary
+    # rather than vendoring a real advisory, since this project pins no known-vulnerable
+    # dependency to break on purpose. ---
+    fake_bin="$scratch/fake-bin"
+    mkdir -p "$fake_bin"
+    cat > "$fake_bin/cargo-audit" <<'EOF'
+#!/usr/bin/env bash
+echo "ci-selftest: simulated advisory" >&2
+exit 1
+EOF
+    chmod +x "$fake_bin/cargo-audit"
+    clone="$scratch/audit"
+    git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+    if (cd "$clone" && PATH="$fake_bin:$PATH" cargo audit) >/tmp/ci-selftest-audit.log 2>&1; then
+        note_fail "audit: expected the simulated advisory to fail the check"
+    fi
+
+    # --- fresh clone: install-hooks + bin/ci is green with no manual step. ---
+    clone="$scratch/fresh"
+    git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+    if ! (cd "$clone" && bin/install-hooks && bin/ci) >/tmp/ci-selftest-fresh.log 2>&1; then
+        note_fail "fresh clone: install-hooks && bin/ci was not green; see /tmp/ci-selftest-fresh.log"
+    fi
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> bin/ci-selftest-full FAILED"
+    exit 1
+fi
+echo "bin/ci-selftest-full: all scenarios pass."

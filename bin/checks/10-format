@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Formatting is not negotiable per-diff: `--check` fails the gate rather than reporting.
+set -euo pipefail
+cargo fmt --check

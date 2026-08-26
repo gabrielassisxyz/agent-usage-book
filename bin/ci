@@ -1,14 +1,25 @@
 #!/usr/bin/env bash
 # The deterministic gate. This is the exact thing CI runs, so "green locally" means
-# "green in CI". Every check accumulates into `fail` rather than exiting early, so one
-# broken check does not hide the state of the others.
-set -euo pipefail
+# "green in CI".
+#
+# This script is a dispatcher, not a checklist: it runs every executable file under
+# bin/checks/, in sorted order, and reports which failed. A new gate check is a new
+# file under bin/checks/, never a new block appended here. At least six beads in this
+# project's tracker add a check (a forbidden-dependency rule, a coefficient tombstone,
+# an identity/privacy scan, a status-latency test, a guard-inventory runner, an
+# end-to-end suite); one file per check keeps their edit surfaces disjoint instead of
+# six beads serializing on one script under a shared-tree swarm.
+#
+# Every check runs to completion before this script decides anything: one broken check
+# must never hide the state of the others, which is why this omits `set -e`.
+set -uo pipefail
 
-fail=0
+cd "$(git rev-parse --show-toplevel)"
 
 # A tool this project cannot run without is a dependency, not a hurdle to document. A
 # `command -v X || exit 0` guard would turn the gate off on exactly the machine that
 # lacks the tool, and still report green.
+fail=0
 for b in cargo cargo-audit git; do
     if ! command -v "$b" >/dev/null 2>&1; then
         echo "missing: $b" >&2
@@ -60,29 +71,53 @@ fi
 echo "==> building in $CARGO_TARGET_DIR"
 # <<< repo-harness:cargo-build-root <<<
 
-echo "==> format check"
-cargo fmt --check || fail=1
+# CI_CHECKS_DIR exists so the dispatcher itself can be proven against a scratch
+# directory of stub checks (bin/ci-selftest), without needing a working cargo toolchain
+# to exercise discovery order, multi-failure reporting or the non-executable case.
+# Nothing but that self-test is meant to set it.
+checks_dir="${CI_CHECKS_DIR:-bin/checks}"
+if [ ! -d "$checks_dir" ]; then
+    echo "no $checks_dir directory: nothing to run" >&2
+    exit 1
+fi
 
-# --all-targets, because without it clippy never looks at a test target. The invariants
-# this project cares about (units, freshness) are asserted in tests, so exempting them
-# from the lint gate exempts the reasoning.
-echo "==> lint"
-cargo clippy --all-targets -- -D warnings || fail=1
+failed_checks=()
 
-echo "==> test"
-cargo test || fail=1
+# Null-delimited and explicitly sorted: discovery order must be the same on every
+# machine and every run, not whatever order the filesystem happens to hand back.
+while IFS= read -r -d '' check; do
+    name="$(basename "$check")"
 
-echo "==> dependency audit"
-cargo audit || fail=1
+    if [ ! -x "$check" ]; then
+        echo "==> $name: FAIL (not executable)"
+        fail=1
+        failed_checks+=("$name")
+        continue
+    fi
+    if [ ! -r "$check" ]; then
+        echo "==> $name: FAIL (unreadable)"
+        fail=1
+        failed_checks+=("$name")
+        continue
+    fi
 
-# Last, so a prose finding never masks a compile or test failure. The scan is whole-tree
-# and not diff-scoped: this repo started clean, so zero tolerance is reachable here, and
-# nothing gets grandfathered in by adopting a weaker posture later.
-echo "==> prose guard"
-bin/slop-guard || fail=1
+    echo "==> $name"
+    start="$(date +%s)"
+    "$check"
+    rc=$?
+    duration=$(( $(date +%s) - start ))
+
+    if [ "$rc" -eq 0 ]; then
+        echo "==> $name: PASS (${duration}s)"
+    else
+        echo "==> $name: FAIL (${duration}s, exit $rc)"
+        fail=1
+        failed_checks+=("$name")
+    fi
+done < <(find "$checks_dir" -mindepth 1 -maxdepth 1 -type f -print0 | sort -z)
 
 if [ "$fail" -ne 0 ]; then
-    echo "==> bin/ci FAILED"
+    echo "==> bin/ci FAILED: ${failed_checks[*]}"
     exit 1
 fi
 

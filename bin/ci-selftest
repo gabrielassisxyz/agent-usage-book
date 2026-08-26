@@ -1,0 +1,133 @@
+#!/usr/bin/env bash
+# Proves bin/ci's DISPATCHER MECHANICS: discovery order, multi-failure reporting, and
+# the non-executable/unreadable cases. Deliberately does not touch cargo, so it runs in
+# a fraction of a second and carries no build cost — a mutation to the dispatcher itself
+# is what this catches, not a regression in cargo fmt/clippy/test/audit or the prose
+# guard, which bin/ci-selftest-full covers against the real bin/checks/ and a real
+# build.
+#
+# Every scenario below breaks something on purpose and asserts bin/ci's exit code and
+# named output reflect it; a scenario that cannot fail is not a test, only ceremony.
+set -uo pipefail
+
+repo_root="$(git -C "$(dirname "$0")/.." rev-parse --show-toplevel)"
+ci_bin="$repo_root/bin/ci"
+fail=0
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+assert_exit() {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$actual" -ne "$expected" ]; then
+        echo "FAIL: $label: expected exit $expected, got $actual" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
+assert_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if ! printf '%s' "$haystack" | grep -qF -- "$needle"; then
+        echo "FAIL: $label: expected output to contain '$needle'" >&2
+        echo "--- actual output ---" >&2
+        printf '%s\n' "$haystack" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
+fresh_checks_dir() {
+    local dir="$scratch/$1"
+    mkdir -p "$dir"
+    printf '%s\n' "$dir"
+}
+
+make_check() {
+    local dir="$1" name="$2" exit_code="$3"
+    cat > "$dir/$name" <<EOF
+#!/usr/bin/env bash
+exit $exit_code
+EOF
+    chmod +x "$dir/$name"
+}
+
+# --- Scenario 1: every check passes -> bin/ci exits 0. ---
+dir="$(fresh_checks_dir all-pass)"
+make_check "$dir" "10-ok" 0
+make_check "$dir" "20-ok" 0
+out="$(CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+assert_exit "all-pass" 0 $?
+
+# --- Scenario 2: one broken check fails the run and is named. ---
+dir="$(fresh_checks_dir one-fail)"
+make_check "$dir" "10-ok" 0
+make_check "$dir" "20-broken" 1
+out="$(CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+rc=$?
+assert_exit "one-fail exit code" 1 "$rc"
+assert_contains "one-fail names the check" "20-broken" "$out"
+assert_contains "one-fail still ran the passing check" "10-ok" "$out"
+
+# --- Scenario 3: two broken checks are BOTH named, proving the run does not stop at
+# the first failure. ---
+dir="$(fresh_checks_dir two-fail)"
+make_check "$dir" "10-broken" 1
+make_check "$dir" "20-ok" 0
+make_check "$dir" "30-broken" 1
+out="$(CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+rc=$?
+assert_exit "two-fail exit code" 1 "$rc"
+assert_contains "two-fail names first" "10-broken" "$out"
+assert_contains "two-fail names second" "30-broken" "$out"
+assert_contains "two-fail still ran the passing one in between" "20-ok" "$out"
+
+# --- Scenario 4: a present, non-executable file fails the run rather than being
+# skipped silently. ---
+dir="$(fresh_checks_dir non-exec)"
+make_check "$dir" "10-ok" 0
+echo "exit 0" > "$dir/20-not-executable"
+chmod -x "$dir/20-not-executable"
+out="$(CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+rc=$?
+assert_exit "non-executable exit code" 1 "$rc"
+assert_contains "non-executable is named" "20-not-executable" "$out"
+assert_contains "non-executable reason" "not executable" "$out"
+
+# --- Scenario 5: a present, executable-but-unreadable file fails the run rather than
+# being skipped. Execute-only (no read bit) so it is caught by the readability check
+# specifically, not the executable check above. ---
+dir="$(fresh_checks_dir unreadable)"
+make_check "$dir" "10-ok" 0
+printf '#!/usr/bin/env bash\nexit 0\n' > "$dir/20-unreadable"
+chmod 100 "$dir/20-unreadable"
+out="$(CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+rc=$?
+assert_exit "unreadable exit code" 1 "$rc"
+assert_contains "unreadable is named" "20-unreadable" "$out"
+assert_contains "unreadable reason" "unreadable" "$out"
+
+# --- Scenario 6: discovery order is the sorted filename order, not creation order. ---
+dir="$(fresh_checks_dir order)"
+make_check "$dir" "30-third" 0
+make_check "$dir" "10-first" 0
+make_check "$dir" "20-second" 0
+out="$(CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+first_line="$(printf '%s\n' "$out" | grep -n '^==> 10-first$' | cut -d: -f1)"
+second_line="$(printf '%s\n' "$out" | grep -n '^==> 20-second$' | cut -d: -f1)"
+third_line="$(printf '%s\n' "$out" | grep -n '^==> 30-third$' | cut -d: -f1)"
+if ! { [ -n "$first_line" ] && [ -n "$second_line" ] && [ -n "$third_line" ] \
+    && [ "$first_line" -lt "$second_line" ] && [ "$second_line" -lt "$third_line" ]; }; then
+    echo "FAIL: order: expected 10-first, 20-second, 30-third in that order" >&2
+    printf '%s\n' "$out" >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> bin/ci-selftest FAILED"
+    exit 1
+fi
+
+echo "bin/ci-selftest: all dispatcher-mechanics scenarios pass."

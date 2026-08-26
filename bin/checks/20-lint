@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# `-D warnings`, or clippy becomes a report nobody reads. `--all-targets`, because
+# without it clippy never looks at a test target, and the invariants this project cares
+# about (units, freshness) are asserted in tests.
+set -euo pipefail
+cargo clippy --all-targets -- -D warnings

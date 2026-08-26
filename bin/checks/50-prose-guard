@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# Last, so a prose finding never masks a compile or test failure — though this dispatcher
+# runs every check regardless of order and reports all of them, unlike the script this
+# check was extracted from. The scan is whole-tree and not diff-scoped: this repo started
+# clean, so zero tolerance is reachable here.
+set -euo pipefail
+bin/slop-guard

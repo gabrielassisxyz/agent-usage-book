@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# `cargo audit` already fails its own exit code on an advisory; the only way this bead's
+# claim (a dependency CVE fails the build rather than getting printed) stops being true
+# is a `|| true` creeping back in here. There isn't one.
+set -euo pipefail
+cargo audit
