@@ -320,48 +320,40 @@ mod tests {
             .collect()
     }
 
-    /// A random short lowercase word, standing in for a label nobody enumerated. Not
-    /// filtered against `CREDENTIAL_LABEL_TOKENS`: even an accidental collision with a
-    /// known label is still a valid case, and the point of this generator is to reach
-    /// labels the code was never told about, which an unfiltered random word already
-    /// does with overwhelming probability.
-    fn synthetic_unknown_label(next: &mut impl FnMut() -> u64) -> String {
-        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
-        let len = 3 + (next() % 6) as usize;
-        (0..len)
-            .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize] as char)
-            .collect()
-    }
-
     /// Property: over a corpus of synthetic error bodies seeded with credential
     /// material, the sanitizer emits no credential substring, whether the secret is
     /// labeled with a known label, labeled with a label nobody enumerated, or bare.
     ///
-    /// The unknown-label template is the one that would have caught
+    /// The fifth template is the one that would have caught
     /// `sanitizer_redacts_a_secret_under_an_unenumerated_label`'s regression before it
-    /// shipped: the other four templates are all shapes the matcher already handled,
-    /// derived from the same mental model as the code, so they explore exactly the
-    /// space the matcher already covers. A generated corpus is only as good as the
-    /// shapes it can imagine.
+    /// shipped: the other four are all shapes the matcher already handled, derived from
+    /// the same mental model as the code, so on their own they explore exactly the
+    /// space the matcher already covers. Its label is a random short lowercase word
+    /// (not one of `CREDENTIAL_LABEL_TOKENS`, and not filtered against it: an
+    /// accidental collision would still be a valid case), derived from the generated
+    /// secret itself so it stays a plain `fn(&str) -> String` like the other four
+    /// rather than needing to capture the shared generator. A generated corpus is only
+    /// as good as the shapes it can imagine.
     #[test]
     fn sanitizer_never_leaks_a_seeded_credential_over_a_generated_corpus() {
         let mut next = xorshift(0xD1B5_4A32_7F19_9E3C);
-        let templates: [fn(&str) -> String; 4] = [
+        let templates: [fn(&str) -> String; 5] = [
             |secret| format!("error: Authorization: Bearer {secret} was rejected"),
             |secret| format!("upstream said api_key={secret} is invalid"),
             |secret| format!("body contained token unexpectedly: {secret}"),
             |secret| format!("{secret} appeared with nothing else around it"),
+            |secret| {
+                format!(
+                    "upstream rejected because {}={secret}",
+                    secret[..4].to_lowercase()
+                )
+            },
         ];
 
         for _ in 0..200 {
             let secret = synthetic_secret(&mut next);
-            let choice = next() % (templates.len() as u64 + 1);
-            let body = if choice < templates.len() as u64 {
-                templates[choice as usize](&secret)
-            } else {
-                let label = synthetic_unknown_label(&mut next);
-                format!("upstream rejected because {label}={secret}")
-            };
+            let template = templates[(next() % templates.len() as u64) as usize];
+            let body = template(&secret);
 
             let sanitized = sanitize_provider_error_text(&body);
             assert!(
