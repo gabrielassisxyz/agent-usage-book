@@ -1,0 +1,3 @@
+# Per-run log directories. They are records, not evidence: pruned to a bounded
+# number of recent runs by the runner, and never committed.
+runs/

@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# End-to-end suite gate. Builds the release binary and runs the whole case set
+# headless against isolated state directories, with a wall-clock budget that fails
+# the build when exceeded. The runner refuses to touch the operator state
+# directory, so this check is safe to run on a real machine.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+# The release binary is what the runner drives: the properties under test include
+# exit statuses, stream separation and the behaviour of a process that starts and
+# exits, none of which a library call proves.
+cargo build --release
+
+# Ask cargo where it actually put the binary: bin/ci points CARGO_TARGET_DIR at a
+# per-worktree directory and ~/.cargo/config.toml points it at a shared build disk,
+# so a hardcoded target/release path is wrong on at least one of those machines.
+target_dir="$(cargo metadata --format-version 1 --no-deps | jq -r '.target_directory')"
+aub_bin="$target_dir/release/aub"
+
+# The budget is a hard gate: a suite that grows without bound is a suite that
+# stops being run, and an unrun suite is a suite that proves nothing.
+budget_seconds="${E2E_BUDGET_SECONDS:-120}"
+
+start="$(date +%s)"
+AUB_BIN="$aub_bin" "$repo_root/tests/e2e/run.sh" --state-dir "$(mktemp -d "${TMPDIR:-/tmp}/aub-e2e-ci-XXXXXX")"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+
+echo "e2e suite: ${elapsed}s (budget ${budget_seconds}s)"
+if [ "$rc" -ne 0 ]; then
+    echo "==> e2e FAILED (exit $rc)"
+    exit 1
+fi
+if [ "$elapsed" -gt "$budget_seconds" ]; then
+    echo "==> e2e FAILED (budget exceeded: ${elapsed}s > ${budget_seconds}s)"
+    exit 1
+fi
+
+echo "e2e suite pass."
