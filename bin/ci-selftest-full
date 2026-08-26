@@ -59,12 +59,16 @@ fi
 
 # No rustup at all: the pin cannot be resolved, so the check must say so rather than
 # quietly comparing a compiler against itself.
-norustup="$scratch/toolchain-norustup"
-mkdir -p "$norustup"
-for tool in rustc cargo git awk sed grep head; do
-    real="$(command -v "$tool")"
-    [ -n "$real" ] && ln -sf "$real" "$norustup/$tool"
-done
+# Built by dropping every PATH entry that holds a rustup, rather than by listing the tools
+# the check needs: a shim directory would have to carry bash and the coreutils the check
+# and its own shebang resolve through, and a list like that goes stale the moment the check
+# reaches for one more.
+norustup=""
+while IFS= read -r -d ':' dir; do
+    [ -n "$dir" ] || continue
+    [ -x "$dir/rustup" ] && continue
+    norustup="$norustup${norustup:+:}$dir"
+done < <(printf '%s:' "$PATH")
 clone="$scratch/toolchain-missing-rustup"
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
 output="$( (cd "$clone" && PATH="$norustup" bin/checks/05-toolchain) 2>&1 )"
