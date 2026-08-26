@@ -1,0 +1,153 @@
+#!/usr/bin/env bash
+# The batch-verify close protocol guard (aub-h1nx): AGENTS.md must document a Phase 2 close
+# procedure that the installed tracker accepts, name where batch-verify evidence lives,
+# how it is audited, and why structured gate reporting was dropped rather than configured.
+#
+# Two halves, following the pattern of bin/checks/75-commit-protocol and bin/checks/78-pane-work-cycle:
+#   conformance  asserts the document drops the refused `br gate report` command, gives the
+#                supported `br close` command with `--reason` and `--transition-comment`,
+#                validates that the documented close flags are accepted by the installed `br`,
+#                names where evidence lives and how to query it, and records why the structured
+#                gate was dropped instead of configured.
+#   integration  runs the documented close procedure on a scratch tracker against a bead in
+#                `batch_pending`, asserting that the bead closes successfully and that the
+#                evidence is recorded in `close_reason` and comment fields retrievable by `br show`.
+set -uo pipefail
+
+cd "$(git rev-parse --show-toplevel)"
+
+doc="AGENTS.md"
+fail=0
+
+# Extract Phase 2 section
+phase2="$(awk '
+    /^### Phase 2: batch verify and close/ { grab = 1; next }
+    grab && /^### / { exit }
+    grab { print }
+' "$doc")"
+
+if [ -z "$phase2" ]; then
+    echo "$doc: no '### Phase 2: batch verify and close' section" >&2
+    exit 1
+fi
+
+require() {  # $1 = criterion, $2 = haystack, $3.. = substrings required
+    local criterion="$1" haystack="$2"
+    shift 2
+    local h_norm n_norm needle
+    h_norm="$(printf '%s' "$haystack" | tr '\n\t' ' ' | tr -s ' ')"
+    for needle in "$@"; do
+        n_norm="$(printf '%s' "$needle" | tr '\n\t' ' ' | tr -s ' ')"
+        if ! printf '%s' "$h_norm" | command grep -qF -- "$n_norm"; then
+            echo "$doc: $criterion: missing '$needle'" >&2
+            fail=1
+        fi
+    done
+}
+
+forbid() {  # $1 = criterion, $2 = haystack, $3.. = substrings forbidden
+    local criterion="$1" haystack="$2"
+    shift 2
+    local needle
+    for needle in "$@"; do
+        if printf '%s' "$haystack" | command grep -qF -- "$needle"; then
+            echo "$doc: $criterion: forbidden '$needle' present" >&2
+            fail=1
+        fi
+    done
+}
+
+# --- Conformance checks ---
+
+# Criterion 1: AGENTS.md stops printing the refused `br gate report` command and gives the supported close command.
+forbid "the refused gate report command is dropped" "$phase2" \
+    'br gate report <id>' \
+    '--gate batch_verify'
+
+require "the supported close command is printed" "$phase2" \
+    'br close <id> --reason "<evidence>" --transition-comment "<batch summary>"'
+
+# Verify that the flags documented in AGENTS.md are accepted by the installed `br`
+br_close_help="$(br close --help 2>&1 || true)"
+if ! printf '%s' "$br_close_help" | command grep -qF -- "--reason"; then
+    echo "installed br close does not accept --reason" >&2
+    fail=1
+fi
+if ! printf '%s' "$br_close_help" | command grep -qF -- "--transition-comment"; then
+    echo "installed br close does not accept --transition-comment" >&2
+    fail=1
+fi
+
+# Criterion 2: The reason for dropping structured gates is recorded so the next reader does not reopen it.
+require "reason for dropping structured gate" "$phase2" \
+    'Why structured gate reporting (`br gate report`) was dropped instead of configured' \
+    'live tracker' \
+    'bin/swarm-dispatch'
+
+# Criterion 5: The document names where batch-verify evidence lives and what makes it auditable.
+require "batch-verify evidence location and audit" "$phase2" \
+    'Batch-verify evidence lives directly in `--reason` and `--transition-comment`' \
+    'br show <id>' \
+    'close_reason'
+
+# --- Integration: drive a bead batch_pending -> closed on a scratch tracker ---
+
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-batch-verify-close-XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+
+git init --quiet "$scratch"
+git -C "$scratch" config user.email orchestrator@example.invalid
+git -C "$scratch" config user.name orchestrator
+
+(
+    cd "$scratch"
+    br init --quiet 2>/dev/null || br init
+    chmod 700 .beads
+)
+
+create_json="$( (cd "$scratch" && br create --title "Scratch batch-verify bead" --type task --priority 2 --json) 2>/dev/null || true )"
+bead_id="$(printf '%s' "$create_json" | jq -r 'if type=="array" then .[0].id else .id end // empty')"
+if [ -z "$bead_id" ]; then
+    echo "integration: failed to create scratch bead" >&2
+    exit 1
+fi
+
+(cd "$scratch" && br update "$bead_id" --status in_progress >/dev/null)
+(cd "$scratch" && br update "$bead_id" --status batch_pending >/dev/null)
+
+# Run the documented close command
+evidence="commit:0123456789abcdef suites:unit,integration,e2e"
+batch_summary="batch 42: union green across 5 beads"
+
+if ! (cd "$scratch" && br close "$bead_id" --reason "$evidence" --transition-comment "$batch_summary" >/dev/null 2>&1); then
+    echo "integration: documented close command failed on batch_pending bead" >&2
+    fail=1
+fi
+
+# Inspect the closed bead to assert evidence was durably recorded and queryable
+bead_json="$( (cd "$scratch" && br show --json "$bead_id") 2>/dev/null || true )"
+status="$(printf '%s' "$bead_json" | jq -r 'if type=="array" then .[0].status else .status end // empty')"
+close_reason="$(printf '%s' "$bead_json" | jq -r 'if type=="array" then .[0].close_reason else .close_reason end // empty')"
+comment_text="$(printf '%s' "$bead_json" | jq -r 'if type=="array" then .[0].comments[0].text else .comments[0].text end // empty')"
+
+if [ "$status" != "closed" ]; then
+    echo "integration: bead was not closed: status is '$status'" >&2
+    fail=1
+fi
+
+if [ "$close_reason" != "$evidence" ]; then
+    echo "integration: close_reason mismatch: expected '$evidence', got '$close_reason'" >&2
+    fail=1
+fi
+
+if [ "$comment_text" != "$batch_summary" ]; then
+    echo "integration: transition comment mismatch: expected '$batch_summary', got '$comment_text'" >&2
+    fail=1
+fi
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> batch-verify-close FAILED" >&2
+    exit 1
+fi
+
+echo "batch-verify-close: the Phase 2 close command is accepted by br, evidence location is documented and auditable, and scratch close succeeds."
