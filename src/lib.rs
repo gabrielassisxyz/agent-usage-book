@@ -14,6 +14,7 @@ pub mod cost_model;
 pub mod coverage;
 pub mod dedup;
 pub mod domain;
+pub mod error;
 pub mod evidence;
 pub mod meter;
 pub mod presentation;
