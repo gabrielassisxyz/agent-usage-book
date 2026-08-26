@@ -9,7 +9,7 @@ checked, so a case cannot be dropped from this document while remaining in the d
 | --- | --- | --- | --- |
 | 1 | TokenCount + Credits | covered | cross_type_arithmetic.rs |
 | 2 | QuotaUsed + Money | covered | quota_used_plus_money.rs |
-| 3 | Credits passed to formatter expecting tokens | covered | token_kind_mismatch.rs |
+| 3 | Credits passed to formatter expecting tokens | covered | credits_where_tokens_expected.rs |
 | 4 | QuotaRemaining passed as QuotaUsed | covered | quota_used_where_remaining_expected.rs |
 | 5 | USD added to another currency without conversion | covered | money_cross_currency.rs |
 | 6 | quantity.unwrap_or_default() | covered | domain_quantities_unwrap_or_default.rs |

@@ -1,15 +1,7 @@
-error[E0369]: cannot add `Credits` to `Tokens`
-  --> tests/compile_fail/cross_type_arithmetic.rs:13:23
+error[E0308]: mismatched types
+  --> tests/compile_fail/cross_type_arithmetic.rs:10:25
    |
-13 |     let _sum = tokens + credits;
-   |                ------ ^ ------- Credits
+10 |     let _sum = tokens + credits;
+   |                ------   ^^^^^^^ expected `TokenCount`, found `Credits`
    |                |
-   |                Tokens
-   |
-note: an implementation of `Add<Credits>` might be missing for `Tokens`
-  --> tests/compile_fail/cross_type_arithmetic.rs:7:1
-   |
- 7 | struct Tokens(u64);
-   | ^^^^^^^^^^^^^ must implement `Add<Credits>`
-note: the trait `Add` must be implemented
-  --> library/core/src/ops/arith.rs:76:0
+   |                expected because this is `TokenCount`

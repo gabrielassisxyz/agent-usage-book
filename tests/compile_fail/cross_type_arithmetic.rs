@@ -1,14 +1,11 @@
-// Compile-fail canary: demonstrates the invariant the domain newtypes will enforce,
-// that quantities are distinct types and arithmetic between them is closed. Adding a
-// token count to a credit count must not compile. The domain beads replace this
-// placeholder with cases against the real types; until then it proves the harness
-// catches a real, specific compile error rather than a typo.
+// Adding a token count to a credit count must not compile: the two are
+// distinct quantities, and no Add implementation exists between them.
 
-struct Tokens(u64);
-struct Credits(u64);
+use agent_usage_book::domain::credits::Credits;
+use agent_usage_book::domain::tokens::TokenCount;
 
 fn main() {
-    let tokens = Tokens(10);
-    let credits = Credits(5);
+    let tokens = TokenCount::new(10);
+    let credits = Credits::from_micros(5);
     let _sum = tokens + credits;
 }
