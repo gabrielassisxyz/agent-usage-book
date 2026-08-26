@@ -29,6 +29,10 @@ same checkout, on the same branch, and coordinates through the three protections
 rather than through filesystem isolation. The reasoning, and what replaces the isolation,
 is in *Coordination under one shared tree*.
 
+`bin/worktree` is tracked here anyway, because the repo harness installs one copy of it in
+every repository it manages. It is not for panes. Nothing in this file ever calls it, and a
+pane that reaches for it because it is sitting there has broken this rule.
+
 ## Irreversible Git and Filesystem Actions - DO NOT EVER BREAK GLASS
 
 `git reset --hard`, `git clean -fd`, `git checkout -- <path>`, `git push --force`,
@@ -42,20 +46,20 @@ Before assuming a commit was lost, check rather than repair:
 
 ## Git Branch: ONLY `main`, NEVER `master`
 
-The default branch is `main`. Implementation runs on one shared feature branch off `main`,
-and that branch reaches `main` as a single pull request once the hardening gate passes.
-Nothing else about the swarm changes if that boundary moves.
+`main` is the default branch and the only branch this repository has. Panes commit to it
+and push, with no branch of their own and no pull request in the path. This is the method's
+own position, adopted whole: branch-per-agent is merge hell, and a logical conflict between
+two beads surfaces faster when both land on one branch than when they sit in two.
 
-**This diverges from the method deliberately.** The method's own position is that agents
-commit straight to `main` with no pull request and no approval gate, on the argument that
-branch-per-agent is merge hell and a logical conflict surfaces faster on a shared branch.
-The first half is adopted here in full: one branch, all agents, no per-agent isolation.
-The second half is not, for one reason that does not apply to a private greenfield tree.
-This repository is public, so its history is the artifact, and a single reviewable pull
-request keeps the implementation revertable as one unit and puts `bin/ci` between the
-swarm and the branch anyone else reads. CI runs on pushes to `main` as well, so the gate
-is not the only thing the pull request buys, and this line gets revisited if the merge
-ever costs more than it protects.
+CI runs on every push to `main`, so the gate sits between a commit and the branch anyone
+else reads either way.
+
+**An earlier version of this section described a shared feature branch reaching `main` as
+one reviewable pull request after the hardening gate.** That branch was never created. Every
+commit of the first swarm landed on `main` directly, and the only pull requests this
+repository has predate it and carry harness changes made by hand. The text was left here
+long enough to be read by panes that would have gone looking for a branch that does not
+exist, or created one, which Rule 2 forbids in the line above.
 
 ## Toolchain: Rust and Cargo
 
@@ -235,6 +239,12 @@ building, and the build runs once, centrally, over everyone's combined changes.
    written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
    concrete test, no known defect. `batch_pending` earns no capability credit; it frees
    claim capacity.
+
+   **Then read the status back.** `br update --status` takes free text and validates
+   nothing: `--status batch_pendign` is accepted, prints a normal transition line, and
+   leaves the bead in a state no query names. It is gone from `in_progress`, so nobody
+   thinks it is being worked, and absent from `batch_pending`, so the verify pass never
+   collects it. `br show <id>` is the whole check, and it costs one call.
 7. Release the reservation and take the next bead.
 
 Commit rate during a wave is a saturation signal for the orchestrator, never a per-agent
@@ -626,10 +636,29 @@ A session is not finished until the work is visible to everyone else.
 
 1. File the remaining work as beads rather than as prose in a message.
 2. Release every reservation you still hold.
-3. `bin/ci` green.
-4. Commit, then `git pull --rebase && git push`, and confirm `git status` reports the
-   branch up to date. Rebasing your own unpushed commits onto what the others landed is
-   the normal path; rewriting a commit that is already pushed is not, and a force push
-   never is.
+3. Run the gate your phase allows. **During a wave that is `cargo check` and nothing more**,
+   because the orchestrator kills per-agent builds every tick and a `bin/ci` started here
+   dies mid-run; proof is the batch-verify pass's job, and a bead reaching `batch_pending`
+   is what asks for it. `bin/ci` is the right closing gate only outside a wave, when no
+   orchestrator is reaping and the tree is yours.
+4. Commit with the path-scoped form from *Committing into a shared index*, then push.
+
+   **If the push is rejected because the branch moved, merge. Never rebase.**
+
+   ```bash
+   git fetch origin && git merge origin/main
+   ```
+
+   `git rebase` and `git pull --rebase` refuse outright while any file is unstaged, even a
+   file the incoming commits never touched, and in a shared tree some pane is always
+   mid-edit: *"cannot rebase: You have unstaged changes."* The two exits git then offers are
+   the two this file forbids, since committing sweeps another pane's work and stashing
+   disturbs it. `git merge` takes the incoming commits and leaves every foreign edit exactly
+   where it was. When the incoming commits touch the very file another pane has open, the
+   merge aborts without changing anything, which is the moment to take a bead with a
+   different edit surface rather than to force it.
+
+   Rewriting a commit that is already pushed is not the normal path, and a force push never
+   is.
 5. Record the outcome on each bead you touched. A bead left `in_progress` with no comment
    is indistinguishable from an abandoned one.
