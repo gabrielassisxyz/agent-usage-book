@@ -23,6 +23,7 @@ path = "src/main.rs"
 
 [dev-dependencies]
 trybuild = "1"
+test-support = { path = "crates/test-support" }
 
 [profile.release]
 strip = true
