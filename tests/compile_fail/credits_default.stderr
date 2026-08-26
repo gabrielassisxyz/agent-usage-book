@@ -1,0 +1,11 @@
+error[E0599]: no associated function or constant named `default` found for struct `Credits` in the current scope
+ --> tests/compile_fail/credits_default.rs:8:22
+  |
+8 |     let _ = Credits::default();
+  |                      ^^^^^^^ associated function or constant not found in `Credits`
+  |
+note: if you're trying to build a new `Credits`, consider using `Credits::from_micros` which returns `Credits`
+ --> src/domain/credits.rs
+  |
+  |     pub const fn from_micros(micros: i64) -> Self {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
