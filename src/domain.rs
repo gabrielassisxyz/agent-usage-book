@@ -1,0 +1,6 @@
+//! Quantities, identifiers, freshness, window semantics, intervals, and provenance.
+//!
+//! May not depend on:
+//! - SQLite, HTTP, or terminal-formatting crates
+//! - transcript locations
+//! - any adapter, workflow, or presentation layer
