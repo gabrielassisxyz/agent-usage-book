@@ -46,6 +46,17 @@ pub struct FlagPolicy {
 }
 
 impl Command {
+    /// Every command, in one place: the enumeration test drives from this rather
+    /// than keeping its own private list, so there is exactly one array to update
+    /// when a variant is added, not two.
+    pub const ALL: [Self; 5] = [
+        Self::Status,
+        Self::Config,
+        Self::LoggingFixture,
+        Self::StateCheck,
+        Self::ExitClass,
+    ];
+
     /// The shared-flag policy for this command: which global flags it accepts
     /// and which it explicitly rejects.
     ///
@@ -338,6 +349,27 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 mod tests {
     use super::*;
     use crate::config::FakeEnv;
+
+    /// Every command declares a shared-flag policy, and the policy is well-formed:
+    /// verbosity is accepted everywhere, and a rejected `--format` states why rather
+    /// than rejecting silently.
+    #[test]
+    fn every_command_declares_a_shared_flag_policy() {
+        for command in Command::ALL {
+            let policy = command.flag_policy();
+            assert_eq!(
+                policy.verbosity,
+                FlagSupport::Accepted,
+                "{command:?} must accept verbosity"
+            );
+            if let FlagSupport::Rejected { reason } = policy.format {
+                assert!(
+                    !reason.is_empty(),
+                    "{command:?} rejects --format without a reason"
+                );
+            }
+        }
+    }
 
     #[test]
     fn apply_set_parses_a_well_formed_key_value_pair() {
