@@ -178,12 +178,20 @@ mod tests {
 
     /// A test-only domain quantity over `f64`, so the arithmetic can be
     /// exercised before the real quantities exist.
-    #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
+    #[derive(Debug, Clone, Copy, PartialEq)]
     struct TestQuantity(f64);
 
     impl Ord for TestQuantity {
         fn cmp(&self, other: &Self) -> Ordering {
             self.0.partial_cmp(&other.0).expect("no NaN in tests")
+        }
+    }
+
+    // Derived alongside `Ord` the two disagree silently, which is the defect clippy
+    // names here; delegating keeps one definition of the order.
+    impl PartialOrd for TestQuantity {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
         }
     }
 

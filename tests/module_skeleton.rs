@@ -226,8 +226,8 @@ fn system_clock_calls_only_in_the_clock_module() {
     let mut files = Vec::new();
     collect_rs_files(&format!("{root}/src"), &mut files);
     for path in files {
-        let source = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
+        let source =
+            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
         for pattern in SYSTEM_CLOCK_PATTERNS {
             assert!(
                 !source.contains(pattern) || path.ends_with(CLOCK_MODULE),
