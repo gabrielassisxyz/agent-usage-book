@@ -73,17 +73,83 @@ fn references_crate(source: &str, name: &str) -> bool {
 }
 
 /// True when `source` declares a code item (function, impl, static, or const) outside a
-/// line comment.
+/// line comment, regardless of any visibility or qualifier prefix on the declaration.
 fn has_code_item(source: &str) -> bool {
     source.lines().any(|line| {
         let trimmed = line.trim();
         if trimmed.starts_with("//") {
             return false;
         }
-        ["fn ", "impl ", "static ", "const "]
-            .iter()
-            .any(|kw| trimmed.starts_with(kw))
+        is_code_item_keyword(strip_leading_modifiers(trimmed))
     })
+}
+
+/// Strips leading visibility and function-qualifier tokens so the remainder begins at
+/// the item keyword. `const` is deliberately not stripped: it is itself an item keyword
+/// (`const X: T = ...`), so it is matched below rather than removed.
+fn strip_leading_modifiers(mut line: &str) -> &str {
+    loop {
+        let Some(rest) = strip_one_modifier(line) else {
+            return line;
+        };
+        line = rest;
+    }
+}
+
+/// Removes one leading modifier token, returning the remainder, or `None` when the line
+/// does not begin with a modifier.
+fn strip_one_modifier(line: &str) -> Option<&str> {
+    // `pub(in path)` is a single visibility token: consume through the closing paren
+    // before bare `pub` can match its prefix.
+    if let Some(rest) = line.strip_prefix("pub(in")
+        && let Some(close) = rest.find(')')
+    {
+        return Some(rest[close + 1..].trim_start());
+    }
+    // `extern "abi"` carries an optional ABI string literal before the item keyword.
+    if let Some(rest) = line.strip_prefix("extern")
+        && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+    {
+        return Some(strip_abi_string(rest.trim_start()));
+    }
+    // Single-token modifiers, longest first so `pub(crate)` is not eaten as bare `pub`.
+    for modifier in [
+        "pub(crate)",
+        "pub(super)",
+        "pub(self)",
+        "pub",
+        "crate",
+        "async",
+        "unsafe",
+        "default",
+    ] {
+        let Some(rest) = line.strip_prefix(modifier) else {
+            continue;
+        };
+        if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+            return Some(rest.trim_start());
+        }
+    }
+    None
+}
+
+/// Consumes a leading `"abi"` string literal, when present, returning the remainder.
+fn strip_abi_string(line: &str) -> &str {
+    let Some(after_open) = line.strip_prefix('"') else {
+        return line;
+    };
+    match after_open.find('"') {
+        Some(close) => after_open[close + 1..].trim_start(),
+        None => line,
+    }
+}
+
+fn is_code_item_keyword(line: &str) -> bool {
+    line.starts_with("fn ")
+        || line.starts_with("static ")
+        || line.starts_with("const ")
+        || line.starts_with("impl ")
+        || line.starts_with("impl<")
 }
 
 #[test]
@@ -141,11 +207,45 @@ fn dependency_check_rejects_a_planted_forbidden_dependency() {
 
 #[test]
 fn code_item_check_rejects_a_planted_implementation() {
+    // A comment-only module is clean.
     assert!(!has_code_item("//! header only\n"));
+
+    // Bare forms.
     assert!(has_code_item("fn convert() {}\n"));
     assert!(has_code_item("static WITNESS: u64 = 1;\n"));
     assert!(has_code_item("const WITNESS: u64 = 1;\n"));
     assert!(has_code_item("impl CostModel {}\n"));
+
+    // Visibility prefixes, which a usable conversion must carry.
+    assert!(has_code_item("pub fn planted() {}\n"));
+    assert!(has_code_item("pub(crate) fn planted() {}\n"));
+    assert!(has_code_item("pub(super) fn planted() {}\n"));
+    assert!(has_code_item("pub const WITNESS: u64 = 1;\n"));
+    assert!(has_code_item("pub static WITNESS: u64 = 1;\n"));
+
+    // Function qualifiers.
+    assert!(has_code_item("async fn planted() {}\n"));
+    assert!(has_code_item("unsafe fn planted() {}\n"));
+    assert!(has_code_item("const fn planted() {}\n"));
+    assert!(has_code_item("unsafe impl CostModel {}\n"));
+    assert!(has_code_item("extern \"C\" fn planted() {}\n"));
+
+    // A type definition is not a conversion implementation or a global witness.
+    assert!(!has_code_item("pub struct CostModel;\n"));
+}
+
+#[test]
+fn a_public_item_planted_in_a_real_conversion_module_is_detected() {
+    // The real check reads the module file from disk and feeds its whole contents to
+    // has_code_item; feed that same file with a public conversion planted, to prove the
+    // wiring catches a violation in a real module rather than only in a string literal.
+    let path = format!("{}/src/cost_model.rs", env!("CARGO_MANIFEST_DIR"));
+    let real = fs::read_to_string(&path).expect("src/cost_model.rs must exist");
+    let planted = format!("{real}\npub fn planted_conversion() {{}}\n");
+    assert!(
+        has_code_item(&planted),
+        "a public conversion planted into src/cost_model.rs must be detected"
+    );
 }
 
 #[test]
