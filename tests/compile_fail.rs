@@ -54,3 +54,32 @@ fn regeneration_procedure_is_documented() {
         "the regeneration procedure must name the TRYBUILD=overwrite command"
     );
 }
+
+/// The coverage list must name every case in design section 34.1, so a case cannot be
+/// dropped from the document while remaining in the design.
+#[test]
+fn coverage_list_names_every_section_34_1_case() {
+    const CASES: [&str; 12] = [
+        "TokenCount + Credits",
+        "QuotaUsed + Money",
+        "Credits passed to formatter",
+        "QuotaRemaining passed as QuotaUsed",
+        "USD added to another currency",
+        "unwrap_or_default",
+        "bare Display",
+        "WindowCalibration outside",
+        "CostModel without an observed TokenKind",
+        "combine Measured and Estimated",
+        "Derivation::Unavailable",
+        "exhaustive model construction",
+    ];
+    let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/compile-fail-coverage.md");
+    let contents =
+        fs::read_to_string(&doc).expect("docs/compile-fail-coverage.md must be readable");
+    for case in CASES {
+        assert!(
+            contents.contains(case),
+            "coverage list does not name case: {case}"
+        );
+    }
+}

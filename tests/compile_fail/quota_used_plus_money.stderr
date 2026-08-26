@@ -1,0 +1,13 @@
+error[E0369]: cannot add `Money<Usd>` to `QuotaUsed`
+  --> tests/compile_fail/quota_used_plus_money.rs:11:21
+   |
+11 |     let _sum = used + money;
+   |                ---- ^ ----- Money<Usd>
+   |                |
+   |                QuotaUsed
+   |
+note: `QuotaUsed` does not implement `Add<Money<Usd>>`
+  --> src/domain/quota.rs
+   |
+   | pub struct QuotaUsed(QuotaFractionPpm);
+   | ^^^^^^^^^^^^^^^^^^^^ `QuotaUsed` is defined in another crate
