@@ -266,16 +266,8 @@ mod tests {
     /// produces the same hash.
     #[test]
     fn inputs_hash_is_canonical_across_orderings() {
-        let forward = ProvenanceManifest::new(
-            evidence(&["a", "b", "c"]),
-            [],
-            semantics(),
-        );
-        let reversed = ProvenanceManifest::new(
-            evidence(&["c", "b", "a"]),
-            [],
-            semantics(),
-        );
+        let forward = ProvenanceManifest::new(evidence(&["a", "b", "c"]), [], semantics());
+        let reversed = ProvenanceManifest::new(evidence(&["c", "b", "a"]), [], semantics());
         assert_eq!(forward.inputs_hash(), reversed.inputs_hash());
         assert_eq!(forward.input_count(), reversed.input_count());
     }
