@@ -64,11 +64,28 @@ fn rustc_reported_version() -> String {
         .to_string()
 }
 
+/// The toolchain file for the package whose manifest lives in `manifest_dir`.
+///
+/// The directory is a parameter so the caller decides where it comes from: the build
+/// script reads it from the `CARGO_MANIFEST_DIR` environment variable at run time,
+/// never from `env!("CARGO_MANIFEST_DIR")`. `env!` bakes the directory that *compiled*
+/// this script into the binary, and the shared `CARGO_TARGET_DIR` hands one worktree's
+/// compiled build script to another: the baked path then points at a worktree that may
+/// be gone, and the build fails blaming a `rust-toolchain.toml` that is correct.
+pub fn toolchain_file_path(manifest_dir: &std::path::Path) -> std::path::PathBuf {
+    manifest_dir.join("rust-toolchain.toml")
+}
+
 /// Reads `rust-toolchain.toml` and returns the `channel` value from its `[toolchain]`
-/// table, or `None` when the file cannot be read or the key is absent.
+/// table, or `None` when the file is readable but the key is absent. A file that cannot
+/// be read is a different failure and panics naming the path that was tried, so the
+/// message cannot send the next reader to a file that is correct.
 fn channel_from_toolchain_file() -> Option<String> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("rust-toolchain.toml");
-    let contents = std::fs::read_to_string(path).ok()?;
+    let manifest_dir = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("cargo must set CARGO_MANIFEST_DIR when running a build script");
+    let path = toolchain_file_path(std::path::Path::new(&manifest_dir));
+    let contents = std::fs::read_to_string(&path)
+        .unwrap_or_else(|err| panic!("cannot read {}: {err}", path.display()));
     channel_from_toolchain_toml(&contents)
 }
 
