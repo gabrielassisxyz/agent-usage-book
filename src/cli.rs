@@ -37,6 +37,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     };
     match first.to_str() {
         Some("status") => status(&RealClock::new(), level),
+        Some("config") => config_command(args),
         Some("__logging-fixture") => logging_fixture(&RealClock::new(), level),
         Some("__exit-class") => {
             let class = args
@@ -50,6 +51,81 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Some(other) => Err(Error::Usage(format!("unknown argument: {other}"))),
         None => Err(Error::Usage("argument is not valid UTF-8".into())),
     }
+}
+
+/// `aub config`: prints every resolved key with the source that won it. Never prints
+/// a raw value from the `accounts` section: that section's provenance is reported as
+/// one bucket (`accounts`, source `file` once any account is configured), never
+/// key-by-key, so a credential's file path or profile reference never reaches this
+/// output. `--set key=value` is the command-line override; repeatable. `--config-file
+/// PATH` overrides where the config file itself is read from (this one setting cannot
+/// be sourced from the file it names).
+fn config_command(args: impl Iterator<Item = OsString>) -> Result<(), Error> {
+    let mut overrides = crate::config::Overrides::new();
+    let mut config_file_flag: Option<String> = None;
+
+    let mut args = args;
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .to_str()
+            .ok_or_else(|| Error::Usage("argument is not valid UTF-8".into()))?
+            .to_string();
+        if let Some(rest) = arg.strip_prefix("--set=") {
+            overrides = apply_set(overrides, rest)?;
+        } else if arg == "--set" {
+            let value = next_arg(&mut args, "--set")?;
+            overrides = apply_set(overrides, &value)?;
+        } else if let Some(rest) = arg.strip_prefix("--config-file=") {
+            config_file_flag = Some(rest.to_string());
+        } else if arg == "--config-file" {
+            config_file_flag = Some(next_arg(&mut args, "--config-file")?);
+        } else {
+            return Err(Error::Usage(format!("unknown argument: {arg}")));
+        }
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(config_file_flag.as_deref(), &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+
+    let (_config, provenance) =
+        crate::config::resolve(&overrides, &env, file_contents.as_deref(), &file_path)?;
+    for (key, source) in provenance.entries() {
+        println!("{key:<32} {}", source.label());
+    }
+    Ok(())
+}
+
+fn next_arg(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, Error> {
+    args.next()
+        .and_then(|s| s.to_str().map(str::to_string))
+        .ok_or_else(|| Error::Usage(format!("{flag} requires an argument")))
+}
+
+fn apply_set(
+    overrides: crate::config::Overrides,
+    kv: &str,
+) -> Result<crate::config::Overrides, Error> {
+    let (key, value) = kv
+        .split_once('=')
+        .ok_or_else(|| Error::Usage(format!("--set requires key=value, got {kv:?}")))?;
+    Ok(overrides.set(key, value))
+}
+
+/// The config file's own path cannot be sourced from the file it names, so it gets a
+/// narrower, three-level resolution ahead of everything else: `--config-file`, then
+/// `AUB_CONFIG_FILE`, then the non-identifying platform default under `$HOME`.
+fn resolve_config_file_path(flag: Option<&str>, env: &dyn crate::config::EnvSource) -> String {
+    if let Some(path) = flag {
+        return path.to_string();
+    }
+    if let Some(path) = env.get("AUB_CONFIG_FILE") {
+        return path;
+    }
+    let home = env
+        .get("HOME")
+        .unwrap_or_else(|| "/nonexistent".to_string());
+    format!("{home}/.config/aub/config.toml")
 }
 
 fn status(clock: &impl Clock, level: Level) -> Result<(), Error> {
@@ -91,4 +167,94 @@ fn logging_fixture(clock: &impl Clock, level: Level) -> Result<(), Error> {
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     println!("{}", envelope.as_json());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::FakeEnv;
+
+    #[test]
+    fn apply_set_parses_a_well_formed_key_value_pair() {
+        let overrides = apply_set(crate::config::Overrides::new(), "state.dir=/x").unwrap();
+        // Overrides has no public getter (it is consumed directly by resolve()); the
+        // round trip through resolve is what config's own tests exercise. This test
+        // only proves apply_set itself does not reject a well-formed pair.
+        let _ = overrides;
+    }
+
+    #[test]
+    fn apply_set_rejects_a_pair_with_no_equals_sign() {
+        assert!(apply_set(crate::config::Overrides::new(), "state.dir").is_err());
+    }
+
+    #[test]
+    fn resolve_config_file_path_prefers_the_flag_over_the_environment_and_default() {
+        let env = FakeEnv::new()
+            .set("HOME", "/tmp/home")
+            .set("AUB_CONFIG_FILE", "/from/env.toml");
+        assert_eq!(
+            resolve_config_file_path(Some("/from/flag.toml"), &env),
+            "/from/flag.toml"
+        );
+    }
+
+    #[test]
+    fn resolve_config_file_path_falls_back_to_the_environment_variable() {
+        let env = FakeEnv::new()
+            .set("HOME", "/tmp/home")
+            .set("AUB_CONFIG_FILE", "/from/env.toml");
+        assert_eq!(resolve_config_file_path(None, &env), "/from/env.toml");
+    }
+
+    #[test]
+    fn resolve_config_file_path_falls_back_to_the_non_identifying_default() {
+        let env = FakeEnv::new().set("HOME", "/tmp/synthetic-home");
+        assert_eq!(
+            resolve_config_file_path(None, &env),
+            "/tmp/synthetic-home/.config/aub/config.toml"
+        );
+    }
+
+    /// `aub config`'s output never names a credential's file path or profile
+    /// reference: an account's provenance is reported as the one bucket key
+    /// `accounts`, never key-by-key, so the account's own `credential_detail`
+    /// (whatever kind of secret-adjacent reference it holds) has no key of its own to
+    /// be printed under.
+    #[test]
+    fn config_provenance_never_exposes_a_credential_detail_as_its_own_key() {
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "file", path = "/secret/path/to/credential.json" }
+"#;
+        let env = FakeEnv::new().set("HOME", "/tmp/synthetic-home");
+        let (config, provenance) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &env,
+            Some(file),
+            "/test/aub.toml",
+        )
+        .unwrap();
+
+        // The credential detail is genuinely present on the resolved Config (a later
+        // bead's adapter needs it) ...
+        assert_eq!(
+            config.accounts[0].credential_detail,
+            "/secret/path/to/credential.json"
+        );
+        // ... but no provenance key printed by `aub config` names it or carries it:
+        // the only key covering accounts is the one bucket key "accounts" itself.
+        for (key, _source) in provenance.entries() {
+            assert!(
+                !key.contains("credential"),
+                "a provenance key names credential material: {key}"
+            );
+        }
+        assert_eq!(
+            provenance.get("accounts"),
+            Some(crate::config::ConfigSource::File)
+        );
+    }
 }

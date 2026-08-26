@@ -20,6 +20,13 @@ name = "aub"
 path = "src/main.rs"
 
 [dependencies]
+# The first real production dependency this crate takes (aub-sth.1): parsing the
+# configuration file's TOML format by hand would mean re-deriving a spec this crate
+# has no stake in getting subtly wrong. Used only for its dynamic `Table`/`Value`
+# API (`toml::Table: FromStr`), never for `#[derive(Deserialize)]` on this crate's own
+# types: per-key provenance and unknown-key detection both need to walk the parsed
+# tree by hand, which a derive-based deserializer would not give us for free.
+toml = "1"
 
 [dev-dependencies]
 trybuild = "1"

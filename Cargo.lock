@@ -7,6 +7,7 @@ name = "agent-usage-book"
 version = "0.1.0"
 dependencies = [
  "test-support",
+ "toml",
  "trybuild",
 ]
 

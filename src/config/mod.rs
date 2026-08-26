@@ -1,0 +1,950 @@
+//! All paths, accounts, credentials, sampling policy, and aliases (the configuration interfaces).
+//!
+//! May not depend on:
+//! - SQLite, HTTP, or terminal-formatting crates
+//! - transcript locations
+//! - any adapter, workflow, or presentation layer
+//!
+//! Configuration is the only authority for local identity and paths, which is what
+//! makes the no-compiled-identity invariant achievable at all: no source file names a
+//! machine, an account, a username or a home directory. Resolution order is documented
+//! and deterministic, checked in both directions everywhere it is tested (a higher
+//! level wins when present, and the level below still wins when it is not, per the
+//! lesson the domain epic paid six reworks to learn):
+//!
+//! ```text
+//! command-line override (--set key=value)
+//!   -> explicitly supported environment override (AUB_<SECTION>_<KEY>)
+//!     -> config file
+//!       -> non-identifying platform default
+//! ```
+//!
+//! `aub config` (`crate::cli`) prints every resolved key with the source that won,
+//! using exactly the four labels above: `flag`, `environment`, `file`, `default`.
+//!
+//! Scope, stated rather than left implicit: the four scalar sections (`state`,
+//! `sampling`, `freshness`, `coverage`) plus `backup.review_after` go through the full
+//! four-level order and are individually provenance-tracked, since those are the keys
+//! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
+//! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
+//! file (or left absent) without flag/environment overrides: overriding a
+//! heterogeneous list, or a credential shape that varies by its own `kind` field,
+//! through one `--set` string is not a well-formed operation, and the adapters that
+//! actually consume those sections (`aub-eun.1`'s credential resolution,
+//! `aub-lqe.1`'s transcript discovery) are later beads.
+
+mod duration;
+
+use std::collections::BTreeMap;
+use std::path::PathBuf;
+
+use crate::domain::time::MonotonicDuration;
+use crate::error::Error;
+
+pub use duration::parse_duration;
+
+/// Where a resolved value came from, in the order that decides a tie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfigSource {
+    Flag,
+    Environment,
+    File,
+    Default,
+}
+
+impl ConfigSource {
+    /// The one of the four stable labels `aub config` prints for this source.
+    pub fn label(self) -> &'static str {
+        match self {
+            ConfigSource::Flag => "flag",
+            ConfigSource::Environment => "environment",
+            ConfigSource::File => "file",
+            ConfigSource::Default => "default",
+        }
+    }
+}
+
+/// Reads named environment variables. A trait so tests resolve configuration under a
+/// synthetic environment without mutating the real process environment, which would
+/// make tests order-dependent under any test runner that parallelizes within a
+/// process.
+pub trait EnvSource {
+    fn get(&self, name: &str) -> Option<String>;
+}
+
+/// The real process environment, used by the CLI entry point.
+pub struct RealEnv;
+
+impl EnvSource for RealEnv {
+    fn get(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
+    }
+}
+
+/// A fixed, injectable environment, used by tests to resolve configuration under a
+/// synthetic `$HOME`/username without touching the real process environment.
+#[derive(Debug, Clone, Default)]
+pub struct FakeEnv(BTreeMap<String, String>);
+
+impl FakeEnv {
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub fn set(mut self, name: &str, value: impl Into<String>) -> Self {
+        self.0.insert(name.to_string(), value.into());
+        self
+    }
+}
+
+impl EnvSource for FakeEnv {
+    fn get(&self, name: &str) -> Option<String> {
+        self.0.get(name).cloned()
+    }
+}
+
+/// Command-line `--set key=value` overrides, the highest-precedence source.
+#[derive(Debug, Clone, Default)]
+pub struct Overrides(BTreeMap<String, String>);
+
+impl Overrides {
+    pub fn new() -> Self {
+        Self(BTreeMap::new())
+    }
+
+    pub fn set(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.0.insert(key.into(), value.into());
+        self
+    }
+
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+}
+
+/// The source that won for every resolved key, in the dotted-key order `aub config`
+/// prints them in.
+#[derive(Debug, Clone, Default)]
+pub struct Provenance(BTreeMap<String, ConfigSource>);
+
+impl Provenance {
+    fn set(&mut self, key: &str, source: ConfigSource) {
+        self.0.insert(key.to_string(), source);
+    }
+
+    /// Every resolved key and the source that won for it, in key order.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, ConfigSource)> {
+        self.0.iter().map(|(k, v)| (k.as_str(), *v))
+    }
+
+    pub fn get(&self, key: &str) -> Option<ConfigSource> {
+        self.0.get(key).copied()
+    }
+}
+
+/// A coverage floor: a fraction in `[0.0, 1.0]`. Private storage, validated
+/// construction, matching this project's rule for every ordinary quantity.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoverageFloor(f64);
+
+impl CoverageFloor {
+    pub fn new(value: f64) -> Option<Self> {
+        (0.0..=1.0).contains(&value).then_some(Self(value))
+    }
+
+    pub fn get(self) -> f64 {
+        self.0
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StateConfig {
+    pub dir: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct SamplingConfig {
+    pub scheduler_tick: MonotonicDuration,
+    pub default_interval: MonotonicDuration,
+    pub reset_edge_lead: MonotonicDuration,
+    pub request_timeout: MonotonicDuration,
+    pub command_budget: MonotonicDuration,
+}
+
+#[derive(Debug, Clone)]
+pub struct FreshnessConfig {
+    pub meter: MonotonicDuration,
+}
+
+#[derive(Debug, Clone)]
+pub struct CoverageConfig {
+    pub attempt_floor: CoverageFloor,
+    pub measurement_floor: CoverageFloor,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackupConfig {
+    pub review_after: MonotonicDuration,
+}
+
+/// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
+/// of the file's `credential` table (`kind`, plus its `ref` or `path`): the typed,
+/// validated credential model belongs to `aub-eun.1`, which consumes this section.
+#[derive(Debug, Clone)]
+pub struct AccountConfig {
+    pub name: String,
+    pub provider: String,
+    pub credential_kind: String,
+    pub credential_detail: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct TranscriptConfig {
+    pub name: String,
+    pub root: PathBuf,
+    pub pattern: String,
+    pub usage_evidence: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TrackerConfig {
+    pub kind: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ValuationConfig {
+    pub default_rate_book: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Config {
+    pub state: StateConfig,
+    pub sampling: SamplingConfig,
+    pub freshness: FreshnessConfig,
+    pub coverage: CoverageConfig,
+    pub accounts: Vec<AccountConfig>,
+    pub transcripts: Vec<TranscriptConfig>,
+    pub tracker: Option<TrackerConfig>,
+    pub valuation: ValuationConfig,
+    pub backup: BackupConfig,
+}
+
+/// The section names and, one level down, the key names this project recognizes. An
+/// unknown key anywhere in this shape is an error naming the key, never a silently
+/// ignored line.
+const KNOWN_SECTIONS: &[&str] = &[
+    "schema",
+    "state",
+    "sampling",
+    "freshness",
+    "coverage",
+    "accounts",
+    "transcripts",
+    "tracker",
+    "valuation",
+    "backup",
+];
+const STATE_KEYS: &[&str] = &["dir"];
+const SAMPLING_KEYS: &[&str] = &[
+    "scheduler_tick",
+    "default_interval",
+    "reset_edge_lead",
+    "request_timeout",
+    "command_budget",
+];
+const FRESHNESS_KEYS: &[&str] = &["meter"];
+const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
+const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
+const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
+const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
+const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "usage_evidence"];
+const TRACKER_KEYS: &[&str] = &["kind", "path"];
+const VALUATION_KEYS: &[&str] = &["default_rate_book"];
+const BACKUP_KEYS: &[&str] = &["review_after"];
+
+fn unknown_key_error(key: &str, file_display: &str) -> Error {
+    Error::Usage(format!(
+        "unknown configuration key {key:?} in {file_display}"
+    ))
+}
+
+fn missing_key_error(key: &str, file_display: &str) -> Error {
+    Error::Usage(format!(
+        "missing required configuration key {key:?}; set it in {file_display}"
+    ))
+}
+
+fn check_keys(
+    table: &toml::Table,
+    allowed: &[&str],
+    path: &str,
+    file_display: &str,
+) -> Result<(), Error> {
+    for key in table.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(unknown_key_error(&format!("{path}.{key}"), file_display));
+        }
+    }
+    Ok(())
+}
+
+/// Rejects every key not on this project's known list, walked over the whole parsed
+/// file rather than only the sections this bead resolves scalar-by-scalar, so a typo
+/// anywhere in the file is caught here rather than silently ignored.
+fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Error> {
+    check_keys(table, KNOWN_SECTIONS, "", file_display)?;
+
+    if let Some(t) = table.get("state").and_then(toml::Value::as_table) {
+        check_keys(t, STATE_KEYS, "state", file_display)?;
+    }
+    if let Some(t) = table.get("sampling").and_then(toml::Value::as_table) {
+        check_keys(t, SAMPLING_KEYS, "sampling", file_display)?;
+    }
+    if let Some(t) = table.get("freshness").and_then(toml::Value::as_table) {
+        check_keys(t, FRESHNESS_KEYS, "freshness", file_display)?;
+    }
+    if let Some(t) = table.get("coverage").and_then(toml::Value::as_table) {
+        check_keys(t, COVERAGE_KEYS, "coverage", file_display)?;
+    }
+    if let Some(t) = table.get("tracker").and_then(toml::Value::as_table) {
+        check_keys(t, TRACKER_KEYS, "tracker", file_display)?;
+    }
+    if let Some(t) = table.get("valuation").and_then(toml::Value::as_table) {
+        check_keys(t, VALUATION_KEYS, "valuation", file_display)?;
+    }
+    if let Some(t) = table.get("backup").and_then(toml::Value::as_table) {
+        check_keys(t, BACKUP_KEYS, "backup", file_display)?;
+    }
+    if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
+        for account in accounts {
+            let Some(account) = account.as_table() else {
+                continue;
+            };
+            check_keys(account, ACCOUNT_KEYS, "accounts[]", file_display)?;
+            if let Some(cred) = account.get("credential").and_then(toml::Value::as_table) {
+                match cred.get("kind").and_then(toml::Value::as_str) {
+                    Some("profile") => check_keys(
+                        cred,
+                        CREDENTIAL_PROFILE_KEYS,
+                        "accounts[].credential",
+                        file_display,
+                    )?,
+                    Some("file") => check_keys(
+                        cred,
+                        CREDENTIAL_FILE_KEYS,
+                        "accounts[].credential",
+                        file_display,
+                    )?,
+                    // An unrecognized or absent `kind` is left to aub-eun.1's
+                    // credential resolution to reject; this bead only owns the
+                    // shape of the two kinds it already knows about.
+                    _ => {}
+                }
+            }
+        }
+    }
+    if let Some(transcripts) = table.get("transcripts").and_then(toml::Value::as_array) {
+        for transcript in transcripts {
+            if let Some(transcript) = transcript.as_table() {
+                check_keys(transcript, TRANSCRIPT_KEYS, "transcripts[]", file_display)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// One entry in the file's parsed dotted-path lookup, rendered as a string regardless
+/// of whether the TOML author wrote it quoted (a duration like `"5m"`) or bare (a
+/// coverage floor like `0.98`): `resolve_string` and everything built on it work on
+/// text, and a coverage floor written as a bare TOML float has no `as_str()` at all,
+/// which is what the first version of this function missed - it silently fell through
+/// to the platform default for every floor actually set in the file, in both
+/// directions (a floor that should have failed range validation resolved to the
+/// default instead, and a valid in-range floor never got read from the file either).
+fn file_raw(file: Option<&toml::Table>, section: &str, key: &str) -> Option<String> {
+    let value = file?.get(section)?.as_table()?.get(key)?;
+    match value {
+        toml::Value::String(s) => Some(s.clone()),
+        toml::Value::Integer(n) => Some(n.to_string()),
+        toml::Value::Float(n) => Some(n.to_string()),
+        toml::Value::Boolean(b) => Some(b.to_string()),
+        toml::Value::Datetime(_) | toml::Value::Array(_) | toml::Value::Table(_) => None,
+    }
+}
+
+fn env_var_name(key: &str) -> String {
+    format!("AUB_{}", key.to_uppercase().replace('.', "_"))
+}
+
+fn resolve_string(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<String, Error> {
+    if let Some(v) = overrides.get(key) {
+        provenance.set(key, ConfigSource::Flag);
+        return Ok(v.to_string());
+    }
+    let env_var = env_var_name(key);
+    if let Some(v) = env.get(&env_var) {
+        provenance.set(key, ConfigSource::Environment);
+        return Ok(v);
+    }
+    if let Some(v) = file_value {
+        provenance.set(key, ConfigSource::File);
+        return Ok(v);
+    }
+    if let Some(v) = default {
+        provenance.set(key, ConfigSource::Default);
+        return Ok(v.to_string());
+    }
+    Err(missing_key_error(key, file_display))
+}
+
+fn resolve_duration(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<MonotonicDuration, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    parse_duration(&raw).map_err(|e| Error::Usage(format!("{key}: {e}")))
+}
+
+fn resolve_floor(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<CoverageFloor, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a number")))?;
+    CoverageFloor::new(value)
+        .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
+}
+
+/// Non-identifying platform defaults: derived from `$HOME` at resolution time, never
+/// from a compiled-in path. `home` is itself resolution's caller-supplied, so a test
+/// can prove no default leaks the *real* process's home directory by resolving under a
+/// synthetic one instead of the actual `$HOME`.
+fn default_state_dir(home: &str) -> String {
+    format!("{home}/.local/state/aub")
+}
+
+/// Resolves the full configuration from, in precedence order, `overrides`, `env`, the
+/// TOML file at `file_contents` (already read by the caller, so this function stays
+/// free of filesystem access and is trivially testable), and this project's own
+/// defaults. `file_display` names the file in a missing-key error even though this
+/// function never opens it itself.
+pub fn resolve(
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_contents: Option<&str>,
+    file_display: &str,
+) -> Result<(Config, Provenance), Error> {
+    let file: Option<toml::Table> = match file_contents {
+        Some(contents) => Some(
+            contents
+                .parse()
+                .map_err(|e| Error::Usage(format!("{file_display}: invalid TOML: {e}")))?,
+        ),
+        None => None,
+    };
+    if let Some(table) = &file {
+        validate_known_keys(table, file_display)?;
+    }
+
+    let mut provenance = Provenance::default();
+    let home = env
+        .get("HOME")
+        .unwrap_or_else(|| "/nonexistent".to_string());
+    let default_dir = default_state_dir(&home);
+
+    let state = StateConfig {
+        dir: PathBuf::from(resolve_string(
+            "state.dir",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "state", "dir"),
+            Some(&default_dir),
+            file_display,
+            &mut provenance,
+        )?),
+    };
+
+    let sampling = SamplingConfig {
+        scheduler_tick: resolve_duration(
+            "sampling.scheduler_tick",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "scheduler_tick"),
+            Some("1m"),
+            file_display,
+            &mut provenance,
+        )?,
+        default_interval: resolve_duration(
+            "sampling.default_interval",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "default_interval"),
+            Some("5m"),
+            file_display,
+            &mut provenance,
+        )?,
+        reset_edge_lead: resolve_duration(
+            "sampling.reset_edge_lead",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "reset_edge_lead"),
+            Some("120s"),
+            file_display,
+            &mut provenance,
+        )?,
+        request_timeout: resolve_duration(
+            "sampling.request_timeout",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "request_timeout"),
+            Some("5s"),
+            file_display,
+            &mut provenance,
+        )?,
+        command_budget: resolve_duration(
+            "sampling.command_budget",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "command_budget"),
+            Some("8s"),
+            file_display,
+            &mut provenance,
+        )?,
+    };
+
+    let freshness = FreshnessConfig {
+        meter: resolve_duration(
+            "freshness.meter",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "freshness", "meter"),
+            Some("12m"),
+            file_display,
+            &mut provenance,
+        )?,
+    };
+
+    let coverage = CoverageConfig {
+        attempt_floor: resolve_floor(
+            "coverage.attempt_floor",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "coverage", "attempt_floor"),
+            Some("0.98"),
+            file_display,
+            &mut provenance,
+        )?,
+        measurement_floor: resolve_floor(
+            "coverage.measurement_floor",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "coverage", "measurement_floor"),
+            Some("0.95"),
+            file_display,
+            &mut provenance,
+        )?,
+    };
+
+    let backup = BackupConfig {
+        review_after: resolve_duration(
+            "backup.review_after",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "backup", "review_after"),
+            Some("48h"),
+            file_display,
+            &mut provenance,
+        )?,
+    };
+
+    let valuation = ValuationConfig {
+        default_rate_book: file
+            .as_ref()
+            .and_then(|t| t.get("valuation"))
+            .and_then(toml::Value::as_table)
+            .and_then(|t| t.get("default_rate_book"))
+            .and_then(toml::Value::as_str)
+            .map(str::to_string),
+    };
+    if valuation.default_rate_book.is_some() {
+        provenance.set("valuation.default_rate_book", ConfigSource::File);
+    }
+
+    let tracker = match file
+        .as_ref()
+        .and_then(|t| t.get("tracker"))
+        .and_then(toml::Value::as_table)
+    {
+        Some(t) => {
+            let kind = t
+                .get("kind")
+                .and_then(toml::Value::as_str)
+                .ok_or_else(|| missing_key_error("tracker.kind", file_display))?;
+            let path = t.get("path").and_then(toml::Value::as_str).unwrap_or("");
+            provenance.set("tracker.kind", ConfigSource::File);
+            Some(TrackerConfig {
+                kind: kind.to_string(),
+                path: PathBuf::from(path),
+            })
+        }
+        None => None,
+    };
+
+    let accounts: Vec<AccountConfig> = file
+        .as_ref()
+        .and_then(|t| t.get("accounts"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .map(|entry| {
+                    let credential = entry.get("credential").and_then(toml::Value::as_table);
+                    AccountConfig {
+                        name: entry
+                            .get("name")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        provider: entry
+                            .get("provider")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        credential_kind: credential
+                            .and_then(|c| c.get("kind"))
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                        credential_detail: credential
+                            .and_then(|c| c.get("ref").or_else(|| c.get("path")))
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    }
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !accounts.is_empty() {
+        provenance.set("accounts", ConfigSource::File);
+    }
+
+    let transcripts: Vec<TranscriptConfig> = file
+        .as_ref()
+        .and_then(|t| t.get("transcripts"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .filter_map(toml::Value::as_table)
+                .map(|entry| TranscriptConfig {
+                    name: entry
+                        .get("name")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    root: PathBuf::from(
+                        entry
+                            .get("root")
+                            .and_then(toml::Value::as_str)
+                            .unwrap_or_default(),
+                    ),
+                    pattern: entry
+                        .get("pattern")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                    usage_evidence: entry
+                        .get("usage_evidence")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if !transcripts.is_empty() {
+        provenance.set("transcripts", ConfigSource::File);
+    }
+
+    Ok((
+        Config {
+            state,
+            sampling,
+            freshness,
+            coverage,
+            accounts,
+            transcripts,
+            tracker,
+            valuation,
+            backup,
+        },
+        provenance,
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resolve_with(
+        overrides: Overrides,
+        env: FakeEnv,
+        file_contents: Option<&str>,
+    ) -> Result<(Config, Provenance), Error> {
+        resolve(&overrides, &env, file_contents, "/test/aub.toml")
+    }
+
+    fn plain_env() -> FakeEnv {
+        FakeEnv::new().set("HOME", "/home/synthetic-user")
+    }
+
+    // --- resolution order: each level checked in BOTH directions ------------------
+
+    #[test]
+    fn flag_wins_over_everything_below_it() {
+        let overrides = Overrides::new().set("sampling.default_interval", "9m");
+        let env = plain_env().set("AUB_SAMPLING_DEFAULT_INTERVAL", "7m");
+        let file = "[sampling]\ndefault_interval = \"3m\"\n";
+        let (config, provenance) = resolve_with(overrides, env, Some(file)).unwrap();
+        assert_eq!(
+            config.sampling.default_interval.as_nanos(),
+            9 * 60 * 1_000_000_000
+        );
+        assert_eq!(
+            provenance.get("sampling.default_interval"),
+            Some(ConfigSource::Flag)
+        );
+    }
+
+    #[test]
+    fn environment_wins_when_no_flag_is_set() {
+        let env = plain_env().set("AUB_SAMPLING_DEFAULT_INTERVAL", "7m");
+        let file = "[sampling]\ndefault_interval = \"3m\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), env, Some(file)).unwrap();
+        assert_eq!(
+            config.sampling.default_interval.as_nanos(),
+            7 * 60 * 1_000_000_000
+        );
+        assert_eq!(
+            provenance.get("sampling.default_interval"),
+            Some(ConfigSource::Environment)
+        );
+    }
+
+    #[test]
+    fn file_wins_when_no_flag_or_environment_is_set() {
+        let file = "[sampling]\ndefault_interval = \"3m\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.sampling.default_interval.as_nanos(),
+            3 * 60 * 1_000_000_000
+        );
+        assert_eq!(
+            provenance.get("sampling.default_interval"),
+            Some(ConfigSource::File)
+        );
+    }
+
+    #[test]
+    fn default_wins_when_nothing_else_is_set() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            config.sampling.default_interval.as_nanos(),
+            5 * 60 * 1_000_000_000
+        );
+        assert_eq!(
+            provenance.get("sampling.default_interval"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    // --- unknown key: checked in both directions -----------------------------------
+
+    #[test]
+    fn an_unknown_key_is_a_named_error() {
+        let file = "[sampling]\nnonexistent_key = \"3m\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("sampling.nonexistent_key"), "{message}");
+    }
+
+    #[test]
+    fn a_known_key_in_the_same_section_is_not_rejected() {
+        let file = "[sampling]\ndefault_interval = \"3m\"\n";
+        assert!(resolve_with(Overrides::new(), plain_env(), Some(file)).is_ok());
+    }
+
+    // --- missing required key: checked in both directions --------------------------
+
+    #[test]
+    fn a_tracker_section_with_no_kind_is_a_missing_key_error_naming_the_file() {
+        let file = "[tracker]\npath = \"~/work/.tracker\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        let message = err.to_string();
+        assert!(message.contains("tracker.kind"), "{message}");
+        assert!(message.contains("/test/aub.toml"), "{message}");
+    }
+
+    #[test]
+    fn a_tracker_section_with_a_kind_resolves_successfully() {
+        let file = "[tracker]\nkind = \"local\"\npath = \"~/work/.tracker\"\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.tracker.unwrap().kind, "local");
+    }
+
+    #[test]
+    fn no_tracker_section_at_all_is_not_a_missing_key_error() {
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(config.tracker.is_none());
+    }
+
+    // --- no compiled identity -------------------------------------------------------
+
+    #[test]
+    fn state_dir_default_is_derived_from_the_injected_home_not_a_compiled_path() {
+        let env = FakeEnv::new().set("HOME", "/tmp/synthetic-home-alpha");
+        let (config, provenance) = resolve_with(Overrides::new(), env, None).unwrap();
+        assert_eq!(
+            config.state.dir,
+            PathBuf::from("/tmp/synthetic-home-alpha/.local/state/aub")
+        );
+        assert_eq!(provenance.get("state.dir"), Some(ConfigSource::Default));
+    }
+
+    /// Property: over every scalar default, resolved under several different
+    /// synthetic environments, none contains the real process's actual $HOME or
+    /// username - proving the code path is genuinely driven by the injected
+    /// environment rather than falling back to a real, compiled-in, or
+    /// process-inherited value under any of them.
+    #[test]
+    fn defaults_never_contain_the_real_process_home_or_username() {
+        let real_home = std::env::var("HOME").unwrap_or_default();
+        let real_user = std::env::var("USER").unwrap_or_default();
+
+        let synthetic_environments = [
+            ("/tmp/synthetic-home-alpha", "alpha-user"),
+            ("/tmp/synthetic-home-beta", "beta-person"),
+            ("/nonexistent/totally-fake-home", "ghost"),
+        ];
+
+        for (fake_home, fake_user) in synthetic_environments {
+            let env = FakeEnv::new().set("HOME", fake_home).set("USER", fake_user);
+            let (config, _) = resolve_with(Overrides::new(), env, None).unwrap();
+            let rendered = format!("{config:?}");
+
+            if !real_home.is_empty() {
+                assert!(
+                    !rendered.contains(&real_home),
+                    "resolved defaults under a synthetic HOME contained the real HOME: {rendered}"
+                );
+            }
+            if !real_user.is_empty() {
+                assert!(
+                    !rendered.contains(&real_user),
+                    "resolved defaults under a synthetic USER contained the real USER: {rendered}"
+                );
+            }
+            assert!(rendered.contains(fake_home), "{rendered}");
+        }
+    }
+
+    // --- everything else the model covers -------------------------------------------
+
+    #[test]
+    fn accounts_and_transcripts_are_populated_from_the_file() {
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "profile", ref = "work-primary" }
+
+[[transcripts]]
+name = "cli-a"
+root = "~/.local/share/cli-a"
+pattern = "**/*.jsonl"
+"#;
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.accounts.len(), 1);
+        assert_eq!(config.accounts[0].name, "work-primary");
+        assert_eq!(config.accounts[0].credential_kind, "profile");
+        assert_eq!(config.accounts[0].credential_detail, "work-primary");
+        assert_eq!(config.transcripts.len(), 1);
+        assert_eq!(config.transcripts[0].pattern, "**/*.jsonl");
+        assert_eq!(provenance.get("accounts"), Some(ConfigSource::File));
+    }
+
+    #[test]
+    fn a_credential_kind_with_an_unexpected_field_is_accepted_by_this_bead() {
+        // Deliberate scope boundary, exercised rather than merely stated: the full
+        // credential shape belongs to aub-eun.1. A "profile" credential missing its
+        // own `ref` (or carrying an extra field under a kind this bead does not
+        // model) is not rejected here.
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "unknown-future-kind", anything = "goes" }
+"#;
+        assert!(resolve_with(Overrides::new(), plain_env(), Some(file)).is_ok());
+    }
+
+    #[test]
+    fn an_invalid_toml_file_is_a_usage_error() {
+        let err =
+            resolve_with(Overrides::new(), plain_env(), Some("not valid toml =")).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn a_coverage_floor_out_of_range_is_a_usage_error() {
+        let file = "[coverage]\nattempt_floor = 1.5\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn a_coverage_floor_in_range_resolves_successfully() {
+        let file = "[coverage]\nattempt_floor = 0.9\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.coverage.attempt_floor.get(), 0.9);
+    }
+}
