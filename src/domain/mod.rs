@@ -9,4 +9,5 @@ pub mod ids;
 pub mod interval;
 pub mod quota;
 pub mod time;
+pub mod money;
 pub mod tokens;
