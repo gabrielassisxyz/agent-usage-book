@@ -1,6 +1,12 @@
 //! One ledger for LLM consumption: token spend read from local agent transcripts, joined
 //! with quota measured at the provider's own endpoints.
 
+// Core matches over Freshness and AttemptOutcome (aub-rif.9) use no wildcard arm.
+// Crate-wide because no lint scoped to two enums exists in clippy and a hand-written
+// test is not a lint; settled as an orchestrator ruling on aub-rif.9 after the
+// alternative (a lint scoped to just those two types) was confirmed not to exist.
+#![deny(clippy::wildcard_enum_match_arm)]
+
 pub mod build_info;
 
 pub mod advice;

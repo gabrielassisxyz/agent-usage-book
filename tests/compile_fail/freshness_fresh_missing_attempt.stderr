@@ -1,0 +1,5 @@
+error[E0063]: missing field `latest_attempt` in initializer of `Freshness<_>`
+  --> tests/compile_fail/freshness_fresh_missing_attempt.rs:16:13
+   |
+16 |     let _ = Freshness::Fresh { observed };
+   |             ^^^^^^^^^^^^^^^^ missing `latest_attempt`

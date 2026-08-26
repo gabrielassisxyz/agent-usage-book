@@ -1,0 +1,7 @@
+error[E0277]: the trait bound `Freshness<u64>: From<AttemptOutcome>` is not satisfied
+  --> tests/compile_fail/freshness_no_from_attempt_outcome.rs:11:37
+   |
+11 |     let _: Freshness<u64> = outcome.into();
+   |                                     ^^^^ the trait `From<AttemptOutcome>` is not implemented for `Freshness<u64>`
+   |
+   = note: required for `AttemptOutcome` to implement `Into<Freshness<u64>>`
