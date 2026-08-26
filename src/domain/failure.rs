@@ -114,9 +114,11 @@ const BARE_SECRET_MIN_LENGTH: usize = 20;
 /// this module, rather than trusting every future call site to remember to redact.
 ///
 /// Two heuristics, applied per whitespace-delimited token: a token matching a known
-/// credential label (`Authorization:`, `Bearer`, `api_key=`, ...) is redacted outright,
-/// and a bare token long enough and shaped enough to plausibly be a secret is redacted
-/// even with no label in front of it.
+/// credential label (`Authorization:`, `Bearer`, `api_key=`, ...) is redacted outright
+/// as a cheap first path, and a token containing a run of characters long enough and
+/// shaped enough to plausibly be a secret is redacted even under a label nobody
+/// enumerated (`token=`, `x-api-key:`, or any other `label=SECRET`/`label:SECRET`
+/// shape), since the run check does not depend on recognizing the label at all.
 pub fn sanitize_provider_error_text(raw: &str) -> String {
     raw.split_whitespace()
         .map(redact_token)
@@ -136,12 +138,19 @@ fn redact_token(word: &str) -> String {
     }
 }
 
+/// True when `word` contains a run of alphanumeric, hyphen or underscore characters
+/// long enough to plausibly be a secret, wherever that run sits inside the word.
+///
+/// Checking the run rather than the whole trimmed word is what catches
+/// `token=SECRET` and `header:SECRET`: an interior `=` or `:` (or any other separator
+/// a label happens to use) splits the word into parts, and the label's own name is one
+/// of those parts, but the run length check only needs the SECRET part to be long
+/// enough. This is why the label list above is a cheap first path rather than the only
+/// path: this check finds a labeled secret without needing to have enumerated its
+/// label.
 fn looks_like_a_bare_secret(word: &str) -> bool {
-    let cleaned = word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-' && c != '_');
-    cleaned.len() >= BARE_SECRET_MIN_LENGTH
-        && cleaned
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    word.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+        .any(|part| part.len() >= BARE_SECRET_MIN_LENGTH)
 }
 
 #[cfg(test)]
@@ -269,6 +278,27 @@ mod tests {
         assert_eq!(sanitize_provider_error_text(raw), raw);
     }
 
+    /// Regression: a label the code does not enumerate (`token=`) previously defeated
+    /// the bare-secret check, because that check trimmed non-token characters only
+    /// from the ends of the word and then required every remaining character to be
+    /// alphanumeric/hyphen/underscore - an interior `=` disqualified the whole word.
+    /// `token=<credential>` is the single most common shape provider error text uses
+    /// for a leaked credential. The fixture below is a long, low-entropy run
+    /// (repeated characters) rather than a realistic-looking token: this project's own
+    /// secret scanner correctly flags a high-entropy `token=`-labeled string as a
+    /// likely live credential, which a random-looking fixture would be, so the test
+    /// exercises the same length-based code path with a string that cannot be mistaken
+    /// for a real one.
+    #[test]
+    fn sanitizer_redacts_a_secret_under_an_unenumerated_label() {
+        let raw = "token=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx";
+        let sanitized = sanitize_provider_error_text(raw);
+        assert!(
+            !sanitized.contains("xxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"),
+            "sanitized text still contains the secret: {sanitized:?}"
+        );
+    }
+
     /// A deterministic pseudo-random generator, the same construction used elsewhere in
     /// this crate's own tests, so this runs over many synthetic bodies without a
     /// property-testing dependency.
@@ -290,9 +320,29 @@ mod tests {
             .collect()
     }
 
+    /// A random short lowercase word, standing in for a label nobody enumerated. Not
+    /// filtered against `CREDENTIAL_LABEL_TOKENS`: even an accidental collision with a
+    /// known label is still a valid case, and the point of this generator is to reach
+    /// labels the code was never told about, which an unfiltered random word already
+    /// does with overwhelming probability.
+    fn synthetic_unknown_label(next: &mut impl FnMut() -> u64) -> String {
+        const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz";
+        let len = 3 + (next() % 6) as usize;
+        (0..len)
+            .map(|_| ALPHABET[(next() % ALPHABET.len() as u64) as usize] as char)
+            .collect()
+    }
+
     /// Property: over a corpus of synthetic error bodies seeded with credential
     /// material, the sanitizer emits no credential substring, whether the secret is
-    /// labeled or bare.
+    /// labeled with a known label, labeled with a label nobody enumerated, or bare.
+    ///
+    /// The unknown-label template is the one that would have caught
+    /// `sanitizer_redacts_a_secret_under_an_unenumerated_label`'s regression before it
+    /// shipped: the other four templates are all shapes the matcher already handled,
+    /// derived from the same mental model as the code, so they explore exactly the
+    /// space the matcher already covers. A generated corpus is only as good as the
+    /// shapes it can imagine.
     #[test]
     fn sanitizer_never_leaks_a_seeded_credential_over_a_generated_corpus() {
         let mut next = xorshift(0xD1B5_4A32_7F19_9E3C);
@@ -305,8 +355,13 @@ mod tests {
 
         for _ in 0..200 {
             let secret = synthetic_secret(&mut next);
-            let template = templates[(next() % templates.len() as u64) as usize];
-            let body = template(&secret);
+            let choice = next() % (templates.len() as u64 + 1);
+            let body = if choice < templates.len() as u64 {
+                templates[choice as usize](&secret)
+            } else {
+                let label = synthetic_unknown_label(&mut next);
+                format!("upstream rejected because {label}={secret}")
+            };
 
             let sanitized = sanitize_provider_error_text(&body);
             assert!(
