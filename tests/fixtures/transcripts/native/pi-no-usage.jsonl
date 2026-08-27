@@ -1,1 +1,1 @@
-{"type":"message","message":{"id":"msg_0001","role":"user","content":[{"type":"text","text":"hello"}]},"cost":{}}
+{"type":"message","message":{"id":"msg_0001","role":"user"},"cost":{}}
