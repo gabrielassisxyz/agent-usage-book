@@ -670,7 +670,7 @@ mod tests {
             MonotonicDuration::from_seconds(0),
             AttemptOutcome::AuthRequired,
         );
-        let input_1 = FreshnessInput::new(
+        let input_1 = FreshnessInput::<u64>::new(
             None,
             None,
             Some(LatestAttempt::new(started_1, Some(result_1), &ctx_a)),
@@ -696,7 +696,7 @@ mod tests {
             MonotonicDuration::from_seconds(0),
             AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
         );
-        let input_2 = FreshnessInput::new(
+        let input_2 = FreshnessInput::<u64>::new(
             None,
             None,
             Some(LatestAttempt::new(started_2, Some(result_2), &ctx_b)),
@@ -774,7 +774,7 @@ mod tests {
             MonotonicDuration::from_seconds(0),
             AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
         );
-        let input = FreshnessInput::new(
+        let input = FreshnessInput::<u64>::new(
             None,
             None,
             Some(LatestAttempt::new(started_2, Some(result_2), &ctx_a)),
