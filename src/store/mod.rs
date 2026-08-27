@@ -8,4 +8,6 @@
 //! This is the only module that knows SQLite.
 
 pub mod connection;
+pub mod migrate;
+pub mod migrations;
 pub mod startup;

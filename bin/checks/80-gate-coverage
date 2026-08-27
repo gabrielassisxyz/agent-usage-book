@@ -46,6 +46,7 @@ declared_boundary_rules=(
     12-transport-no-ureq-outside-transport
     13-no-async-runtime-dependency
     14-parser-no-cost-or-meter
+    15-status-no-migration
 )
 
 # Mapping of check filenames to their required descriptive phrase in AGENTS.md:93-95

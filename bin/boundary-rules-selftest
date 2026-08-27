@@ -89,6 +89,7 @@ violation "rule09" "09-presentation-no-store-or-calibration" "src/presentation.r
 violation "rule10" "10-freshness-constructed-only-in-domain" "src/advice.rs" "pub fn bad() { let _ = Freshness::AuthRequired { last_good: None, latest_attempt: crate::domain::attempt::AttemptId::new(1) }; }"
 violation "rule11" "11-store-connections-through-one-function" "src/store.rs" "rusqlite::Connection::open(\"foo\");"
 violation "rule12" "12-transport-no-ureq-outside-transport" "src/advice.rs" "use ureq::Agent;"
+violation "rule15" "15-status-no-migration" "src/projection.rs" "use crate::store::migrate;"
 
 # --- two rules violated in one run are BOTH named, not only the first ---
 dir="$(make_scenario two-fail)"
