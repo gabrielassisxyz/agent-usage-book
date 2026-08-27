@@ -85,6 +85,8 @@ violation "rule05" "05-advice-no-calibration" "src/advice.rs" "use crate::calibr
 violation "rule06" "06-status-no-http-transport" "src/projection.rs" "use ureq::get;"
 violation "rule07" "07-provider-adapters-no-credential-paths" "src/meter.rs" "use crate::auth;"
 violation "rule08" "08-window-selection-ownership" "src/advice.rs" "lowest_remaining_fraction_window(windows, model);"
+violation "rule09" "09-presentation-no-store-or-calibration" "src/presentation.rs" "use crate::store;"
+violation "rule10" "10-freshness-constructed-only-in-domain" "src/advice.rs" "pub fn bad() { let _ = Freshness::AuthRequired { last_good: None, latest_attempt: crate::domain::attempt::AttemptId::new(1) }; }"
 
 # --- two rules violated in one run are BOTH named, not only the first ---
 dir="$(make_scenario two-fail)"

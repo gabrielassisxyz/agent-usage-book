@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+# Boundary: Freshness values are constructed only within src/domain/freshness.rs.
+# Design: PLAN.md sections 3.2 and 7.4, and bead aub-me5.2.
+# Detection: scan all Rust source files under src/ (excluding src/domain/freshness.rs)
+#   for expressions constructing Freshness::(Fresh|Stale|AuthRequired) in production code
+#   (before #[cfg(test)]). Destructuring match arms ending with => are permitted.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+python3 - <<'PYEOF'
+import os, re, sys
+
+pattern = re.compile(r'Freshness(?:::<[^>]+>)?::(Fresh|Stale|AuthRequired)\s*\{')
+violations = []
+
+for root, _, files in os.walk('src'):
+    for f in sorted(files):
+        if not f.endswith('.rs'):
+            continue
+        filepath = os.path.join(root, f)
+        if filepath == 'src/domain/freshness.rs':
+            continue
+        try:
+            with open(filepath, 'r', encoding='utf-8') as handle:
+                content = handle.read()
+        except Exception as e:
+            print(f"error reading {filepath}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        # Ignore test modules
+        if '#[cfg(test)]' in content:
+            content = content.split('#[cfg(test)]')[0]
+
+        for m in pattern.finditer(content):
+            start = m.start()
+            depth = 0
+            end_brace_idx = -1
+            for idx in range(m.end() - 1, len(content)):
+                if content[idx] == '{':
+                    depth += 1
+                elif content[idx] == '}':
+                    depth -= 1
+                    if depth == 0:
+                        end_brace_idx = idx
+                        break
+            if end_brace_idx != -1:
+                rest = content[end_brace_idx + 1:].lstrip()
+                if not rest.startswith('=>'):
+                    line_no = content[:start].count('\n') + 1
+                    snippet = content[start:min(start + 50, len(content))].replace('\n', ' ')
+                    violations.append(f"{filepath}:{line_no}: {snippet}")
+
+if violations:
+    print("Freshness value constructed outside src/domain/freshness.rs:", file=sys.stderr)
+    for v in violations:
+        print(f"    {v}", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)
+PYEOF

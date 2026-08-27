@@ -18,7 +18,10 @@
 //! (an orchestrator ruling recorded on `aub-rif.9`: no lint scoped to two enums exists
 //! in clippy, and a hand-written test is not a lint), not by anything in this file.
 
-use super::attempt::AttemptId;
+use super::attempt::{AttemptId, AttemptOutcome, AttemptResult, AttemptStarted};
+use super::failure::to_stale_reason;
+use super::ids::CredentialContextId;
+use super::time::{Clock, ClockSkewEnvelope, MonotonicDuration, UtcTimestamp, age};
 use super::time::{MeasurementBasis, ProviderObservedAt, ReceivedAt};
 
 /// A value the collector actually observed, together with when and how.
@@ -153,6 +156,233 @@ impl<T> Freshness<T> {
             Freshness::Fresh { latest_attempt, .. }
             | Freshness::Stale { latest_attempt, .. }
             | Freshness::AuthRequired { latest_attempt, .. } => *latest_attempt,
+        }
+    }
+}
+
+/// A collection attempt presented to the freshness state machine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatestAttempt<'a> {
+    pub started: AttemptStarted,
+    pub result: Option<AttemptResult>,
+    pub credential_context: &'a CredentialContextId,
+}
+
+impl<'a> LatestAttempt<'a> {
+    pub const fn new(
+        started: AttemptStarted,
+        result: Option<AttemptResult>,
+        credential_context: &'a CredentialContextId,
+    ) -> Self {
+        Self {
+            started,
+            result,
+            credential_context,
+        }
+    }
+}
+
+/// Inputs required by the pure freshness calculation at read time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FreshnessInput<'a, T> {
+    pub last_good: Option<Observed<T>>,
+    pub last_good_context: Option<&'a CredentialContextId>,
+    pub latest_attempt: Option<LatestAttempt<'a>>,
+    pub last_auth_failure_context: Option<&'a CredentialContextId>,
+    pub latest_auth_success_context: Option<&'a CredentialContextId>,
+    pub freshness_horizon: MonotonicDuration,
+    pub command_horizon: MonotonicDuration,
+    pub clock_skew_envelope: ClockSkewEnvelope,
+}
+
+impl<'a, T> FreshnessInput<'a, T> {
+    #[allow(clippy::too_many_arguments)]
+    pub const fn new(
+        last_good: Option<Observed<T>>,
+        last_good_context: Option<&'a CredentialContextId>,
+        latest_attempt: Option<LatestAttempt<'a>>,
+        last_auth_failure_context: Option<&'a CredentialContextId>,
+        latest_auth_success_context: Option<&'a CredentialContextId>,
+        freshness_horizon: MonotonicDuration,
+        command_horizon: MonotonicDuration,
+        clock_skew_envelope: ClockSkewEnvelope,
+    ) -> Self {
+        Self {
+            last_good,
+            last_good_context,
+            latest_attempt,
+            last_auth_failure_context,
+            latest_auth_success_context,
+            freshness_horizon,
+            command_horizon,
+            clock_skew_envelope,
+        }
+    }
+}
+
+/// Computes effective [`Freshness`] at read time as a pure function over attempt
+/// history, the last successful observation, credential context metadata, the
+/// freshness horizon, the command execution horizon, the clock-skew envelope,
+/// and the current clock.
+///
+/// Performs no I/O of any kind, allowing status, synthetic sampling, and projection
+/// readers to share the exact same temporal state machine without divergence.
+pub fn compute_freshness<T: Clone>(
+    input: &FreshnessInput<'_, T>,
+    clock: &impl Clock,
+) -> Freshness<T> {
+    let now = clock.now();
+
+    let Some(latest) = &input.latest_attempt else {
+        return Freshness::Stale {
+            last_good: input.last_good.clone(),
+            latest_attempt: AttemptId::new(0),
+            reason: match &input.last_good {
+                Some(_) => StaleReason::SamplingGap,
+                None => StaleReason::NoSuccessfulObservation,
+            },
+        };
+    };
+
+    let latest_attempt_id = latest.started.attempt_id();
+    let current_ctx = latest.credential_context;
+
+    match &latest.result {
+        Some(result) => match result.outcome() {
+            AttemptOutcome::Success => evaluate_observation(
+                input.last_good.as_ref(),
+                latest_attempt_id,
+                now,
+                input.freshness_horizon,
+                input.clock_skew_envelope,
+            ),
+            AttemptOutcome::AuthRequired => Freshness::AuthRequired {
+                last_good: input.last_good.clone(),
+                latest_attempt: latest_attempt_id,
+            },
+            AttemptOutcome::Unreachable(failure_class) => {
+                if let Some(auth_fail_ctx) = input.last_auth_failure_context {
+                    if auth_fail_ctx == current_ctx {
+                        Freshness::AuthRequired {
+                            last_good: input.last_good.clone(),
+                            latest_attempt: latest_attempt_id,
+                        }
+                    } else {
+                        let verified = input.latest_auth_success_context == Some(current_ctx);
+                        if verified {
+                            Freshness::Stale {
+                                last_good: input.last_good.clone(),
+                                latest_attempt: latest_attempt_id,
+                                reason: to_stale_reason(failure_class),
+                            }
+                        } else {
+                            Freshness::Stale {
+                                last_good: input.last_good.clone(),
+                                latest_attempt: latest_attempt_id,
+                                reason: StaleReason::CredentialChangedUnverified,
+                            }
+                        }
+                    }
+                } else {
+                    Freshness::Stale {
+                        last_good: input.last_good.clone(),
+                        latest_attempt: latest_attempt_id,
+                        reason: to_stale_reason(failure_class),
+                    }
+                }
+            }
+        },
+        None => {
+            let started_at = latest.started.started_at();
+            let is_future = now < started_at;
+            let elapsed_nanos = now.unix_nanos().saturating_sub(started_at.unix_nanos());
+
+            if is_future {
+                Freshness::Stale {
+                    last_good: input.last_good.clone(),
+                    latest_attempt: latest_attempt_id,
+                    reason: StaleReason::ClockAnomaly,
+                }
+            } else if elapsed_nanos > input.command_horizon.as_nanos() as i64 {
+                Freshness::Stale {
+                    last_good: input.last_good.clone(),
+                    latest_attempt: latest_attempt_id,
+                    reason: StaleReason::CollectorInterrupted,
+                }
+            } else if let Some(auth_fail_ctx) = input.last_auth_failure_context {
+                if auth_fail_ctx == current_ctx {
+                    Freshness::AuthRequired {
+                        last_good: input.last_good.clone(),
+                        latest_attempt: latest_attempt_id,
+                    }
+                } else if input.latest_auth_success_context != Some(current_ctx) {
+                    Freshness::Stale {
+                        last_good: input.last_good.clone(),
+                        latest_attempt: latest_attempt_id,
+                        reason: StaleReason::CredentialChangedUnverified,
+                    }
+                } else {
+                    evaluate_observation(
+                        input.last_good.as_ref(),
+                        latest_attempt_id,
+                        now,
+                        input.freshness_horizon,
+                        input.clock_skew_envelope,
+                    )
+                }
+            } else {
+                evaluate_observation(
+                    input.last_good.as_ref(),
+                    latest_attempt_id,
+                    now,
+                    input.freshness_horizon,
+                    input.clock_skew_envelope,
+                )
+            }
+        }
+    }
+}
+
+fn evaluate_observation<T: Clone>(
+    last_good: Option<&Observed<T>>,
+    latest_attempt_id: AttemptId,
+    now: UtcTimestamp,
+    freshness_horizon: MonotonicDuration,
+    clock_skew_envelope: ClockSkewEnvelope,
+) -> Freshness<T> {
+    if let Some(observed) = last_good {
+        match age(
+            observed.provider_observed_at(),
+            observed.received_at(),
+            observed.measurement_basis(),
+            now,
+            clock_skew_envelope,
+        ) {
+            Err(_) => Freshness::Stale {
+                last_good: Some(observed.clone()),
+                latest_attempt: latest_attempt_id,
+                reason: StaleReason::ClockAnomaly,
+            },
+            Ok(reading_age) => {
+                if reading_age.as_nanos() <= freshness_horizon.as_nanos() {
+                    Freshness::Fresh {
+                        observed: observed.clone(),
+                        latest_attempt: latest_attempt_id,
+                    }
+                } else {
+                    Freshness::Stale {
+                        last_good: Some(observed.clone()),
+                        latest_attempt: latest_attempt_id,
+                        reason: StaleReason::AgeExceeded,
+                    }
+                }
+            }
+        }
+    } else {
+        Freshness::Stale {
+            last_good: None,
+            latest_attempt: latest_attempt_id,
+            reason: StaleReason::NoSuccessfulObservation,
         }
     }
 }
@@ -300,5 +530,540 @@ mod tests {
             freshness_kinds.len(),
             "coincidental equality would make this property test worthless"
         );
+    }
+
+    fn test_observed(
+        value: u64,
+        provider_nanos: Option<i64>,
+        received_nanos: i64,
+    ) -> Observed<u64> {
+        Observed::new(
+            value,
+            provider_nanos.map(|n| ProviderObservedAt::new(UtcTimestamp::from_unix_nanos(n))),
+            ReceivedAt::new(UtcTimestamp::from_unix_nanos(received_nanos)),
+            MeasurementBasis::ProviderObserved,
+        )
+    }
+
+    #[test]
+    fn ordinary_ageing_inside_and_outside_freshness_horizon() {
+        let ctx = CredentialContextId::new("ctx-1");
+        let horizon = MonotonicDuration::from_seconds(60);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+        let obs = test_observed(100, Some(1_000_000_000), 1_000_000_000);
+        let started = AttemptStarted::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000),
+        );
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Success,
+        );
+
+        let input = FreshnessInput::new(
+            Some(obs.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        // Read at T + 30s (inside horizon)
+        let clock_inside =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(31_000_000_000));
+        let fresh = compute_freshness(&input, &clock_inside);
+        assert_eq!(fresh.kind(), FreshnessKind::Fresh);
+        assert_eq!(fresh.latest_attempt(), AttemptId::new(1));
+        match fresh {
+            Freshness::Fresh { observed, .. } => assert_eq!(observed, obs),
+            _ => panic!("expected Fresh"),
+        }
+
+        // Read at T + 70s (outside horizon)
+        let clock_outside =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(71_000_000_000));
+        let stale = compute_freshness(&input, &clock_outside);
+        assert_eq!(stale.kind(), FreshnessKind::Stale);
+        match stale {
+            Freshness::Stale {
+                last_good: Some(good),
+                reason: StaleReason::AgeExceeded,
+                latest_attempt,
+            } => {
+                assert_eq!(good, obs);
+                assert_eq!(latest_attempt, AttemptId::new(1));
+            }
+            _ => panic!("expected Stale(AgeExceeded)"),
+        }
+    }
+
+    #[test]
+    fn fresh_then_transport_failure_retains_historical_value_and_named_reason() {
+        let ctx = CredentialContextId::new("ctx-1");
+        let horizon = MonotonicDuration::from_seconds(300);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+        let obs = test_observed(42, Some(1_000_000_000), 1_000_000_000);
+
+        // Attempt 2 failed with ConnectTimeout
+        let started_2 = AttemptStarted::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+        );
+        let result_2 = AttemptResult::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+        );
+
+        let input = FreshnessInput::new(
+            Some(obs.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started_2, Some(result_2), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(3_000_000_000));
+        let stale = compute_freshness(&input, &clock);
+        assert_eq!(stale.kind(), FreshnessKind::Stale);
+        match stale {
+            Freshness::Stale {
+                last_good: Some(good),
+                latest_attempt,
+                reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
+            } => {
+                assert_eq!(good, obs);
+                assert_eq!(latest_attempt, AttemptId::new(2));
+            }
+            _ => panic!("expected Stale(ConnectTimeout) with historical last_good"),
+        }
+    }
+
+    #[test]
+    fn credential_sequence_auth_required_replaced_transport_failure_then_success() {
+        let ctx_a = CredentialContextId::new("ctx-a");
+        let ctx_b = CredentialContextId::new("ctx-b");
+        let horizon = MonotonicDuration::from_seconds(300);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+
+        // Step 1: AuthRequired under context A
+        let started_1 = AttemptStarted::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000),
+        );
+        let result_1 = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::AuthRequired,
+        );
+        let input_1 = FreshnessInput::new(
+            None,
+            None,
+            Some(LatestAttempt::new(started_1, Some(result_1), &ctx_a)),
+            Some(&ctx_a),
+            None,
+            horizon,
+            command_horizon,
+            envelope,
+        );
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(1_500_000_000));
+        let res_1 = compute_freshness(&input_1, &clock);
+        assert_eq!(res_1.kind(), FreshnessKind::AuthRequired);
+
+        // Step 2: Credential replaced to context B, transport failure under B
+        let started_2 = AttemptStarted::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+        );
+        let result_2 = AttemptResult::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+        );
+        let input_2 = FreshnessInput::new(
+            None,
+            None,
+            Some(LatestAttempt::new(started_2, Some(result_2), &ctx_b)),
+            Some(&ctx_a), // Prior auth failure was under ctx_a
+            None,         // ctx_b has not yet succeeded
+            horizon,
+            command_horizon,
+            envelope,
+        );
+        let res_2 = compute_freshness(&input_2, &clock);
+        assert_eq!(res_2.kind(), FreshnessKind::Stale);
+        match res_2 {
+            Freshness::Stale {
+                last_good: None,
+                latest_attempt,
+                reason: StaleReason::CredentialChangedUnverified,
+            } => {
+                assert_eq!(latest_attempt, AttemptId::new(2));
+            }
+            _ => panic!("expected Stale(CredentialChangedUnverified)"),
+        }
+
+        // Step 3: Success under context B
+        let obs_b = test_observed(99, Some(3_000_000_000), 3_000_000_000);
+        let started_3 = AttemptStarted::new(
+            AttemptId::new(3),
+            UtcTimestamp::from_unix_nanos(3_000_000_000),
+        );
+        let result_3 = AttemptResult::new(
+            AttemptId::new(3),
+            UtcTimestamp::from_unix_nanos(3_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Success,
+        );
+        let input_3 = FreshnessInput::new(
+            Some(obs_b.clone()),
+            Some(&ctx_b),
+            Some(LatestAttempt::new(started_3, Some(result_3), &ctx_b)),
+            None,         // Auth failure under ctx_a cleared by success under ctx_b
+            Some(&ctx_b), // ctx_b verified
+            horizon,
+            command_horizon,
+            envelope,
+        );
+        let clock_3 =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(3_100_000_000));
+        let res_3 = compute_freshness(&input_3, &clock_3);
+        assert_eq!(res_3.kind(), FreshnessKind::Fresh);
+        match res_3 {
+            Freshness::Fresh {
+                observed,
+                latest_attempt,
+            } => {
+                assert_eq!(observed, obs_b);
+                assert_eq!(latest_attempt, AttemptId::new(3));
+            }
+            _ => panic!("expected Fresh"),
+        }
+    }
+
+    #[test]
+    fn same_credential_context_transport_failure_retains_unresolved_auth_condition() {
+        let ctx_a = CredentialContextId::new("ctx-a");
+        let horizon = MonotonicDuration::from_seconds(300);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+
+        let started_2 = AttemptStarted::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+        );
+        let result_2 = AttemptResult::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+        );
+        let input = FreshnessInput::new(
+            None,
+            None,
+            Some(LatestAttempt::new(started_2, Some(result_2), &ctx_a)),
+            Some(&ctx_a), // Prior auth failure was under same ctx_a
+            None,
+            horizon,
+            command_horizon,
+            envelope,
+        );
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(2_500_000_000));
+        let res = compute_freshness(&input, &clock);
+        assert_eq!(res.kind(), FreshnessKind::AuthRequired);
+    }
+
+    #[test]
+    fn started_attempt_past_command_horizon_yields_collector_interrupted() {
+        let ctx = CredentialContextId::new("ctx-1");
+        let horizon = MonotonicDuration::from_seconds(300);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+        let obs = test_observed(50, Some(1_000_000_000), 1_000_000_000);
+
+        // Attempt 2 started at T=5s, but has NO result
+        let started = AttemptStarted::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(5_000_000_000),
+        );
+        let input = FreshnessInput::new(
+            Some(obs.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, None, &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        // Clock is T=20s (15s elapsed > 10s command horizon)
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(20_000_000_000));
+        let res = compute_freshness(&input, &clock);
+        assert_eq!(res.kind(), FreshnessKind::Stale);
+        match res {
+            Freshness::Stale {
+                last_good: Some(good),
+                latest_attempt,
+                reason: StaleReason::CollectorInterrupted,
+            } => {
+                assert_eq!(good, obs);
+                assert_eq!(latest_attempt, AttemptId::new(2));
+            }
+            _ => panic!("expected Stale(CollectorInterrupted)"),
+        }
+    }
+
+    #[test]
+    fn provider_timestamp_outside_skew_envelope_yields_clock_anomaly() {
+        let ctx = CredentialContextId::new("ctx-1");
+        let horizon = MonotonicDuration::from_seconds(300);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+
+        // Provider observed at 1_050s, received at 1_000s (> 10s envelope)
+        let obs = test_observed(77, Some(1_050_000_000_000), 1_000_000_000_000);
+        let started = AttemptStarted::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000_000),
+        );
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Success,
+        );
+
+        let input = FreshnessInput::new(
+            Some(obs.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(1_060_000_000_000));
+        let res = compute_freshness(&input, &clock);
+        assert_eq!(res.kind(), FreshnessKind::Stale);
+        match res {
+            Freshness::Stale {
+                last_good: Some(good),
+                latest_attempt,
+                reason: StaleReason::ClockAnomaly,
+            } => {
+                assert_eq!(good, obs);
+                assert_eq!(latest_attempt, AttemptId::new(1));
+            }
+            _ => panic!("expected Stale(ClockAnomaly)"),
+        }
+    }
+
+    #[test]
+    fn pure_function_called_twice_with_identical_inputs_returns_identical_output() {
+        let ctx = CredentialContextId::new("ctx-1");
+        let horizon = MonotonicDuration::from_seconds(60);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+        let obs = test_observed(123, Some(1_000_000_000), 1_000_000_000);
+        let started = AttemptStarted::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000),
+        );
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000_000_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Success,
+        );
+
+        let input = FreshnessInput::new(
+            Some(obs),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(10_000_000_000));
+        let call_1 = compute_freshness(&input, &clock);
+        let call_2 = compute_freshness(&input, &clock);
+        assert_eq!(call_1, call_2);
+    }
+
+    fn xorshift(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    #[test]
+    fn time_alone_can_make_fresh_data_stale_and_never_makes_stale_data_fresh() {
+        use crate::domain::failure::HttpStatusClass;
+
+        let mut rng = xorshift(0xDEAD_BEEF_CAFE_BABE);
+        let ctx_a = CredentialContextId::new("ctx-a");
+        let ctx_b = CredentialContextId::new("ctx-b");
+        let contexts = [&ctx_a, &ctx_b];
+
+        for _ in 0..100 {
+            let base_time_sec = (rng() % 1000) + 100;
+            let base_nanos = (base_time_sec as i64) * 1_000_000_000;
+            let horizon_sec = (rng() % 120) + 10;
+            let horizon = MonotonicDuration::from_seconds(horizon_sec);
+            let command_horizon = MonotonicDuration::from_seconds(10);
+            let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+
+            let has_last_good = rng() % 2 == 0;
+            let obs = if has_last_good {
+                Some(test_observed(rng() % 1000, Some(base_nanos), base_nanos))
+            } else {
+                None
+            };
+            let obs_ctx = if has_last_good {
+                Some(contexts[(rng() % 2) as usize])
+            } else {
+                None
+            };
+
+            let outcome_choice = rng() % 5;
+            let started = AttemptStarted::new(
+                AttemptId::new((rng() % 100) + 1),
+                UtcTimestamp::from_unix_nanos(base_nanos),
+            );
+            let latest_ctx = contexts[(rng() % 2) as usize];
+            let result = match outcome_choice {
+                0 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::Success,
+                )),
+                1 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::AuthRequired,
+                )),
+                2 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+                )),
+                3 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::Unreachable(FailureClass::HttpStatus(
+                        HttpStatusClass::ServerError,
+                    )),
+                )),
+                _ => None,
+            };
+
+            let auth_fail_ctx = if rng() % 2 == 0 {
+                Some(contexts[(rng() % 2) as usize])
+            } else {
+                None
+            };
+            let auth_success_ctx = if rng() % 2 == 0 {
+                Some(contexts[(rng() % 2) as usize])
+            } else {
+                None
+            };
+
+            let input = FreshnessInput::new(
+                obs,
+                obs_ctx,
+                Some(LatestAttempt::new(started, result, latest_ctx)),
+                auth_fail_ctx,
+                auth_success_ctx,
+                horizon,
+                command_horizon,
+                envelope,
+            );
+
+            let t0 = UtcTimestamp::from_unix_nanos(base_nanos);
+            let clock_0 = crate::domain::time::FakeClock::new(t0);
+            let initial = compute_freshness(&input, &clock_0);
+
+            // Advance clock by various increments
+            for delta_sec in [
+                1,
+                5,
+                horizon_sec / 2,
+                horizon_sec,
+                horizon_sec + 1,
+                horizon_sec * 2,
+                3600,
+            ] {
+                let t_future =
+                    UtcTimestamp::from_unix_nanos(base_nanos + (delta_sec as i64) * 1_000_000_000);
+                let clock_future = crate::domain::time::FakeClock::new(t_future);
+                let later = compute_freshness(&input, &clock_future);
+
+                match initial.kind() {
+                    FreshnessKind::Stale => {
+                        assert_ne!(
+                            later.kind(),
+                            FreshnessKind::Fresh,
+                            "time alone must never turn Stale into Fresh"
+                        );
+                    }
+                    FreshnessKind::AuthRequired => {
+                        assert_ne!(
+                            later.kind(),
+                            FreshnessKind::Fresh,
+                            "time alone must never turn AuthRequired into Fresh"
+                        );
+                    }
+                    FreshnessKind::Fresh => {
+                        assert_ne!(
+                            later.kind(),
+                            FreshnessKind::AuthRequired,
+                            "time alone must never turn Fresh into AuthRequired"
+                        );
+                        if delta_sec > horizon_sec {
+                            assert_eq!(
+                                later.kind(),
+                                FreshnessKind::Stale,
+                                "Fresh data must age into Stale past the freshness horizon"
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

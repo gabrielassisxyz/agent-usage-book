@@ -200,6 +200,23 @@ impl AdapterVersion {
     }
 }
 
+/// An identifier for the credential context under which an attempt was made.
+///
+/// Distinct from credential secrets: carries no secret bytes. Used to determine
+/// if two attempts ran under the same or different credentials.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct CredentialContextId(String);
+
+impl CredentialContextId {
+    pub fn new(value: impl Into<String>) -> Self {
+        CredentialContextId(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +269,11 @@ mod tests {
         assert_eq!(billing.as_str(), "model-x-subscription-v4");
         assert_eq!(contract.as_str(), "endpoint-schema-v3");
         assert_eq!(adapter.as_str(), "v14");
+    }
+
+    #[test]
+    fn credential_context_id_round_trips_its_value() {
+        let ctx = CredentialContextId::new("anthropic-oauth-user-1");
+        assert_eq!(ctx.as_str(), "anthropic-oauth-user-1");
     }
 }
