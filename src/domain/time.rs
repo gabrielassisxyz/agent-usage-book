@@ -17,6 +17,20 @@ use std::time::Instant as StdInstant;
 use std::time::SystemTime;
 use std::time::UNIX_EPOCH;
 
+/// The time since the Unix epoch, in nanoseconds, for a wall-clock instant.
+///
+/// The one place a [`SystemTime`] is converted to an epoch count outside the
+/// clock module's own reads: a file's modification time is a wall-clock
+/// instant, and the modules that need it (credential resolution) must not
+/// touch the epoch constant themselves. A pre-epoch instant is impossible in
+/// practice and maps to zero rather than failing the caller.
+pub fn unix_nanos(system_time: SystemTime) -> u128 {
+    system_time
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+}
+
 /// A wall-clock instant in UTC, as nanoseconds since the Unix epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct UtcTimestamp(i64);
@@ -341,6 +355,20 @@ mod tests {
 
     fn envelope(seconds: u64) -> ClockSkewEnvelope {
         ClockSkewEnvelope::new(MonotonicDuration::from_seconds(seconds))
+    }
+
+    /// The epoch conversion reports the instant's nanoseconds since the epoch.
+    #[test]
+    fn unix_nanos_reports_nanoseconds_since_the_epoch() {
+        let instant = UNIX_EPOCH + std::time::Duration::from_secs(2);
+        assert_eq!(unix_nanos(instant), 2_000_000_000);
+    }
+
+    /// A pre-epoch instant maps to zero rather than failing the caller.
+    #[test]
+    fn unix_nanos_maps_a_pre_epoch_instant_to_zero() {
+        let instant = UNIX_EPOCH - std::time::Duration::from_secs(1);
+        assert_eq!(unix_nanos(instant), 0);
     }
 
     /// A provider timestamp exactly at the envelope boundary is inside; one

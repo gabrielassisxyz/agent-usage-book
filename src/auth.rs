@@ -14,7 +14,6 @@
 
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::SystemTime;
 
 use crate::config::AccountConfig;
 use crate::domain::ids::CredentialContextId;
@@ -133,9 +132,14 @@ impl std::fmt::Debug for ResolvedCredential {
 
 /// The filesystem surface credential resolution reads through, so tests can
 /// inject a fake instead of touching the real home directory.
+///
+/// Modification times are reported as nanoseconds since the Unix epoch, never
+/// as a wall-clock instant type: the epoch conversion belongs to the clock
+/// module (`src/domain/time.rs`), the only module allowed to touch the epoch
+/// constant.
 pub trait CredentialFs {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
-    fn modified(&self, path: &Path) -> io::Result<SystemTime>;
+    fn modified_nanos(&self, path: &Path) -> io::Result<u128>;
 }
 
 /// The real filesystem.
@@ -147,8 +151,9 @@ impl CredentialFs for RealFs {
         std::fs::read_to_string(path)
     }
 
-    fn modified(&self, path: &Path) -> io::Result<SystemTime> {
-        std::fs::metadata(path)?.modified()
+    fn modified_nanos(&self, path: &Path) -> io::Result<u128> {
+        let modified = std::fs::metadata(path)?.modified()?;
+        Ok(crate::domain::time::unix_nanos(modified))
     }
 }
 
@@ -184,18 +189,15 @@ pub fn resolve(
                     source_label(&path, verbose)
                 )));
             }
-            let modified = fs.modified(&path).map_err(|cause| {
+            let modified_nanos = fs.modified_nanos(&path).map_err(|cause| {
                 Error::AuthRequired(format!(
                     "account '{}': credential file '{}' metadata could not be read: {cause}",
                     account.name,
                     source_label(&path, verbose)
                 ))
             })?;
-            let context_id = CredentialContextId::new(format!(
-                "file:{}:{}",
-                path.display(),
-                mtime_nanos(modified)
-            ));
+            let context_id =
+                CredentialContextId::new(format!("file:{}:{}", path.display(), modified_nanos));
             Ok(ResolvedCredential {
                 material: Secret::new(AuthMaterial::new(material)),
                 context_id,
@@ -216,24 +218,13 @@ fn source_label(path: &Path, verbose: bool) -> String {
     }
 }
 
-/// The file's modification time as nanoseconds since the Unix epoch. A
-/// pre-epoch timestamp is impossible for a credential file in practice and
-/// maps to zero rather than failing the resolution.
-fn mtime_nanos(modified: SystemTime) -> u128 {
-    modified
-        .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::error::ExitClass;
     use std::collections::BTreeMap;
-    use std::time::{Duration, UNIX_EPOCH};
 
-    struct FakeFs(BTreeMap<PathBuf, (String, SystemTime)>);
+    struct FakeFs(BTreeMap<PathBuf, (String, u128)>);
 
     impl FakeFs {
         fn new() -> Self {
@@ -244,9 +235,9 @@ mod tests {
             mut self,
             path: impl Into<PathBuf>,
             content: impl Into<String>,
-            modified: SystemTime,
+            modified_nanos: u128,
         ) -> Self {
-            self.0.insert(path.into(), (content.into(), modified));
+            self.0.insert(path.into(), (content.into(), modified_nanos));
             self
         }
     }
@@ -259,10 +250,10 @@ mod tests {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
         }
 
-        fn modified(&self, path: &Path) -> io::Result<SystemTime> {
+        fn modified_nanos(&self, path: &Path) -> io::Result<u128> {
             self.0
                 .get(path)
-                .map(|(_, modified)| *modified)
+                .map(|(_, modified_nanos)| *modified_nanos)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
         }
     }
@@ -276,8 +267,8 @@ mod tests {
         }
     }
 
-    fn at(nanos: u64) -> SystemTime {
-        UNIX_EPOCH + Duration::from_nanos(nanos)
+    fn at(nanos: u64) -> u128 {
+        u128::from(nanos)
     }
 
     #[test]
