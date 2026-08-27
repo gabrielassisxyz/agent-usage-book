@@ -215,14 +215,36 @@ mod tests {
         }
     }
 
-    /// A scripted pragma connection: tests inject set and readback failures and
-    /// mismatched readbacks without a real database, and can assert which pragmas
-    /// were set or read.
+    /// The value SQLite reports back after a set, modelling the normalization
+    /// the real connection performs: journal mode is lower-cased, and
+    /// `synchronous` and `foreign_keys` report their integer form.
+    fn normalized_pragma_value(name: &str, value: &str) -> String {
+        match name {
+            "journal_mode" => value.to_lowercase(),
+            "synchronous" => match value {
+                "FULL" => "2".to_string(),
+                "NORMAL" => "1".to_string(),
+                "OFF" => "0".to_string(),
+                _ => value.to_string(),
+            },
+            "foreign_keys" => match value {
+                "ON" => "1".to_string(),
+                "OFF" => "0".to_string(),
+                _ => value.to_string(),
+            },
+            _ => value.to_string(),
+        }
+    }
+
+    /// A scripted pragma connection: tests inject set and readback failures,
+    /// sets that silently do not take effect, and mismatched readbacks without a
+    /// real database, and can assert which pragmas were set or read.
     #[derive(Default)]
     struct FakePragmaConnection {
         values: RefCell<BTreeMap<String, String>>,
         fail_set: BTreeMap<String, ()>,
         fail_read: BTreeMap<String, ()>,
+        stuck: BTreeMap<String, ()>,
         set_calls: RefCell<Vec<String>>,
         read_calls: RefCell<Vec<String>>,
     }
@@ -256,6 +278,11 @@ mod tests {
             self
         }
 
+        fn stuck_on(mut self, name: &str) -> Self {
+            self.stuck.insert(name.into(), ());
+            self
+        }
+
         fn with_value(mut self, name: &str, value: &str) -> Self {
             self.values.get_mut().insert(name.into(), value.into());
             self
@@ -278,9 +305,14 @@ mod tests {
                     "injected failure setting PRAGMA {name} = {value}"
                 )));
             }
+            if self.stuck.contains_key(name) {
+                // The set silently does not take effect: the readback observes
+                // the value already in effect.
+                return Ok(());
+            }
             self.values
                 .borrow_mut()
-                .insert(name.to_string(), value.to_string());
+                .insert(name.to_string(), normalized_pragma_value(name, value));
             Ok(())
         }
 
@@ -360,7 +392,9 @@ mod tests {
     /// actually in effect.
     #[test]
     fn a_readback_mismatch_names_required_and_observed_values() {
-        let fake = FakePragmaConnection::new().with_value("journal_mode", "delete");
+        let fake = FakePragmaConnection::new()
+            .with_value("journal_mode", "delete")
+            .stuck_on("journal_mode");
         let err = apply_policy(&fake, AccessMode::ReadWrite, &policy()).unwrap_err();
         assert_eq!(err.exit_class(), ExitClass::Store);
         let message = err.to_string();
