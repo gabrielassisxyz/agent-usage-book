@@ -314,7 +314,20 @@ fn map_transport_error(err: &ureq::Transport) -> FailureClass {
                 FailureClass::ConnectTimeout
             }
         }
-        _ => {
+        // Enumerated rather than left to a wildcard: ureq::ErrorKind is not
+        // #[non_exhaustive], so naming every variant makes a future ureq
+        // release fail to compile here instead of silently classifying a new
+        // failure mode as a connect timeout.
+        ureq::ErrorKind::InvalidUrl
+        | ureq::ErrorKind::UnknownScheme
+        | ureq::ErrorKind::InsecureRequestHttpsOnly
+        | ureq::ErrorKind::TooManyRedirects
+        | ureq::ErrorKind::BadStatus
+        | ureq::ErrorKind::BadHeader
+        | ureq::ErrorKind::InvalidProxyUrl
+        | ureq::ErrorKind::ProxyConnect
+        | ureq::ErrorKind::ProxyUnauthorized
+        | ureq::ErrorKind::HTTP => {
             if msg.contains("timeout") || msg.contains("timed out") {
                 FailureClass::ReadTimeout
             } else {
