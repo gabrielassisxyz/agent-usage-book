@@ -175,7 +175,7 @@ pub fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::time::RealClock;
+    use crate::domain::time::{Clock, RealClock};
     use crate::error::ExitClass;
     use std::cell::RefCell;
     use std::collections::BTreeMap;
@@ -220,7 +220,7 @@ mod tests {
     /// were set or read.
     #[derive(Default)]
     struct FakePragmaConnection {
-        values: BTreeMap<String, String>,
+        values: RefCell<BTreeMap<String, String>>,
         fail_set: BTreeMap<String, ()>,
         fail_read: BTreeMap<String, ()>,
         set_calls: RefCell<Vec<String>>,
@@ -231,10 +231,18 @@ mod tests {
         fn new() -> Self {
             let mut fake = Self::default();
             // The values a correctly configured connection would read back.
-            fake.values.insert("busy_timeout".into(), "1000".into());
-            fake.values.insert("journal_mode".into(), "wal".into());
-            fake.values.insert("synchronous".into(), "2".into());
-            fake.values.insert("foreign_keys".into(), "1".into());
+            fake.values
+                .get_mut()
+                .insert("busy_timeout".into(), "1000".into());
+            fake.values
+                .get_mut()
+                .insert("journal_mode".into(), "wal".into());
+            fake.values
+                .get_mut()
+                .insert("synchronous".into(), "2".into());
+            fake.values
+                .get_mut()
+                .insert("foreign_keys".into(), "1".into());
             fake
         }
 
@@ -249,7 +257,7 @@ mod tests {
         }
 
         fn with_value(mut self, name: &str, value: &str) -> Self {
-            self.values.insert(name.into(), value.into());
+            self.values.get_mut().insert(name.into(), value.into());
             self
         }
 
@@ -270,7 +278,9 @@ mod tests {
                     "injected failure setting PRAGMA {name} = {value}"
                 )));
             }
-            self.values.insert(name.to_string(), value.to_string());
+            self.values
+                .borrow_mut()
+                .insert(name.to_string(), value.to_string());
             Ok(())
         }
 
@@ -281,7 +291,7 @@ mod tests {
                     "injected failure reading PRAGMA {name}"
                 )));
             }
-            Ok(self.values.get(name).cloned().unwrap_or_default())
+            Ok(self.values.borrow().get(name).cloned().unwrap_or_default())
         }
     }
 
@@ -437,7 +447,7 @@ mod tests {
     fn a_reader_is_not_blocked_behind_a_writer_under_wal() {
         let scratch = ScratchDir::new();
         let db_path = scratch.path().join("meter.db");
-        let writer = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+        let mut writer = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
         writer
             .execute_batch("CREATE TABLE samples (id INTEGER PRIMARY KEY, value INTEGER)")
             .unwrap();
@@ -497,7 +507,7 @@ mod tests {
     fn a_write_transaction_under_synchronous_full_completes_within_the_busy_bound() {
         let scratch = ScratchDir::new();
         let db_path = scratch.path().join("meter.db");
-        let conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
         conn.execute_batch("CREATE TABLE samples (id INTEGER PRIMARY KEY, value INTEGER)")
             .unwrap();
 
