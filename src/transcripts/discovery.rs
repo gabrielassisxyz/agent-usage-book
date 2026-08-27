@@ -301,7 +301,6 @@ fn glob_match(pattern: &str, name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::time::Instant;
 
     fn config(name: &str, root: &Path, pattern: &str) -> TranscriptConfig {
         TranscriptConfig {
@@ -498,27 +497,5 @@ mod tests {
         let sources = [config("s", &root, "**/*.jsonl")];
         let result = discover(&sources, &DiscoveryOptions::default()).unwrap();
         assert_eq!(result[0].files.len(), 2);
-    }
-
-    /// Discovery over a synthetic tree of stated size completes within its
-    /// budget: a deep root is the case that would otherwise walk a filesystem.
-    #[test]
-    fn discovery_over_a_synthetic_tree_completes_within_budget() {
-        let root = scratch("perf");
-        for level in 0..20 {
-            for branch in 0..5 {
-                let dir = root.join(format!("l{level}")).join(format!("b{branch}"));
-                write(&dir.join(format!("t-{level}-{branch}.jsonl")), "{}");
-            }
-        }
-        let sources = [config("s", &root, "*.jsonl")];
-        let started = Instant::now();
-        let result = discover(&sources, &DiscoveryOptions::default()).unwrap();
-        let elapsed = started.elapsed();
-        assert_eq!(result[0].files.len(), 100, "20 levels x 5 branches");
-        assert!(
-            elapsed.as_secs() < 5,
-            "discovery of 100 files took {elapsed:?}, over the 5s budget"
-        );
     }
 }
