@@ -421,6 +421,10 @@ CI additionally contains a tombstone check for the known legacy constant and tes
 that consumers change behavior when the active calibration row changes without any
 source-code edit.
 
+TOMBSTONE: the legacy coefficient `564,577` (credits per percentage point) must never
+be hardcoded in source; the tombstone check in `bin/ci` fails the build if it
+reappears.
+
 ## 3.4 No compiled identity
 
 Source code contains no machine-specific paths, account names, usernames, personal identifiers, repository locations, state directories, or credential paths.

@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Tombstone: the legacy credits-per-percentage-point coefficient 564,577 must
+# never be hardcoded in source. It is a duplicate of a fit made by hand in a
+# second program, with no path through which a corrected fit could ever reach
+# it. The calibration repository is the single source of truth.
+#
+# This check is deliberately narrow: it greps for one specific historical
+# literal, not a blanket prohibition on numeric literals. HTTP status
+# constants, schema versions, array sizes, retry counts and test values are
+# all legitimate. The invariant is that domain conversion witnesses cannot be
+# constructed ad hoc by consumers (PLAN.md section 3.3).
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
+cd "$repo_root"
+
+# The literal, in the forms it could reappear: prose (564,577), plain
+# (564577), and Rust integer (564_577).
+matches="$(grep -rnE '564[,_]?577' src tests/fixtures 2>/dev/null || true)"
+if [ -n "$matches" ]; then
+    echo "the legacy coefficient 564,577 must not be hardcoded:" >&2
+    printf '%s\n' "$matches" >&2
+    echo "it is a duplicate of a fit made by hand in a second program, with no" >&2
+    echo "path through which a corrected fit could reach it. Resolve the" >&2
+    echo "coefficient through the calibration repository instead." >&2
+    exit 1
+fi

@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# Proves the coefficient tombstone check catches the one literal it exists to
+# catch, and nothing else. Each scenario mutates a scratch copy of bin/, src/
+# and tests/fixtures/ (never the live tree) and asserts the check's exit code
+# and named output reflect the mutation.
+#
+# A scenario that cannot fail is not a test: the literal is planted once in
+# each of source, configuration and fixture files and the check must fail
+# naming the file and the reason, and a file full of legitimate numeric
+# literals must pass, proving no blanket prohibition was introduced.
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+fail=0
+
+scratch="$(mktemp -d)"
+trap 'rm -rf "$scratch"' EXIT
+
+assert_exit() {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$actual" -ne "$expected" ]; then
+        echo "FAIL: $label: expected exit $expected, got $actual" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
+assert_contains() {
+    local label="$1" needle="$2" haystack="$3"
+    if ! printf '%s' "$haystack" | grep -qF -- "$needle"; then
+        echo "FAIL: $label: expected output to contain '$needle'" >&2
+        echo "--- actual output ---" >&2
+        printf '%s\n' "$haystack" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
+# A fresh scratch copy of bin/, src/ and tests/fixtures/ with the repo's
+# layout, so the check resolves its paths from its own location and never
+# touches the live tree.
+make_scenario() {
+    local dir="$scratch/$1"
+    mkdir -p "$dir"
+    cp -a "$repo_root/bin" "$dir/bin"
+    cp -a "$repo_root/src" "$dir/src"
+    mkdir -p "$dir/tests"
+    cp -a "$repo_root/tests/fixtures" "$dir/tests/fixtures"
+    printf '%s\n' "$dir"
+}
+
+check_for() {
+    printf '%s/bin/checks/55-coefficient-tombstone' "$1"
+}
+
+# --- clean run passes ---
+dir="$(make_scenario clean)"
+out="$("$(check_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "clean run exits 0" 0 "$rc"
+
+# --- the literal in a source file fails and explains why ---
+dir="$(make_scenario source)"
+printf 'const LEGACY: u64 = 564_577;\n' >> "$dir/src/calibration.rs"
+out="$("$(check_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "source literal exits 1" 1 "$rc"
+assert_contains "source names file" "src/calibration.rs" "$out"
+assert_contains "source explains why" "must not be hardcoded" "$out"
+assert_contains "source points at repository" "calibration repository" "$out"
+
+# --- the literal in a configuration file fails ---
+dir="$(make_scenario config)"
+printf 'const LEGACY: u64 = 564577;\n' >> "$dir/src/config/mod.rs"
+out="$("$(check_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "config literal exits 1" 1 "$rc"
+assert_contains "config names file" "src/config/mod.rs" "$out"
+
+# --- the literal in a fixture file fails ---
+dir="$(make_scenario fixture)"
+printf '564,577\n' >> "$dir/tests/fixtures/sample.txt"
+out="$("$(check_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "fixture literal exits 1" 1 "$rc"
+assert_contains "fixture names file" "tests/fixtures/sample.txt" "$out"
+
+# --- legitimate numeric literals pass (no blanket prohibition) ---
+dir="$(make_scenario legitimate)"
+printf 'const HTTP_OK: u64 = 200;\nconst RETRIES: u64 = 3;\nconst RATE: f64 = 0.000015;\nconst SCHEMA: u64 = 1;\n' >> "$dir/src/calibration.rs"
+out="$("$(check_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "legitimate literals exit 0" 0 "$rc"
+
+# --- the tombstone documentation line is permitted (docs are out of scope) ---
+# The live docs/PLAN.md names the literal as a tombstone; the check scans src/
+# and tests/fixtures/, never docs/, so a tree whose only occurrence is the
+# documentation line must pass.
+dir="$(make_scenario tombstone-doc)"
+out="$("$(check_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "tombstone doc exits 0" 0 "$rc"
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> coefficient-tombstone-selftest FAILED"
+    exit 1
+fi
+
+echo "coefficient-tombstone-selftest: all scenarios pass."

@@ -21,6 +21,7 @@ declared_checks=(
     40-audit
     45-boundary-rules
     50-prose-guard
+    55-coefficient-tombstone
     60-e2e
     70-quantity-inventory
     75-commit-protocol
@@ -42,6 +43,9 @@ declared_boundary_rules=(
     09-presentation-no-store-or-calibration
     10-freshness-constructed-only-in-domain
     11-store-connections-through-one-function
+    12-transport-no-ureq-outside-transport
+    13-no-async-runtime-dependency
+    14-parser-no-cost-or-meter
 )
 
 # Mapping of check filenames to their required descriptive phrase in AGENTS.md:93-95
