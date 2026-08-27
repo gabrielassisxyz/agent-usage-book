@@ -650,6 +650,20 @@ mod tests {
         );
     }
 
+    /// Native-usage sources are measured: every event is classified reported,
+    /// never reconstructed or derived.
+    #[test]
+    fn the_parser_classifies_everything_as_reported() {
+        let parser = ClaudeCodeParser;
+        let input = r#"{"message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5}}}"#;
+        let output = parser.parse(input, &location());
+        assert_eq!(
+            output.events()[0].classification(),
+            &EvidenceClassification::Reported,
+            "native-usage sources are measured, never reconstructed or derived"
+        );
+    }
+
     /// A stable native event identifier is passed through in the provenance.
     #[test]
     fn a_stable_native_event_identifier_is_passed_through() {
