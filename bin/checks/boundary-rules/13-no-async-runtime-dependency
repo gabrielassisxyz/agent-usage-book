@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Boundary: no async runtime may appear in the dependency tree.
+# Design: PLAN.md section 41 and bead aub-eun.2.
+# Detection: scan `cargo tree` output for forbidden async runtime crates.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+forbidden_matches="$(cargo tree 2>/dev/null | grep -E '\b(tokio|async-std|smol|actix-rt)\b' || true)"
+
+if [ -n "$forbidden_matches" ]; then
+    echo "Forbidden async runtime detected in dependency tree:" >&2
+    echo "$forbidden_matches" >&2
+    exit 1
+fi
+
+exit 0

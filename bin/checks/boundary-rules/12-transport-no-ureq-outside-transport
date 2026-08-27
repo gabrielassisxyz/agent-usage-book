@@ -1,0 +1,49 @@
+#!/usr/bin/env bash
+# Boundary: ureq types may not appear outside src/meter/transport.rs.
+# Design: PLAN.md section 14.3 and bead aub-eun.2.
+# Detection: scan all Rust source files under src/ (excluding src/meter/transport.rs)
+#   for references to `ureq::` in production code.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+python3 - <<'PYEOF'
+import os, re, sys
+
+pattern = re.compile(r'\bureq::')
+violations = []
+
+for root, _, files in os.walk('src'):
+    for f in sorted(files):
+        if not f.endswith('.rs'):
+            continue
+        filepath = os.path.join(root, f)
+        if filepath == 'src/meter/transport.rs':
+            continue
+        try:
+            with open(filepath, 'r', encoding='utf-8') as handle:
+                content = handle.read()
+        except Exception as e:
+            print(f"error reading {filepath}: {e}", file=sys.stderr)
+            sys.exit(2)
+
+        # Ignore test modules
+        if '#[cfg(test)]' in content:
+            content = content.split('#[cfg(test)]')[0]
+
+        for m in pattern.finditer(content):
+            start = m.start()
+            line_no = content[:start].count('\n') + 1
+            snippet = content[start:min(start + 50, len(content))].replace('\n', ' ')
+            violations.append(f"{filepath}:{line_no}: {snippet}")
+
+if violations:
+    print("ureq referenced outside src/meter/transport.rs:", file=sys.stderr)
+    for v in violations:
+        print(f"    {v}", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)
+PYEOF

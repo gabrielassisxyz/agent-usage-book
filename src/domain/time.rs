@@ -86,17 +86,22 @@ pub struct MonotonicDuration(u64);
 
 impl MonotonicDuration {
     /// A duration from nanoseconds.
-    pub fn from_nanos(nanos: u64) -> Self {
+    pub const fn from_nanos(nanos: u64) -> Self {
         Self(nanos)
     }
 
     /// A duration from whole seconds.
-    pub fn from_seconds(seconds: u64) -> Self {
+    pub const fn from_seconds(seconds: u64) -> Self {
         Self(seconds.saturating_mul(1_000_000_000))
     }
 
+    /// A duration from milliseconds.
+    pub const fn from_millis(millis: u64) -> Self {
+        Self(millis.saturating_mul(1_000_000))
+    }
+
     /// Nanoseconds.
-    pub fn as_nanos(self) -> u64 {
+    pub const fn as_nanos(self) -> u64 {
         self.0
     }
 }
@@ -513,5 +518,11 @@ mod tests {
     fn real_clock_reports_a_time_after_the_epoch() {
         let clock = RealClock::new();
         assert!(clock.now().unix_nanos() > 0);
+    }
+
+    #[test]
+    fn monotonic_duration_from_millis_constructs_correct_nanos() {
+        let dur = MonotonicDuration::from_millis(250);
+        assert_eq!(dur.as_nanos(), 250_000_000);
     }
 }
