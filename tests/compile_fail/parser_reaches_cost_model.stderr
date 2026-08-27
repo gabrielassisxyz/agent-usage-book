@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+  --> tests/compile_fail/parser_reaches_cost_model.rs:26:9
+   |
+25 |       fn parse(&self, _input: &str, _location: &SourceLocation) -> ParseOutput {
+   |                                                                    ----------- expected `ParseOutput` because of return type
+26 | /         UsageVector::new(
+27 | |             KnownTokenVector::new(
+28 | |                 InputTokens::new(1),
+29 | |                 OutputTokens::new(1),
+...  |
+35 | |             EvidenceQuality::Measured,
+36 | |         )
+   | |_________^ expected `ParseOutput`, found `UsageVector`

@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# Boundary: transcript parsers must not reach cost models, calibrations, rate cards,
+#   task history, or meter observations.
+# Design: PLAN.md section 9 ("Transcript parsers do not calculate costs") and bead
+#   aub-lqe.3 ("The trait exposes no access to cost models, calibrations, rate cards,
+#   task history or meter observations").
+# Detection: any reference to the modules that own those concepts in the transcripts
+#   module source, wherever it lives: the flat file when it is a file, every .rs under
+#   the directory when it is a directory.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+sources=()
+if [ -f "src/transcripts.rs" ]; then
+    sources+=(src/transcripts.rs)
+fi
+if [ -d "src/transcripts" ]; then
+    while IFS= read -r file; do
+        sources+=("$file")
+    done < <(find src/transcripts -name '*.rs' -type f | sort)
+fi
+if [ "${#sources[@]}" -eq 0 ]; then
+    echo "transcript parsers must not reach cost models: no src/transcripts.rs or src/transcripts/ found" >&2
+    exit 2
+fi
+
+matches="$(grep -nHE 'crate::(cost_model|calibration|valuation|meter|attribution)([^A-Za-z0-9_]|$)' "${sources[@]}" 2>/dev/null || true)"
+if [ -n "$matches" ]; then
+    echo "transcript parsers reach a cost model, calibration, rate card, task history, or meter observation:" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+exit 0
