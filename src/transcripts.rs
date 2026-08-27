@@ -6,9 +6,11 @@
 //! - subscription window capacity, API pricing, task history, or meter percentages
 
 pub mod discovery;
+pub mod native;
 pub mod parser;
 
 pub use discovery::{DiscoveryError, DiscoveryOptions, SourceDiscovery, discover};
+pub use native::{ClaudeCodeParser, CodexParser, PiParser};
 pub use parser::{
     EstimatorVersion, EvidenceClassification, FIXTURE_CATALOG, FixtureCoverage, FixtureShape,
     InputFormatVersion, MutationExpectation, MutationKind, NormalizedUsageEvent, ParseOutput,

@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_0001","model":"claude-opus-4","usage":{"input_tokens":1200,"output_tokens":340}},"timestamp":"2026-08-25T10:00:00Z","uuid":"uuid-0001"}
+{"type":"assistant","message":{"id":"msg_0002","model":"claude-opus-4","usage":{"input_tokens":800,"output_tokens":210}},"timestamp":"2026-08-25T10:01:00Z","uuid":"uuid-0002"}

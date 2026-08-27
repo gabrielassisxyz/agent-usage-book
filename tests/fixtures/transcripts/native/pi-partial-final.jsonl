@@ -1,0 +1,2 @@
+{"type":"message","message":{"id":"msg_0001","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"reasoning":5,"totalTokens":185}},"cost":{"input":0.0001,"output":0.0002}}
+{"type":"message","message":{"id":"msg_0002","usage":{"input":200,"output":100,"cacheRead":40,"cacheWrite":20,"reasoning":10,"totalTokens":370

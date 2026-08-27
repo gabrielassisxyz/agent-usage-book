@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_0001","model":"claude-opus-4","usage":{"input_tokens":100,"output_tokens":50}},"timestamp":"2026-08-25T10:00:00Z","uuid":"uuid-0001"}
+{"type":"user","message":{"role":"user","content":[{"type":"text","text":"subagent transcript at projects/proj-a/subagents/agent-1.jsonl"}]},"timestamp":"2026-08-25T10:00:30Z","uuid":"uuid-0002"}
