@@ -130,7 +130,7 @@ pub trait SafeDiagnosticValue: private::Sealed {
 /// A value accepted as a structured diagnostic field.
 pub trait LogField: SafeDiagnosticValue {}
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub struct LogicalName(String);
 
 impl LogicalName {

@@ -6,12 +6,15 @@
 //! - provider adapters
 
 pub mod models;
+pub mod provenance;
 
 pub use models::{
     BackupReport, CalibrateReport, CoverageReport, DoctorReport, ExportReport, IngestReport,
-    IngestionGeneration, LedgerGeneration, MeterAccount, NowReport, ReportMetadata, SampleAttempt,
-    SampleReport, SpendGroup, SpendReport, StatusReport, TaskReport,
+    IngestionGeneration, LedgerGeneration, MeterAccount, MeterReadingProvenance, NowReport,
+    ReportMetadata, SampleAttempt, SampleReport, SpendGroup, SpendGroupProvenance, SpendReport,
+    StatusReport, TaskReport,
 };
+pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 
 use crate::logging::RunId;
 
