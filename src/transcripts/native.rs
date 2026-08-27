@@ -72,9 +72,14 @@ fn measured_usage(
 /// that is not one. A float or negative number is a wrong type: token counts
 /// are integers.
 fn count_value(value: &Value) -> Result<u64, QuarantineClass> {
+    // Enumerated rather than left to a wildcard: serde_json::Value is not
+    // #[non_exhaustive], so a variant added upstream fails to compile here
+    // instead of silently classifying as the wrong field type.
     match value {
         Value::Number(n) => n.as_u64().ok_or(QuarantineClass::WrongFieldType),
-        _ => Err(QuarantineClass::WrongFieldType),
+        Value::Null | Value::Bool(_) | Value::String(_) | Value::Array(_) | Value::Object(_) => {
+            Err(QuarantineClass::WrongFieldType)
+        }
     }
 }
 
@@ -91,7 +96,7 @@ fn extract_usage(
     known: &[(&str, TokenKind)],
     ignored: &[&str],
     required: &[&str],
-) -> Result<(u64, u64, u64, u64, BTreeMap<String, TokenCount>), QuarantineClass> {
+) -> Result<UsageCounts, QuarantineClass> {
     let mut input = 0u64;
     let mut output = 0u64;
     let mut cache_read = 0u64;
@@ -148,6 +153,11 @@ fn event(
 /// event identifier. The `cache_creation` ephemeral breakdown is a sub-detail
 /// of the cache write, not a separate kind; it is used only as a fallback when
 /// the total is absent.
+/// The four headline counts plus the per-kind breakdown a native-usage line
+/// yields. Named because the tuple appears in three signatures and clippy
+/// refuses a type this wide repeated inline.
+type UsageCounts = (u64, u64, u64, u64, BTreeMap<String, TokenCount>);
+
 pub struct ClaudeCodeParser;
 
 const CLAUDE_KNOWN: [(&str, TokenKind); 4] = [
@@ -262,7 +272,7 @@ impl ParserAdapter for CodexParser {
     }
 
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
-        let mut last: Option<(u64, u64, u64, u64, BTreeMap<String, TokenCount>)> = None;
+        let mut last: Option<UsageCounts> = None;
         let mut quarantined = Vec::new();
         for (index, line) in input.lines().enumerate() {
             let line = line.trim();
@@ -296,9 +306,7 @@ impl ParserAdapter for CodexParser {
     }
 }
 
-fn parse_codex_line(
-    line: &str,
-) -> Result<Option<(u64, u64, u64, u64, BTreeMap<String, TokenCount>)>, QuarantineClass> {
+fn parse_codex_line(line: &str) -> Result<Option<UsageCounts>, QuarantineClass> {
     let value: Value =
         serde_json::from_str(line).map_err(|_| QuarantineClass::TruncatedStructure)?;
     let Some(payload) = value.get("payload").and_then(Value::as_object) else {
