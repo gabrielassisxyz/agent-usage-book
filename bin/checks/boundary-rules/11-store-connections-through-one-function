@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Boundary: every SQLite connection is opened through the one setup function in
+# src/store/connection.rs.
+# Design: PLAN.md section 11.3 ("Every connection applies those connection-scoped
+#   settings and verifies that the required journal mode is in effect rather than
+#   assuming an earlier process set it") and AGENTS.md "Persistence".
+# Detection: any reference to rusqlite's Connection::open / open_with_flags outside
+#   src/store/connection.rs. The one setup function is the only place a connection
+#   may be opened, so the pragma policy cannot be bypassed by a caller that opens
+#   its own connection.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+connection_module="src/store/connection.rs"
+if [ ! -r "$connection_module" ]; then
+    echo "store connection policy: cannot read $connection_module" >&2
+    exit 2
+fi
+
+matches="$(grep -rnE 'Connection::open' src --include='*.rs' | grep -v "^$connection_module:" || true)"
+if [ -n "$matches" ]; then
+    echo "a SQLite connection is opened outside $connection_module:" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+exit 0

@@ -27,6 +27,16 @@ path = "src/main.rs"
 # types: per-key provenance and unknown-key detection both need to walk the parsed
 # tree by hand, which a derive-based deserializer would not give us for free.
 toml = "1"
+# The bundled SQLite build (aub-sth.3): the store layer's one persistence
+# dependency. Bundled so behaviour does not depend on the host's SQLite version
+# (AGENTS.md "Persistence"; PLAN.md section 11.2). Only src/store/ may reference
+# it; bin/checks/boundary-rules/11-store-connections-through-one-function
+# enforces that every connection goes through the one setup function.
+rusqlite = { version = "0.32", features = ["bundled"] }
+# The blocking HTTP client (aub-eun.2): wrapped behind an owned interface in
+# src/meter/transport.rs with explicit timeouts and command budget. No async
+# runtime is pulled in.
+ureq = "2"
 
 [dev-dependencies]
 trybuild = "1"

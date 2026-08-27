@@ -40,6 +40,8 @@ declared_boundary_rules=(
     07-provider-adapters-no-credential-paths
     08-window-selection-ownership
     09-presentation-no-store-or-calibration
+    10-freshness-constructed-only-in-domain
+    11-store-connections-through-one-function
 )
 
 # Mapping of check filenames to their required descriptive phrase in AGENTS.md:93-95

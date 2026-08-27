@@ -205,11 +205,21 @@ fn collect_rs_files(dir: &str, out: &mut Vec<String>) {
     }
 }
 
+/// Crates the design assigns to a specific non-lowest layer, which the manifest
+/// legitimately declares: rusqlite for the store layer (PLAN.md section 11) and
+/// ureq for the meter layer (PLAN.md section 5). The manifest-level check below
+/// permits exactly these and no other forbidden crate; the lowest layers are
+/// still guarded by `lowest_layers_reference_no_forbidden_crate`.
+const MANIFEST_ALLOWED_FORBIDDEN: &[&str] = &["rusqlite", "ureq"];
+
 #[test]
 fn manifest_declares_no_forbidden_crate() {
     let manifest = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("Cargo.toml must exist");
     for name in FORBIDDEN_CRATES {
+        if MANIFEST_ALLOWED_FORBIDDEN.contains(&name) {
+            continue;
+        }
         assert!(
             !declares_dependency(&manifest, name),
             "Cargo.toml declares a forbidden crate: {name}"
