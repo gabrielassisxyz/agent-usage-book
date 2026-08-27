@@ -1,0 +1,2 @@
+{"type":"message","session_id":"s-1","model":"claude-opus-4","usage":{"input_tokens":1200,"output_tokens":340}}
+{"type":"message","session_id":"s-1","model":"claude-opus-4","usage":{"input_tokens":800,"output_tokens":210}}

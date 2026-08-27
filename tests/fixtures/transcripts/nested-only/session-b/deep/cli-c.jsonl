@@ -1,0 +1,2 @@
+{"type":"message","session_id":"s-3","model":"gpt-oss-120b","usage":{"input_tokens":3000,"output_tokens":1500}}
+{"type":"message","session_id":"s-3","model":"gpt-oss-120b","usage":{"input_tokens":900,"output_tokens":400}}
