@@ -1,16 +1,22 @@
 //! Argument parsing and orchestration.
 //!
 //! May not depend on:
-//! - presentation (it orchestrates, it does not format)
 //! - provider adapters directly
+//!
+//! Rendering is delegated to `presentation`: a command builds its typed report
+//! model and hands it to the presentation entry point, never formatting a
+//! quantity itself.
 
 use std::ffi::OsString;
 use std::io;
 
-use crate::domain::time::{Clock, RealClock};
+use crate::domain::freshness::{FreshnessInput, compute_freshness};
+use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock};
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
+use crate::presentation::render::render_status_report;
 use crate::report::ReportEnvelope;
+use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
 
 /// Declares [`Command`] and the derived list of its variants from one token list, so
 /// the list cannot drift from the enum: a variant joins both at once. [`Command::ALL`]
@@ -279,6 +285,14 @@ fn resolve_config_file_path(flag: Option<&str>, env: &dyn crate::config::EnvSour
     format!("{home}/.config/aub/config.toml")
 }
 
+/// The clock-skew envelope the status path passes to the freshness machine.
+/// No config key owns this yet (the sampling policy snapshot does, PLAN.md
+/// section 7.5), so 60 seconds is the provisional value the presentation tests
+/// exercise; it cannot be load-bearing until observations exist.
+fn status_clock_skew_envelope() -> ClockSkewEnvelope {
+    ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60))
+}
+
 fn status(clock: &impl Clock, level: Level) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
@@ -291,7 +305,44 @@ fn status(clock: &impl Clock, level: Level) -> Result<(), Error> {
             &[("command", &command)],
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-    println!("status unavailable");
+
+    // The report is built from the configured accounts; until the projection
+    // exists (aub-me5.6) every account's reading is the never-observed state,
+    // computed through the freshness machine rather than constructed here.
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let freshness = compute_freshness(
+        &FreshnessInput::new(
+            None,
+            None,
+            None,
+            None,
+            None,
+            config.freshness.meter,
+            config.sampling.command_budget,
+            status_clock_skew_envelope(),
+        ),
+        clock,
+    );
+    let accounts = config
+        .accounts
+        .iter()
+        .map(|account| MeterAccount::new(LogicalName::new(account.name.clone()), freshness.clone()))
+        .collect();
+    let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
+    let report = StatusReport::new(metadata, accounts, vec![]);
+    println!(
+        "{}",
+        render_status_report(&report, timestamp, status_clock_skew_envelope())
+    );
     Ok(())
 }
 
@@ -414,6 +465,44 @@ mod tests {
                     "{command:?} rejects --format without a reason"
                 );
             }
+        }
+    }
+
+    /// This bead ships no explain behaviour: every command keeps rejecting
+    /// `--explain`, with a reason, and no explain token is parsed. The explicit
+    /// pin makes that state a checked fact rather than an unstated one, so the
+    /// explain bead flips it deliberately instead of silently.
+    #[test]
+    fn every_command_rejects_explain() {
+        for command in Command::ALL {
+            match command.flag_policy().explain {
+                FlagSupport::Rejected { reason } => assert!(
+                    !reason.is_empty(),
+                    "{command:?} rejects --explain without a reason"
+                ),
+                FlagSupport::Accepted => {
+                    panic!("{command:?} accepts --explain; no explain behaviour ships yet")
+                }
+            }
+        }
+    }
+
+    /// `--explain` is not a parsed token: the argument surface recognises only
+    /// `-v` and the command names, so an explain flag is an unknown argument.
+    /// This is the parser half of "no explain token is parsed".
+    #[test]
+    fn explain_is_not_a_parsed_token() {
+        let result = run([
+            OsString::from("aub"),
+            OsString::from("--explain"),
+            OsString::from("status"),
+        ]);
+        match result {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("unknown argument"),
+                "--explain must be rejected as an unknown argument, got: {message}"
+            ),
+            other => panic!("--explain must be rejected as an unknown argument, got: {other:?}"),
         }
     }
 

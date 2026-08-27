@@ -16,6 +16,6 @@ pub mod vocabulary;
 pub use precision::{CREDITS, MONEY, PERCENT, TOKENS};
 pub use render::{
     format_number, render_age, render_failure_class, render_meter_reading, render_percentage,
-    render_quantity, render_stale_reason, render_total,
+    render_quantity, render_stale_reason, render_status_report, render_total,
 };
 pub use vocabulary::{Qualification, coverage_term, quality_term};

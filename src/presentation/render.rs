@@ -11,7 +11,9 @@ use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
 use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
 use crate::evidence::CoverageCompleteness;
+use crate::presentation::precision::PERCENT;
 use crate::presentation::vocabulary::Qualification;
+use crate::report::StatusReport;
 
 /// Formats a raw integer with the given number of fractional digits, trimming
 /// trailing zeros. The raw value is already scaled to the display unit.
@@ -41,6 +43,30 @@ pub fn render_percentage(ppm: u32, precision: Precision) -> String {
     let divisor = 10u32.pow(digits);
     let scaled = (u64::from(ppm) * u64::from(divisor) + 5_000) / 10_000;
     format_number(&scaled.to_string(), precision)
+}
+
+/// The unit every meter reading is rendered in: remaining quota is a percentage of
+/// the window.
+const METER_UNIT: &str = "%";
+
+/// The report-to-rendering seam for status: takes a [`StatusReport`] and returns
+/// its human rendering, one line per account carrying the account name and its
+/// meter reading.
+///
+/// This function is the entry point the status command calls. It performs no data
+/// collection of its own (the model arrives complete), and it reaches the fragment
+/// renderers rather than bypassing them, so a wording change stays in one place.
+pub fn render_status_report(
+    report: &StatusReport,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(report.accounts.len());
+    for account in &report.accounts {
+        let reading = render_meter_reading(&account.reading, METER_UNIT, PERCENT, now, envelope);
+        lines.push(format!("{} {}", account.account.as_str(), reading));
+    }
+    lines.join("\n")
 }
 
 /// Renders a quantity with its unit, precision and qualification.
@@ -371,5 +397,111 @@ mod tests {
         assert_eq!(render_percentage(380_000, Precision::new(2)), "38");
         assert_eq!(render_percentage(385_500, Precision::new(2)), "38.55");
         assert_eq!(render_percentage(1_000_000, Precision::new(2)), "100");
+    }
+
+    /// The status entry point renders every fragment the report model carries: each
+    /// account line carries the account name and its own reading, fresh, stale and
+    /// auth-required alike, so no fragment can be dropped without this failing.
+    #[test]
+    fn status_report_renders_each_account_fragment() {
+        use crate::logging::LogicalName;
+        use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+
+        let now = now();
+        let envelope = envelope();
+        let metadata = ReportMetadata::new(now, now, LedgerGeneration::new(0), None);
+        let report = StatusReport::new(
+            metadata,
+            vec![
+                MeterAccount::new(
+                    LogicalName::new("work-a"),
+                    Freshness::Fresh {
+                        observed: observed(
+                            380_000,
+                            UtcTimestamp::from_unix_nanos(
+                                now.unix_nanos() - 5 * 3_600 * NANOS_PER_SECOND,
+                            ),
+                        ),
+                        latest_attempt: AttemptId::new(1),
+                    },
+                ),
+                MeterAccount::new(
+                    LogicalName::new("research"),
+                    Freshness::Stale {
+                        last_good: Some(observed(
+                            380_000,
+                            UtcTimestamp::from_unix_nanos(
+                                now.unix_nanos() - 14 * 60 * NANOS_PER_SECOND,
+                            ),
+                        )),
+                        latest_attempt: AttemptId::new(2),
+                        reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
+                    },
+                ),
+                MeterAccount::new(
+                    LogicalName::new("legacy"),
+                    Freshness::<QuotaRemaining>::AuthRequired {
+                        last_good: None,
+                        latest_attempt: AttemptId::new(3),
+                    },
+                ),
+            ],
+            vec![],
+        );
+
+        let rendered = render_status_report(&report, now, envelope);
+        assert!(
+            rendered.contains("work-a 38% left · 5h"),
+            "fresh fragment missing from rendering: {rendered}"
+        );
+        assert!(
+            rendered.contains("research ~38% · stale 14m · timeout"),
+            "stale fragment missing from rendering: {rendered}"
+        );
+        assert!(
+            rendered.contains("legacy auth!"),
+            "auth fragment missing from rendering: {rendered}"
+        );
+    }
+
+    /// The entry point performs no lookup of its own: a report built entirely from
+    /// literals, with no configuration, no store and no data source, renders every
+    /// fragment it carries. An entry point that collected data itself would have
+    /// nothing to collect from for this model, and the exact-output assertion
+    /// would fail instead of being satisfied by a coincidentally empty lookup.
+    #[test]
+    fn status_report_built_from_literals_renders_without_lookup() {
+        use crate::domain::attempt::AttemptId;
+        use crate::domain::freshness::Observed;
+        use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining};
+        use crate::domain::time::{MeasurementBasis, ReceivedAt, UtcTimestamp};
+        use crate::logging::LogicalName;
+        use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+
+        let now = UtcTimestamp::from_unix_nanos(1_000_000_000_000);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
+        let metadata = ReportMetadata::new(now, now, LedgerGeneration::new(0), None);
+        let observed = Observed::new(
+            QuotaRemaining::new(QuotaFractionPpm::new(380_000).unwrap()),
+            None,
+            ReceivedAt::new(UtcTimestamp::from_unix_nanos(
+                now.unix_nanos() - 5 * 3_600 * NANOS_PER_SECOND,
+            )),
+            MeasurementBasis::LocallyReceived,
+        );
+        let report = StatusReport::new(
+            metadata,
+            vec![MeterAccount::new(
+                LogicalName::new("work-primary"),
+                Freshness::Fresh {
+                    observed,
+                    latest_attempt: AttemptId::new(1),
+                },
+            )],
+            vec![],
+        );
+
+        let rendered = render_status_report(&report, now, envelope);
+        assert_eq!(rendered, "work-primary 38% left · 5h");
     }
 }

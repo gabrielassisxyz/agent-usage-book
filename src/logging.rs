@@ -137,6 +137,11 @@ impl LogicalName {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    /// The underlying name, for rendering and diagnostics.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 #[derive(Clone, Eq, PartialEq)]
