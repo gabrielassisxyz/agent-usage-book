@@ -217,7 +217,7 @@ fn manifest_declares_no_forbidden_crate() {
     let manifest = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"))
         .expect("Cargo.toml must exist");
     for name in FORBIDDEN_CRATES {
-        if MANIFEST_ALLOWED_FORBIDDEN.contains(&name) {
+        if MANIFEST_ALLOWED_FORBIDDEN.contains(name) {
             continue;
         }
         assert!(

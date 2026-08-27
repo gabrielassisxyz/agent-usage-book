@@ -580,27 +580,26 @@ mod tests {
         let fresh = compute_freshness(&input, &clock_inside);
         assert_eq!(fresh.kind(), FreshnessKind::Fresh);
         assert_eq!(fresh.latest_attempt(), AttemptId::new(1));
-        match fresh {
-            Freshness::Fresh { observed, .. } => assert_eq!(observed, obs),
-            _ => panic!("expected Fresh"),
-        }
+        let Freshness::Fresh { observed, .. } = fresh else {
+            panic!("expected Fresh");
+        };
+        assert_eq!(observed, obs);
 
         // Read at T + 70s (outside horizon)
         let clock_outside =
             crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(71_000_000_000));
         let stale = compute_freshness(&input, &clock_outside);
         assert_eq!(stale.kind(), FreshnessKind::Stale);
-        match stale {
-            Freshness::Stale {
-                last_good: Some(good),
-                reason: StaleReason::AgeExceeded,
-                latest_attempt,
-            } => {
-                assert_eq!(good, obs);
-                assert_eq!(latest_attempt, AttemptId::new(1));
-            }
-            _ => panic!("expected Stale(AgeExceeded)"),
-        }
+        let Freshness::Stale {
+            last_good: Some(good),
+            reason: StaleReason::AgeExceeded,
+            latest_attempt,
+        } = stale
+        else {
+            panic!("expected Stale(AgeExceeded)");
+        };
+        assert_eq!(good, obs);
+        assert_eq!(latest_attempt, AttemptId::new(1));
     }
 
     #[test]
@@ -638,17 +637,16 @@ mod tests {
             crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(3_000_000_000));
         let stale = compute_freshness(&input, &clock);
         assert_eq!(stale.kind(), FreshnessKind::Stale);
-        match stale {
-            Freshness::Stale {
-                last_good: Some(good),
-                latest_attempt,
-                reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
-            } => {
-                assert_eq!(good, obs);
-                assert_eq!(latest_attempt, AttemptId::new(2));
-            }
-            _ => panic!("expected Stale(ConnectTimeout) with historical last_good"),
-        }
+        let Freshness::Stale {
+            last_good: Some(good),
+            latest_attempt,
+            reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
+        } = stale
+        else {
+            panic!("expected Stale(ConnectTimeout) with historical last_good");
+        };
+        assert_eq!(good, obs);
+        assert_eq!(latest_attempt, AttemptId::new(2));
     }
 
     #[test]
@@ -708,16 +706,15 @@ mod tests {
         );
         let res_2 = compute_freshness(&input_2, &clock);
         assert_eq!(res_2.kind(), FreshnessKind::Stale);
-        match res_2 {
-            Freshness::Stale {
-                last_good: None,
-                latest_attempt,
-                reason: StaleReason::CredentialChangedUnverified,
-            } => {
-                assert_eq!(latest_attempt, AttemptId::new(2));
-            }
-            _ => panic!("expected Stale(CredentialChangedUnverified)"),
-        }
+        let Freshness::Stale {
+            last_good: None,
+            latest_attempt,
+            reason: StaleReason::CredentialChangedUnverified,
+        } = res_2
+        else {
+            panic!("expected Stale(CredentialChangedUnverified)");
+        };
+        assert_eq!(latest_attempt, AttemptId::new(2));
 
         // Step 3: Success under context B
         let obs_b = test_observed(99, Some(3_000_000_000), 3_000_000_000);
@@ -745,16 +742,15 @@ mod tests {
             crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(3_100_000_000));
         let res_3 = compute_freshness(&input_3, &clock_3);
         assert_eq!(res_3.kind(), FreshnessKind::Fresh);
-        match res_3 {
-            Freshness::Fresh {
-                observed,
-                latest_attempt,
-            } => {
-                assert_eq!(observed, obs_b);
-                assert_eq!(latest_attempt, AttemptId::new(3));
-            }
-            _ => panic!("expected Fresh"),
-        }
+        let Freshness::Fresh {
+            observed,
+            latest_attempt,
+        } = res_3
+        else {
+            panic!("expected Fresh");
+        };
+        assert_eq!(observed, obs_b);
+        assert_eq!(latest_attempt, AttemptId::new(3));
     }
 
     #[test]
@@ -819,17 +815,16 @@ mod tests {
             crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(20_000_000_000));
         let res = compute_freshness(&input, &clock);
         assert_eq!(res.kind(), FreshnessKind::Stale);
-        match res {
-            Freshness::Stale {
-                last_good: Some(good),
-                latest_attempt,
-                reason: StaleReason::CollectorInterrupted,
-            } => {
-                assert_eq!(good, obs);
-                assert_eq!(latest_attempt, AttemptId::new(2));
-            }
-            _ => panic!("expected Stale(CollectorInterrupted)"),
-        }
+        let Freshness::Stale {
+            last_good: Some(good),
+            latest_attempt,
+            reason: StaleReason::CollectorInterrupted,
+        } = res
+        else {
+            panic!("expected Stale(CollectorInterrupted)");
+        };
+        assert_eq!(good, obs);
+        assert_eq!(latest_attempt, AttemptId::new(2));
     }
 
     #[test]
@@ -867,17 +862,16 @@ mod tests {
             crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(1_060_000_000_000));
         let res = compute_freshness(&input, &clock);
         assert_eq!(res.kind(), FreshnessKind::Stale);
-        match res {
-            Freshness::Stale {
-                last_good: Some(good),
-                latest_attempt,
-                reason: StaleReason::ClockAnomaly,
-            } => {
-                assert_eq!(good, obs);
-                assert_eq!(latest_attempt, AttemptId::new(1));
-            }
-            _ => panic!("expected Stale(ClockAnomaly)"),
-        }
+        let Freshness::Stale {
+            last_good: Some(good),
+            latest_attempt,
+            reason: StaleReason::ClockAnomaly,
+        } = res
+        else {
+            panic!("expected Stale(ClockAnomaly)");
+        };
+        assert_eq!(good, obs);
+        assert_eq!(latest_attempt, AttemptId::new(1));
     }
 
     #[test]
@@ -944,7 +938,7 @@ mod tests {
             let command_horizon = MonotonicDuration::from_seconds(10);
             let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
 
-            let has_last_good = rng() % 2 == 0;
+            let has_last_good = rng().is_multiple_of(2);
             let obs = if has_last_good {
                 Some(test_observed(rng() % 1000, Some(base_nanos), base_nanos))
             } else {
@@ -992,12 +986,12 @@ mod tests {
                 _ => None,
             };
 
-            let auth_fail_ctx = if rng() % 2 == 0 {
+            let auth_fail_ctx = if rng().is_multiple_of(2) {
                 Some(contexts[(rng() % 2) as usize])
             } else {
                 None
             };
-            let auth_success_ctx = if rng() % 2 == 0 {
+            let auth_success_ctx = if rng().is_multiple_of(2) {
                 Some(contexts[(rng() % 2) as usize])
             } else {
                 None
