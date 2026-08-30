@@ -156,16 +156,26 @@ fn ensure_dir_mode_0700(path: &Path) -> Result<(), Error> {
 /// the platform permits" (`docs/PLAN.md` line 4775). The database, projection and
 /// spool files this project's later beads create should go through this rather than
 /// each re-deriving the permission mode by hand.
+///
+/// `.mode(0o600)` only takes effect when this call is the one that creates the file
+/// (POSIX `open(2)`): a pre-existing file keeps whatever mode it already had. Rather
+/// than refuse a database found at a wider mode, this repairs it in place, the same
+/// policy `ensure_dir_mode_0700` above applies to the state directory itself
+/// (`aub-sth.2`): a file that was ever created wider than intended is the case this
+/// bead exists to close, not one to leave standing once found.
 #[cfg(unix)]
 pub fn create_file_mode_0600(path: &Path) -> Result<fs::File, Error> {
-    use std::os::unix::fs::OpenOptionsExt;
-    fs::OpenOptions::new()
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let file = fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .write(true)
         .mode(0o600)
         .open(path)
-        .map_err(|error| Error::Store(format!("cannot create {path:?} at mode 0600: {error}")))
+        .map_err(|error| Error::Store(format!("cannot create {path:?} at mode 0600: {error}")))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .map_err(|error| Error::Store(format!("cannot set {path:?} to mode 0600: {error}")))?;
+    Ok(file)
 }
 
 #[cfg(not(unix))]
@@ -176,6 +186,29 @@ pub fn create_file_mode_0600(path: &Path) -> Result<fs::File, Error> {
         .write(true)
         .open(path)
         .map_err(|error| Error::Store(format!("cannot create {path:?}: {error}")))
+}
+
+/// Forces an existing file to mode 0600, the same repair-not-refuse policy
+/// [`create_file_mode_0600`] applies to the main database file. For SQLite's `-wal`
+/// and `-shm` sidecars, which this project cannot create itself (SQLite owns their
+/// creation) and so cannot pass a mode to at creation time. A no-op when `path` does
+/// not exist: a sidecar is conditional on journal mode and page-cache activity, and
+/// its absence is not a defect.
+#[cfg(unix)]
+pub fn force_file_mode_0600(path: &Path) -> Result<(), Error> {
+    use std::os::unix::fs::PermissionsExt;
+    match fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(Error::Store(format!(
+            "cannot set {path:?} to mode 0600: {error}"
+        ))),
+    }
+}
+
+#[cfg(not(unix))]
+pub fn force_file_mode_0600(_path: &Path) -> Result<(), Error> {
+    Ok(())
 }
 
 /// Proves the directory is actually writable by this process, rather than trusting
@@ -301,6 +334,42 @@ mod tests {
         let target = scratch.path().join("spool.bin");
         create_file_mode_0600(&target).unwrap();
         assert_eq!(mode_of(&target), 0o600);
+    }
+
+    /// Planted negative: a pre-existing file found at a wider mode is repaired to
+    /// 0600 rather than left as-is, since `.mode()` only takes effect at creation
+    /// and a naive implementation would silently keep the wider mode.
+    #[test]
+    fn create_file_mode_0600_repairs_a_preexisting_wider_file() {
+        let scratch = ScratchDir::new();
+        let target = scratch.path().join("spool.bin");
+        fs::write(&target, b"").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&target), 0o644);
+
+        create_file_mode_0600(&target).unwrap();
+        assert_eq!(mode_of(&target), 0o600);
+    }
+
+    // --- force_file_mode_0600 -----------------------------------------------------
+
+    #[test]
+    fn force_file_mode_0600_tightens_an_existing_wider_file() {
+        let scratch = ScratchDir::new();
+        let target = scratch.path().join("meter.db-wal");
+        fs::write(&target, b"").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
+
+        force_file_mode_0600(&target).unwrap();
+        assert_eq!(mode_of(&target), 0o600);
+    }
+
+    #[test]
+    fn force_file_mode_0600_is_a_no_op_when_the_file_does_not_exist() {
+        let scratch = ScratchDir::new();
+        let target = scratch.path().join("meter.db-shm");
+        force_file_mode_0600(&target).unwrap();
+        assert!(!target.exists());
     }
 
     // --- verify_writable ---------------------------------------------------------

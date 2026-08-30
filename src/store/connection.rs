@@ -18,10 +18,12 @@
 //! connection therefore sets what it can and reads all of it back, refusing with a
 //! store-failure class when a required value is not in effect.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
+
+use super::startup::{create_file_mode_0600, force_file_mode_0600};
 
 /// The journal mode every database must be in (PLAN.md section 11.2). WAL lets a
 /// long analytical read coexist with a writer holding the write slot.
@@ -148,6 +150,21 @@ pub fn apply_policy(
     Ok(())
 }
 
+/// The path SQLite gives its write-ahead log sidecar next to the main database file.
+fn wal_sidecar_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push("-wal");
+    PathBuf::from(os)
+}
+
+/// The path SQLite gives its shared-memory index sidecar next to the main database
+/// file.
+fn shm_sidecar_path(path: &Path) -> PathBuf {
+    let mut os = path.as_os_str().to_os_string();
+    os.push("-shm");
+    PathBuf::from(os)
+}
+
 /// Opens a database connection through the one setup path every caller uses.
 ///
 /// The write path is the only one that may create the database file; read paths
@@ -155,6 +172,12 @@ pub fn apply_policy(
 /// 11.2). The pragma policy is applied and verified before the connection is
 /// returned, so a connection that cannot establish the required settings is
 /// refused rather than handed out.
+///
+/// On the write path the main database file is created (or repaired, if found
+/// wider) at mode 0600 before SQLite ever opens it, so it cannot exist even
+/// momentarily at the process's default create mode; after the pragma policy has
+/// transitioned the file into WAL, its `-wal` and `-shm` sidecars are repaired to
+/// 0600 the same way (PLAN.md line 4775, `aub-c2bw`).
 pub fn open(
     path: &Path,
     mode: AccessMode,
@@ -166,9 +189,16 @@ pub fn open(
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
         }
     };
+    if mode == AccessMode::ReadWrite {
+        create_file_mode_0600(path)?;
+    }
     let conn = rusqlite::Connection::open_with_flags(path, flags)
         .map_err(|e| Error::Store(format!("cannot open database {path:?}: {e}")))?;
     apply_policy(&conn, mode, policy)?;
+    if mode == AccessMode::ReadWrite {
+        force_file_mode_0600(&wal_sidecar_path(path))?;
+        force_file_mode_0600(&shm_sidecar_path(path))?;
+    }
     Ok(conn)
 }
 
@@ -351,6 +381,54 @@ mod tests {
             .pragma_query_value(None, "journal_mode", |row| row.get(0))
             .unwrap();
         assert_eq!(mode, "wal");
+    }
+
+    // --- unit: file mode (aub-c2bw) --------------------------------------------------
+
+    #[cfg(unix)]
+    fn mode_of(path: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    /// After the first open of a fresh state directory through the production open
+    /// path, the database file and every sidecar SQLite created next to it are at
+    /// mode 0600, not whatever the process's default create mode would have given
+    /// them.
+    #[cfg(unix)]
+    #[test]
+    fn a_fresh_database_and_its_wal_sidecars_are_created_at_mode_0600() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("meter.db");
+
+        let _conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+
+        assert_eq!(mode_of(&db_path), 0o600);
+        let wal_path = wal_sidecar_path(&db_path);
+        if wal_path.exists() {
+            assert_eq!(mode_of(&wal_path), 0o600);
+        }
+        let shm_path = shm_sidecar_path(&db_path);
+        if shm_path.exists() {
+            assert_eq!(mode_of(&shm_path), 0o600);
+        }
+    }
+
+    /// Planted negative: a database file pre-created at a wider mode (0644) is
+    /// repaired to 0600 by the production open path rather than left as found.
+    #[cfg(unix)]
+    #[test]
+    fn a_preexisting_database_at_a_wider_mode_is_repaired_to_0600() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("meter.db");
+        std::fs::write(&db_path, b"").unwrap();
+        std::fs::set_permissions(&db_path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(mode_of(&db_path), 0o644);
+
+        let _conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+        assert_eq!(mode_of(&db_path), 0o600);
     }
 
     // --- unit: injected set and readback failures ----------------------------------

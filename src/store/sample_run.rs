@@ -112,7 +112,7 @@ fn row_to_sample_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<SampleRun> {
 
 /// Starts a sample run: durable before any account in the batch is sampled.
 /// `aub_version` is stamped from the running binary (`crate::build_info`),
-/// matching how the migration framework stamps its own audit columns — a
+/// matching how the migration framework stamps its own audit columns: a
 /// caller cannot record a version other than the binary it is actually
 /// running.
 pub fn start_sample_run(
