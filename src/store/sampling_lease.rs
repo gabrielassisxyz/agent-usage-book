@@ -204,25 +204,23 @@ pub fn clear_expired(conn: &rusqlite::Connection, clock: &dyn Clock) -> Result<u
 }
 
 /// The live and expired lease counts, as of `clock`.
+///
+/// Both counts come from one statement, so they are two facts about one snapshot
+/// of the table rather than two snapshots taken a moment apart: counting live and
+/// expired separately can report a lease twice, or not at all, when an acquisition
+/// commits between the two reads.
 pub fn health(conn: &rusqlite::Connection, clock: &dyn Clock) -> Result<LeaseHealth, Error> {
     let now = clock.now().unix_nanos();
-    let live: i64 = conn
+    let (live, expired): (i64, i64) = conn
         .query_row(
-            "SELECT count(*) FROM sampling_lease WHERE expires_at > ?1",
+            "SELECT sum(expires_at > ?1), count(*) - sum(expires_at > ?1) FROM sampling_lease",
             rusqlite::params![now],
-            |row| row.get(0),
+            |row| Ok((row.get(0).unwrap_or(0), row.get(1).unwrap_or(0))),
         )
-        .map_err(|e| store_error("cannot count live sampling leases", e))?;
-    let expired: i64 = conn
-        .query_row(
-            "SELECT count(*) FROM sampling_lease WHERE expires_at <= ?1",
-            rusqlite::params![now],
-            |row| row.get(0),
-        )
-        .map_err(|e| store_error("cannot count expired sampling leases", e))?;
+        .map_err(|e| store_error("cannot count sampling leases", e))?;
     Ok(LeaseHealth {
-        live: live as usize,
-        expired: expired as usize,
+        live: live.max(0) as usize,
+        expired: expired.max(0) as usize,
     })
 }
 
@@ -554,6 +552,24 @@ mod tests {
             health(&conn, &clock).expect("health must be readable"),
             LeaseHealth {
                 live: 1,
+                expired: 0
+            }
+        );
+    }
+
+    /// An empty table reports zero of each rather than failing.
+    ///
+    /// The aggregate `sum()` returns NULL over no rows, which is the one shape
+    /// that would surface as a store failure instead of a count if it were read
+    /// as an integer.
+    #[test]
+    fn health_over_an_empty_table_is_zero_of_each() {
+        let scratch = ScratchDir::new();
+        let conn = migrated_db(&scratch);
+        assert_eq!(
+            health(&conn, &clock_at(1_000)).expect("health must be readable"),
+            LeaseHealth {
+                live: 0,
                 expired: 0
             }
         );
