@@ -8,6 +8,18 @@ set -uo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 
+# The runner's own self-test and the command-surface consistency check need no
+# release binary, so they run before the build: a broken runner or an unexercised
+# command fails fast instead of waiting on a compile first.
+if ! "$repo_root/tests/e2e/run.sh" --self-test; then
+    echo "==> e2e FAILED (runner self-test)"
+    exit 1
+fi
+if ! "$repo_root/tests/e2e/run.sh" --check-consistency; then
+    echo "==> e2e FAILED (command-surface consistency check)"
+    exit 1
+fi
+
 # The release binary is what the runner drives: the properties under test include
 # exit statuses, stream separation and the behaviour of a process that starts and
 # exits, none of which a library call proves.
