@@ -313,7 +313,8 @@ panes at once is the bottleneck the whole model exists to remove.
    the wave to guess costs more.
 6. Move the bead to `batch_pending` **only when substantively complete**: code and tests
    written, commit linked, reserved paths respected, every acceptance checkbox mapped to a
-   concrete test, no known defect. `batch_pending` earns no capability credit; it frees
+   concrete test, no known defect. Before moving it, reread the code and tests you just
+   wrote with fresh eyes and fix what that reading finds. `batch_pending` earns no capability credit; it frees
    claim capacity.
 
    **Then read the status back.** `br update --status` takes free text and validates
