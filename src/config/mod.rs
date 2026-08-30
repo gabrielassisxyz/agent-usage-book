@@ -203,6 +203,10 @@ pub struct TranscriptConfig {
     pub name: String,
     pub root: PathBuf,
     pub pattern: String,
+    /// Which parser reads this source: `claude-code`, `codex` or `pi`. The name is
+    /// the operator's label and says nothing about the record shape, so the format
+    /// is declared rather than guessed from a path.
+    pub format: Option<String>,
     pub usage_evidence: Option<String>,
 }
 
@@ -258,7 +262,7 @@ const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
-const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "usage_evidence"];
+const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &["review_after"];
@@ -692,6 +696,10 @@ pub fn resolve(
                         .and_then(toml::Value::as_str)
                         .unwrap_or_default()
                         .to_string(),
+                    format: entry
+                        .get("format")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
                     usage_evidence: entry
                         .get("usage_evidence")
                         .and_then(toml::Value::as_str)

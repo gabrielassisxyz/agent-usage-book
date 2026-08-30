@@ -1,17 +1,19 @@
 //! Typed report models for every command.
 //!
 //! The report model is the seam that keeps the renderer honest: every quantity
-//! field is a [`Qualified`] or [`Derivation`] value, never a bare newtype, and a
+//! field is a qualified value or a [`Derivation`], never a bare newtype, and a
 //! meter reading carries exactly one freshness variant. A renderer cannot produce
 //! an unqualified number because it never holds one.
+
+use std::collections::BTreeMap;
 
 use crate::domain::attempt::AttemptOutcome;
 use crate::domain::freshness::Freshness;
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
-use crate::domain::time::UtcTimestamp;
-use crate::domain::tokens::TokenCount;
-use crate::evidence::{CoverageCompleteness, Derivation, Qualified};
+use crate::domain::time::{UtcDate, UtcTimestamp};
+use crate::domain::tokens::{TokenCount, UsageVector};
+use crate::evidence::{CoverageCompleteness, Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 
@@ -172,26 +174,62 @@ impl NowReport {
 }
 
 /// One group of a spend report, keyed by day, session, project, repository, account
-/// or task. The token count is qualified and carries its derivation identifier.
+/// or task. The usage is a vector over token kinds, never one collapsed count,
+/// and it carries its own coverage and evidence quality; the provenance names the
+/// files the group was read from and the derivation identifier binds the group to
+/// the manifest it was computed under.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendGroup {
     pub key: LogicalName,
-    pub tokens: Qualified<TokenCount>,
+    pub usage: UsageVector,
+    pub provenance: Provenance,
     pub derivation_id: DerivationId,
 }
 
 impl SpendGroup {
     pub fn new(
         key: LogicalName,
-        tokens: Qualified<TokenCount>,
+        usage: UsageVector,
+        provenance: Provenance,
         derivation_id: DerivationId,
     ) -> Self {
         Self {
             key,
-            tokens,
+            usage,
+            provenance,
             derivation_id,
         }
     }
+}
+
+/// What ingestion did to produce a spend report, so the counts never stand alone:
+/// a report reads as complete only when the reader can see nothing was quarantined,
+/// nothing was unreadable and nothing fell outside the window unexplained.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IngestSummary {
+    /// Files opened and parsed.
+    pub files_read: u64,
+    /// Files skipped because their modification time predates the window; an
+    /// append-only transcript that has not changed since the window opened holds no
+    /// event inside it.
+    pub files_skipped_before_window: u64,
+    /// Files that could not be read, by path. Non-empty makes the report incomplete.
+    pub unreadable_files: Vec<String>,
+    /// Quarantined records, by the parser's quarantine class name.
+    pub quarantined_by_class: BTreeMap<String, u64>,
+    /// Occurrences that collapsed into an already-counted identity.
+    pub replayed_occurrences: u64,
+    /// Occurrences sharing an identity with a counted event but disagreeing with it.
+    pub collisions: u64,
+    /// Canonical events that carried no strong identity.
+    pub without_identity: u64,
+    /// Canonical events whose record carried no readable timestamp; never placed
+    /// in a day.
+    pub undated_events: u64,
+    /// Canonical events dated outside the requested window.
+    pub events_outside_window: u64,
+    /// Canonical events inside the window, which is what the groups sum.
+    pub events_in_window: u64,
 }
 
 /// Provenance material for one spend group's token count.
@@ -207,19 +245,28 @@ impl SpendGroupProvenance {
     }
 }
 
-/// The spend report for `aub spend`.
+/// The spend report for `aub spend`: the window it covers, the groups, the
+/// provenance graph and the ingestion summary the groups were built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendReport {
     pub metadata: ReportMetadata,
+    /// The first UTC day of the window, inclusive.
+    pub since: UtcDate,
+    /// The first UTC day after the window, exclusive.
+    pub until: UtcDate,
     pub groups: Vec<SpendGroup>,
     pub provenance: ProvenanceGraph,
+    pub ingest: IngestSummary,
 }
 
 impl SpendReport {
     pub fn new(
         metadata: ReportMetadata,
+        since: UtcDate,
+        until: UtcDate,
         groups: Vec<SpendGroup>,
         group_provenance: Vec<SpendGroupProvenance>,
+        ingest: IngestSummary,
     ) -> Self {
         let provenance = ProvenanceGraph::new(
             group_provenance
@@ -228,8 +275,11 @@ impl SpendReport {
         );
         Self {
             metadata,
+            since,
+            until,
             groups,
             provenance,
+            ingest,
         }
     }
 }
@@ -442,6 +492,27 @@ mod tests {
 
     /// A canonical provenance node for tests: one member, one source, one
     /// observation, read directly.
+    fn day() -> UtcDate {
+        UtcDate::parse("2026-08-25").unwrap()
+    }
+
+    fn usage_vector() -> UsageVector {
+        use crate::domain::tokens::{
+            CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
+        };
+        UsageVector::new(
+            KnownTokenVector::new(
+                InputTokens::new(100),
+                OutputTokens::new(50),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            ),
+            BTreeMap::new(),
+            CoverageCompleteness::Complete,
+            crate::evidence::EvidenceQuality::Measured,
+        )
+    }
+
     fn node() -> ProvenanceNode {
         ProvenanceNode::new(
             [EvidenceId::new("ev-1")],
@@ -483,7 +554,14 @@ mod tests {
                     node(),
                 )],
             ),
-            &SpendReport::new(m.clone(), vec![], vec![]),
+            &SpendReport::new(
+                m.clone(),
+                day(),
+                day(),
+                vec![],
+                vec![],
+                IngestSummary::default(),
+            ),
             &CoverageReport::new(m.clone(), CoverageCompleteness::Complete, true, node()),
             &SampleReport::new(m.clone(), vec![]),
             &IngestReport::new(m.clone(), IngestionGeneration::new(3)),
@@ -541,28 +619,23 @@ mod tests {
         assert_eq!(auth.reading.kind(), FreshnessKind::AuthRequired);
     }
 
-    /// The spend group's token count is a qualified value, never a bare newtype: the
-    /// only constructor takes a `Qualified<TokenCount>`.
+    /// The spend group's usage is a qualified vector over token kinds, never a bare
+    /// newtype and never one collapsed count: the only constructor takes a
+    /// `UsageVector`, whose coverage and quality are readable on the group.
     #[test]
-    fn spend_group_tokens_are_qualified() {
-        let qualified = Qualified::new(
-            TokenCount::new(100),
-            CoverageCompleteness::Complete,
-            crate::evidence::EvidenceQuality::Measured,
-            crate::evidence::Provenance::new([]),
-        );
+    fn spend_group_usage_is_a_qualified_vector() {
         let group = SpendGroup::new(
             LogicalName::new("by-day"),
-            qualified,
+            usage_vector(),
+            Provenance::new(["file.jsonl".to_string()]),
             DerivationId::from_manifest(&crate::domain::provenance::ProvenanceManifest::new(
                 [],
                 [],
                 crate::domain::provenance::QuerySemantics::new("by-day", "all"),
             )),
         );
-        // The token count is qualified: its coverage is readable, and there is no
-        // value-only accessor on the group.
-        assert_eq!(group.tokens.coverage(), &CoverageCompleteness::Complete);
+        assert_eq!(group.usage.coverage(), &CoverageCompleteness::Complete);
+        assert_eq!(group.usage.known().input().value(), 100);
     }
 
     /// Every quantitative field of every report model resolves to a provenance
@@ -590,12 +663,8 @@ mod tests {
         );
         let group = SpendGroup::new(
             LogicalName::new("by-day"),
-            Qualified::new(
-                TokenCount::new(100),
-                CoverageCompleteness::Complete,
-                crate::evidence::EvidenceQuality::Measured,
-                crate::evidence::Provenance::new([]),
-            ),
+            usage_vector(),
+            Provenance::new(["file.jsonl".to_string()]),
             DerivationId::from_manifest(&crate::domain::provenance::ProvenanceManifest::new(
                 [],
                 [],
@@ -621,11 +690,14 @@ mod tests {
         );
         let spend = SpendReport::new(
             m.clone(),
+            day(),
+            day(),
             vec![group],
             vec![SpendGroupProvenance::new(
                 LogicalName::new("by-day"),
                 node(),
             )],
+            IngestSummary::default(),
         );
         let coverage = CoverageReport::new(m.clone(), CoverageCompleteness::Complete, true, node());
         let export = ExportReport::new(m.clone(), 42, node());

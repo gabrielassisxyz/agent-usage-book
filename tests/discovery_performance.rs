@@ -16,6 +16,7 @@ fn config(name: &str, root: &Path, pattern: &str) -> TranscriptConfig {
         name: name.to_string(),
         root: root.to_path_buf(),
         pattern: pattern.to_string(),
+        format: None,
         usage_evidence: None,
     }
 }

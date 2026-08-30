@@ -1,6 +1,8 @@
 # The command surface the end-to-end suite must cover. One command per line;
 # blank lines and lines starting with # are ignored. A command listed here with
 # no case file that exercises it fails the consistency check, so a command cannot
-# ship unexercised. Test hooks (__exit-class, __logging-fixture) are not part of
-# the shipping surface and are deliberately absent.
+# ship unexercised. Test hooks (__exit-class, __logging-fixture, __state-check) are
+# not part of the shipping surface and are deliberately absent.
 status
+spend
+config

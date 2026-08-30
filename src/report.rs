@@ -8,11 +8,13 @@
 pub mod models;
 pub mod provenance;
 
+pub mod spend;
+
 pub use models::{
     BackupReport, CalibrateReport, CoverageReport, DoctorReport, ExportReport, IngestReport,
-    IngestionGeneration, LedgerGeneration, MeterAccount, MeterReadingProvenance, NowReport,
-    ReportMetadata, SampleAttempt, SampleReport, SpendGroup, SpendGroupProvenance, SpendReport,
-    StatusReport, TaskReport,
+    IngestSummary, IngestionGeneration, LedgerGeneration, MeterAccount, MeterReadingProvenance,
+    NowReport, ReportMetadata, SampleAttempt, SampleReport, SpendGroup, SpendGroupProvenance,
+    SpendReport, StatusReport, TaskReport,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

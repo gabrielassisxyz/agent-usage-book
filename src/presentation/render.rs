@@ -10,10 +10,11 @@ use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
 use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
+use crate::domain::tokens::TokenKind;
 use crate::evidence::CoverageCompleteness;
-use crate::presentation::precision::PERCENT;
-use crate::presentation::vocabulary::Qualification;
-use crate::report::StatusReport;
+use crate::presentation::precision::{PERCENT, TOKENS};
+use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
+use crate::report::{SpendGroup, SpendReport, StatusReport};
 
 /// Formats a raw integer with the given number of fractional digits, trimming
 /// trailing zeros. The raw value is already scaled to the display unit.
@@ -67,6 +68,106 @@ pub fn render_status_report(
         lines.push(format!("{} {}", account.account.as_str(), reading));
     }
     lines.join("\n")
+}
+
+/// The unit every token count is rendered in.
+const TOKEN_UNIT: &str = "tokens";
+
+/// The report-to-rendering seam for spend: the window, one line per group with the
+/// four known kinds and any unknown component, each count carrying its unit, then
+/// the ingest summary. The summary is not optional output: a count printed without
+/// what was quarantined, skipped or replayed behind it would read as complete when
+/// nothing proved it was.
+pub fn render_spend_report(report: &SpendReport) -> String {
+    let mut lines = vec![format!(
+        "spend from {} to {} (UTC days, end exclusive), by day and source",
+        report.since.iso(),
+        report.until.iso()
+    )];
+    if report.groups.is_empty() {
+        lines.push(format!(
+            "no usage events in the window: {} canonical events read, {} outside it, {} undated",
+            report.ingest.events_in_window,
+            report.ingest.events_outside_window,
+            report.ingest.undated_events
+        ));
+    }
+    for group in &report.groups {
+        lines.push(render_spend_group(group));
+    }
+    lines.push(render_ingest_summary(report));
+    lines.join("\n")
+}
+
+fn render_spend_group(group: &SpendGroup) -> String {
+    let known = group.usage.known();
+    let mut parts: Vec<String> = TokenKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{} {}",
+                token_kind_label(*kind),
+                render_count(known.value(*kind))
+            )
+        })
+        .collect();
+    for (name, count) in group.usage.unknown() {
+        parts.push(format!("{name} {}", render_count(count.value())));
+    }
+    let qualification = match quality_term(group.usage.quality()) {
+        Some(term) => term,
+        None => coverage_term(group.usage.coverage()),
+    };
+    format!(
+        "{}  {} ({})",
+        group.key.as_str(),
+        parts.join(" · "),
+        qualification.term()
+    )
+}
+
+fn render_count(raw: u64) -> String {
+    format!("{} {TOKEN_UNIT}", format_number(&raw.to_string(), TOKENS))
+}
+
+fn token_kind_label(kind: TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Input => "input",
+        TokenKind::Output => "output",
+        TokenKind::CacheRead => "cache read",
+        TokenKind::CacheWrite => "cache write",
+    }
+}
+
+fn render_ingest_summary(report: &SpendReport) -> String {
+    let ingest = &report.ingest;
+    let quarantined: u64 = ingest.quarantined_by_class.values().sum();
+    let by_class = ingest
+        .quarantined_by_class
+        .iter()
+        .map(|(class, count)| format!("{class} {count}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut line = format!(
+        "ingest: {} files read, {} skipped (unchanged before the window), {} unreadable · {} canonical events in window, {} outside, {} undated · {} replayed occurrences, {} collisions, {} without identity · {} quarantined",
+        ingest.files_read,
+        ingest.files_skipped_before_window,
+        ingest.unreadable_files.len(),
+        ingest.events_in_window,
+        ingest.events_outside_window,
+        ingest.undated_events,
+        ingest.replayed_occurrences,
+        ingest.collisions,
+        ingest.without_identity,
+        quarantined
+    );
+    if !by_class.is_empty() {
+        line.push_str(&format!(" ({by_class})"));
+    }
+    for file in &ingest.unreadable_files {
+        line.push_str(&format!("\nunreadable: {file}"));
+    }
+    line
 }
 
 /// Renders a quantity with its unit, precision and qualification.

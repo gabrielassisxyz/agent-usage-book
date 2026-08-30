@@ -10,9 +10,10 @@
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::interval::{DomainQuantity, Interval};
 use crate::domain::quota::QuotaRemaining;
+use crate::domain::tokens::TokenKind;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
-use crate::report::ReportMetadata;
+use crate::report::{ReportMetadata, SpendReport, StatusReport};
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
 /// below pin the exact shape, so a field added without bumping this fails them.
@@ -74,8 +75,18 @@ impl JsonEnvelope {
     /// The envelope object: schema version, command, run identifier, generation time,
     /// knowledge time and ledger generation.
     pub fn to_json(&self) -> String {
+        format!("{{{}}}", self.fields())
+    }
+
+    /// The envelope with the report's own fields appended after the shared ones,
+    /// so every command's JSON opens with the same envelope keys in the same order.
+    pub fn to_json_with(&self, body: &str) -> String {
+        format!("{{{},{body}}}", self.fields())
+    }
+
+    fn fields(&self) -> String {
         format!(
-            "{{\"schema\":{},\"command\":{},\"run\":{},\"generated_at\":{},\"knowledge_at\":{},\"ledger_generation\":{}}}",
+            "\"schema\":{},\"command\":{},\"run\":{},\"generated_at\":{},\"knowledge_at\":{},\"ledger_generation\":{}",
             SCHEMA_VERSION,
             json_string(self.command),
             json_string(self.run.as_str()),
@@ -83,6 +94,99 @@ impl JsonEnvelope {
             self.metadata.knowledge_at.unix_nanos(),
             self.metadata.ledger_generation.get(),
         )
+    }
+}
+
+/// The status report under the envelope: one object per account with its freshness.
+pub fn status_json(report: &StatusReport, run: RunId) -> String {
+    let accounts = report
+        .accounts
+        .iter()
+        .map(|account| freshness_json(account.account.as_str(), &account.reading))
+        .collect::<Vec<_>>()
+        .join(",");
+    JsonEnvelope::new("status", run, report.metadata.clone())
+        .to_json_with(&format!("\"accounts\":[{accounts}]"))
+}
+
+/// The spend report under the envelope: the window, one object per group with a
+/// `{value, unit}` per token kind, and the ingest summary, so a consumer can read
+/// the counts and what qualifies them from one document.
+pub fn spend_json(report: &SpendReport, run: RunId) -> String {
+    let groups = report
+        .groups
+        .iter()
+        .map(|group| {
+            let known = group.usage.known();
+            let kinds = TokenKind::ALL
+                .iter()
+                .map(|kind| {
+                    format!(
+                        "{}:{}",
+                        json_string(token_kind_key(*kind)),
+                        quantity_json(&known.value(*kind).to_string(), "tokens")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            let unknown = group
+                .usage
+                .unknown()
+                .iter()
+                .map(|(name, count)| {
+                    format!(
+                        "{}:{}",
+                        json_string(name),
+                        quantity_json(&count.value().to_string(), "tokens")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{}}}",
+                json_string(group.key.as_str()),
+                coverage_and_quality_json(group.usage.coverage(), group.usage.quality())
+                    .trim_matches(|c| c == '{' || c == '}'),
+                provenance_json(&group.provenance),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let ingest = &report.ingest;
+    let quarantined = ingest
+        .quarantined_by_class
+        .iter()
+        .map(|(class, count)| format!("{}:{count}", json_string(class)))
+        .collect::<Vec<_>>()
+        .join(",");
+    let unreadable = ingest
+        .unreadable_files
+        .iter()
+        .map(|file| json_string(file))
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        "\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"groups\":[{groups}],\"ingest\":{{\"files_read\":{},\"files_skipped_before_window\":{},\"unreadable_files\":[{unreadable}],\"quarantined\":{{{quarantined}}},\"replayed_occurrences\":{},\"collisions\":{},\"without_identity\":{},\"undated_events\":{},\"events_outside_window\":{},\"events_in_window\":{}}}",
+        json_string(&report.since.iso()),
+        json_string(&report.until.iso()),
+        ingest.files_read,
+        ingest.files_skipped_before_window,
+        ingest.replayed_occurrences,
+        ingest.collisions,
+        ingest.without_identity,
+        ingest.undated_events,
+        ingest.events_outside_window,
+        ingest.events_in_window,
+    );
+    JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+fn token_kind_key(kind: TokenKind) -> &'static str {
+    match kind {
+        TokenKind::Input => "input",
+        TokenKind::Output => "output",
+        TokenKind::CacheRead => "cache_read",
+        TokenKind::CacheWrite => "cache_write",
     }
 }
 

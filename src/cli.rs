@@ -11,11 +11,13 @@ use std::ffi::OsString;
 use std::io;
 
 use crate::domain::freshness::{FreshnessInput, compute_freshness};
-use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock};
+use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate};
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
-use crate::presentation::render::render_status_report;
+use crate::presentation::json::{spend_json, status_json};
+use crate::presentation::render::{render_spend_report, render_status_report};
 use crate::report::ReportEnvelope;
+use crate::report::spend::{SpendWindow, assemble as assemble_spend};
 use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
 
 /// Declares [`Command`] and the derived list of its variants from one token list, so
@@ -48,6 +50,7 @@ macro_rules! aub_command_enum {
 
 aub_command_enum! {
     Status,
+    Spend,
     Config,
     LoggingFixture,
     StateCheck,
@@ -79,8 +82,9 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 6] = [
         Self::Status,
+        Self::Spend,
         Self::Config,
         Self::LoggingFixture,
         Self::StateCheck,
@@ -103,6 +107,19 @@ impl Command {
                 account: FlagSupport::Accepted,
                 no_color: FlagSupport::Rejected {
                     reason: "status prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Spend => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "spend prints its ingest summary on every run; --explain arrives with the provenance bead",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "spend has no account dimension until account attribution lands",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "spend prints no color",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -166,10 +183,74 @@ impl Command {
             },
         }
     }
+
+    /// The token that selects this command on the command line. Test hooks carry a
+    /// double underscore so they cannot be typed by accident.
+    pub fn name(self) -> &'static str {
+        match self {
+            Command::Status => "status",
+            Command::Spend => "spend",
+            Command::Config => "config",
+            Command::LoggingFixture => "__logging-fixture",
+            Command::StateCheck => "__state-check",
+            Command::ExitClass => "__exit-class",
+        }
+    }
+
+    /// The one-line description `--help` prints. A test hook prints none: it is not
+    /// part of the shipping surface and help does not list it.
+    pub fn summary(self) -> Option<&'static str> {
+        match self {
+            Command::Status => Some("render the last known meter reading per configured account"),
+            Command::Spend => Some(
+                "token usage per UTC day and transcript source, read from the configured transcripts",
+            ),
+            Command::Config => {
+                Some("print every resolved configuration key with the source that won")
+            }
+            Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
+        }
+    }
+
+    fn from_name(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|command| command.name() == name)
+    }
 }
 
-/// Parse the early command surface and route it to bounded workflows.
-pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
+/// The output format a command was asked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputFormat {
+    Text,
+    Json,
+}
+
+/// What the command line asked for, before anything runs: the command, the shared
+/// flags the command's policy accepted, and the command's own positional arguments
+/// and options left for it to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Invocation {
+    pub command: Command,
+    pub format: OutputFormat,
+    pub verbosity: u8,
+    pub rest: Vec<String>,
+}
+
+/// What a command line resolves to once the argument surface has been read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Request {
+    /// No command: print the version line.
+    Version,
+    /// `--help` or `-h`: print the command list.
+    Help,
+    /// A command to run.
+    Run(Invocation),
+}
+
+/// Reads the argument surface without running anything, so the parser can be tested
+/// against the flag policy directly. Leading `-v` flags raise verbosity; `--format`
+/// is honoured exactly where the command's policy accepts it and refused with the
+/// policy's own reason elsewhere; everything else is left to the command.
+pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Request, Error> {
     let mut args = args.into_iter();
     let _program = args.next();
     let mut verbosity: u8 = 0;
@@ -178,36 +259,225 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         verbosity += 1;
         first = args.next();
     }
+    let Some(first) = first else {
+        return Ok(Request::Version);
+    };
+    let name = first
+        .to_str()
+        .ok_or_else(|| Error::Usage("argument is not valid UTF-8".into()))?;
+    match name {
+        "--help" | "-h" => return Ok(Request::Help),
+        "--version" | "-V" => return Ok(Request::Version),
+        _ => {}
+    }
+    let command = Command::from_name(name)
+        .ok_or_else(|| Error::Usage(format!("unknown argument: {name}")))?;
+
+    let mut format = OutputFormat::Text;
+    let mut rest = Vec::new();
+    let mut args = args.peekable();
+    while let Some(arg) = args.next() {
+        let arg = arg
+            .to_str()
+            .ok_or_else(|| Error::Usage("argument is not valid UTF-8".into()))?
+            .to_string();
+        let format_value = if let Some(value) = arg.strip_prefix("--format=") {
+            Some(value.to_string())
+        } else if arg == "--format" {
+            Some(next_arg(&mut args, "--format")?)
+        } else {
+            None
+        };
+        match format_value {
+            Some(value) => format = parse_format(command, &value)?,
+            None if arg == "-v" => verbosity += 1,
+            None => rest.push(arg),
+        }
+    }
+    Ok(Request::Run(Invocation {
+        command,
+        format,
+        verbosity,
+        rest,
+    }))
+}
+
+fn parse_format(command: Command, value: &str) -> Result<OutputFormat, Error> {
+    match command.flag_policy().format {
+        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
+            "{} does not accept --format: {reason}",
+            command.name()
+        ))),
+        FlagSupport::Accepted => match value {
+            "json" => Ok(OutputFormat::Json),
+            "text" => Ok(OutputFormat::Text),
+            other => Err(Error::Usage(format!(
+                "--format must be text or json, got {other}"
+            ))),
+        },
+    }
+}
+
+/// The `--help` text: one line per shipping command, plus the shared flags.
+pub fn help_text() -> String {
+    let mut lines = vec![
+        "aub: one ledger for LLM consumption".to_string(),
+        String::new(),
+        "usage: aub [-v...] <command> [--format text|json] [options]".to_string(),
+        String::new(),
+        "commands:".to_string(),
+    ];
+    for command in Command::ALL {
+        if let Some(summary) = command.summary() {
+            lines.push(format!("  {:<8} {summary}", command.name()));
+        }
+    }
+    lines.extend([
+        String::new(),
+        "spend options: --today (default) | --since YYYY-MM-DD | --days N".to_string(),
+        "config options: --set key=value (repeatable), --config-file PATH".to_string(),
+        String::new(),
+        "aub            prints the version; aub --help prints this".to_string(),
+    ]);
+    lines.join("\n")
+}
+
+/// Parse the command surface and route it to bounded workflows.
+pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
+    let invocation = match parse_invocation(args)? {
+        Request::Version => {
+            println!(
+                "aub {} ({})",
+                crate::build_info::crate_version(),
+                crate::build_info::source_revision(),
+            );
+            return Ok(());
+        }
+        Request::Help => {
+            println!("{}", help_text());
+            return Ok(());
+        }
+        Request::Run(invocation) => invocation,
+    };
     let level = std::env::var("AUB_LOG_LEVEL")
         .ok()
         .and_then(|value| Level::parse(&value))
         .unwrap_or(Level::DEFAULT)
-        .raised_by(verbosity);
-    let Some(first) = first else {
-        println!(
-            "aub {} ({})",
-            crate::build_info::crate_version(),
-            crate::build_info::source_revision(),
-        );
-        return Ok(());
-    };
-    match first.to_str() {
-        Some("status") => status(&RealClock::new(), level),
-        Some("config") => config_command(args),
-        Some("__logging-fixture") => logging_fixture(&RealClock::new(), level),
-        Some("__state-check") => state_check(&RealClock::new(), level),
-        Some("__exit-class") => {
-            let class = args
-                .next()
-                .and_then(|s| s.to_str().and_then(|s| s.parse::<u8>().ok()));
+        .raised_by(invocation.verbosity);
+    match invocation.command {
+        Command::Status => {
+            reject_positionals(&invocation)?;
+            status(&RealClock::new(), level, invocation.format)
+        }
+        Command::Spend => spend(&RealClock::new(), level, &invocation),
+        Command::Config => config_command(invocation.rest.into_iter().map(OsString::from)),
+        Command::LoggingFixture => logging_fixture(&RealClock::new(), level),
+        Command::StateCheck => state_check(&RealClock::new(), level),
+        Command::ExitClass => {
+            let class = invocation.rest.first().and_then(|s| s.parse::<u8>().ok());
             match class {
                 Some(n) => crate::error::representative_outcome(n),
                 None => Err(Error::Usage("__exit-class requires a class 0..=8".into())),
             }
         }
-        Some(other) => Err(Error::Usage(format!("unknown argument: {other}"))),
-        None => Err(Error::Usage("argument is not valid UTF-8".into())),
     }
+}
+
+fn reject_positionals(invocation: &Invocation) -> Result<(), Error> {
+    match invocation.rest.first() {
+        Some(extra) => Err(Error::Usage(format!("unknown argument: {extra}"))),
+        None => Ok(()),
+    }
+}
+
+/// `aub spend`: the window flags are read here, everything else is the assembly in
+/// `report::spend` and the rendering in `presentation`. An unreadable file makes the
+/// report incomplete: it is still printed, with the file named, and the exit class
+/// says so.
+fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("spend");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let window = spend_window(&invocation.rest, timestamp)?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let report = assemble_spend(&config, window, timestamp)?;
+    match invocation.format {
+        OutputFormat::Text => println!("{}", render_spend_report(&report)),
+        OutputFormat::Json => println!("{}", spend_json(&report, run)),
+    }
+    if report.ingest.unreadable_files.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::IngestIncomplete(format!(
+            "{} file(s) could not be read; the counts above exclude them",
+            report.ingest.unreadable_files.len()
+        )))
+    }
+}
+
+/// The window from `--today`, `--since YYYY-MM-DD` and `--days N`. Today is the
+/// default, in UTC, because the binary has no local time zone facility and must not
+/// pretend to. The window is always stated in the output.
+fn spend_window(
+    rest: &[String],
+    now: crate::domain::time::UtcTimestamp,
+) -> Result<SpendWindow, Error> {
+    let mut since: Option<UtcDate> = None;
+    let mut days: i64 = 1;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--today" => since = Some(now.utc_date()),
+            "--since" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--since requires YYYY-MM-DD".into()))?;
+                since = Some(parse_date(value)?);
+            }
+            "--days" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--days requires a number".into()))?;
+                days = value
+                    .parse()
+                    .map_err(|_| Error::Usage(format!("--days must be a number, got {value}")))?;
+            }
+            other => match other.strip_prefix("--since=") {
+                Some(value) => since = Some(parse_date(value)?),
+                None => match other.strip_prefix("--days=") {
+                    Some(value) => {
+                        days = value.parse().map_err(|_| {
+                            Error::Usage(format!("--days must be a number, got {value}"))
+                        })?
+                    }
+                    None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                },
+            },
+        }
+    }
+    SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)
+}
+
+fn parse_date(value: &str) -> Result<UtcDate, Error> {
+    UtcDate::parse(value)
+        .ok_or_else(|| Error::Usage(format!("--since must be YYYY-MM-DD, got {value}")))
 }
 
 /// `aub config`: prints every resolved key with the source that won it. Never prints
@@ -293,11 +563,11 @@ fn status_clock_skew_envelope() -> ClockSkewEnvelope {
     ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60))
 }
 
-fn status(clock: &impl Clock, level: Level) -> Result<(), Error> {
+fn status(clock: &impl Clock, level: Level, format: OutputFormat) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
     let command = LogicalName::new("status");
-    let mut logger = DiagnosticLogger::new(io::stderr(), level, run);
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
     logger
         .emit(
             timestamp,
@@ -339,10 +609,13 @@ fn status(clock: &impl Clock, level: Level) -> Result<(), Error> {
         .collect();
     let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
     let report = StatusReport::new(metadata, accounts, vec![]);
-    println!(
-        "{}",
-        render_status_report(&report, timestamp, status_clock_skew_envelope())
-    );
+    match format {
+        OutputFormat::Text => println!(
+            "{}",
+            render_status_report(&report, timestamp, status_clock_skew_envelope())
+        ),
+        OutputFormat::Json => println!("{}", status_json(&report, run)),
+    }
     Ok(())
 }
 
@@ -492,7 +765,7 @@ mod tests {
     /// This is the parser half of "no explain token is parsed".
     #[test]
     fn explain_is_not_a_parsed_token() {
-        let result = run([
+        let result = parse_invocation([
             OsString::from("aub"),
             OsString::from("--explain"),
             OsString::from("status"),
@@ -504,6 +777,93 @@ mod tests {
             ),
             other => panic!("--explain must be rejected as an unknown argument, got: {other:?}"),
         }
+    }
+
+    fn args(items: &[&str]) -> Vec<OsString> {
+        std::iter::once("aub")
+            .chain(items.iter().copied())
+            .map(OsString::from)
+            .collect()
+    }
+
+    /// The parser honours the flag policy for every command, checked against the
+    /// parser rather than the table: `--format json` is accepted exactly where the
+    /// policy says `Accepted` and refused with the policy's reason elsewhere. The
+    /// planted negative is a policy row that says `Accepted` for a command whose
+    /// parser path ignores the flag, which this loop would report by name.
+    #[test]
+    fn the_parser_honours_the_format_policy_for_every_command() {
+        for command in Command::ALL {
+            let result = parse_invocation(args(&[command.name(), "--format", "json"]));
+            match command.flag_policy().format {
+                FlagSupport::Accepted => match result {
+                    Ok(Request::Run(invocation)) => {
+                        assert_eq!(invocation.format, OutputFormat::Json, "{command:?}");
+                        assert!(
+                            invocation.rest.is_empty(),
+                            "{command:?} left the flag unread"
+                        );
+                    }
+                    other => panic!("{command:?} accepts --format but parsed as {other:?}"),
+                },
+                FlagSupport::Rejected { reason } => match result {
+                    Err(Error::Usage(message)) => {
+                        assert!(message.contains(reason), "{command:?}: {message}")
+                    }
+                    other => panic!("{command:?} rejects --format but parsed as {other:?}"),
+                },
+            }
+        }
+    }
+
+    #[test]
+    fn help_and_version_are_recognised_and_unknown_arguments_are_named() {
+        assert_eq!(parse_invocation(args(&["--help"])).unwrap(), Request::Help);
+        assert_eq!(parse_invocation(args(&["-h"])).unwrap(), Request::Help);
+        assert_eq!(
+            parse_invocation(args(&["--version"])).unwrap(),
+            Request::Version
+        );
+        assert_eq!(parse_invocation(args(&[])).unwrap(), Request::Version);
+        match parse_invocation(args(&["--definitely-not-a-flag"])) {
+            Err(Error::Usage(message)) => assert!(message.contains("--definitely-not-a-flag")),
+            other => panic!("{other:?}"),
+        }
+        let help = help_text();
+        for command in Command::ALL {
+            match command.summary() {
+                Some(_) => assert!(
+                    help.contains(command.name()),
+                    "{command:?} missing from help"
+                ),
+                None => assert!(!help.contains(command.name()), "{command:?} is a hook"),
+            }
+        }
+    }
+
+    /// The spend window: today by default, `--since` with `--days`, and a malformed
+    /// date refused rather than guessed.
+    #[test]
+    fn spend_window_defaults_to_the_utc_day_and_reads_its_flags() {
+        let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-08-30T23:30:00Z").unwrap();
+        let today = spend_window(&[], now).unwrap();
+        assert_eq!(today.since.iso(), "2026-08-30");
+        assert_eq!(today.until.iso(), "2026-08-31");
+        let explicit = spend_window(
+            &[
+                "--since".into(),
+                "2026-08-25".into(),
+                "--days".into(),
+                "3".into(),
+            ],
+            now,
+        )
+        .unwrap();
+        assert_eq!(explicit.since.iso(), "2026-08-25");
+        assert_eq!(explicit.until.iso(), "2026-08-28");
+        assert!(spend_window(&["--since".into(), "25/08/2026".into()], now).is_err());
+        assert!(spend_window(&["--days".into(), "0".into()], now).is_err());
+        assert!(spend_window(&["--bogus".into()], now).is_err());
     }
 
     #[test]
