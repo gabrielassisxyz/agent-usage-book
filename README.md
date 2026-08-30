@@ -8,8 +8,13 @@ from one source instead of from several tools that quietly disagree.
 
 ## Status
 
-Early. The harness, the licence obligations and the correctness rules are in place; the
-measurement itself is being built. There is no release yet.
+Early. The harness, the licence obligations and the correctness rules are in place, and
+the first half of the measurement exists: `aub spend` reads the transcripts Claude Code,
+Codex and pi leave on disk and reports token usage per UTC day and per source, with
+replayed records collapsed and every quarantined record, skipped file and undated event
+counted beside the totals. It re-reads the configured roots on every run; nothing is
+stored yet. Quota is not measured yet: `aub status` renders every configured account as
+never observed until the sampler lands. There is no release yet.
 
 ## Why it exists
 
@@ -52,7 +57,24 @@ cargo install --path .
 ## Configuration
 
 Nothing that identifies a machine, an account or a person is compiled in. Transcript
-paths, the accounts to measure and the state directory are configuration.
+paths, the accounts to measure and the state directory are configuration. The file is
+`$HOME/.config/aub/config.toml`, or whatever `AUB_CONFIG_FILE` names; `aub config` prints
+every resolved key with the source that won.
+
+A transcript source names its root, the glob that finds its files beneath it, and the
+format the parser reads:
+
+```toml
+[[transcripts]]
+name = "claude-code"
+root = "/path/to/.claude/projects"
+pattern = "**/*.jsonl"
+format = "claude-code"   # or "codex", "pi"
+```
+
+`aub spend` reports today by default; `--since YYYY-MM-DD` and `--days N` widen the
+window, and `--format json` emits the versioned envelope with a `{value, unit}` per token
+kind.
 
 ## Development
 

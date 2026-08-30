@@ -171,10 +171,13 @@ reported as if it were right**: a stale reading rendered as fresh, or one unit p
 the place of another. Availability is cheap to notice and a wrong number is not, so these
 five rules outrank convenience everywhere they meet it.
 
-1. **Quantities are newtypes, and the arithmetic between them is closed.** `Percent`,
-   `Credits`, `Tokens` and `Cost` are distinct types. No cross-type operator, no `From`
-   between them, no conversion that is not a named function stating what it assumes. A
-   bare `f64` or `u64` crossing a module boundary is a defect, not a shortcut.
+1. **Quantities are newtypes, and the arithmetic between them is closed.**
+   `QuotaFractionPpm`, `Credits`, the per-kind token counts and `Money<C>` are distinct
+   types, and there is deliberately no generic `Cost`: subscription credits and an API
+   list-price equivalent are different quantities (PLAN.md section 25.2). No cross-type
+   operator, no `From` between them, no conversion that is not a named function stating
+   what it assumes. A bare `f64` or `u64` crossing a module boundary is a defect, not a
+   shortcut.
 2. **Every reading carries its freshness in an exhaustive enum**, `fresh | stale |
    auth_required`. Not `Option`, which erases which of the three happened, and not a
    boolean, which cannot say that credentials expired. A caller that renders a reading
@@ -221,9 +224,10 @@ costs one unit in plan space, five in bead space and twenty five in code space.
 
 ### Which stage this project is in
 
-**Execution prep.** The plan converged and lives at `docs/PLAN.md`; translation produced
-the bead graph; what remains before the first wave is the launch readiness of the beads
-and of the coordination layer.
+**Swarm implementation, between waves.** The plan converged and lives at `docs/PLAN.md`;
+translation produced the bead graph; the first waves ran on 2026-08-26 and 2026-08-27
+and closed the harness, the domain vocabulary and the first evidence-substrate beads. No
+session is up, and the ready pool is what the next wave works on.
 
 **Do not read that sentence as current.** A stage written by hand goes stale the moment
 the work moves, and this line said "Planning" for days after 187 beads existed. Derive it
