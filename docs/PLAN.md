@@ -5323,6 +5323,8 @@ The open questions resolve as follows.
 
 # 47. Suggested configuration sketch
 
+The configuration defaults in `src/config/mod.rs` are the source of truth for the numbers; this sketch is illustrative.
+
 ```toml
 schema = 1
 
@@ -5332,7 +5334,8 @@ dir = "~/.local/state/aub"
 [sampling]
 scheduler_tick = "1m"
 default_interval = "5m"
-reset_edge_lead = "60s"
+# reset_edge_lead must strictly exceed the 1m scheduler tick
+reset_edge_lead = "120s"
 request_timeout = "5s"
 command_budget = "8s"
 
