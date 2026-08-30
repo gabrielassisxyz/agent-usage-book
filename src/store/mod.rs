@@ -7,7 +7,10 @@
 //!
 //! This is the only module that knows SQLite.
 
+pub mod account;
 pub mod connection;
 pub mod migrate;
 pub mod migrations;
+pub mod sample_run;
+pub mod sampling_policy_snapshot;
 pub mod startup;

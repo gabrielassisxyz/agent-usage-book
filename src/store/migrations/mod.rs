@@ -14,11 +14,16 @@
 
 use super::migrate::Migration;
 
+// File names are the migration's own version number, which cannot start a Rust
+// identifier, so each module is declared with an explicit path rather than a
+// bare `mod` line.
+#[path = "0001_account_sample_run_policy_snapshot.rs"]
+mod migration_0001;
+
 /// Every migration this binary knows, in version order.
 ///
-/// Empty until the first schema bead lands (`aub-sth.5` and its successors).
 /// The framework is exercised by its own tests with synthetic registries; this
 /// is the registry production code reads.
 pub fn registry() -> Vec<Migration> {
-    vec![]
+    vec![migration_0001::migration()]
 }
