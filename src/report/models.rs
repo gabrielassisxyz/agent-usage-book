@@ -11,9 +11,10 @@ use crate::domain::attempt::AttemptOutcome;
 use crate::domain::freshness::Freshness;
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
+use crate::domain::rows::RowCount;
 use crate::domain::time::{UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
-use crate::evidence::{CoverageCompleteness, Derivation, Provenance};
+use crate::evidence::{CoverageCompleteness, Derivation, Provenance, Qualified};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 
@@ -449,15 +450,20 @@ impl CalibrateReport {
 }
 
 /// The export report for `aub export`.
+///
+/// The row count is qualified rather than bare because an export is a view of the
+/// ledger and inherits its coverage: nine hundred rows written from an incomplete
+/// ingestion and nine hundred rows written from a complete one are the same integer
+/// and different facts, and only the coverage on the qualified value separates them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportReport {
     pub metadata: ReportMetadata,
-    pub rows: u64,
+    pub rows: Qualified<RowCount>,
     pub provenance: ProvenanceGraph,
 }
 
 impl ExportReport {
-    pub fn new(metadata: ReportMetadata, rows: u64, node: ProvenanceNode) -> Self {
+    pub fn new(metadata: ReportMetadata, rows: Qualified<RowCount>, node: ProvenanceNode) -> Self {
         let provenance = ProvenanceGraph::new([(ReportField::ExportRows, node)]);
         Self {
             metadata,
@@ -524,11 +530,50 @@ mod tests {
         )
     }
 
-    /// Every command's report model carries the four metadata fields. Enumerating the
-    /// models here means a new command model that forgets the metadata fails this test.
-    #[test]
-    fn every_report_model_carries_the_metadata() {
-        let m = metadata();
+    /// The uniform accessor the metadata tests enumerate over.
+    ///
+    /// Implemented per model rather than derived, so a new report model has to be
+    /// named here to be covered, and a model that drops its `metadata` field stops
+    /// compiling instead of quietly leaving the enumeration.
+    trait CarriesMetadata {
+        fn metadata(&self) -> &ReportMetadata;
+    }
+
+    macro_rules! carries_metadata {
+        ($($model:ty),+ $(,)?) => {
+            $(impl CarriesMetadata for $model {
+                fn metadata(&self) -> &ReportMetadata {
+                    &self.metadata
+                }
+            })+
+        };
+    }
+
+    carries_metadata!(
+        StatusReport,
+        NowReport,
+        SpendReport,
+        CoverageReport,
+        SampleReport,
+        IngestReport,
+        BackupReport,
+        DoctorReport,
+        TaskReport,
+        CalibrateReport,
+        ExportReport,
+    );
+
+    fn exported_rows(count: u64) -> Qualified<RowCount> {
+        Qualified::new(
+            RowCount::new(count),
+            CoverageCompleteness::Complete,
+            crate::evidence::EvidenceQuality::Measured,
+            Provenance::new(["ledger".to_string()]),
+        )
+    }
+
+    /// One instance of every command's report model, each labelled with its command.
+    fn every_model(m: ReportMetadata) -> Vec<(&'static str, Box<dyn CarriesMetadata>)> {
         let account = MeterAccount::new(
             LogicalName::new("work-a"),
             Freshness::AuthRequired {
@@ -537,48 +582,152 @@ mod tests {
             },
         );
 
-        let models: [&dyn std::fmt::Debug; 11] = [
-            &StatusReport::new(
-                m.clone(),
-                vec![account.clone()],
-                vec![MeterReadingProvenance::new(
-                    LogicalName::new("work-a"),
+        vec![
+            (
+                "status",
+                Box::new(StatusReport::new(
+                    m.clone(),
+                    vec![account.clone()],
+                    vec![MeterReadingProvenance::new(
+                        LogicalName::new("work-a"),
+                        node(),
+                    )],
+                )) as Box<dyn CarriesMetadata>,
+            ),
+            (
+                "now",
+                Box::new(NowReport::new(
+                    m.clone(),
+                    vec![account.clone()],
+                    vec![MeterReadingProvenance::new(
+                        LogicalName::new("work-a"),
+                        node(),
+                    )],
+                )),
+            ),
+            (
+                "spend",
+                Box::new(SpendReport::new(
+                    m.clone(),
+                    day(),
+                    day(),
+                    vec![],
+                    vec![],
+                    IngestSummary::default(),
+                )),
+            ),
+            (
+                "coverage",
+                Box::new(CoverageReport::new(
+                    m.clone(),
+                    CoverageCompleteness::Complete,
+                    true,
                     node(),
-                )],
+                )),
             ),
-            &NowReport::new(
-                m.clone(),
-                vec![account.clone()],
-                vec![MeterReadingProvenance::new(
-                    LogicalName::new("work-a"),
+            ("sample", Box::new(SampleReport::new(m.clone(), vec![]))),
+            (
+                "ingest",
+                Box::new(IngestReport::new(m.clone(), IngestionGeneration::new(3))),
+            ),
+            ("backup", Box::new(BackupReport::new(m.clone(), true))),
+            ("doctor", Box::new(DoctorReport::new(m.clone(), vec![]))),
+            ("task", Box::new(TaskReport::new(m.clone(), vec![]))),
+            (
+                "calibrate",
+                Box::new(CalibrateReport::new(
+                    m.clone(),
+                    Derivation::Unavailable {
+                        missing: Default::default(),
+                        provenance: crate::evidence::Provenance::new([]),
+                    },
                     node(),
-                )],
+                )),
             ),
-            &SpendReport::new(
-                m.clone(),
-                day(),
-                day(),
-                vec![],
-                vec![],
-                IngestSummary::default(),
+            (
+                "export",
+                Box::new(ExportReport::new(m.clone(), exported_rows(0), node())),
             ),
-            &CoverageReport::new(m.clone(), CoverageCompleteness::Complete, true, node()),
-            &SampleReport::new(m.clone(), vec![]),
-            &IngestReport::new(m.clone(), IngestionGeneration::new(3)),
-            &BackupReport::new(m.clone(), true),
-            &DoctorReport::new(m.clone(), vec![]),
-            &TaskReport::new(m.clone(), vec![]),
-            &CalibrateReport::new(
-                m.clone(),
-                Derivation::Unavailable {
-                    missing: Default::default(),
-                    provenance: crate::evidence::Provenance::new([]),
-                },
-                node(),
-            ),
-            &ExportReport::new(m.clone(), 0, node()),
-        ];
+        ]
+    }
+
+    /// Every command's report model carries the report-level metadata, asserted
+    /// field by field on each model.
+    ///
+    /// The previous version of this test built the same eleven models and asserted
+    /// `len() == 11`, which is true of any eleven values and would have passed with
+    /// every metadata field wrong or absent. What the criterion asks for is the
+    /// assertion below: the generation time, the knowledge time and the ledger
+    /// generation on each model, plus the transcript ingestion generation carried
+    /// through wherever the caller supplies one.
+    #[test]
+    fn every_report_model_carries_the_metadata() {
+        let models = every_model(metadata());
         assert_eq!(models.len(), 11, "every command must have a report model");
+
+        for (command, model) in &models {
+            let carried = model.metadata();
+            assert_eq!(
+                carried.generated_at,
+                UtcTimestamp::from_unix_nanos(2_000),
+                "the {command} model lost the generation time"
+            );
+            assert_eq!(
+                carried.knowledge_at,
+                UtcTimestamp::from_unix_nanos(1_000),
+                "the {command} model lost the knowledge time"
+            );
+            assert_eq!(
+                carried.ledger_generation,
+                LedgerGeneration::new(7),
+                "the {command} model lost the ledger generation"
+            );
+            assert_eq!(
+                carried.ingestion_generation,
+                Some(IngestionGeneration::new(3)),
+                "the {command} model lost the transcript ingestion generation"
+            );
+        }
+    }
+
+    /// A model built without a transcript ingestion generation still carries the
+    /// three unconditional fields.
+    ///
+    /// This is the near-identical negative of the test above: it differs in exactly
+    /// the one dimension the "where relevant" wording covers, so a model that
+    /// silently dropped the other three whenever ingestion was absent would pass
+    /// there and fail here.
+    #[test]
+    fn a_model_with_no_ingestion_generation_still_carries_the_other_three() {
+        let without = ReportMetadata::new(
+            UtcTimestamp::from_unix_nanos(2_000),
+            UtcTimestamp::from_unix_nanos(1_000),
+            LedgerGeneration::new(7),
+            None,
+        );
+
+        for (command, model) in &every_model(without) {
+            let carried = model.metadata();
+            assert_eq!(
+                carried.generated_at,
+                UtcTimestamp::from_unix_nanos(2_000),
+                "the {command} model lost the generation time"
+            );
+            assert_eq!(
+                carried.knowledge_at,
+                UtcTimestamp::from_unix_nanos(1_000),
+                "the {command} model lost the knowledge time"
+            );
+            assert_eq!(
+                carried.ledger_generation,
+                LedgerGeneration::new(7),
+                "the {command} model lost the ledger generation"
+            );
+            assert_eq!(
+                carried.ingestion_generation, None,
+                "the {command} model invented an ingestion generation"
+            );
+        }
     }
 
     /// A meter reading carries exactly one freshness variant: the three kinds are
@@ -700,7 +849,7 @@ mod tests {
             IngestSummary::default(),
         );
         let coverage = CoverageReport::new(m.clone(), CoverageCompleteness::Complete, true, node());
-        let export = ExportReport::new(m.clone(), 42, node());
+        let export = ExportReport::new(m.clone(), exported_rows(42), node());
         let calibrate = CalibrateReport::new(
             m.clone(),
             Derivation::Unavailable {
@@ -788,9 +937,207 @@ mod tests {
     #[test]
     fn every_node_in_a_report_graph_verifies() {
         let m = metadata();
-        let report = ExportReport::new(m, 42, node());
+        let report = ExportReport::new(m, exported_rows(42), node());
         for (_, node) in report.provenance.iter() {
             assert!(node.verify());
+        }
+    }
+
+    /// Every domain quantity this module could name bare. A field whose type
+    /// mentions one of these and no qualifying wrapper is an unqualified number in
+    /// a report model, which is exactly what this seam exists to prevent.
+    const BARE_QUANTITIES: [&str; 16] = [
+        "u8",
+        "u16",
+        "u32",
+        "u64",
+        "u128",
+        "usize",
+        "i8",
+        "i16",
+        "i32",
+        "i64",
+        "isize",
+        "f32",
+        "f64",
+        "TokenCount",
+        "UsageVector",
+        "RowCount",
+    ];
+
+    /// The wrappers that qualify a quantity: coverage and evidence quality
+    /// (`Qualified`), a truthful refusal (`Derivation`), or exactly one freshness
+    /// variant (`Freshness`).
+    const QUALIFYING_WRAPPERS: [&str; 3] = ["Qualified", "Derivation", "Freshness"];
+
+    /// Fields that hold a quantity without one of those wrappers, each with the
+    /// reason it is nonetheless not an unqualified report number. `"*"` covers
+    /// every field of the struct.
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 2] = [
+        (
+            "IngestSummary",
+            "*",
+            "operational counters describing what the ingestion run did, not \
+             measurements it reports; they exist to say the report is incomplete",
+        ),
+        (
+            "SpendGroup",
+            "usage",
+            "a UsageVector carries its own coverage and evidence quality, with the \
+             provenance and derivation identifier as sibling fields on the group",
+        ),
+    ];
+
+    /// One named field of one struct, as read out of the module's own source.
+    #[derive(Debug, PartialEq, Eq)]
+    struct SourceField {
+        owner: String,
+        name: String,
+        type_text: String,
+    }
+
+    /// The named public fields of every `pub struct` in `source`.
+    ///
+    /// Reading the source is what makes this test enumerate the models rather than
+    /// sample them: a field added to any model is seen here without anyone
+    /// remembering to list it.
+    fn public_fields(source: &str) -> Vec<SourceField> {
+        let mut fields = Vec::new();
+        let mut owner: Option<String> = None;
+        for line in source.lines() {
+            if let Some(rest) = line.strip_prefix("pub struct ")
+                && let Some(name) = rest.strip_suffix(" {")
+            {
+                owner = Some(name.to_string());
+                continue;
+            }
+            if line == "}" {
+                owner = None;
+                continue;
+            }
+            let Some(current) = owner.as_ref() else {
+                continue;
+            };
+            let trimmed = line.trim();
+            let Some(declaration) = trimmed.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, type_text)) = declaration.split_once(": ") else {
+                continue;
+            };
+            fields.push(SourceField {
+                owner: current.clone(),
+                name: name.to_string(),
+                type_text: type_text.trim_end_matches(',').to_string(),
+            });
+        }
+        fields
+    }
+
+    /// Whether `type_text` names a quantity with no qualifying wrapper around it.
+    fn is_bare_quantity(type_text: &str) -> bool {
+        let identifiers: Vec<&str> = type_text
+            .split(|c: char| !c.is_alphanumeric() && c != '_')
+            .filter(|piece| !piece.is_empty())
+            .collect();
+        let wrapped = identifiers
+            .iter()
+            .any(|identifier| QUALIFYING_WRAPPERS.contains(identifier));
+        !wrapped
+            && identifiers
+                .iter()
+                .any(|identifier| BARE_QUANTITIES.contains(identifier))
+    }
+
+    /// Every field of every model in `source` that holds an unqualified quantity,
+    /// as `Struct.field: Type`.
+    fn unqualified_quantity_fields(source: &str) -> Vec<String> {
+        public_fields(source)
+            .into_iter()
+            .filter(|field| is_bare_quantity(&field.type_text))
+            .filter(|field| {
+                !STRUCTURALLY_QUALIFIED.iter().any(|(owner, name, _)| {
+                    *owner == field.owner && (*name == "*" || *name == field.name)
+                })
+            })
+            .map(|field| format!("{}.{}: {}", field.owner, field.name, field.type_text))
+            .collect()
+    }
+
+    /// Every quantity field on every report model is qualified, enumerated from
+    /// the module's own source rather than from a list somebody maintains.
+    ///
+    /// This is the test the export row count regression got past: `rows: u64` was
+    /// added to `ExportReport` with a provenance node and no qualification, and
+    /// nothing in this module objected.
+    #[test]
+    fn every_quantity_field_on_every_model_is_qualified() {
+        let source =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/report/models.rs"))
+                .expect("this module's own source must be readable");
+
+        let unqualified = unqualified_quantity_fields(&source);
+        assert!(
+            unqualified.is_empty(),
+            "unqualified quantity fields in report models: {unqualified:?}"
+        );
+    }
+
+    /// A one-field report model, as source text, for the checker's own tests.
+    fn fixture(field: &str) -> String {
+        [
+            "pub struct ExampleReport {",
+            "    pub metadata: ReportMetadata,",
+            &format!("    {field}"),
+            "}",
+        ]
+        .join("\n")
+    }
+
+    /// The enumeration itself refuses a bare quantity and accepts the qualified
+    /// form of the same field.
+    ///
+    /// The two sources below differ only in the wrapper around the quantity, which
+    /// is the single dimension the rule is about: a checker that accepted both, or
+    /// refused both, would still pass the test above against a clean tree.
+    #[test]
+    fn the_enumeration_refuses_a_bare_quantity_and_accepts_a_qualified_one() {
+        // Assembled line by line rather than written as one literal block: a
+        // literal would put `pub struct` at column zero in this file, and the
+        // test above reads this file, so the fixture would be parsed as a real
+        // report model and fail it.
+        let bare = fixture("pub rows: u64,");
+        let qualified = fixture("pub rows: Qualified<RowCount>,");
+        assert_eq!(
+            unqualified_quantity_fields(&bare),
+            vec!["ExampleReport.rows: u64".to_string()]
+        );
+        assert!(unqualified_quantity_fields(&qualified).is_empty());
+    }
+
+    /// A quantity hidden inside a container is still a bare quantity, so wrapping
+    /// one in a `Vec` is not a way around the rule.
+    #[test]
+    fn a_quantity_inside_a_container_is_still_bare() {
+        let source = fixture("pub counts: Vec<TokenCount>,");
+        assert_eq!(
+            unqualified_quantity_fields(&source),
+            vec!["ExampleReport.counts: Vec<TokenCount>".to_string()]
+        );
+    }
+
+    /// The structurally qualified exceptions are exactly the two documented here,
+    /// each naming the reason it is not an unqualified number. A third one cannot
+    /// be added without this test being edited, which is the point: the list is a
+    /// decision, not a convenience.
+    #[test]
+    fn the_structurally_qualified_exceptions_are_documented() {
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 2);
+        for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
+            assert!(
+                !reason.is_empty(),
+                "the exception for {owner} states no reason"
+            );
         }
     }
 }
