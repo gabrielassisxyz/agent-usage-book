@@ -520,6 +520,8 @@ holding everything, and do not wait on the file.
 | `src/error.rs`, `src/problem_code.rs` | registries, one variant per failure a bead introduces |
 | `src/cli.rs` | the command enumeration and `Command::ALL` |
 | `Cargo.toml` | one dependency line per bead that needs one |
+| `src/store/migrations/mod.rs` | the migration registry, one `pub mod` line and one `registry()` entry per schema bead. Take the version number as the highest one present plus one, under reservation of this file: `validate_registry()` refuses a gap or a duplicate, and the pane check subset never runs it, so a collision surfaces only at batch-verify |
+| `bin/checks/boundary-rules/` | one numbered executable per rule; the number is the highest present plus one, and a bead whose text fixes the number keeps it |
 
 That list is not closed. **A file is shared when a bead's normal work appends to it rather
 than rewriting it**: a declaration list, an enumeration, a registry, a manifest. Finding one
