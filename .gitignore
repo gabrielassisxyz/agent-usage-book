@@ -43,3 +43,9 @@
 # the upstream accounts. All three are facts about one machine at one moment, so committing them
 # would put another machine's pane ids and one afternoon's rate-limit counters in every checkout.
 /.ntm
+
+# The beads compliance audit's own directory. It is a separate repository with its own
+# history (one commit per verification pass) that lives inside this tree so the scorecards
+# stay next to the code they cite. Nothing in it belongs in this project's history. No
+# trailing slash, for the reason the private-boundary block above spells out.
+/beads_compliance_audit
