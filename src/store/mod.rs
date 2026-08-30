@@ -12,5 +12,6 @@ pub mod connection;
 pub mod migrate;
 pub mod migrations;
 pub mod sample_run;
+pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
 pub mod startup;

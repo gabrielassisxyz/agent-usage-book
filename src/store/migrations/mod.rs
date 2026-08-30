@@ -20,10 +20,15 @@ use super::migrate::Migration;
 #[path = "0001_account_sample_run_policy_snapshot.rs"]
 mod migration_0001;
 
+// Visible to the crate so the sampling lease repository's own tests can migrate
+// a fixture database up to exactly this version.
+#[path = "0002_sampling_lease.rs"]
+pub(crate) mod migration_0002;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
 /// is the registry production code reads.
 pub fn registry() -> Vec<Migration> {
-    vec![migration_0001::migration()]
+    vec![migration_0001::migration(), migration_0002::migration()]
 }
