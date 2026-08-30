@@ -245,7 +245,13 @@ pub fn execute_single(
         Ok(res) => to_http_response(res, budget, clock),
         Err(ureq::Error::Status(_status, res)) => to_http_response(res, budget, clock),
         Err(ureq::Error::Transport(err)) => {
-            if budget.is_expired(clock) {
+            if budget.is_expired(clock)
+                || (effective_timeouts.read_timeout < request.timeouts.read_timeout
+                    && (err.kind() == ureq::ErrorKind::Io
+                        || err.kind() == ureq::ErrorKind::ConnectionFailed)
+                    && (err.to_string().to_lowercase().contains("timeout")
+                        || err.to_string().to_lowercase().contains("timed out")))
+            {
                 Err(FailureClass::TotalBudgetExpired)
             } else {
                 Err(map_transport_error(&err))
@@ -296,8 +302,6 @@ fn map_transport_error(err: &ureq::Transport) -> FailureClass {
         ureq::ErrorKind::ConnectionFailed => {
             if msg.contains("timeout") || msg.contains("timed out") {
                 FailureClass::ConnectTimeout
-            } else if msg.contains("refused") {
-                FailureClass::HttpStatus(HttpStatusClass::ClientError)
             } else {
                 FailureClass::ConnectTimeout
             }
@@ -479,12 +483,12 @@ mod tests {
         assert_eq!(responses[1].key, "account-b");
 
         for resp in responses {
-            match resp.result {
-                Err(FailureClass::TotalBudgetExpired) | Err(FailureClass::ReadTimeout) => {}
-                other => panic!(
-                    "expected TotalBudgetExpired or ReadTimeout within budget, got {other:?}"
-                ),
-            }
+            assert_eq!(
+                resp.result,
+                Err(FailureClass::TotalBudgetExpired),
+                "expected TotalBudgetExpired for wedged endpoint, got {:?}",
+                resp.result
+            );
         }
 
         // Must complete within budget plus shutdown tolerance
@@ -492,6 +496,124 @@ mod tests {
         assert!(
             elapsed.as_nanos() <= max_allowed,
             "elapsed {elapsed:?} exceeded budget + tolerance {max_allowed}ns"
+        );
+    }
+
+    #[test]
+    fn connection_refused_unreachable_and_dns_failure_map_to_transport_variants() {
+        let clock = RealClock::new();
+
+        // 1. Connection refused: port where nothing listens -> ConnectTimeout (transport, not HttpStatus)
+        let unused_port = {
+            let temp = TcpListener::bind("127.0.0.1:0").unwrap();
+            temp.local_addr().unwrap().port()
+        };
+        let refused_req = HttpRequest::get(
+            format!("http://127.0.0.1:{unused_port}"),
+            timeouts(50, 50, Some(50)),
+        );
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
+        let refused_res = execute_single(&refused_req, &budget, &clock);
+        assert_eq!(
+            refused_res,
+            Err(FailureClass::ConnectTimeout),
+            "connection refused must map to transport FailureClass::ConnectTimeout"
+        );
+
+        // 2. DNS failure -> DnsFailure
+        let dns_req = HttpRequest::get(
+            "http://nonexistent.invalid.domain.for.transport.test:80",
+            timeouts(50, 50, Some(50)),
+        );
+        let dns_res = execute_single(&dns_req, &budget, &clock);
+        assert_eq!(
+            dns_res,
+            Err(FailureClass::DnsFailure),
+            "dns resolution failure must map to FailureClass::DnsFailure"
+        );
+
+        // 3. Planted negative: real 4xx response from server -> HttpStatus(ClientError)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+            }
+        });
+        let client_err_req = HttpRequest::get(
+            format!("http://127.0.0.1:{port}"),
+            timeouts(200, 200, Some(200)),
+        );
+        let client_err_res = execute_single(&client_err_req, &budget, &clock).unwrap();
+        assert_eq!(
+            client_err_res.http_status_class(),
+            Some(HttpStatusClass::ClientError),
+            "real 4xx HTTP response must produce HttpStatusClass::ClientError"
+        );
+    }
+
+    #[test]
+    fn each_timeout_honoured_within_configured_value_with_tolerance() {
+        let clock = RealClock::new();
+
+        // 1. Read timeout: server accepts connection and never sends data
+        let listener_read = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_read = listener_read.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener_read.accept() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        let read_req = HttpRequest::get(
+            format!("http://127.0.0.1:{port_read}"),
+            timeouts(5000, 60, None),
+        );
+        let budget_large = CommandBudget::new(MonotonicDuration::from_millis(5000), &clock);
+        let start_read = clock.monotonic_now();
+        let read_res = execute_single(&read_req, &budget_large, &clock);
+        let elapsed_read = clock.monotonic_now().duration_since(start_read);
+
+        assert_eq!(
+            read_res,
+            Err(FailureClass::ReadTimeout),
+            "read timeout must produce FailureClass::ReadTimeout"
+        );
+        let min_read = 40_000_000u128; // 40ms
+        let max_read = 60_000_000u128 + SHUTDOWN_TOLERANCE.as_nanos();
+        assert!(
+            elapsed_read.as_nanos() >= min_read && elapsed_read.as_nanos() <= max_read,
+            "read timeout elapsed {elapsed_read:?} out of expected range {min_read}..={max_read}ns"
+        );
+
+        // 2. Total command budget timeout: server accepts connection and sleeps
+        let listener_budget = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port_budget = listener_budget.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((_stream, _)) = listener_budget.accept() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        let budget_req = HttpRequest::get(
+            format!("http://127.0.0.1:{port_budget}"),
+            timeouts(5000, 5000, None),
+        );
+        let budget_short = CommandBudget::new(MonotonicDuration::from_millis(60), &clock);
+        let start_budget = clock.monotonic_now();
+        let budget_res = execute_single(&budget_req, &budget_short, &clock);
+        let elapsed_budget = clock.monotonic_now().duration_since(start_budget);
+
+        assert_eq!(
+            budget_res,
+            Err(FailureClass::TotalBudgetExpired),
+            "expired command budget must produce FailureClass::TotalBudgetExpired"
+        );
+        let min_budget = 40_000_000u128; // 40ms
+        let max_budget = 60_000_000u128 + SHUTDOWN_TOLERANCE.as_nanos();
+        assert!(
+            elapsed_budget.as_nanos() >= min_budget && elapsed_budget.as_nanos() <= max_budget,
+            "budget timeout elapsed {elapsed_budget:?} out of expected range {min_budget}..={max_budget}ns"
         );
     }
 
