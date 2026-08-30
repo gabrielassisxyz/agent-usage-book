@@ -921,8 +921,147 @@ mod tests {
         }
     }
 
+    proptest::proptest! {
+        #[test]
+        fn prop_time_alone_can_make_fresh_data_stale_and_never_makes_stale_data_fresh(
+            base_time_sec in 100u64..10_000u64,
+            horizon_sec in 10u64..120u64,
+            has_last_good in proptest::bool::ANY,
+            last_good_val in 0u64..1000u64,
+            obs_ctx_idx in 0usize..2,
+            outcome_choice in 0u8..5,
+            attempt_id_raw in 1u64..1000u64,
+            latest_ctx_idx in 0usize..2,
+            has_auth_fail in proptest::bool::ANY,
+            auth_fail_ctx_idx in 0usize..2,
+            has_auth_success in proptest::bool::ANY,
+            auth_success_ctx_idx in 0usize..2,
+            delta_sec in 1u64..7200u64,
+        ) {
+            use crate::domain::failure::HttpStatusClass;
+
+            let ctx_a = CredentialContextId::new("ctx-a");
+            let ctx_b = CredentialContextId::new("ctx-b");
+            let contexts = [&ctx_a, &ctx_b];
+
+            let base_nanos = (base_time_sec as i64) * 1_000_000_000;
+            let horizon = MonotonicDuration::from_seconds(horizon_sec);
+            let command_horizon = MonotonicDuration::from_seconds(10);
+            let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+
+            let obs = if has_last_good {
+                Some(test_observed(last_good_val, Some(base_nanos), base_nanos))
+            } else {
+                None
+            };
+            let obs_ctx = if has_last_good {
+                Some(contexts[obs_ctx_idx % 2])
+            } else {
+                None
+            };
+
+            let started = AttemptStarted::new(
+                AttemptId::new(attempt_id_raw),
+                UtcTimestamp::from_unix_nanos(base_nanos),
+            );
+            let latest_ctx = contexts[latest_ctx_idx % 2];
+            let result = match outcome_choice {
+                0 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::Success,
+                )),
+                1 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::AuthRequired,
+                )),
+                2 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+                )),
+                3 => Some(AttemptResult::new(
+                    started.attempt_id(),
+                    UtcTimestamp::from_unix_nanos(base_nanos),
+                    MonotonicDuration::from_seconds(0),
+                    AttemptOutcome::Unreachable(FailureClass::HttpStatus(
+                        HttpStatusClass::ServerError,
+                    )),
+                )),
+                _ => None,
+            };
+
+            let auth_fail_ctx = if has_auth_fail {
+                Some(contexts[auth_fail_ctx_idx % 2])
+            } else {
+                None
+            };
+            let auth_success_ctx = if has_auth_success {
+                Some(contexts[auth_success_ctx_idx % 2])
+            } else {
+                None
+            };
+
+            let input = FreshnessInput::new(
+                obs,
+                obs_ctx,
+                Some(LatestAttempt::new(started, result, latest_ctx)),
+                auth_fail_ctx,
+                auth_success_ctx,
+                horizon,
+                command_horizon,
+                envelope,
+            );
+
+            let t0 = UtcTimestamp::from_unix_nanos(base_nanos);
+            let clock_0 = crate::domain::time::FakeClock::new(t0);
+            let initial = compute_freshness(&input, &clock_0);
+
+            let t_future =
+                UtcTimestamp::from_unix_nanos(base_nanos + (delta_sec as i64) * 1_000_000_000);
+            let clock_future = crate::domain::time::FakeClock::new(t_future);
+            let later = compute_freshness(&input, &clock_future);
+
+            match initial.kind() {
+                FreshnessKind::Stale => {
+                    prop_assert_ne!(
+                        later.kind(),
+                        FreshnessKind::Fresh,
+                        "time alone must never turn Stale into Fresh"
+                    );
+                }
+                FreshnessKind::AuthRequired => {
+                    prop_assert_ne!(
+                        later.kind(),
+                        FreshnessKind::Fresh,
+                        "time alone must never turn AuthRequired into Fresh"
+                    );
+                }
+                FreshnessKind::Fresh => {
+                    prop_assert_ne!(
+                        later.kind(),
+                        FreshnessKind::AuthRequired,
+                        "time alone must never turn Fresh into AuthRequired"
+                    );
+                    if delta_sec > horizon_sec {
+                        prop_assert_eq!(
+                            later.kind(),
+                            FreshnessKind::Stale,
+                            "Fresh data must age into Stale past the freshness horizon"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Retained hand-picked regression: walks deterministic pseudo-random samples.
     #[test]
-    fn time_alone_can_make_fresh_data_stale_and_never_makes_stale_data_fresh() {
+    fn time_alone_can_make_fresh_data_stale_and_never_makes_stale_data_fresh_hand_picked() {
         use crate::domain::failure::HttpStatusClass;
 
         let mut rng = xorshift(0xDEAD_BEEF_CAFE_BABE);

@@ -280,11 +280,58 @@ mod tests {
         assert_eq!(i.width(), q(2.0));
     }
 
-    /// Enclosure under inclusion: if `A` is contained in `B`, then applying
-    /// the same operation with the same operand keeps the result of `A`
-    /// contained in the result of `B`.
+    proptest::proptest! {
+        #[test]
+        fn prop_operations_preserve_enclosure_under_inclusion(
+            b_lower in -1000.0f64..1000.0f64,
+            b_width in 0.0f64..2000.0f64,
+            a_rel_lower in 0.0f64..=1.0f64,
+            a_rel_upper in 0.0f64..=1.0f64,
+            c_lower in -1000.0f64..1000.0f64,
+            c_width in 0.0f64..2000.0f64,
+            scalar in -100.0f64..100.0f64,
+        ) {
+            let b_upper = b_lower + b_width;
+            let (rel_min, rel_max) = if a_rel_lower <= a_rel_upper {
+                (a_rel_lower, a_rel_upper)
+            } else {
+                (a_rel_upper, a_rel_lower)
+            };
+            let a_lower = b_lower + rel_min * b_width;
+            let a_upper = b_lower + rel_max * b_width;
+            let c_upper = c_lower + c_width;
+
+            let a = interval(a_lower, a_upper);
+            let b = interval(b_lower, b_upper);
+            let c = interval(c_lower, c_upper);
+
+            let add_a = a + c;
+            let add_b = b + c;
+            prop_assert!(add_a.lower() >= add_b.lower());
+            prop_assert!(add_a.upper() <= add_b.upper());
+
+            let sub_a = a - c;
+            let sub_b = b - c;
+            prop_assert!(sub_a.lower() >= sub_b.lower());
+            prop_assert!(sub_a.upper() <= sub_b.upper());
+
+            let mul_a = a * c;
+            let mul_b = b * c;
+            prop_assert!(mul_a.lower() >= mul_b.lower());
+            prop_assert!(mul_a.upper() <= mul_b.upper());
+
+            let s = q(scalar);
+            let smul_a = a * s;
+            let smul_b = b * s;
+            prop_assert!(smul_a.lower() >= smul_b.lower());
+            prop_assert!(smul_a.upper() <= smul_b.upper());
+        }
+    }
+
+    /// Retained hand-picked regression: fixed intervals covering enclosure under
+    /// addition, subtraction, multiplication, and scalar multiplication.
     #[test]
-    fn operations_preserve_enclosure_under_inclusion() {
+    fn operations_preserve_enclosure_under_inclusion_hand_picked() {
         // A is contained in B: B.lower <= A.lower and A.upper <= B.upper.
         let a = interval(2.0, 3.0);
         let b = interval(1.0, 4.0);

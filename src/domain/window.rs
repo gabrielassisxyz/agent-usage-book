@@ -380,8 +380,66 @@ mod tests {
         ));
     }
 
+    proptest::proptest! {
+        #[test]
+        fn prop_adding_a_tighter_window_never_raises_selected_headroom(
+            base_remaining_ppm in 0u32..=1_000_000u32,
+            tighter_remaining_ppm in 0u32..=1_000_000u32,
+            base_micros in 1i64..1_000_000i64,
+            tighter_micros in 1i64..1_000_000i64,
+        ) {
+            let model = ModelId::new("model-a");
+            let base = window("base", WindowScope::AccountWide, 1_000_000 - base_remaining_ppm, 100);
+            let tighter = window(
+                "tighter",
+                WindowScope::ModelSpecific(model.clone()),
+                1_000_000 - tighter_remaining_ppm,
+                100,
+            );
+            let calibrations = BTreeMap::from([
+                (
+                    crate::domain::window::WindowSemanticKey::new("base"),
+                    CreditsPerPercentagePoint::from_micros_per_point(base_micros),
+                ),
+                (
+                    crate::domain::window::WindowSemanticKey::new("tighter"),
+                    CreditsPerPercentagePoint::from_micros_per_point(tighter_micros),
+                ),
+            ]);
+            let before_windows = [base.clone()];
+            let after_windows = [base, tighter];
+            let before =
+                limiting_credit_headroom_window(&before_windows, &model, &calibrations).unwrap();
+            let after =
+                limiting_credit_headroom_window(&after_windows, &model, &calibrations).unwrap();
+
+            let CreditHeadroomSelection::Known {
+                headroom: before_headroom, ..
+            } = before
+            else {
+                prop_assert!(false, "base calibration is present");
+                return Ok(());
+            };
+            let CreditHeadroomSelection::Known {
+                headroom: after_headroom, ..
+            } = after
+            else {
+                prop_assert!(false, "both calibrations are present");
+                return Ok(());
+            };
+
+            prop_assert!(
+                after_headroom.micros() <= before_headroom.micros(),
+                "adding another constraint raised headroom from {:?} to {:?}",
+                before_headroom,
+                after_headroom
+            );
+        }
+    }
+
+    /// Retained hand-picked regression: walks stepping fractions over fixed calibrations.
     #[test]
-    fn adding_a_tighter_window_never_raises_selected_headroom() {
+    fn adding_a_tighter_window_never_raises_selected_headroom_hand_picked() {
         let model = ModelId::new("model-a");
         for remaining_ppm in (100_000..=900_000).step_by(100_000) {
             let base = window("base", WindowScope::AccountWide, 500_000, 100);

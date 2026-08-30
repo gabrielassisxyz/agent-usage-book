@@ -298,8 +298,50 @@ mod tests {
         assert_eq!(Level::DEFAULT.raised_by(3), Level::Trace);
     }
 
+    proptest::proptest! {
+        #[test]
+        fn prop_redacted_values_never_serialize_input_at_any_level(
+            secret in "SECRET_[a-zA-Z0-9_-]{10,50}",
+            path in "PATH_[a-zA-Z0-9_-]{10,50}",
+            level_idx in 0usize..5,
+        ) {
+            let levels = [
+                Level::Error,
+                Level::Warn,
+                Level::Info,
+                Level::Debug,
+                Level::Trace,
+            ];
+            let level = levels[level_idx % 5];
+            let body = format!("{{\"token\":\"{secret}\",\"path\":\"/{path}\"}}");
+            let timestamp = UtcTimestamp::from_unix_nanos(1);
+            let mut output = Vec::new();
+            let run = RunId::new(timestamp);
+            let credential = Redacted::credential(&secret);
+            let provider_body = Redacted::provider_body(&body);
+            let logical_name = LogicalName::new("provider-main");
+            let mut logger = DiagnosticLogger::new(&mut output, level, run);
+            logger
+                .emit(
+                    timestamp,
+                    DiagnosticEvent::RunStarted,
+                    &[
+                        ("credential", &credential),
+                        ("body", &provider_body),
+                        ("source", &logical_name),
+                    ],
+                )
+                .unwrap();
+            let rendered = String::from_utf8(output).unwrap();
+            prop_assert!(!rendered.contains(&secret));
+            prop_assert!(!rendered.contains(&body));
+            prop_assert!(!rendered.contains(&path));
+        }
+    }
+
+    /// Retained hand-picked regression: fixed bearer token and body across all 5 levels.
     #[test]
-    fn redacted_values_never_serialize_input_at_any_level() {
+    fn redacted_values_never_serialize_input_at_any_level_hand_picked() {
         let secret = "Bearer abc.credential-value";
         let body = format!("{{\"token\":\"{secret}\",\"path\":\"/home/private\"}}");
         let timestamp = UtcTimestamp::from_unix_nanos(1);

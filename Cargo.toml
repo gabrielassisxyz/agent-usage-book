@@ -46,6 +46,10 @@ ureq = "2"
 serde_json = "1"
 
 [dev-dependencies]
+# Property-testing framework (aub-gmms): generates inputs over stated domains
+# and provides automatic test-case shrinking. No async runtime or network
+# dependencies are pulled in (AGENTS.md constraints).
+proptest = { version = "1", default-features = false, features = ["std"] }
 trybuild = "1"
 test-support = { path = "crates/test-support" }
 

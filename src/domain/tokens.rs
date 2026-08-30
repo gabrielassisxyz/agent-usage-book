@@ -305,12 +305,37 @@ mod tests {
         )
     }
 
-    /// Property-style: vector addition preserves each kind independently and never
-    /// merges two kinds. No property-testing crate is a dependency of this project, so
-    /// this walks a small hand-picked table spanning zero, equal, and asymmetric counts
-    /// per field rather than pulling one in for a single bead.
+    proptest::proptest! {
+        #[test]
+        fn prop_vector_addition_preserves_each_kind_independently(
+            ai in 0..=(u64::MAX / 2),
+            ao in 0..=(u64::MAX / 2),
+            ar in 0..=(u64::MAX / 2),
+            aw in 0..=(u64::MAX / 2),
+            bi in 0..=(u64::MAX / 2),
+            bo in 0..=(u64::MAX / 2),
+            br in 0..=(u64::MAX / 2),
+            bw in 0..=(u64::MAX / 2),
+        ) {
+            let a = sample_vector(ai, ao, ar, aw);
+            let b = sample_vector(bi, bo, br, bw);
+            let sum = a + b;
+
+            prop_assert_eq!(sum.input().value(), ai + bi);
+            prop_assert_eq!(sum.output().value(), ao + bo);
+            prop_assert_eq!(sum.cache_read().value(), ar + br);
+            prop_assert_eq!(sum.cache_write().value(), aw + bw);
+
+            for kind in TokenKind::ALL {
+                prop_assert_eq!(sum.value(kind), a.value(kind) + b.value(kind));
+            }
+        }
+    }
+
+    /// Retained hand-picked regression: walks fixed cases including zero, equal, and
+    /// asymmetric counts.
     #[test]
-    fn vector_addition_preserves_each_kind_independently() {
+    fn vector_addition_preserves_each_kind_independently_hand_picked() {
         let cases: [(u64, u64, u64, u64); 5] = [
             (0, 0, 0, 0),
             (1, 1, 1, 1),

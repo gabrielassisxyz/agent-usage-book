@@ -262,20 +262,93 @@ mod tests {
         QuerySemantics::new("by-account", "last-7-days")
     }
 
-    /// The inputs hash is canonical: the same evidence set in any order
-    /// produces the same hash.
+    proptest::proptest! {
+        #[test]
+        fn prop_inputs_hash_is_canonical_across_orderings(
+            raw_ids in proptest::collection::vec("[a-z0-9_-]{1,16}", 1..20),
+        ) {
+            let forward_ids = raw_ids.clone();
+            let mut reversed_ids = raw_ids.clone();
+            reversed_ids.reverse();
+
+            let forward = ProvenanceManifest::new(
+                forward_ids.iter().map(|s| EvidenceId::new(s.as_str())),
+                [],
+                semantics(),
+            );
+            let reversed = ProvenanceManifest::new(
+                reversed_ids.iter().map(|s| EvidenceId::new(s.as_str())),
+                [],
+                semantics(),
+            );
+
+            prop_assert_eq!(forward.inputs_hash(), reversed.inputs_hash());
+            prop_assert_eq!(forward.input_count(), reversed.input_count());
+        }
+
+        #[test]
+        fn prop_derivation_id_is_stable_and_sensitive(
+            raw_ids in proptest::collection::vec("[a-z0-9_-]{1,16}", 1..10),
+            extra_id in "[A-Z0-9_-]{17,25}",
+            different_query in "[a-zA-Z0-9_-]{1,20}",
+        ) {
+            let mut shuffled_ids = raw_ids.clone();
+            shuffled_ids.reverse();
+
+            let base = ProvenanceManifest::new(
+                raw_ids.iter().map(|s| EvidenceId::new(s.as_str())),
+                [],
+                semantics(),
+            );
+            let same = ProvenanceManifest::new(
+                shuffled_ids.iter().map(|s| EvidenceId::new(s.as_str())),
+                [],
+                semantics(),
+            );
+            prop_assert_eq!(
+                DerivationId::from_manifest(&base),
+                DerivationId::from_manifest(&same),
+                "same inputs and semantics must produce the same derivation id"
+            );
+
+            let mut diff_ids = raw_ids.clone();
+            diff_ids.push(extra_id);
+            let diff_manifest = ProvenanceManifest::new(
+                diff_ids.iter().map(|s| EvidenceId::new(s.as_str())),
+                [],
+                semantics(),
+            );
+            prop_assert_ne!(
+                DerivationId::from_manifest(&base),
+                DerivationId::from_manifest(&diff_manifest),
+                "different inputs must change the derivation id"
+            );
+
+            let diff_sem = ProvenanceManifest::new(
+                raw_ids.iter().map(|s| EvidenceId::new(s.as_str())),
+                [],
+                QuerySemantics::new("by-account", different_query),
+            );
+            prop_assert_ne!(
+                DerivationId::from_manifest(&base),
+                DerivationId::from_manifest(&diff_sem),
+                "different semantics must change the derivation id"
+            );
+        }
+    }
+
+    /// Retained hand-picked regression: 3 fixed evidence IDs in forward and reversed order.
     #[test]
-    fn inputs_hash_is_canonical_across_orderings() {
+    fn inputs_hash_is_canonical_across_orderings_hand_picked() {
         let forward = ProvenanceManifest::new(evidence(&["a", "b", "c"]), [], semantics());
         let reversed = ProvenanceManifest::new(evidence(&["c", "b", "a"]), [], semantics());
         assert_eq!(forward.inputs_hash(), reversed.inputs_hash());
         assert_eq!(forward.input_count(), reversed.input_count());
     }
 
-    /// A derivation identifier is stable across runs for the same inputs and
-    /// semantics, and changes when either changes.
+    /// Retained hand-picked regression: fixed 2-item evidence sets and semantics variants.
     #[test]
-    fn derivation_id_is_stable_and_sensitive() {
+    fn derivation_id_is_stable_and_sensitive_hand_picked() {
         let base = ProvenanceManifest::new(evidence(&["a", "b"]), [], semantics());
         let same = ProvenanceManifest::new(evidence(&["b", "a"]), [], semantics());
         assert_eq!(

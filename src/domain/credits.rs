@@ -244,13 +244,28 @@ mod tests {
         assert_eq!((rate * negative_points).micros(), -750_000);
     }
 
-    /// Property-style: scaling a token count by a further integer factor and applying
-    /// the rate once must agree with applying the rate to the base count and then
-    /// scaling by the same factor, up to the rounding drift one independent rounding
-    /// per application can introduce. No property-testing crate is a dependency of this
-    /// project; this walks a deterministic pseudo-random sample.
+    proptest::proptest! {
+        #[test]
+        fn prop_scaling_a_token_rate_is_linear_and_stays_in_credits(
+            rate_micros in -1_000_000i64..=1_000_000i64,
+            count in 0u64..10_000_000u64,
+            factor in 1u64..=10u64,
+        ) {
+            let rate = CreditsPerToken::from_micros_per_million_tokens(rate_micros);
+            let once: Credits = rate * (count * factor);
+            let composed = Credits::from_micros((rate * count).micros() * factor as i64);
+
+            let diff = (once.micros() - composed.micros()).abs();
+            prop_assert!(
+                diff <= factor as i64,
+                "scaling drift {diff} exceeds the {factor} independent-roundings bound"
+            );
+        }
+    }
+
+    /// Retained hand-picked regression: walks deterministic pseudo-random samples.
     #[test]
-    fn scaling_a_token_rate_is_linear_and_stays_in_credits() {
+    fn scaling_a_token_rate_is_linear_and_stays_in_credits_hand_picked() {
         let mut next = xorshift(0x2545_F491_4F6C_DD1D);
         for _ in 0..200 {
             let rate = CreditsPerToken::from_micros_per_million_tokens(

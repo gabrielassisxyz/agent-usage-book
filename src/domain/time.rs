@@ -633,10 +633,52 @@ mod tests {
         assert_eq!(result.as_nanos(), 50_000_000_000);
     }
 
-    /// For a fixed observation, age is monotonically non-decreasing as the
-    /// fake clock advances.
+    proptest::proptest! {
+        #[test]
+        fn prop_age_is_monotonic_as_the_clock_advances(
+            received_sec in 1_000i64..100_000i64,
+            provider_offset_sec in -30i64..=30i64,
+            init_offset_sec in 30i64..100i64,
+            advances in proptest::collection::vec(1u64..100u64, 1..20),
+        ) {
+            let received = ReceivedAt::new(ts(received_sec));
+            let provider = ProviderObservedAt::new(ts(received_sec + provider_offset_sec));
+            let env = envelope(60);
+            let mut clock = FakeClock::new(ts(received_sec + init_offset_sec));
+
+            let mut previous = age(
+                Some(provider),
+                received,
+                MeasurementBasis::ProviderObserved,
+                clock.now(),
+                env,
+            )
+            .unwrap()
+            .as_nanos();
+
+            for delta in advances {
+                clock.advance(MonotonicDuration::from_seconds(delta));
+                let current = age(
+                    Some(provider),
+                    received,
+                    MeasurementBasis::ProviderObserved,
+                    clock.now(),
+                    env,
+                )
+                .unwrap()
+                .as_nanos();
+                prop_assert!(
+                    current >= previous,
+                    "age must not decrease as the clock advances"
+                );
+                previous = current;
+            }
+        }
+    }
+
+    /// Retained hand-picked regression: walks 100 1-second advances from a fixed start.
     #[test]
-    fn age_is_monotonic_as_the_clock_advances() {
+    fn age_is_monotonic_as_the_clock_advances_hand_picked() {
         let received = ReceivedAt::new(ts(1_000));
         let provider = ProviderObservedAt::new(ts(1_005));
         let env = envelope(60);
