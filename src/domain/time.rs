@@ -46,9 +46,151 @@ impl UtcTimestamp {
         self.0
     }
 
+    /// Parses an RFC 3339 timestamp such as `2026-08-30T14:26:29.342Z` or
+    /// `2026-08-30T11:26:29+00:00` into UTC nanoseconds. Transcript sources write
+    /// this shape; anything else is `None`, never a guessed instant, because a
+    /// timestamp a parser could not read must not place an event in a day.
+    pub fn parse_rfc3339(text: &str) -> Option<Self> {
+        let text = text.trim();
+        let (date, rest) = text.split_once('T')?;
+        let date = UtcDate::parse(date)?;
+        let (clock, offset_seconds) = split_offset(rest)?;
+        let mut clock_parts = clock.splitn(3, ':');
+        let hour: i64 = clock_parts.next()?.parse().ok()?;
+        let minute: i64 = clock_parts.next()?.parse().ok()?;
+        let second_text = clock_parts.next()?;
+        let (second, fraction_nanos) = match second_text.split_once('.') {
+            Some((whole, fraction)) => (whole.parse::<i64>().ok()?, fraction_to_nanos(fraction)?),
+            None => (second_text.parse::<i64>().ok()?, 0),
+        };
+        if !(0..24).contains(&hour) || !(0..60).contains(&minute) || !(0..61).contains(&second) {
+            return None;
+        }
+        let day_seconds = hour * 3_600 + minute * 60 + second - offset_seconds;
+        let seconds = date.days_since_epoch() * 86_400 + day_seconds;
+        Some(Self(seconds.checked_mul(1_000_000_000)? + fraction_nanos))
+    }
+
+    /// The UTC calendar day this instant falls on.
+    pub fn utc_date(self) -> UtcDate {
+        UtcDate::from_days_since_epoch(self.0.div_euclid(86_400 * 1_000_000_000))
+    }
+
     /// The absolute difference between two timestamps, in nanoseconds.
     fn abs_diff_nanos(self, other: UtcTimestamp) -> u64 {
         self.0.abs_diff(other.0)
+    }
+}
+
+/// The trailing zone designator of an RFC 3339 time: `Z`, `+HH:MM` or `-HH:MM`.
+/// Returns the clock text and the offset in seconds to subtract to reach UTC.
+fn split_offset(rest: &str) -> Option<(&str, i64)> {
+    if let Some(clock) = rest.strip_suffix('Z').or_else(|| rest.strip_suffix('z')) {
+        return Some((clock, 0));
+    }
+    let sign_at = rest.rfind(['+', '-'])?;
+    let (clock, offset) = rest.split_at(sign_at);
+    let (sign, hhmm) = offset.split_at(1);
+    let (hours, minutes) = hhmm.split_once(':')?;
+    let seconds = hours.parse::<i64>().ok()? * 3_600 + minutes.parse::<i64>().ok()? * 60;
+    Some((clock, if sign == "-" { -seconds } else { seconds }))
+}
+
+/// Fractional seconds as nanoseconds: up to nine digits, the rest truncated.
+fn fraction_to_nanos(fraction: &str) -> Option<i64> {
+    if fraction.is_empty() || !fraction.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let digits: String = fraction.chars().take(9).collect();
+    let scale = 10i64.pow(9 - digits.len() as u32);
+    Some(digits.parse::<i64>().ok()? * scale)
+}
+
+/// A calendar day in UTC. The unit reports group by; it carries no clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct UtcDate {
+    year: i64,
+    month: u32,
+    day: u32,
+}
+
+impl UtcDate {
+    /// A date from `YYYY-MM-DD`. Rejects an impossible month or day rather than
+    /// normalising it.
+    pub fn parse(text: &str) -> Option<Self> {
+        let mut parts = text.splitn(3, '-');
+        let year: i64 = parts.next()?.parse().ok()?;
+        let month: u32 = parts.next()?.parse().ok()?;
+        let day: u32 = parts.next()?.parse().ok()?;
+        if !(1..=12).contains(&month) || day == 0 || day > days_in_month(year, month) {
+            return None;
+        }
+        Some(Self { year, month, day })
+    }
+
+    /// The `YYYY-MM-DD` form. A date is a label, not a quantity, so the text is
+    /// produced here rather than through a rendering helper.
+    pub fn iso(self) -> String {
+        format!("{:04}-{:02}-{:02}", self.year, self.month, self.day)
+    }
+
+    /// Midnight at the start of this day.
+    pub fn start(self) -> UtcTimestamp {
+        UtcTimestamp::from_unix_nanos(self.days_since_epoch() * 86_400 * 1_000_000_000)
+    }
+
+    /// The day after this one, across month and year boundaries.
+    pub fn next(self) -> Self {
+        Self::from_days_since_epoch(self.days_since_epoch() + 1)
+    }
+
+    /// This day plus `days` days.
+    pub fn plus_days(self, days: i64) -> Self {
+        Self::from_days_since_epoch(self.days_since_epoch() + days)
+    }
+
+    /// Days since 1970-01-01, negative before it (Howard Hinnant's civil algorithm).
+    fn days_since_epoch(self) -> i64 {
+        let year = if self.month <= 2 {
+            self.year - 1
+        } else {
+            self.year
+        };
+        let era = year.div_euclid(400);
+        let year_of_era = year - era * 400;
+        let month_from_march = i64::from((self.month + 9) % 12);
+        let day_of_year = (153 * month_from_march + 2) / 5 + i64::from(self.day) - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        era * 146_097 + day_of_era - 719_468
+    }
+
+    fn from_days_since_epoch(days: i64) -> Self {
+        let shifted = days + 719_468;
+        let era = shifted.div_euclid(146_097);
+        let day_of_era = shifted - era * 146_097;
+        let year_of_era =
+            (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+        let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+        let month_from_march = (5 * day_of_year + 2) / 153;
+        let day = (day_of_year - (153 * month_from_march + 2) / 5 + 1) as u32;
+        let month = if month_from_march < 10 {
+            month_from_march + 3
+        } else {
+            month_from_march - 9
+        } as u32;
+        let year = year_of_era + era * 400 + i64::from(month <= 2);
+        Self { year, month, day }
+    }
+}
+
+fn days_in_month(year: i64, month: u32) -> u32 {
+    let leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => 0,
     }
 }
 
@@ -552,5 +694,80 @@ mod tests {
     fn monotonic_duration_from_millis_constructs_correct_nanos() {
         let dur = MonotonicDuration::from_millis(250);
         assert_eq!(dur.as_nanos(), 250_000_000);
+    }
+}
+
+#[cfg(test)]
+mod calendar_tests {
+    use super::*;
+
+    #[test]
+    fn rfc3339_with_fraction_and_z_parses_to_utc_nanos() {
+        let parsed = UtcTimestamp::parse_rfc3339("2026-08-30T14:26:29.342Z").unwrap();
+        assert_eq!(parsed.unix_nanos(), 1_788_099_989_342_000_000);
+    }
+
+    #[test]
+    fn rfc3339_with_an_explicit_offset_is_shifted_to_utc() {
+        let zulu = UtcTimestamp::parse_rfc3339("2026-08-30T11:26:29Z").unwrap();
+        let minus_three = UtcTimestamp::parse_rfc3339("2026-08-30T08:26:29-03:00").unwrap();
+        let plus_zero = UtcTimestamp::parse_rfc3339("2026-08-30T11:26:29+00:00").unwrap();
+        assert_eq!(zulu, minus_three);
+        assert_eq!(zulu, plus_zero);
+    }
+
+    /// The planted negative: a date-only string, an impossible day and a missing
+    /// zone are all refused rather than guessed.
+    #[test]
+    fn unreadable_timestamps_are_none_not_guessed() {
+        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30"), None);
+        assert_eq!(UtcTimestamp::parse_rfc3339("2026-02-30T00:00:00Z"), None);
+        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30T14:26:29"), None);
+        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30T24:00:00Z"), None);
+    }
+
+    #[test]
+    fn a_day_boundary_separates_the_last_and_first_nanosecond() {
+        let last = UtcTimestamp::parse_rfc3339("2026-08-30T23:59:59.999999999Z").unwrap();
+        let first = UtcTimestamp::parse_rfc3339("2026-08-31T00:00:00Z").unwrap();
+        assert_eq!(last.utc_date().iso(), "2026-08-30");
+        assert_eq!(first.utc_date().iso(), "2026-08-31");
+        assert_eq!(
+            UtcDate::parse("2026-08-30").unwrap().next().iso(),
+            "2026-08-31"
+        );
+        assert_eq!(
+            UtcDate::parse("2026-12-31").unwrap().next().iso(),
+            "2027-01-01"
+        );
+        assert_eq!(
+            UtcDate::parse("2028-02-28").unwrap().next().iso(),
+            "2028-02-29"
+        );
+    }
+
+    #[test]
+    fn dates_round_trip_through_days_since_epoch() {
+        for text in [
+            "1970-01-01",
+            "1999-12-31",
+            "2000-02-29",
+            "2026-08-30",
+            "2100-03-01",
+        ] {
+            let date = UtcDate::parse(text).unwrap();
+            assert_eq!(date.start().utc_date(), date, "{text}");
+            assert_eq!(date.iso(), text);
+        }
+        assert_eq!(
+            UtcDate::parse("1970-01-01").unwrap().start().unix_nanos(),
+            0
+        );
+    }
+
+    #[test]
+    fn a_pre_epoch_instant_still_lands_on_its_calendar_day() {
+        let before = UtcTimestamp::from_unix_nanos(-1);
+        assert_eq!(before.utc_date().iso(), "1969-12-31");
     }
 }

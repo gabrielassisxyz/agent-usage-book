@@ -10,6 +10,8 @@
 
 use std::collections::BTreeMap;
 
+use crate::domain::ids::SessionId;
+use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::UsageVector;
 use crate::evidence::{EstimatorId, Provenance};
 
@@ -143,6 +145,18 @@ pub enum QuarantineClass {
     UnsupportedInputFormat,
 }
 
+impl QuarantineClass {
+    /// The stable name a report prints for this class.
+    pub fn name(self) -> &'static str {
+        match self {
+            QuarantineClass::MissingRequiredField => "missing_required_field",
+            QuarantineClass::WrongFieldType => "wrong_field_type",
+            QuarantineClass::TruncatedStructure => "truncated_structure",
+            QuarantineClass::UnsupportedInputFormat => "unsupported_input_format",
+        }
+    }
+}
+
 /// A source record that could not be normalized.
 ///
 /// Emitted rather than dropped: a silently skipped record is an undercount, and an
@@ -180,14 +194,28 @@ impl QuarantineRecord {
     }
 }
 
+/// The provenance entry prefix that marks a stable, source-provided event identifier.
+///
+/// The dedup framework treats an entry with this prefix as strong identity rather
+/// than a heuristic fingerprint, so the prefix is defined once, here, and every
+/// parser that passes a native identifier through writes it under this prefix.
+pub const STRONG_IDENTITY_PREFIX: &str = "event-id:";
+
 /// A normalized usage event: a usage vector, its evidence classification, the source
-/// provenance, and the parser version that produced it.
+/// provenance, and the parser version that produced it, plus the record timestamp
+/// and the session the source attributes it to where the source writes them.
+///
+/// The timestamp and the session are optional because a source may omit them, and
+/// an absent value must stay absent: a report that cannot place an event in a day
+/// counts it as undated rather than inventing a day for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedUsageEvent {
     usage: UsageVector,
     classification: EvidenceClassification,
     provenance: Provenance,
     parser_version: ParserVersion,
+    occurred_at: Option<UtcTimestamp>,
+    session: Option<SessionId>,
 }
 
 impl NormalizedUsageEvent {
@@ -202,7 +230,37 @@ impl NormalizedUsageEvent {
             classification,
             provenance,
             parser_version,
+            occurred_at: None,
+            session: None,
         }
+    }
+
+    /// The same event carrying the record's own timestamp.
+    pub fn with_occurred_at(mut self, occurred_at: UtcTimestamp) -> Self {
+        self.occurred_at = Some(occurred_at);
+        self
+    }
+
+    /// The same event attributed to the session its source names.
+    pub fn with_session(mut self, session: SessionId) -> Self {
+        self.session = Some(session);
+        self
+    }
+
+    pub fn occurred_at(&self) -> Option<UtcTimestamp> {
+        self.occurred_at
+    }
+
+    pub fn session(&self) -> Option<&SessionId> {
+        self.session.as_ref()
+    }
+
+    /// The source-provided stable identifier, when the source wrote one.
+    pub fn strong_identity(&self) -> Option<&str> {
+        self.provenance
+            .sources()
+            .iter()
+            .find_map(|source| source.strip_prefix(STRONG_IDENTITY_PREFIX))
     }
 
     pub fn usage(&self) -> &UsageVector {

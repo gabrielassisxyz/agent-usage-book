@@ -21,6 +21,16 @@
 //! figure. This parser takes the last `token_count` record per file, which is
 //! what the legacy tooling already does.
 //!
+//! A key inside the usage object that no parser recognises is an unknown token
+//! component only when its value is a non-negative integer. The real sources
+//! write strings, objects and arrays beside the counts (`service_tier`,
+//! `server_tool_use`, `iterations`, a nested `cost`), and none of those is a count:
+//! they are ignored, while a known key with a wrong type still quarantines.
+//!
+//! Every source writes a record timestamp and a session identifier, and both are
+//! passed through on the event, because a report that groups by day or by session
+//! has nothing else to group on.
+//!
 //! May not depend on:
 //! - calibration, cost models, rate cards, task history, or meter observations
 
@@ -28,6 +38,8 @@ use std::collections::BTreeMap;
 
 use serde_json::Value;
 
+use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
+use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenCount,
     TokenKind, UsageVector,
@@ -36,13 +48,14 @@ use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::transcripts::parser::{
     EvidenceClassification, FixtureCoverage, FixtureShape, InputFormatVersion,
     NormalizedUsageEvent, ParseOutput, ParserAdapter, ParserVersion, QuarantineClass,
-    QuarantineRecord, SourceLocation,
+    QuarantineRecord, STRONG_IDENTITY_PREFIX, SourceLocation,
 };
 
-/// The provenance prefix for a stable native event identifier. The dedup
-/// framework treats a provenance entry with this prefix as strong identity
-/// rather than a heuristic fingerprint.
-const EVENT_ID_PREFIX: &str = "event-id:";
+/// The source namespaces the three parsers attribute sessions under. One
+/// definition each, so a session join never sees two spellings of one source.
+pub const CLAUDE_CODE_NAMESPACE: &str = "claude-code";
+pub const CODEX_NAMESPACE: &str = "codex";
+pub const PI_NAMESPACE: &str = "pi";
 
 /// The fixture directory for this parser, relative to the crate root.
 pub const FIXTURE_DIR: &str = "tests/fixtures/transcripts/native";
@@ -83,14 +96,27 @@ fn count_value(value: &Value) -> Result<u64, QuarantineClass> {
     }
 }
 
+/// An unrecognised key's value as a count, when it is one. A string, object,
+/// array, boolean, null or non-integer number under a key no parser knows is
+/// not a token component and is ignored; only a non-negative integer survives
+/// into the unknown map.
+fn unknown_count(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(n) => n.as_u64(),
+        Value::Null | Value::Bool(_) | Value::String(_) | Value::Array(_) | Value::Object(_) => {
+            None
+        }
+    }
+}
+
 /// Extracts the four known kinds and the unknown components from a usage
 /// object.
 ///
 /// `known` maps field names to token kinds; `ignored` names fields that are
 /// recognised but are not token kinds (a nested breakdown or a derived total);
 /// `required` names fields that must be present, whose absence is a missing
-/// field rather than a zero. Any other numeric field is an unknown usage
-/// component and survives in the unknown map under its reported key.
+/// field rather than a zero. Any other non-negative integer field is an unknown
+/// usage component and survives in the unknown map under its reported key.
 fn extract_usage(
     usage: &serde_json::Map<String, Value>,
     known: &[(&str, TokenKind)],
@@ -112,7 +138,9 @@ fn extract_usage(
             Some(TokenKind::CacheWrite) => cache_write = count_value(value)?,
             None if ignored.contains(&key.as_str()) => {}
             None => {
-                unknown.insert(key.clone(), TokenCount::new(count_value(value)?));
+                if let Some(count) = unknown_count(value) {
+                    unknown.insert(key.clone(), TokenCount::new(count));
+                }
             }
         }
     }
@@ -126,23 +154,54 @@ fn extract_usage(
     Ok((input, output, cache_read, cache_write, unknown))
 }
 
+/// The record-level context every source writes beside its counts: the record
+/// timestamp, the session the record belongs to, and the stable event identifier
+/// where the source has one. Each is optional so an absent value stays absent.
+struct RecordContext<'a> {
+    event_id: Option<&'a str>,
+    occurred_at: Option<UtcTimestamp>,
+    session: Option<SessionId>,
+}
+
 /// Builds a measured event from the four kinds, unknown components, the source
-/// file, and an optional stable event identifier.
+/// file, and the record context.
 fn event(
     usage: UsageVector,
     file: &str,
-    event_id: Option<&str>,
+    context: RecordContext<'_>,
     parser_version: ParserVersion,
 ) -> NormalizedUsageEvent {
     let mut sources = vec![file.to_string()];
-    if let Some(id) = event_id {
-        sources.push(format!("{EVENT_ID_PREFIX}{id}"));
+    if let Some(id) = context.event_id {
+        sources.push(format!("{STRONG_IDENTITY_PREFIX}{id}"));
     }
-    NormalizedUsageEvent::new(
+    let mut event = NormalizedUsageEvent::new(
         usage,
         EvidenceClassification::Reported,
         Provenance::new(sources),
         parser_version,
+    );
+    if let Some(occurred_at) = context.occurred_at {
+        event = event.with_occurred_at(occurred_at);
+    }
+    if let Some(session) = context.session {
+        event = event.with_session(session);
+    }
+    event
+}
+
+/// A record's top-level `timestamp`, parsed when it is an RFC 3339 string.
+fn record_timestamp(value: &Value) -> Option<UtcTimestamp> {
+    value
+        .get("timestamp")
+        .and_then(Value::as_str)
+        .and_then(UtcTimestamp::parse_rfc3339)
+}
+
+fn session_id(namespace: &str, native: &str) -> SessionId {
+    SessionId::new(
+        SourceNamespace::new(namespace),
+        NativeSessionId::new(native),
     )
 }
 
@@ -219,11 +278,18 @@ fn parse_claude_line(
     if !usage.contains_key("cache_creation_input_tokens") {
         cache_write = claude_cache_write_fallback(usage)?;
     }
-    let event_id = message.get("id").and_then(Value::as_str);
+    let context = RecordContext {
+        event_id: message.get("id").and_then(Value::as_str),
+        occurred_at: record_timestamp(&value),
+        session: value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .map(|native| session_id(CLAUDE_CODE_NAMESPACE, native)),
+    };
     Ok(Some(event(
         measured_usage(input, output, cache_read, cache_write, unknown),
         location.file(),
-        event_id,
+        context,
         parser_version,
     )))
 }
@@ -250,8 +316,11 @@ fn claude_cache_write_fallback(
 /// Reads `payload.info.total_token_usage.{input_tokens, cached_input_tokens,
 /// cache_write_input_tokens, output_tokens}` on records of payload type
 /// `token_count`. Codex reports cumulatively, so this parser emits one event:
-/// the last `token_count` record in the file. Codex provides no stable
-/// per-event identifier, so no strong dedup identity is reported.
+/// the last `token_count` record in the file, stamped with that record's
+/// timestamp and attributed to the session the file's `session_meta` header
+/// names. A `token_count` whose `info` is null carries only a rate-limit update
+/// and is neither an event nor a quarantine. Codex provides no stable per-event
+/// identifier, so no strong dedup identity is reported.
 pub struct CodexParser;
 
 const CODEX_KNOWN: [(&str, TokenKind); 4] = [
@@ -272,7 +341,8 @@ impl ParserAdapter for CodexParser {
     }
 
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
-        let mut last: Option<UsageCounts> = None;
+        let mut last: Option<(UsageCounts, Option<UtcTimestamp>)> = None;
+        let mut session: Option<SessionId> = None;
         let mut quarantined = Vec::new();
         for (index, line) in input.lines().enumerate() {
             let line = line.trim();
@@ -282,8 +352,9 @@ impl ParserAdapter for CodexParser {
             let record_location =
                 SourceLocation::new(location.file().to_string(), location.line() + index as u64);
             match parse_codex_line(line) {
-                Ok(Some(usage)) => last = Some(usage),
-                Ok(None) => {}
+                Ok(CodexLine::Usage(usage, occurred_at)) => last = Some((usage, occurred_at)),
+                Ok(CodexLine::Session(id)) => session = Some(id),
+                Ok(CodexLine::Nothing) => {}
                 Err(class) => quarantined.push(QuarantineRecord::new(
                     record_location,
                     self.parser_version(),
@@ -292,45 +363,72 @@ impl ParserAdapter for CodexParser {
             }
         }
         let events = last
-            .map(|(input, output, cache_read, cache_write, unknown)| {
-                event(
-                    measured_usage(input, output, cache_read, cache_write, unknown),
-                    location.file(),
-                    None,
-                    self.parser_version(),
-                )
-            })
+            .map(
+                |((input, output, cache_read, cache_write, unknown), occurred_at)| {
+                    event(
+                        measured_usage(input, output, cache_read, cache_write, unknown),
+                        location.file(),
+                        RecordContext {
+                            event_id: None,
+                            occurred_at,
+                            session,
+                        },
+                        self.parser_version(),
+                    )
+                },
+            )
             .into_iter()
             .collect();
         ParseOutput::new(events, quarantined)
     }
 }
 
-fn parse_codex_line(line: &str) -> Result<Option<UsageCounts>, QuarantineClass> {
+/// What one Codex line contributes: a cumulative usage record, the session
+/// header, or nothing this parser reads.
+enum CodexLine {
+    Usage(UsageCounts, Option<UtcTimestamp>),
+    Session(SessionId),
+    Nothing,
+}
+
+fn parse_codex_line(line: &str) -> Result<CodexLine, QuarantineClass> {
     let value: Value =
         serde_json::from_str(line).map_err(|_| QuarantineClass::TruncatedStructure)?;
     let Some(payload) = value.get("payload").and_then(Value::as_object) else {
-        return Ok(None);
+        return Ok(CodexLine::Nothing);
     };
-    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
-        return Ok(None);
+    if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+        return Ok(payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|native| CodexLine::Session(session_id(CODEX_NAMESPACE, native)))
+            .unwrap_or(CodexLine::Nothing));
     }
-    let Some(usage) = payload
-        .get("info")
-        .and_then(|info| info.get("total_token_usage"))
-        .and_then(Value::as_object)
-    else {
-        return Err(QuarantineClass::MissingRequiredField);
+    if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        return Ok(CodexLine::Nothing);
+    }
+    let usage = match payload.get("info") {
+        // A rate-limit-only update: Codex writes `info: null` when nothing was
+        // consumed, and a record with no usage is not a malformed record.
+        None | Some(Value::Null) => return Ok(CodexLine::Nothing),
+        Some(info) => info
+            .get("total_token_usage")
+            .and_then(Value::as_object)
+            .ok_or(QuarantineClass::MissingRequiredField)?,
     };
-    extract_usage(usage, &CODEX_KNOWN, &CODEX_IGNORED, &["input_tokens"]).map(Some)
+    let counts = extract_usage(usage, &CODEX_KNOWN, &CODEX_IGNORED, &["input_tokens"])?;
+    Ok(CodexLine::Usage(counts, record_timestamp(&value)))
 }
 
 /// The pi transcript parser.
 ///
-/// Reads `message.usage.{input, output, cacheRead, cacheWrite}` and passes
-/// `message.id` through as the stable event identifier. `reasoning` is a token
-/// class outside the four known kinds and survives in the unknown map; the
-/// `cost` object is not usage and is ignored.
+/// Reads `message.usage.{input, output, cacheRead, cacheWrite}` and passes the
+/// record's stable identifier through: pi writes it at the top level as `id`,
+/// and `message.id` is honoured first where a record carries one. The record's
+/// top-level `timestamp` is the event time, and the session comes from the
+/// `{"type":"session","id":...}` header line. `reasoning` is a token class
+/// outside the four known kinds and survives in the unknown map; the `cost`
+/// object nested inside `usage` is money, not usage, and is ignored.
 pub struct PiParser;
 
 const PI_KNOWN: [(&str, TokenKind); 4] = [
@@ -353,6 +451,7 @@ impl ParserAdapter for PiParser {
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
         let mut events = Vec::new();
         let mut quarantined = Vec::new();
+        let mut session: Option<SessionId> = None;
         for (index, line) in input.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
@@ -360,9 +459,15 @@ impl ParserAdapter for PiParser {
             }
             let record_location =
                 SourceLocation::new(location.file().to_string(), location.line() + index as u64);
-            match parse_pi_line(line, &record_location, self.parser_version()) {
-                Ok(Some(event)) => events.push(event),
-                Ok(None) => {}
+            match parse_pi_line(
+                line,
+                &record_location,
+                session.clone(),
+                self.parser_version(),
+            ) {
+                Ok(PiLine::Usage(event)) => events.push(*event),
+                Ok(PiLine::Session(id)) => session = Some(id),
+                Ok(PiLine::Nothing) => {}
                 Err(class) => quarantined.push(QuarantineRecord::new(
                     record_location,
                     self.parser_version(),
@@ -374,28 +479,51 @@ impl ParserAdapter for PiParser {
     }
 }
 
+/// What one pi line contributes: a usage event, the session header, or nothing
+/// this parser reads.
+enum PiLine {
+    Usage(Box<NormalizedUsageEvent>),
+    Session(SessionId),
+    Nothing,
+}
+
 fn parse_pi_line(
     line: &str,
     location: &SourceLocation,
+    session: Option<SessionId>,
     parser_version: ParserVersion,
-) -> Result<Option<NormalizedUsageEvent>, QuarantineClass> {
+) -> Result<PiLine, QuarantineClass> {
     let value: Value =
         serde_json::from_str(line).map_err(|_| QuarantineClass::TruncatedStructure)?;
+    if value.get("type").and_then(Value::as_str) == Some("session") {
+        return Ok(value
+            .get("id")
+            .and_then(Value::as_str)
+            .map(|native| PiLine::Session(session_id(PI_NAMESPACE, native)))
+            .unwrap_or(PiLine::Nothing));
+    }
     let Some(message) = value.get("message").and_then(Value::as_object) else {
-        return Ok(None);
+        return Ok(PiLine::Nothing);
     };
     let Some(usage) = message.get("usage").and_then(Value::as_object) else {
-        return Ok(None);
+        return Ok(PiLine::Nothing);
     };
     let (input, output, cache_read, cache_write, unknown) =
         extract_usage(usage, &PI_KNOWN, &PI_IGNORED, &["input"])?;
-    let event_id = message.get("id").and_then(Value::as_str);
-    Ok(Some(event(
+    let context = RecordContext {
+        event_id: message
+            .get("id")
+            .and_then(Value::as_str)
+            .or_else(|| value.get("id").and_then(Value::as_str)),
+        occurred_at: record_timestamp(&value),
+        session,
+    };
+    Ok(PiLine::Usage(Box::new(event(
         measured_usage(input, output, cache_read, cache_write, unknown),
         location.file(),
-        event_id,
+        context,
         parser_version,
-    )))
+    ))))
 }
 
 /// The declared fixture coverage: one entry per catalog shape, so a shape added
@@ -615,7 +743,10 @@ mod tests {
     /// quarantine counts.
     #[test]
     fn each_fixture_parses_to_its_golden_output() {
-        let cases: [(&str, &dyn ParserAdapter, usize, usize); 8] = [
+        let cases: [(&str, &dyn ParserAdapter, usize, usize); 11] = [
+            ("claude-real-shape.jsonl", &ClaudeCodeParser, 3, 0),
+            ("codex-real-shape.jsonl", &CodexParser, 1, 0),
+            ("pi-real-shape.jsonl", &PiParser, 2, 0),
             ("claude-simple-session.jsonl", &ClaudeCodeParser, 2, 0),
             ("claude-nested-subagent.jsonl", &ClaudeCodeParser, 1, 0),
             ("codex-truncated.jsonl", &CodexParser, 1, 1),
@@ -700,7 +831,7 @@ mod tests {
                 .provenance()
                 .sources()
                 .iter()
-                .any(|s| s.starts_with(EVENT_ID_PREFIX)),
+                .any(|s| s.starts_with(STRONG_IDENTITY_PREFIX)),
             "Codex provides no stable event identifier, so no strong identity is reported"
         );
     }
@@ -761,6 +892,147 @@ mod tests {
             Some(5),
             "reasoning must survive as an unknown component"
         );
+    }
+
+    /// The real Claude Code shape: strings, objects and an array inside `usage`
+    /// beside the four counts. The counts survive, the non-counts are ignored,
+    /// and the record's timestamp and session are carried on the event.
+    #[test]
+    fn claude_real_shape_keeps_the_counts_and_ignores_non_count_fields() {
+        let parser = ClaudeCodeParser;
+        let output = parser.parse(
+            &read_fixture("claude-real-shape.jsonl"),
+            &SourceLocation::new("claude-real-shape.jsonl", 1),
+        );
+        assert!(
+            output.quarantined().is_empty(),
+            "{:?}",
+            output.quarantined()
+        );
+        let first = &output.events()[0];
+        let known = first.usage().known();
+        assert_eq!(known.input().value(), 2);
+        assert_eq!(known.cache_write().value(), 30_011);
+        assert_eq!(known.cache_read().value(), 26_503);
+        assert_eq!(known.output().value(), 913);
+        assert!(
+            first.usage().unknown().is_empty(),
+            "no string or object is a token component: {:?}",
+            first.usage().unknown()
+        );
+        assert_eq!(first.strong_identity(), Some("msg_real_0001"));
+        assert_eq!(
+            first.occurred_at(),
+            UtcTimestamp::parse_rfc3339("2026-08-25T17:43:19.599Z")
+        );
+        assert_eq!(
+            first.session(),
+            Some(&session_id(CLAUDE_CODE_NAMESPACE, "session-real-0001"))
+        );
+    }
+
+    /// The planted negative pair: an unrecognised key with an integer value is an
+    /// unknown component; the same key with a string value is not a component
+    /// and is ignored, while a known key with a string value still quarantines.
+    #[test]
+    fn only_integer_values_under_unknown_keys_become_components() {
+        let parser = ClaudeCodeParser;
+        let integer = r#"{"message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5,"future_tokens":99}}}"#;
+        let string = r#"{"message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5,"future_tokens":"99"}}}"#;
+        let known_wrong =
+            r#"{"message":{"id":"m1","usage":{"input_tokens":"10","output_tokens":5}}}"#;
+        let with_integer = parser.parse(integer, &location());
+        assert_eq!(
+            with_integer.events()[0]
+                .usage()
+                .unknown()
+                .get("future_tokens")
+                .map(|c| c.value()),
+            Some(99)
+        );
+        let with_string = parser.parse(string, &location());
+        assert_eq!(with_string.events().len(), 1);
+        assert!(with_string.events()[0].usage().unknown().is_empty());
+        let wrong = parser.parse(known_wrong, &location());
+        assert!(wrong.events().is_empty());
+        assert_eq!(
+            wrong.quarantined()[0].class(),
+            QuarantineClass::WrongFieldType
+        );
+    }
+
+    /// The real pi shape: the identifier and the timestamp at the top level, a
+    /// `cost` object nested inside `usage`, and the session from the header line.
+    #[test]
+    fn pi_real_shape_takes_identity_time_and_session_from_where_pi_writes_them() {
+        let parser = PiParser;
+        let output = parser.parse(
+            &read_fixture("pi-real-shape.jsonl"),
+            &SourceLocation::new("pi-real-shape.jsonl", 1),
+        );
+        assert!(
+            output.quarantined().is_empty(),
+            "{:?}",
+            output.quarantined()
+        );
+        assert_eq!(output.events().len(), 2);
+        let first = &output.events()[0];
+        assert_eq!(first.strong_identity(), Some("rec-real-0001"));
+        assert_eq!(first.usage().known().input().value(), 19_221);
+        assert_eq!(
+            first.usage().unknown().get("reasoning").map(|c| c.value()),
+            Some(202)
+        );
+        assert_eq!(
+            first.occurred_at(),
+            UtcTimestamp::parse_rfc3339("2026-08-25T23:33:39.627Z")
+        );
+        assert_eq!(
+            first.session(),
+            Some(&session_id(PI_NAMESPACE, "session-real-pi-0001"))
+        );
+        // `message.id` still wins where a record carries one.
+        let explicit = parser.parse(
+            r#"{"id":"top","message":{"id":"inner","usage":{"input":1,"output":1}}}"#,
+            &location(),
+        );
+        assert_eq!(explicit.events()[0].strong_identity(), Some("inner"));
+    }
+
+    /// The real Codex shape: a `session_meta` header, a rate-limit-only
+    /// `token_count` with null info, then cumulative records. One event, no
+    /// quarantine, the last record's timestamp, the header's session.
+    #[test]
+    fn codex_real_shape_skips_null_info_and_keeps_the_last_record() {
+        let parser = CodexParser;
+        let output = parser.parse(
+            &read_fixture("codex-real-shape.jsonl"),
+            &SourceLocation::new("codex-real-shape.jsonl", 1),
+        );
+        assert!(
+            output.quarantined().is_empty(),
+            "{:?}",
+            output.quarantined()
+        );
+        assert_eq!(output.events().len(), 1);
+        let only = &output.events()[0];
+        assert_eq!(only.usage().known().input().value(), 34_830);
+        assert_eq!(only.usage().known().cache_read().value(), 19_200);
+        assert_eq!(
+            only.occurred_at(),
+            UtcTimestamp::parse_rfc3339("2026-08-25T14:33:10.001Z")
+        );
+        assert_eq!(
+            only.session(),
+            Some(&session_id(CODEX_NAMESPACE, "session-real-codex-0001"))
+        );
+        // A file holding only the null-info record is neither an event nor a quarantine.
+        let null_only = parser.parse(
+            r#"{"timestamp":"2026-08-25T14:31:33.849Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{}}}"#,
+            &location(),
+        );
+        assert!(null_only.events().is_empty());
+        assert!(null_only.quarantined().is_empty());
     }
 
     /// No fixture contains a credential pattern, a personal identifier, or an
