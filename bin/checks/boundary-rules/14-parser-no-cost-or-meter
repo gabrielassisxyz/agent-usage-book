@@ -13,17 +13,14 @@ script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
+source "$script_dir/lib/module-files.sh"
+
 sources=()
-if [ -f "src/transcripts.rs" ]; then
-    sources+=(src/transcripts.rs)
-fi
-if [ -d "src/transcripts" ]; then
-    while IFS= read -r file; do
-        sources+=("$file")
-    done < <(find src/transcripts -name '*.rs' -type f | sort)
-fi
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files transcripts)
+
 if [ "${#sources[@]}" -eq 0 ]; then
-    echo "transcript parsers must not reach cost models: no src/transcripts.rs or src/transcripts/ found" >&2
     exit 2
 fi
 

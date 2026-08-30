@@ -3,20 +3,26 @@
 # Design: PLAN.md section 8.2 ("meter writing SQLite directly") and section 9
 #   ("Provider adapters do not know SQLite").
 # Detection: any reference to a SQLite crate (rusqlite, libsqlite3-sys, sqlx, diesel,
-#   sqlite) in the meter module source.
+#   sqlite) in the meter module source, wherever it lives: the flat file when it is a file,
+#   every .rs under the directory when it is a directory.
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
-source_file="src/meter.rs"
-if [ ! -r "$source_file" ]; then
-    echo "meter must not write SQLite directly: cannot read $source_file" >&2
+source "$script_dir/lib/module-files.sh"
+
+sources=()
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files meter)
+
+if [ "${#sources[@]}" -eq 0 ]; then
     exit 2
 fi
 
-matches="$(grep -nHE '(rusqlite|libsqlite3-sys|sqlx|diesel|sqlite)::' "$source_file" 2>/dev/null || true)"
+matches="$(grep -nHE '(rusqlite|libsqlite3-sys|sqlx|diesel|sqlite)::' "${sources[@]}" 2>/dev/null || true)"
 if [ -n "$matches" ]; then
     echo "meter references a SQLite crate directly:" >&2
     printf '%s\n' "$matches" >&2

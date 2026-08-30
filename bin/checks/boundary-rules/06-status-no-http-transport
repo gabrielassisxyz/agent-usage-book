@@ -3,21 +3,30 @@
 # Design: PLAN.md section 8.2 ("status referencing the HTTP transport layer"), section
 #   16.2 ("aub status must not perform HTTP"), and section 34.31.
 # Detection: any reference to an HTTP client crate (ureq, reqwest, http, hyper, curl,
-#   isahc, attohttpc) in the projection module source. projection is the status
-#   projection the status workflow reads, so this is where the transport could leak in.
+#   isahc, attohttpc) in the status path source files (projection module and cli module).
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
-source_file="src/projection.rs"
-if [ ! -r "$source_file" ]; then
-    echo "status must not reference the HTTP transport layer: cannot read $source_file" >&2
+source "$script_dir/lib/module-files.sh"
+
+sources=()
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files projection)
+
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files cli)
+
+if [ "${#sources[@]}" -eq 0 ]; then
+    echo "status must not reference the HTTP transport layer: no status source files found" >&2
     exit 2
 fi
 
-matches="$(grep -nHE '(ureq|reqwest|http|hyper|curl|isahc|attohttpc)::' "$source_file" 2>/dev/null || true)"
+matches="$(grep -nHE '(ureq|reqwest|http|hyper|curl|isahc|attohttpc)::' "${sources[@]}" 2>/dev/null || true)"
 if [ -n "$matches" ]; then
     echo "status references the HTTP transport layer:" >&2
     printf '%s\n' "$matches" >&2

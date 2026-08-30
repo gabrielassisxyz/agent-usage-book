@@ -4,30 +4,29 @@
 #   section 16.2 (the status contract: "schema migrations" and "lock waiting" are
 #   on the must-not list), and bead aub-sth.4.
 # Detection: any reference to the store migration module (crate::store::migrate)
-#   in the projection module source, wherever it lives: the flat file when it is
-#   a file, every .rs under the directory when it is a directory. projection is
-#   the status projection the status workflow reads, so this is where a migration
-#   could leak into the status path. The status command itself never opens
-#   SQLite (PLAN.md section 16.2), and the full structural claim that status
-#   reaches neither network nor store is owned by aub-me5.7; this rule guards the
-#   projection side.
+#   in the status path source. The status command is implemented in src/cli.rs
+#   (chosen because that is where `fn status` and the CLI status execution workflow live)
+#   and the projection module in src/projection.rs / src/projection/, so those are the files
+#   checked for migrations.
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
+source "$script_dir/lib/module-files.sh"
+
 sources=()
-if [ -f "src/projection.rs" ]; then
-    sources+=(src/projection.rs)
-fi
-if [ -d "src/projection" ]; then
-    while IFS= read -r file; do
-        sources+=("$file")
-    done < <(find src/projection -name '*.rs' -type f | sort)
-fi
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files projection)
+
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files cli)
+
 if [ "${#sources[@]}" -eq 0 ]; then
-    echo "status must not reference the migration framework: no src/projection.rs or src/projection/ found" >&2
+    echo "status must not reference the migration framework: no status source files found" >&2
     exit 2
 fi
 

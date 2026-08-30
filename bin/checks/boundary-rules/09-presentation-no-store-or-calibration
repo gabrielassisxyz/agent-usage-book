@@ -13,15 +13,14 @@ script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
-if [ -f "src/presentation.rs" ]; then
-    sources=(src/presentation.rs)
-elif [ -d "src/presentation" ]; then
-    sources=()
-    while IFS= read -r file; do
-        sources+=("$file")
-    done < <(find src/presentation -name '*.rs' -type f | sort)
-else
-    echo "presentation must not import store or calibration: no src/presentation.rs or src/presentation/ found" >&2
+source "$script_dir/lib/module-files.sh"
+
+sources=()
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files presentation)
+
+if [ "${#sources[@]}" -eq 0 ]; then
     exit 2
 fi
 

@@ -11,20 +11,33 @@ script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
+source "$script_dir/lib/module-files.sh"
+
 fail=0
-for module in src/*.rs; do
-    case "$module" in
-        src/lib.rs|src/main.rs) continue ;;
+seen=()
+for item in src/*; do
+    name="$(basename "$item" .rs)"
+    case "$name" in
+        lib|main|bin) continue ;;
     esac
 
-    first_nonblank="$(awk 'NF {print; exit}' "$module")"
-    case "$first_nonblank" in
-        '//!'*) ;;
-        *)
-            echo "module $module declares no dependency policy (missing //! header)" >&2
-            fail=1
-            ;;
-    esac
+    # Deduplicate if both src/<name>.rs and src/<name>/ exist
+    if printf '%s\n' "${seen[@]:-}" | grep -qx "$name"; then
+        continue
+    fi
+    seen+=("$name")
+
+    while IFS= read -r module; do
+        [ -n "$module" ] || continue
+        first_nonblank="$(awk 'NF {print; exit}' "$module")"
+        case "$first_nonblank" in
+            '//!'*) ;;
+            *)
+                echo "module $module declares no dependency policy (missing //! header)" >&2
+                fail=1
+                ;;
+        esac
+    done < <(module_files "$name")
 done
 
 [ "$fail" -eq 0 ] || exit 1

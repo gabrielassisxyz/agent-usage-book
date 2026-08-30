@@ -1,20 +1,27 @@
 #!/usr/bin/env bash
 # Boundary: advice must not construct calibration constants.
 # Design: PLAN.md section 8.2 ("advice constructing calibration constants").
-# Detection: any reference to crate::calibration in the advice module source.
+# Detection: any reference to crate::calibration in the advice module source,
+#   wherever it lives: the flat file when it is a file, every .rs under the directory
+#   when it is a directory.
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
-source_file="src/advice.rs"
-if [ ! -r "$source_file" ]; then
-    echo "advice must not construct calibration constants: cannot read $source_file" >&2
+source "$script_dir/lib/module-files.sh"
+
+sources=()
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files advice)
+
+if [ "${#sources[@]}" -eq 0 ]; then
     exit 2
 fi
 
-matches="$(grep -nHE 'crate::calibration([^A-Za-z0-9_]|$)' "$source_file" 2>/dev/null || true)"
+matches="$(grep -nHE 'crate::calibration([^A-Za-z0-9_]|$)' "${sources[@]}" 2>/dev/null || true)"
 if [ -n "$matches" ]; then
     echo "advice constructs calibration constants (crate::calibration):" >&2
     printf '%s\n' "$matches" >&2

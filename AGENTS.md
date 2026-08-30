@@ -527,6 +527,7 @@ holding everything, and do not wait on the file.
 | `Cargo.toml` | one dependency line per bead that needs one |
 | `src/store/migrations/mod.rs` | the migration registry, one `pub mod` line and one `registry()` entry per schema bead. Take the version number as the highest one present plus one, under reservation of this file: `validate_registry()` refuses a gap or a duplicate, and the pane check subset never runs it, so a collision surfaces only at batch-verify |
 | `bin/checks/boundary-rules/` | one numbered executable per rule. The number is fixed in the bead's own text when the bead is written, as the next number after the highest that any bead, open or closed, already fixes; the tracker is the registry and the directory is its projection. "Highest present plus one" at implementation time is not a rule here: it collides with a bead that fixed its number earlier, and there is no single file to reserve that would serialize the two. A rule bead whose text fixes no number is not ready |
+| `bin/checks/boundary-rules/lib/module-files.sh` | the shared module-resolution helper sourced by every boundary rule that inspects module source files |
 
 That list is not closed. **A file is shared when a bead's normal work appends to it rather
 than rewriting it**: a declaration list, an enumeration, a registry, a manifest. Finding one
