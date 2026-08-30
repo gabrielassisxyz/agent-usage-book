@@ -100,20 +100,23 @@ mod tests {
     }
 
     /// One parsed row of the invariants table in `docs/INVARIANTS.md`.
+    #[derive(Debug, Clone, PartialEq, Eq)]
     struct InvariantRow {
         number: usize,
+        invariant: String,
         enforcer: String,
         check: String,
     }
 
-    /// Parses the invariants table out of `docs/INVARIANTS.md`. The table is
-    /// the only Markdown table in the document; its header names the
-    /// `Enforcing module` column, which is what locates it.
+    /// Parses the invariants table out of `docs/INVARIANTS.md`.
     fn parse_invariant_rows(docs: &str) -> Vec<InvariantRow> {
         let lines: Vec<&str> = docs.lines().collect();
         let mut rows = Vec::new();
         let mut i = 0;
-        while i < lines.len() && !lines[i].contains("Enforcing module") {
+        while i < lines.len()
+            && !lines[i].contains("Enforcing path")
+            && !lines[i].contains("Enforcing module")
+        {
             i += 1;
         }
         // Skip the header row and the `|---|` separator row.
@@ -124,60 +127,200 @@ mod tests {
                 break;
             }
             let cells: Vec<&str> = line.split('|').map(|c| c.trim()).collect();
-            // cells = ["", "#", "invariant", "module", "check", ""]
+            // cells = ["", "#", "Invariant", "Enforcing path", "Test or constraint", ""]
             if cells.len() >= 5 {
-                rows.push(InvariantRow {
-                    number: cells[1].parse().unwrap_or(0),
-                    enforcer: cells[3].to_string(),
-                    check: cells[4].to_string(),
-                });
+                if let Ok(num) = cells[1].parse::<usize>() {
+                    rows.push(InvariantRow {
+                        number: num,
+                        invariant: cells[2].to_string(),
+                        enforcer: cells[3].to_string(),
+                        check: cells[4].to_string(),
+                    });
+                }
             }
             i += 1;
         }
         rows
     }
 
-    /// The document carries all 27 invariants, numbered 1..=27 in the same
-    /// order as PLAN.md section 42, so an invariant dropped in transcription
-    /// fails this test.
+    fn normalize_whitespace(s: &str) -> String {
+        s.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    fn extract_plan_invariants(plan_text: &str) -> Vec<String> {
+        let start_marker = "# 42. Important invariants to document in the source tree";
+        let section_start = plan_text
+            .find(start_marker)
+            .expect("PLAN.md section 42 must exist");
+        let after_start = &plan_text[section_start..];
+        let section_end = after_start.find("\n---").unwrap_or(after_start.len());
+        let section = &after_start[..section_end];
+
+        let mut invariants = Vec::new();
+        let lines: Vec<&str> = section.lines().collect();
+        let mut current_item = String::new();
+        let mut current_num = 1;
+
+        for line in lines {
+            let trimmed = line.trim();
+            let prefix = format!("{current_num}.");
+            if trimmed.starts_with(&prefix) {
+                if !current_item.is_empty() {
+                    invariants.push(normalize_whitespace(&current_item));
+                    current_item.clear();
+                }
+                current_num += 1;
+                let text = trimmed.strip_prefix(&prefix).unwrap().trim();
+                current_item.push_str(text);
+            } else if !current_item.is_empty() && !trimmed.is_empty() && !trimmed.starts_with('#') {
+                if trimmed == "These are more important than most implementation choices." {
+                    continue;
+                }
+                current_item.push(' ');
+                current_item.push_str(trimmed);
+            }
+        }
+        if !current_item.is_empty() {
+            invariants.push(normalize_whitespace(&current_item));
+        }
+        invariants
+    }
+
+    fn validate_invariant_row(row: &InvariantRow, base_dir: &str) -> Result<bool, String> {
+        if row.enforcer.starts_with("unenforced") {
+            let parts: Vec<&str> = row.enforcer.split_whitespace().collect();
+            if parts.len() < 2 {
+                return Err(format!(
+                    "invariant {} marked unenforced with no bead id: {:?}",
+                    row.number, row.enforcer
+                ));
+            }
+            let bead_id = parts[1];
+            let issues_path = format!("{base_dir}/.beads/issues.jsonl");
+            let issues_content = fs::read_to_string(&issues_path)
+                .map_err(|e| format!("cannot read .beads/issues.jsonl: {e}"))?;
+            let mut found = false;
+            let mut is_open = false;
+            for line in issues_content.lines() {
+                if line.contains(&format!("\"id\":\"{bead_id}\"")) {
+                    found = true;
+                    if !line.contains("\"status\":\"closed\"") {
+                        is_open = true;
+                    }
+                    break;
+                }
+            }
+            if !found {
+                return Err(format!(
+                    "invariant {} names unenforced bead {bead_id} which does not exist in .beads/issues.jsonl",
+                    row.number
+                ));
+            }
+            if !is_open {
+                return Err(format!(
+                    "invariant {} names unenforced bead {bead_id} which is closed in tracker",
+                    row.number
+                ));
+            }
+            Ok(false) // unenforced
+        } else {
+            let path = format!("{base_dir}/{}", row.enforcer);
+            let file_path = std::path::Path::new(&path);
+            if !file_path.exists() {
+                return Err(format!(
+                    "invariant {} names enforcer path {:?} which does not exist",
+                    row.number, row.enforcer
+                ));
+            }
+            let content = fs::read_to_string(file_path)
+                .map_err(|e| format!("cannot read {:?}: {e}", row.enforcer))?;
+            let test_identifier = row.check.split("::").last().unwrap_or(&row.check).trim();
+            if !content.contains(test_identifier) {
+                return Err(format!(
+                    "invariant {} names check {:?} not found in {:?}",
+                    row.number, test_identifier, row.enforcer
+                ));
+            }
+            Ok(true) // enforced
+        }
+    }
+
+    /// Compares the table's invariant list against docs/PLAN.md section 42.
     #[test]
-    fn invariants_document_lists_all_27_numbered_invariants() {
+    fn invariants_document_matches_plan_section_42() {
         let docs = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/INVARIANTS.md"))
             .expect("docs/INVARIANTS.md must be readable");
+        let plan = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/PLAN.md"))
+            .expect("docs/PLAN.md must be readable");
+
         let rows = parse_invariant_rows(&docs);
+        let plan_invariants = extract_plan_invariants(&plan);
+
         assert_eq!(
             rows.len(),
-            27,
-            "expected 27 invariant rows, found {}",
+            plan_invariants.len(),
+            "expected {} invariant rows from PLAN.md section 42, found {}",
+            plan_invariants.len(),
             rows.len()
         );
+
         for (i, row) in rows.iter().enumerate() {
             assert_eq!(
                 row.number,
                 i + 1,
                 "invariant numbering must be 1..=27 in order"
             );
+            assert_eq!(
+                row.invariant, plan_invariants[i],
+                "invariant {} in docs/INVARIANTS.md does not match PLAN.md section 42",
+                row.number
+            );
         }
     }
 
-    /// Every invariant row names an enforcer (a module plus a test or check)
-    /// or the explicit word `unenforced`. A row with neither fails this test.
+    /// Every invariant row names an existing file path and test/check, or an open bead in the tracker.
+    /// The document's summary counts are kept in sync by this test.
     #[test]
-    fn every_invariant_names_an_enforcer_or_unenforced() {
+    fn every_invariant_names_existing_file_and_test_or_open_tracker_bead() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
         let docs = fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/INVARIANTS.md"))
             .expect("docs/INVARIANTS.md must be readable");
         let rows = parse_invariant_rows(&docs);
+
+        let mut enforced_count = 0;
+        let mut unenforced_count = 0;
+
         for row in &rows {
-            let names_enforcer = !row.enforcer.is_empty() && !row.check.is_empty();
-            let marked_unenforced =
-                row.enforcer.contains("unenforced") || row.check.contains("unenforced");
-            assert!(
-                names_enforcer || marked_unenforced,
-                "invariant {} names neither an enforcer nor 'unenforced' (module={:?}, check={:?})",
-                row.number,
-                row.enforcer,
-                row.check
-            );
+            match validate_invariant_row(row, manifest_dir) {
+                Ok(true) => enforced_count += 1,
+                Ok(false) => unenforced_count += 1,
+                Err(err) => panic!("{err}"),
+            }
         }
+
+        assert_eq!(enforced_count + unenforced_count, rows.len());
+        assert!(
+            docs.contains(&format!("{enforced_count} are enforced")),
+            "docs/INVARIANTS.md summary count mismatch: expected {enforced_count} enforced"
+        );
+        assert!(
+            docs.contains(&format!("{unenforced_count} are unenforced")),
+            "docs/INVARIANTS.md summary count mismatch: expected {unenforced_count} unenforced"
+        );
+    }
+
+    /// Planted negative: changing an enforcer path to a non-existent file causes validation to fail.
+    #[test]
+    fn validation_fails_when_enforcer_path_does_not_exist() {
+        let manifest_dir = env!("CARGO_MANIFEST_DIR");
+        let fake_row = InvariantRow {
+            number: 99,
+            invariant: "Fake invariant".to_string(),
+            enforcer: "src/domain/nonexistent_file_for_negative_test.rs".to_string(),
+            check: "tests::fake_test".to_string(),
+        };
+        let result = validate_invariant_row(&fake_row, manifest_dir);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("does not exist"));
     }
 }
