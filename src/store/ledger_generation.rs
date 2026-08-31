@@ -175,8 +175,8 @@ mod tests {
         let second = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
 
         let results: Vec<Generation> = std::thread::scope(|scope| {
-            let a = scope.spawn(|| advance(&first).unwrap());
-            let b = scope.spawn(|| advance(&second).unwrap());
+            let a = scope.spawn(move || advance(&first).unwrap());
+            let b = scope.spawn(move || advance(&second).unwrap());
             vec![a.join().unwrap(), b.join().unwrap()]
         });
 
