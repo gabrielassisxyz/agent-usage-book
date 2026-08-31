@@ -216,13 +216,6 @@ fn session_id(namespace: &str, native: &str) -> SessionId {
     )
 }
 
-/// The Claude Code transcript parser.
-///
-/// Reads `message.usage.{input_tokens, output_tokens, cache_read_input_tokens,
-/// cache_creation_input_tokens}` and passes `message.id` through as the stable
-/// event identifier. The `cache_creation` ephemeral breakdown is a sub-detail
-/// of the cache write, not a separate kind; it is used only as a fallback when
-/// the total is absent.
 /// The four headline counts plus unknown and absent components from one native
 /// usage record. A missing known kind stays zero in the numeric vector, but its
 /// coverage witness prevents that placeholder from being read as evidence.
@@ -236,6 +229,13 @@ struct UsageCounts {
     missing: BTreeSet<ComponentKind>,
 }
 
+/// The Claude Code transcript parser.
+///
+/// Reads `message.usage.{input_tokens, output_tokens, cache_read_input_tokens,
+/// cache_creation_input_tokens}` and passes `message.id` through as the stable
+/// event identifier. The `cache_creation` ephemeral breakdown is a sub-detail
+/// of the cache write, not a separate kind; it is used only as a fallback when
+/// the total is absent.
 pub struct ClaudeCodeParser;
 
 const CLAUDE_KNOWN: [(&str, TokenKind); 4] = [
