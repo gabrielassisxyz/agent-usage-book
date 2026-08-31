@@ -103,9 +103,10 @@ impl FileState {
 
 /// The platform-abstract file identity: device and inode on Unix, so a file
 /// replaced by rename is a different identity while an in-place append is the
-/// same one. On platforms without a stable inode, the canonical path stands in:
-/// it changes when the file is replaced, which is the property the identity
-/// exists to detect.
+/// same one. On platforms without a stable inode, a constant identity is used:
+/// the size and mtime checks still detect every change except a same-size
+/// replacement, which is the one case this project's platforms (Linux) can
+/// detect and the fallback cannot.
 fn file_identity(metadata: &std::fs::Metadata) -> String {
     #[cfg(unix)]
     {
