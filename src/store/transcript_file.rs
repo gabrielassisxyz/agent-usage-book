@@ -192,7 +192,7 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
+        let conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
         create_table(&conn).unwrap();
         (scratch, conn)
     }
