@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Boundary: provider adapters must not write files.
+# Design: PLAN.md section 8.2 ("meter writing SQLite directly" family) and
+#   section 9 ("It does not write files or databases").
+# Detection: any reference to a write-capable std filesystem facility (std::fs,
+#   fs::write, fs::create, fs::File, fs::OpenOptions, File::create) in the meter
+#   module source, wherever it lives: the flat file when it is a file, every .rs
+#   under the directory when it is a directory. Adapters receive everything they
+#   need through their ports; persistence and spools belong to the layers that
+#   orchestrate them.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+source "$script_dir/lib/module-files.sh"
+
+sources=()
+while IFS= read -r file; do
+    [ -n "$file" ] && sources+=("$file")
+done < <(module_files meter)
+
+if [ "${#sources[@]}" -eq 0 ]; then
+    exit 2
+fi
+
+matches="$(grep -nHE 'std::fs|[^_A-Za-z0-9]fs::(write|create|File|OpenOptions)|[^_A-Za-z0-9]File::create' "${sources[@]}" 2>/dev/null || true)"
+if [ -n "$matches" ]; then
+    echo "provider adapters write files (std::fs write-capable facility):" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+exit 0
