@@ -293,13 +293,13 @@ fn parse_claude_line(
         return Ok(None);
     };
     let mut counts = extract_usage(usage, &CLAUDE_KNOWN, &CLAUDE_IGNORED, &["input_tokens"])?;
-    if !usage.contains_key("cache_creation_input_tokens") {
-        if let Some(cache_write) = claude_cache_write_fallback(usage)? {
-            counts.cache_write = cache_write;
-            counts
-                .missing
-                .remove(&component_kind(TokenKind::CacheWrite));
-        }
+    if !usage.contains_key("cache_creation_input_tokens")
+        && let Some(cache_write) = claude_cache_write_fallback(usage)?
+    {
+        counts.cache_write = cache_write;
+        counts
+            .missing
+            .remove(&component_kind(TokenKind::CacheWrite));
     }
     let context = RecordContext {
         event_id: message.get("id").and_then(Value::as_str),
