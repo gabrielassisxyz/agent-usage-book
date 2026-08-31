@@ -42,6 +42,9 @@ pub(crate) mod migration_0005;
 #[path = "0006_transcript_file.rs"]
 pub(crate) mod migration_0006;
 
+#[path = "0007_task_event.rs"]
+pub(crate) mod migration_0007;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -54,5 +57,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0004::migration(),
         migration_0005::migration(),
         migration_0006::migration(),
+        migration_0007::migration(),
     ]
 }
