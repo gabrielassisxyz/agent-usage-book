@@ -326,7 +326,7 @@ run_case() {
     # the whole case-declared surface first, which is as much a part of "a case
     # cannot observe another case's state" as the fresh state directory below.
     unset -f case_preconditions case_steps case_assertions 2>/dev/null
-    unset CASE_ID CASE_DESCRIPTION CASE_SYNTHETIC_SERVER_ENDPOINT
+    unset CASE_ID CASE_DESCRIPTION CASE_SYNTHETIC_SERVER_ENDPOINT CASE_INJECTED_CLOCK
 
     # shellcheck disable=SC1090
     source "$case_file"
@@ -426,7 +426,7 @@ run_case() {
         echo "state_digest_after: $(state_digest "$STATE_DIR")"
         echo "resolved_configuration: $resolved_configuration"
         echo "allowlisted_env: $allowlisted_env"
-        echo "injected_clock: none"
+        echo "injected_clock: ${CASE_INJECTED_CLOCK:-none}"
         echo "synthetic_server_endpoint: ${CASE_SYNTHETIC_SERVER_ENDPOINT:-none}"
         echo "fixture_hashes: $fixture_hashes"
     } >"$case_log_dir/case.log"
@@ -478,6 +478,19 @@ write_timeline() {
             phase="$(awk -F': ' '$1=="phase"{print $2}' "$RUN_DIR/cases/$id/case.log" 2>/dev/null)"
             [ -n "$phase" ] || phase="pass"
             echo "  case $id: ${verdict^^} (${duration}ns, phase=$phase)"
+            # Every step, named with its outcome and duration, so a failure is
+            # diagnosable from the timeline alone without re-running. The step
+            # directory name carries the monotonic sequence number and the step
+            # name; exit.txt holds the exit, signal or timeout token.
+            local step_dir step_name exit_token wall mono
+            for step_dir in "$RUN_DIR/cases/$id"/steps/*/; do
+                [ -d "$step_dir" ] || continue
+                step_name="$(basename "$step_dir")"
+                exit_token="$(cat "$step_dir/exit.txt" 2>/dev/null || echo unknown)"
+                wall="$(awk -F: '$1=="wall_ns"{print $2}' "$step_dir/duration.txt" 2>/dev/null)"
+                mono="$(awk -F: '$1=="mono_ns"{print $2}' "$step_dir/duration.txt" 2>/dev/null)"
+                echo "    step $step_name: $exit_token (wall ${wall:-unknown}ns, mono ${mono:-unknown}ns)"
+            done
             local assertions_file="$RUN_DIR/cases/$id/assertions.txt"
             if [ -f "$assertions_file" ]; then
                 while IFS='|' read -r aname aexpected aobserved averdict akind; do
@@ -640,6 +653,17 @@ case_assertions() {
     assert_exit 0 1
 }
 CASE
+    cat >"$cases/003-clock.sh" <<'CASE'
+CASE_ID="003-clock"
+CASE_DESCRIPTION="a case that injects a clock records exactly what it injected."
+CASE_INJECTED_CLOCK="fake-clock@2026-01-01T00:00:00Z"
+case_steps() {
+    step "status" "$AUB_BIN" status
+}
+case_assertions() {
+    assert_exit 0 1
+}
+CASE
 
     local runs="$tmp/runs"
     local out
@@ -664,6 +688,15 @@ CASE
 
     # The failing case is recorded as fail, not as a runner crash.
     grep -q '"verdict": "fail"' "$runs"/*/summary.json || { echo "self-test: failing case not recorded" >&2; rm -rf "$tmp"; return 1; }
+
+    # A failing case's timeline names its step and its outcome, so the failure
+    # is diagnosable from the run directory alone.
+    grep -q "step 1-fail: exit:3" "$runs"/*/timeline.txt || { echo "self-test: failing case timeline missing its step outcome" >&2; rm -rf "$tmp"; return 1; }
+
+    # A case-declared injected clock is recorded as the case declared it, not as
+    # a fixed literal, and a case that declares none records none.
+    grep -q "injected_clock: fake-clock@2026-01-01T00:00:00Z" "$runs"/*/cases/003-clock/case.log || { echo "self-test: declared injected clock not recorded" >&2; rm -rf "$tmp"; return 1; }
+    grep -q "injected_clock: none" "$runs"/*/cases/001-status/case.log || { echo "self-test: absent injected clock not recorded as none" >&2; rm -rf "$tmp"; return 1; }
 
     # Refusal: running against the operator state directory must refuse.
     if AUB_BIN="$fake_bin" CASES_DIR="$cases" RUNS_DIR="$runs" STATE_ROOT="$OPERATOR_STATE_DIR" \
@@ -854,6 +887,11 @@ CASE
 
     grep -q "case 001-status: PASS" "$run_dir/timeline.txt" || {
         echo "self-test: timeline verdict does not match summary" >&2
+        rm -rf "$tmp"
+        return 1
+    }
+    grep -q "step 1-status: exit:0" "$run_dir/timeline.txt" || {
+        echo "self-test: timeline does not name the step and its outcome" >&2
         rm -rf "$tmp"
         return 1
     }
