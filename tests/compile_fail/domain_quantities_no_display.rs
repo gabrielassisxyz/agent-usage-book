@@ -11,8 +11,15 @@
 // value the format machinery would print ever exists at runtime.
 
 use agent_usage_book::domain::credits::Credits;
+use agent_usage_book::domain::interval::Interval;
 use agent_usage_book::domain::money::{MoneyPerMillionTokens, Usd};
 use agent_usage_book::domain::quota::{PercentagePoints, QuotaFractionPpm, QuotaRemaining, QuotaUsed};
+use agent_usage_book::domain::render::Precision;
+use agent_usage_book::domain::rows::RowCount;
+use agent_usage_book::domain::time::{
+    Age, ClockSkewEnvelope, MonotonicDuration, MonotonicInstant, ProviderObservedAt, ReceivedAt,
+    Timeout, UtcDate, UtcTimestamp,
+};
 use agent_usage_book::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenCount,
     UsageVector,
@@ -57,6 +64,42 @@ fn percentage_points() -> PercentagePoints {
 fn money_per_million_tokens() -> MoneyPerMillionTokens<Usd> {
     unreachable!()
 }
+fn row_count() -> RowCount {
+    unreachable!()
+}
+fn precision() -> Precision {
+    unreachable!()
+}
+fn utc_timestamp() -> UtcTimestamp {
+    unreachable!()
+}
+fn utc_date() -> UtcDate {
+    unreachable!()
+}
+fn provider_observed_at() -> ProviderObservedAt {
+    unreachable!()
+}
+fn received_at() -> ReceivedAt {
+    unreachable!()
+}
+fn monotonic_duration() -> MonotonicDuration {
+    unreachable!()
+}
+fn monotonic_instant() -> MonotonicInstant {
+    unreachable!()
+}
+fn age() -> Age {
+    unreachable!()
+}
+fn clock_skew_envelope() -> ClockSkewEnvelope {
+    unreachable!()
+}
+fn timeout() -> Timeout {
+    unreachable!()
+}
+fn interval() -> Interval<TokenCount> {
+    unreachable!()
+}
 
 fn main() {
     println!("{}", input_tokens());
@@ -72,4 +115,17 @@ fn main() {
     println!("{}", quota_remaining());
     println!("{}", percentage_points());
     println!("{}", money_per_million_tokens());
+    println!("{}", row_count());
+    println!("{}", precision());
+    println!("{}", utc_timestamp());
+    println!("{}", utc_date());
+    println!("{}", provider_observed_at());
+    println!("{}", received_at());
+    println!("{}", monotonic_duration());
+    println!("{}", monotonic_instant());
+    println!("{}", age());
+    println!("{}", clock_skew_envelope());
+    println!("{}", timeout());
+    println!("{}", interval());
 }
+

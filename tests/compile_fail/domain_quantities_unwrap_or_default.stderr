@@ -1,44 +1,80 @@
 error[E0277]: the trait bound `InputTokens: std::default::Default` is not satisfied
-  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:19:15
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:23:15
    |
-19 |     let _ = a.unwrap_or_default();
+23 |     let _ = a.unwrap_or_default();
    |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `InputTokens`
    |
 note: required by a bound in `Option::<T>::unwrap_or_default`
   --> $RUST/core/src/option.rs
 
 error[E0277]: the trait bound `agent_usage_book::domain::credits::Credits: std::default::Default` is not satisfied
-  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:22:15
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:26:15
    |
-22 |     let _ = b.unwrap_or_default();
+26 |     let _ = b.unwrap_or_default();
    |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `agent_usage_book::domain::credits::Credits`
    |
 note: required by a bound in `Option::<T>::unwrap_or_default`
   --> $RUST/core/src/option.rs
 
 error[E0277]: the trait bound `QuotaFractionPpm: std::default::Default` is not satisfied
-  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:25:15
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:29:15
    |
-25 |     let _ = c.unwrap_or_default();
+29 |     let _ = c.unwrap_or_default();
    |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `QuotaFractionPpm`
    |
 note: required by a bound in `Option::<T>::unwrap_or_default`
   --> $RUST/core/src/option.rs
 
 error[E0277]: the trait bound `Money<Usd>: std::default::Default` is not satisfied
-  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:28:15
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:32:15
    |
-28 |     let _ = d.unwrap_or_default();
+32 |     let _ = d.unwrap_or_default();
    |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `Money<Usd>`
    |
 note: required by a bound in `Option::<T>::unwrap_or_default`
   --> $RUST/core/src/option.rs
 
 error[E0277]: the trait bound `PercentagePoints: std::default::Default` is not satisfied
-  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:31:15
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:35:15
    |
-31 |     let _ = e.unwrap_or_default();
+35 |     let _ = e.unwrap_or_default();
    |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `PercentagePoints`
+   |
+note: required by a bound in `Option::<T>::unwrap_or_default`
+  --> $RUST/core/src/option.rs
+
+error[E0277]: the trait bound `RowCount: std::default::Default` is not satisfied
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:38:15
+   |
+38 |     let _ = f.unwrap_or_default();
+   |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `RowCount`
+   |
+note: required by a bound in `Option::<T>::unwrap_or_default`
+  --> $RUST/core/src/option.rs
+
+error[E0277]: the trait bound `Precision: std::default::Default` is not satisfied
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:41:15
+   |
+41 |     let _ = g.unwrap_or_default();
+   |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `Precision`
+   |
+note: required by a bound in `Option::<T>::unwrap_or_default`
+  --> $RUST/core/src/option.rs
+
+error[E0277]: the trait bound `UtcTimestamp: std::default::Default` is not satisfied
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:44:15
+   |
+44 |     let _ = h.unwrap_or_default();
+   |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `UtcTimestamp`
+   |
+note: required by a bound in `Option::<T>::unwrap_or_default`
+  --> $RUST/core/src/option.rs
+
+error[E0277]: the trait bound `Interval<TokenCount>: std::default::Default` is not satisfied
+  --> tests/compile_fail/domain_quantities_unwrap_or_default.rs:47:15
+   |
+47 |     let _ = i.unwrap_or_default();
+   |               ^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `Interval<TokenCount>`
    |
 note: required by a bound in `Option::<T>::unwrap_or_default`
   --> $RUST/core/src/option.rs

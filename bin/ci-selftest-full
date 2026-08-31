@@ -105,6 +105,46 @@ else
     fi
 fi
 
+# --- quantity inventory: bin/checks/70-quantity-inventory covers all public types in src/domain/
+# and rejects Default implementations/derives while ignoring comments and strings. ---
+clone="$scratch/quantity-inventory-baseline"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+if ! (cd "$clone" && bin/checks/70-quantity-inventory) >/tmp/ci-selftest-quantity-baseline.log 2>&1; then
+    note_fail "quantity inventory: baseline clone fails before any mutation; see /tmp/ci-selftest-quantity-baseline.log"
+fi
+
+# Mutant 1: planting #[derive(Default)] on a domain type (must fail)
+clone="$scratch/quantity-inventory-derive-default"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+sed -i 's/^pub struct RowCount(u64);/#[derive(Default)]\npub struct RowCount(u64);/' "$clone/src/domain/rows.rs"
+output="$( (cd "$clone" && bin/checks/70-quantity-inventory) 2>&1 )"
+if [ $? -eq 0 ]; then
+    note_fail "quantity inventory: expected check to fail when #[derive(Default)] is planted on RowCount"
+elif ! printf '%s' "$output" | grep -qF -- "forbidden Default derive on RowCount"; then
+    note_fail "quantity inventory: failed on derive(Default), but never named 'forbidden Default derive on RowCount'"
+    printf '%s\n' "$output" >&2
+fi
+
+# Mutant 2: planting the word Default in a comment (must pass)
+clone="$scratch/quantity-inventory-comment-default"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+printf '\n// A comment discussing Default trait behavior.\n' >> "$clone/src/domain/rows.rs"
+if ! (cd "$clone" && bin/checks/70-quantity-inventory) >/tmp/ci-selftest-quantity-comment.log 2>&1; then
+    note_fail "quantity inventory: expected check to pass with 'Default' in a comment; see /tmp/ci-selftest-quantity-comment.log"
+fi
+
+# Mutant 3: planting an uninventoried public struct (must fail)
+clone="$scratch/quantity-inventory-uninventoried-type"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+printf '\npub struct UninventoriedDomainType(u64);\n' >> "$clone/src/domain/rows.rs"
+output="$( (cd "$clone" && bin/checks/70-quantity-inventory) 2>&1 )"
+if [ $? -eq 0 ]; then
+    note_fail "quantity inventory: expected check to fail when an uninventoried type is added"
+elif ! printf '%s' "$output" | grep -qF -- "not in docs/domain-quantity-inventory.md: UninventoriedDomainType"; then
+    note_fail "quantity inventory: failed on uninventoried type, but never named 'UninventoriedDomainType'"
+    printf '%s\n' "$output" >&2
+fi
+
 # --- commit protocol: bin/checks/75-commit-protocol has a conformance half over AGENTS.md
 # and an integration half over a scratch git repository, and each half is mutated here.
 # A prose guard that keeps passing after its sentence is deleted is checking nothing, and

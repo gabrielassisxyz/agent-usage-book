@@ -10,9 +10,13 @@
 // file, not to re-enumerate every type a second time.
 
 use agent_usage_book::domain::credits::Credits;
+use agent_usage_book::domain::interval::Interval;
 use agent_usage_book::domain::money::{Money, Usd};
 use agent_usage_book::domain::quota::{PercentagePoints, QuotaFractionPpm};
-use agent_usage_book::domain::tokens::InputTokens;
+use agent_usage_book::domain::render::Precision;
+use agent_usage_book::domain::rows::RowCount;
+use agent_usage_book::domain::time::UtcTimestamp;
+use agent_usage_book::domain::tokens::{InputTokens, TokenCount};
 
 fn main() {
     let a: Option<InputTokens> = None;
@@ -29,4 +33,16 @@ fn main() {
 
     let e: Option<PercentagePoints> = None;
     let _ = e.unwrap_or_default();
+
+    let f: Option<RowCount> = None;
+    let _ = f.unwrap_or_default();
+
+    let g: Option<Precision> = None;
+    let _ = g.unwrap_or_default();
+
+    let h: Option<UtcTimestamp> = None;
+    let _ = h.unwrap_or_default();
+
+    let i: Option<Interval<TokenCount>> = None;
+    let _ = i.unwrap_or_default();
 }

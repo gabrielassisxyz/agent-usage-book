@@ -1,50 +1,188 @@
 #!/usr/bin/env bash
-# The persistent quantity-inventory guard (aub-rif.12): fails when one of the four
-# scoped domain files (docs/domain-quantity-inventory.md explains the scope, and why it
-# is these four and not every file under src/domain/) declares a public struct or enum
-# that is not named in that document's tables. A new quantity type is meant to force a
-# reader here, not slip past silently with no Default/Display coverage.
-#
-# This only checks that the DOCUMENT is complete relative to the SOURCE. It says
-# nothing about whether Default/Display are actually absent: that is
-# tests/compile_fail/domain_quantities_no_default.rs and
-# ..._no_display.rs's job, run by bin/checks/30-test.
+# The persistent quantity-inventory guard (aub-rif.12, extended by aub-qgng):
+# 1. Dynamically enumerates every `src/domain/*.rs` file (excluding `mod.rs`).
+# 2. Ensures every declared public struct or enum appears in `docs/domain-quantity-inventory.md`.
+# 3. Detects `impl Default for <type>` and `#[derive(... Default ...)]` on domain types
+#    (outside comments and string literals, allowing only behavioral time sources like RealClock).
 set -euo pipefail
 
-cd "$(git rev-parse --show-toplevel)"
+repo_root="$(git rev-parse --show-toplevel)"
+cd "$repo_root"
 
 doc="docs/domain-quantity-inventory.md"
-files=(
-    src/domain/tokens.rs
-    src/domain/credits.rs
-    src/domain/quota.rs
-    src/domain/money.rs
-)
-
-# Every backtick-quoted, uppercase-starting identifier anywhere in the document: table
-# entries and the "excluded" bullet lists alike, one pass. Anchoring on an uppercase
-# first letter is what keeps this from also matching backticked prose like
-# `pub(crate)`, `default()` or a file name like `money.rs` (none start uppercase), while
-# still stopping at the first non-identifier character, so `Money<Usd>` contributes
-# `Money` and `Type::default()` contributes `Type`.
-inventoried=$(command grep -oE '`[A-Z][A-Za-z0-9_]*' "$doc" | sed -E 's/^`//' | sort -u)
-
-fail=0
-for f in "${files[@]}"; do
-    declared=$(command grep -oE '^pub (struct|enum) [A-Za-z0-9_]+' "$f" | awk '{print $3}' | sort -u)
-    while IFS= read -r name; do
-        [ -z "$name" ] && continue
-        if ! printf '%s\n' "$inventoried" | command grep -qx "$name"; then
-            echo "not in $doc: $name ($f)" >&2
-            fail=1
-        fi
-    done <<< "$declared"
-done
-
-if [ "$fail" -ne 0 ]; then
-    echo "quantity-inventory: FAILED - extend $doc (and the compile-fail fixtures it" >&2
-    echo "describes) to cover the type(s) named above before this check can pass." >&2
+if [ ! -f "$doc" ]; then
+    echo "quantity-inventory: missing inventory document: $doc" >&2
     exit 1
 fi
 
-echo "quantity-inventory: every pub struct/enum in the scoped files is documented."
+python3 - <<'PYEOF'
+import glob, os, re, sys
+
+doc_file = "docs/domain-quantity-inventory.md"
+with open(doc_file, "r", encoding="utf-8") as f:
+    doc_content = f.read()
+
+# Extract backticked PascalCase identifiers from the inventory doc
+inventoried = set(re.findall(r'`([A-Z][A-Za-z0-9_]*)', doc_content))
+
+def strip_comments_and_strings(source):
+    result = []
+    i = 0
+    n = len(source)
+    in_line_comment = False
+    block_depth = 0
+    in_str = False
+    in_raw_str = False
+    raw_hash_count = 0
+
+    while i < n:
+        c = source[i]
+        if in_line_comment:
+            if c == '\n':
+                in_line_comment = False
+                result.append('\n')
+            else:
+                result.append(' ')
+            i += 1
+            continue
+
+        if block_depth > 0:
+            if i + 1 < n and source[i:i+2] == '/*':
+                block_depth += 1
+                result.append('  ')
+                i += 2
+            elif i + 1 < n and source[i:i+2] == '*/':
+                block_depth -= 1
+                result.append('  ')
+                i += 2
+            else:
+                if c == '\n':
+                    result.append('\n')
+                else:
+                    result.append(' ')
+                i += 1
+            continue
+
+        if not in_str and not in_raw_str and c == 'r':
+            j = i + 1
+            hashes = 0
+            while j < n and source[j] == '#':
+                hashes += 1
+                j += 1
+            if j < n and source[j] == '"':
+                in_raw_str = True
+                raw_hash_count = hashes
+                result.append(' ' * (j + 1 - i))
+                i = j + 1
+                continue
+
+        if in_raw_str:
+            if c == '"':
+                if i + 1 + raw_hash_count <= n and source[i+1:i+1+raw_hash_count] == '#' * raw_hash_count:
+                    in_raw_str = False
+                    result.append(' ' * (1 + raw_hash_count))
+                    i += 1 + raw_hash_count
+                    continue
+            if c == '\n':
+                result.append('\n')
+            else:
+                result.append(' ')
+            i += 1
+            continue
+
+        if in_str:
+            if c == '\\':
+                result.append('  ')
+                i += 2
+                continue
+            elif c == '"':
+                in_str = False
+                result.append(' ')
+                i += 1
+                continue
+            else:
+                if c == '\n':
+                    result.append('\n')
+                else:
+                    result.append(' ')
+                i += 1
+                continue
+
+        if c == '"':
+            in_str = True
+            result.append(' ')
+            i += 1
+            continue
+
+        if i + 1 < n and source[i:i+2] == '//':
+            in_line_comment = True
+            result.append('  ')
+            i += 2
+            continue
+
+        if i + 1 < n and source[i:i+2] == '/*':
+            block_depth = 1
+            result.append('  ')
+            i += 2
+            continue
+
+        result.append(c)
+        i += 1
+
+    return "".join(result)
+
+fail = 0
+
+# Allowed Default implementors (behavioral time sources)
+ALLOWED_DEFAULT = {"RealClock"}
+
+domain_files = sorted(glob.glob("src/domain/*.rs"))
+for f in domain_files:
+    if os.path.basename(f) == "mod.rs":
+        continue
+
+    with open(f, "r", encoding="utf-8") as handle:
+        raw_source = handle.read()
+
+    # 1. Inventory check: all declared pub struct/enum must be in doc
+    declared = []
+    for m in re.finditer(r'^\s*pub\s+(?:struct|enum)\s+([A-Za-z0-9_]+)', raw_source, re.MULTILINE):
+        name = m.group(1)
+        if name != '$name':
+            declared.append(name)
+    for m in re.finditer(r'^\s*token_newtype!\s*\(\s*([A-Za-z0-9_]+)', raw_source, re.MULTILINE):
+        declared.append(m.group(1))
+
+    for name in sorted(declared):
+        if name not in inventoried:
+            print(f"not in {doc_file}: {name} ({f})", file=sys.stderr)
+            fail = 1
+
+    # 2. Check for Default implementations / derives outside tests, comments, and strings
+    production_raw = raw_source.split('#[cfg(test)]')[0]
+    cleaned = strip_comments_and_strings(production_raw)
+
+    # Check impl Default for <Type>
+    for m in re.finditer(r'\bimpl(?:\s*<[^>]+>)?\s+Default\s+for\s+([A-Za-z0-9_]+)', cleaned):
+        type_name = m.group(1)
+        if type_name not in ALLOWED_DEFAULT:
+            line_no = cleaned[:m.start()].count('\n') + 1
+            print(f"forbidden Default implementation for {type_name} in {f}:{line_no}", file=sys.stderr)
+            fail = 1
+
+    # Check #[derive(... Default ...)]
+    for m in re.finditer(r'#\[derive\s*\([^)]*\bDefault\b[^)]*\)\]', cleaned):
+        line_no = cleaned[:m.start()].count('\n') + 1
+        after = cleaned[m.end():]
+        follow = re.search(r'\bpub\s+(?:struct|enum)\s+([A-Za-z0-9_]+)', after)
+        target = follow.group(1) if follow else "unknown"
+        if target not in ALLOWED_DEFAULT:
+            print(f"forbidden Default derive on {target} in {f}:{line_no}", file=sys.stderr)
+            fail = 1
+
+if fail != 0:
+    print("quantity-inventory: FAILED", file=sys.stderr)
+    sys.exit(1)
+
+print(f"quantity-inventory: every pub struct/enum in {len(domain_files) - 1} domain files is documented and free of Default.")
+PYEOF

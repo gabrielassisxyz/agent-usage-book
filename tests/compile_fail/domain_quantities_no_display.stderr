@@ -1,142 +1,263 @@
 error[E0277]: `InputTokens` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:62:20
-   |
-62 |     println!("{}", input_tokens());
-   |               --   ^^^^^^^^^^^^^^ `InputTokens` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `InputTokens`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:105:20
+    |
+105 |     println!("{}", input_tokens());
+    |               --   ^^^^^^^^^^^^^^ `InputTokens` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `InputTokens`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `OutputTokens` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:63:20
-   |
-63 |     println!("{}", output_tokens());
-   |               --   ^^^^^^^^^^^^^^^ `OutputTokens` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `OutputTokens`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:106:20
+    |
+106 |     println!("{}", output_tokens());
+    |               --   ^^^^^^^^^^^^^^^ `OutputTokens` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `OutputTokens`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `CacheReadTokens` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:64:20
-   |
-64 |     println!("{}", cache_read_tokens());
-   |               --   ^^^^^^^^^^^^^^^^^^^ `CacheReadTokens` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `CacheReadTokens`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:107:20
+    |
+107 |     println!("{}", cache_read_tokens());
+    |               --   ^^^^^^^^^^^^^^^^^^^ `CacheReadTokens` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `CacheReadTokens`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `CacheWriteTokens` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:65:20
-   |
-65 |     println!("{}", cache_write_tokens());
-   |               --   ^^^^^^^^^^^^^^^^^^^^ `CacheWriteTokens` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `CacheWriteTokens`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:108:20
+    |
+108 |     println!("{}", cache_write_tokens());
+    |               --   ^^^^^^^^^^^^^^^^^^^^ `CacheWriteTokens` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `CacheWriteTokens`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `TokenCount` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:66:20
-   |
-66 |     println!("{}", token_count());
-   |               --   ^^^^^^^^^^^^^ `TokenCount` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `TokenCount`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:109:20
+    |
+109 |     println!("{}", token_count());
+    |               --   ^^^^^^^^^^^^^ `TokenCount` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `TokenCount`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `KnownTokenVector` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:67:20
-   |
-67 |     println!("{}", known_token_vector());
-   |               --   ^^^^^^^^^^^^^^^^^^^^ `KnownTokenVector` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `KnownTokenVector`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:110:20
+    |
+110 |     println!("{}", known_token_vector());
+    |               --   ^^^^^^^^^^^^^^^^^^^^ `KnownTokenVector` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `KnownTokenVector`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `UsageVector` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:68:20
-   |
-68 |     println!("{}", usage_vector());
-   |               --   ^^^^^^^^^^^^^^ `UsageVector` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `UsageVector`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:111:20
+    |
+111 |     println!("{}", usage_vector());
+    |               --   ^^^^^^^^^^^^^^ `UsageVector` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `UsageVector`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `agent_usage_book::domain::credits::Credits` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:69:20
-   |
-69 |     println!("{}", credits());
-   |               --   ^^^^^^^^^ `agent_usage_book::domain::credits::Credits` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `agent_usage_book::domain::credits::Credits`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:112:20
+    |
+112 |     println!("{}", credits());
+    |               --   ^^^^^^^^^ `agent_usage_book::domain::credits::Credits` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `agent_usage_book::domain::credits::Credits`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `QuotaFractionPpm` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:70:20
-   |
-70 |     println!("{}", quota_fraction_ppm());
-   |               --   ^^^^^^^^^^^^^^^^^^^^ `QuotaFractionPpm` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `QuotaFractionPpm`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:113:20
+    |
+113 |     println!("{}", quota_fraction_ppm());
+    |               --   ^^^^^^^^^^^^^^^^^^^^ `QuotaFractionPpm` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `QuotaFractionPpm`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `QuotaUsed` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:71:20
-   |
-71 |     println!("{}", quota_used());
-   |               --   ^^^^^^^^^^^^ `QuotaUsed` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `QuotaUsed`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:114:20
+    |
+114 |     println!("{}", quota_used());
+    |               --   ^^^^^^^^^^^^ `QuotaUsed` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `QuotaUsed`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `QuotaRemaining` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:72:20
-   |
-72 |     println!("{}", quota_remaining());
-   |               --   ^^^^^^^^^^^^^^^^^ `QuotaRemaining` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `QuotaRemaining`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:115:20
+    |
+115 |     println!("{}", quota_remaining());
+    |               --   ^^^^^^^^^^^^^^^^^ `QuotaRemaining` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `QuotaRemaining`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `PercentagePoints` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:73:20
-   |
-73 |     println!("{}", percentage_points());
-   |               --   ^^^^^^^^^^^^^^^^^^^ `PercentagePoints` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `PercentagePoints`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:116:20
+    |
+116 |     println!("{}", percentage_points());
+    |               --   ^^^^^^^^^^^^^^^^^^^ `PercentagePoints` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `PercentagePoints`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `MoneyPerMillionTokens<Usd>` doesn't implement `std::fmt::Display`
-  --> tests/compile_fail/domain_quantities_no_display.rs:74:20
-   |
-74 |     println!("{}", money_per_million_tokens());
-   |               --   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `MoneyPerMillionTokens<Usd>` cannot be formatted with the default formatter
-   |               |
-   |               required by this formatting parameter
-   |
-   = help: the trait `std::fmt::Display` is not implemented for `MoneyPerMillionTokens<Usd>`
-   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+   --> tests/compile_fail/domain_quantities_no_display.rs:117:20
+    |
+117 |     println!("{}", money_per_million_tokens());
+    |               --   ^^^^^^^^^^^^^^^^^^^^^^^^^^ `MoneyPerMillionTokens<Usd>` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `MoneyPerMillionTokens<Usd>`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `RowCount` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:118:20
+    |
+118 |     println!("{}", row_count());
+    |               --   ^^^^^^^^^^^ `RowCount` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `RowCount`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `Precision` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:119:20
+    |
+119 |     println!("{}", precision());
+    |               --   ^^^^^^^^^^^ `Precision` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `Precision`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `UtcTimestamp` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:120:20
+    |
+120 |     println!("{}", utc_timestamp());
+    |               --   ^^^^^^^^^^^^^^^ `UtcTimestamp` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `UtcTimestamp`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `UtcDate` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:121:20
+    |
+121 |     println!("{}", utc_date());
+    |               --   ^^^^^^^^^^ `UtcDate` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `UtcDate`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `ProviderObservedAt` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:122:20
+    |
+122 |     println!("{}", provider_observed_at());
+    |               --   ^^^^^^^^^^^^^^^^^^^^^^ `ProviderObservedAt` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `ProviderObservedAt`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `ReceivedAt` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:123:20
+    |
+123 |     println!("{}", received_at());
+    |               --   ^^^^^^^^^^^^^ `ReceivedAt` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `ReceivedAt`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `MonotonicDuration` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:124:20
+    |
+124 |     println!("{}", monotonic_duration());
+    |               --   ^^^^^^^^^^^^^^^^^^^^ `MonotonicDuration` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `MonotonicDuration`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `MonotonicInstant` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:125:20
+    |
+125 |     println!("{}", monotonic_instant());
+    |               --   ^^^^^^^^^^^^^^^^^^^ `MonotonicInstant` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `MonotonicInstant`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `Age` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:126:20
+    |
+126 |     println!("{}", age());
+    |               --   ^^^^^ `Age` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `Age`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `ClockSkewEnvelope` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:127:20
+    |
+127 |     println!("{}", clock_skew_envelope());
+    |               --   ^^^^^^^^^^^^^^^^^^^^^ `ClockSkewEnvelope` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `ClockSkewEnvelope`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
+
+error[E0277]: `agent_usage_book::domain::time::Timeout` doesn't implement `std::fmt::Display`
+   --> tests/compile_fail/domain_quantities_no_display.rs:128:20
+    |
+128 |     println!("{}", timeout());
+    |               --   ^^^^^^^^^ `agent_usage_book::domain::time::Timeout` cannot be formatted with the default formatter
+    |               |
+    |               required by this formatting parameter
+    |
+    = help: the trait `std::fmt::Display` is not implemented for `agent_usage_book::domain::time::Timeout`
+    = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead

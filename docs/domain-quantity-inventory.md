@@ -1,41 +1,24 @@
 # Domain quantity inventory
 
-The Phase 0 negative-trait inventory (`aub-rif.12`): no `Default`, no free-standing
-`Display`/`LowerHex`/other formatting trait, private representation with a validated
-public smart constructor, and (for coefficient types and conversion witnesses) no
+The Phase 0 negative-trait inventory (`aub-rif.12`, extended across all domain files by `aub-qgng`):
+no `Default`, no free-standing `Display`/`LowerHex`/other formatting trait, private representation
+with a validated public smart constructor, and (for coefficient types and conversion witnesses) no
 unchecked external construction.
 
 ## Scope of this inventory
 
-This bead's formal dependencies are `aub-rif.1` (tokens), `aub-rif.2` (credits),
-`aub-rif.3` (quota) and `aub-rif.4` (money): those are the only quantity beads the bead
-graph requires closed before this one runs. The inventory below, and the guard script
-that checks it (`bin/checks/70-quantity-inventory`), cover exactly those four files:
-`src/domain/tokens.rs`, `src/domain/credits.rs`, `src/domain/quota.rs`,
-`src/domain/money.rs`.
+The inventory below, and the guard script that checks it (`bin/checks/70-quantity-inventory`),
+dynamically cover every file under `src/domain/*.rs`. Every public struct or enum declared in any
+domain file is explicitly inventoried: either as a measured quantity in the tables below, or in the
+documented exclusion categories with its rationale.
 
-`src/domain/time.rs`, `src/domain/interval.rs`, `src/domain/ids.rs` and
-`src/domain/provenance.rs` (from `aub-rif.5`, `aub-rif.6`, `aub-rif.7` and
-`aub-rif.11`) already exist in the tree, since the domain wave batched more beads than
-this one's formal dependency edge names, but are **not yet covered** by this inventory or
-its guard script. That is a real, visible gap, not an oversight papered over: extending
-the guard's file list and this document to include them is exactly the kind of growth
-the guard below exists to force, the first time someone runs it against those files.
-Scoping the guard's *scan* to the four dependency files now, rather than failing
-immediately on a backlog this bead did not create, is what keeps the guard green on
-the day it is introduced instead of red from the first run.
-
-`src/domain/window.rs` and whatever `aub-rif.9` and `aub-rif.13` land as are still
-`in_progress` as of this writing and are excluded for the same reason: their shape
-could still change before they close.
+A new public struct or enum added to any domain file must be added to this document, or the quantity
+inventory guard will fail `bin/ci`.
 
 ## Ordinary Phase 0 measurements
 
-Private representation, a validated public smart constructor, no `Default`, no
-free-standing formatting trait. Two types already had one of the two cases from their
-own bead (`aub-rif.2`, `aub-rif.4`); this bead did not duplicate an existing, working,
-already mutation-proved fixture, and the table says exactly which file covers which
-case for every type.
+Private representation, a validated public smart constructor, no `Default`, no free-standing
+formatting trait.
 
 | Type | File | `Default` case | `Display` case |
 | --- | --- | --- | --- |
@@ -53,67 +36,61 @@ case for every type.
 | `PercentagePoints` | `quota.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
 | `Money<Usd>` | `money.rs` | `domain_quantities_no_default.rs` | `money_display.rs` (aub-rif.4) |
 | `MoneyPerMillionTokens<Usd>` | `money.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `RowCount` | `rows.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `Precision` | `render.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `UtcTimestamp` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `UtcDate` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `ProviderObservedAt` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `ReceivedAt` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `MonotonicDuration` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `MonotonicInstant` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `Age` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `ClockSkewEnvelope` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `Timeout` | `time.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
+| `Interval` | `interval.rs` | `domain_quantities_no_default.rs` | `domain_quantities_no_display.rs` |
 
-`Money<Usd>` and `MoneyPerMillionTokens<Usd>` are generic (`Money<C: Currency>`); each is
-tested at one concrete currency, since the absence of an impl does not vary by which
-currency instantiates the type parameter.
-
-`Usd` and `Eur` themselves are uninhabited currency marker types, not quantities, and
-are excluded (see the exclusion list below).
+`Money<Usd>` and `MoneyPerMillionTokens<Usd>` are generic (`Money<C: Currency>`); each is tested at
+one concrete currency, since the absence of an impl does not vary by which currency instantiates
+the type parameter.
 
 ## Coefficient types and conversion witnesses
 
-Construction is `pub(crate)`, restricted to this crate (the tightest boundary
-expressible without a module-tree restructure; see `src/domain/credits.rs`'s module
-documentation). Each has its own "construction outside the boundary" compile-fail case.
+Construction is `pub(crate)`, restricted to this crate (see `src/domain/credits.rs`). Each has its
+own "construction outside the boundary" compile-fail case.
 
 | Type | File | Compile-fail case |
 | --- | --- | --- |
 | `CreditsPerToken` | `credits.rs` | `credits_per_token_construction_outside_boundary.rs` |
 | `CreditsPerPercentagePoint` | `credits.rs` | `credits_per_percentage_point_construction_outside_boundary.rs` (aub-rif.2) |
 
-Future `WindowCalibration` and `CostModel` witnesses are explicitly out of scope here;
-their construction compile-fail cases belong to `aub-c0b.1` and
-`aub-ai3.1`/`aub-ai3.2` respectively.
+## Excluded categories
 
-## Excluded from the four scoped files
+Each of the following is a public struct or enum declared in `src/domain/` that is not a measured
+quantity, documented here with its reason for exclusion:
 
-Named here, rather than left for the guard script to discover as an unexplained gap,
-because each is a real `pub struct`/`pub enum` in a scoped file that is not a measured
-quantity:
+### Tags, currency markers and errors
+- `TokenKind` (`tokens.rs`): tag enum selecting which known kind a count belongs to, not a measured quantity.
+- `Usd`, `Eur` (`money.rs`): uninhabited currency marker types, never instantiated.
+- `IntervalError` (`interval.rs`): error enum for interval construction failures.
+- `MeasurementBasis` (`time.rs`): tag enum indicating observation basis, not a quantity.
+- `ClockAnomaly` (`time.rs`): error and anomaly event descriptor.
+- `RealClock`, `FakeClock` (`time.rs`): behavioral time sources, not values (`RealClock` implements `Default` to provide the default wall/monotonic clock).
 
-- `TokenKind` (`tokens.rs`) is a tag enum selecting which known kind a count belongs to,
-  not itself a measured quantity.
-- `Usd`, `Eur` (`money.rs`) are uninhabited currency marker types, never instantiated.
+### Namespaced and semantic identifiers (`ids.rs`)
+- `SourceNamespace`: source system namespace wrapper.
+- `NativeSessionId`, `NativeTaskId`, `NativeRunId`: un-namespaced raw identifier wrappers.
+- `SessionId`, `TaskId`, `RunId`: namespaced identifier composite types.
+- `MeterSemanticsId`, `BillingSemanticsId`, `ProviderContractId`, `AdapterVersion`, `CredentialContextId`: semantic contract and version identifiers.
 
-## Deliberately excluded from `time.rs`, `interval.rs`, `ids.rs`, `provenance.rs`
+### Attempt lifecycle and failure classifications (`attempt.rs`, `failure.rs`)
+- `AttemptId`: monotonic sequence identifier for sampling attempts.
+- `AttemptOutcome`, `AttemptStarted`, `AttemptResult`: attempt lifecycle state enums.
+- `HttpStatusClass`, `FailureClass`, `AuthReason`: categorized failure classifications.
 
-Recorded here so a future extension of the guard's file list knows what was already
-looked at and ruled out, rather than re-litigating it:
+### Freshness models (`freshness.rs`)
+- `Observed`, `StaleReason`, `Freshness`, `FreshnessKind`, `LatestAttempt`, `FreshnessInput`: freshness domain state models and inputs.
 
-- `MeasurementBasis` (`time.rs`) is a tag enum, not a measured quantity.
-- `ClockAnomaly` (`time.rs`) is an error/event descriptor.
-- `RealClock`, `FakeClock` (`time.rs`) are behavioral time sources, not values.
-- `IntervalError` (`interval.rs`) is an error enum.
-- `WitnessId`, `QuerySemantics`, `ProvenanceManifest`, `Derived<T>` (`provenance.rs`)
-  are compound aggregates with their own bead-level (`aub-rif.11`) validated
-  constructors, not scalar measurements.
-
-## Representative, not exhaustive, checks
-
-Two properties are structural consequences of Rust's privacy rules rather than a
-per-type risk that varies by which quantity owns the field, so they are proven once per
-distinct *shape* rather than once per every type name above:
-
-- **Direct field/tuple construction outside the owning module**:
-  `domain_quantity_direct_construction.rs` covers one tuple-struct-over-a-primitive
-  (`InputTokens`), one tuple-struct-over-a-newtype (`QuotaUsed`), one
-  multi-field brace struct (`KnownTokenVector`), and one generic struct
-  (`Money<Usd>`).
-- **`unwrap_or_default()` on `Option<Quantity>`**:
-  `domain_quantities_unwrap_or_default.rs` covers `InputTokens`, `Credits`,
-  `QuotaFractionPpm`, `Money<Usd>` and `PercentagePoints`. The underlying missing
-  `Default` impl is already proven exhaustively by
-  `domain_quantities_no_default.rs`; this fixture exists to prove the *generic-bound*
-  code path (`T: Default`) fails the same way the direct associated-function call does,
-  not to re-enumerate every type a second time.
+### Provenance and window descriptors (`provenance.rs`, `window.rs`)
+- `Digest`, `EvidenceId`, `CostModelId`, `WindowCalibrationId`, `RateCardId`, `WitnessId`, `DerivationId`: provenance identifiers.
+- `QuerySemantics`, `ProvenanceManifest`, `Derived`: compound provenance aggregates and wrappers.
+- `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
