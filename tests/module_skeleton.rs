@@ -10,18 +10,6 @@ const LOWEST_LAYERS: [&str; 3] = ["domain", "evidence", "config"];
 /// The conversion-owning modules from PLAN.md section 9.
 const CONVERSION_MODULES: [&str; 3] = ["cost_model", "calibration", "valuation"];
 
-/// The clock module is the only place the system clock may be read.
-const CLOCK_MODULE: &str = "src/domain/time.rs";
-
-/// System-clock call sites that must live only in the clock module.
-const SYSTEM_CLOCK_PATTERNS: &[&str] = &[
-    "SystemTime::now",
-    "Instant::now",
-    "UNIX_EPOCH",
-    "std::time::SystemTime",
-    "std::time::Instant",
-];
-
 /// Crate families the lowest layers must not depend on (PLAN.md section 8.1).
 const FORBIDDEN_CRATES: &[&str] = &[
     // SQLite
@@ -243,21 +231,26 @@ fn lowest_layers_reference_no_forbidden_crate() {
     }
 }
 
+/// Delegates to `bin/checks/boundary-rules/18-no-system-clock-outside-time`
+/// instead of carrying its own grep, so the "only the clock module reads the
+/// system clock" property has one definition (aub-6gco). The rule's own
+/// mutant scenarios (a planted call outside and inside the clock module) live
+/// in `bin/boundary-rules-selftest`; this test only proves the rule currently
+/// passes over the real tree.
 #[test]
 fn system_clock_calls_only_in_the_clock_module() {
     let root = concat!(env!("CARGO_MANIFEST_DIR"));
-    let mut files = Vec::new();
-    collect_rs_files(&format!("{root}/src"), &mut files);
-    for path in files {
-        let source =
-            fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path} must be readable: {e}"));
-        for pattern in SYSTEM_CLOCK_PATTERNS {
-            assert!(
-                !source.contains(pattern) || path.ends_with(CLOCK_MODULE),
-                "{path} reads the system clock ({pattern}); only {CLOCK_MODULE} may"
-            );
-        }
-    }
+    let rule = format!("{root}/bin/checks/boundary-rules/18-no-system-clock-outside-time");
+    let output = std::process::Command::new(&rule)
+        .current_dir(root)
+        .output()
+        .unwrap_or_else(|e| panic!("{rule} must be runnable: {e}"));
+    assert!(
+        output.status.success(),
+        "boundary rule 18 failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[test]

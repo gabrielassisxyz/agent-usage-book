@@ -94,6 +94,7 @@ violation "rule12" "12-transport-no-ureq-outside-transport" "src/advice.rs" "use
 violation "rule14-flat" "14-parser-no-cost-or-meter" "src/transcripts.rs" "use crate::cost_model;"
 violation "rule15-flat" "15-status-no-migration" "src/projection.rs" "use crate::store::migrate;"
 violation "rule15-cli" "15-status-no-migration" "src/cli.rs" "use crate::store::migrate;"
+violation "rule18-flat" "18-no-system-clock-outside-time" "src/advice.rs" "pub fn bad() { let _ = std::time::SystemTime::now(); }"
 
 # Nested-file violations under module directories
 violation "rule01-nested" "01-presentation-no-provider-adapters" "src/presentation/render.rs" "use crate::meter;"
@@ -106,6 +107,14 @@ violation "rule07-nested" "07-provider-adapters-no-credential-paths" "src/meter/
 violation "rule09-nested" "09-presentation-no-store-or-calibration" "src/presentation/render.rs" "use crate::store;"
 violation "rule14-nested" "14-parser-no-cost-or-meter" "src/transcripts/native.rs" "use crate::cost_model;"
 violation "rule15-nested" "15-status-no-migration" "src/projection/nested.rs" "use crate::store::migrate;"
+violation "rule18-nested" "18-no-system-clock-outside-time" "src/presentation/precision.rs" "pub fn bad() { let _ = std::time::Instant::now(); }"
+
+# --- rule 18: a near-identical planting inside the clock module itself passes ---
+dir="$(make_scenario rule18-allowed)"
+printf 'pub fn also_ok() { let _ = std::time::SystemTime::now(); }\n' >> "$dir/src/domain/time.rs"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "rule18-allowed exits 0" 0 "$rc"
 
 # --- two rules violated in one run are BOTH named, not only the first ---
 dir="$(make_scenario two-fail)"

@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# Boundary: the wall clock is read only from src/domain/time.rs.
+# Design: aub-rif.5 (every module reads time through the injected Clock, never the
+#   system clock directly) and aub-vcx.4 (the clock rule named as a later rule);
+#   found ungated by the beads compliance audit at HEAD b83ab0a. A module that reads
+#   SystemTime::now() or Instant::now() directly cannot be driven by FakeClock in a
+#   test and silently depends on real wall-clock time.
+# Detection: resolve every top-level module under src/ (flat file and/or directory)
+#   through bin/checks/boundary-rules/lib/module-files.sh, so a nested file is covered
+#   with no flat-file blind spot (aub-hao6), plus the crate's entry points
+#   (lib.rs/main.rs/bin/*.rs) which are not modules module_files resolves by name. The
+#   collected files are then scanned for SystemTime::now, Instant::now,
+#   std::time::SystemTime and a chrono/time-crate clock read, outside
+#   src/domain/time.rs and outside #[cfg(test)] (split at the first occurrence, same
+#   convention as rule 10).
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+source "$script_dir/lib/module-files.sh"
+
+sources=()
+seen=()
+for item in src/*; do
+    name="$(basename "$item" .rs)"
+    case "$name" in
+        lib|main|bin) continue ;;
+    esac
+
+    if printf '%s\n' "${seen[@]:-}" | grep -qx "$name"; then
+        continue
+    fi
+    seen+=("$name")
+
+    while IFS= read -r file; do
+        [ -n "$file" ] && sources+=("$file")
+    done < <(module_files "$name")
+done
+
+for extra in src/lib.rs src/main.rs src/bin/*.rs; do
+    [ -f "$extra" ] && sources+=("$extra")
+done
+
+python3 - "${sources[@]}" <<'PYEOF'
+import re, sys
+
+ALLOWED_FILE = 'src/domain/time.rs'
+
+patterns = [
+    re.compile(r'\bSystemTime::now\b'),
+    re.compile(r'\bInstant::now\b'),
+    re.compile(r'\bstd::time::SystemTime\b'),
+    re.compile(r'\bchrono::[A-Za-z_]+::now\b'),
+    re.compile(r'\btime::OffsetDateTime::now_\w+\b'),
+]
+
+violations = []
+
+for filepath in sys.argv[1:]:
+    if filepath == ALLOWED_FILE:
+        continue
+    try:
+        with open(filepath, 'r', encoding='utf-8') as handle:
+            content = handle.read()
+    except Exception as e:
+        print(f"error reading {filepath}: {e}", file=sys.stderr)
+        sys.exit(2)
+
+    # Ignore test modules: a fixture may legitimately construct a real clock to
+    # prove FakeClock against it.
+    production = content.split('#[cfg(test)]')[0]
+
+    for pattern in patterns:
+        for m in pattern.finditer(production):
+            line_no = production[:m.start()].count('\n') + 1
+            violations.append(f"{filepath}:{line_no}: {m.group(0)}")
+
+if violations:
+    print("system clock read outside src/domain/time.rs:", file=sys.stderr)
+    for v in violations:
+        print(f"    {v}", file=sys.stderr)
+    sys.exit(1)
+
+sys.exit(0)
+PYEOF
