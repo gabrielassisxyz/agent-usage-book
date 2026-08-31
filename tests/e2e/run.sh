@@ -992,6 +992,64 @@ CASE
     echo "self-test: timeout and signal reporting ok"
 }
 
+# self_test_self_sufficient_build: the runner builds the release binary itself
+# when none is supplied, resolving the real path through cargo metadata, so a
+# verification environment that runs the suite without a pre-built binary gets
+# one built from the repo's own toolchain. A fake cargo shadows the real one so
+# the path is proven without a real build.
+self_test_self_sufficient_build() {
+    local tmp
+    tmp="$(mktemp -d)"
+    local fake_cargo="$tmp/cargo"
+    local fake_target="$tmp/target"
+    local fake_bin="$tmp/fake-aub"
+    cat >"$fake_bin" <<'FAKE'
+#!/usr/bin/env bash
+case "${1:-}" in
+    status) echo '{"status":"ok"}'; exit 0 ;;
+    *) echo "fake-aub"; exit 0 ;;
+esac
+FAKE
+    chmod +x "$fake_bin"
+    cat >"$fake_cargo" <<'FAKE'
+#!/usr/bin/env bash
+case "${1:-}" in
+    build)
+        mkdir -p "$FAKE_TARGET/release"
+        cp "$FAKE_BIN_SRC" "$FAKE_TARGET/release/aub"
+        chmod +x "$FAKE_TARGET/release/aub"
+        ;;
+    metadata)
+        printf '{"target_directory":"%s"}' "$FAKE_TARGET"
+        ;;
+    *) exit 1 ;;
+esac
+FAKE
+    chmod +x "$fake_cargo"
+
+    local cases="$tmp/cases"
+    mkdir -p "$cases"
+    cat >"$cases/001-status.sh" <<'CASE'
+CASE_ID="001-status"
+case_steps() { step "status" "$AUB_BIN" status; }
+case_assertions() { assert_exit 0 1; assert_json_field 1 status ok; }
+CASE
+
+    local runs="$tmp/runs"
+    local out
+    out="$(PATH="$tmp:$PATH" FAKE_TARGET="$fake_target" FAKE_BIN_SRC="$fake_bin" \
+        AUB_BIN="$tmp/no-such-aub" CASES_DIR="$cases" RUNS_DIR="$runs" STATE_ROOT="$tmp/state" \
+        bash "$0" --state-dir "$tmp/state" --cases-dir "$cases" --runs-dir "$runs" 2>&1)"
+    local rc=$?
+    [ "$rc" -eq 0 ] || { echo "self-test: self-sufficient build run exited $rc: $out" >&2; rm -rf "$tmp"; return 1; }
+
+    [ -x "$fake_target/release/aub" ] || { echo "self-test: the runner did not build the binary" >&2; rm -rf "$tmp"; return 1; }
+    grep -q '"verdict": "pass"' "$runs"/*/summary.json || { echo "self-test: the built binary did not run the suite" >&2; rm -rf "$tmp"; return 1; }
+
+    rm -rf "$tmp"
+    echo "self-test: self-sufficient build ok"
+}
+
 self_test() {
     local overall=0
     self_test_basic || overall=1
@@ -1000,6 +1058,7 @@ self_test() {
     self_test_consistency || overall=1
     self_test_summary_parseback || overall=1
     self_test_timeout_and_signal || overall=1
+    self_test_self_sufficient_build || overall=1
     [ "$overall" -eq 0 ] && echo "self-test: ok"
     return "$overall"
 }
@@ -1041,7 +1100,20 @@ main() {
 
     refuse_if_operator_state
 
-    [ -x "$AUB_BIN" ] || die "release binary not found at $AUB_BIN; build it first (cargo build --release)"
+    # The runner is self-sufficient: a verification environment that runs the
+    # suite without a pre-built binary gets one built here, from the repo's own
+    # toolchain, so the gate cannot fail on a missing artifact. The build is
+    # skipped when the caller supplied a working binary (bin/checks/60-e2e
+    # pre-builds and passes AUB_BIN).
+    if [ ! -x "$AUB_BIN" ]; then
+        echo "run.sh: release binary not found at $AUB_BIN; building it (cargo build --release)" >&2
+        cargo build --release || die "cargo build --release failed"
+        # Ask cargo where it actually put the binary: CARGO_TARGET_DIR and
+        # ~/.cargo/config.toml can both move it away from target/release.
+        target_dir="$(cargo metadata --format-version 1 --no-deps | jq -r '.target_directory')"
+        AUB_BIN="$target_dir/release/aub"
+    fi
+    [ -x "$AUB_BIN" ] || die "release binary not found at $AUB_BIN after building"
 
     RUNNER_REVISION="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo unknown)"
     BINARY_REVISION="$("$AUB_BIN" 2>/dev/null | awk '{print $NF}' | tr -d '()' || echo unknown)"
