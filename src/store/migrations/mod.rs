@@ -11,6 +11,11 @@
 //! store module: one file per migration in this directory, a `pub mod` line
 //! below, and one entry in [`registry`]. The framework itself never changes for
 //! a new schema.
+//!
+//! This file is shared by every schema bead, so a bead adds its migration under
+//! reservation: reserve this file first, read the highest version already
+//! present, take the next one, append the module line and the registry entry,
+//! then commit path-scoped and release.
 
 use super::migrate::Migration;
 
@@ -25,10 +30,21 @@ mod migration_0001;
 #[path = "0002_sampling_lease.rs"]
 pub(crate) mod migration_0002;
 
+#[path = "0003_ledger_generation.rs"]
+pub(crate) mod migration_0003;
+
+#[path = "0004_session_account_marker.rs"]
+pub(crate) mod migration_0004;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
 /// is the registry production code reads.
 pub fn registry() -> Vec<Migration> {
-    vec![migration_0001::migration(), migration_0002::migration()]
+    vec![
+        migration_0001::migration(),
+        migration_0002::migration(),
+        migration_0003::migration(),
+        migration_0004::migration(),
+    ]
 }
