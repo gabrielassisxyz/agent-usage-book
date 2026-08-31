@@ -23,6 +23,7 @@ declared_checks=(
     50-prose-guard
     55-coefficient-tombstone
     60-e2e
+    65-synthetic-adapter-absent-from-release
     70-quantity-inventory
     75-commit-protocol
     78-pane-work-cycle
