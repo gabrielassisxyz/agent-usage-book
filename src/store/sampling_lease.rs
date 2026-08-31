@@ -608,7 +608,6 @@ mod tests {
                 .map(|i| {
                     let account = account.clone();
                     let scratch = &scratch;
-                    let clock = clock;
                     scope.spawn(move || {
                         let mut conn = open_second(scratch);
                         acquire(
@@ -652,7 +651,6 @@ mod tests {
                 .into_iter()
                 .map(|name| {
                     let scratch = &scratch;
-                    let clock = clock;
                     scope.spawn(move || {
                         let mut conn = open_second(scratch);
                         acquire(

@@ -273,6 +273,7 @@ fn zero_fraction() -> QuotaFractionPpm {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn window(key: &str, scope: WindowScope, used_ppm: i32, reset_nanos: i64) -> MeterWindow {
         MeterWindow::new(
@@ -389,11 +390,16 @@ mod tests {
             tighter_micros in 1i64..1_000_000i64,
         ) {
             let model = ModelId::new("model-a");
-            let base = window("base", WindowScope::AccountWide, 1_000_000 - base_remaining_ppm, 100);
+            let base = window(
+                "base",
+                WindowScope::AccountWide,
+                (1_000_000 - base_remaining_ppm).try_into().unwrap(),
+                100,
+            );
             let tighter = window(
                 "tighter",
                 WindowScope::ModelSpecific(model.clone()),
-                1_000_000 - tighter_remaining_ppm,
+                (1_000_000 - tighter_remaining_ppm).try_into().unwrap(),
                 100,
             );
             let calibrations = BTreeMap::from([

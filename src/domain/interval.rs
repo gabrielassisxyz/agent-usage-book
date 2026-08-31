@@ -174,6 +174,7 @@ impl<T: DomainQuantity> FromStr for Interval<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
     use std::cmp::Ordering;
 
     /// A test-only domain quantity over `f64`, so the arithmetic can be

@@ -265,6 +265,7 @@ fn push_json_string(output: &mut String, value: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     #[test]
     fn each_level_suppresses_only_events_above_its_threshold() {

@@ -128,15 +128,15 @@ mod tests {
             }
             let cells: Vec<&str> = line.split('|').map(|c| c.trim()).collect();
             // cells = ["", "#", "Invariant", "Enforcing path", "Test or constraint", ""]
-            if cells.len() >= 5 {
-                if let Ok(num) = cells[1].parse::<usize>() {
-                    rows.push(InvariantRow {
-                        number: num,
-                        invariant: cells[2].to_string(),
-                        enforcer: cells[3].to_string(),
-                        check: cells[4].to_string(),
-                    });
-                }
+            if cells.len() >= 5
+                && let Ok(num) = cells[1].parse::<usize>()
+            {
+                rows.push(InvariantRow {
+                    number: num,
+                    invariant: cells[2].to_string(),
+                    enforcer: cells[3].to_string(),
+                    check: cells[4].to_string(),
+                });
             }
             i += 1;
         }

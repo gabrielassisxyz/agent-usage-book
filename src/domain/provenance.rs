@@ -253,6 +253,7 @@ impl<T> Derived<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn evidence(ids: &[&str]) -> Vec<EvidenceId> {
         ids.iter().map(|s| EvidenceId::new(*s)).collect()

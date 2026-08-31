@@ -392,6 +392,7 @@ mod tests {
     use super::*;
     use crate::domain::failure::FailureClass;
     use crate::domain::time::UtcTimestamp;
+    use proptest::prelude::*;
 
     fn observed(value: u64) -> Observed<u64> {
         Observed::new(

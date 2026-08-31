@@ -172,6 +172,7 @@ impl std::ops::Mul<PercentagePoints> for CreditsPerPercentagePoint {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     /// A deterministic pseudo-random generator, the same construction `money.rs` uses,
     /// so property-style tests run over many values without a property-testing

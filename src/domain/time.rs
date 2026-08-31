@@ -490,6 +490,7 @@ impl Timeout {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn ts(seconds: i64) -> UtcTimestamp {
         UtcTimestamp::from_unix_nanos(seconds * 1_000_000_000)

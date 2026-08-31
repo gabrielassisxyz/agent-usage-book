@@ -265,6 +265,7 @@ impl UsageVector {
 mod tests {
     use super::*;
     use crate::evidence::{ComponentKind, EstimatorId};
+    use proptest::prelude::*;
 
     #[test]
     fn token_kind_all_has_exactly_four_variants() {
