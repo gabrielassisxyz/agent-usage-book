@@ -687,7 +687,8 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
                 &crate::store::connection::PragmaPolicy {
                     busy_timeout: config.sampling.request_timeout,
                 },
-            )?;
+            )
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
             logger.emit(
                 clock.now(),
                 DiagnosticEvent::RequestAttempted,
