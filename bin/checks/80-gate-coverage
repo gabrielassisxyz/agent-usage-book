@@ -47,6 +47,9 @@ declared_boundary_rules=(
     13-no-async-runtime-dependency
     14-parser-no-cost-or-meter
     15-status-no-migration
+    16-sql-only-in-store
+    17-provider-adapters-no-file-writes
+    18-no-system-clock-outside-time
 )
 
 # Mapping of check filenames to their required descriptive phrase in AGENTS.md:93-95

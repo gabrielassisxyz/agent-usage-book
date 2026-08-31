@@ -14,15 +14,37 @@ script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
+source "$script_dir/lib/module-files.sh"
+
 sources=()
-while IFS= read -r file; do
-    [ -n "$file" ] && sources+=("$file")
-done < <(find src -name '*.rs' -type f -not -path 'src/store/*' | sort)
+seen=()
+for item in src/*; do
+    name="$(basename "$item" .rs)"
+    case "$name" in
+        lib|main|bin|store) continue ;;
+    esac
+
+    # Deduplicate if both src/<name>.rs and src/<name>/ exist
+    if printf '%s\n' "${seen[@]:-}" | grep -qx "$name"; then
+        continue
+    fi
+    seen+=("$name")
+
+    while IFS= read -r file; do
+        [ -n "$file" ] && sources+=("$file")
+    done < <(module_files "$name")
+done
+
+# Also include src/lib.rs, src/main.rs and any binaries under src/bin/
+for extra in src/lib.rs src/main.rs src/bin/*.rs; do
+    [ -f "$extra" ] && sources+=("$extra")
+done
 
 if [ "${#sources[@]}" -eq 0 ]; then
     echo "sql-only-in-store: no source files found outside src/store/" >&2
     exit 2
 fi
+
 
 matches="$(grep -nHE '\b(SELECT|INSERT|UPDATE|DELETE|PRAGMA)\b|CREATE TABLE' "${sources[@]}" 2>/dev/null || true)"
 if [ -n "$matches" ]; then
