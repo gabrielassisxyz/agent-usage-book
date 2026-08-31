@@ -55,6 +55,7 @@ aub_command_enum! {
     LoggingFixture,
     StateCheck,
     ExitClass,
+    AttemptCrashHook,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -82,13 +83,14 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Status,
         Self::Spend,
         Self::Config,
         Self::LoggingFixture,
         Self::StateCheck,
         Self::ExitClass,
+        Self::AttemptCrashHook,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -181,6 +183,21 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::AttemptCrashHook => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook drives the store, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook names its own fixture account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook prints plain counts",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -194,6 +211,7 @@ impl Command {
             Command::LoggingFixture => "__logging-fixture",
             Command::StateCheck => "__state-check",
             Command::ExitClass => "__exit-class",
+            Command::AttemptCrashHook => "__attempt-crash-hook",
         }
     }
 
@@ -209,6 +227,7 @@ impl Command {
                 Some("print every resolved configuration key with the source that won")
             }
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
+            Command::AttemptCrashHook => None,
         }
     }
 
@@ -380,6 +399,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 None => Err(Error::Usage("__exit-class requires a class 0..=8".into())),
             }
         }
+        Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
     }
 }
 
@@ -700,6 +720,144 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
     open_store_then_emit_request_attempted?;
     println!("state directory ready");
     Ok(())
+}
+
+/// Test-only surface: the crash-injection hook for the two-stage meter attempt
+/// lifecycle (`aub-sth.6`, PLAN.md section 34.7). `__attempt-crash-hook start`
+/// commits the attempt start through the real store APIs and then aborts the
+/// process, so a test can prove exactly what survives a kill between the two
+/// commits: the start with no result. `complete` is the adjacent positive
+/// control, running start then result then a clean exit, and `read-back`
+/// reports what the database actually holds. Its fixture facts are stand-in
+/// rows so a crash can be injected at every stage of the write path without a
+/// live provider; the real due decision and policy resolution are later beads
+/// (`aub-me5.3`). Not part of the shipping command surface:
+/// `tests/e2e/command-surface.txt` deliberately excludes every `__`-prefixed
+/// hook, matching `__exit-class`/`__state-check`.
+fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let stage = invocation.rest.first().map(String::as_str).unwrap_or("");
+    if !matches!(stage, "start" | "complete" | "read-back") {
+        return Err(Error::Usage(format!(
+            "__attempt-crash-hook requires a stage (start | complete | read-back), got {stage:?}"
+        )));
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let outcome = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            let read_only = stage == "read-back";
+            let mut conn = crate::store::connection::open(
+                &config.state.dir.join("attempt-crash-hook.db"),
+                if read_only {
+                    crate::store::connection::AccessMode::ReadOnly
+                } else {
+                    crate::store::connection::AccessMode::ReadWrite
+                },
+                &crate::store::connection::PragmaPolicy {
+                    busy_timeout: config.sampling.request_timeout,
+                },
+            )?;
+            if read_only {
+                let starts: u64 = conn
+                    .query_row("SELECT count(*) FROM meter_attempt", [], |row| row.get(0))
+                    .map_err(|e| Error::Store(format!("cannot count attempts: {e}")))?;
+                let results: u64 = conn
+                    .query_row("SELECT count(*) FROM meter_attempt_result", [], |row| {
+                        row.get(0)
+                    })
+                    .map_err(|e| Error::Store(format!("cannot count results: {e}")))?;
+                println!("starts={starts} results={results}");
+                return Ok(());
+            }
+
+            crate::store::migrate::run_migrations(
+                &mut conn,
+                &crate::store::migrations::registry(),
+                None,
+                clock,
+            )?;
+
+            // Fixture facts the attempt row references, written through the
+            // real insert APIs so the lifecycle under test is the real one.
+            let account = crate::store::account::observe_account(
+                &conn,
+                "fixture-provider",
+                "fixture-account",
+                clock.now(),
+            )?;
+            let run = crate::store::sample_run::start_sample_run(
+                &conn,
+                crate::store::sample_run::Trigger::Manual,
+                clock.now(),
+                "__attempt-crash-hook",
+            )?;
+            let snapshot_policy = crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
+                ordinary_cadence: MonotonicDuration::from_millis(300_000),
+                freshness_horizon: MonotonicDuration::from_millis(900_000),
+                reset_edge_policy: "fixture".to_string(),
+                retry_backoff_policy: "fixture".to_string(),
+                command_budget: config.sampling.command_budget,
+                policy_algorithm_version: "fixture-1".to_string(),
+            };
+            let snapshot = crate::store::sampling_policy_snapshot::resolve_policy_snapshot(
+                &conn,
+                account,
+                clock.now(),
+                &snapshot_policy,
+            )?;
+
+            let started_at = clock.now();
+            let attempt = crate::store::meter_attempt::NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "fixture-provider".to_string(),
+                request_started_at: started_at,
+                credential_context_id: Some("fixture-credential-context".to_string()),
+                policy_snapshot_id: snapshot,
+                due_at: started_at,
+                due_reason: crate::store::meter_attempt::DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "fixture-endpoint-schema".to_string(),
+                meter_semantics_id: "fixture-meter-semantics".to_string(),
+            };
+            let row_id = crate::store::meter_attempt::start_meter_attempt(&conn, &attempt)?;
+
+            if stage == "start" {
+                // The crash-injection point: the start is durable, the result
+                // does not exist, and the process ends here by signal.
+                std::process::abort();
+            }
+
+            let mono_start = clock.monotonic_now();
+            let result = crate::store::meter_attempt::NewMeterAttemptResult {
+                attempt_id: row_id,
+                completed_at: clock.now(),
+                elapsed: clock
+                    .monotonic_now()
+                    .duration_since(mono_start)
+                    .max(MonotonicDuration::from_nanos(1)),
+                outcome: crate::domain::attempt::AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            };
+            crate::store::meter_attempt::record_meter_attempt_result(&conn, &result)?;
+            println!("attempt {} start and result written", row_id.value());
+            Ok(())
+        },
+    )?;
+    outcome
 }
 
 #[cfg(test)]
