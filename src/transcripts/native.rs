@@ -34,7 +34,7 @@
 //! May not depend on:
 //! - calibration, cost models, rate cards, task history, or meter observations
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde_json::Value;
 
@@ -44,7 +44,7 @@ use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenCount,
     TokenKind, UsageVector,
 };
-use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
+use crate::evidence::{ComponentKind, CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::transcripts::parser::{
     EvidenceClassification, FixtureCoverage, FixtureShape, InputFormatVersion,
     NormalizedUsageEvent, ParseOutput, ParserAdapter, ParserVersion, QuarantineClass,
@@ -61,22 +61,20 @@ pub const PI_NAMESPACE: &str = "pi";
 pub const FIXTURE_DIR: &str = "tests/fixtures/transcripts/native";
 
 /// A measured usage vector: the four known kinds plus any unknown components.
-fn measured_usage(
-    input: u64,
-    output: u64,
-    cache_read: u64,
-    cache_write: u64,
-    unknown: BTreeMap<String, TokenCount>,
-) -> UsageVector {
+fn measured_usage(counts: UsageCounts) -> UsageVector {
     UsageVector::new(
         KnownTokenVector::new(
-            InputTokens::new(input),
-            OutputTokens::new(output),
-            CacheReadTokens::new(cache_read),
-            CacheWriteTokens::new(cache_write),
+            InputTokens::new(counts.input),
+            OutputTokens::new(counts.output),
+            CacheReadTokens::new(counts.cache_read),
+            CacheWriteTokens::new(counts.cache_write),
         ),
-        unknown,
-        CoverageCompleteness::Complete,
+        counts.unknown,
+        if counts.missing.is_empty() {
+            CoverageCompleteness::Complete
+        } else {
+            CoverageCompleteness::partial(counts.missing)
+        },
         EvidenceQuality::Measured,
     )
 }
@@ -109,6 +107,17 @@ fn unknown_count(value: &Value) -> Option<u64> {
     }
 }
 
+/// The stable coverage component name for one known token kind. Source field
+/// names differ between CLIs, so coverage records the normalized kind instead.
+fn component_kind(kind: TokenKind) -> ComponentKind {
+    match kind {
+        TokenKind::Input => ComponentKind::new("input"),
+        TokenKind::Output => ComponentKind::new("output"),
+        TokenKind::CacheRead => ComponentKind::new("cache-read"),
+        TokenKind::CacheWrite => ComponentKind::new("cache-write"),
+    }
+}
+
 /// Extracts the four known kinds and the unknown components from a usage
 /// object.
 ///
@@ -123,23 +132,19 @@ fn extract_usage(
     ignored: &[&str],
     required: &[&str],
 ) -> Result<UsageCounts, QuarantineClass> {
-    let mut input = 0u64;
-    let mut output = 0u64;
-    let mut cache_read = 0u64;
-    let mut cache_write = 0u64;
-    let mut unknown = BTreeMap::new();
+    let mut counts = UsageCounts::default();
 
     for (key, value) in usage {
         let kind = known.iter().find(|(name, _)| *name == key).map(|(_, k)| *k);
         match kind {
-            Some(TokenKind::Input) => input = count_value(value)?,
-            Some(TokenKind::Output) => output = count_value(value)?,
-            Some(TokenKind::CacheRead) => cache_read = count_value(value)?,
-            Some(TokenKind::CacheWrite) => cache_write = count_value(value)?,
+            Some(TokenKind::Input) => counts.input = count_value(value)?,
+            Some(TokenKind::Output) => counts.output = count_value(value)?,
+            Some(TokenKind::CacheRead) => counts.cache_read = count_value(value)?,
+            Some(TokenKind::CacheWrite) => counts.cache_write = count_value(value)?,
             None if ignored.contains(&key.as_str()) => {}
             None => {
                 if let Some(count) = unknown_count(value) {
-                    unknown.insert(key.clone(), TokenCount::new(count));
+                    counts.unknown.insert(key.clone(), TokenCount::new(count));
                 }
             }
         }
@@ -151,7 +156,13 @@ fn extract_usage(
         }
     }
 
-    Ok((input, output, cache_read, cache_write, unknown))
+    for (field, kind) in known {
+        if !usage.contains_key(*field) && !required.contains(field) {
+            counts.missing.insert(component_kind(*kind));
+        }
+    }
+
+    Ok(counts)
 }
 
 /// The record-level context every source writes beside its counts: the record
@@ -212,10 +223,18 @@ fn session_id(namespace: &str, native: &str) -> SessionId {
 /// event identifier. The `cache_creation` ephemeral breakdown is a sub-detail
 /// of the cache write, not a separate kind; it is used only as a fallback when
 /// the total is absent.
-/// The four headline counts plus the per-kind breakdown a native-usage line
-/// yields. Named because the tuple appears in three signatures and clippy
-/// refuses a type this wide repeated inline.
-type UsageCounts = (u64, u64, u64, u64, BTreeMap<String, TokenCount>);
+/// The four headline counts plus unknown and absent components from one native
+/// usage record. A missing known kind stays zero in the numeric vector, but its
+/// coverage witness prevents that placeholder from being read as evidence.
+#[derive(Default)]
+struct UsageCounts {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    unknown: BTreeMap<String, TokenCount>,
+    missing: BTreeSet<ComponentKind>,
+}
 
 pub struct ClaudeCodeParser;
 
@@ -273,10 +292,14 @@ fn parse_claude_line(
     let Some(usage) = message.get("usage").and_then(Value::as_object) else {
         return Ok(None);
     };
-    let (input, output, cache_read, mut cache_write, unknown) =
-        extract_usage(usage, &CLAUDE_KNOWN, &CLAUDE_IGNORED, &["input_tokens"])?;
+    let mut counts = extract_usage(usage, &CLAUDE_KNOWN, &CLAUDE_IGNORED, &["input_tokens"])?;
     if !usage.contains_key("cache_creation_input_tokens") {
-        cache_write = claude_cache_write_fallback(usage)?;
+        if let Some(cache_write) = claude_cache_write_fallback(usage)? {
+            counts.cache_write = cache_write;
+            counts
+                .missing
+                .remove(&component_kind(TokenKind::CacheWrite));
+        }
     }
     let context = RecordContext {
         event_id: message.get("id").and_then(Value::as_str),
@@ -287,7 +310,7 @@ fn parse_claude_line(
             .map(|native| session_id(CLAUDE_CODE_NAMESPACE, native)),
     };
     Ok(Some(event(
-        measured_usage(input, output, cache_read, cache_write, unknown),
+        measured_usage(counts),
         location.file(),
         context,
         parser_version,
@@ -298,17 +321,19 @@ fn parse_claude_line(
 /// breakdown, which is the only place the figure then lives.
 fn claude_cache_write_fallback(
     usage: &serde_json::Map<String, Value>,
-) -> Result<u64, QuarantineClass> {
+) -> Result<Option<u64>, QuarantineClass> {
     let Some(breakdown) = usage.get("cache_creation").and_then(Value::as_object) else {
-        return Ok(0);
+        return Ok(None);
     };
     let mut sum = 0u64;
+    let mut found = false;
     for key in ["ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens"] {
         if let Some(value) = breakdown.get(key) {
             sum += count_value(value)?;
+            found = true;
         }
     }
-    Ok(sum)
+    Ok(found.then_some(sum))
 }
 
 /// The Codex transcript parser.
@@ -363,20 +388,18 @@ impl ParserAdapter for CodexParser {
             }
         }
         let events = last
-            .map(
-                |((input, output, cache_read, cache_write, unknown), occurred_at)| {
-                    event(
-                        measured_usage(input, output, cache_read, cache_write, unknown),
-                        location.file(),
-                        RecordContext {
-                            event_id: None,
-                            occurred_at,
-                            session,
-                        },
-                        self.parser_version(),
-                    )
-                },
-            )
+            .map(|(counts, occurred_at)| {
+                event(
+                    measured_usage(counts),
+                    location.file(),
+                    RecordContext {
+                        event_id: None,
+                        occurred_at,
+                        session,
+                    },
+                    self.parser_version(),
+                )
+            })
             .into_iter()
             .collect();
         ParseOutput::new(events, quarantined)
@@ -508,8 +531,7 @@ fn parse_pi_line(
     let Some(usage) = message.get("usage").and_then(Value::as_object) else {
         return Ok(PiLine::Nothing);
     };
-    let (input, output, cache_read, cache_write, unknown) =
-        extract_usage(usage, &PI_KNOWN, &PI_IGNORED, &["input"])?;
+    let counts = extract_usage(usage, &PI_KNOWN, &PI_IGNORED, &["input"])?;
     let context = RecordContext {
         event_id: message
             .get("id")
@@ -519,7 +541,7 @@ fn parse_pi_line(
         session,
     };
     Ok(PiLine::Usage(Box::new(event(
-        measured_usage(input, output, cache_read, cache_write, unknown),
+        measured_usage(counts),
         location.file(),
         context,
         parser_version,
@@ -739,27 +761,125 @@ mod tests {
         }
     }
 
-    /// Each fixture parses to its golden output: the expected event and
-    /// quarantine counts.
+    /// Each fixture parses to its golden output: every event's normalized token
+    /// vector and the expected quarantine count.
     #[test]
     fn each_fixture_parses_to_its_golden_output() {
-        let cases: [(&str, &dyn ParserAdapter, usize, usize); 11] = [
-            ("claude-real-shape.jsonl", &ClaudeCodeParser, 3, 0),
-            ("codex-real-shape.jsonl", &CodexParser, 1, 0),
-            ("pi-real-shape.jsonl", &PiParser, 2, 0),
-            ("claude-simple-session.jsonl", &ClaudeCodeParser, 2, 0),
-            ("claude-nested-subagent.jsonl", &ClaudeCodeParser, 1, 0),
-            ("codex-truncated.jsonl", &CodexParser, 1, 1),
-            ("pi-partial-final.jsonl", &PiParser, 1, 1),
-            ("claude-malformed.jsonl", &ClaudeCodeParser, 1, 1),
-            ("pi-model-change.jsonl", &PiParser, 2, 0),
-            ("codex-cache.jsonl", &CodexParser, 1, 0),
-            ("pi-no-usage.jsonl", &PiParser, 0, 0),
+        type ExpectedUsage = (u64, u64, u64, u64);
+        let cases: [(&str, &dyn ParserAdapter, &[ExpectedUsage], usize); 11] = [
+            (
+                "claude-real-shape.jsonl",
+                &ClaudeCodeParser,
+                &[
+                    (2, 913, 26_503, 30_011),
+                    (2, 1_188, 26_503, 30_011),
+                    (4, 41, 12_000, 0),
+                ],
+                0,
+            ),
+            (
+                "codex-real-shape.jsonl",
+                &CodexParser,
+                &[(34_830, 404, 19_200, 0)],
+                0,
+            ),
+            (
+                "pi-real-shape.jsonl",
+                &PiParser,
+                &[(19_221, 302, 0, 0), (20_001, 150, 512, 64)],
+                0,
+            ),
+            (
+                "claude-simple-session.jsonl",
+                &ClaudeCodeParser,
+                &[(1_200, 340, 0, 0), (800, 210, 0, 0)],
+                0,
+            ),
+            (
+                "claude-nested-subagent.jsonl",
+                &ClaudeCodeParser,
+                &[(100, 50, 0, 0)],
+                0,
+            ),
+            (
+                "codex-truncated.jsonl",
+                &CodexParser,
+                &[(100, 50, 20, 10)],
+                1,
+            ),
+            ("pi-partial-final.jsonl", &PiParser, &[(100, 50, 20, 10)], 1),
+            (
+                "claude-malformed.jsonl",
+                &ClaudeCodeParser,
+                &[(100, 50, 0, 0)],
+                1,
+            ),
+            (
+                "pi-model-change.jsonl",
+                &PiParser,
+                &[(100, 50, 0, 0), (200, 100, 0, 0)],
+                0,
+            ),
+            ("codex-cache.jsonl", &CodexParser, &[(200, 100, 40, 20)], 0),
+            ("pi-no-usage.jsonl", &PiParser, &[], 0),
         ];
-        for (fixture, parser, events, quarantined) in cases {
+        for (fixture, parser, expected, quarantined) in cases {
             let output = parser.parse(&read_fixture(fixture), &SourceLocation::new(fixture, 1));
-            assert_eq!(output.events().len(), events, "fixture {fixture}");
+            let actual: Vec<ExpectedUsage> = output
+                .events()
+                .iter()
+                .map(|event| {
+                    let known = event.usage().known();
+                    (
+                        known.input().value(),
+                        known.output().value(),
+                        known.cache_read().value(),
+                        known.cache_write().value(),
+                    )
+                })
+                .collect();
+            assert_eq!(actual, expected, "fixture {fixture}");
             assert_eq!(output.quarantined().len(), quarantined, "fixture {fixture}");
+        }
+    }
+
+    /// A missing optional field keeps its numeric placeholder at zero while its
+    /// coverage names the absent kinds. Explicit zero values are complete data.
+    #[test]
+    fn absent_optional_known_fields_are_partial_not_measured_zero() {
+        let missing = CoverageCompleteness::partial([
+            ComponentKind::new("output"),
+            ComponentKind::new("cache-read"),
+            ComponentKind::new("cache-write"),
+        ]);
+        let cases: [(&dyn ParserAdapter, &str, &str); 3] = [
+            (
+                &ClaudeCodeParser,
+                r#"{"message":{"usage":{"input_tokens":1}}}"#,
+                r#"{"message":{"usage":{"input_tokens":1,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            ),
+            (
+                &CodexParser,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1}}}}"#,
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":1,"output_tokens":0,"cached_input_tokens":0,"cache_write_input_tokens":0}}}}"#,
+            ),
+            (
+                &PiParser,
+                r#"{"message":{"usage":{"input":1}}}"#,
+                r#"{"message":{"usage":{"input":1,"output":0,"cacheRead":0,"cacheWrite":0}}}"#,
+            ),
+        ];
+
+        for (parser, absent, explicit_zero) in cases {
+            let absent = parser.parse(absent, &location());
+            assert_eq!(absent.events().len(), 1);
+            assert_eq!(absent.events()[0].usage().coverage(), &missing);
+            let explicit_zero = parser.parse(explicit_zero, &location());
+            assert_eq!(explicit_zero.events().len(), 1);
+            assert_eq!(
+                explicit_zero.events()[0].usage().coverage(),
+                &CoverageCompleteness::Complete
+            );
         }
     }
 
