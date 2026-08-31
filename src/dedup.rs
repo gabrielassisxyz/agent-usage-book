@@ -23,8 +23,10 @@
 //! the others are earlier snapshots of the same message.
 //!
 //! The database uniqueness constraint over `(source_namespace, native_event_id)` is
-//! the final authority for the strong domain; the heuristic domain's constraint is
-//! scoped per parser. Both land with the table that carries them, in `aub-lqe.8`.
+//! the final authority for the strong domain; `(parser_version, heuristic_key)`, scoped
+//! per parser, is the final authority for the heuristic domain. Both are enforced by
+//! `usage_occurrence` (`crate::store::usage_occurrence`); `aub-lqe.8` adds the table's
+//! remaining occurrence metadata once `usage_event` exists to reference.
 //!
 //! May not depend on:
 //! - presentation
