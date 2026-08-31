@@ -673,13 +673,21 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
         &file_path,
     )?;
 
-    // The closure below stands in for a real command's first network-touching call.
-    // `run_after_state_check` never invokes it unless the check above already
-    // succeeded, which is what makes the ordering provable rather than assumed.
-    let emit_request_attempted = crate::store::startup::run_after_state_check(
+    // The closure below follows the real store-open path before standing in for a
+    // mutating command's first network-touching call. `run_after_state_check` never
+    // invokes either operation unless readiness already succeeded, which makes the
+    // ordering provable rather than assumed.
+    let open_store_then_emit_request_attempted = crate::store::startup::run_after_state_check(
         &config.state.dir,
         &crate::store::startup::ProcMounts,
         || {
+            let _store = crate::store::connection::open(
+                &config.state.dir.join("state-check.db"),
+                crate::store::connection::AccessMode::ReadWrite,
+                &crate::store::connection::PragmaPolicy {
+                    busy_timeout: config.sampling.request_timeout,
+                },
+            )?;
             logger.emit(
                 clock.now(),
                 DiagnosticEvent::RequestAttempted,
@@ -687,7 +695,7 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
             )
         },
     )?;
-    emit_request_attempted
+    open_store_then_emit_request_attempted
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     println!("state directory ready");
     Ok(())

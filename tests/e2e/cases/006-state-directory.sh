@@ -6,7 +6,7 @@
 # refusal happened before any network access rather than merely alongside it.
 
 CASE_ID="006-state-directory"
-CASE_DESCRIPTION="__state-check refuses an unwritable state directory with the store-failure class and logs no request-attempted event."
+CASE_DESCRIPTION="__state-check refuses an unwritable state directory before a request, and opens its state database at mode 0600 on the permitted path."
 
 BLOCKED_STATE_DIR=""
 
@@ -27,6 +27,10 @@ case_steps() {
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$BLOCKED_STATE_DIR" \
         "$AUB_BIN" __state-check
+    step "create secured state database" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_STATE_DIR=$STATE_DIR/ready" \
+        "$AUB_BIN" __state-check
 }
 
 case_assertions() {
@@ -37,6 +41,16 @@ case_assertions() {
         CASE_FAILED=1
     else
         record_assertion "no request_attempted event logged" "absent" "absent" "pass"
+    fi
+
+    assert_exit 0 2
+    local database_mode
+    database_mode="$(stat -c %a "$STATE_DIR/ready/state-check.db")"
+    if [ "$database_mode" = "600" ]; then
+        record_assertion "state database mode" "600" "$database_mode" "pass"
+    else
+        record_assertion "state database mode" "600" "$database_mode" "fail"
+        CASE_FAILED=1
     fi
 
     # Restore removability before the run directory is pruned or inspected by hand;
