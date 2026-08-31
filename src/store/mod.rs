@@ -23,3 +23,5 @@ pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
 pub mod session_account_marker;
 pub mod startup;
+pub mod transcript_file;
+pub mod usage_occurrence;
