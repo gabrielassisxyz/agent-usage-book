@@ -217,7 +217,7 @@ pub fn execute_single(
         .timeout_read(read_dur);
 
     // ureq derives the socket read timeout from the overall deadline whenever one is
-    // set, discarding timeout_read entirely — so a budget-derived total would silently
+    // set, discarding timeout_read entirely - so a budget-derived total would silently
     // disable the per-read timeout. Only a total the request itself declared becomes
     // ureq's deadline; the budget is enforced by the is_expired checks around the call,
     // and connect/read are already clipped to the remaining budget above.
