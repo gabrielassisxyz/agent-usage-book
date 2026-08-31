@@ -1,0 +1,49 @@
+{
+  "formats": {
+    "claude-code": {
+      "input_format_version": "claude-code-jsonl-v1",
+      "real_capture": "claude-real-shape.jsonl",
+      "shapes": {
+        "SimpleSession": { "fixture": "claude-simple-session.jsonl" },
+        "NestedSubagentPaths": { "fixture": "claude-nested-subagent.jsonl" },
+        "TruncatedFile": { "fixture": "claude-truncated.jsonl" },
+        "PartiallyWrittenFinalRecord": { "fixture": "claude-partial-final.jsonl" },
+        "FileRotation": { "not_applicable": "file rotation is a discovery and ingestion concern; the parser normalizes one file's content and never sees the rotation boundary" },
+        "MalformedRecords": { "fixture": "claude-malformed.jsonl" },
+        "ModelChangeMidSession": { "fixture": "claude-model-change.jsonl" },
+        "CacheReadsAndWrites": { "fixture": "claude-cache.jsonl" },
+        "NoNativeUsageField": { "fixture": "claude-no-usage.jsonl" }
+      }
+    },
+    "codex": {
+      "input_format_version": "codex-jsonl-v1",
+      "real_capture": "codex-real-shape.jsonl",
+      "shapes": {
+        "SimpleSession": { "fixture": "codex-simple-session.jsonl" },
+        "NestedSubagentPaths": { "fixture": "codex-nested-subagent.jsonl" },
+        "TruncatedFile": { "fixture": "codex-truncated.jsonl" },
+        "PartiallyWrittenFinalRecord": { "fixture": "codex-partial-final.jsonl" },
+        "FileRotation": { "not_applicable": "file rotation is a discovery and ingestion concern; the parser normalizes one file's content and never sees the rotation boundary" },
+        "MalformedRecords": { "fixture": "codex-malformed.jsonl" },
+        "ModelChangeMidSession": { "fixture": "codex-model-change.jsonl" },
+        "CacheReadsAndWrites": { "fixture": "codex-cache.jsonl" },
+        "NoNativeUsageField": { "fixture": "codex-no-usage.jsonl" }
+      }
+    },
+    "pi": {
+      "input_format_version": "pi-jsonl-v1",
+      "real_capture": "pi-real-shape.jsonl",
+      "shapes": {
+        "SimpleSession": { "fixture": "pi-simple-session.jsonl" },
+        "NestedSubagentPaths": { "fixture": "pi-nested-subagent.jsonl" },
+        "TruncatedFile": { "fixture": "pi-truncated.jsonl" },
+        "PartiallyWrittenFinalRecord": { "fixture": "pi-partial-final.jsonl" },
+        "FileRotation": { "not_applicable": "file rotation is a discovery and ingestion concern; the parser normalizes one file's content and never sees the rotation boundary" },
+        "MalformedRecords": { "fixture": "pi-malformed.jsonl" },
+        "ModelChangeMidSession": { "fixture": "pi-model-change.jsonl" },
+        "CacheReadsAndWrites": { "fixture": "pi-cache.jsonl" },
+        "NoNativeUsageField": { "fixture": "pi-no-usage.jsonl" }
+      }
+    }
+  }
+}

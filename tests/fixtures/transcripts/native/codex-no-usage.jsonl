@@ -1,0 +1,2 @@
+{"timestamp":"2026-08-25T10:00:00Z","type":"session_meta","payload":{"type":null,"id":"codex-no-usage-1","cwd":"/work/project"}}
+{"timestamp":"2026-08-25T10:01:00Z","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{}}}

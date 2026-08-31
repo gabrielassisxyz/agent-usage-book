@@ -1,0 +1,2 @@
+{"type":"assistant","message":{"id":"msg_0001","model":"claude-opus-4","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":20,"cache_creation_input_tokens":10}},"timestamp":"2026-08-25T10:00:00Z","uuid":"uuid-0001"}
+{"type":"assistant","message":{"id":"msg_0002","model":"claude-opus-4","usage":{"input_tokens":200,"output_tokens":100,"cache_read_input_tokens":40,"cache_creation_input_tokens":20}},"timestamp":"2026-08-25T10:01:00Z","uuid":"uuid-0002"}

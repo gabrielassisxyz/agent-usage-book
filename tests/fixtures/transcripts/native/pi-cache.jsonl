@@ -1,0 +1,3 @@
+{"type":"session","id":"pi-cache-1","timestamp":"2026-08-25T10:00:00Z"}
+{"type":"message","id":"rec-0001","timestamp":"2026-08-25T10:01:00Z","message":{"role":"assistant","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"reasoning":5,"totalTokens":185}}}
+{"type":"message","id":"rec-0002","timestamp":"2026-08-25T10:02:00Z","message":{"role":"assistant","usage":{"input":200,"output":100,"cacheRead":40,"cacheWrite":20,"reasoning":10,"totalTokens":370}}}

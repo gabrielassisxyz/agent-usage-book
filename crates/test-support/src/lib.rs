@@ -20,6 +20,7 @@ pub mod evidence;
 pub mod fixture;
 pub mod log_events;
 pub mod rng;
+pub mod sanitization;
 pub mod state_dir;
 
 pub use binary::aub_binary_in;
@@ -31,4 +32,5 @@ pub use evidence::{
 pub use fixture::{fixture_path, load_fixture};
 pub use log_events::{LogEvent, assert_event};
 pub use rng::{Rng, Seed, check_property};
+pub use sanitization::{FORBIDDEN_PATTERNS, matched_patterns};
 pub use state_dir::StateDir;
