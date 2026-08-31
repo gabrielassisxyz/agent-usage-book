@@ -8,6 +8,7 @@
 pub mod discovery;
 pub mod native;
 pub mod parser;
+pub mod watermark;
 
 pub use discovery::{DiscoveryError, DiscoveryOptions, SourceDiscovery, discover};
 pub use native::{ClaudeCodeParser, CodexParser, PiParser};
@@ -29,3 +30,4 @@ pub use parser::{
     ParserAdapter, ParserVersion, QuarantineClass, QuarantineRecord, SourceLocation,
     assert_mutation_outcome, verify_fixture_coverage,
 };
+pub use watermark::{ChangeClass, FileState, Watermark, classify, last_complete_line_offset};
