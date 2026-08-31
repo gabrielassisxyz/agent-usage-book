@@ -197,8 +197,19 @@ mod tests {
             }
             let bead_id = parts[1];
             let issues_path = format!("{base_dir}/.beads/issues.jsonl");
-            let issues_content = fs::read_to_string(&issues_path)
-                .map_err(|e| format!("cannot read .beads/issues.jsonl: {e}"))?;
+            let issues_content = match fs::read_to_string(&issues_path) {
+                Ok(content) => content,
+                // `.beads/` is gitignored machine-local state (AGENTS.md), so it is
+                // absent in a clean clone, including the isolation clone
+                // bin/bead-close-verified uses. Skip the tracker-membership check
+                // for this row rather than fail a clone for lacking machine state;
+                // wherever the file exists, this check still runs and still fails
+                // hard (validation_fails_when_a_named_unenforced_bead_is_absent_from_a_present_tracker
+                // proves it against a fixture tracker, independent of whether this
+                // machine happens to have a live one).
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) => return Err(format!("cannot read .beads/issues.jsonl: {e}")),
+            };
             let mut found = false;
             let mut is_open = false;
             for line in issues_content.lines() {
@@ -287,6 +298,15 @@ mod tests {
             .expect("docs/INVARIANTS.md must be readable");
         let rows = parse_invariant_rows(&docs);
 
+        let tracker_path = format!("{manifest_dir}/.beads/issues.jsonl");
+        if !std::path::Path::new(&tracker_path).exists() {
+            eprintln!(
+                "every_invariant_names_existing_file_and_test_or_open_tracker_bead: \
+                 {tracker_path} absent (gitignored, machine-local); skipping the \
+                 tracker-membership check for unenforced rows in this run"
+            );
+        }
+
         let mut enforced_count = 0;
         let mut unenforced_count = 0;
 
@@ -307,6 +327,112 @@ mod tests {
             docs.contains(&format!("{unenforced_count} are unenforced")),
             "docs/INVARIANTS.md summary count mismatch: expected {unenforced_count} unenforced"
         );
+    }
+
+    /// A scratch directory holding nothing but a minimal `.beads/issues.jsonl`, so a test
+    /// can prove the tracker-membership check against a fixture without depending on this
+    /// machine's live tracker state.
+    struct ScratchTrackerDir(std::path::PathBuf);
+
+    impl ScratchTrackerDir {
+        fn with_issues(jsonl: &str) -> Self {
+            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            let suffix = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!(
+                "aub-lib-invariant-tracker-test-{}-{suffix}",
+                std::process::id()
+            ));
+            let beads_dir = dir.join(".beads");
+            fs::create_dir_all(&beads_dir).expect("scratch .beads dir must be creatable");
+            fs::write(beads_dir.join("issues.jsonl"), jsonl)
+                .expect("scratch issues.jsonl must be writable");
+            Self(dir)
+        }
+
+        fn path(&self) -> &str {
+            self.0.to_str().expect("scratch path must be valid UTF-8")
+        }
+    }
+
+    impl Drop for ScratchTrackerDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A clean clone has no `.beads/` at all (gitignored, machine-local per AGENTS.md).
+    /// An unenforced row must not error there: the `NotFound` arm classifies it
+    /// unenforced without asserting tracker membership, which is exactly what lets
+    /// `bin/ci` reach green on a fresh clone.
+    #[test]
+    fn validation_skips_the_tracker_check_when_no_beads_directory_exists_at_all() {
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let suffix = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aub-lib-invariant-no-tracker-test-{}-{suffix}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let row = InvariantRow {
+            number: 99,
+            invariant: "Fake invariant".to_string(),
+            enforcer: "unenforced aub-anything".to_string(),
+            check: "(some test)".to_string(),
+        };
+        let result = validate_invariant_row(&row, dir.to_str().unwrap());
+        let _ = fs::remove_dir_all(&dir);
+        assert_eq!(result, Ok(false));
+    }
+
+    /// Proves absence-tolerance for a missing tracker file (see the `NotFound` arm in
+    /// `validate_invariant_row`) cannot silently disable the check: wherever
+    /// `.beads/issues.jsonl` does exist, a row naming a bead id absent from it still
+    /// fails, with the id in the message.
+    #[test]
+    fn validation_fails_when_a_named_unenforced_bead_is_absent_from_a_present_tracker() {
+        let scratch = ScratchTrackerDir::with_issues("{\"id\":\"aub-real\",\"status\":\"open\"}\n");
+        let row = InvariantRow {
+            number: 99,
+            invariant: "Fake invariant".to_string(),
+            enforcer: "unenforced aub-does-not-exist".to_string(),
+            check: "(some test)".to_string(),
+        };
+        let result = validate_invariant_row(&row, scratch.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("aub-does-not-exist"), "{err}");
+    }
+
+    /// The same present-tracker fixture, but the row's bead is closed rather than absent:
+    /// still a hard failure, naming the bead.
+    #[test]
+    fn validation_fails_when_a_named_unenforced_bead_is_closed_in_a_present_tracker() {
+        let scratch =
+            ScratchTrackerDir::with_issues("{\"id\":\"aub-done\",\"status\":\"closed\"}\n");
+        let row = InvariantRow {
+            number: 99,
+            invariant: "Fake invariant".to_string(),
+            enforcer: "unenforced aub-done".to_string(),
+            check: "(some test)".to_string(),
+        };
+        let result = validate_invariant_row(&row, scratch.path());
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("aub-done"), "{err}");
+        assert!(err.contains("closed"), "{err}");
+    }
+
+    /// The positive case for the same fixture shape: an open, present bead validates.
+    #[test]
+    fn validation_passes_when_a_named_unenforced_bead_is_open_in_a_present_tracker() {
+        let scratch = ScratchTrackerDir::with_issues("{\"id\":\"aub-real\",\"status\":\"open\"}\n");
+        let row = InvariantRow {
+            number: 99,
+            invariant: "Fake invariant".to_string(),
+            enforcer: "unenforced aub-real".to_string(),
+            check: "(some test)".to_string(),
+        };
+        assert_eq!(validate_invariant_row(&row, scratch.path()), Ok(false));
     }
 
     /// Planted negative: changing an enforcer path to a non-existent file causes validation to fail.
