@@ -1106,7 +1106,7 @@ main() {
     # skipped when the caller supplied a working binary (bin/checks/60-e2e
     # pre-builds and passes AUB_BIN).
     if [ ! -x "$AUB_BIN" ]; then
-        echo "run.sh: release binary not found at $AUB_BIN; building it (cargo build --release)" >&2
+        echo "e2e runner: release binary not found at $AUB_BIN; building it (cargo build --release)" >&2
         cargo build --release || die "cargo build --release failed"
         # Ask cargo where it actually put the binary: CARGO_TARGET_DIR and
         # ~/.cargo/config.toml can both move it away from target/release.

@@ -22,8 +22,14 @@ fi
 
 # The release binary is what the runner drives: the properties under test include
 # exit statuses, stream separation and the behaviour of a process that starts and
-# exits, none of which a library call proves.
-cargo build --release
+# exits, none of which a library call proves. A failed build must fail the check
+# here, loudly: without this, the runner would be invoked against a missing binary
+# and the resulting error would be attributed to the runner rather than to the
+# commit that broke the crate.
+cargo build --release || {
+    echo "==> e2e FAILED (release build failed; the crate must compile before the suite can run)" >&2
+    exit 1
+}
 
 # Ask cargo where it actually put the binary: bin/ci points CARGO_TARGET_DIR at a
 # per-worktree directory and ~/.cargo/config.toml points it at a shared build disk,
