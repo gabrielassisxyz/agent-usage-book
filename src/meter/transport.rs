@@ -216,7 +216,14 @@ pub fn execute_single(
         .timeout_connect(connect_dur)
         .timeout_read(read_dur);
 
-    if let Some(total) = effective_timeouts.total_timeout {
+    // ureq derives the socket read timeout from the overall deadline whenever one is
+    // set, discarding timeout_read entirely — so a budget-derived total would silently
+    // disable the per-read timeout. Only a total the request itself declared becomes
+    // ureq's deadline; the budget is enforced by the is_expired checks around the call,
+    // and connect/read are already clipped to the remaining budget above.
+    if request.timeouts.total_timeout.is_some()
+        && let Some(total) = effective_timeouts.total_timeout
+    {
         agent_builder = agent_builder.timeout(Duration::from_nanos(total.as_nanos()));
     }
 
@@ -299,13 +306,9 @@ fn map_transport_error(err: &ureq::Transport) -> FailureClass {
     let msg = err.to_string().to_lowercase();
     match err.kind() {
         ureq::ErrorKind::Dns => FailureClass::DnsFailure,
-        ureq::ErrorKind::ConnectionFailed => {
-            if msg.contains("timeout") || msg.contains("timed out") {
-                FailureClass::ConnectTimeout
-            } else {
-                FailureClass::ConnectTimeout
-            }
-        }
+        // Refused and timed-out connects share a class on purpose: FailureClass has no
+        // refused variant, and callers only distinguish connect-phase from read-phase.
+        ureq::ErrorKind::ConnectionFailed => FailureClass::ConnectTimeout,
         ureq::ErrorKind::Io => {
             if msg.contains("connect") && (msg.contains("timeout") || msg.contains("timed out")) {
                 FailureClass::ConnectTimeout
@@ -580,9 +583,10 @@ mod tests {
             "read timeout must produce FailureClass::ReadTimeout"
         );
         let min_read = 40_000_000u128; // 40ms
-        let max_read = 60_000_000u128 + SHUTDOWN_TOLERANCE.as_nanos();
+        let max_read = 60_000_000u128 + u128::from(SHUTDOWN_TOLERANCE.as_nanos());
         assert!(
-            elapsed_read.as_nanos() >= min_read && elapsed_read.as_nanos() <= max_read,
+            u128::from(elapsed_read.as_nanos()) >= min_read
+                && u128::from(elapsed_read.as_nanos()) <= max_read,
             "read timeout elapsed {elapsed_read:?} out of expected range {min_read}..={max_read}ns"
         );
 
@@ -610,9 +614,10 @@ mod tests {
             "expired command budget must produce FailureClass::TotalBudgetExpired"
         );
         let min_budget = 40_000_000u128; // 40ms
-        let max_budget = 60_000_000u128 + SHUTDOWN_TOLERANCE.as_nanos();
+        let max_budget = 60_000_000u128 + u128::from(SHUTDOWN_TOLERANCE.as_nanos());
         assert!(
-            elapsed_budget.as_nanos() >= min_budget && elapsed_budget.as_nanos() <= max_budget,
+            u128::from(elapsed_budget.as_nanos()) >= min_budget
+                && u128::from(elapsed_budget.as_nanos()) <= max_budget,
             "budget timeout elapsed {elapsed_budget:?} out of expected range {min_budget}..={max_budget}ns"
         );
     }
