@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Gate: the synthetic provider adapter (aub-me5.1) never reaches a release binary.
+# Design: `src/meter/synthetic.rs` is declared `#[cfg(test)]` in `src/meter.rs`, so
+#   the compiler excludes it entirely from a non-test build.
+# Detection, two layers:
+#   1. A structural check that the `#[cfg(test)]` attribute immediately precedes
+#      `pub mod synthetic;` in src/meter.rs. This is the check that can actually
+#      fail: `[profile.release] strip = true` (Cargo.toml) strips the symbol table
+#      from every release binary, and dead-code elimination removes an unreferenced
+#      module's code whether or not it carries a `cfg` gate at all (verified while
+#      writing this check: dropping the attribute with no call site added anywhere
+#      still produced a clean release binary, because nothing reachable from `main`
+#      referenced the module). A binary-contents check alone cannot be proven to
+#      go red, so it is not the primary mechanism.
+#   2. A search of the built release binary's strings for the synthetic adapter's
+#      distinctive panic message, which exists nowhere else in the crate. A string
+#      literal survives symbol stripping (it lives in .rodata), so this catches the
+#      one scenario layer 1 cannot: the module correctly ungated *and* made
+#      reachable from a real call site.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+cd "$repo_root"
+
+meter_mod="src/meter.rs"
+needle="synthetic adapter script exhausted"
+
+if [ ! -f "$meter_mod" ]; then
+    echo "synthetic-adapter-absent-from-release: no $meter_mod" >&2
+    exit 2
+fi
+
+# The attribute must appear on the line immediately before the module
+# declaration: `grep -B1` over an exact match on the declaration line, checked
+# for the attribute in the line above it.
+declaration_line="$(grep -n '^pub mod synthetic;$' "$meter_mod" | head -1 | cut -d: -f1)"
+if [ -z "$declaration_line" ]; then
+    echo "synthetic-adapter-absent-from-release: no 'pub mod synthetic;' declaration in $meter_mod" >&2
+    exit 2
+fi
+attribute_line=$((declaration_line - 1))
+attribute="$(sed -n "${attribute_line}p" "$meter_mod")"
+if [ "$attribute" != "#[cfg(test)]" ]; then
+    echo "src/meter.rs: 'pub mod synthetic;' (line $declaration_line) is not preceded by #[cfg(test)]" >&2
+    echo "  found instead: '$attribute'" >&2
+    exit 1
+fi
+
+cargo build --release || {
+    echo "==> synthetic-adapter-absent-from-release FAILED (release build failed)" >&2
+    exit 1
+}
+
+target_dir="$(cargo metadata --format-version 1 --no-deps | jq -r '.target_directory')"
+aub_bin="$target_dir/release/aub"
+
+if [ ! -x "$aub_bin" ]; then
+    echo "synthetic-adapter-absent-from-release: no release binary at $aub_bin" >&2
+    exit 2
+fi
+
+if strings "$aub_bin" | grep -qF "$needle"; then
+    echo "the synthetic adapter's panic message was found in the release binary:" >&2
+    echo "  $aub_bin" >&2
+    exit 1
+fi
+
+echo "synthetic-adapter-absent-from-release: gated in source and absent from the release binary."
