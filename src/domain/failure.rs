@@ -203,43 +203,68 @@ mod tests {
 
     #[test]
     fn total_budget_expiry_is_recorded_as_unreachable_with_a_timeout_class_not_omitted() {
-        use super::super::attempt::AttemptOutcome;
-
-        let outcome = AttemptOutcome::Unreachable(FailureClass::TotalBudgetExpired);
-        match outcome {
-            AttemptOutcome::Unreachable(FailureClass::TotalBudgetExpired) => {}
-            AttemptOutcome::Success | AttemptOutcome::AuthRequired => {
-                panic!("expected Unreachable(TotalBudgetExpired), got a different outcome kind")
-            }
-            other @ AttemptOutcome::Unreachable(_) => {
-                panic!("expected Unreachable(TotalBudgetExpired), got {other:?}")
-            }
-        }
+        // The production mapping is the recording decision: budget expiry must
+        // stay visible as an unreachable source retaining its own class, so a
+        // report can say an unfinished source was attempted and timed out, never
+        // that it was omitted (aub-knw7 rewrote this to call the mapper instead of
+        // constructing the expected value it matched back).
+        let mapped = to_stale_reason(FailureClass::TotalBudgetExpired);
+        assert_eq!(
+            mapped,
+            StaleReason::SourceUnreachable(FailureClass::TotalBudgetExpired)
+        );
     }
 
     /// Not every 403 means authentication: an ambiguous status is recorded as an
     /// ordinary unreachable failure, never automatically upgraded to AuthRequired.
     /// That upgrade, when a provider's contract says it is warranted, is the adapter's
-    /// decision, made outside this module.
+    /// decision, made outside this module. The input is fed through the production
+    /// freshness state machine, the component where an auth upgrade would actually
+    /// appear, so the guarantee covers the real decision and not a value this test
+    /// built to match itself (aub-knw7).
     #[test]
     fn an_ambiguous_403_is_not_classified_as_authentication_by_default() {
-        use super::super::attempt::AttemptOutcome;
+        use crate::domain::attempt::{AttemptId, AttemptOutcome, AttemptResult, AttemptStarted};
+        use crate::domain::freshness::{
+            Freshness, FreshnessInput, LatestAttempt, compute_freshness,
+        };
+        use crate::domain::time::{ClockSkewEnvelope, FakeClock, MonotonicDuration, UtcTimestamp};
 
-        let ambiguous_403 =
-            AttemptOutcome::Unreachable(FailureClass::HttpStatus(HttpStatusClass::ClientError));
-        match ambiguous_403 {
-            AttemptOutcome::Unreachable(FailureClass::HttpStatus(HttpStatusClass::ClientError)) => {
-            }
-            AttemptOutcome::AuthRequired => {
-                panic!("an ambiguous HTTP status must never be auto-classified as auth required")
-            }
-            AttemptOutcome::Success => {
-                panic!("expected Unreachable(HttpStatus(ClientError)), got Success")
-            }
-            other @ AttemptOutcome::Unreachable(_) => {
-                panic!("expected Unreachable(HttpStatus(ClientError)), got {other:?}")
-            }
-        }
+        let ctx = crate::domain::ids::CredentialContextId::new("ctx-403");
+        let started = AttemptStarted::new(AttemptId::new(1), UtcTimestamp::from_unix_nanos(1_000));
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Unreachable(FailureClass::HttpStatus(HttpStatusClass::ClientError)),
+        );
+        let input = FreshnessInput::new(
+            None,
+            None,
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            MonotonicDuration::from_seconds(60),
+            MonotonicDuration::from_seconds(10),
+            ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10)),
+        );
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000));
+
+        let freshness: Freshness<u64> = compute_freshness(&input, &clock);
+
+        let Freshness::Stale {
+            last_good: None,
+            reason,
+            ..
+        } = freshness
+        else {
+            panic!("an ambiguous client error must never be auto-classified as auth required")
+        };
+        assert_eq!(
+            reason,
+            StaleReason::SourceUnreachable(FailureClass::HttpStatus(HttpStatusClass::ClientError)),
+            "the ambiguous status must surface as an unreachable source, never as auth"
+        );
     }
 
     #[test]

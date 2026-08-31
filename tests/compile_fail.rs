@@ -78,30 +78,54 @@ fn regeneration_procedure_is_documented() {
     );
 }
 
-/// The coverage list must name every case in design section 34.1, so a case cannot be
-/// dropped from the document while remaining in the design.
+/// The example lines the design states inside `text` fences of section 34.1,
+/// parsed from the upstream document itself so a case added upstream changes
+/// the set this test demands instead of disappearing against a hardcoded copy
+/// (aub-knw7). The exhaustiveness consequence is prose, not a fenced example;
+/// its coverage is anchored to `aub-ai3.2` in the coverage document rather
+/// than matched by text.
+fn section_34_1_example_lines() -> Vec<String> {
+    let plan = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/PLAN.md"))
+        .expect("docs/PLAN.md must be readable");
+    let start = plan
+        .find("## 34.1")
+        .expect("PLAN.md must contain design section 34.1");
+    let rest = &plan[start..];
+    let end = rest[1..].find("\n## ").map(|i| i + 1).unwrap_or(rest.len());
+    let section = &rest[..end];
+
+    let mut inside_fence = false;
+    let mut cases = Vec::new();
+    for line in section.lines() {
+        if line.trim_start().starts_with("```") {
+            inside_fence = !inside_fence;
+            continue;
+        }
+        if inside_fence {
+            let case = line.trim();
+            if !case.is_empty() {
+                cases.push(case.to_string());
+            }
+        }
+    }
+    assert!(
+        cases.len() >= 11,
+        "the section 34.1 parse lost example rows: only {cases:?}"
+    );
+    cases
+}
+
+/// The coverage list must name every case the design section states, including
+/// a case the design adds later: the checked set comes from parsing the section,
+/// not from a hand copy.
 #[test]
 fn coverage_list_names_every_section_34_1_case() {
-    const CASES: [&str; 12] = [
-        "TokenCount + Credits",
-        "QuotaUsed + Money",
-        "Credits passed to formatter",
-        "QuotaRemaining passed as QuotaUsed",
-        "USD added to another currency",
-        "unwrap_or_default",
-        "bare Display",
-        "WindowCalibration outside",
-        "CostModel without an observed TokenKind",
-        "combine Measured and Estimated",
-        "Derivation::Unavailable",
-        "exhaustive model construction",
-    ];
     let doc = Path::new(env!("CARGO_MANIFEST_DIR")).join("docs/compile-fail-coverage.md");
     let contents =
         fs::read_to_string(&doc).expect("docs/compile-fail-coverage.md must be readable");
-    for case in CASES {
+    for case in section_34_1_example_lines() {
         assert!(
-            contents.contains(case),
+            contents.contains(&case),
             "coverage list does not name case: {case}"
         );
     }

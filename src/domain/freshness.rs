@@ -413,59 +413,95 @@ mod tests {
     /// A 503 after a good observation yields Stale carrying the last good reading and
     /// a reason naming the status. There is no HTTP layer in this module, so "a 503"
     /// is represented the way this bead's own vocabulary represents it: an
-    /// unreachable source, reported through StaleReason::SourceUnreachable.
+    /// unreachable source, reported through StaleReason::SourceUnreachable. The
+    /// input is fed through the production state machine, so the assertion covers
+    /// what `compute_freshness` actually decides and not a value this test built
+    /// itself (aub-knw7).
     #[test]
     fn a_failure_after_a_good_observation_yields_stale_with_last_good_and_a_named_reason() {
+        let ctx = CredentialContextId::new("ctx-503");
+        let horizon = MonotonicDuration::from_seconds(300);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
         let last_good = observed(42);
-        let fresh_before = Freshness::Fresh {
-            observed: last_good.clone(),
-            latest_attempt: AttemptId::new(1),
-        };
-        assert_eq!(fresh_before.kind(), FreshnessKind::Fresh);
+        let started = AttemptStarted::new(AttemptId::new(2), UtcTimestamp::from_unix_nanos(2_000));
+        let result = AttemptResult::new(
+            AttemptId::new(2),
+            UtcTimestamp::from_unix_nanos(2_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Unreachable(FailureClass::HttpStatus(
+                crate::domain::failure::HttpStatusClass::ServerError,
+            )),
+        );
 
-        let stale_after = Freshness::Stale {
-            last_good: Some(last_good.clone()),
-            latest_attempt: AttemptId::new(2),
-            reason: StaleReason::SourceUnreachable(FailureClass::DnsFailure),
-        };
+        let input = FreshnessInput::new(
+            Some(last_good.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+        let clock = crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(3_000));
 
-        match stale_after {
-            Freshness::Stale {
-                last_good: Some(good),
-                reason: StaleReason::SourceUnreachable(FailureClass::DnsFailure),
-                ..
-            } => {
-                assert_eq!(good, last_good);
-            }
-            Freshness::Fresh { .. } | Freshness::AuthRequired { .. } => {
-                panic!("expected Stale with last_good and a named reason, got a different kind")
-            }
-            other @ Freshness::Stale { .. } => {
-                panic!("expected Stale with last_good and a named reason, got {other:?}")
-            }
-        }
+        let stale = compute_freshness(&input, &clock);
+
+        assert_eq!(stale.kind(), FreshnessKind::Stale);
+        let Freshness::Stale {
+            last_good: Some(good),
+            latest_attempt,
+            reason: StaleReason::SourceUnreachable(FailureClass::HttpStatus(_)),
+        } = stale
+        else {
+            panic!("expected Stale with last_good and a reason naming the status");
+        };
+        assert_eq!(good, last_good);
+        assert_eq!(latest_attempt, AttemptId::new(2));
     }
 
-    /// A 503 before any success yields Stale with no value at all.
+    /// A 503 before any success yields Stale with no value at all. Computed
+    /// through the production state machine (aub-knw7), not constructed here.
     #[test]
     fn a_failure_before_any_success_yields_stale_with_no_value() {
-        let stale = Freshness::<u64>::Stale {
-            last_good: None,
-            latest_attempt: AttemptId::new(1),
-            reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
-        };
+        let ctx = CredentialContextId::new("ctx-503-first");
+        let horizon = MonotonicDuration::from_seconds(60);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(10));
+        let started = AttemptStarted::new(AttemptId::new(1), UtcTimestamp::from_unix_nanos(1_000));
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(1_000),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Unreachable(FailureClass::HttpStatus(
+                crate::domain::failure::HttpStatusClass::ServerError,
+            )),
+        );
 
-        match stale {
-            Freshness::Stale {
-                last_good: None, ..
-            } => {}
-            Freshness::Fresh { .. } | Freshness::AuthRequired { .. } => {
-                panic!("expected Stale with no last_good, got a different kind")
-            }
-            other @ Freshness::Stale { .. } => {
-                panic!("expected Stale with no last_good, got {other:?}")
-            }
-        }
+        let input = FreshnessInput::new(
+            None,
+            None,
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+        let clock = crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(2_000));
+
+        let stale: Freshness<u64> = compute_freshness(&input, &clock);
+
+        let Freshness::Stale {
+            last_good: None,
+            latest_attempt,
+            ..
+        } = stale
+        else {
+            panic!("expected Stale with no value at all before any success");
+        };
+        assert_eq!(latest_attempt, AttemptId::new(1));
     }
 
     #[test]
