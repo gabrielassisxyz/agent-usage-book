@@ -22,6 +22,7 @@ pub mod log_events;
 pub mod rng;
 pub mod sanitization;
 pub mod state_dir;
+pub mod synthetic_server;
 
 pub use binary::aub_binary_in;
 pub use clock::{Clock, FakeClock, SystemClock};
@@ -34,3 +35,6 @@ pub use log_events::{LogEvent, assert_event};
 pub use rng::{Rng, Seed, check_property};
 pub use sanitization::{FORBIDDEN_PATTERNS, matched_patterns};
 pub use state_dir::StateDir;
+pub use synthetic_server::{
+    RecordedRequest, ScriptedOutcome, ScriptedResponseBody, SyntheticServer, SyntheticServerError,
+};
