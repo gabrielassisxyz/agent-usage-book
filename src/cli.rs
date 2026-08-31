@@ -687,17 +687,17 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
                 &crate::store::connection::PragmaPolicy {
                     busy_timeout: config.sampling.request_timeout,
                 },
-            )
-            .map_err(|error| std::io::Error::other(error.to_string()))?;
-            logger.emit(
-                clock.now(),
-                DiagnosticEvent::RequestAttempted,
-                &[("command", &command)],
-            )
+            )?;
+            logger
+                .emit(
+                    clock.now(),
+                    DiagnosticEvent::RequestAttempted,
+                    &[("command", &command)],
+                )
+                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))
         },
     )?;
-    open_store_then_emit_request_attempted
-        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    open_store_then_emit_request_attempted?;
     println!("state directory ready");
     Ok(())
 }
