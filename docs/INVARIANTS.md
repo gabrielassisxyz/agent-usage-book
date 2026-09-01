@@ -37,7 +37,7 @@ same thing in both documents.
 | 6 | A failed source never produces zero. | src/domain/freshness.rs | tests::a_failure_before_any_success_yields_stale_with_no_value |
 | 7 | A historical value is never presented without its actual observation time. | src/domain/freshness.rs | tests::a_failure_after_a_good_observation_yields_stale_with_last_good_and_a_named_reason |
 | 8 | Provider credentials are resolved from named-account configuration, never accidental ambient state. | src/auth.rs | tests::file_kind_resolves_to_material_and_context_id |
-| 9 | All replay deduplication passes through one semantic event-identity framework and database uniqueness constraint. | unenforced aub-lqe.7 | (dedup collision test) |
+| 9 | All replay deduplication passes through one semantic event-identity framework and database uniqueness constraint. | src/store/usage_occurrence.rs | tests::a_duplicate_strong_identity_fails_the_direct_insert |
 | 10 | Unknown token components block complete conversions. | unenforced aub-ai3.2 | (fail-closed conversion test) |
 | 11 | Cost-model coefficients and window calibrations are distinct versioned witnesses. | src/domain/provenance.rs | tests::witness_identifier_types_are_distinct |
 | 12 | Calibrated values have immutable IDs and no consumer-side literals. | unenforced aub-c0b.13 | (single-source calibration proof) |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 10 are enforced by mechanical checks present at HEAD (file paths and tests), and 17 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 11 are enforced by mechanical checks present at HEAD (file paths and tests), and 16 are unenforced and tracked by open beads in the tracker.
