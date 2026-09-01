@@ -3,15 +3,15 @@
 /target
 
 # >>> repo-harness:gitignore-private-boundary >>>
-# Maintainer notes — not part of the project; they live in the private notes repo,
+# Maintainer notes - not part of the project; they live in the private notes repo,
 # reachable through the `local` symlink. NO trailing slash on any path in this block:
 # a worktree materializes these paths as SYMLINKS, and a `foo/` pattern matches a real
-# directory only — the ignore then keeps working in the main tree and silently fails
+# directory only - the ignore then keeps working in the main tree and silently fails
 # in every worktree.
 /local
 
 # Environment secrets and the per-machine agent sandbox config. `.env.*` covers the
-# variants a real session produces — `.env.local`, and above all the `.env.bak.<epoch>`
+# variants a real session produces - `.env.local`, and above all the `.env.bak.<epoch>`
 # an editor or a script leaves behind. One of those sat untracked in a repo for weeks:
 # the pre-commit secret scan only reads what is staged, so a secret nobody stages is a
 # secret nobody scans, and `.env` alone does not match it.
@@ -43,6 +43,10 @@
 # the upstream accounts. All three are facts about one machine at one moment, so committing them
 # would put another machine's pane ids and one afternoon's rate-limit counters in every checkout.
 /.ntm
+
+# Exception: .ntm/marching-orders.md is force-added and tracked on purpose (lw-zi84). The runbook
+# is orders, not runtime state - the settled-before-arming lines must survive in history, and that
+# bead's recovery path says the runbook lines are text in git.
 
 # The beads compliance audit's own directory. It is a separate repository with its own
 # history (one commit per verification pass) that lives inside this tree so the scorecards
