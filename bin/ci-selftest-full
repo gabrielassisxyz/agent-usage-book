@@ -245,7 +245,7 @@ batch_verify_close_mutant "deleted evidence description" "$clone" "batch-verify 
 # tracker is touched. Otherwise a verified close could make the next gate red.
 clone="$scratch/batch-verify-close-invariant-duty"
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
-grep -v 'If an unenforced row still names that bead' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
+grep -v 'unenforced row still names that bead, the wave refuses to close it' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
 mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
 batch_verify_close_mutant "deleted invariant-close duty" "$clone" "invariant rows travel with a close"
 
