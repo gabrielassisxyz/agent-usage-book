@@ -186,7 +186,20 @@ mod tests {
         invariants
     }
 
-    fn validate_invariant_row(row: &InvariantRow, base_dir: &str) -> Result<bool, String> {
+    const INVARIANT_TRACKER_MEMBERSHIP_SKIPPED_MARKER: &str =
+        "[INVARIANT_TRACKER_MEMBERSHIP_SKIPPED]";
+
+    #[derive(Debug, PartialEq, Eq)]
+    enum InvariantRowValidation {
+        Enforced,
+        Unenforced,
+        TrackerMembershipSkipped,
+    }
+
+    fn validate_invariant_row(
+        row: &InvariantRow,
+        base_dir: &str,
+    ) -> Result<InvariantRowValidation, String> {
         if row.enforcer.starts_with("unenforced") {
             let parts: Vec<&str> = row.enforcer.split_whitespace().collect();
             if parts.len() < 2 {
@@ -207,7 +220,9 @@ mod tests {
                 // hard (validation_fails_when_a_named_unenforced_bead_is_absent_from_a_present_tracker
                 // proves it against a fixture tracker, independent of whether this
                 // machine happens to have a live one).
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(InvariantRowValidation::TrackerMembershipSkipped);
+                }
                 Err(e) => return Err(format!("cannot read .beads/issues.jsonl: {e}")),
             };
             let mut found = false;
@@ -233,7 +248,7 @@ mod tests {
                     row.number
                 ));
             }
-            Ok(false) // unenforced
+            Ok(InvariantRowValidation::Unenforced)
         } else {
             let path = format!("{base_dir}/{}", row.enforcer);
             let file_path = std::path::Path::new(&path);
@@ -252,7 +267,7 @@ mod tests {
                     row.number, test_identifier, row.enforcer
                 ));
             }
-            Ok(true) // enforced
+            Ok(InvariantRowValidation::Enforced)
         }
     }
 
@@ -298,24 +313,30 @@ mod tests {
             .expect("docs/INVARIANTS.md must be readable");
         let rows = parse_invariant_rows(&docs);
 
-        let tracker_path = format!("{manifest_dir}/.beads/issues.jsonl");
-        if !std::path::Path::new(&tracker_path).exists() {
-            eprintln!(
-                "every_invariant_names_existing_file_and_test_or_open_tracker_bead: \
-                 {tracker_path} absent (gitignored, machine-local); skipping the \
-                 tracker-membership check for unenforced rows in this run"
-            );
-        }
-
         let mut enforced_count = 0;
         let mut unenforced_count = 0;
+        let mut tracker_membership_skipped = false;
 
         for row in &rows {
             match validate_invariant_row(row, manifest_dir) {
-                Ok(true) => enforced_count += 1,
-                Ok(false) => unenforced_count += 1,
+                Ok(InvariantRowValidation::Enforced) => enforced_count += 1,
+                Ok(InvariantRowValidation::Unenforced) => unenforced_count += 1,
+                Ok(InvariantRowValidation::TrackerMembershipSkipped) => {
+                    tracker_membership_skipped = true;
+                    unenforced_count += 1;
+                }
                 Err(err) => panic!("{err}"),
             }
+        }
+
+        if tracker_membership_skipped {
+            let tracker_path = format!("{manifest_dir}/.beads/issues.jsonl");
+            eprintln!(
+                "{INVARIANT_TRACKER_MEMBERSHIP_SKIPPED_MARKER} \
+                 every_invariant_names_existing_file_and_test_or_open_tracker_bead: \
+                 {tracker_path} absent (gitignored, machine-local); skipping the \
+                 tracker-membership check for unenforced rows in this run"
+            );
         }
 
         assert_eq!(enforced_count + unenforced_count, rows.len());
@@ -381,7 +402,11 @@ mod tests {
         };
         let result = validate_invariant_row(&row, dir.to_str().unwrap());
         let _ = fs::remove_dir_all(&dir);
-        assert_eq!(result, Ok(false));
+        assert_eq!(result, Ok(InvariantRowValidation::TrackerMembershipSkipped));
+        eprintln!(
+            "{INVARIANT_TRACKER_MEMBERSHIP_SKIPPED_MARKER} fixture run: \
+             absent .beads/issues.jsonl skipped tracker membership"
+        );
     }
 
     /// Proves absence-tolerance for a missing tracker file (see the `NotFound` arm in
@@ -403,23 +428,24 @@ mod tests {
         assert!(err.contains("aub-does-not-exist"), "{err}");
     }
 
-    /// The same present-tracker fixture, but the row's bead is closed rather than absent:
-    /// still a hard failure, naming the bead.
+    /// Regression pin for the closed-bead row that made a previously verified HEAD red.
     #[test]
-    fn validation_fails_when_a_named_unenforced_bead_is_closed_in_a_present_tracker() {
+    fn validation_rejects_the_closed_lqe_7_fixture_with_the_regression_message() {
         let scratch =
-            ScratchTrackerDir::with_issues("{\"id\":\"aub-done\",\"status\":\"closed\"}\n");
+            ScratchTrackerDir::with_issues("{\"id\":\"aub-lqe.7\",\"status\":\"closed\"}\n");
         let row = InvariantRow {
-            number: 99,
+            number: 9,
             invariant: "Fake invariant".to_string(),
-            enforcer: "unenforced aub-done".to_string(),
+            enforcer: "unenforced aub-lqe.7".to_string(),
             check: "(some test)".to_string(),
         };
-        let result = validate_invariant_row(&row, scratch.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(err.contains("aub-done"), "{err}");
-        assert!(err.contains("closed"), "{err}");
+        assert_eq!(
+            validate_invariant_row(&row, scratch.path()),
+            Err(
+                "invariant 9 names unenforced bead aub-lqe.7 which is closed in tracker"
+                    .to_string()
+            )
+        );
     }
 
     /// The positive case for the same fixture shape: an open, present bead validates.
@@ -432,7 +458,10 @@ mod tests {
             enforcer: "unenforced aub-real".to_string(),
             check: "(some test)".to_string(),
         };
-        assert_eq!(validate_invariant_row(&row, scratch.path()), Ok(false));
+        assert_eq!(
+            validate_invariant_row(&row, scratch.path()),
+            Ok(InvariantRowValidation::Unenforced)
+        );
     }
 
     /// Planted negative: changing an enforcer path to a non-existent file causes validation to fail.

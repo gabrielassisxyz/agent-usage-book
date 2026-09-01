@@ -241,6 +241,21 @@ grep -v 'Batch-verify evidence lives directly in' "$clone/AGENTS.md" > "$clone/A
 mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
 batch_verify_close_mutant "deleted evidence description" "$clone" "batch-verify evidence location and audit"
 
+# Conformance, deleting the invariant-close refusal sentence must fail before the scratch
+# tracker is touched. Otherwise a verified close could make the next gate red.
+clone="$scratch/batch-verify-close-invariant-duty"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+grep -v 'If an unenforced row still names that bead' "$clone/AGENTS.md" > "$clone/AGENTS.md.mutant"
+mv "$clone/AGENTS.md.mutant" "$clone/AGENTS.md"
+batch_verify_close_mutant "deleted invariant-close duty" "$clone" "invariant rows travel with a close"
+
+# Integration, disabling the fixture guard must make the check report that an unchanged
+# invariant row was allowed through rather than reaching the scratch close command.
+clone="$scratch/batch-verify-close-invariant-guard"
+git clone --quiet --local --no-hardlinks "$repo_root" "$clone"
+sed -i 's/if command grep -qF -- "| unenforced \$candidate_bead |" "\$table"; then/if false; then/' "$clone/bin/checks/80-batch-verify-close"
+batch_verify_close_mutant "disabled invariant-close guard" "$clone" "wave allowed a close while an unenforced invariant row named the bead"
+
 # Integration, corrupting the scratch close command
 clone="$scratch/batch-verify-close-bad-command"
 git clone --quiet --local --no-hardlinks "$repo_root" "$clone"

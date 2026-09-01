@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # The batch-verify close protocol guard (aub-h1nx): AGENTS.md must document a Phase 2 close
-# procedure that the installed tracker accepts, name where batch-verify evidence lives,
-# how it is audited, and why structured gate reporting was dropped rather than configured.
+# procedure that the installed tracker accepts, refuses to close a bead that remains named
+# as unenforced in the invariants table, names where batch-verify evidence lives, how it is
+# audited, and why structured gate reporting was dropped rather than configured.
 #
 # Two halves, following the pattern of bin/checks/75-commit-protocol and bin/checks/78-pane-work-cycle:
 #   conformance  asserts the document drops the refused `br gate report` command, gives the
 #                supported `br close` command with `--reason` and `--transition-comment`,
 #                validates that the documented close flags are accepted by the installed `br`,
-#                names where evidence lives and how to query it, and records why the structured
-#                gate was dropped instead of configured.
+#                requires the invariant-row update duty, names where evidence lives and how to
+#                query it, and records why the structured gate was dropped instead of configured.
 #   integration  runs the documented close procedure on a scratch tracker against a bead in
-#                `batch_pending`, asserting that the bead closes successfully and that the
-#                evidence is recorded in `close_reason` and comment fields retrievable by `br show`.
+#                `batch_pending`, asserting that the wave refuses a still-unenforced row, then
+#                closes only after the fixture row and summary counts are updated.
 set -uo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
@@ -66,6 +67,11 @@ forbid "the refused gate report command is dropped" "$phase2" \
 
 require "the supported close command is printed" "$phase2" \
     'br close <id> --reason "<evidence>" --transition-comment "<batch summary>"'
+
+require "invariant rows travel with a close" "$phase2" \
+    'If an unenforced row still names that bead, the wave refuses to close it' \
+    'same commit series that flips the row to its enforcing path and check' \
+    'updates both enforcement-summary counts'
 
 # Verify that the flags documented in AGENTS.md are accepted by the installed `br`.
 #
@@ -143,11 +149,51 @@ fi
 (cd "$scratch" && br update "$bead_id" --status in_progress >/dev/null)
 (cd "$scratch" && br update "$bead_id" --status batch_pending >/dev/null)
 
+invariants="$scratch/docs/INVARIANTS.md"
+mkdir -p "$(dirname "$invariants")"
+cat > "$invariants" <<EOF
+| # | Invariant | Enforcing path | Test or constraint |
+|---:|---|---|---|
+| 9 | Scratch close invariant. | unenforced $bead_id | (scratch invariant test) |
+
+## Enforcement status
+
+Of the 1 invariants above, 0 are enforced by mechanical checks present at HEAD, and 1 are unenforced and tracked by open beads in the tracker.
+EOF
+
+assert_invariant_summary_matches_rows() { # $1 = INVARIANTS fixture
+    local table="$1" enforced unenforced
+    enforced="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 !~ /unenforced/ { count += 1 } END { print count + 0 }' "$table")"
+    unenforced="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced/ { count += 1 } END { print count + 0 }' "$table")"
+    if ! command grep -qF -- "$enforced are enforced" "$table" || ! command grep -qF -- "$unenforced are unenforced" "$table"; then
+        echo "integration: invariant summary does not match fixture rows" >&2
+        return 1
+    fi
+}
+
+wave_close_allows_bead() { # $1 = bead id, $2 = INVARIANTS fixture
+    local candidate_bead="$1" table="$2"
+    if command grep -qF -- "| unenforced $candidate_bead |" "$table"; then
+        echo "integration: refusing close: $candidate_bead remains named by an unenforced invariant row" >&2
+        return 1
+    fi
+    assert_invariant_summary_matches_rows "$table"
+}
+
 # Run the documented close command
 evidence="commit:0123456789abcdef suites:unit,integration,e2e"
 batch_summary="batch 42: union green across 5 beads"
 
-if ! (cd "$scratch" && br close "$bead_id" --reason "$evidence" --transition-comment "$batch_summary" >/dev/null 2>&1); then
+if wave_close_allows_bead "$bead_id" "$invariants" >/dev/null 2>&1; then
+    echo "integration: wave allowed a close while an unenforced invariant row named the bead" >&2
+    fail=1
+fi
+
+sed -i "s@| unenforced $bead_id |@| src/lib.rs |@; s@0 are enforced@1 are enforced@; s@1 are unenforced@0 are unenforced@" "$invariants"
+
+if ! wave_close_allows_bead "$bead_id" "$invariants"; then
+    fail=1
+elif ! (cd "$scratch" && br close "$bead_id" --reason "$evidence" --transition-comment "$batch_summary" >/dev/null 2>&1); then
     echo "integration: documented close command failed on batch_pending bead" >&2
     fail=1
 fi
@@ -178,4 +224,4 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
-echo "batch-verify-close: the Phase 2 close command is accepted by br, evidence location is documented and auditable, and scratch close succeeds."
+echo "batch-verify-close: the wave refuses an unchanged invariant row, then closes after its row and summary update; evidence remains documented and auditable."

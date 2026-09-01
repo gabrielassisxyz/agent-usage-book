@@ -317,6 +317,12 @@ panes at once is the bottleneck the whole model exists to remove.
    wrote with fresh eyes and fix what that reading finds. `batch_pending` earns no capability credit; it frees
    claim capacity.
 
+   **An invariant row travels with its bead.** If `docs/INVARIANTS.md` names the bead as
+   unenforced, prepare the same commit series to flip that row to its enforcing path and
+   check, and update both enforcement-summary counts. The Phase 2 close evidence must point
+   at that series; a later hand edit would make the verified revision and the tracker state
+   disagree.
+
    **Then read the status back.** `br update --status` takes free text and validates
    nothing: `--status batch_pendign` is accepted, prints a normal transition line, and
    leaves the bead in a state no query names. It is gone from `in_progress`, so nobody
@@ -370,7 +376,10 @@ score. The moment agents are scored on commits you get commit pumping.
    The verdict is recorded at step 5 after a green verification run and written to
    `.beads/last-verify`. It is machine-local and does not reach CI or another clone, giving
    panes a zero-compilation way to query central verification freshness.
-6. Close only green `batch_pending` beads, citing the verification run:
+6. Before closing a green `batch_pending` bead, inspect `docs/INVARIANTS.md`. If an
+   unenforced row still names that bead, the wave refuses to close it. The close's evidence
+   must point at the same commit series that flips the row to its enforcing path and check
+   and updates both enforcement-summary counts. Only then close, citing the verification run:
 
    ```bash
    br close <id> --reason "<evidence>" --transition-comment "<batch summary>"

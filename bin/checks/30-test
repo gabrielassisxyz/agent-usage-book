@@ -1,3 +1,21 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cargo test
+# Passing tests normally hide their captured stderr. Keep the invariant skip marker in
+# the gate transcript so a clean clone cannot look as if tracker membership was checked.
+set +e
+test_output="$(cargo test -- --nocapture 2>&1)"
+test_status=$?
+set -e
+printf '%s\n' "$test_output"
+
+if [ "$test_status" -ne 0 ]; then
+    exit "$test_status"
+fi
+
+case "$test_output" in
+    *"[INVARIANT_TRACKER_MEMBERSHIP_SKIPPED]"*) ;;
+    *)
+        echo "invariant tracker-membership skip marker was not surfaced by cargo test" >&2
+        exit 1
+        ;;
+esac
