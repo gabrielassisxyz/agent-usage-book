@@ -16,8 +16,9 @@ use std::collections::BTreeMap;
 use rusqlite::params;
 
 use crate::attribution::{
-    emit_task_kind_candidates, resolve_task_kind, ResolvedTaskKind, TaskIdentityState, TaskKind,
-    TaskKindCandidate, TaskKindMapping, TaskKindOrigin, TrackerTaskReader, TrackerTaskRecord,
+    ResolvedTaskKind, TaskIdentityState, TaskKind, TaskKindCandidate, TaskKindMapping,
+    TaskKindOrigin, TrackerTaskReader, TrackerTaskRecord, emit_task_kind_candidates,
+    resolve_task_kind,
 };
 use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
 use crate::error::Error;
@@ -44,7 +45,9 @@ impl TrackerTaskReader for BeadsTaskKindReader<'_> {
         let mut statement = self
             .connection
             .prepare("SELECT id, issue_type FROM issues ORDER BY id")
-            .map_err(|error| Error::IngestIncomplete(format!("cannot read tracker issues: {error}")))?;
+            .map_err(|error| {
+                Error::IngestIncomplete(format!("cannot read tracker issues: {error}"))
+            })?;
         let mut tasks: Vec<TrackerTaskRecord> = statement
             .query_map([], |row| {
                 Ok(TrackerTaskRecord {
@@ -53,7 +56,9 @@ impl TrackerTaskReader for BeadsTaskKindReader<'_> {
                     labels: Vec::new(),
                 })
             })
-            .map_err(|error| Error::IngestIncomplete(format!("cannot query tracker issues: {error}")))?
+            .map_err(|error| {
+                Error::IngestIncomplete(format!("cannot query tracker issues: {error}"))
+            })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 Error::IngestIncomplete(format!("cannot decode tracker issue: {error}"))
@@ -62,10 +67,16 @@ impl TrackerTaskReader for BeadsTaskKindReader<'_> {
         let mut statement = self
             .connection
             .prepare("SELECT issue_id, label FROM labels ORDER BY issue_id, label")
-            .map_err(|error| Error::IngestIncomplete(format!("cannot read tracker labels: {error}")))?;
+            .map_err(|error| {
+                Error::IngestIncomplete(format!("cannot read tracker labels: {error}"))
+            })?;
         let mut label_rows = statement
-            .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))
-            .map_err(|error| Error::IngestIncomplete(format!("cannot query tracker labels: {error}")))?
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(|error| {
+                Error::IngestIncomplete(format!("cannot query tracker labels: {error}"))
+            })?
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| {
                 Error::IngestIncomplete(format!("cannot decode tracker label: {error}"))
@@ -164,7 +175,13 @@ pub fn rebuild_task_identities(
     let mut written = 0u64;
     for (task_source, task_native, candidates) in &groups {
         let resolved = resolve_task_kind(candidates, mapping);
-        insert_identity(&transaction, task_source, task_native, resolved, mapping.version())?;
+        insert_identity(
+            &transaction,
+            task_source,
+            task_native,
+            resolved,
+            mapping.version(),
+        )?;
         written += 1;
     }
     transaction
@@ -210,7 +227,7 @@ fn read_candidate_groups(
         let candidate = TaskKindCandidate {
             task_id: TaskId::new(
                 SourceNamespace::new(task_source.clone()),
-                crate::domain::ids::NativeTaskId::new(task_native.clone()),
+                NativeTaskId::new(task_native.clone()),
             ),
             origin,
             raw_value,
@@ -232,20 +249,15 @@ fn insert_identity(
     resolved: ResolvedTaskKind,
     normalization_version: u32,
 ) -> Result<(), Error> {
-    let (state, kind, winner, evidence) = match resolved {
+    let state = resolved.state().state_label();
+    let (kind, winner, evidence) = match resolved {
         ResolvedTaskKind::Resolved {
             kind,
             winner,
             evidence,
-        } => (
-            resolved.state().state_label(),
-            Some(kind.as_str()),
-            Some(winner.provenance_id()),
-            evidence,
-        ),
-        ResolvedTaskKind::Unknown { evidence }
-        | ResolvedTaskKind::Conflict { evidence } => {
-            (resolved.state().state_label(), None, None, evidence)
+        } => (Some(kind.as_str()), Some(winner.provenance_id()), evidence),
+        ResolvedTaskKind::Unknown { evidence } | ResolvedTaskKind::Conflict { evidence } => {
+            (None, None, evidence)
         }
     };
     connection
@@ -266,19 +278,6 @@ fn insert_identity(
         )
         .map(|_| ())
         .map_err(|error| Error::Store(format!("cannot insert task identity: {error}")))
-}
-
-/// The typed identity states a persisted row can carry. A bare string never
-/// represents a resolved identity: these variants cross module boundaries, and
-/// the distribution contract is expressed in them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TaskIdentityState {
-    /// Resolved to the kind carried alongside.
-    Resolved,
-    /// Evidence existed but none of it asserted a kind under the mapping.
-    Unknown,
-    /// Equal-rank evidence disagreed; no winner was selected.
-    Conflict,
 }
 
 /// One task's persisted identity, read back from the ledger.
@@ -385,9 +384,7 @@ pub fn task_kind_distribution(
     connection: &rusqlite::Connection,
 ) -> Result<TaskKindDistribution, Error> {
     let mut statement = connection
-        .prepare(
-            "SELECT state, kind, COUNT(*) FROM task_identity GROUP BY state, kind",
-        )
+        .prepare("SELECT state, kind, COUNT(*) FROM task_identity GROUP BY state, kind")
         .map_err(|error| Error::Store(format!("cannot read task-kind distribution: {error}")))?;
     let rows = statement
         .query_map([], |row| {
@@ -423,7 +420,7 @@ pub fn task_kind_distribution(
             other => {
                 return Err(Error::Store(format!(
                     "task-kind distribution carries an unknown state label: {other}"
-                )))
+                )));
             }
         }
     }
@@ -552,17 +549,12 @@ mod tests {
     fn rebuild_replaces_the_derived_state_and_round_trips() {
         let (_scratch, connection) = fixture_connection();
         let reader = FixtureReader(vec![record("aub-1", "task", &["testing"])]);
-        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader)
-            .unwrap();
+        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
 
-        let first =
-            rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
+        let first = rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
         assert_eq!(first.identities_written, 1);
 
-        let task_id = TaskId::new(
-            SourceNamespace::new("beads-a"),
-            NativeTaskId::new("aub-1"),
-        );
+        let task_id = TaskId::new(SourceNamespace::new("beads-a"), NativeTaskId::new("aub-1"));
         let row = read_task_identity(&connection, &task_id).unwrap().unwrap();
         assert_eq!(row.state, TaskIdentityState::Resolved);
         assert_eq!(row.kind, Some(TaskKind::Task));
@@ -572,8 +564,7 @@ mod tests {
         );
         assert_eq!(row.normalization_version, 1);
 
-        let second =
-            rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
+        let second = rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
         assert_eq!(second.identities_written, 1);
         let after = read_task_identity(&connection, &task_id).unwrap().unwrap();
         assert_eq!(row, after);
@@ -583,14 +574,10 @@ mod tests {
     fn a_mapping_change_changes_the_rebuild_while_candidates_stay_put() {
         let (_scratch, connection) = fixture_connection();
         let reader = FixtureReader(vec![record("aub-1", "task", &["testing"])]);
-        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader)
-            .unwrap();
+        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
 
         rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
-        let task_id = TaskId::new(
-            SourceNamespace::new("beads-a"),
-            NativeTaskId::new("aub-1"),
-        );
+        let task_id = TaskId::new(SourceNamespace::new("beads-a"), NativeTaskId::new("aub-1"));
         let before = read_task_identity(&connection, &task_id).unwrap().unwrap();
         assert_eq!(before.kind, Some(TaskKind::Task));
 
@@ -630,8 +617,7 @@ mod tests {
             // a typed conflict with no winner, whatever the ingest order.
             record("aub-4", "spike", &["alpha", "beta"]),
         ]);
-        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader)
-            .unwrap();
+        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
         let mapping = TaskKindMapping::new(
             3,
             [
