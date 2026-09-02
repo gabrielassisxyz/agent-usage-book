@@ -4,8 +4,8 @@
 //! A rate file on disk is an import source, never a runtime witness: valuation
 //! reads the immutable versioned records in the database, and this module only
 //! turns the file's text into drafts the store can persist. Every date comment
-//! in the pre-existing hardcoded price table becomes structured metadata here —
-//! an effective interval and a publication reference — so a figure derived from
+//! in the pre-existing hardcoded price table becomes structured metadata here:
+//! an effective interval and a publication reference, so a figure derived from
 //! a rate can always name the rate it used and when that rate was true.
 //!
 //! Unknown keys are refused, not ignored: a rate book that grew a field this

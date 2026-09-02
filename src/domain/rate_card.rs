@@ -7,8 +7,8 @@
 //! price book and forcing the shape through one enum would lose that precision.
 //!
 //! Records are immutable by construction: a corrected price is a new record, and
-//! the store layer enforces the same rule mechanically by rejecting every
-//! `UPDATE` and `DELETE` against the table. Nothing here computes a valuation;
+//! the store layer enforces the same rule mechanically, refusing every rewrite
+//! of the table at the schema level. Nothing here computes a valuation;
 //! that is the valuation module's job (aub-wyu.2), which resolves the record
 //! effective at an event's time.
 
