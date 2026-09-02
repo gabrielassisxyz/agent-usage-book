@@ -482,6 +482,48 @@ mod tests {
         }
     }
 
+    /// Enumerates the resolution variants explicitly: the crate denies
+    /// wildcard arms on enum matches, and each unexpected variant is its own
+    /// named failure.
+    fn expect_resolved(
+        resolved: ResolvedTaskKind,
+        what: &str,
+    ) -> (TaskKind, TaskKindOrigin, String) {
+        match resolved {
+            ResolvedTaskKind::Resolved {
+                kind,
+                winner,
+                evidence,
+            } => (kind, winner, evidence),
+            ResolvedTaskKind::Unknown { .. } => {
+                panic!("expected a resolution, got unknown: {what}")
+            }
+            ResolvedTaskKind::Conflict { .. } => {
+                panic!("expected a resolution, got a conflict: {what}")
+            }
+        }
+    }
+
+    fn expect_conflict(resolved: ResolvedTaskKind, what: &str) -> String {
+        match resolved {
+            ResolvedTaskKind::Conflict { evidence } => evidence,
+            ResolvedTaskKind::Resolved { .. } => {
+                panic!("expected a conflict, got a resolution: {what}")
+            }
+            ResolvedTaskKind::Unknown { .. } => panic!("expected a conflict, got unknown: {what}"),
+        }
+    }
+
+    fn expect_unknown(resolved: ResolvedTaskKind, what: &str) -> String {
+        match resolved {
+            ResolvedTaskKind::Unknown { evidence } => evidence,
+            ResolvedTaskKind::Resolved { .. } => {
+                panic!("expected unknown, got a resolution: {what}")
+            }
+            ResolvedTaskKind::Conflict { .. } => panic!("expected unknown, got a conflict: {what}"),
+        }
+    }
+
     #[test]
     fn the_identity_field_outranks_a_tag_at_the_same_task() {
         let mapping = TaskKindMapping::default_v1();
@@ -498,16 +540,12 @@ mod tests {
             ),
         ];
         let resolved = resolve_task_kind(&candidates, &mapping);
-        match resolved {
-            ResolvedTaskKind::Resolved { kind, winner, .. } => {
-                assert_eq!(kind, TaskKind::Bug);
-                assert_eq!(
-                    winner,
-                    TaskKindOrigin::TrackerField("issue_type".to_owned())
-                );
-            }
-            other => panic!("expected a resolution, got {other:?}"),
-        }
+        let (kind, winner, _) = expect_resolved(resolved, "the identity field outranks the tag");
+        assert_eq!(kind, TaskKind::Bug);
+        assert_eq!(
+            winner,
+            TaskKindOrigin::TrackerField("issue_type".to_owned())
+        );
     }
 
     #[test]
@@ -538,13 +576,12 @@ mod tests {
                 "spike-tag",
             ),
         ];
-        match resolve_task_kind(&candidates, &mapping) {
-            ResolvedTaskKind::Resolved { kind, winner, .. } => {
-                assert_eq!(kind, TaskKind::Task);
-                assert_eq!(winner, TaskKindOrigin::TrackerLabel("spike-tag".to_owned()));
-            }
-            other => panic!("expected a resolution through the tag, got {other:?}"),
-        }
+        let (kind, winner, _) = expect_resolved(
+            resolve_task_kind(&candidates, &mapping),
+            "the tag resolves what the field cannot",
+        );
+        assert_eq!(kind, TaskKind::Task);
+        assert_eq!(winner, TaskKindOrigin::TrackerLabel("spike-tag".to_owned()));
     }
 
     #[test]
@@ -568,35 +605,31 @@ mod tests {
                 "beta",
             ),
         ];
-        match resolve_task_kind(&candidates, &mapping) {
-            ResolvedTaskKind::Conflict { evidence } => {
-                assert!(evidence.contains("tracker_label:alpha=alpha"));
-                assert!(evidence.contains("tracker_label:beta=beta"));
-            }
-            other => panic!("expected a conflict, got {other:?}"),
-        }
+        let evidence = expect_conflict(
+            resolve_task_kind(&candidates, &mapping),
+            "equal-rank disagreement",
+        );
+        assert!(evidence.contains("tracker_label:alpha=alpha"));
+        assert!(evidence.contains("tracker_label:beta=beta"));
     }
 
     #[test]
     fn missing_evidence_is_unknown_and_every_case_keeps_its_evidence() {
         let mapping = TaskKindMapping::default_v1();
         // No candidates at all: unknown, with no evidence.
-        match resolve_task_kind(&[], &mapping) {
-            ResolvedTaskKind::Unknown { evidence } => assert_eq!(evidence, ""),
-            other => panic!("expected unknown, got {other:?}"),
-        }
+        let evidence = expect_unknown(resolve_task_kind(&[], &mapping), "no candidates");
+        assert_eq!(evidence, "");
         // Only candidates the mapping does not cover: unknown, with evidence.
         let candidates = vec![task_kind_candidate(
             "aub-1",
             TaskKindOrigin::TrackerField("issue_type".to_owned()),
             "spike",
         )];
-        match resolve_task_kind(&candidates, &mapping) {
-            ResolvedTaskKind::Unknown { evidence } => {
-                assert_eq!(evidence, "tracker_field:issue_type=spike");
-            }
-            other => panic!("expected unknown, got {other:?}"),
-        }
+        let evidence = expect_unknown(
+            resolve_task_kind(&candidates, &mapping),
+            "only candidates the mapping does not cover",
+        );
+        assert_eq!(evidence, "tracker_field:issue_type=spike");
     }
 
     #[test]

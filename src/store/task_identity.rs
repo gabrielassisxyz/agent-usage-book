@@ -236,7 +236,7 @@ fn read_candidate_groups(
             Some((source, native, list)) if *source == task_source && *native == task_native => {
                 list.push(candidate);
             }
-            _ => groups.push((task_source, task_native, vec![candidate])),
+            Some(_) | None => groups.push((task_source, task_native, vec![candidate])),
         }
     }
     Ok(groups)
