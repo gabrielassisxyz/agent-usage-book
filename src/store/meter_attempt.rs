@@ -257,11 +257,17 @@ pub fn record_meter_attempt_result(
                 FailureClass::RateLimited { retry_after } => {
                     retry_after.map(|d| d.as_nanos() as i64)
                 }
-                _ => None,
+                FailureClass::DnsFailure
+                | FailureClass::ConnectTimeout
+                | FailureClass::ReadTimeout
+                | FailureClass::TotalBudgetExpired
+                | FailureClass::HttpStatus(_)
+                | FailureClass::MalformedBody
+                | FailureClass::MissingRequiredField => None,
             };
             (Some(failure_class_sql::as_sql(class)), retry_after)
         }
-        _ => (None, None),
+        AttemptOutcome::Success | AttemptOutcome::AuthRequired => (None, None),
     };
     conn.execute(
         "INSERT INTO meter_attempt_result (
@@ -757,10 +763,10 @@ mod tests {
         assert_eq!(stored.retry_index, Some(1));
     }
 
-    /// Over generated attempt sequences, whatever the interleaving, the number
-    /// of terminal results never exceeds the number of started attempts: a
-    /// result can only land on an already-started attempt, and a second result
-    /// for a started attempt is refused by the database.
+    // Over generated attempt sequences, whatever the interleaving, the number
+    // of terminal results never exceeds the number of started attempts: a
+    // result can only land on an already-started attempt, and a second result
+    // for a started attempt is refused by the database.
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(24))]
         #[test]
