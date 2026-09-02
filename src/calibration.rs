@@ -6,3 +6,5 @@
 //!
 //! The Credits to PercentDelta conversion requires a typed `WindowCalibration` witness
 //! and is owned by this module; no global conversion witness exists.
+
+pub mod health;
