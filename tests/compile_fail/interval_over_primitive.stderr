@@ -5,15 +5,20 @@ error[E0277]: the trait bound `f64: DomainQuantity` is not satisfied
   |             ^^^^^^^^^^^^^^^ the trait `DomainQuantity` is not implemented for `f64`
   |
 help: the following other types implement trait `DomainQuantity`
- --> src/domain/tokens.rs
+ --> src/domain/rows.rs
+  |
+  | impl DomainQuantity for RowCount {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RowCount`
+  |
+ ::: src/domain/tokens.rs
   |
   | impl DomainQuantity for TokenCount {
   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `TokenCount`
   |
- ::: src/domain/rows.rs
+ ::: src/domain/credits.rs
   |
-  | impl DomainQuantity for RowCount {
-  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `RowCount`
+  | impl crate::domain::interval::DomainQuantity for Credits {
+  | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `agent_usage_book::domain::credits::Credits`
 note: required by a bound in `Interval`
  --> src/domain/interval.rs
   |
