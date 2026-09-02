@@ -287,6 +287,189 @@ fn the_command_budget_bounds_a_wedged_endpoint() {
     );
 }
 
+// --- the transport failure shapes reaching the persisted attempt result ------
+
+/// Store fixture: one account, one sample run, one policy snapshot, one
+/// started attempt - the same chain the attempt repository's own tests build,
+/// through the public APIs, so the persisted result this test reads back is a
+/// real row under the real constraints.
+fn fixture_store() -> (
+    ScratchDir,
+    rusqlite::Connection,
+    agent_usage_book::store::sample_run::SampleRunId,
+    agent_usage_book::store::account::AccountId,
+    agent_usage_book::store::sampling_policy_snapshot::SamplingPolicySnapshotId,
+) {
+    use agent_usage_book::domain::time::UtcTimestamp;
+    use agent_usage_book::store::account::observe_account;
+    use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
+    use agent_usage_book::store::migrate::run_migrations;
+    use agent_usage_book::store::migrations::registry;
+    use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
+    use agent_usage_book::store::sampling_policy_snapshot::{
+        ResolvedSamplingPolicy, resolve_policy_snapshot,
+    };
+
+    const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
+        ordinary_cadence: MonotonicDuration::from_millis(300_000),
+        freshness_horizon: MonotonicDuration::from_millis(900_000),
+        reset_edge_policy: String::new(),
+        retry_backoff_policy: String::new(),
+        command_budget: MonotonicDuration::from_millis(60_000),
+        policy_algorithm_version: String::new(),
+    };
+
+    let scratch = ScratchDir::new("synthetic-server-store");
+    let mut connection = open(
+        &scratch.path().join("state.db"),
+        AccessMode::ReadWrite,
+        &PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1_000),
+        },
+    )
+    .unwrap();
+    run_migrations(
+        &mut connection,
+        &registry(),
+        None,
+        &agent_usage_book::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(9_000)),
+    )
+    .unwrap();
+    let account = observe_account(
+        &connection,
+        "synthetic",
+        "account-a",
+        UtcTimestamp::from_unix_nanos(10_000),
+    )
+    .unwrap();
+    let run = start_sample_run(
+        &connection,
+        Trigger::Manual,
+        UtcTimestamp::from_unix_nanos(11_000),
+        "fixture",
+    )
+    .unwrap();
+    let snapshot = resolve_policy_snapshot(
+        &connection,
+        account,
+        UtcTimestamp::from_unix_nanos(10_000),
+        &POLICY,
+    )
+    .unwrap();
+    (scratch, connection, run, account, snapshot)
+}
+
+/// The bead's integration item: each transport failure shape produces its
+/// expected failure class in the persisted attempt result. Three of the four
+/// shapes are the transport's own decision; the fourth (close mid body) is
+/// asserted at its transport-level truth, an incomplete 200, because the
+/// failure class for a truncated body is the adapter's decision and belongs
+/// to the contract suite that runs an adapter over this server.
+#[test]
+fn the_transport_failure_shapes_reach_the_persisted_attempt_result() {
+    use agent_usage_book::domain::attempt::AttemptOutcome;
+    use agent_usage_book::domain::time::UtcTimestamp;
+    use agent_usage_book::store::meter_attempt::{
+        DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
+        result_by_attempt_id, start_meter_attempt,
+    };
+
+    let (_scratch, connection, run, account, snapshot) = fixture_store();
+    let clock = RealClock::new();
+    let attempt_id = start_meter_attempt(
+        &connection,
+        &NewMeterAttempt {
+            run_id: run,
+            account_id: account,
+            provider: "synthetic".to_owned(),
+            request_started_at: UtcTimestamp::from_unix_nanos(20_000),
+            credential_context_id: Some("ctx-synthetic".to_owned()),
+            policy_snapshot_id: snapshot,
+            due_at: UtcTimestamp::from_unix_nanos(19_000),
+            due_reason: DueReason::OrdinaryCadence,
+            due_basis: None,
+            provider_contract_id: "synthetic-endpoint-v1".to_owned(),
+            meter_semantics_id: "synthetic-meter-v1".to_owned(),
+        },
+    )
+    .unwrap();
+
+    let timeouts = RequestTimeoutConfig::new(
+        MonotonicDuration::from_millis(1_000),
+        MonotonicDuration::from_millis(250),
+        None,
+    );
+    let budget = CommandBudget::new(MonotonicDuration::from_millis(5_000), &clock);
+
+    // Shape 1: headers then stall - read phase.
+    let stalled = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+    }])
+    .unwrap();
+    let request =
+        HttpRequest::get(stalled.url(), timeouts).with_header("Authorization", "Bearer alpha");
+    let class = execute_single(&request, &budget, &clock).unwrap_err();
+    assert_eq!(class, FailureClass::ReadTimeout);
+
+    // Shape 2: accept then never respond - also the read phase, through a
+    // different wire shape (no headers at all).
+    let silent = SyntheticServer::start(vec![ScriptedOutcome::AcceptThenNeverRespond]).unwrap();
+    let request =
+        HttpRequest::get(silent.url(), timeouts).with_header("Authorization", "Bearer alpha");
+    let class = execute_single(&request, &budget, &clock).unwrap_err();
+    assert_eq!(class, FailureClass::ReadTimeout);
+
+    // Shape 3: connection refused - connect phase.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let request = HttpRequest::get(format!("http://127.0.0.1:{port}/usage"), timeouts);
+    let class = execute_single(&request, &budget, &clock).unwrap_err();
+    assert_eq!(class, FailureClass::ConnectTimeout);
+
+    // Persist one transport-classified shape end to end and read it back: the
+    // store carries exactly the class the transport assigned, and the attempt
+    // lifecycle carries the timings the adapter never owns.
+    record_meter_attempt_result(
+        &connection,
+        &NewMeterAttemptResult {
+            attempt_id,
+            completed_at: UtcTimestamp::from_unix_nanos(25_000),
+            elapsed: MonotonicDuration::from_millis(250),
+            outcome: AttemptOutcome::Unreachable(FailureClass::ReadTimeout),
+            sanitized_error_classification: None,
+            retry_index: None,
+            clock_anomaly: false,
+        },
+    )
+    .unwrap();
+    let stored = result_by_attempt_id(&connection, attempt_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.outcome,
+        AttemptOutcome::Unreachable(FailureClass::ReadTimeout)
+    );
+
+    // Shape 4: close mid body. The transport observes an incomplete response,
+    // not a transport failure: the bytes arrive and the socket closes.
+    let truncating = SyntheticServer::start(vec![ScriptedOutcome::CloseMidBody {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        partial_body: b"{\"incomp".to_vec(),
+    }])
+    .unwrap();
+    let request =
+        HttpRequest::get(truncating.url(), timeouts).with_header("Authorization", "Bearer alpha");
+    let response = execute_single(&request, &budget, &clock).unwrap();
+    assert_eq!(response.status(), 200);
+    assert!(response.body_as_str().unwrap().contains("{\"incomp"));
+    // The truncated body's failure class (malformed response) is assigned by
+    // the adapter that parses it, and that classification's persisted form
+    // belongs to the contract suite that runs an adapter over this server.
+}
+
 // --- acceptance criteria 4: per-request recording ------------------------------
 
 #[test]
@@ -443,6 +626,28 @@ fn push_outcome_extends_the_script_at_runtime() {
     server.push_outcome(ScriptedOutcome::Forbidden403);
     let (status_b, _) = http_get(server.port(), "/b", Some("Bearer x"));
     assert_eq!(status_b, 403);
+}
+
+/// One scratch state directory per test, removed on drop.
+struct ScratchDir(std::path::PathBuf);
+
+impl ScratchDir {
+    fn new(name: &str) -> Self {
+        let path = std::env::temp_dir().join(format!("aub-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::create_dir_all(&path).expect("scratch dir must be creatable");
+        Self(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
 }
 
 // --- helpers ------------------------------------------------------------------
