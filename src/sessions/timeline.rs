@@ -29,19 +29,14 @@ pub struct SessionTimeline {
 /// Derives a session's bounds from its event timestamps.
 ///
 /// The documented derivation: start is the earliest event timestamp and end is the
-/// latest, so a single event yields `start == end`. `end` is `None` only for an
-/// empty event list, which is not a session at all; the function refuses that case
-/// rather than inventing a bound for it.
-pub fn derive_session_bounds(events: &[UtcTimestamp]) -> (UtcTimestamp, Option<UtcTimestamp>) {
-    let start = *events
-        .iter()
-        .min()
-        .expect("a session timeline needs at least one event");
-    let end = *events
-        .iter()
-        .max()
-        .expect("a session timeline needs at least one event");
-    (start, Some(end))
+/// latest, so a single event yields `start == end`. Returns `None` for an empty
+/// event list, which is not a session at all.
+pub fn derive_session_bounds(
+    events: &[UtcTimestamp],
+) -> Option<(UtcTimestamp, Option<UtcTimestamp>)> {
+    let start = *events.iter().min()?;
+    let end = *events.iter().max()?;
+    Some((start, Some(end)))
 }
 
 /// Groups events by session and derives each session's bounds, in (source, native
@@ -63,13 +58,13 @@ pub fn build_timelines(events: &[(SessionId, UtcTimestamp)]) -> Vec<SessionTimel
     }
     by_session
         .into_iter()
-        .map(|((source, native), times)| {
-            let (start, end) = derive_session_bounds(&times);
-            SessionTimeline {
+        .filter_map(|((source, native), times)| {
+            let (start, end) = derive_session_bounds(&times)?;
+            Some(SessionTimeline {
                 session: SessionId::new(SourceNamespace::new(source), NativeSessionId::new(native)),
                 start,
                 end,
-            }
+            })
         })
         .collect()
 }
@@ -201,19 +196,18 @@ mod tests {
     /// and a single event yields start == end.
     #[test]
     fn bounds_derive_from_event_timestamps() {
-        let (start, end) = derive_session_bounds(&[ts(3_000), ts(1_000), ts(2_000)]);
+        let (start, end) = derive_session_bounds(&[ts(3_000), ts(1_000), ts(2_000)]).unwrap();
         assert_eq!(start, ts(1_000));
         assert_eq!(end, Some(ts(3_000)));
 
-        let (start, end) = derive_session_bounds(&[ts(5_000)]);
+        let (start, end) = derive_session_bounds(&[ts(5_000)]).unwrap();
         assert_eq!(start, ts(5_000));
         assert_eq!(end, Some(ts(5_000)));
     }
 
     #[test]
-    #[should_panic(expected = "at least one event")]
     fn empty_event_list_is_not_a_session() {
-        let _ = derive_session_bounds(&[]);
+        assert_eq!(derive_session_bounds(&[]), None);
     }
 
     /// Two textually identical native session identifiers from different sources

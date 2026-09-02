@@ -205,14 +205,16 @@ fn report_grouped_by_project_accounts_for_every_canonical_event_with_unknown_buc
 #[test]
 fn session_start_and_end_derive_from_event_timestamps() {
     let timestamps = vec![ts(5000), ts(1000), ts(3000), ts(7000)];
-    let (start, end) = derive_session_bounds(&timestamps);
+    let (start, end) = derive_session_bounds(&timestamps).unwrap();
     assert_eq!(start, ts(1000));
     assert_eq!(end, Some(ts(7000)));
 
     let single = vec![ts(42)];
-    let (s_start, s_end) = derive_session_bounds(&single);
+    let (s_start, s_end) = derive_session_bounds(&single).unwrap();
     assert_eq!(s_start, ts(42));
     assert_eq!(s_end, Some(ts(42)));
+
+    assert_eq!(derive_session_bounds(&[]), None);
 }
 
 #[test]
