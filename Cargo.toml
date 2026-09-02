@@ -44,6 +44,10 @@ ureq = "2"
 # types: per-field extraction and unknown-field detection walk the parsed tree
 # by hand.
 serde_json = "1"
+# The cryptographic content hash for the meter response evidence capsule
+# (aub-sth.7): the stored proof that a sanitized evidence capsule survived
+# storage unaltered. Pure Rust, no async runtime or network dependencies.
+sha2 = "0.10"
 
 [dev-dependencies]
 # Property-testing framework (aub-gmms): generates inputs over stated domains
