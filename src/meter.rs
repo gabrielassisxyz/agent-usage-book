@@ -7,7 +7,6 @@
 
 pub mod adapter;
 pub mod anthropic;
-pub mod due;
 #[cfg(test)]
 pub mod synthetic;
 pub mod transport;
