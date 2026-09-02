@@ -1,15 +1,16 @@
 //! Integration tests for the synthetic provider HTTP server (`aub-71j.3`).
 //!
-//! These tests exercise the server through the production HTTP transport
-//! (`src/meter/transport.rs`), not through a hand-rolled client, so a test
-//! that passes here is one that proves the real `aub` binary's transport
-//! honours the synthetic server's responses. The in-process synthetic
-//! adapter (`aub-me5.1`) proves the adapter logic; this file proves the
-//! composed binary's behaviour over a real socket.
+//! The response-shape tests assert wire bytes directly, because what they
+//! prove is byte forwarding; the failure-class tests drive the server through
+//! the production HTTP transport (`src/meter/transport.rs`), so a test that
+//! passes here is one that proves the real `aub` binary's transport honours
+//! the synthetic server's shapes. The in-process synthetic adapter
+//! (`aub-me5.1`) proves the adapter logic; this file proves the composed
+//! binary's behaviour over a real socket.
 //!
 //! May not depend on:
 //! - the ureq transport driver (rule `12`); tests go through the public
-//!   `HttpTransport` trait only.
+//!   `execute_single` entry point only.
 //! - SQLite (rule `03`).
 //!
 //! The server is bound to the loopback interface on an ephemeral port so
@@ -17,6 +18,11 @@
 
 use std::time::Duration;
 
+use agent_usage_book::domain::failure::FailureClass;
+use agent_usage_book::domain::time::{MonotonicDuration, RealClock};
+use agent_usage_book::meter::transport::{
+    CommandBudget, HttpRequest, RequestTimeoutConfig, execute_single,
+};
 use test_support::{
     RecordedRequest, ScriptedOutcome, ScriptedResponseBody, SyntheticServer, SyntheticServerError,
 };
@@ -201,6 +207,84 @@ fn close_mid_body_does_not_send_a_complete_response() {
     // server's job is just to produce the partial body.
     let (_, body) = http_get(server.port(), "/usage", Some("Bearer alpha"));
     assert!(body.contains("{\"incomp"));
+}
+
+// --- read-timeout versus connect-timeout, and the command budget -------------
+
+/// The pair the bead's context names as the one most likely to be conflated:
+/// a connect-phase failure and a read-phase failure must stay distinct
+/// classes, and the declarative server produces both shapes on demand.
+#[test]
+fn headers_then_stall_and_a_refused_port_yield_distinct_failure_classes() {
+    let clock = RealClock::new();
+    let budget = CommandBudget::new(MonotonicDuration::from_millis(5_000), &clock);
+    let timeouts = RequestTimeoutConfig::new(
+        MonotonicDuration::from_millis(1_000),
+        MonotonicDuration::from_millis(250),
+        None,
+    );
+
+    // Read phase: the server accepts, sends headers, then never completes the
+    // body. The transport must classify this as a read timeout.
+    let stalled = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+    }])
+    .unwrap();
+    let request =
+        HttpRequest::get(stalled.url(), timeouts).with_header("Authorization", "Bearer alpha");
+    let read_phase = execute_single(&request, &budget, &clock);
+    assert_eq!(read_phase.unwrap_err(), FailureClass::ReadTimeout);
+
+    // Connect phase: nothing binds the port. The transport has no refused
+    // variant, so refusal and connect timeout share the connect-phase class
+    // on purpose; the assertion is that this is NOT the read-phase class.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    drop(listener);
+    let request = HttpRequest::get(
+        format!("http://127.0.0.1:{port}/usage"),
+        RequestTimeoutConfig::new(
+            MonotonicDuration::from_millis(500),
+            MonotonicDuration::from_millis(500),
+            None,
+        ),
+    );
+    let connect_phase = execute_single(&request, &budget, &clock);
+    assert_eq!(connect_phase.unwrap_err(), FailureClass::ConnectTimeout);
+}
+
+#[test]
+fn the_command_budget_bounds_a_wedged_endpoint() {
+    let stalled = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+    }])
+    .unwrap();
+    let clock = RealClock::new();
+    // The budget is far below the declared read timeout, so only the command
+    // budget can bound this request; the wedged endpoint must not hold the
+    // command for its declared read timeout.
+    let budget = CommandBudget::new(MonotonicDuration::from_millis(300), &clock);
+    let request = HttpRequest::get(
+        stalled.url(),
+        RequestTimeoutConfig::new(
+            MonotonicDuration::from_millis(1_000),
+            MonotonicDuration::from_millis(30_000),
+            None,
+        ),
+    )
+    .with_header("Authorization", "Bearer alpha");
+
+    let started = std::time::Instant::now();
+    let outcome = execute_single(&request, &budget, &clock);
+    let elapsed = started.elapsed();
+
+    assert_eq!(outcome.unwrap_err(), FailureClass::TotalBudgetExpired);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the budget must bound a wedged endpoint, took {elapsed:?}"
+    );
 }
 
 // --- acceptance criteria 4: per-request recording ------------------------------
