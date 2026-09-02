@@ -26,7 +26,6 @@ pub mod rate_card;
 pub mod sample_run;
 pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
-pub mod session;
 pub mod session_account_marker;
 pub mod startup;
 pub mod task_event;
