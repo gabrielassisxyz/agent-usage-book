@@ -125,15 +125,18 @@ impl Quantity {
         let value_val = obj
             .get("value")
             .ok_or(JsonContractError::MissingField("value"))?;
-        let value_str = if let Some(s) = value_val.as_str() {
-            s.to_string()
-        } else if let Some(n) = value_val.as_number() {
-            n.to_string()
-        } else {
-            return Err(JsonContractError::InvalidFormat {
-                field: "value",
-                message: "expected string or number".to_string(),
-            });
+        let value_str = match value_val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Array(_)
+            | serde_json::Value::Object(_) => {
+                return Err(JsonContractError::InvalidFormat {
+                    field: "value",
+                    message: "expected string or number".to_string(),
+                });
+            }
         };
         let unit_str = obj
             .get("unit")
@@ -708,7 +711,7 @@ fn stale_reason_name(reason: &StaleReason) -> &'static str {
     match reason {
         StaleReason::AgeExceeded => "age_exceeded",
         StaleReason::NoSuccessfulObservation => "no_successful_observation",
-        StaleReason::SourceUnreachable(_) => "source_unreachable",
+        StaleReason::SourceUnreachable(_source) => "source_unreachable",
         StaleReason::MalformedProviderResponse => "malformed_provider_response",
         StaleReason::RateLimited => "rate_limited",
         StaleReason::SamplingGap => "sampling_gap",
@@ -721,15 +724,21 @@ fn stale_reason_name(reason: &StaleReason) -> &'static str {
 fn coverage_name(coverage: &CoverageCompleteness) -> &'static str {
     match coverage {
         CoverageCompleteness::Complete => "complete",
-        CoverageCompleteness::Partial { .. } => "partial",
+        CoverageCompleteness::Partial { missing: _ } => "partial",
     }
 }
 
 fn quality_name<T: DomainQuantity>(quality: &EvidenceQuality<T>) -> &'static str {
     match quality {
         EvidenceQuality::Measured => "measured",
-        EvidenceQuality::Estimated { .. } => "estimated",
-        EvidenceQuality::Mixed { .. } => "mixed",
+        EvidenceQuality::Estimated {
+            methods: _,
+            uncertainty: _,
+        } => "estimated",
+        EvidenceQuality::Mixed {
+            methods: _,
+            uncertainty: _,
+        } => "mixed",
     }
 }
 
