@@ -133,8 +133,12 @@ fn reject_symlinked_state_dir(path: &Path) -> Result<(), Error> {
 /// existing directory keeps its content but still has its mode forced: a directory
 /// that was ever created wider than intended is the hostile case this bead exists to
 /// close, not one to leave in place once found.
+///
+/// `pub(crate)` rather than private: the pending-observation spool (`aub-sth.10`)
+/// creates its own directories (`pending/`, `pending/quarantine/`) at this same mode
+/// and reuses this rather than re-deriving the permission logic.
 #[cfg(unix)]
-fn ensure_dir_mode_0700(path: &Path) -> Result<(), Error> {
+pub(crate) fn ensure_dir_mode_0700(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::PermissionsExt;
     fs::create_dir_all(path).map_err(|error| {
         Error::Store(format!("cannot create state directory {path:?}: {error}"))
@@ -147,7 +151,7 @@ fn ensure_dir_mode_0700(path: &Path) -> Result<(), Error> {
 }
 
 #[cfg(not(unix))]
-fn ensure_dir_mode_0700(path: &Path) -> Result<(), Error> {
+pub(crate) fn ensure_dir_mode_0700(path: &Path) -> Result<(), Error> {
     fs::create_dir_all(path)
         .map_err(|error| Error::Store(format!("cannot create state directory {path:?}: {error}")))
 }
@@ -259,6 +263,27 @@ pub fn run_after_state_check<T>(
     then: impl FnOnce() -> T,
 ) -> Result<T, Error> {
     ensure_state_dir_ready(path, mounts)?;
+    Ok(then())
+}
+
+/// [`run_after_state_check`], extended to also drain the pending-observation
+/// spool (`aub-sth.10`) before `then` runs. Draining is the highest-priority
+/// rebuildable-or-not work a mutating command performs, ahead of everything
+/// else the command does, because the pending directory holds the newest
+/// irreplaceable evidence precisely when something is already going wrong;
+/// a mutating command that touches the spool wraps its first
+/// network-touching call in this rather than in [`run_after_state_check`]
+/// alone, so the ordering is a property of the call graph rather than a
+/// convention every such call site has to remember on its own. A command
+/// with no spool involvement keeps using [`run_after_state_check`] directly.
+pub fn run_after_state_check_and_drain<T>(
+    path: &Path,
+    mounts: &dyn MountTable,
+    conn: &mut rusqlite::Connection,
+    then: impl FnOnce() -> T,
+) -> Result<T, Error> {
+    ensure_state_dir_ready(path, mounts)?;
+    crate::store::spool::drain_pending(conn, path)?;
     Ok(then())
 }
 
