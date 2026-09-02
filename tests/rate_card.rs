@@ -2,7 +2,8 @@
 //! persists it immutably, re-import is a visible no-op, and the effective
 //! interval answers "which rate is true today".
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::domain::rate_card::{
     BillingBasis, CurrencyCode, RateCardDraft, ReviewDuePolicy, TokenClass,
@@ -17,15 +18,40 @@ fn crate_root() -> &'static Path {
     Path::new(env!("CARGO_MANIFEST_DIR"))
 }
 
-fn open_migrated() -> rusqlite::Connection {
+static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A fresh scratch directory under the system temp dir, removed on drop. A
+/// file database rather than `:memory:`: the connection policy requires WAL,
+/// which an in-memory database cannot report.
+struct ScratchDir(PathBuf);
+
+impl ScratchDir {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "aub-rate-card-integration-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed),
+        ));
+        std::fs::create_dir(&path).expect("scratch dir must be creatable");
+        ScratchDir(path)
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+/// The scratch must outlive the connection, so both travel together.
+fn open_migrated() -> (ScratchDir, rusqlite::Connection) {
+    let scratch = ScratchDir::new();
     let mut conn = agent_usage_book::store::connection::open(
-        Path::new(":memory:"),
+        &scratch.path().join("rate-card.db"),
         AccessMode::ReadWrite,
         &PragmaPolicy {
             busy_timeout: agent_usage_book::domain::time::MonotonicDuration::from_millis(1_000),
         },
     )
-    .expect("in-memory database must open");
+    .expect("scratch database must open");
     run_migrations(
         &mut conn,
         &agent_usage_book::store::migrations::registry(),
@@ -33,7 +59,7 @@ fn open_migrated() -> rusqlite::Connection {
         &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
     )
     .expect("migrations must run");
-    conn
+    (scratch, conn)
 }
 
 /// The existing price table, imported. The assertion is the bead's integration
@@ -46,7 +72,7 @@ fn importing_the_existing_price_table_produces_dated_records() {
     let book = rate_book::parse(&text).expect("the existing price table must parse");
     assert_eq!(book.cards.len(), 55, "the fixture carries the full table");
 
-    let conn = open_migrated();
+    let (_scratch, conn) = open_migrated();
     let summary = rate_card::insert(&conn, &book.cards, UtcTimestamp::from_unix_nanos(1_000_000))
         .expect("import must persist");
     assert_eq!(
@@ -99,7 +125,7 @@ fn reimporting_the_existing_price_table_is_visibly_a_no_op() {
         .expect("rate book fixture must be readable");
     let book = rate_book::parse(&text).expect("the existing price table must parse");
 
-    let conn = open_migrated();
+    let (_scratch, conn) = open_migrated();
     rate_card::insert(&conn, &book.cards, UtcTimestamp::from_unix_nanos(1_000))
         .expect("first import must persist");
     let again = rate_card::insert(&conn, &book.cards, UtcTimestamp::from_unix_nanos(2_000))
@@ -117,7 +143,7 @@ fn reimporting_the_existing_price_table_is_visibly_a_no_op() {
 
 #[test]
 fn a_missing_publication_reference_is_recorded_as_missing() {
-    let conn = open_migrated();
+    let (_scratch, conn) = open_migrated();
     let draft = RateCardDraft {
         vendor: "anthropic".to_string(),
         model: "claude-fable-5".to_string(),
@@ -153,7 +179,7 @@ fn a_missing_publication_reference_is_recorded_as_missing() {
 /// superseded rate is not effective once its successor starts.
 #[test]
 fn the_effective_book_is_the_one_true_today() {
-    let conn = open_migrated();
+    let (_scratch, conn) = open_migrated();
     let clock_at = UtcTimestamp::from_unix_nanos(1_000);
 
     let standard = RateCardDraft {
@@ -217,7 +243,7 @@ fn the_effective_book_is_the_one_true_today() {
 /// have slipped through it.
 #[test]
 fn two_fully_open_cards_do_not_duplicate_on_reimport() {
-    let conn = open_migrated();
+    let (_scratch, conn) = open_migrated();
     let draft = RateCardDraft {
         vendor: "anthropic".to_string(),
         model: "claude-fable-5".to_string(),
@@ -258,7 +284,7 @@ fn two_fully_open_cards_do_not_duplicate_on_reimport() {
 /// rewrite a price history.
 #[test]
 fn direct_update_and_delete_are_refused_by_the_table() {
-    let conn = open_migrated();
+    let (_scratch, conn) = open_migrated();
     let draft = RateCardDraft {
         vendor: "anthropic".to_string(),
         model: "claude-fable-5".to_string(),

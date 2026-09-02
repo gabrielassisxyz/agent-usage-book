@@ -101,16 +101,41 @@ mod tests {
     use crate::store::connection::{AccessMode, PragmaPolicy};
     use crate::store::migrate::run_migrations;
     use crate::store::rate_card;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn open_migrated() -> rusqlite::Connection {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A fresh scratch directory under the system temp dir, removed on drop.
+    /// A file database rather than `:memory:`: the connection policy requires
+    /// WAL, which an in-memory database cannot report.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aub-rate-card-migration-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    fn open_migrated() -> (ScratchDir, rusqlite::Connection) {
+        let scratch = ScratchDir::new();
         let mut conn = crate::store::connection::open(
-            std::path::Path::new(":memory:"),
+            &scratch.path().join("rate-card.db"),
             AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1_000),
             },
         )
-        .expect("in-memory database must open");
+        .expect("scratch database must open");
         run_migrations(
             &mut conn,
             &crate::store::migrations::registry(),
@@ -118,7 +143,7 @@ mod tests {
             &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
         )
         .expect("migrations must run");
-        conn
+        (scratch, conn)
     }
 
     fn draft(rate_micros: i64) -> RateCardDraft {
@@ -141,7 +166,7 @@ mod tests {
 
     #[test]
     fn reimporting_the_same_draft_is_reported_unchanged_not_added() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000));
 
         let first = rate_card::insert(&conn, std::slice::from_ref(&draft(10_000_000)), clock.now())
@@ -162,7 +187,7 @@ mod tests {
     /// exists precisely to prevent that.
     #[test]
     fn two_open_ended_cards_with_no_provenance_still_conflict() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000));
         rate_card::insert(&conn, std::slice::from_ref(&draft(5_000_000)), clock.now())
             .expect("first import must insert");
@@ -177,7 +202,7 @@ mod tests {
     /// price history.
     #[test]
     fn direct_update_and_delete_are_refused_by_the_table() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000));
         rate_card::insert(&conn, std::slice::from_ref(&draft(10_000_000)), clock.now())
             .expect("insert must work");
@@ -198,7 +223,7 @@ mod tests {
     /// the old one stays readable.
     #[test]
     fn a_provenance_correction_creates_a_new_record_and_keeps_the_old() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000));
         rate_card::insert(&conn, std::slice::from_ref(&draft(10_000_000)), clock.now())
             .expect("first import must insert");

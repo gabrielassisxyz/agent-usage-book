@@ -215,15 +215,40 @@ mod tests {
     use crate::store::connection::{AccessMode, PragmaPolicy};
     use crate::store::migrate::run_migrations;
 
-    fn open_migrated() -> rusqlite::Connection {
+    /// A fresh scratch directory under the system temp dir, removed on drop.
+    /// A file database rather than `:memory:`: the connection policy requires
+    /// WAL, which an in-memory database cannot report.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aub-rate-card-repo-test-{}-{}",
+                std::process::id(),
+                COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    /// The scratch must outlive the connection, so both travel together.
+    fn open_migrated() -> (ScratchDir, rusqlite::Connection) {
+        let scratch = ScratchDir::new();
         let mut conn = crate::store::connection::open(
-            std::path::Path::new(":memory:"),
+            &scratch.path().join("rate-card.db"),
             AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1_000),
             },
         )
-        .expect("in-memory database must open");
+        .expect("scratch database must open");
         run_migrations(
             &mut conn,
             &crate::store::migrations::registry(),
@@ -231,7 +256,7 @@ mod tests {
             &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
         )
         .expect("migrations must run");
-        conn
+        (scratch, conn)
     }
 
     fn draft(vendor: &str, model: &str, class: TokenClass, rate: &str) -> RateCardDraft {
@@ -254,7 +279,7 @@ mod tests {
 
     #[test]
     fn effective_at_includes_open_ended_and_excludes_future_and_expired() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock_at = UtcTimestamp::from_unix_nanos(1_000);
         let mut past = draft("anthropic", "model-a", TokenClass::Input, "1.00");
         past.effective_start = UtcDate::parse("2026-01-01").unwrap();
@@ -264,7 +289,8 @@ mod tests {
         let open_ended = draft("anthropic", "model-c", TokenClass::Input, "3.00");
         insert(&conn, &[past, future, open_ended], clock_at).expect("insert must work");
 
-        let effective = effective_at(&conn, clock_at).expect("read must work");
+        let effective = effective_at(&conn, UtcDate::parse("2026-07-01").unwrap().start())
+            .expect("read must work");
         let models: Vec<&str> = effective.iter().map(|c| c.draft.model.as_str()).collect();
         assert_eq!(
             models,
@@ -275,7 +301,7 @@ mod tests {
 
     #[test]
     fn the_effective_interval_boundary_is_start_inclusive_end_exclusive() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock_at = UtcTimestamp::from_unix_nanos(1_000);
         let mut card = draft("anthropic", "model-a", TokenClass::Input, "1.00");
         card.effective_start = UtcDate::parse("2026-06-24").unwrap();
@@ -299,7 +325,7 @@ mod tests {
 
     #[test]
     fn history_orders_by_vendor_model_class_then_start() {
-        let conn = open_migrated();
+        let (_scratch, conn) = open_migrated();
         let clock_at = UtcTimestamp::from_unix_nanos(1_000);
         let mut older = draft("anthropic", "claude-fable-5", TokenClass::Input, "10.00");
         older.effective_start = UtcDate::parse("2026-06-24").unwrap();
