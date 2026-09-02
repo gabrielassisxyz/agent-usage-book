@@ -1,0 +1,22 @@
+error: cannot construct `agent_usage_book::store::cost_model::CostModel` with struct literal syntax due to private fields
+  --> tests/compile_fail/cost_model_exhaustive_construction.rs:17:20
+   |
+17 |     let _literal = CostModel {};
+   |                    ^^^^^^^^^
+
+error[E0624]: associated function `new` is private
+  --> tests/compile_fail/cost_model_exhaustive_construction.rs:21:35
+   |
+21 |       let _constructed = CostModel::new(
+   |                                     ^^^ private associated function
+   |
+  ::: src/store/cost_model.rs
+   |
+   | /     pub(crate) fn new(
+   | |         id: CostModelId,
+   | |         provider: ProviderKey,
+   | |         scope: CostModelScope,
+...  |
+   | |         terms: Vec<CostModelTerm>,
+   | |     ) -> Result<Self, Error> {
+   | |____________________________- private associated function defined here
