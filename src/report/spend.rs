@@ -336,7 +336,7 @@ fn add_usage(left: &UsageVector, right: &UsageVector) -> UsageVector {
 
 fn finish_group(
     key: GroupKey,
-    mut group: GroupAccumulator,
+    group: GroupAccumulator,
     window: SpendWindow,
     reset_exclusions: &BTreeMap<GroupKey, BTreeSet<ComponentKind>>,
 ) -> (SpendGroup, SpendGroupProvenance) {

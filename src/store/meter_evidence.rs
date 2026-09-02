@@ -570,7 +570,7 @@ mod tests {
     use crate::store::account::observe_account;
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use crate::store::meter_attempt::{
-        DueReason, NewMeterAttempt, NewMeterAttemptResult, start_meter_attempt,
+        DueReason, NewMeterAttempt, start_meter_attempt,
     };
     use crate::store::migrate::run_migrations;
     use crate::store::migrations::registry;

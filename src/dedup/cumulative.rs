@@ -25,7 +25,7 @@ use crate::domain::tokens::{
     UsageVector,
 };
 use crate::evidence::ComponentKind;
-use crate::transcripts::parser::{EvidenceClassification, NormalizedUsageEvent, ParserVersion};
+use crate::transcripts::parser::{NormalizedUsageEvent, ParserVersion};
 
 /// One cumulative source's ordered series outcome: the deltas that replace its
 /// events, and the counter resets that were rejected instead of stored.

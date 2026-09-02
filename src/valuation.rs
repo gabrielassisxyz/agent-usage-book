@@ -145,7 +145,7 @@ impl RateBook {
                     && (card_model == normalized_model || normalized_model.contains(&card_model))
                     && card.draft.token_class == token_class
                     && date >= card.draft.effective_start
-                    && card.draft.effective_end.map_or(true, |end| date <= end)
+                    && card.draft.effective_end.is_none_or(|end| date <= end)
             })
             .max_by_key(|card| (card.draft.effective_start, card.id, card.imported_at))
     }
@@ -308,7 +308,7 @@ mod tests {
     use crate::domain::rate_card::{BillingBasis, Publication, RateCardDraft, ReviewDuePolicy};
     use crate::domain::time::UtcTimestamp;
     use crate::domain::tokens::{
-        CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenCount,
+        CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
     };
     use crate::evidence::{CoverageCompleteness, EvidenceQuality};
 

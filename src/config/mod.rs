@@ -510,7 +510,7 @@ pub fn resolve(
         .unwrap_or_else(|| "/nonexistent".to_string());
     // Error messages name the config file home-relative, so a default error
     // never prints an absolute home-directory path (aub-xus.8).
-    let file_display = display_path(&file_display, &home);
+    let file_display = display_path(file_display, &home);
     let file: Option<toml::Table> = match file_contents {
         Some(contents) => Some(contents.parse().map_err(|e| {
             Error::Usage(format!("{file_display}: invalid TOML: {e}; fix the file"))
