@@ -1373,6 +1373,42 @@ mod tests {
         assert_eq!(loaded, exp);
     }
 
+    #[test]
+    fn candidate_round_trips_and_needs_a_real_experiment() {
+        let (_scratch, conn) = fixture_conn();
+        insert_experiment(&conn, &experiment("exp-cand", interval(1, 9), 1)).unwrap();
+        let candidate = WindowCalibrationCandidate {
+            id: CandidateId::new("cand-rt"),
+            experiment: ExperimentId::new("exp-cand"),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("max"),
+            window_semantic_key: WindowSemanticKey::new("account"),
+            fitted: ppp(880_000),
+            equivalent_full_window_capacity: Credits::from_micros(11_000_000),
+            fit_residual: Credits::from_micros(9_100),
+            uncertainty: CoefficientUncertainty::new(ppp(870_000), ppp(890_000)).unwrap(),
+            sample_count: 12,
+            inputs: EvidenceDigest::from_inputs(&evidence(&["s-1", "s-2"])),
+            validity: interval(1, 9),
+            knowledge_time: ts(2),
+        };
+        insert_candidate(&conn, &candidate).unwrap();
+        assert_eq!(
+            load_candidate(&conn, &candidate.id).unwrap().unwrap(),
+            candidate
+        );
+
+        // A candidate naming an experiment that does not exist is refused by the
+        // repository, before any row is written.
+        let orphan = WindowCalibrationCandidate {
+            id: CandidateId::new("cand-orphan"),
+            experiment: ExperimentId::new("exp-missing"),
+            ..candidate
+        };
+        assert!(insert_candidate(&conn, &orphan).is_err());
+        assert!(load_candidate(&conn, &orphan.id).unwrap().is_none());
+    }
+
     /// A full result round-trips with every field intact, and its provenance verifies
     /// against exactly the evidence set it was built from.
     #[test]
@@ -1424,7 +1460,7 @@ mod tests {
             .collect::<Result<_, _>>()
             .unwrap();
         columns.sort();
-        let mut expected: Vec<&str> = vec![
+        let mut expected: Vec<String> = [
             "id",
             "calibration_id",
             "provider",
@@ -1461,8 +1497,11 @@ mod tests {
             "valid_from",
             "valid_until",
             "knowledge_time",
-        ];
-        expected.sort_unstable();
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        expected.sort();
         assert_eq!(columns, expected);
     }
 
