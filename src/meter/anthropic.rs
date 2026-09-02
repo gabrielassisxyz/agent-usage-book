@@ -123,38 +123,39 @@ fn extract_bearer_token(credential: &CredentialHandle) -> Result<String, AuthRea
         return Err(AuthReason::CredentialExpired);
     }
 
-    if raw.starts_with('{') && raw.ends_with('}') {
-        if let Ok(val) = serde_json::from_str::<serde_json::Value>(raw) {
-            if let Some(token) = val
-                .get("claudeAiOauth")
-                .and_then(|o| o.get("accessToken"))
-                .and_then(|t| t.as_str())
-            {
-                let trimmed = token.trim();
-                if trimmed.is_empty() {
-                    return Err(AuthReason::CredentialExpired);
-                }
-                return Ok(trimmed.to_string());
+    if raw.starts_with('{')
+        && raw.ends_with('}')
+        && let Ok(val) = serde_json::from_str::<serde_json::Value>(raw)
+    {
+        if let Some(token) = val
+            .get("claudeAiOauth")
+            .and_then(|o| o.get("accessToken"))
+            .and_then(|t| t.as_str())
+        {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                return Err(AuthReason::CredentialExpired);
             }
-
-            if let Some(token) = val.get("accessToken").and_then(|t| t.as_str()) {
-                let trimmed = token.trim();
-                if trimmed.is_empty() {
-                    return Err(AuthReason::CredentialExpired);
-                }
-                return Ok(trimmed.to_string());
-            }
-
-            if let Some(token) = val.get("access_token").and_then(|t| t.as_str()) {
-                let trimmed = token.trim();
-                if trimmed.is_empty() {
-                    return Err(AuthReason::CredentialExpired);
-                }
-                return Ok(trimmed.to_string());
-            }
-
-            return Err(AuthReason::CredentialExpired);
+            return Ok(trimmed.to_string());
         }
+
+        if let Some(token) = val.get("accessToken").and_then(|t| t.as_str()) {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                return Err(AuthReason::CredentialExpired);
+            }
+            return Ok(trimmed.to_string());
+        }
+
+        if let Some(token) = val.get("access_token").and_then(|t| t.as_str()) {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                return Err(AuthReason::CredentialExpired);
+            }
+            return Ok(trimmed.to_string());
+        }
+
+        return Err(AuthReason::CredentialExpired);
     }
 
     Ok(raw.to_string())
@@ -197,18 +198,18 @@ pub fn parse_anthropic_usage_body(
     let mut windows = vec![five_hour_window, seven_day_window];
 
     for (key, v) in root {
-        if key.starts_with("seven_day_") {
-            if let Some(obj) = v.as_object() {
-                let model_name = key.trim_start_matches("seven_day_");
-                if !model_name.is_empty() {
-                    let model_window = parse_window(
-                        key,
-                        WindowScope::ModelSpecific(ModelId::new(model_name)),
-                        obj,
-                        NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
-                    )?;
-                    windows.push(model_window);
-                }
+        if key.starts_with("seven_day_")
+            && let Some(obj) = v.as_object()
+        {
+            let model_name = key.trim_start_matches("seven_day_");
+            if !model_name.is_empty() {
+                let model_window = parse_window(
+                    key,
+                    WindowScope::ModelSpecific(ModelId::new(model_name)),
+                    obj,
+                    NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
+                )?;
+                windows.push(model_window);
             }
         }
     }
@@ -483,6 +484,21 @@ mod tests {
         FakeClock::new(UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000))
     }
 
+    /// Destructures a successful reading from the observation. The exhaustive
+    /// three-arm match over [`ProviderObservation`] is what keeps the crate-wide
+    /// `clippy::wildcard_enum_match_arm` deny satisfied: each variant is named.
+    fn expect_measured(obs: ProviderObservation<AnthropicReading>) -> AnthropicReading {
+        match obs {
+            ProviderObservation::Measured(reading) => reading,
+            ProviderObservation::AuthRequired(reason) => {
+                panic!("expected Measured, got AuthRequired({reason:?})")
+            }
+            ProviderObservation::Unreachable(failure) => {
+                panic!("expected Measured, got Unreachable({failure:?})")
+            }
+        }
+    }
+
     #[test]
     fn case_01_valid_success() {
         let adapter = test_adapter();
@@ -495,35 +511,31 @@ mod tests {
             &clock,
         );
 
-        match obs {
-            ProviderObservation::Measured(reading) => {
-                assert_eq!(reading.windows.len(), 3);
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 3);
 
-                let five_hour = &reading.windows[0];
-                assert_eq!(five_hour.semantic_key().as_str(), "five_hour");
-                assert_eq!(*five_hour.scope(), WindowScope::AccountWide);
-                assert_eq!(five_hour.quota_used().as_ppm().get(), 80_000);
-                assert_eq!(five_hour.nominal_duration().as_nanos(), 18_000_000_000_000);
+        let five_hour = &reading.windows[0];
+        assert_eq!(five_hour.semantic_key().as_str(), "five_hour");
+        assert_eq!(*five_hour.scope(), WindowScope::AccountWide);
+        assert_eq!(five_hour.quota_used().as_ppm().get(), 80_000);
+        assert_eq!(five_hour.nominal_duration().as_nanos(), 18_000_000_000_000);
 
-                let seven_day = &reading.windows[1];
-                assert_eq!(seven_day.semantic_key().as_str(), "seven_day");
-                assert_eq!(*seven_day.scope(), WindowScope::AccountWide);
-                assert_eq!(seven_day.quota_used().as_ppm().get(), 910_000);
-                assert_eq!(seven_day.nominal_duration().as_nanos(), 604_800_000_000_000);
+        let seven_day = &reading.windows[1];
+        assert_eq!(seven_day.semantic_key().as_str(), "seven_day");
+        assert_eq!(*seven_day.scope(), WindowScope::AccountWide);
+        assert_eq!(seven_day.quota_used().as_ppm().get(), 910_000);
+        assert_eq!(seven_day.nominal_duration().as_nanos(), 604_800_000_000_000);
 
-                let sonnet = &reading.windows[2];
-                assert_eq!(sonnet.semantic_key().as_str(), "seven_day_sonnet");
-                assert_eq!(
-                    *sonnet.scope(),
-                    WindowScope::ModelSpecific(ModelId::new("sonnet"))
-                );
-                assert_eq!(sonnet.quota_used().as_ppm().get(), 0);
+        let sonnet = &reading.windows[2];
+        assert_eq!(sonnet.semantic_key().as_str(), "seven_day_sonnet");
+        assert_eq!(
+            *sonnet.scope(),
+            WindowScope::ModelSpecific(ModelId::new("sonnet"))
+        );
+        assert_eq!(sonnet.quota_used().as_ppm().get(), 0);
 
-                let extra = reading.extra_usage.expect("extra_usage is present");
-                assert!(!extra.is_enabled);
-            }
-            other => panic!("expected Measured, got {other:?}"),
-        }
+        let extra = reading.extra_usage.expect("extra_usage is present");
+        assert!(!extra.is_enabled);
     }
 
     #[test]
@@ -538,14 +550,10 @@ mod tests {
             &clock,
         );
 
-        match obs {
-            ProviderObservation::Measured(reading) => {
-                assert_eq!(reading.windows.len(), 2);
-                assert_eq!(reading.windows[0].quota_used().as_ppm().get(), 0);
-                assert_eq!(reading.windows[1].quota_used().as_ppm().get(), 0);
-            }
-            other => panic!("expected Measured, got {other:?}"),
-        }
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 2);
+        assert_eq!(reading.windows[0].quota_used().as_ppm().get(), 0);
+        assert_eq!(reading.windows[1].quota_used().as_ppm().get(), 0);
     }
 
     #[test]
@@ -560,21 +568,17 @@ mod tests {
             &clock,
         );
 
-        match obs {
-            ProviderObservation::Measured(reading) => {
-                assert_eq!(reading.windows.len(), 4);
-                let keys: Vec<&str> = reading
-                    .windows
-                    .iter()
-                    .map(|w| w.semantic_key().as_str())
-                    .collect();
-                assert!(keys.contains(&"five_hour"));
-                assert!(keys.contains(&"seven_day"));
-                assert!(keys.contains(&"seven_day_sonnet"));
-                assert!(keys.contains(&"seven_day_opus"));
-            }
-            other => panic!("expected Measured, got {other:?}"),
-        }
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 4);
+        let keys: Vec<&str> = reading
+            .windows
+            .iter()
+            .map(|w| w.semantic_key().as_str())
+            .collect();
+        assert!(keys.contains(&"five_hour"));
+        assert!(keys.contains(&"seven_day"));
+        assert!(keys.contains(&"seven_day_sonnet"));
+        assert!(keys.contains(&"seven_day_opus"));
     }
 
     #[test]
@@ -589,21 +593,17 @@ mod tests {
             &clock,
         );
 
-        match obs {
-            ProviderObservation::Measured(reading) => {
-                let sonnet = reading
-                    .windows
-                    .iter()
-                    .find(|w| w.semantic_key().as_str() == "seven_day_sonnet")
-                    .expect("seven_day_sonnet must be present");
-                assert_eq!(
-                    *sonnet.scope(),
-                    WindowScope::ModelSpecific(ModelId::new("sonnet"))
-                );
-                assert_eq!(sonnet.quota_used().as_ppm().get(), 180_000);
-            }
-            other => panic!("expected Measured, got {other:?}"),
-        }
+        let reading = expect_measured(obs);
+        let sonnet = reading
+            .windows
+            .iter()
+            .find(|w| w.semantic_key().as_str() == "seven_day_sonnet")
+            .expect("seven_day_sonnet must be present");
+        assert_eq!(
+            *sonnet.scope(),
+            WindowScope::ModelSpecific(ModelId::new("sonnet"))
+        );
+        assert_eq!(sonnet.quota_used().as_ppm().get(), 180_000);
     }
 
     #[test]
@@ -742,14 +742,10 @@ mod tests {
             &clock,
         );
 
-        match obs {
-            ProviderObservation::Measured(reading) => {
-                assert_eq!(reading.windows.len(), 2);
-                let payload = reading.raw_payload.expect("raw_payload must be retained");
-                assert!(payload.get("unknown_top_level_metric").is_some());
-            }
-            other => panic!("expected Measured, got {other:?}"),
-        }
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 2);
+        let payload = reading.raw_payload.expect("raw_payload must be retained");
+        assert!(payload.get("unknown_top_level_metric").is_some());
     }
 
     #[test]
@@ -764,15 +760,11 @@ mod tests {
             &clock,
         );
 
-        match obs {
-            ProviderObservation::Measured(reading) => {
-                assert_eq!(reading.windows.len(), 2);
-                let expected_ts = UtcTimestamp::parse_rfc3339("2020-01-01T00:00:00.000Z")
-                    .expect("valid RFC3339 timestamp");
-                assert_eq!(reading.windows[0].resets_at(), expected_ts);
-            }
-            other => panic!("expected Measured, got {other:?}"),
-        }
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 2);
+        let expected_ts = UtcTimestamp::parse_rfc3339("2020-01-01T00:00:00.000Z")
+            .expect("valid RFC3339 timestamp");
+        assert_eq!(reading.windows[0].resets_at(), expected_ts);
     }
 
     #[test]
@@ -796,10 +788,8 @@ mod tests {
             &clock,
         );
 
-        let (reading_a, reading_b) = match (obs_a, obs_b) {
-            (ProviderObservation::Measured(a), ProviderObservation::Measured(b)) => (a, b),
-            other => panic!("expected both Measured, got {other:?}"),
-        };
+        let reading_a = expect_measured(obs_a);
+        let reading_b = expect_measured(obs_b);
 
         assert_ne!(
             reading_a.windows[0].resets_at(),
