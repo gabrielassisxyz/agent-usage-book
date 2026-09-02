@@ -6,6 +6,7 @@
 //! - calibration
 
 pub mod adapter;
+pub mod anthropic;
 #[cfg(test)]
 pub mod synthetic;
 pub mod transport;

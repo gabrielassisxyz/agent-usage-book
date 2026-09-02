@@ -1,0 +1,15 @@
+{
+  "five_hour": {
+    "utilization": 8.0,
+    "resets_at": "2026-08-30T19:00:00.000Z",
+    "future_field_window": 12345
+  },
+  "seven_day": {
+    "utilization": 91.0,
+    "resets_at": "2026-09-06T12:00:00.000Z"
+  },
+  "unknown_top_level_metric": {
+    "metric_id": "test",
+    "score": 99.9
+  }
+}

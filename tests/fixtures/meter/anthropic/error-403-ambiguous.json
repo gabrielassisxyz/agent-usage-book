@@ -1,0 +1,7 @@
+{
+  "type": "error",
+  "error": {
+    "type": "permission_error",
+    "message": "The requested resource is forbidden for this workspace."
+  }
+}
