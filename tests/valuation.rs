@@ -14,6 +14,7 @@ use agent_usage_book::domain::tokens::{
 use agent_usage_book::evidence::{CoverageCompleteness, EvidenceQuality};
 use agent_usage_book::valuation::{RateBook, ValuationOutcome, value_batch, value_usage_vector};
 
+#[allow(clippy::too_many_arguments)]
 fn helper_card(
     id: i64,
     vendor: &str,
