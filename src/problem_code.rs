@@ -10,13 +10,15 @@
 
 use crate::domain::failure::{AuthReason, FailureClass, HttpStatusClass};
 use crate::domain::freshness::StaleReason;
-use crate::error::ExitClass;
+use crate::error::{Error, ExitClass};
 use crate::evidence::CoverageCompleteness;
 
 /// A stable symbolic problem code.
 ///
 /// One variant per distinguishable condition, derived from [`FailureClass`],
-/// [`AuthReason`], [`StaleReason`] and [`CoverageCompleteness`]. The string form is
+/// [`AuthReason`], [`StaleReason`] and [`CoverageCompleteness`] where a finer
+/// classification carries the detail, and from the [`Error`] taxonomy for the
+/// generic failures whose only payload is a human message. The string form is
 /// the public contract and is documented in `docs/problem-codes.md`; a test fails when
 /// a code is renamed or removed, so a change is deliberate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -45,6 +47,15 @@ pub enum ProblemCode {
     CredentialChangedUnverified,
     // CoverageCompleteness.
     IngestPartial,
+    // Error taxonomy: the generic failures whose payload is only a message, so
+    // no finer classification exists to derive a code from.
+    InternalError,
+    InvalidUsage,
+    AuthenticationRequired,
+    RemoteSourceUnavailable,
+    StoreFailure,
+    InsufficientEvidence,
+    ThresholdNotMet,
 }
 
 impl ProblemCode {
@@ -71,39 +82,18 @@ impl ProblemCode {
             ProblemCode::CollectorInterrupted => "COLLECTOR_INTERRUPTED",
             ProblemCode::CredentialChangedUnverified => "CREDENTIAL_CHANGED_UNVERIFIED",
             ProblemCode::IngestPartial => "INGEST_PARTIAL",
-        }
-    }
-
-    /// The one stable exit class this code belongs to. Multiple codes may share a
-    /// coarse class; the mapping is exhaustive with no wildcard arm, so adding a code
-    /// without choosing its class fails to compile.
-    pub fn exit_class(self) -> ExitClass {
-        match self {
-            ProblemCode::DnsFailure
-            | ProblemCode::ConnectTimeout
-            | ProblemCode::ReadTimeout
-            | ProblemCode::TotalBudgetExpired
-            | ProblemCode::HttpClientError
-            | ProblemCode::HttpServerError
-            | ProblemCode::RateLimited
-            | ProblemCode::MalformedBody
-            | ProblemCode::MissingRequiredField
-            | ProblemCode::MalformedProviderResponse => ExitClass::RemoteUnavailable,
-            ProblemCode::CredentialExpired
-            | ProblemCode::CredentialRejected
-            | ProblemCode::ProviderDeclaredExpiry
-            | ProblemCode::CredentialChangedUnverified => ExitClass::AuthRequired,
-            ProblemCode::AgeExceeded => ExitClass::Success,
-            ProblemCode::NoSuccessfulObservation => ExitClass::InsufficientEvidence,
-            ProblemCode::SamplingGap
-            | ProblemCode::CollectorInterrupted
-            | ProblemCode::IngestPartial => ExitClass::IngestIncomplete,
-            ProblemCode::ClockAnomaly => ExitClass::Internal,
+            ProblemCode::InternalError => "INTERNAL_ERROR",
+            ProblemCode::InvalidUsage => "INVALID_USAGE",
+            ProblemCode::AuthenticationRequired => "AUTHENTICATION_REQUIRED",
+            ProblemCode::RemoteSourceUnavailable => "REMOTE_SOURCE_UNAVAILABLE",
+            ProblemCode::StoreFailure => "STORE_FAILURE",
+            ProblemCode::InsufficientEvidence => "INSUFFICIENT_EVIDENCE",
+            ProblemCode::ThresholdNotMet => "THRESHOLD_NOT_MET",
         }
     }
 
     /// One instance of every code, for the enumeration and documentation tests.
-    pub fn all() -> [ProblemCode; 20] {
+    pub fn all() -> [ProblemCode; 27] {
         [
             ProblemCode::DnsFailure,
             ProblemCode::ConnectTimeout,
@@ -125,6 +115,13 @@ impl ProblemCode {
             ProblemCode::CollectorInterrupted,
             ProblemCode::CredentialChangedUnverified,
             ProblemCode::IngestPartial,
+            ProblemCode::InternalError,
+            ProblemCode::InvalidUsage,
+            ProblemCode::AuthenticationRequired,
+            ProblemCode::RemoteSourceUnavailable,
+            ProblemCode::StoreFailure,
+            ProblemCode::InsufficientEvidence,
+            ProblemCode::ThresholdNotMet,
         ]
     }
 
@@ -144,6 +141,64 @@ impl ProblemCode {
         match coverage {
             CoverageCompleteness::Complete => None,
             CoverageCompleteness::Partial { .. } => Some(ProblemCode::IngestPartial),
+        }
+    }
+}
+
+/// The one stable exit class a code belongs to. Multiple codes may share a coarse
+/// class; the match is exhaustive with no wildcard arm, so adding a code without
+/// choosing its class fails to compile. This is the single place a symbolic code
+/// is coarsened to a process exit class: [`Error::exit_class`] reaches it through
+/// [`Error::problem_code`] and holds no mapping of its own.
+impl From<ProblemCode> for ExitClass {
+    fn from(code: ProblemCode) -> Self {
+        match code {
+            ProblemCode::DnsFailure
+            | ProblemCode::ConnectTimeout
+            | ProblemCode::ReadTimeout
+            | ProblemCode::TotalBudgetExpired
+            | ProblemCode::HttpClientError
+            | ProblemCode::HttpServerError
+            | ProblemCode::RateLimited
+            | ProblemCode::MalformedBody
+            | ProblemCode::MissingRequiredField
+            | ProblemCode::MalformedProviderResponse
+            | ProblemCode::RemoteSourceUnavailable => ExitClass::RemoteUnavailable,
+            ProblemCode::CredentialExpired
+            | ProblemCode::CredentialRejected
+            | ProblemCode::ProviderDeclaredExpiry
+            | ProblemCode::CredentialChangedUnverified
+            | ProblemCode::AuthenticationRequired => ExitClass::AuthRequired,
+            ProblemCode::AgeExceeded => ExitClass::Success,
+            ProblemCode::NoSuccessfulObservation | ProblemCode::InsufficientEvidence => {
+                ExitClass::InsufficientEvidence
+            }
+            ProblemCode::SamplingGap
+            | ProblemCode::CollectorInterrupted
+            | ProblemCode::IngestPartial => ExitClass::IngestIncomplete,
+            ProblemCode::ClockAnomaly | ProblemCode::InternalError => ExitClass::Internal,
+            ProblemCode::InvalidUsage => ExitClass::Usage,
+            ProblemCode::StoreFailure => ExitClass::Store,
+            ProblemCode::ThresholdNotMet => ExitClass::ThresholdNotMet,
+        }
+    }
+}
+
+/// The one derivation from a failure to a symbolic code. Every [`Error`] variant
+/// yields a code; the generic variants whose only payload is a message map to the
+/// `Error`-taxonomy codes, and the match is exhaustive with no wildcard arm, so a
+/// new `Error` variant cannot be added without choosing its code.
+impl From<&Error> for ProblemCode {
+    fn from(error: &Error) -> Self {
+        match error {
+            Error::Internal(_) => ProblemCode::InternalError,
+            Error::Usage(_) => ProblemCode::InvalidUsage,
+            Error::AuthRequired(_) => ProblemCode::AuthenticationRequired,
+            Error::RemoteUnavailable(_) => ProblemCode::RemoteSourceUnavailable,
+            Error::Store(_) => ProblemCode::StoreFailure,
+            Error::InsufficientEvidence(_) => ProblemCode::InsufficientEvidence,
+            Error::ThresholdNotMet(_) => ProblemCode::ThresholdNotMet,
+            Error::IngestIncomplete(_) => ProblemCode::IngestPartial,
         }
     }
 }
@@ -264,7 +319,7 @@ mod tests {
     /// fails the run.
     #[test]
     fn enumeration_names_every_code_exactly_once() {
-        const EXPECTED: [&str; 20] = [
+        const EXPECTED: [&str; 27] = [
             "DNS_FAILURE",
             "CONNECT_TIMEOUT",
             "READ_TIMEOUT",
@@ -285,6 +340,13 @@ mod tests {
             "COLLECTOR_INTERRUPTED",
             "CREDENTIAL_CHANGED_UNVERIFIED",
             "INGEST_PARTIAL",
+            "INTERNAL_ERROR",
+            "INVALID_USAGE",
+            "AUTHENTICATION_REQUIRED",
+            "REMOTE_SOURCE_UNAVAILABLE",
+            "STORE_FAILURE",
+            "INSUFFICIENT_EVIDENCE",
+            "THRESHOLD_NOT_MET",
         ];
         let actual: Vec<&str> = ProblemCode::all().iter().map(|c| c.code()).collect();
         assert_eq!(actual, EXPECTED);
@@ -315,7 +377,7 @@ mod tests {
         .expect("docs/problem-codes.md must be readable");
 
         for code in ProblemCode::all() {
-            let row = format!("| {} | {} |", code.code(), code.exit_class().name());
+            let row = format!("| {} | {} |", code.code(), ExitClass::from(code).name());
             assert!(
                 docs.contains(&row),
                 "docs/problem-codes.md has no row matching {row:?}"
@@ -330,7 +392,7 @@ mod tests {
     fn every_code_maps_to_exactly_one_exit_class() {
         for code in ProblemCode::all() {
             // The mapping is a total function; calling it is the exhaustive check.
-            let _ = code.exit_class();
+            let _ = ExitClass::from(code);
         }
 
         let timeout_codes = [
@@ -339,7 +401,7 @@ mod tests {
             ProblemCode::TotalBudgetExpired,
         ];
         for timeout in timeout_codes {
-            assert_eq!(timeout.exit_class(), ExitClass::RemoteUnavailable);
+            assert_eq!(ExitClass::from(timeout), ExitClass::RemoteUnavailable);
             assert_ne!(
                 timeout.code(),
                 ProblemCode::CollectorInterrupted.code(),
@@ -347,8 +409,48 @@ mod tests {
             );
         }
         assert_eq!(
-            ProblemCode::CollectorInterrupted.exit_class(),
+            ExitClass::from(ProblemCode::CollectorInterrupted),
             ExitClass::IngestIncomplete
+        );
+    }
+
+    /// Every `Error` variant derives a code, and the derived codes are distinct
+    /// and each enumerated, so a `String`-only error is never rendered without a
+    /// stable symbolic code. The planted negative is the distinctness assert: a
+    /// `From<&Error>` that fell through to one code for several variants would
+    /// pass "yields a code" and fail here.
+    #[test]
+    fn every_error_variant_derives_an_enumerated_code() {
+        let enumerated: BTreeSet<&str> = ProblemCode::all().iter().map(|c| c.code()).collect();
+        let errors = [
+            Error::Internal("m".into()),
+            Error::Usage("m".into()),
+            Error::AuthRequired("m".into()),
+            Error::RemoteUnavailable("m".into()),
+            Error::Store("m".into()),
+            Error::InsufficientEvidence("m".into()),
+            Error::ThresholdNotMet("m".into()),
+            Error::IngestIncomplete("m".into()),
+        ];
+        let derived: BTreeSet<&str> = errors
+            .iter()
+            .map(|error| ProblemCode::from(error).code())
+            .collect();
+        for error in &errors {
+            assert!(enumerated.contains(ProblemCode::from(error).code()));
+        }
+        assert_eq!(
+            derived.len(),
+            errors.len(),
+            "each Error variant must derive a distinct problem code"
+        );
+        assert_eq!(
+            ProblemCode::from(&Error::Usage("m".into())),
+            ProblemCode::InvalidUsage
+        );
+        assert_eq!(
+            ExitClass::from(ProblemCode::from(&Error::Store("m".into()))),
+            ExitClass::Store
         );
     }
 }

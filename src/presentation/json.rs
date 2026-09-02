@@ -12,8 +12,10 @@ use crate::domain::interval::{DomainQuantity, Interval};
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
+use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
+use crate::problem_code::ProblemCode;
 use crate::report::{LedgerGeneration, ReportMetadata, SpendReport, StatusReport};
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
@@ -522,6 +524,28 @@ pub fn spend_json(report: &SpendReport, run: RunId) -> String {
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
 }
 
+/// Renders a failed command as the versioned JSON error envelope: the schema
+/// version, the command name where one was resolved, and an `error` object
+/// carrying the stable symbolic problem code, the human message and the numeric
+/// exit class. It is the machine-readable counterpart of the plain `aub: <message>`
+/// line, so a caller reading `--format json` never parses prose to learn that a
+/// source needed authentication, and never has to infer the class from the
+/// process exit code alone. The code and the class are both read from
+/// [`Error::problem_code`], so the envelope and the exit status cannot disagree.
+pub fn error_envelope_json(error: &Error, command: Option<&str>) -> String {
+    let code = ProblemCode::from(error);
+    let command_field = match command {
+        Some(name) => format!("\"command\":{},", json_string(name)),
+        None => String::new(),
+    };
+    format!(
+        "{{\"schema\":{SCHEMA_VERSION},{command_field}\"error\":{{\"code\":{},\"message\":{},\"exit_class\":{}}}}}",
+        json_string(code.code()),
+        json_string(&error.to_string()),
+        error.exit_class().code(),
+    )
+}
+
 fn token_kind_key(kind: TokenKind) -> &'static str {
     match kind {
         TokenKind::Input => "input",
@@ -1008,6 +1032,75 @@ mod tests {
 
         let round_trip = provenance_from_json(&json).expect("provenance round-trip");
         assert_eq!(round_trip, provenance);
+    }
+
+    #[test]
+    fn error_envelope_carries_code_message_and_exit_class() {
+        let error = Error::Usage("--since must be YYYY-MM-DD, got \"x\"".to_string());
+        let json = error_envelope_json(&error, Some("spend"));
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid error JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "schema": 1,
+                "command": "spend",
+                "error": {
+                    "code": "INVALID_USAGE",
+                    "message": "--since must be YYYY-MM-DD, got \"x\"",
+                    "exit_class": 2
+                }
+            })
+        );
+
+        let no_command = error_envelope_json(&Error::Store("disk full".to_string()), None);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&no_command).expect("valid error JSON without a command");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "schema": 1,
+                "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
+            })
+        );
+    }
+
+    /// Every reachable error path renders a JSON envelope that carries its stable
+    /// code, its message verbatim and the same numeric class the process exits
+    /// with. The planted negative is the distinct-class assertion: an envelope
+    /// that hard-coded one class, or dropped the code for the generic variants,
+    /// would pass the per-row checks and fail the set checks.
+    #[test]
+    fn every_error_path_renders_a_json_envelope_with_its_code() {
+        let mut classes = std::collections::BTreeSet::new();
+        for class in 1..=8u8 {
+            let error = crate::error::representative_outcome(class)
+                .expect_err("classes 1..=8 are failures");
+            let json = error_envelope_json(&error, Some("spend"));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("valid error JSON for every variant");
+            let envelope_error = parsed.get("error").expect("error object present");
+            let code = envelope_error["code"].as_str().expect("code is a string");
+            assert!(!code.is_empty(), "class {class} rendered an empty code");
+            assert_eq!(
+                envelope_error["message"],
+                error.to_string(),
+                "class {class} did not carry its message verbatim"
+            );
+            let rendered_class = envelope_error["exit_class"]
+                .as_u64()
+                .expect("exit_class is a number");
+            assert_eq!(
+                rendered_class as u8,
+                error.exit_class().code(),
+                "class {class} envelope disagrees with the process exit class"
+            );
+            classes.insert(rendered_class);
+        }
+        assert_eq!(
+            classes.len(),
+            8,
+            "the eight error paths must render eight distinct classes"
+        );
     }
 
     #[test]

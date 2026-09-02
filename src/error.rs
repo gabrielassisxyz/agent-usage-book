@@ -2,8 +2,15 @@
 //!
 //! Exit codes are a scripting contract, not a convention: automation must not
 //! parse prose to learn that a remote source needed authentication. Every
-//! command reports failure through this one vocabulary, and the mapping from
-//! error to exit class lives in exactly one place: [`Error::exit_class`].
+//! command reports failure through this one vocabulary.
+//!
+//! There is one derivation from a failure to its exit class and it runs through
+//! the symbolic problem code: [`Error::problem_code`] names the stable
+//! [`crate::problem_code::ProblemCode`] for a failure, and
+//! [`ExitClass`]'s `From<ProblemCode>` is the single place a code is coarsened to
+//! a class. [`Error::exit_class`] is the only entry point callers use, and it is
+//! that composition with no mapping of its own, so the class the binary returns
+//! and the code the JSON envelope carries can never disagree.
 
 /// The nine stable process exit classes.
 ///
@@ -59,8 +66,10 @@ impl ExitClass {
 /// The error type every command returns.
 ///
 /// Variants correspond to failure classes 1 through 8; successful completion
-/// is `Ok` and maps to [`ExitClass::Success`] in the binary. The mapping from
-/// variant to class lives in exactly one place: [`Error::exit_class`].
+/// is `Ok` and maps to [`ExitClass::Success`] in the binary. A variant is
+/// coarsened to a class only through its [`crate::problem_code::ProblemCode`]
+/// (see [`Error::problem_code`]); [`Error::exit_class`] is that composition and
+/// carries no class mapping of its own.
 #[derive(Debug)]
 pub enum Error {
     /// 1 - unexpected internal failure.
@@ -82,21 +91,24 @@ pub enum Error {
 }
 
 impl Error {
-    /// The single mapping from error variant to exit class.
+    /// The stable symbolic problem code for this failure.
     ///
-    /// This match is exhaustive with no wildcard arm: adding a variant to
-    /// [`Error`] breaks compilation here until its class is chosen.
+    /// This is the one derivation from an [`Error`] to a
+    /// [`crate::problem_code::ProblemCode`]; the JSON error envelope and the
+    /// process exit class are both read from it, so they cannot drift. The
+    /// conversion match lives with the other `ProblemCode` derivations in
+    /// [`crate::problem_code`] and is exhaustive with no wildcard arm.
+    pub fn problem_code(&self) -> crate::problem_code::ProblemCode {
+        self.into()
+    }
+
+    /// The process exit class for this failure.
+    ///
+    /// This is the only entry point for turning a failure into a class, and it
+    /// is `problem_code` composed with `ExitClass`'s `From<ProblemCode>`: no
+    /// class mapping lives here. `rg 'fn exit_class' src/` returns this one line.
     pub fn exit_class(&self) -> ExitClass {
-        match self {
-            Error::Internal(_) => ExitClass::Internal,
-            Error::Usage(_) => ExitClass::Usage,
-            Error::AuthRequired(_) => ExitClass::AuthRequired,
-            Error::RemoteUnavailable(_) => ExitClass::RemoteUnavailable,
-            Error::Store(_) => ExitClass::Store,
-            Error::InsufficientEvidence(_) => ExitClass::InsufficientEvidence,
-            Error::ThresholdNotMet(_) => ExitClass::ThresholdNotMet,
-            Error::IngestIncomplete(_) => ExitClass::IngestIncomplete,
-        }
+        ExitClass::from(self.problem_code())
     }
 }
 
@@ -153,12 +165,33 @@ pub fn representative_outcome(class: u8) -> Result<(), Error> {
 mod tests {
     use super::*;
 
-    /// Every error variant maps to its documented class. The match in
-    /// [`Error::exit_class`] has no wildcard arm, so adding a variant breaks
-    /// that match's compilation; this test then pins the correct class for
-    /// each variant so the two cannot drift.
+    /// One instance of every [`Error`] variant, so a test that must cover the
+    /// whole taxonomy drives from this rather than keeping its own list.
+    fn every_variant() -> [Error; 8] {
+        [
+            Error::Internal("x".into()),
+            Error::Usage("x".into()),
+            Error::AuthRequired("x".into()),
+            Error::RemoteUnavailable("x".into()),
+            Error::Store("x".into()),
+            Error::InsufficientEvidence("x".into()),
+            Error::ThresholdNotMet("x".into()),
+            Error::IngestIncomplete("x".into()),
+        ]
+    }
+
+    /// Every error variant derives a problem code and, through it, its
+    /// documented class. `Error::problem_code`'s conversion match and
+    /// `ExitClass`'s `From<ProblemCode>` are both exhaustive with no wildcard
+    /// arm, so adding a variant to either enum breaks compilation until it is
+    /// handled; this test then pins the correct pairing for each variant so the
+    /// two cannot drift.
+    ///
+    /// The planted negative is the `assert_ne!` block: an implementation that
+    /// collapsed distinct failures onto one code, or routed every code to
+    /// `Internal`, would still pass the positive rows above and fails here.
     #[test]
-    fn exit_class_mapping_is_exhaustive_and_correct() {
+    fn every_error_derives_a_code_and_a_class_that_agree() {
         let cases = [
             (Error::Internal("x".into()), ExitClass::Internal),
             (Error::Usage("x".into()), ExitClass::Usage),
@@ -183,7 +216,22 @@ mod tests {
         ];
         for (error, class) in cases {
             assert_eq!(error.exit_class(), class);
+            assert_eq!(ExitClass::from(error.problem_code()), class);
         }
+
+        let codes: std::collections::BTreeSet<&str> = every_variant()
+            .iter()
+            .map(|error| error.problem_code().code())
+            .collect();
+        assert_eq!(
+            codes.len(),
+            8,
+            "each error variant must derive a distinct problem code"
+        );
+        assert_ne!(
+            Error::Usage("x".into()).problem_code().code(),
+            Error::Internal("x".into()).problem_code().code(),
+        );
     }
 
     /// A single failure is exactly one variant, so it maps to exactly one
