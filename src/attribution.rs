@@ -4,6 +4,8 @@
 //! - presentation
 //! - provider adapters
 
+pub mod segment;
+
 use std::collections::BTreeMap;
 
 use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};

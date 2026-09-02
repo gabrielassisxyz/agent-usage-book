@@ -15,6 +15,7 @@
 
 pub mod account;
 pub mod attempt_crash_hook;
+pub mod attribution_segment;
 pub mod calibration;
 pub mod connection;
 pub mod cost_model;
