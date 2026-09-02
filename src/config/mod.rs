@@ -35,12 +35,15 @@
 
 mod duration;
 
+pub mod aliases;
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
 
+pub use aliases::AliasTable;
 pub use duration::parse_duration;
 
 /// Where a resolved value came from, in the order that decides a tie.
@@ -232,6 +235,10 @@ pub struct Config {
     pub tracker: Option<TrackerConfig>,
     pub valuation: ValuationConfig,
     pub backup: BackupConfig,
+    /// Working-directory to logical project identity (`aub-lqe.12`).
+    pub projects: AliasTable,
+    /// Working-directory to logical repository identity (`aub-lqe.12`).
+    pub repositories: AliasTable,
 }
 
 /// The section names and, one level down, the key names this project recognizes. An
@@ -248,6 +255,8 @@ const KNOWN_SECTIONS: &[&str] = &[
     "tracker",
     "valuation",
     "backup",
+    "projects",
+    "repositories",
 ];
 const STATE_KEYS: &[&str] = &["dir"];
 const SAMPLING_KEYS: &[&str] = &[
@@ -269,7 +278,7 @@ const BACKUP_KEYS: &[&str] = &["review_after"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
-        "unknown configuration key {key:?} in {file_display}"
+        "unknown configuration key {key:?} in {file_display}; remove it or fix the spelling"
     ))
 }
 
@@ -277,6 +286,16 @@ fn missing_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
         "missing required configuration key {key:?}; set it in {file_display}"
     ))
+}
+
+/// Renders a config file path for error messages with the home directory
+/// collapsed to `~`, so a default error never prints an absolute home path
+/// (aub-xus.8). A path outside the home directory is left as it is.
+fn display_path(path: &str, home: &str) -> String {
+    match path.strip_prefix(home) {
+        Some(rest) if !rest.is_empty() => format!("~{rest}"),
+        _ => path.to_string(),
+    }
 }
 
 fn check_keys(
@@ -352,6 +371,17 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
         for transcript in transcripts {
             if let Some(transcript) = transcript.as_table() {
                 check_keys(transcript, TRANSCRIPT_KEYS, "transcripts[]", file_display)?;
+            }
+        }
+    }
+    for section in ["projects", "repositories"] {
+        if let Some(aliases) = table.get(section).and_then(toml::Value::as_table) {
+            for (path, value) in aliases {
+                if value.as_str().is_none() {
+                    return Err(Error::Usage(format!(
+                        "{section}.{path}: alias value must be a string"
+                    )));
+                }
             }
         }
     }
@@ -475,22 +505,23 @@ pub fn resolve(
     file_contents: Option<&str>,
     file_display: &str,
 ) -> Result<(Config, Provenance), Error> {
-    let file: Option<toml::Table> = match file_contents {
-        Some(contents) => Some(
-            contents
-                .parse()
-                .map_err(|e| Error::Usage(format!("{file_display}: invalid TOML: {e}")))?,
-        ),
-        None => None,
-    };
-    if let Some(table) = &file {
-        validate_known_keys(table, file_display)?;
-    }
-
-    let mut provenance = Provenance::default();
     let home = env
         .get("HOME")
         .unwrap_or_else(|| "/nonexistent".to_string());
+    // Error messages name the config file home-relative, so a default error
+    // never prints an absolute home-directory path (aub-xus.8).
+    let file_display = display_path(&file_display, &home);
+    let file: Option<toml::Table> = match file_contents {
+        Some(contents) => Some(contents.parse().map_err(|e| {
+            Error::Usage(format!("{file_display}: invalid TOML: {e}; fix the file"))
+        })?),
+        None => None,
+    };
+    if let Some(table) = &file {
+        validate_known_keys(table, &file_display)?;
+    }
+
+    let mut provenance = Provenance::default();
     let default_dir = default_state_dir(&home);
 
     let state = StateConfig {
@@ -500,7 +531,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "state", "dir"),
             Some(&default_dir),
-            file_display,
+            &file_display,
             &mut provenance,
         )?),
     };
@@ -512,7 +543,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "scheduler_tick"),
             Some("1m"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
         default_interval: resolve_duration(
@@ -521,7 +552,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "default_interval"),
             Some("5m"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
         reset_edge_lead: resolve_duration(
@@ -530,7 +561,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "reset_edge_lead"),
             Some("120s"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
         request_timeout: resolve_duration(
@@ -539,7 +570,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "request_timeout"),
             Some("5s"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
         command_budget: resolve_duration(
@@ -548,7 +579,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "command_budget"),
             Some("8s"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
     };
@@ -560,7 +591,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "freshness", "meter"),
             Some("12m"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
     };
@@ -572,7 +603,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "coverage", "attempt_floor"),
             Some("0.98"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
         measurement_floor: resolve_floor(
@@ -581,7 +612,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "coverage", "measurement_floor"),
             Some("0.95"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
     };
@@ -593,7 +624,7 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "backup", "review_after"),
             Some("48h"),
-            file_display,
+            &file_display,
             &mut provenance,
         )?,
     };
@@ -620,7 +651,7 @@ pub fn resolve(
             let kind = t
                 .get("kind")
                 .and_then(toml::Value::as_str)
-                .ok_or_else(|| missing_key_error("tracker.kind", file_display))?;
+                .ok_or_else(|| missing_key_error("tracker.kind", &file_display))?;
             let path = t.get("path").and_then(toml::Value::as_str).unwrap_or("");
             provenance.set("tracker.kind", ConfigSource::File);
             Some(TrackerConfig {
@@ -712,6 +743,15 @@ pub fn resolve(
         provenance.set("transcripts", ConfigSource::File);
     }
 
+    let projects = alias_table_from_file(file.as_ref(), "projects")?;
+    if projects.entries().next().is_some() {
+        provenance.set("projects", ConfigSource::File);
+    }
+    let repositories = alias_table_from_file(file.as_ref(), "repositories")?;
+    if repositories.entries().next().is_some() {
+        provenance.set("repositories", ConfigSource::File);
+    }
+
     Ok((
         Config {
             state,
@@ -723,9 +763,32 @@ pub fn resolve(
             tracker,
             valuation,
             backup,
+            projects,
+            repositories,
         },
         provenance,
     ))
+}
+
+/// Reads one alias section (`projects` or `repositories`) from the file into a
+/// validated [`AliasTable`]. File-only, like the other heterogeneous sections:
+/// overriding a path-to-name mapping through one `--set` string is not a
+/// well-formed operation.
+fn alias_table_from_file(file: Option<&toml::Table>, section: &str) -> Result<AliasTable, Error> {
+    let Some(table) = file
+        .and_then(|t| t.get(section))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(AliasTable::default());
+    };
+    let mut entries = BTreeMap::new();
+    for (path, value) in table {
+        let name = value.as_str().ok_or_else(|| {
+            Error::Usage(format!("{section}.{path}: alias value must be a string"))
+        })?;
+        entries.insert(path.clone(), name.to_string());
+    }
+    AliasTable::new(entries)
 }
 
 #[cfg(test)]

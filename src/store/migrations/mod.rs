@@ -63,6 +63,12 @@ pub(crate) mod migration_0012;
 #[path = "0013_meter_evidence_observation.rs"]
 pub(crate) mod migration_0013;
 
+#[path = "0014_session.rs"]
+pub(crate) mod migration_0014;
+
+#[path = "0015_calibration.rs"]
+pub(crate) mod migration_0015;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -82,5 +88,7 @@ pub fn registry() -> Vec<Migration> {
         migration_0011::migration(),
         migration_0012::migration(),
         migration_0013::migration(),
+        migration_0014::migration(),
+        migration_0015::migration(),
     ]
 }
