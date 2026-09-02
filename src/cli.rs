@@ -56,6 +56,7 @@ aub_command_enum! {
     StateCheck,
     ExitClass,
     AttemptCrashHook,
+    RateCard,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -83,7 +84,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -91,6 +92,7 @@ impl Command {
         Self::StateCheck,
         Self::ExitClass,
         Self::AttemptCrashHook,
+        Self::RateCard,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -198,6 +200,21 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::RateCard => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "rate-card prints a price book, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "rate-card derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "the rate book is reference data, not per-account state",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "rate-card prints plain rows",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -212,6 +229,7 @@ impl Command {
             Command::StateCheck => "__state-check",
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
+            Command::RateCard => "rate-card",
         }
     }
 
@@ -228,6 +246,9 @@ impl Command {
             }
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
+            Command::RateCard => {
+                Some("import, show and history the immutable dated vendor rate cards")
+            }
         }
     }
 
@@ -400,6 +421,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
             }
         }
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
+        Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
     }
 }
 
@@ -784,6 +806,163 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         }
     }
     Ok(())
+}
+
+/// `aub rate-card`: the subcommand selects the operation; the shared flags are
+/// refused by the command's policy. The store path follows the state-check and
+/// crash-hook commands: readiness first, then the one connection path, then
+/// migrations, then the operation.
+fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let subcommand = invocation.rest.first().map(String::as_str);
+    match subcommand {
+        Some("import") => rate_card_import(clock, invocation),
+        Some("show") => rate_card_show(clock),
+        Some("history") => rate_card_history(clock),
+        other => Err(Error::Usage(format!(
+            "rate-card requires a subcommand (import | show | history), got {other:?}"
+        ))),
+    }
+}
+
+/// Opens the one production ledger database through the one connection path:
+/// state readiness first, migrations next, then the caller operates. The rate
+/// card is the first production store user, so this is where the database file
+/// name resolves from [`crate::store::connection::LEDGER_DATABASE_FILE`].
+fn rate_card_open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Error> {
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let opened = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            let mut conn = crate::store::connection::open(
+                &db_path,
+                crate::store::connection::AccessMode::ReadWrite,
+                &crate::store::connection::PragmaPolicy {
+                    busy_timeout: config.sampling.request_timeout,
+                },
+            )?;
+            crate::store::migrate::run_migrations(
+                &mut conn,
+                &crate::store::migrations::registry(),
+                None,
+                clock,
+            )?;
+            Ok(conn)
+        },
+    )??;
+    Ok(opened)
+}
+
+fn rate_card_import(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let path = invocation
+        .rest
+        .get(1)
+        .ok_or_else(|| Error::Usage("rate-card import requires a file path".into()))?;
+    let text = std::fs::read_to_string(path).map_err(|error| {
+        Error::IngestIncomplete(format!("cannot read rate book {path}: {error}"))
+    })?;
+    let book = crate::rate_book::parse(&text)
+        .map_err(|error| Error::Usage(format!("rate book rejected: {error}")))?;
+    let conn = rate_card_open_ledger(clock)?;
+    let summary = crate::store::rate_card::insert(&conn, &book.cards, clock.now())?;
+    println!(
+        "rate-card import: added={} unchanged={}",
+        summary.cards_added, summary.cards_unchanged
+    );
+    Ok(())
+}
+
+fn rate_card_show(clock: &impl Clock) -> Result<(), Error> {
+    let conn = rate_card_open_ledger(clock)?;
+    let total = crate::store::rate_card::count(&conn)?;
+    if total == 0 {
+        println!("no rate card records; import a book with `aub rate-card import`");
+        return Ok(());
+    }
+    let effective = crate::store::rate_card::effective_at(&conn, clock.now())?;
+    if effective.is_empty() {
+        println!(
+            "{total} rate card records exist and none is effective today; inspect them with `aub rate-card history`"
+        );
+        return Ok(());
+    }
+    for card in &effective {
+        println!("{}", render_rate_card(card));
+    }
+    Ok(())
+}
+
+fn rate_card_history(clock: &impl Clock) -> Result<(), Error> {
+    let conn = rate_card_open_ledger(clock)?;
+    let cards = crate::store::rate_card::history(&conn)?;
+    if cards.is_empty() {
+        println!("no rate card records; import a book with `aub rate-card import`");
+        return Ok(());
+    }
+    for card in &cards {
+        println!("{}", render_rate_card(card));
+    }
+    Ok(())
+}
+
+/// The exact decimal form of a micros rate: at least two fractional digits,
+/// trailing zeros trimmed without ever losing a digit the value carries. A
+/// one-micro rate renders as 0.000001, never as 0.00.
+fn render_rate_micros(micros: i64) -> String {
+    let whole = micros / 1_000_000;
+    let mut digits = format!("{:06}", micros % 1_000_000);
+    while digits.len() > 2 && digits.ends_with('0') {
+        digits.pop();
+    }
+    format!("{whole}.{digits}")
+}
+
+/// One rate card as a listing row. Missing provenance is a visible fact on the
+/// line, never silently presented as fully sourced (PLAN.md section 32).
+fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
+    let draft = &card.draft;
+    let interval = match draft.effective_end {
+        Some(end) => format!("{}-{}", draft.effective_start.iso(), end.iso()),
+        None => format!("{}-open", draft.effective_start.iso()),
+    };
+    let mut line = format!(
+        "{} {} {} {} {} {} {}",
+        draft.vendor,
+        draft.model,
+        draft.token_class.as_str(),
+        render_rate_micros(draft.rate_micros),
+        draft.currency.as_str(),
+        draft.billing_basis.as_str(),
+        interval,
+    );
+    if let Some(published) = draft.publication.published_at {
+        line.push_str(&format!(" published={}", published.utc_date().iso()));
+    }
+    if let Some(source) = &draft.publication.source {
+        line.push_str(&format!(" source={source}"));
+    }
+    match (&draft.publication.source, draft.publication.published_at) {
+        (None, None) => line.push_str(" provenance=missing-both"),
+        (None, Some(_)) => line.push_str(" provenance=missing-source"),
+        (Some(_), None) => line.push_str(" provenance=missing-publication"),
+        (Some(_), Some(_)) => {}
+    }
+    if let crate::domain::rate_card::ReviewDuePolicy::On(date) = draft.review_due {
+        line.push_str(&format!(" review-due {}", date.iso()));
+    }
+    line
 }
 
 #[cfg(test)]
