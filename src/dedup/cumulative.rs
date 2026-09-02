@@ -74,9 +74,9 @@ impl CounterResetExclusion {
 /// (`ParserAdapter::reports_cumulative`); the caller supplies it as a predicate
 /// so the pipeline never has to enumerate parsers itself.
 ///
-/// The events are grouped by source series — parser version plus session,
-/// falling back to the file name when the source attributes no session — and
-/// each group is ordered by the strongest available discriminator: source
+/// The events are grouped by source series: parser version plus session,
+/// falling back to the file name when the source attributes no session. Each
+/// group is ordered by the strongest available discriminator: source
 /// sequence where the event carries one, then the record timestamp, then a
 /// documented deterministic tiebreak (known components ascending, then source
 /// file) for records that share a timestamp and carry no sequence. Two records

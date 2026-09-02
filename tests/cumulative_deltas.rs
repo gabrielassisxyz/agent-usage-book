@@ -97,8 +97,8 @@ fn a_rotated_session_totals_once_not_once_per_file() {
     assert!(outcome.resets.is_empty());
 }
 
-/// The deliberate reversal: summing the deduplicated survivors — what the code
-/// did before the pipeline existed — produces the double count this bead
+/// The deliberate reversal: summing the deduplicated survivors, which is what
+/// the code did before the pipeline existed, produces the double count this bead
 /// removes. The assertion pins the overcount so a regression that reorders the
 /// pipeline cannot pass silently: the naive path is detectably wrong.
 #[test]
@@ -164,7 +164,7 @@ fn a_counter_reset_never_stores_a_negative_delta() {
     for delta in &outcome.deltas {
         let known = delta.usage().known();
         // The property the AC pins, asserted per stored delta: never negative,
-        // and unsigned types cannot store one anyway — the rejection is what
+        // and unsigned types cannot store one anyway; the rejection is what
         // guarantees that, so the assertion documents it rather than guards it.
         assert!(known.input().value() <= 500);
     }
