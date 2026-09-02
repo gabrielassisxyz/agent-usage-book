@@ -157,6 +157,45 @@ impl QuarantineClass {
     }
 }
 
+/// Diagnostic policy for quarantine excerpt storage (aub-2r3, PLAN.md 12.11).
+///
+/// Default is hash-only storage (no excerpt text stored). A bounded redacted
+/// excerpt is stored only under explicit configuration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum QuarantineDiagnosticPolicy {
+    /// Default: stores hash and byte offset only, no excerpt text.
+    #[default]
+    HashOnly,
+    /// Opt-in: stores a bounded redacted excerpt up to max_bytes.
+    BoundedRedactedExcerpt { max_bytes: usize },
+}
+
+impl QuarantineDiagnosticPolicy {
+    pub fn stores_excerpt(&self) -> bool {
+        matches!(self, Self::BoundedRedactedExcerpt { .. })
+    }
+
+    pub fn sanitize_and_bound_excerpt(&self, raw: &str) -> Option<String> {
+        match self {
+            Self::HashOnly => None,
+            Self::BoundedRedactedExcerpt { max_bytes } => {
+                let bounded: String = raw.chars().take(*max_bytes).collect();
+                let sanitized = bounded
+                    .chars()
+                    .map(|c| {
+                        if c.is_control() && c != '\n' && c != '\t' {
+                            ' '
+                        } else {
+                            c
+                        }
+                    })
+                    .collect();
+                Some(sanitized)
+            }
+        }
+    }
+}
+
 /// A source record that could not be normalized.
 ///
 /// Emitted rather than dropped: a silently skipped record is an undercount, and an
@@ -166,6 +205,9 @@ pub struct QuarantineRecord {
     location: SourceLocation,
     parser_version: ParserVersion,
     class: QuarantineClass,
+    byte_offset: Option<u64>,
+    excerpt_hash: String,
+    excerpt: Option<String>,
 }
 
 impl QuarantineRecord {
@@ -174,10 +216,37 @@ impl QuarantineRecord {
         parser_version: ParserVersion,
         class: QuarantineClass,
     ) -> Self {
+        use sha2::{Digest, Sha256};
+        let hash_input = format!("{}:{}:{}", location.file(), location.line(), class.name());
+        let excerpt_hash = format!("{:x}", Sha256::digest(hash_input.as_bytes()));
         Self {
             location,
             parser_version,
             class,
+            byte_offset: None,
+            excerpt_hash,
+            excerpt: None,
+        }
+    }
+
+    pub fn with_raw_content(
+        location: SourceLocation,
+        parser_version: ParserVersion,
+        class: QuarantineClass,
+        byte_offset: Option<u64>,
+        raw_content: &str,
+        policy: &QuarantineDiagnosticPolicy,
+    ) -> Self {
+        use sha2::{Digest, Sha256};
+        let excerpt_hash = format!("{:x}", Sha256::digest(raw_content.as_bytes()));
+        let excerpt = policy.sanitize_and_bound_excerpt(raw_content);
+        Self {
+            location,
+            parser_version,
+            class,
+            byte_offset,
+            excerpt_hash,
+            excerpt,
         }
     }
 
@@ -191,6 +260,18 @@ impl QuarantineRecord {
 
     pub fn class(&self) -> QuarantineClass {
         self.class
+    }
+
+    pub fn byte_offset(&self) -> Option<u64> {
+        self.byte_offset
+    }
+
+    pub fn excerpt_hash(&self) -> &str {
+        &self.excerpt_hash
+    }
+
+    pub fn excerpt(&self) -> Option<&str> {
+        self.excerpt.as_deref()
     }
 }
 

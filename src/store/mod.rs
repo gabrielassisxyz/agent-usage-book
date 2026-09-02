@@ -19,6 +19,7 @@ pub mod attribution_segment;
 pub mod calibration;
 pub mod connection;
 pub mod cost_model;
+pub mod ingest_quarantine;
 pub mod ledger_generation;
 pub mod meter_attempt;
 pub mod meter_evidence;

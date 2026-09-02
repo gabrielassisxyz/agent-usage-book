@@ -72,6 +72,9 @@ pub(crate) mod migration_0015;
 #[path = "0016_attribution_segment.rs"]
 pub(crate) mod migration_0016;
 
+#[path = "0017_ingest_quarantine.rs"]
+pub(crate) mod migration_0017;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -94,5 +97,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0014::migration(),
         migration_0015::migration(),
         migration_0016::migration(),
+        migration_0017::migration(),
     ]
 }
