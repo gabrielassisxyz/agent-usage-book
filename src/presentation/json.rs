@@ -10,14 +10,62 @@
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::interval::{DomainQuantity, Interval};
 use crate::domain::quota::QuotaRemaining;
+use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
-use crate::report::{ReportMetadata, SpendReport, StatusReport};
+use crate::report::{LedgerGeneration, ReportMetadata, SpendReport, StatusReport};
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
 /// below pin the exact shape, so a field added without bumping this fails them.
 pub const SCHEMA_VERSION: u32 = 1;
+
+/// An error during JSON contract validation or deserialization.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum JsonContractError {
+    /// Invalid JSON syntax.
+    InvalidJson(String),
+    /// Missing a required field.
+    MissingField(&'static str),
+    /// Schema version mismatch or unversioned schema change.
+    SchemaVersionMismatch { expected: u32, actual: u32 },
+    /// An unknown / unexpected field was encountered in a strict envelope or object.
+    UnexpectedField(String),
+    /// Field has an unexpected type or format.
+    InvalidFormat {
+        field: &'static str,
+        message: String,
+    },
+    /// Unit mismatch for a typed quantity.
+    UnitMismatch {
+        expected: &'static str,
+        actual: String,
+    },
+}
+
+impl std::fmt::Display for JsonContractError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidJson(msg) => write!(f, "invalid JSON: {msg}"),
+            Self::MissingField(field) => write!(f, "missing required field: {field}"),
+            Self::SchemaVersionMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "schema version mismatch: expected {expected}, got {actual}"
+                )
+            }
+            Self::UnexpectedField(field) => write!(f, "unexpected field: {field}"),
+            Self::InvalidFormat { field, message } => {
+                write!(f, "invalid format for field '{field}': {message}")
+            }
+            Self::UnitMismatch { expected, actual } => {
+                write!(f, "unit mismatch: expected '{expected}', got '{actual}'")
+            }
+        }
+    }
+}
+
+impl std::error::Error for JsonContractError {}
 
 /// A quantity with explicit unit semantics and an exact value representation.
 ///
@@ -53,6 +101,70 @@ impl Quantity {
             json_string(self.unit)
         )
     }
+
+    /// Deserializes a quantity from its JSON string representation.
+    pub fn from_json(json_str: &str) -> Result<Self, JsonContractError> {
+        let value: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| JsonContractError::InvalidJson(e.to_string()))?;
+        Self::from_value(&value)
+    }
+
+    /// Extracts a quantity from a JSON object `{"value": "...", "unit": "..."}`.
+    pub fn from_value(val: &serde_json::Value) -> Result<Self, JsonContractError> {
+        let obj = val
+            .as_object()
+            .ok_or_else(|| JsonContractError::InvalidFormat {
+                field: "quantity",
+                message: "expected JSON object".to_string(),
+            })?;
+        for key in obj.keys() {
+            if key != "value" && key != "unit" {
+                return Err(JsonContractError::UnexpectedField(key.clone()));
+            }
+        }
+        let value_val = obj
+            .get("value")
+            .ok_or(JsonContractError::MissingField("value"))?;
+        let value_str = match value_val {
+            serde_json::Value::String(s) => s.clone(),
+            serde_json::Value::Number(n) => n.to_string(),
+            _ => {
+                return Err(JsonContractError::InvalidFormat {
+                    field: "value",
+                    message: "expected string or number".to_string(),
+                });
+            }
+        };
+        let unit_val = obj
+            .get("unit")
+            .ok_or(JsonContractError::MissingField("unit"))?;
+        let unit_str = unit_val
+            .as_str()
+            .ok_or_else(|| JsonContractError::InvalidFormat {
+                field: "unit",
+                message: "expected string".to_string(),
+            })?;
+        let leaked_unit: &'static str = match unit_str {
+            "ppm" => "ppm",
+            "tokens" => "tokens",
+            "credits" => "credits",
+            "rows" => "rows",
+            "usd" => "usd",
+            _ => Box::leak(unit_str.to_string().into_boxed_str()),
+        };
+        Ok(Self::new(value_str, leaked_unit))
+    }
+}
+
+/// Parsed metadata extracted from a JSON envelope.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedEnvelope {
+    pub schema: u32,
+    pub command: String,
+    pub run: RunId,
+    pub generated_at: UtcTimestamp,
+    pub knowledge_at: UtcTimestamp,
+    pub ledger_generation: LedgerGeneration,
 }
 
 /// The shared envelope every report serializes under.
@@ -70,6 +182,18 @@ impl JsonEnvelope {
             run,
             metadata,
         }
+    }
+
+    pub fn command(&self) -> &'static str {
+        self.command
+    }
+
+    pub fn run(&self) -> &RunId {
+        &self.run
+    }
+
+    pub fn metadata(&self) -> &ReportMetadata {
+        &self.metadata
     }
 
     /// The envelope object: schema version, command, run identifier, generation time,
@@ -95,6 +219,225 @@ impl JsonEnvelope {
             self.metadata.ledger_generation.get(),
         )
     }
+
+    /// Parses and validates the envelope fields from a JSON string, returning the
+    /// parsed envelope and the full JSON object.
+    pub fn parse(json_str: &str) -> Result<(ParsedEnvelope, serde_json::Value), JsonContractError> {
+        let value: serde_json::Value = serde_json::from_str(json_str)
+            .map_err(|e| JsonContractError::InvalidJson(e.to_string()))?;
+        let obj = value
+            .as_object()
+            .ok_or_else(|| JsonContractError::InvalidFormat {
+                field: "root",
+                message: "expected root JSON object".to_string(),
+            })?;
+
+        let schema = obj
+            .get("schema")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(JsonContractError::MissingField("schema"))? as u32;
+        if schema != SCHEMA_VERSION {
+            return Err(JsonContractError::SchemaVersionMismatch {
+                expected: SCHEMA_VERSION,
+                actual: schema,
+            });
+        }
+
+        let command = obj
+            .get("command")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JsonContractError::MissingField("command"))?
+            .to_string();
+
+        let run_str = obj
+            .get("run")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JsonContractError::MissingField("run"))?;
+        let run = RunId::from_str(run_str);
+
+        let gen_nanos = obj
+            .get("generated_at")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or(JsonContractError::MissingField("generated_at"))?;
+        let generated_at = UtcTimestamp::from_unix_nanos(gen_nanos);
+
+        let know_nanos = obj
+            .get("knowledge_at")
+            .and_then(serde_json::Value::as_i64)
+            .ok_or(JsonContractError::MissingField("knowledge_at"))?;
+        let knowledge_at = UtcTimestamp::from_unix_nanos(know_nanos);
+
+        let ledger_gen_val = obj
+            .get("ledger_generation")
+            .and_then(serde_json::Value::as_u64)
+            .ok_or(JsonContractError::MissingField("ledger_generation"))?;
+        let ledger_generation = LedgerGeneration::new(ledger_gen_val);
+
+        let parsed = ParsedEnvelope {
+            schema,
+            command,
+            run,
+            generated_at,
+            knowledge_at,
+            ledger_generation,
+        };
+        Ok((parsed, value))
+    }
+}
+
+/// Strict validation of a standalone JSON envelope: verifies all 6 envelope keys are
+/// present and that NO extra or unversioned field is included.
+pub fn validate_envelope_strict(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_ENVELOPE_KEYS: [&str; 6] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_ENVELOPE_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    Ok(parsed)
+}
+
+/// Validates that a status report JSON string strictly conforms to schema version 1.
+pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "status" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'status', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_STATUS_KEYS: [&str; 7] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "accounts",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_STATUS_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    let accounts = obj
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JsonContractError::MissingField("accounts"))?;
+    for account in accounts {
+        let acc_obj = account
+            .as_object()
+            .ok_or_else(|| JsonContractError::InvalidFormat {
+                field: "accounts[]",
+                message: "expected account object".to_string(),
+            })?;
+        if !acc_obj.contains_key("account") {
+            return Err(JsonContractError::MissingField("account"));
+        }
+        let freshness = acc_obj
+            .get("freshness")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JsonContractError::MissingField("freshness"))?;
+        match freshness {
+            "fresh" => {
+                if !acc_obj.contains_key("remaining") {
+                    return Err(JsonContractError::MissingField("remaining"));
+                }
+                if !acc_obj.contains_key("latest_attempt") {
+                    return Err(JsonContractError::MissingField("latest_attempt"));
+                }
+            }
+            "stale" => {
+                if !acc_obj.contains_key("reason") {
+                    return Err(JsonContractError::MissingField("reason"));
+                }
+                if !acc_obj.contains_key("last_good") {
+                    return Err(JsonContractError::MissingField("last_good"));
+                }
+                if !acc_obj.contains_key("latest_attempt") {
+                    return Err(JsonContractError::MissingField("latest_attempt"));
+                }
+            }
+            "auth_required" => {
+                if !acc_obj.contains_key("last_good") {
+                    return Err(JsonContractError::MissingField("last_good"));
+                }
+                if !acc_obj.contains_key("latest_attempt") {
+                    return Err(JsonContractError::MissingField("latest_attempt"));
+                }
+            }
+            other => {
+                return Err(JsonContractError::InvalidFormat {
+                    field: "freshness",
+                    message: format!("unknown freshness state '{other}'"),
+                });
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+/// Validates that a spend report JSON string strictly conforms to schema version 1.
+pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "spend" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'spend', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_SPEND_KEYS: [&str; 9] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "window",
+        "groups",
+        "ingest",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    if !obj.contains_key("window") {
+        return Err(JsonContractError::MissingField("window"));
+    }
+    if !obj.contains_key("groups") {
+        return Err(JsonContractError::MissingField("groups"));
+    }
+    if !obj.contains_key("ingest") {
+        return Err(JsonContractError::MissingField("ingest"));
+    }
+    Ok(parsed)
 }
 
 /// The status report under the envelope: one object per account with its freshness.
@@ -240,13 +583,84 @@ pub fn coverage_and_quality_json<T: DomainQuantity>(
 }
 
 /// Serializes an interval with both endpoints and the unit of its element type.
+/// Uses exact string representations of the endpoints to prevent float rounding.
 pub fn interval_json<T: DomainQuantity>(interval: &Interval<T>) -> String {
     format!(
         "{{\"lower\":{},\"upper\":{},\"unit\":{}}}",
-        json_string(&interval.lower().to_f64().to_string()),
-        json_string(&interval.upper().to_f64().to_string()),
+        json_string(&interval.lower().to_exact_string()),
+        json_string(&interval.upper().to_exact_string()),
         json_string(T::unit()),
     )
+}
+
+/// Deserializes an interval from JSON object `{"lower": "...", "upper": "...", "unit": "..."}`.
+pub fn interval_from_json<T: DomainQuantity>(
+    json_str: &str,
+) -> Result<Interval<T>, JsonContractError> {
+    let val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| JsonContractError::InvalidJson(e.to_string()))?;
+    let obj = val
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "interval",
+            message: "expected object".to_string(),
+        })?;
+
+    for key in obj.keys() {
+        if key != "lower" && key != "upper" && key != "unit" {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+
+    let unit = obj
+        .get("unit")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(JsonContractError::MissingField("unit"))?;
+    if unit != T::unit() {
+        return Err(JsonContractError::UnitMismatch {
+            expected: T::unit(),
+            actual: unit.to_string(),
+        });
+    }
+
+    let lower_val = obj
+        .get("lower")
+        .ok_or(JsonContractError::MissingField("lower"))?;
+    let lower_str = match lower_val {
+        serde_json::Value::String(s) => s.as_str(),
+        _ => {
+            return Err(JsonContractError::InvalidFormat {
+                field: "lower",
+                message: "expected string".to_string(),
+            });
+        }
+    };
+    let lower = T::from_exact_str(lower_str).ok_or_else(|| JsonContractError::InvalidFormat {
+        field: "lower",
+        message: format!("failed to parse '{lower_str}' into quantity"),
+    })?;
+
+    let upper_val = obj
+        .get("upper")
+        .ok_or(JsonContractError::MissingField("upper"))?;
+    let upper_str = match upper_val {
+        serde_json::Value::String(s) => s.as_str(),
+        _ => {
+            return Err(JsonContractError::InvalidFormat {
+                field: "upper",
+                message: "expected string".to_string(),
+            });
+        }
+    };
+    let upper = T::from_exact_str(upper_str).ok_or_else(|| JsonContractError::InvalidFormat {
+        field: "upper",
+        message: format!("failed to parse '{upper_str}' into quantity"),
+    })?;
+
+    Interval::new(lower, upper).map_err(|e| JsonContractError::InvalidFormat {
+        field: "interval",
+        message: format!("{e:?}"),
+    })
 }
 
 /// Serializes provenance identifiers.
@@ -258,6 +672,40 @@ pub fn provenance_json(provenance: &Provenance) -> String {
         .collect::<Vec<_>>()
         .join(",");
     format!("{{\"sources\":[{}]}}", sources)
+}
+
+/// Deserializes provenance from JSON object `{"sources": ["..."]}`.
+pub fn provenance_from_json(json_str: &str) -> Result<Provenance, JsonContractError> {
+    let val: serde_json::Value = serde_json::from_str(json_str)
+        .map_err(|e| JsonContractError::InvalidJson(e.to_string()))?;
+    let obj = val
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "provenance",
+            message: "expected object".to_string(),
+        })?;
+
+    for key in obj.keys() {
+        if key != "sources" {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+
+    let sources_val = obj
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JsonContractError::MissingField("sources"))?;
+
+    let mut sources = Vec::with_capacity(sources_val.len());
+    for s in sources_val {
+        let src_str = s.as_str().ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "sources[]",
+            message: "expected string element".to_string(),
+        })?;
+        sources.push(src_str.to_string());
+    }
+
+    Ok(Provenance::new(sources))
 }
 
 fn quantity_json(value: &str, unit: &str) -> String {
@@ -360,41 +808,107 @@ mod tests {
     #[test]
     fn quantity_serializes_with_value_and_unit() {
         let q = Quantity::new("500000", "ppm");
-        assert_eq!(q.to_json(), "{\"value\":\"500000\",\"unit\":\"ppm\"}");
+        let json = q.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON expected");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "value": "500000",
+                "unit": "ppm"
+            })
+        );
+        let round_trip = Quantity::from_json(&json).expect("parse back");
+        assert_eq!(round_trip, q);
     }
 
     #[test]
-    fn envelope_serializes_every_required_field() {
+    fn envelope_serializes_every_required_field_with_exact_schema() {
         let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
         let envelope = JsonEnvelope::new("now", run.clone(), metadata());
         let json = envelope.to_json();
-        assert!(json.contains("\"schema\":1"), "{json}");
-        assert!(json.contains("\"command\":\"now\""), "{json}");
-        assert!(
-            json.contains(&format!("\"run\":\"{}\"", run.as_str())),
-            "{json}"
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON envelope");
+        let expected = serde_json::json!({
+            "schema": 1,
+            "command": "now",
+            "run": run.as_str(),
+            "generated_at": 2000,
+            "knowledge_at": 1000,
+            "ledger_generation": 7
+        });
+        assert_eq!(parsed, expected);
+
+        let validated = validate_envelope_strict(&json).expect("envelope validates strictly");
+        assert_eq!(validated.schema, 1);
+        assert_eq!(validated.command, "now");
+        assert_eq!(validated.run.as_str(), run.as_str());
+        assert_eq!(validated.generated_at.unix_nanos(), 2000);
+        assert_eq!(validated.knowledge_at.unix_nanos(), 1000);
+        assert_eq!(validated.ledger_generation.get(), 7);
+    }
+
+    #[test]
+    fn adding_field_without_version_bump_fails_strict_validation() {
+        let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
+        let envelope = JsonEnvelope::new("now", run.clone(), metadata());
+        let unversioned_json = format!(
+            "{{{},\"extra_unversioned_field\":\"surprise\"}}",
+            envelope.fields()
         );
-        assert!(json.contains("\"generated_at\":2000"), "{json}");
-        assert!(json.contains("\"knowledge_at\":1000"), "{json}");
-        assert!(json.contains("\"ledger_generation\":7"), "{json}");
+
+        let err = validate_envelope_strict(&unversioned_json)
+            .expect_err("adding an unversioned field must fail strict contract validation");
+        assert_eq!(
+            err,
+            JsonContractError::UnexpectedField("extra_unversioned_field".to_string())
+        );
+    }
+
+    #[test]
+    fn bumping_schema_version_without_schema_update_fails_contract() {
+        let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
+        let invalid_version_json = format!(
+            "\"schema\":2,\"command\":\"now\",\"run\":{},\"generated_at\":2000,\"knowledge_at\":1000,\"ledger_generation\":7",
+            json_string(run.as_str())
+        );
+        let wrapped = format!("{{{invalid_version_json}}}");
+
+        let err = validate_envelope_strict(&wrapped)
+            .expect_err("bumped schema version without contract update must fail");
+        assert_eq!(
+            err,
+            JsonContractError::SchemaVersionMismatch {
+                expected: 1,
+                actual: 2
+            }
+        );
     }
 
     #[test]
     fn freshness_serializes_exactly_one_variant() {
-        let fresh = freshness_json(
+        let fresh_str = freshness_json(
             "work-a",
             &Freshness::Fresh {
                 observed: observed(500_000),
                 latest_attempt: AttemptId::new(1),
             },
         );
-        assert!(fresh.contains("\"freshness\":\"fresh\""), "{fresh}");
-        assert!(
-            fresh.contains("\"remaining\":{\"value\":\"500000\",\"unit\":\"ppm\"}"),
-            "{fresh}"
+        let fresh_parsed: serde_json::Value =
+            serde_json::from_str(&fresh_str).expect("valid fresh JSON");
+        assert_eq!(
+            fresh_parsed,
+            serde_json::json!({
+                "account": "work-a",
+                "freshness": "fresh",
+                "remaining": {
+                    "value": "500000",
+                    "unit": "ppm"
+                },
+                "latest_attempt": 1
+            })
         );
 
-        let stale = freshness_json(
+        let stale_str = freshness_json(
             "work-a",
             &Freshness::Stale {
                 last_good: Some(observed(500_000)),
@@ -402,27 +916,40 @@ mod tests {
                 reason: StaleReason::AgeExceeded,
             },
         );
-        assert!(stale.contains("\"freshness\":\"stale\""), "{stale}");
-        assert!(stale.contains("\"reason\":\"age_exceeded\""), "{stale}");
-        assert!(
-            stale.contains("\"last_good\":{\"value\":\"500000\",\"unit\":\"ppm\"}"),
-            "{stale}"
+        let stale_parsed: serde_json::Value =
+            serde_json::from_str(&stale_str).expect("valid stale JSON");
+        assert_eq!(
+            stale_parsed,
+            serde_json::json!({
+                "account": "work-a",
+                "freshness": "stale",
+                "reason": "age_exceeded",
+                "last_good": {
+                    "value": "500000",
+                    "unit": "ppm"
+                },
+                "latest_attempt": 2
+            })
         );
 
-        let auth = freshness_json(
+        let auth_str = freshness_json(
             "work-a",
             &Freshness::<QuotaRemaining>::AuthRequired {
                 last_good: None,
                 latest_attempt: AttemptId::new(3),
             },
         );
-        assert!(auth.contains("\"freshness\":\"auth_required\""), "{auth}");
-        assert!(auth.contains("\"last_good\":null"), "{auth}");
-
-        // Stale and auth-required are distinguishable without parsing prose: the
-        // freshness field names the state directly.
-        assert!(stale.contains("\"freshness\":\"stale\""), "{stale}");
-        assert!(auth.contains("\"freshness\":\"auth_required\""), "{auth}");
+        let auth_parsed: serde_json::Value =
+            serde_json::from_str(&auth_str).expect("valid auth JSON");
+        assert_eq!(
+            auth_parsed,
+            serde_json::json!({
+                "account": "work-a",
+                "freshness": "auth_required",
+                "last_good": null,
+                "latest_attempt": 3
+            })
+        );
     }
 
     #[test]
@@ -431,37 +958,68 @@ mod tests {
             &CoverageCompleteness::Complete,
             &EvidenceQuality::Measured,
         );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid coverage/quality JSON");
         assert_eq!(
-            json,
-            "{\"coverage\":\"complete\",\"evidence_quality\":\"measured\"}"
+            parsed,
+            serde_json::json!({
+                "coverage": "complete",
+                "evidence_quality": "measured"
+            })
         );
 
         let partial = coverage_and_quality_json::<TokenCount>(
             &CoverageCompleteness::partial([crate::evidence::ComponentKind::new("x")]),
             &EvidenceQuality::estimated([crate::evidence::EstimatorId::new("chars")], None),
         );
-        assert!(partial.contains("\"coverage\":\"partial\""), "{partial}");
-        assert!(
-            partial.contains("\"evidence_quality\":\"estimated\""),
-            "{partial}"
+        let partial_parsed: serde_json::Value =
+            serde_json::from_str(&partial).expect("valid partial coverage/quality JSON");
+        assert_eq!(
+            partial_parsed,
+            serde_json::json!({
+                "coverage": "partial",
+                "evidence_quality": "estimated"
+            })
         );
     }
 
     #[test]
-    fn interval_serializes_both_endpoints_and_the_unit() {
-        let interval = Interval::new(TokenCount::new(10), TokenCount::new(20)).unwrap();
+    fn interval_serializes_both_endpoints_exact_and_the_unit() {
+        // Test with a large u64 value that would lose precision if routed through f64
+        let large_lower = TokenCount::new(9_007_199_254_740_993); // 2^53 + 1
+        let large_upper = TokenCount::new(9_007_199_254_740_995); // 2^53 + 3
+        let interval = Interval::new(large_lower, large_upper).unwrap();
         let json = interval_json(&interval);
+
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid interval JSON");
         assert_eq!(
-            json,
-            "{\"lower\":\"10\",\"upper\":\"20\",\"unit\":\"tokens\"}"
+            parsed,
+            serde_json::json!({
+                "lower": "9007199254740993",
+                "upper": "9007199254740995",
+                "unit": "tokens"
+            })
         );
+
+        let round_trip: Interval<TokenCount> =
+            interval_from_json(&json).expect("interval round-trip");
+        assert_eq!(round_trip, interval);
     }
 
     #[test]
     fn provenance_identifiers_round_trip() {
         let provenance = Provenance::new(["a".to_string(), "b".to_string()]);
         let json = provenance_json(&provenance);
-        assert_eq!(json, "{\"sources\":[\"a\",\"b\"]}");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid provenance JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "sources": ["a", "b"]
+            })
+        );
+
+        let round_trip = provenance_from_json(&json).expect("provenance round-trip");
+        assert_eq!(round_trip, provenance);
     }
 
     #[test]
@@ -469,5 +1027,9 @@ mod tests {
         assert_eq!(json_string("a\"b"), "\"a\\\"b\"");
         assert_eq!(json_string("a\\b"), "\"a\\\\b\"");
         assert_eq!(json_string("a\nb"), "\"a\\nb\"");
+        assert_eq!(json_string("a\rb"), "\"a\\rb\"");
+        assert_eq!(json_string("a\tb"), "\"a\\tb\"");
+        assert_eq!(json_string("a\u{0000}b"), "\"a\\u0000b\"");
+        assert_eq!(json_string("a\u{001f}b"), "\"a\\u001fb\"");
     }
 }

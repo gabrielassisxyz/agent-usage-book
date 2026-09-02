@@ -13,7 +13,12 @@ pub mod precision;
 pub mod render;
 pub mod vocabulary;
 
-pub use json::{spend_json, status_json};
+pub use json::{
+    JsonContractError, JsonEnvelope, ParsedEnvelope, Quantity, SCHEMA_VERSION,
+    coverage_and_quality_json, freshness_json, interval_from_json, interval_json,
+    provenance_from_json, provenance_json, spend_json, status_json, validate_envelope_strict,
+    validate_spend_report_json, validate_status_report_json,
+};
 pub use precision::{CREDITS, MONEY, PERCENT, TOKENS};
 pub use render::{
     format_number, render_age, render_failure_class, render_meter_reading, render_percentage,

@@ -33,7 +33,7 @@ use std::ops::Add;
 ///
 /// The trait is sealed: currencies are a closed set defined here, not invented ad hoc
 /// by downstream code.
-pub trait Currency: private::Sealed {
+pub trait Currency: private::Sealed + Copy {
     /// The ISO 4217 alphabetic code, for rendering.
     const CODE: &'static str;
 }

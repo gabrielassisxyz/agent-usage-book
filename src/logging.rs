@@ -73,6 +73,14 @@ impl RunId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    pub fn from_string(s: String) -> Self {
+        Self(s)
+    }
+
+    pub fn from_str(s: &str) -> Self {
+        Self(s.to_string())
+    }
 }
 
 /// Typed vocabulary for the events available before sampling workflows land.

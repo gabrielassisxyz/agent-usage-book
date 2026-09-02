@@ -25,6 +25,16 @@ pub trait DomainQuantity:
 
     /// Reconstructs the quantity from a primitive value, for deserialization.
     fn from_f64(value: f64) -> Self;
+
+    /// Exact string representation of the quantity without loss of precision.
+    fn to_exact_string(self) -> String {
+        self.to_f64().to_string()
+    }
+
+    /// Reconstructs the quantity from an exact string value.
+    fn from_exact_str(s: &str) -> Option<Self> {
+        s.parse::<f64>().ok().map(Self::from_f64)
+    }
 }
 
 /// A closed interval `[lower, upper]` over an ordered domain quantity.

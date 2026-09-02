@@ -111,6 +111,14 @@ impl DomainQuantity for TokenCount {
     fn from_f64(value: f64) -> Self {
         Self(value.max(0.0).min(u64::MAX as f64) as u64)
     }
+
+    fn to_exact_string(self) -> String {
+        self.0.to_string()
+    }
+
+    fn from_exact_str(s: &str) -> Option<Self> {
+        s.parse::<u64>().ok().map(Self)
+    }
 }
 token_newtype!(
     OutputTokens,
