@@ -71,6 +71,11 @@ quantity, documented here with its reason for exclusion:
 ### Tags, currency markers and errors
 - `TokenKind` (`tokens.rs`): tag enum selecting which known kind a count belongs to, not a measured quantity.
 - `Usd`, `Eur` (`money.rs`): uninhabited currency marker types, never instantiated.
+- `TokenClass` (`rate_card.rs`): tag enum selecting which token stream a rate prices, not a measured quantity.
+- `BillingBasis` (`rate_card.rs`): tag enum selecting the unit a rate is quoted against.
+- `CurrencyCode` (`rate_card.rs`): runtime currency marker enum a rate card carries as imported data; converting into a typed `Money<C>` is a named valuation function (aub-wyu.2), never a cast.
+- `ReviewDuePolicy` (`rate_card.rs`): review-due policy tag for temporal reference data, a date or its recorded absence; replaces the freshness enum where authentication is nonsensical (PLAN.md section 25.3).
+- `RateCardParseError` (`rate_card.rs`): error enum for rate value parse failures.
 - `IntervalError` (`interval.rs`): error enum for interval construction failures.
 - `MeasurementBasis` (`time.rs`): tag enum indicating observation basis, not a quantity.
 - `ClockAnomaly` (`time.rs`): error and anomaly event descriptor.
@@ -94,3 +99,8 @@ quantity, documented here with its reason for exclusion:
 - `Digest`, `EvidenceId`, `CostModelId`, `WindowCalibrationId`, `RateCardId`, `WitnessId`, `DerivationId`: provenance identifiers.
 - `QuerySemantics`, `ProvenanceManifest`, `Derived`: compound provenance aggregates and wrappers.
 - `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
+
+### Rate cards (`rate_card.rs`)
+- `Publication`: provenance descriptor for one rate card, a source reference and a publication instant with absence explicit, not a quantity.
+- `RateCardDraft`: the import payload for one rate component, a composite record whose rate is stored as exact integer micros rather than as a measured-quantity newtype; the monetary arithmetic stays in the money module.
+- `RateCard`: a persisted rate card, the storage row identity plus import stamp plus draft; composite record, not a quantity.
