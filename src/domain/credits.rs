@@ -55,7 +55,7 @@ fn round_div(numerator: i128, denominator: i128) -> i128 {
 /// This project's own accounting unit, stored as integer micro-credits (1/1_000_000 of
 /// one credit) so aggregation is exact regardless of how many terms were summed or in
 /// what order.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Credits {
     micros: i64,
 }
@@ -77,6 +77,53 @@ impl std::ops::Add for Credits {
 
     fn add(self, rhs: Self) -> Self {
         Self::from_micros(self.micros + rhs.micros)
+    }
+}
+
+impl std::ops::Sub for Credits {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self {
+        Self::from_micros(self.micros - rhs.micros)
+    }
+}
+
+impl std::ops::Mul for Credits {
+    type Output = Self;
+
+    /// Multiplies two credit amounts, dividing by one million so the result is in
+    /// micro-credits. The `i128` intermediate keeps the multiplication itself from
+    /// overflowing at any pair of `i64` values; the final cast back to `i64` is
+    /// faithful for any product that fits in `i64`. The same convention
+    /// `CreditsPerToken::Mul<u64>` uses.
+    fn mul(self, rhs: Self) -> Self {
+        let numerator = i128::from(self.micros) * i128::from(rhs.micros);
+        let micros = round_div(numerator, 1_000_000);
+        Self::from_micros(micros as i64)
+    }
+}
+
+impl crate::domain::interval::DomainQuantity for Credits {
+    fn unit() -> &'static str {
+        "credits"
+    }
+
+    fn to_f64(self) -> f64 {
+        self.micros as f64 / 1_000_000.0
+    }
+
+    fn from_f64(value: f64) -> Self {
+        Self::from_micros((value * 1_000_000.0).round() as i64)
+    }
+
+    fn to_exact_string(self) -> String {
+        // Micro-credit granularity; downstream rendering takes a presentation helper
+        // with explicit precision context, never this string.
+        self.micros.to_string()
+    }
+
+    fn from_exact_str(s: &str) -> Option<Self> {
+        s.parse::<i64>().ok().map(Self::from_micros)
     }
 }
 
