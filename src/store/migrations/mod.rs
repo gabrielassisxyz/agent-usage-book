@@ -45,6 +45,21 @@ pub(crate) mod migration_0006;
 #[path = "0007_task_event.rs"]
 pub(crate) mod migration_0007;
 
+#[path = "0008_meter_attempt.rs"]
+pub(crate) mod migration_0008;
+
+#[path = "0009_task_identity.rs"]
+pub(crate) mod migration_0009;
+
+#[path = "0010_cost_model.rs"]
+pub(crate) mod migration_0010;
+
+#[path = "0011_rate_card.rs"]
+pub(crate) mod migration_0011;
+
+#[path = "0012_usage_event_component.rs"]
+pub(crate) mod migration_0012;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -58,5 +73,10 @@ pub fn registry() -> Vec<Migration> {
         migration_0005::migration(),
         migration_0006::migration(),
         migration_0007::migration(),
+        migration_0008::migration(),
+        migration_0009::migration(),
+        migration_0010::migration(),
+        migration_0011::migration(),
+        migration_0012::migration(),
     ]
 }

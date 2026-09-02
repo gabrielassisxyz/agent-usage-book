@@ -14,15 +14,22 @@
 //! - A write transaction stays short: no network I/O and no unrelated work happens inside it.
 
 pub mod account;
+pub mod attempt_crash_hook;
 pub mod connection;
+pub mod cost_model;
 pub mod ledger_generation;
+pub mod meter_attempt;
 pub mod migrate;
 pub mod migrations;
+pub mod rate_card;
 pub mod sample_run;
 pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
 pub mod session_account_marker;
 pub mod startup;
 pub mod task_event;
+pub mod task_identity;
 pub mod transcript_file;
+pub mod usage_component;
+pub mod usage_event;
 pub mod usage_occurrence;
