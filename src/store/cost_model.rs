@@ -823,7 +823,12 @@ pub fn activate(
                 cost_model_id, event_kind, event_at, supersedes_model_id
             ) VALUES (?1, ?2, ?3, ?4)
             RETURNING id",
-            params![db_id.value(), event_kind, event_at.unix_nanos(), supersedes_db_id],
+            params![
+                db_id.value(),
+                event_kind,
+                event_at.unix_nanos(),
+                supersedes_db_id
+            ],
             |row| row.get::<_, i64>(0),
         )
         .map_err(|e| Error::Store(format!("cannot insert the lifecycle event: {e}")))?;
