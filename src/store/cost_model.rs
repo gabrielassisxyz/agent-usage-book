@@ -140,9 +140,9 @@ impl CoefficientUncertainty {
     /// Constructs an interval, rejecting a lower bound above its upper one.
     pub fn new(lower: CreditsPerToken, upper: CreditsPerToken) -> Result<Self, Error> {
         if lower.micros_per_million_tokens() > upper.micros_per_million_tokens() {
-            return Err(Error::Store(format!(
-                "coefficient uncertainty lower bound exceeds upper bound"
-            )));
+            return Err(Error::Store(
+                "coefficient uncertainty lower bound exceeds upper bound".into(),
+            ));
         }
         Ok(Self { lower, upper })
     }
@@ -1186,7 +1186,7 @@ mod tests {
     /// are enforced on this connection.
     #[test]
     fn term_row_cannot_reference_a_missing_model() {
-        let (_scratch, mut conn) = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let err = conn
             .execute(
                 "INSERT INTO cost_model_term (
