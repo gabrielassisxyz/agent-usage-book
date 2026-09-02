@@ -46,14 +46,14 @@ same thing in both documents.
 | 15 | `status` never opens SQLite, performs network I/O, or writes. | unenforced aub-me5.7 | (status no-store / no-network test) |
 | 16 | The projection is disposable and contains no stored freshness boolean. | unenforced aub-me5.5 | (disposable projection test) |
 | 17 | Task ambiguity becomes explicit overhead. | unenforced aub-eu7.2 | (temporal task segmentation test) |
-| 18 | Dollar valuation and subscription credits are distinct dimensions. | unenforced aub-wyu.2 | (exact-money valuation test) |
+| 18 | Dollar valuation and subscription credits are distinct dimensions. | tests/valuation.rs | tests::golden_hand_computed_exact_decimal_fixtures |
 | 19 | Meter residual is diagnostic and is not automatically called hidden token spend. | unenforced aub-dpn | (unexplained residual test) |
 | 20 | Estimated transcript usage is never silently promoted to measured usage. | src/evidence.rs | tests::quality_combine_never_recovers_measured_from_estimated |
 | 21 | The friction ledger remains external and joins only through stable IDs. | unenforced aub-xus.7 | (external friction ledger join test) |
 | 22 | Irreplaceable meter history is backed up and never automatically pruned. | unenforced aub-sth.12 | (retention and restore test) |
 | 23 | An outbound meter request is never begun before its attempt identity is durable. | tests/meter_attempt_crash.rs | tests::killed_between_start_and_result_leaves_exactly_one_start_with_no_result |
 | 24 | An attempt without a terminal result is evidence of collector interruption, not evidence that no attempt occurred. | src/domain/freshness.rs | tests::started_attempt_past_command_horizon_yields_collector_interrupted |
-| 25 | Provider response evidence and its normalized interpretation are separate records; a corrected adapter reinterprets retained evidence and never overwrites the earlier interpretation. | unenforced aub-sth.7 | (response evidence capsule test) |
+| 25 | Provider response evidence and its normalized interpretation are separate records; a corrected adapter reinterprets retained evidence and never overwrites the earlier interpretation. | src/store/meter_evidence.rs | tests::switching_the_preference_keeps_both_interpretations_immutable |
 | 26 | Workload feasibility is evaluated against every constraining window in calibrated credits, never against the lowest remaining percentage alone. | src/domain/window.rs | tests::display_and_advice_select_different_windows_when_calibrations_diverge |
 | 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | unenforced aub-me5.8 | (policy snapshot denominator test) |
 
