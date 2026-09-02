@@ -187,7 +187,7 @@ fn the_effective_book_is_the_one_true_today() {
     // rate starts on 2026-08-31. Two records for one vendor, model and token
     // class are never effective at once, so valuation never has to pick a
     // winner between two simultaneous prices for the same key.
-    let mut standard = RateCardDraft {
+    let standard = RateCardDraft {
         vendor: "anthropic".to_string(),
         model: "claude-sonnet-5".to_string(),
         token_class: TokenClass::Input,
