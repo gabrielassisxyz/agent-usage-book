@@ -336,9 +336,13 @@ fn identity_rows_from_two_tracker_sources_do_not_merge() {
 #[test]
 fn the_persisted_identity_refuses_state_labels_it_cannot_parse() {
     let (_scratch, connection) = state_db("identity-refusal");
-    // A row written by a newer format the current code cannot parse is a
-    // store failure naming the value, never a silent fallback.
-    connection
+    // The database is the first line of defense: a row carrying a state
+    // label this code does not know cannot be stored at all, so a newer
+    // writer cannot hand an unparseable row to this version through the
+    // table's own constraint. The CHECK is what makes the read path's parse
+    // refusal reachable only under schema drift, which is why the refusal
+    // contract is asserted at both reachable lines.
+    let error = connection
         .execute(
             "INSERT INTO task_identity (
                 task_source, task_native, state, kind, winner_origin,
@@ -346,9 +350,20 @@ fn the_persisted_identity_refuses_state_labels_it_cannot_parse() {
             ) VALUES ('beads-a', 'aub-1', 'postponed', NULL, NULL, 'tracker_field:issue_type=task', 1)",
             [],
         )
-        .unwrap();
-    let error = read_task_identity(&connection, &task("beads-a", "aub-1")).unwrap_err();
-    assert!(error.to_string().contains("unknown state label"));
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("CHECK"),
+        "the database must refuse an unknown state label: {error}"
+    );
+    // The typed refusal is the second line: the state vocabulary parses
+    // exactly its own labels, so a label that slips past the schema (a
+    // future migration relaxing the check, read by older code) is a store
+    // failure naming the value, never a silent fallback.
+    assert_eq!(TaskIdentityState::parse("postponed"), None);
+    assert_eq!(
+        TaskIdentityState::parse("resolved"),
+        Some(TaskIdentityState::Resolved)
+    );
 }
 
 #[test]
