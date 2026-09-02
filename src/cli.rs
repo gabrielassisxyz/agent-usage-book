@@ -55,6 +55,7 @@ aub_command_enum! {
     LoggingFixture,
     StateCheck,
     ExitClass,
+    AttemptCrashHook,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -82,13 +83,14 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Status,
         Self::Spend,
         Self::Config,
         Self::LoggingFixture,
         Self::StateCheck,
         Self::ExitClass,
+        Self::AttemptCrashHook,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -181,6 +183,21 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::AttemptCrashHook => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook drives the store, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook names its own fixture account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook prints plain counts",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -194,6 +211,7 @@ impl Command {
             Command::LoggingFixture => "__logging-fixture",
             Command::StateCheck => "__state-check",
             Command::ExitClass => "__exit-class",
+            Command::AttemptCrashHook => "__attempt-crash-hook",
         }
     }
 
@@ -209,6 +227,7 @@ impl Command {
                 Some("print every resolved configuration key with the source that won")
             }
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
+            Command::AttemptCrashHook => None,
         }
     }
 
@@ -380,6 +399,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 None => Err(Error::Usage("__exit-class requires a class 0..=8".into())),
             }
         }
+        Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
     }
 }
 
@@ -699,6 +719,70 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
     )?;
     open_store_then_emit_request_attempted?;
     println!("state directory ready");
+    Ok(())
+}
+
+/// Test-only surface: the crash-injection hook for the two-stage meter attempt
+/// lifecycle (`aub-sth.6`, PLAN.md section 34.7). `__attempt-crash-hook start`
+/// commits the attempt start through the real store APIs and then aborts the
+/// process, so a test can prove exactly what survives a kill between the two
+/// commits: the start with no result. `complete` is the adjacent positive
+/// control, running start then result then a clean exit, and `read-back`
+/// reports what the database actually holds.
+///
+/// The hook's body lives in the store layer (`crate::store::attempt_crash_hook`)
+/// because it runs migrations, writes fixture rows and counts rows, all of
+/// which the boundary rules confine to `src/store/` (rules 15 and 16); this
+/// shim only parses the stage, resolves configuration and renders the outcome.
+/// Not part of the shipping command surface: `tests/e2e/command-surface.txt`
+/// deliberately excludes every `__`-prefixed hook, matching
+/// `__exit-class`/`__state-check`.
+fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let stage = match invocation.rest.first().map(String::as_str) {
+        Some("start") => crate::store::attempt_crash_hook::CrashHookStage::Start,
+        Some("complete") => crate::store::attempt_crash_hook::CrashHookStage::Complete,
+        Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
+        other => {
+            return Err(Error::Usage(format!(
+                "__attempt-crash-hook requires a stage (start | complete | read-back), got {other:?}"
+            )));
+        }
+    };
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let outcome = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            crate::store::attempt_crash_hook::run_stage(
+                &config.state.dir.join("attempt-crash-hook.db"),
+                stage,
+                config.sampling.request_timeout,
+                config.sampling.command_budget,
+                clock,
+            )
+        },
+    )?;
+    match outcome? {
+        crate::store::attempt_crash_hook::CrashHookOutcome::Completed { attempt_row_id } => {
+            println!(
+                "attempt {} start and result written",
+                attempt_row_id.value()
+            );
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::Counts { starts, results } => {
+            println!("starts={starts} results={results}");
+        }
+    }
     Ok(())
 }
 

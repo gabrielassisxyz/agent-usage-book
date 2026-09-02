@@ -5,7 +5,6 @@
 //! so this test drives the real binary through its documented crash-injection
 //! hook (`__attempt-crash-hook`, the same surface the e2e case drives).
 
-use std::path::PathBuf;
 use std::process::Command;
 
 /// One fresh isolated state directory per test, removed on drop.
