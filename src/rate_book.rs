@@ -20,7 +20,7 @@ use crate::domain::time::{UtcDate, UtcTimestamp};
 
 /// The keys a card entry may carry. Anything else is refused, so a field the
 /// importer silently drops is impossible by construction.
-const CARD_KEYS: [&str; 10] = [
+const CARD_KEYS: [&str; 11] = [
     "vendor",
     "model",
     "token_class",
@@ -31,6 +31,7 @@ const CARD_KEYS: [&str; 10] = [
     "effective_end",
     "published_at",
     "source",
+    "review_due",
 ];
 
 /// Why a rate book could not be parsed. The card index (0-based, in file
