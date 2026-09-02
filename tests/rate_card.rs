@@ -182,14 +182,19 @@ fn the_effective_book_is_the_one_true_today() {
     let (_scratch, conn) = open_migrated();
     let clock_at = UtcTimestamp::from_unix_nanos(1_000);
 
-    let standard = RateCardDraft {
+    // The introductory price and the standard price hand off at the expiry
+    // day: the intro covers 2026-06-24 to 2026-08-31 exclusive, the standard
+    // rate starts on 2026-08-31. Two records for one vendor, model and token
+    // class are never effective at once, so valuation never has to pick a
+    // winner between two simultaneous prices for the same key.
+    let mut standard = RateCardDraft {
         vendor: "anthropic".to_string(),
         model: "claude-sonnet-5".to_string(),
         token_class: TokenClass::Input,
         rate_micros: 3_000_000,
         currency: CurrencyCode::Usd,
         billing_basis: BillingBasis::PerMillionTokens,
-        effective_start: UtcDate::parse("2026-06-24").unwrap(),
+        effective_start: UtcDate::parse("2026-08-31").unwrap(),
         effective_end: None,
         publication: agent_usage_book::domain::rate_card::Publication {
             source: Some("claude-api reference".into()),
@@ -197,10 +202,13 @@ fn the_effective_book_is_the_one_true_today() {
         },
         review_due: ReviewDuePolicy::None,
     };
-    let mut intro = standard.clone();
-    intro.rate_micros = 2_000_000;
-    intro.effective_end = Some(UtcDate::parse("2026-08-31").unwrap());
-    intro.review_due = ReviewDuePolicy::On(UtcDate::parse("2026-08-31").unwrap());
+    let intro = RateCardDraft {
+        rate_micros: 2_000_000,
+        effective_start: UtcDate::parse("2026-06-24").unwrap(),
+        effective_end: Some(UtcDate::parse("2026-08-31").unwrap()),
+        review_due: ReviewDuePolicy::On(UtcDate::parse("2026-08-31").unwrap()),
+        ..standard.clone()
+    };
     rate_card::insert(&conn, &[standard.clone(), intro], clock_at).expect("import must persist");
 
     let on_intro_day =
@@ -209,8 +217,18 @@ fn the_effective_book_is_the_one_true_today() {
     let rates: Vec<i64> = on_intro_day.iter().map(|c| c.draft.rate_micros).collect();
     assert_eq!(
         rates,
-        vec![2_000_000, 3_000_000],
-        "both the intro interval and the open-ended standard are effective mid-window"
+        vec![2_000_000],
+        "mid-window the introductory rate is the one effective price"
+    );
+
+    let on_handoff_day =
+        rate_card::effective_at(&conn, UtcDate::parse("2026-08-31").unwrap().start())
+            .expect("read must work");
+    let rates: Vec<i64> = on_handoff_day.iter().map(|c| c.draft.rate_micros).collect();
+    assert_eq!(
+        rates,
+        vec![3_000_000],
+        "the expiry day belongs to the standard rate: the intro interval is end-exclusive and the standard interval is start-inclusive"
     );
 
     let after_expiry =

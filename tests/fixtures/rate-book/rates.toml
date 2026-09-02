@@ -6,7 +6,9 @@
 # Anthropic rows were read 2026-06-24 from the claude-api reference.
 # OpenAI rows were read 2026-08-14 from `bunx tokscale pricing` (LiteLLM).
 # The claude-sonnet-5 introductory rows expire 2026-08-31 and carry the
-# review-due date the expiry defines.
+# review-due date the expiry defines; the standard sonnet-5 rows start on that
+# expiry day, so the two intervals hand off instead of overlapping - exactly
+# one rate per vendor, model and token class is ever effective.
 #
 # Rates are USD per million tokens; cache-write classes carry the absolute
 # price for their TTL, never a multiplier of another rate.
@@ -348,7 +350,7 @@ token_class = "input"
 rate = "3.00"
 currency = "USD"
 billing_basis = "per_million_tokens"
-effective_start = "2026-06-24"
+effective_start = "2026-08-31"
 published_at = "2026-06-24"
 source = "claude-api reference"
 
@@ -359,7 +361,7 @@ token_class = "output"
 rate = "15.00"
 currency = "USD"
 billing_basis = "per_million_tokens"
-effective_start = "2026-06-24"
+effective_start = "2026-08-31"
 published_at = "2026-06-24"
 source = "claude-api reference"
 
@@ -370,7 +372,7 @@ token_class = "cache_read"
 rate = "0.30"
 currency = "USD"
 billing_basis = "per_million_tokens"
-effective_start = "2026-06-24"
+effective_start = "2026-08-31"
 published_at = "2026-06-24"
 source = "claude-api reference"
 
@@ -381,7 +383,7 @@ token_class = "cache_write_5m"
 rate = "3.75"
 currency = "USD"
 billing_basis = "per_million_tokens"
-effective_start = "2026-06-24"
+effective_start = "2026-08-31"
 published_at = "2026-06-24"
 source = "claude-api reference"
 
@@ -392,7 +394,7 @@ token_class = "cache_write_1h"
 rate = "6.00"
 currency = "USD"
 billing_basis = "per_million_tokens"
-effective_start = "2026-06-24"
+effective_start = "2026-08-31"
 published_at = "2026-06-24"
 source = "claude-api reference"
 

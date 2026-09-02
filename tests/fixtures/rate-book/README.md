@@ -8,7 +8,8 @@ publication references.
 - Anthropic rows were read 2026-06-24 from the claude-api reference.
 - OpenAI rows were read 2026-08-14 from `bunx tokscale pricing` (LiteLLM).
 - The claude-sonnet-5 introductory rows expire 2026-08-31; their `review_due`
-  is that expiry date.
+  is that expiry date, and the standard sonnet-5 rows take effect on it, so
+  the two intervals hand off rather than overlap.
 
 The file is import source, not a runtime witness: `aub rate-card import`
 persists it as immutable records, and valuation reads the database records,
