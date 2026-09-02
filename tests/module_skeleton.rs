@@ -1,14 +1,28 @@
 //! Guards the module skeleton's dependency direction: the three lowest layers must not
-//! depend on SQLite, HTTP, or terminal-formatting crates, and the conversion-owning
-//! modules must document typed witnesses without implementing them.
+//! depend on SQLite, HTTP, or terminal-formatting crates, and the not-yet-implemented
+//! conversion-owning modules must document typed witnesses without implementing them.
 
 use std::fs;
 
 /// The three lowest layers from PLAN.md section 8.1.
 const LOWEST_LAYERS: [&str; 3] = ["domain", "evidence", "config"];
 
-/// The conversion-owning modules from PLAN.md section 9.
-const CONVERSION_MODULES: [&str; 3] = ["cost_model", "calibration", "valuation"];
+/// All conversion-owning modules from PLAN.md section 9, whose module headers must
+/// always document that conversions require an explicit typed witness.
+const ALL_CONVERSION_MODULES: [&str; 3] = ["cost_model", "calibration", "valuation"];
+
+/// The conversion-owning modules from PLAN.md section 9 (`UsageVector -> Credits`,
+/// `Credits -> PercentDelta`, `UsageVector -> ApiListPriceEquivalent`) that have not
+/// yet received their implementing bead.
+///
+/// Retired as implementation beads land:
+/// - `cost_model` retired in aub-ai3.2 (PLAN.md sections 9, 13.1, 24.1): implemented
+///   `convert()` behind explicit `CostModel` witness.
+/// - `valuation` retired in aub-wyu.2 (PLAN.md sections 9, 25.1, 25.2, 25.4): implemented
+///   `value_usage_vector()` and `value_batch()` behind explicit `RateBook` / `RateCard` witness.
+///
+/// `calibration` stays listed until its own bead (aub-c0b.3/aub-c0b.4) lands the same way.
+const SKELETON_CONVERSION_MODULES: [&str; 1] = ["calibration"];
 
 /// Crate families the lowest layers must not depend on (PLAN.md section 8.1).
 const FORBIDDEN_CRATES: &[&str] = &[
@@ -381,7 +395,7 @@ fn a_public_item_planted_in_a_real_conversion_module_is_detected() {
 
 #[test]
 fn conversion_module_headers_document_typed_witnesses() {
-    for module in CONVERSION_MODULES {
+    for module in ALL_CONVERSION_MODULES {
         let path = format!("{}/src/{module}.rs", env!("CARGO_MANIFEST_DIR"));
         let source =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("src/{module}.rs must exist: {e}"));
@@ -398,7 +412,7 @@ fn conversion_module_headers_document_typed_witnesses() {
 
 #[test]
 fn conversion_modules_introduce_no_implementation_or_global_witness() {
-    for module in CONVERSION_MODULES {
+    for module in SKELETON_CONVERSION_MODULES {
         let path = format!("{}/src/{module}.rs", env!("CARGO_MANIFEST_DIR"));
         let source =
             fs::read_to_string(&path).unwrap_or_else(|e| panic!("src/{module}.rs must exist: {e}"));
