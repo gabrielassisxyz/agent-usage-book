@@ -513,7 +513,6 @@ fn the_contract_suite_passes_over_the_real_socket() {
         CredentialHandle, MeterRequest, ProviderAdapter, ProviderObservation,
     };
     use agent_usage_book::meter::anthropic::AnthropicAdapter;
-    use agent_usage_book::meter::transport::HttpResponse;
     use test_support::ScriptedResponseBody;
 
     let credential = CredentialHandle::new("test-token-anthropic");
