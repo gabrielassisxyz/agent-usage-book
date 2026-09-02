@@ -775,7 +775,7 @@ mod tests {
                 credential_context_id: Some("ctx-1".into()),
                 policy_snapshot_id: snapshot,
                 due_at: UtcTimestamp::from_unix_nanos(0),
-                due_reason: crate::domain::attempt::DueReason::OrdinaryCadence,
+                due_reason: crate::store::meter_attempt::DueReason::OrdinaryCadence,
                 due_basis: None,
                 provider_contract_id: "endpoint-schema-v3".into(),
                 meter_semantics_id: "account-5h-v2".into(),
@@ -935,9 +935,18 @@ mod tests {
     #[test]
     fn when_sqlite_is_unavailable_the_pending_evidence_stays_durable_and_the_error_is_reported() {
         let scratch = ScratchDir::new();
-        // A connection with no schema at all: every insert must fail, the
+        // A connection opened through the project's own connection module but
+        // never migrated: no schema at all, so every insert must fail, the
         // same shape as SQLite being unable to service the write.
-        let mut conn = Connection::open_in_memory().unwrap();
+        let policy = PragmaPolicy {
+            busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = open(
+            &scratch.path().join("unmigrated.db"),
+            AccessMode::ReadWrite,
+            &policy,
+        )
+        .unwrap();
         let bundle = sample_bundle(1);
         spool_pending(scratch.path(), &bundle).unwrap();
 
