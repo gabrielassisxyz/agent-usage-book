@@ -109,7 +109,7 @@ fn completeness_checking_against_usage_vector_with_all_four_known_kinds() {
 }
 
 /// 2. Unit: a term rejected when it carries no derivation method, since a coefficient
-/// with unknown provenance is not evidence.
+///    with unknown provenance is not evidence.
 #[test]
 fn term_derivation_method_requires_valid_known_provenance() {
     // Valid derivation methods parse cleanly.
@@ -137,7 +137,7 @@ fn term_derivation_method_requires_valid_known_provenance() {
 }
 
 /// 3. Unit: no term populated with a placeholder or a zero standing in for an unknown value,
-/// asserted over the seeded model.
+///    asserted over the seeded model.
 #[test]
 fn seeded_model_has_no_zero_or_placeholder_terms() {
     let published_at = UtcTimestamp::from_unix_nanos(1_717_200_000_000_000_000);
@@ -163,7 +163,7 @@ fn seeded_model_has_no_zero_or_placeholder_terms() {
 }
 
 /// 4. Integration: the activation lifecycle recorded, with the model queryable as active
-/// from that instant.
+///    from that instant.
 #[test]
 fn activation_lifecycle_recorded_and_queryable_from_instant() {
     let (_scratch, mut conn) = open_migrated();
