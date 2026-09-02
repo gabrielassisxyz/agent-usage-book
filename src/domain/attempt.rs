@@ -43,6 +43,25 @@ pub enum AttemptOutcome {
     Unreachable(FailureClass),
 }
 
+/// Why an account was due for an attempt: the four-value vocabulary the due
+/// decision produces and the attempt persists (`aub-me5.3`, PLAN.md 14.4).
+/// One definition, in the domain, because the decision that mints it (meter)
+/// and the persistence that spells it for storage (store) are different layers
+/// that must never grow private copies of it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum DueReason {
+    /// The account's ordinary sampling interval expired.
+    OrdinaryCadence,
+    /// A known reset is approaching within the configured edge lead and no
+    /// sufficiently recent pre-reset sample exists.
+    ResetEdge,
+    /// A known reset has passed and no attempt has observed the post-reset
+    /// state yet.
+    PostResetConfirmation,
+    /// An explicit operator or hook request, due regardless of history.
+    ForcedOrManual,
+}
+
 /// Durable before any network I/O begins.
 ///
 /// Absence of a terminal [`AttemptResult`] past the command's maximum execution
