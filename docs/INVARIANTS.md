@@ -51,7 +51,7 @@ same thing in both documents.
 | 20 | Estimated transcript usage is never silently promoted to measured usage. | src/evidence.rs | tests::quality_combine_never_recovers_measured_from_estimated |
 | 21 | The friction ledger remains external and joins only through stable IDs. | unenforced aub-xus.7 | (external friction ledger join test) |
 | 22 | Irreplaceable meter history is backed up and never automatically pruned. | unenforced aub-sth.12 | (retention and restore test) |
-| 23 | An outbound meter request is never begun before its attempt identity is durable. | unenforced aub-sth.6 | (durable attempt start test) |
+| 23 | An outbound meter request is never begun before its attempt identity is durable. | tests/meter_attempt_crash.rs | tests::killed_between_start_and_result_leaves_exactly_one_start_with_no_result |
 | 24 | An attempt without a terminal result is evidence of collector interruption, not evidence that no attempt occurred. | src/domain/freshness.rs | tests::started_attempt_past_command_horizon_yields_collector_interrupted |
 | 25 | Provider response evidence and its normalized interpretation are separate records; a corrected adapter reinterprets retained evidence and never overwrites the earlier interpretation. | unenforced aub-sth.7 | (response evidence capsule test) |
 | 26 | Workload feasibility is evaluated against every constraining window in calibrated credits, never against the lowest remaining percentage alone. | src/domain/window.rs | tests::display_and_advice_select_different_windows_when_calibrations_diverge |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 11 are enforced by mechanical checks present at HEAD (file paths and tests), and 16 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 12 are enforced by mechanical checks present at HEAD (file paths and tests), and 15 are unenforced and tracked by open beads in the tracker.
