@@ -6,8 +6,8 @@
   "knowledge_at": 1000,
   "ledger_generation": 7,
   "window": {
-    "since": "2026-08-25T00:00:00Z",
-    "until": "2026-08-26T00:00:00Z",
+    "since": "2026-08-25",
+    "until": "2026-08-26",
     "calendar": "utc"
   },
   "groups": [
