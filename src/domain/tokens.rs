@@ -21,7 +21,7 @@ use crate::evidence::{CoverageCompleteness, EvidenceQuality};
 /// instead (see `TokenCount`). Every match on `TokenKind` in this module is exhaustive
 /// with no wildcard arm, so adding a fifth variant here is meant to break compilation at
 /// every one of those call sites rather than fall silently into a `_` branch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum TokenKind {
     Input,
     Output,
