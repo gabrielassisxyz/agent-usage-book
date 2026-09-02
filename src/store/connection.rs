@@ -25,6 +25,13 @@ use crate::error::Error;
 
 use super::startup::{create_file_mode_0600, force_file_mode_0600};
 
+/// The file name of the one production database (PLAN.md section 11.1: one
+/// database, no separate per-purpose stores). Every store-touching command
+/// resolves its database under the configured state directory through this
+/// constant, so the file is named in exactly one place. The test hooks open
+/// their own databases and deliberately do not share it.
+pub const LEDGER_DATABASE_FILE: &str = "ledger.db";
+
 /// The journal mode every database must be in (PLAN.md section 11.2). WAL lets a
 /// long analytical read coexist with a writer holding the write slot.
 const REQUIRED_JOURNAL_MODE: &str = "wal";
