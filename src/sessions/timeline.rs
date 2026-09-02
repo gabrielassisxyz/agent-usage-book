@@ -333,7 +333,7 @@ mod tests {
         let first = load_all_sessions(&conn).unwrap();
 
         // Delete and rebuild from the same events: identical rows come back.
-        conn.execute("DELETE FROM session", []).unwrap();
+        crate::store::session::clear_all_sessions(&conn).unwrap();
         rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
         let second = load_all_sessions(&conn).unwrap();
 

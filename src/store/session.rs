@@ -224,3 +224,10 @@ pub fn load_session(
     .optional()
     .map_err(|e| Error::Store(format!("cannot load the session row: {e}")))
 }
+
+/// Clears every session row from the table.
+pub fn clear_all_sessions(conn: &Connection) -> Result<(), Error> {
+    conn.execute("DELETE FROM session", [])
+        .map_err(|e| Error::Store(format!("cannot clear session table: {e}")))?;
+    Ok(())
+}

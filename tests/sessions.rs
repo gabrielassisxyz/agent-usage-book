@@ -235,7 +235,7 @@ fn rebuild_determinism_property_over_sessions() {
     let first = load_all_sessions(&conn).unwrap();
 
     // Rebuild again on fresh table
-    conn.execute("DELETE FROM session", []).unwrap();
+    agent_usage_book::store::session::clear_all_sessions(&conn).unwrap();
     rebuild_sessions(&mut conn, &events, &dirs, &projects, &repos).unwrap();
     let second = load_all_sessions(&conn).unwrap();
 
