@@ -125,16 +125,6 @@ impl ProblemCode {
         ]
     }
 
-    /// Renders this code alongside a human message as a JSON object, so automation
-    /// reads the code and a human reads the message from the same record.
-    pub fn as_json(self, message: &str) -> String {
-        format!(
-            "{{\"code\":\"{}\",\"message\":\"{}\"}}",
-            self.code(),
-            message.replace('\\', "\\\\").replace('"', "\\\"")
-        )
-    }
-
     /// The code for a report qualification. `Complete` is not a problem, so it has no
     /// code; `Partial` is the one qualification that carries a code.
     pub fn from_coverage(coverage: CoverageCompleteness) -> Option<ProblemCode> {
@@ -350,20 +340,6 @@ mod tests {
         ];
         let actual: Vec<&str> = ProblemCode::all().iter().map(|c| c.code()).collect();
         assert_eq!(actual, EXPECTED);
-    }
-
-    /// Every code renders into JSON alongside a human message, so a condition reported
-    /// in JSON always carries its code.
-    #[test]
-    fn every_code_renders_into_json_with_a_message() {
-        for code in ProblemCode::all() {
-            let json = code.as_json("the human message");
-            assert!(
-                json.contains(code.code()),
-                "JSON for {code:?} must contain its code string: {json}"
-            );
-            assert!(json.contains("the human message"));
-        }
     }
 
     /// The documented table lists every code with its exit class, checked against the

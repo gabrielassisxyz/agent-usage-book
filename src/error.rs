@@ -104,9 +104,9 @@ impl Error {
 
     /// The process exit class for this failure.
     ///
-    /// This is the only entry point for turning a failure into a class, and it
-    /// is `problem_code` composed with `ExitClass`'s `From<ProblemCode>`: no
-    /// class mapping lives here. `rg 'fn exit_class' src/` returns this one line.
+    /// This is the only entry point for turning a failure into a class, and the
+    /// only method of its name in the tree. It is `problem_code` composed with
+    /// `ExitClass`'s `From<ProblemCode>`, and carries no class mapping of its own.
     pub fn exit_class(&self) -> ExitClass {
         ExitClass::from(self.problem_code())
     }
