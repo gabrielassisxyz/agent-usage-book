@@ -569,9 +569,7 @@ mod tests {
     use crate::domain::time::{FakeClock, MonotonicDuration};
     use crate::store::account::observe_account;
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::meter_attempt::{
-        DueReason, NewMeterAttempt, start_meter_attempt,
-    };
+    use crate::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
     use crate::store::migrate::run_migrations;
     use crate::store::migrations::registry;
     use crate::store::sample_run::{Trigger, start_sample_run};
