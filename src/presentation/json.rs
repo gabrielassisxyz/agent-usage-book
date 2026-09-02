@@ -125,25 +125,20 @@ impl Quantity {
         let value_val = obj
             .get("value")
             .ok_or(JsonContractError::MissingField("value"))?;
-        let value_str = match value_val {
-            serde_json::Value::String(s) => s.clone(),
-            serde_json::Value::Number(n) => n.to_string(),
-            _ => {
-                return Err(JsonContractError::InvalidFormat {
-                    field: "value",
-                    message: "expected string or number".to_string(),
-                });
-            }
+        let value_str = if let Some(s) = value_val.as_str() {
+            s.to_string()
+        } else if let Some(n) = value_val.as_number() {
+            n.to_string()
+        } else {
+            return Err(JsonContractError::InvalidFormat {
+                field: "value",
+                message: "expected string or number".to_string(),
+            });
         };
-        let unit_val = obj
+        let unit_str = obj
             .get("unit")
+            .and_then(serde_json::Value::as_str)
             .ok_or(JsonContractError::MissingField("unit"))?;
-        let unit_str = unit_val
-            .as_str()
-            .ok_or_else(|| JsonContractError::InvalidFormat {
-                field: "unit",
-                message: "expected string".to_string(),
-            })?;
         let leaked_unit: &'static str = match unit_str {
             "ppm" => "ppm",
             "tokens" => "tokens",
@@ -623,35 +618,19 @@ pub fn interval_from_json<T: DomainQuantity>(
         });
     }
 
-    let lower_val = obj
+    let lower_str = obj
         .get("lower")
+        .and_then(serde_json::Value::as_str)
         .ok_or(JsonContractError::MissingField("lower"))?;
-    let lower_str = match lower_val {
-        serde_json::Value::String(s) => s.as_str(),
-        _ => {
-            return Err(JsonContractError::InvalidFormat {
-                field: "lower",
-                message: "expected string".to_string(),
-            });
-        }
-    };
     let lower = T::from_exact_str(lower_str).ok_or_else(|| JsonContractError::InvalidFormat {
         field: "lower",
         message: format!("failed to parse '{lower_str}' into quantity"),
     })?;
 
-    let upper_val = obj
+    let upper_str = obj
         .get("upper")
+        .and_then(serde_json::Value::as_str)
         .ok_or(JsonContractError::MissingField("upper"))?;
-    let upper_str = match upper_val {
-        serde_json::Value::String(s) => s.as_str(),
-        _ => {
-            return Err(JsonContractError::InvalidFormat {
-                field: "upper",
-                message: "expected string".to_string(),
-            });
-        }
-    };
     let upper = T::from_exact_str(upper_str).ok_or_else(|| JsonContractError::InvalidFormat {
         field: "upper",
         message: format!("failed to parse '{upper_str}' into quantity"),
