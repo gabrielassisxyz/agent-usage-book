@@ -825,9 +825,11 @@ fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
 }
 
 /// Opens the one production ledger database through the one connection path:
-/// state readiness first, migrations next, then the caller operates. The rate
-/// card is the first production store user, so this is where the database file
-/// name resolves from [`crate::store::connection::LEDGER_DATABASE_FILE`].
+/// state readiness first, then the store-side open (which runs migrations;
+/// `src/cli.rs` must never name the migration framework itself, boundary rule
+/// `15`). The rate card is the first production store user, so this is where
+/// the database file name resolves from
+/// [`crate::store::connection::LEDGER_DATABASE_FILE`].
 fn rate_card_open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Error> {
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
@@ -845,22 +847,7 @@ fn rate_card_open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Err
     let opened = crate::store::startup::run_after_state_check(
         &config.state.dir,
         &crate::store::startup::ProcMounts,
-        || {
-            let mut conn = crate::store::connection::open(
-                &db_path,
-                crate::store::connection::AccessMode::ReadWrite,
-                &crate::store::connection::PragmaPolicy {
-                    busy_timeout: config.sampling.request_timeout,
-                },
-            )?;
-            crate::store::migrate::run_migrations(
-                &mut conn,
-                &crate::store::migrations::registry(),
-                None,
-                clock,
-            )?;
-            Ok(conn)
-        },
+        || crate::store::rate_card::open_ledger(&db_path, config.sampling.request_timeout, clock),
     )??;
     Ok(opened)
 }

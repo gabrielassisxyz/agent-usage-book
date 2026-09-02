@@ -12,8 +12,37 @@ use rusqlite::params;
 use crate::domain::rate_card::{
     BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, TokenClass,
 };
-use crate::domain::time::{UtcDate, UtcTimestamp};
+use crate::domain::time::{Clock, MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::error::Error;
+use std::path::Path;
+
+/// Opens the one production ledger database through the one connection path,
+/// then brings its schema current. The rate-card command is the first
+/// production store user, so the path lives here for now: the state directory
+/// and database file name belong to the caller (the cli resolves
+/// configuration), the open-and-migrate mechanics belong to the store, and
+/// `src/cli.rs` must never name the migration framework itself (boundary rule
+/// `15-status-no-migration`). A later bead that lands the sampling
+/// orchestration will move this to the module that owns the production open
+/// path once a second caller proves the shape.
+pub fn open_ledger(
+    db_path: &Path,
+    busy_timeout: MonotonicDuration,
+    clock: &impl Clock,
+) -> Result<rusqlite::Connection, Error> {
+    let mut conn = crate::store::connection::open(
+        db_path,
+        crate::store::connection::AccessMode::ReadWrite,
+        &crate::store::connection::PragmaPolicy { busy_timeout },
+    )?;
+    crate::store::migrate::run_migrations(
+        &mut conn,
+        &crate::store::migrations::registry(),
+        None,
+        clock,
+    )?;
+    Ok(conn)
+}
 
 /// What one import pass did. A re-import of an unchanged book is visibly a
 /// no-op: the counts say so instead of the operator having to diff.
