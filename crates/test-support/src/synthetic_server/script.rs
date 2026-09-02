@@ -27,6 +27,18 @@ pub enum ScriptedOutcome {
     /// server then closes the response half of the connection cleanly.
     Success(ScriptedResponseBody),
 
+    /// Send an arbitrary complete response: any status, any headers, any
+    /// body, verbatim. The named variants cover the shapes the failure-class
+    /// table distinguishes; this one carries a contract-suite fixture exactly
+    /// as captured when a case needs a status-and-body pair the named shapes
+    /// do not express (a 401 carrying the provider's own expiry body, whose
+    /// content decides the auth reason, for example).
+    Response {
+        status: u16,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    },
+
     /// Send a 401 status (the credential was rejected), with no body. Real
     /// providers differ on whether 401 carries a body; this is the minimal
     /// form a test can rely on.
@@ -107,6 +119,9 @@ pub enum ScriptedOutcome {
 impl ScriptedOutcome {
     /// Returns `true` if this outcome is a clean success: a complete, parseable
     /// response that a working adapter should turn into a measured reading.
+    /// The generic [`ScriptedOutcome::Response`] is not assumed clean: whether
+    /// it measures depends on the body it carries, which only the adapter's
+    /// contract knows.
     pub fn is_clean_success(&self) -> bool {
         matches!(self, ScriptedOutcome::Success(_))
     }
@@ -155,6 +170,7 @@ impl fmt::Display for ScriptedOutcome {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ScriptedOutcome::Success(_) => f.write_str("Success(200)"),
+            ScriptedOutcome::Response { status, .. } => write!(f, "Response(status={status})"),
             ScriptedOutcome::Unauthorized401 => f.write_str("Unauthorized401"),
             ScriptedOutcome::Forbidden403 => f.write_str("Forbidden403"),
             ScriptedOutcome::TooManyRequests429 { .. } => f.write_str("TooManyRequests429"),
@@ -201,8 +217,10 @@ mod tests {
 
     #[test]
     fn clean_success_is_a_clean_success() {
-        assert!(ScriptedOutcome::Success(ScriptedResponseBody::json_ok(b"{}".to_vec()))
-            .is_clean_success());
+        assert!(
+            ScriptedOutcome::Success(ScriptedResponseBody::json_ok(b"{}".to_vec()))
+                .is_clean_success()
+        );
     }
 
     #[test]
@@ -210,7 +228,9 @@ mod tests {
         let outcomes = [
             ScriptedOutcome::Unauthorized401,
             ScriptedOutcome::Forbidden403,
-            ScriptedOutcome::TooManyRequests429 { retry_after_seconds: None },
+            ScriptedOutcome::TooManyRequests429 {
+                retry_after_seconds: None,
+            },
             ScriptedOutcome::InternalServerError500,
             ScriptedOutcome::AcceptThenNeverRespond,
         ];

@@ -122,8 +122,11 @@ impl SyntheticServer {
     /// The script is the programmed sequence of responses the server will
     /// produce. One entry per expected request, in order.
     pub fn start(script: Vec<ScriptedOutcome>) -> Result<Self, SyntheticServerError> {
-        let listener = TcpListener::bind("127.0.0.1:0").map_err(SyntheticServerError::BindFailed)?;
-        let address = listener.local_addr().expect("local_addr on a bound socket is infallible");
+        let listener =
+            TcpListener::bind("127.0.0.1:0").map_err(SyntheticServerError::BindFailed)?;
+        let address = listener
+            .local_addr()
+            .expect("local_addr on a bound socket is infallible");
         let requests: Arc<Mutex<Vec<RecordedRequest>>> = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(script));
         let script_exhausted = Arc::new(Mutex::new(false));
@@ -163,15 +166,15 @@ impl SyntheticServer {
     /// caller reads this after issuing all the requests it planned and
     /// before asserting on the recorded credential.
     pub fn requests(&self) -> Vec<RecordedRequest> {
-        self.requests.lock().expect("requests mutex poisoned").clone()
+        self.requests
+            .lock()
+            .expect("requests mutex poisoned")
+            .clone()
     }
 
     /// How many requests the server has received.
     pub fn request_count(&self) -> usize {
-        self.requests
-            .lock()
-            .expect("requests mutex poisoned")
-            .len()
+        self.requests.lock().expect("requests mutex poisoned").len()
     }
 
     /// `true` if the script ran out of entries. A request received after
@@ -332,14 +335,11 @@ fn read_request(stream: &mut TcpStream) -> Result<RecordedRequest, SyntheticServ
             ))
         })?;
     let header_text = std::str::from_utf8(&buf[..header_end]).map_err(|e| {
-        SyntheticServerError::ReadFailed(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            e,
-        ))
+        SyntheticServerError::ReadFailed(std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     })?;
-    let (start_line, rest_headers) = header_text
-        .split_once("\r\n")
-        .ok_or_else(|| SyntheticServerError::ReadFailed(std::io::Error::other("no request line")))?;
+    let (start_line, rest_headers) = header_text.split_once("\r\n").ok_or_else(|| {
+        SyntheticServerError::ReadFailed(std::io::Error::other("no request line"))
+    })?;
     let mut header_iter = rest_headers.split("\r\n");
     let mut headers = Vec::new();
     let mut content_length: usize = 0;
@@ -405,18 +405,33 @@ fn read_request(stream: &mut TcpStream) -> Result<RecordedRequest, SyntheticServ
 /// Writes the programmed outcome to the stream. Every variant produces a
 /// single best-effort write; failure closes the socket with the partial
 /// buffer flushed.
-fn write_outcome(stream: &mut TcpStream, outcome: &ScriptedOutcome) -> Result<(), SyntheticServerError> {
+fn write_outcome(
+    stream: &mut TcpStream,
+    outcome: &ScriptedOutcome,
+) -> Result<(), SyntheticServerError> {
     match outcome {
         ScriptedOutcome::Success(body) => write_response(stream, body),
-        ScriptedOutcome::Unauthorized401 => write_response(
+        ScriptedOutcome::Response {
+            status,
+            headers,
+            body,
+        } => write_response(
             stream,
-            &ScriptedResponseBody::with_status(401, Vec::new()),
+            &ScriptedResponseBody {
+                status: *status,
+                headers: headers.clone(),
+                body: body.clone(),
+            },
         ),
-        ScriptedOutcome::Forbidden403 => write_response(
-            stream,
-            &ScriptedResponseBody::with_status(403, Vec::new()),
-        ),
-        ScriptedOutcome::TooManyRequests429 { retry_after_seconds } => {
+        ScriptedOutcome::Unauthorized401 => {
+            write_response(stream, &ScriptedResponseBody::with_status(401, Vec::new()))
+        }
+        ScriptedOutcome::Forbidden403 => {
+            write_response(stream, &ScriptedResponseBody::with_status(403, Vec::new()))
+        }
+        ScriptedOutcome::TooManyRequests429 {
+            retry_after_seconds,
+        } => {
             let mut body = ScriptedResponseBody::with_status(429, Vec::new());
             if let Some(secs) = retry_after_seconds {
                 body.headers
@@ -424,10 +439,9 @@ fn write_outcome(stream: &mut TcpStream, outcome: &ScriptedOutcome) -> Result<()
             }
             write_response(stream, &body)
         }
-        ScriptedOutcome::InternalServerError500 => write_response(
-            stream,
-            &ScriptedResponseBody::with_status(500, Vec::new()),
-        ),
+        ScriptedOutcome::InternalServerError500 => {
+            write_response(stream, &ScriptedResponseBody::with_status(500, Vec::new()))
+        }
         ScriptedOutcome::MalformedJson {
             status,
             headers,

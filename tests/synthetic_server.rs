@@ -470,6 +470,318 @@ fn the_transport_failure_shapes_reach_the_persisted_attempt_result() {
     // belongs to the contract suite that runs an adapter over this server.
 }
 
+// --- the contract suite over the real socket ----------------------------------
+
+/// Glue that lets an adapter run against the real driver through the port it
+/// already has: the sampler will own a production `HttpTransport` impl, and
+/// until that bead lands this is the test-side equivalent, one call deep.
+struct RealTransportOverExecuteSingle;
+
+impl agent_usage_book::meter::adapter::HttpTransport for RealTransportOverExecuteSingle {
+    fn send(
+        &self,
+        request: &HttpRequest,
+        budget: &CommandBudget,
+        clock: &impl agent_usage_book::domain::time::Clock,
+    ) -> Result<agent_usage_book::meter::transport::HttpResponse, FailureClass> {
+        execute_single(request, budget, clock)
+    }
+}
+
+fn meter_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/meter/anthropic")
+            .join(name),
+    )
+    .unwrap_or_else(|_| panic!("fixture {name} must exist"))
+}
+
+/// The Done-when: the same fourteen-case suite the adapter contract defines
+/// (PLAN.md section 34.8) runs unchanged over a real socket - the same
+/// sanitized fixtures, the same adapter, but the production transport and the
+/// declarative server in place of the in-process mock. The assertions mirror
+/// the adapter's own suite case for case; extracting one shared suite is
+/// deferred until a second network adapter proves the parametrization, per
+/// the no-early-extraction rule.
+#[test]
+fn the_contract_suite_passes_over_the_real_socket() {
+    use agent_usage_book::domain::failure::{AuthReason, HttpStatusClass};
+    use agent_usage_book::domain::time::UtcTimestamp;
+    use agent_usage_book::domain::window::{ModelId, WindowScope};
+    use agent_usage_book::meter::adapter::{
+        CredentialHandle, MeterRequest, ProviderAdapter, ProviderObservation,
+    };
+    use agent_usage_book::meter::anthropic::AnthropicAdapter;
+    use agent_usage_book::meter::transport::HttpResponse;
+    use test_support::ScriptedResponseBody;
+
+    let credential = CredentialHandle::new("test-token-anthropic");
+    let request = MeterRequest::default();
+    let clock = RealClock::new();
+    let transport = RealTransportOverExecuteSingle;
+
+    /// Serves one scripted outcome over a fresh ephemeral server and returns
+    /// the adapter's typed observation through the production transport.
+    fn observe_outcome(
+        transport: &RealTransportOverExecuteSingle,
+        credential: &CredentialHandle,
+        request: &MeterRequest,
+        clock: &RealClock,
+        outcome: ScriptedOutcome,
+    ) -> ProviderObservation<agent_usage_book::meter::anthropic::AnthropicReading> {
+        let server = SyntheticServer::start(vec![outcome]).unwrap();
+        let adapter = AnthropicAdapter::with_endpoint(server.url());
+        adapter.observe(credential, request, transport, clock)
+    }
+
+    let fixture_body = |name: &str| ScriptedOutcome::Response {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        body: meter_fixture(name),
+    };
+
+    // 1. valid success
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("valid-success.json"),
+    );
+    match obs {
+        ProviderObservation::Measured(ref r) => {
+            assert_eq!(r.windows.len(), 3);
+            assert_eq!(r.windows[0].quota_used().as_ppm().get(), 80_000);
+            assert_eq!(r.windows[1].quota_used().as_ppm().get(), 910_000);
+        }
+        other => panic!("case 1 expected Measured, got {other:?}"),
+    }
+
+    // 2. zero percentage
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("zero-percentage.json"),
+    );
+    match obs {
+        ProviderObservation::Measured(ref r) => {
+            assert_eq!(r.windows[0].quota_used().as_ppm().get(), 0);
+        }
+        other => panic!("case 2 expected Measured, got {other:?}"),
+    }
+
+    // 3. multiple windows
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("multiple-windows.json"),
+    );
+    match obs {
+        ProviderObservation::Measured(ref r) => {
+            assert_eq!(r.windows.len(), 4);
+        }
+        other => panic!("case 3 expected Measured, got {other:?}"),
+    }
+
+    // 4. model-specific windows
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("model-specific.json"),
+    );
+    match obs {
+        ProviderObservation::Measured(ref r) => {
+            let model_win = r
+                .windows
+                .iter()
+                .find(|w| w.semantic_key().as_str() == "seven_day_sonnet")
+                .expect("model window present");
+            assert_eq!(
+                *model_win.scope(),
+                WindowScope::ModelSpecific(ModelId::new("sonnet"))
+            );
+        }
+        other => panic!("case 4 expected Measured, got {other:?}"),
+    }
+
+    // 5. 401 invalid credential (the body decides the reason)
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        ScriptedOutcome::Response {
+            status: 401,
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body: meter_fixture("error-401-invalid.json"),
+        },
+    );
+    assert_eq!(
+        obs,
+        ProviderObservation::AuthRequired(AuthReason::CredentialRejected)
+    );
+
+    // 6. provider-declared authentication expiration
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        ScriptedOutcome::Response {
+            status: 401,
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body: meter_fixture("error-401-expired.json"),
+        },
+    );
+    assert_eq!(
+        obs,
+        ProviderObservation::AuthRequired(AuthReason::ProviderDeclaredExpiry)
+    );
+
+    // 7. 403 with ambiguous semantics: client error, never authentication
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        ScriptedOutcome::Response {
+            status: 403,
+            headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+            body: meter_fixture("error-403-ambiguous.json"),
+        },
+    );
+    assert_eq!(
+        obs,
+        ProviderObservation::Unreachable(FailureClass::HttpStatus(HttpStatusClass::ClientError))
+    );
+
+    // 8. 429 rate limited, with the provider's Retry-After honoured
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        ScriptedOutcome::Response {
+            status: 429,
+            headers: vec![
+                ("Content-Type".to_owned(), "application/json".to_owned()),
+                ("Retry-After".to_owned(), "60".to_owned()),
+            ],
+            body: meter_fixture("error-429.json"),
+        },
+    );
+    assert_eq!(
+        obs,
+        ProviderObservation::Unreachable(FailureClass::RateLimited {
+            retry_after: Some(MonotonicDuration::from_seconds(60)),
+        })
+    );
+
+    // 9. timeout: the adapter owns its timeouts, so the stalled server holds
+    // the observation until the adapter's read timeout fires - the honest
+    // cost of proving the composed wiring rather than a mocked deadline.
+    let stalled = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+    }])
+    .unwrap();
+    let stalled_adapter = AnthropicAdapter::with_endpoint(stalled.url());
+    let obs = stalled_adapter.observe(&credential, &request, &transport, &clock);
+    assert_eq!(
+        obs,
+        ProviderObservation::Unreachable(FailureClass::ReadTimeout)
+    );
+
+    // 10. malformed JSON
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("malformed.json"),
+    );
+    assert_eq!(
+        obs,
+        ProviderObservation::Unreachable(FailureClass::MalformedBody)
+    );
+
+    // 11. missing expected field
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("missing-field.json"),
+    );
+    assert_eq!(
+        obs,
+        ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
+    );
+
+    // 12. unknown additional field: measured, and the payload is retained for
+    // the capsule builder (aub-eun.5 owns retention).
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("unknown-fields.json"),
+    );
+    match obs {
+        ProviderObservation::Measured(ref r) => {
+            assert!(r.raw_payload.is_some());
+        }
+        other => panic!("case 12 expected Measured, got {other:?}"),
+    }
+
+    // 13. stale server timestamp: measured, with the provider's own timestamp
+    let obs = observe_outcome(
+        &transport,
+        &credential,
+        &request,
+        &clock,
+        fixture_body("stale-timestamp.json"),
+    );
+    match obs {
+        ProviderObservation::Measured(ref r) => {
+            assert_eq!(
+                r.windows[0].resets_at(),
+                UtcTimestamp::parse_rfc3339("2020-01-01T00:00:00.000Z").unwrap()
+            );
+        }
+        other => panic!("case 13 expected Measured, got {other:?}"),
+    }
+
+    // 14. reset change: two reads of the same window disagree on the reset
+    let server = SyntheticServer::start(vec![ScriptedOutcome::Success(ScriptedResponseBody {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        body: meter_fixture("reset-changed-a.json"),
+    })])
+    .unwrap();
+    let adapter = AnthropicAdapter::with_endpoint(server.url());
+    let obs_a = adapter.observe(&credential, &request, &transport, &clock);
+    server.push_outcome(ScriptedOutcome::Success(ScriptedResponseBody {
+        status: 200,
+        headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
+        body: meter_fixture("reset-changed-b.json"),
+    }));
+    let obs_b = adapter.observe(&credential, &request, &transport, &clock);
+    match (obs_a, obs_b) {
+        (ProviderObservation::Measured(a), ProviderObservation::Measured(b)) => {
+            assert_ne!(a.windows[0].resets_at(), b.windows[0].resets_at());
+        }
+        other => panic!("case 14 expected a Measured pair, got {other:?}"),
+    }
+}
+
 // --- acceptance criteria 4: per-request recording ------------------------------
 
 #[test]
