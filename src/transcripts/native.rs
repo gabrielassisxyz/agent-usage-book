@@ -365,6 +365,15 @@ impl ParserAdapter for CodexParser {
         InputFormatVersion::new("codex-jsonl-v1")
     }
 
+    /// Codex reports totals so far on every `token_count` record, so its
+    /// events are points of one monotonic series per session, never
+    /// independent consumption. The cumulative pipeline orders the surviving
+    /// series and differences it; summing the records as they arrive would
+    /// count every earlier snapshot again.
+    fn reports_cumulative(&self) -> bool {
+        true
+    }
+
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
         let mut last: Option<(UsageCounts, Option<UtcTimestamp>)> = None;
         let mut session: Option<SessionId> = None;

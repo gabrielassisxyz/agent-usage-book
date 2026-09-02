@@ -27,15 +27,15 @@ use crate::domain::provenance::{DerivationId, EvidenceId, QuerySemantics};
 use crate::domain::time::{UtcDate, UtcTimestamp, unix_nanos};
 use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::error::Error;
-use crate::evidence::Provenance;
+use crate::evidence::{ComponentKind, CoverageCompleteness, Provenance};
 use crate::logging::LogicalName;
 use crate::report::models::{
     IngestSummary, LedgerGeneration, ReportMetadata, SpendGroup, SpendGroupProvenance, SpendReport,
 };
 use crate::report::provenance::{ProvenanceNode, ValueArithmetic};
 use crate::transcripts::{
-    DiscoveryError, DiscoveryOptions, NormalizedUsageEvent, ParserAdapter, SourceLocation,
-    discover, parser_for_format,
+    DiscoveryError, DiscoveryOptions, NormalizedUsageEvent, ParserAdapter, ParserVersion,
+    SourceLocation, discover, parser_for_format,
 };
 
 /// The UTC day range a spend report covers: `since` inclusive, `until` exclusive.
@@ -80,6 +80,11 @@ pub fn assemble(
         ));
     }
     let parsers = parsers_for(config)?;
+    let cumulative_parsers: BTreeSet<ParserVersion> = parsers
+        .values()
+        .filter(|parser| parser.reports_cumulative())
+        .map(|parser| parser.parser_version())
+        .collect();
     let discovered =
         discover(&config.transcripts, &DiscoveryOptions::default()).map_err(discovery_error)?;
 
@@ -119,7 +124,7 @@ pub fn assemble(
         }
     }
 
-    let groups = group_events(events, window, &mut summary);
+    let groups = group_events(events, window, &mut summary, &cumulative_parsers);
     let metadata = ReportMetadata::new(generated_at, generated_at, LedgerGeneration::new(0), None);
     let (groups, provenance): (Vec<SpendGroup>, Vec<SpendGroupProvenance>) =
         groups.into_iter().unzip();
@@ -201,6 +206,7 @@ fn group_events(
     events: Vec<(String, NormalizedUsageEvent)>,
     window: SpendWindow,
     summary: &mut IngestSummary,
+    cumulative_parsers: &BTreeSet<ParserVersion>,
 ) -> Vec<(SpendGroup, SpendGroupProvenance)> {
     let (sources, events): (Vec<String>, Vec<NormalizedUsageEvent>) = events.into_iter().unzip();
     // Deduplication runs over the whole batch, not per source, because one
@@ -212,8 +218,37 @@ fn group_events(
     summary.collisions = deduplicated.collisions;
     summary.without_identity = deduplicated.without_identity;
 
+    // Cumulative sources report totals so far, so their surviving events are
+    // points of one series per session, not independent consumption: the
+    // pipeline orders each series and differences it into deltas, rejecting
+    // counter resets with the affected interval named (aub-lqe.9). The deltas
+    // replace the source's events before grouping sums anything, and each
+    // reset marks the group it would have joined partially covered.
+    let (canonical, cumulative) = crate::dedup::cumulative::derive_cumulative_deltas(
+        deduplicated.canonical,
+        &|version: &ParserVersion| cumulative_parsers.contains(version),
+    );
+    let mut reset_exclusions: BTreeMap<GroupKey, BTreeSet<ComponentKind>> = BTreeMap::new();
+    for reset in &cumulative.resets {
+        if let Some(occurred_at) = reset.rejected.occurred_at() {
+            let file = event_file(&reset.rejected);
+            let source = source_of_file
+                .get(&file)
+                .cloned()
+                .unwrap_or_else(|| "unknown-source".to_string());
+            let key = GroupKey {
+                day: occurred_at.utc_date(),
+                source,
+            };
+            reset_exclusions
+                .entry(key)
+                .or_default()
+                .extend(reset.missing.iter().cloned());
+        }
+    }
+
     let mut groups: BTreeMap<GroupKey, GroupAccumulator> = BTreeMap::new();
-    for event in deduplicated.canonical {
+    for event in canonical {
         let Some(occurred_at) = event.occurred_at() else {
             summary.undated_events += 1;
             continue;
@@ -251,7 +286,7 @@ fn group_events(
 
     groups
         .into_iter()
-        .map(|(key, group)| finish_group(key, group, window))
+        .map(|(key, group)| finish_group(key, group, window, &reset_exclusions))
         .collect()
 }
 
@@ -301,8 +336,9 @@ fn add_usage(left: &UsageVector, right: &UsageVector) -> UsageVector {
 
 fn finish_group(
     key: GroupKey,
-    group: GroupAccumulator,
+    mut group: GroupAccumulator,
     window: SpendWindow,
+    reset_exclusions: &BTreeMap<GroupKey, BTreeSet<ComponentKind>>,
 ) -> (SpendGroup, SpendGroupProvenance) {
     let name = LogicalName::new(format!("{} {}", key.day.iso(), key.source));
     let node = ProvenanceNode::new(
@@ -322,6 +358,23 @@ fn finish_group(
     let usage = group
         .usage
         .expect("a spend group is created by the first event that lands in it");
+    // A counter reset excluded a delta this group would have carried: its
+    // components surface as partial coverage rather than the group reading as
+    // complete (aub-lqe.9, PLAN.md section 34.14).
+    let usage = match reset_exclusions.get(&key) {
+        None => usage,
+        Some(missing) => {
+            let merged = usage.coverage().combine(&CoverageCompleteness::Partial {
+                missing: missing.clone(),
+            });
+            UsageVector::new(
+                usage.known(),
+                usage.unknown().clone(),
+                merged,
+                usage.quality().clone(),
+            )
+        }
+    };
     let spend_group = SpendGroup::new(
         name.clone(),
         usage,

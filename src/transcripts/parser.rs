@@ -216,6 +216,13 @@ pub struct NormalizedUsageEvent {
     parser_version: ParserVersion,
     occurred_at: Option<UtcTimestamp>,
     session: Option<SessionId>,
+    /// A source-provided sequence number for the record, when the source
+    /// writes one. The strongest available ordering discriminator for a
+    /// cumulative series: a sequence survives clock skew and identical
+    /// timestamps where a timestamp alone cannot order two records. `None`
+    /// means the source writes no sequence and ordering falls back to the
+    /// timestamp path with a documented tiebreak.
+    sequence: Option<u64>,
 }
 
 impl NormalizedUsageEvent {
@@ -232,6 +239,7 @@ impl NormalizedUsageEvent {
             parser_version,
             occurred_at: None,
             session: None,
+            sequence: None,
         }
     }
 
@@ -247,8 +255,19 @@ impl NormalizedUsageEvent {
         self
     }
 
+    /// The same event carrying the source's sequence number for the record.
+    pub fn with_sequence(mut self, sequence: u64) -> Self {
+        self.sequence = Some(sequence);
+        self
+    }
+
     pub fn occurred_at(&self) -> Option<UtcTimestamp> {
         self.occurred_at
+    }
+
+    /// The source-provided sequence number, when the source wrote one.
+    pub fn sequence(&self) -> Option<u64> {
+        self.sequence
     }
 
     pub fn session(&self) -> Option<&SessionId> {
@@ -323,6 +342,18 @@ pub trait ParserAdapter {
 
     /// Parses one source into normalized events and quarantine records.
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput;
+
+    /// Whether this source reports cumulative totals rather than per-record
+    /// consumption. A cumulative parser's event carries a total-so-far value,
+    /// so summing its events as if each were independent overcounts any series
+    /// longer than one record. The dedup module's cumulative pipeline
+    /// (`crate::dedup::cumulative`) orders a cumulative source's surviving
+    /// events and differences them into deltas; a parser that reports false
+    /// has its events counted as they are. Declared once per parser, here, so
+    /// the pipeline reads the declaration instead of a per-caller list.
+    fn reports_cumulative(&self) -> bool {
+        false
+    }
 }
 
 /// One shape every parser's fixture set must cover.

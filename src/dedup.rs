@@ -38,6 +38,8 @@ use crate::transcripts::NormalizedUsageEvent;
 use crate::transcripts::parser::ParserVersion;
 use fingerprint::HeuristicKey;
 
+pub mod cumulative;
+
 /// The outcome of deduplicating one batch of events.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Deduplicated {
