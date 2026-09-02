@@ -285,7 +285,7 @@ fn to_http_response(
         if budget.is_expired(clock) {
             return Err(FailureClass::TotalBudgetExpired);
         }
-        if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock {
+        if is_timeout_flavored_io_error(&e) {
             return Err(FailureClass::ReadTimeout);
         }
         return Err(FailureClass::MalformedBody);
@@ -300,6 +300,25 @@ fn to_http_response(
         headers,
         body,
     })
+}
+
+/// True when an io error from the body reader is a timeout in disguise.
+///
+/// The kind check alone misses ureq's overall-deadline expiry: when a request
+/// declares a total timeout, ureq discards the per-read timeout and derives
+/// the socket deadline from the total, and the deadline's expiry surfaces
+/// through the body reader with a non-timeout kind and a deadline-flavoured
+/// message. The message check mirrors `map_transport_error`'s convention so
+/// the two classifier paths agree on what a timeout is, and a provider hang is
+/// never persisted as a malformed body (PLAN.md 14.5: timeouts are retried,
+/// malformed responses are not).
+fn is_timeout_flavored_io_error(e: &std::io::Error) -> bool {
+    let message = e.to_string().to_lowercase();
+    e.kind() == std::io::ErrorKind::TimedOut
+        || e.kind() == std::io::ErrorKind::WouldBlock
+        || message.contains("timeout")
+        || message.contains("timed out")
+        || message.contains("deadline")
 }
 
 fn map_transport_error(err: &ureq::Transport) -> FailureClass {

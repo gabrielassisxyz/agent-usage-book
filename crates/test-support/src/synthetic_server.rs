@@ -493,7 +493,12 @@ fn write_outcome(
         ScriptedOutcome::HeadersThenStall { status, headers } => {
             // Write the status line and headers, then sleep long enough for
             // the client to give up reading. The sleep is bounded so a test
-            // does not hang the test runner indefinitely.
+            // does not hang the test runner indefinitely, and it must exceed
+            // the longest client deadline any test drives against this shape
+            // (the contract suite's 15s total): a stall shorter than the
+            // client's deadline races it, and when the server's close wins
+            // the client sees a clean EOF and an empty body instead of the
+            // timeout the case is pinning (aub-deadline-body-read-timeout-u3db).
             let head = format!(
                 "HTTP/1.1 {} {}\r\n{}\r\n",
                 status,
@@ -504,14 +509,14 @@ fn write_outcome(
                 .write_all(head.as_bytes())
                 .map_err(SyntheticServerError::WriteFailed)?;
             stream.flush().map_err(SyntheticServerError::WriteFailed)?;
-            thread::sleep(Duration::from_secs(15));
+            thread::sleep(Duration::from_secs(20));
             Ok(())
         }
         ScriptedOutcome::AcceptThenNeverRespond => {
             // Sleep without writing anything. The client's connect completes
             // because the TCP handshake already happened on accept, but its
             // read times out because we never send a byte.
-            thread::sleep(Duration::from_secs(15));
+            thread::sleep(Duration::from_secs(20));
             Ok(())
         }
         ScriptedOutcome::CloseMidBody {

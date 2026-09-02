@@ -689,12 +689,11 @@ fn the_contract_suite_passes_over_the_real_socket() {
     // one. What fires is the total deadline, not the 10s read timeout:
     // execute_single documents that ureq discards timeout_read whenever an
     // overall timeout is declared, and the deadline's io error surfaces
-    // through the body reader as a non-timeout kind, which the transport's
-    // classifier maps to MalformedBody. The case pins that composed
-    // classification: any regression to Measured, AuthRequired, or a
-    // fallback zero still fails, and a transport-side refinement of the
-    // class (deadline expiry is a timeout, not a malformed body) updates
-    // this assertion with the fix, not before.
+    // through the body reader with a non-timeout kind but a
+    // deadline-flavoured message, which the transport's classifier maps to
+    // ReadTimeout (aub-deadline-body-read-timeout-u3db). The case pins that
+    // composed classification: any regression to Measured, AuthRequired, a
+    // fallback zero, or the pre-fix MalformedBody still fails.
     let stalled = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
         status: 200,
         headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
@@ -704,7 +703,7 @@ fn the_contract_suite_passes_over_the_real_socket() {
     let obs = stalled_adapter.observe(&credential, &request, &transport, &clock);
     assert_eq!(
         obs,
-        ProviderObservation::Unreachable(FailureClass::MalformedBody)
+        ProviderObservation::Unreachable(FailureClass::ReadTimeout)
     );
 
     // 10. malformed JSON
