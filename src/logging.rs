@@ -77,9 +77,13 @@ impl RunId {
     pub fn from_string(s: String) -> Self {
         Self(s)
     }
+}
 
-    pub fn from_str(s: &str) -> Self {
-        Self(s.to_string())
+impl std::str::FromStr for RunId {
+    type Err = std::convert::Infallible;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(Self(s.to_string()))
     }
 }
 

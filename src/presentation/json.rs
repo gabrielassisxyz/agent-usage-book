@@ -253,7 +253,7 @@ impl JsonEnvelope {
             .get("run")
             .and_then(serde_json::Value::as_str)
             .ok_or(JsonContractError::MissingField("run"))?;
-        let run = RunId::from_str(run_str);
+        let run = RunId::from_string(run_str.to_string());
 
         let gen_nanos = obj
             .get("generated_at")

@@ -37,7 +37,7 @@ fn test_metadata() -> ReportMetadata {
 }
 
 fn test_run_id() -> RunId {
-    RunId::from_str("run-1000-2000-1")
+    RunId::from_string("run-1000-2000-1".to_string())
 }
 
 fn remaining_ppm(ppm: u32) -> QuotaRemaining {
