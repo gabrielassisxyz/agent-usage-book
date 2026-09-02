@@ -35,7 +35,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 use crate::domain::credits::CreditsPerToken;
 use crate::domain::ids::BillingSemanticsId;
 use crate::domain::provenance::{
-    CostModelId, EvidenceId, ProvenanceManifest, canonical_inputs_hash,
+    CostModelId, EvidenceId, ProvenanceManifest, QuerySemantics, WitnessId, canonical_inputs_hash,
 };
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
@@ -442,6 +442,20 @@ impl CostModel {
     pub fn terms(&self) -> &[CostModelTerm] {
         &self.terms
     }
+
+    /// True when the cost model carries a term for every known token kind in [`TokenKind::ALL`].
+    pub fn is_complete(&self) -> bool {
+        TokenKind::ALL.iter().all(|kind| self.term(*kind).is_some())
+    }
+
+    /// Every known token kind absent from this model.
+    pub fn missing_token_kinds(&self) -> Vec<TokenKind> {
+        TokenKind::ALL
+            .iter()
+            .copied()
+            .filter(|kind| self.term(*kind).is_none())
+            .collect()
+    }
 }
 
 /// A lifecycle event row's SQLite rowid.
@@ -836,6 +850,83 @@ pub fn activate(
     tx.commit()
         .map_err(|e| Error::Store(format!("cannot commit the activation: {e}")))?;
     Ok(LifecycleEventId::new(event_id))
+}
+
+/// The default / first published cost model for Anthropic Claude messages subscription (`aub-ai3.3`).
+///
+/// Published with explicit per-term provenance covering all 4 token kinds:
+/// - input: 3_000_000 micro-credits / M tokens (3.0 credits / M)
+/// - output: 15_000_000 micro-credits / M tokens (15.0 credits / M)
+/// - cache_read: 300_000 micro-credits / M tokens (0.30 credits / M)
+/// - cache_write: 3_750_000 micro-credits / M tokens (3.75 credits / M)
+///
+/// Derivation method for each term is [`TermDerivationMethod::PublishedBillingSemantics`].
+/// No term is populated with a placeholder or a zero standing in for an unknown value.
+pub fn anthropic_claude_messages_v1(valid_from: UtcTimestamp) -> CostModel {
+    let manifest = ProvenanceManifest::new(
+        [EvidenceId::new("anthropic-pricing-2024-06-01")],
+        [WitnessId::CostModel(CostModelId::new(
+            "anthropic-claude-messages-v1",
+        ))],
+        QuerySemantics::new("cost_model", "published_seed"),
+    );
+    CostModel::new(
+        CostModelId::new("anthropic-claude-messages-v1"),
+        ProviderKey::new("anthropic"),
+        CostModelScope::ModelClass,
+        BillingSemanticsId::new("anthropic-messages-subscription-v1"),
+        None,
+        CostModelVersion::new("1.0"),
+        ValidityInterval::new(valid_from, UtcTimestamp::from_unix_nanos(i64::MAX))
+            .expect("validity interval"),
+        valid_from,
+        ModelProvenance::from_manifest(&manifest),
+        vec![
+            CostModelTerm::new(
+                TokenKind::Input,
+                CreditsPerToken::from_micros_per_million_tokens(3_000_000),
+                None,
+                TermDerivationMethod::PublishedBillingSemantics,
+                None,
+            ),
+            CostModelTerm::new(
+                TokenKind::Output,
+                CreditsPerToken::from_micros_per_million_tokens(15_000_000),
+                None,
+                TermDerivationMethod::PublishedBillingSemantics,
+                None,
+            ),
+            CostModelTerm::new(
+                TokenKind::CacheRead,
+                CreditsPerToken::from_micros_per_million_tokens(300_000),
+                None,
+                TermDerivationMethod::PublishedBillingSemantics,
+                None,
+            ),
+            CostModelTerm::new(
+                TokenKind::CacheWrite,
+                CreditsPerToken::from_micros_per_million_tokens(3_750_000),
+                None,
+                TermDerivationMethod::PublishedBillingSemantics,
+                None,
+            ),
+        ],
+    )
+    .expect("valid anthropic-claude-messages-v1 cost model")
+}
+
+/// Seeds the initial published cost model if no cost model is currently active,
+/// activating it at `event_at`. If a model is already active, returns the active model.
+pub fn seed_initial_cost_model(
+    conn: &mut Connection,
+    event_at: UtcTimestamp,
+) -> Result<CostModel, Error> {
+    if let Some(active) = load_active_at(conn, event_at)? {
+        return Ok(active);
+    }
+    let model = anthropic_claude_messages_v1(event_at);
+    activate(conn, &model, event_at, None)?;
+    Ok(model)
 }
 
 /// One nanosecond before `at`, the instant `load_active_at` uses to read the state a
