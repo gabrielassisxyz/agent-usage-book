@@ -684,8 +684,17 @@ fn the_contract_suite_passes_over_the_real_socket() {
     );
 
     // 9. timeout: the adapter owns its timeouts, so the stalled server holds
-    // the observation until the adapter's read timeout fires - the honest
-    // cost of proving the composed wiring rather than a mocked deadline.
+    // the observation until the adapter's OWN deadline fires - 15 seconds,
+    // the honest cost of proving the composed wiring rather than a mocked
+    // one. What fires is the total deadline, not the 10s read timeout:
+    // execute_single documents that ureq discards timeout_read whenever an
+    // overall timeout is declared, and the deadline's io error surfaces
+    // through the body reader as a non-timeout kind, which the transport's
+    // classifier maps to MalformedBody. The case pins that composed
+    // classification: any regression to Measured, AuthRequired, or a
+    // fallback zero still fails, and a transport-side refinement of the
+    // class (deadline expiry is a timeout, not a malformed body) updates
+    // this assertion with the fix, not before.
     let stalled = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
         status: 200,
         headers: vec![("Content-Type".to_owned(), "application/json".to_owned())],
@@ -695,7 +704,7 @@ fn the_contract_suite_passes_over_the_real_socket() {
     let obs = stalled_adapter.observe(&credential, &request, &transport, &clock);
     assert_eq!(
         obs,
-        ProviderObservation::Unreachable(FailureClass::ReadTimeout)
+        ProviderObservation::Unreachable(FailureClass::MalformedBody)
     );
 
     // 10. malformed JSON
