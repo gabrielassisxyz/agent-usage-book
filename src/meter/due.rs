@@ -221,7 +221,16 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
 pub fn next_due_after(result: &AttemptResult, ordinary_cadence: MonotonicDuration) -> UtcTimestamp {
     let retry_after = match result.outcome() {
         AttemptOutcome::Unreachable(FailureClass::RateLimited { retry_after }) => retry_after,
-        _ => None,
+        AttemptOutcome::Success | AttemptOutcome::AuthRequired => None,
+        AttemptOutcome::Unreachable(
+            FailureClass::DnsFailure
+            | FailureClass::ConnectTimeout
+            | FailureClass::ReadTimeout
+            | FailureClass::TotalBudgetExpired
+            | FailureClass::HttpStatus(_)
+            | FailureClass::MalformedBody
+            | FailureClass::MissingRequiredField,
+        ) => None,
     };
     let postpone = retry_after
         .map(|delay| delay.as_nanos())
@@ -240,7 +249,16 @@ fn retry_postponement(entry: &AttemptHistoryEntry) -> Option<UtcTimestamp> {
                 result.finished_at().unix_nanos() + delay.as_nanos() as i64,
             ))
         }
-        _ => None,
+        AttemptOutcome::Success | AttemptOutcome::AuthRequired => None,
+        AttemptOutcome::Unreachable(
+            FailureClass::DnsFailure
+            | FailureClass::ConnectTimeout
+            | FailureClass::ReadTimeout
+            | FailureClass::TotalBudgetExpired
+            | FailureClass::HttpStatus(_)
+            | FailureClass::MalformedBody
+            | FailureClass::MissingRequiredField,
+        ) => None,
     }
 }
 
