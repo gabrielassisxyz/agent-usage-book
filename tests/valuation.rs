@@ -130,7 +130,9 @@ fn golden_hand_computed_exact_decimal_fixtures() {
             );
             assert_eq!(equiv.amount(), Money::<Usd>::from_micros(1_117_038));
         }
-        other => panic!("expected Complete outcome, got {other:?}"),
+        ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+            panic!("expected Complete outcome, got {outcome:?}");
+        }
     }
 }
 
@@ -222,7 +224,9 @@ fn missing_rate_names_vendor_model_and_token_class() {
             assert_eq!(missing_rates[0].token_class, "output");
             assert_eq!(missing_rates[0].date, date);
         }
-        other => panic!("expected Incomplete outcome, got {other:?}"),
+        ValuationOutcome::Complete(..) | ValuationOutcome::UnsupportedCurrency { .. } => {
+            panic!("expected Incomplete outcome, got {outcome:?}");
+        }
     }
 }
 
@@ -265,7 +269,9 @@ fn missing_cache_write_price_never_zero_cost() {
             assert_eq!(missing_rates.len(), 1);
             assert_eq!(missing_rates[0].token_class, "cache_write_5m");
         }
-        other => panic!("expected Incomplete outcome, got {other:?}"),
+        ValuationOutcome::Complete(..) | ValuationOutcome::UnsupportedCurrency { .. } => {
+            panic!("expected Incomplete outcome, got {outcome:?}");
+        }
     }
 }
 
@@ -327,7 +333,9 @@ fn different_rates_per_token_class_order_of_magnitude() {
             // total: 2_100_000 micros ($2.10)
             assert_eq!(equiv.micros(), 2_100_000);
         }
-        other => panic!("expected Complete outcome, got {other:?}"),
+        ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+            panic!("expected Complete outcome, got {outcome:?}");
+        }
     }
 }
 
@@ -374,7 +382,9 @@ fn mid_period_model_price_change_two_halves() {
             // Total: $15.00 (15_000_000 micros)
             assert_eq!(equiv.micros(), 15_000_000);
         }
-        other => panic!("expected Complete outcome, got {other:?}"),
+        ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+            panic!("expected Complete outcome, got {outcome:?}");
+        }
     }
 }
 
@@ -402,7 +412,9 @@ fn unsupported_currency_is_rejected() {
             assert_eq!(found, CurrencyCode::Eur);
             assert_eq!(expected, "USD");
         }
-        other => panic!("expected UnsupportedCurrency outcome, got {other:?}"),
+        ValuationOutcome::Complete(..) | ValuationOutcome::Incomplete { .. } => {
+            panic!("expected UnsupportedCurrency outcome, got {outcome:?}");
+        }
     }
 }
 

@@ -417,7 +417,9 @@ mod tests {
                     "expected exact hand-computed 652,500 micros ($0.6525)"
                 );
             }
-            other => panic!("expected Complete valuation, got {other:?}"),
+            ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+                panic!("expected Complete valuation, got {res:?}");
+            }
         }
     }
 
@@ -514,7 +516,9 @@ mod tests {
                 assert_eq!(missing_rates.len(), 1);
                 assert_eq!(missing_rates[0].token_class, "cache_write_5m");
             }
-            other => panic!("expected Incomplete outcome, got {other:?}"),
+            ValuationOutcome::Complete(..) | ValuationOutcome::UnsupportedCurrency { .. } => {
+                panic!("expected Incomplete outcome, got {outcome:?}");
+            }
         }
     }
 
@@ -550,14 +554,20 @@ mod tests {
         let cost_july =
             match value_usage_vector::<Usd>(&book, "openai", "gpt-4o", date_july, &usage) {
                 ValuationOutcome::Complete(eq) => eq,
-                other => panic!("expected July to be complete, got {other:?}"),
+                ValuationOutcome::Incomplete { .. }
+                | ValuationOutcome::UnsupportedCurrency { .. } => {
+                    panic!("expected July to be complete");
+                }
             };
         assert_eq!(cost_july.micros(), 5_000_000); // $5.00
 
         let cost_aug =
             match value_usage_vector::<Usd>(&book, "openai", "gpt-4o", date_august, &usage) {
                 ValuationOutcome::Complete(eq) => eq,
-                other => panic!("expected August to be complete, got {other:?}"),
+                ValuationOutcome::Incomplete { .. }
+                | ValuationOutcome::UnsupportedCurrency { .. } => {
+                    panic!("expected August to be complete");
+                }
             };
         assert_eq!(cost_aug.micros(), 2_500_000); // $2.50
 
