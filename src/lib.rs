@@ -27,6 +27,7 @@ pub mod meter;
 pub mod presentation;
 pub mod problem_code;
 pub mod projection;
+pub mod rate_book;
 pub mod report;
 pub mod sessions;
 pub mod store;

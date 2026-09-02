@@ -14,6 +14,7 @@ pub mod interval;
 pub mod money;
 pub mod provenance;
 pub mod quota;
+pub mod rate_card;
 pub mod render;
 pub mod rows;
 pub mod time;
