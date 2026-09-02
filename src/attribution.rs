@@ -472,6 +472,7 @@ pub fn normalize_tracker_event(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use proptest::prelude::*;
 
     fn task_kind_candidate(native: &str, origin: TaskKindOrigin, raw: &str) -> TaskKindCandidate {
         TaskKindCandidate {
@@ -640,7 +641,7 @@ mod tests {
         let baseline = resolve_task_kind(&candidates, &mapping);
         // Deterministic rotations and the reversal cover every position of the
         // winning candidate without a random dependency.
-        for rotation in 1..candidates.len() {
+        for _ in 1..candidates.len() {
             candidates.rotate_left(1);
             assert_eq!(resolve_task_kind(&candidates, &mapping), baseline);
         }
@@ -669,29 +670,19 @@ mod tests {
             )
             .unwrap();
             let build = |spec: (u8, u8)| {
-                let (origin, raw) = match spec {
-                    (0, raw) => (
-                        TaskKindOrigin::TrackerField("issue_type".to_owned()),
-                        match raw {
-                            0 => "task",
-                            1 => "bug",
-                            2 => "spike",
-                            _ => unreachable!(),
-                        },
-                    ),
-                    _ => (
-                        TaskKindOrigin::TrackerLabel(format!("label-{raw}")),
-                        match raw {
-                            0 => "alpha",
-                            1 => "beta",
-                            _ => "spike",
-                        },
-                    ),
+                let (is_field, selector) = spec;
+                let (origin, raw) = match (is_field, selector) {
+                    (0, 0) => (TaskKindOrigin::TrackerField("issue_type".to_owned()), "task"),
+                    (0, 1) => (TaskKindOrigin::TrackerField("issue_type".to_owned()), "bug"),
+                    (0, _) => (TaskKindOrigin::TrackerField("issue_type".to_owned()), "spike"),
+                    (1, 0) => (TaskKindOrigin::TrackerLabel("label-0".to_owned()), "alpha"),
+                    (1, 1) => (TaskKindOrigin::TrackerLabel("label-1".to_owned()), "beta"),
+                    (_, _) => (TaskKindOrigin::TrackerLabel("label-2".to_owned()), "spike"),
                 };
                 task_kind_candidate("aub-1", origin, raw)
             };
             let forward: Vec<TaskKindCandidate> =
-                spec.iter().map(|spec| build(*spec)).collect();
+                specs.iter().map(|spec| build(*spec)).collect();
             let mut reversed = forward.clone();
             reversed.reverse();
             prop_assert_eq!(
@@ -758,12 +749,10 @@ mod tests {
     fn normalization_is_deterministic_and_idempotent() {
         let mapping = TaskKindMapping::default_v1();
         for raw in ["task", "epic", "bug", "docs", "question", "spike", ""] {
+            // Idempotence here is that repeated lookups over the same raw
+            // value agree, and unmapped values stay unmapped.
             let once = mapping.normalize(raw);
-            let twice = mapping.normalize(raw).and_then(|kind| {
-                // The mapping maps raw values, not kinds; idempotence here is
-                // that repeated lookups agree and unmapped values stay unmapped.
-                mapping.normalize(raw)
-            });
+            let twice = mapping.normalize(raw);
             assert_eq!(once, twice);
             if raw == "spike" || raw.is_empty() {
                 assert_eq!(once, None);

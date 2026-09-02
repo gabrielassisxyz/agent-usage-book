@@ -681,11 +681,12 @@ mod tests {
         assert_eq!(tasks[0].labels, vec!["testing".to_owned()]);
         // The candidate set is exactly the categorical values, so the title the
         // fixture carries never becomes evidence.
-        let raw_values: Vec<&str> =
-            emit_task_kind_candidates(SourceNamespace::new("beads-a"), tasks[0].clone())
-                .iter()
-                .map(|candidate| candidate.raw_value.as_str())
-                .collect();
+        let candidates =
+            emit_task_kind_candidates(SourceNamespace::new("beads-a"), tasks[0].clone());
+        let raw_values: Vec<&str> = candidates
+            .iter()
+            .map(|candidate| candidate.raw_value.as_str())
+            .collect();
         assert_eq!(raw_values, vec!["bug", "testing"]);
     }
 }
