@@ -330,7 +330,7 @@ review_due = "2026-08-31"
 
     #[test]
     fn an_unknown_key_is_refused_naming_the_key() {
-        let error = parse(MINIMAL_CARD.replace(
+        let error = parse(&MINIMAL_CARD.replace(
             "effective_start = \"2026-06-24\"",
             "effective_start = \"2026-06-24\"\nintro = \"maybe\"",
         ))
@@ -346,7 +346,7 @@ review_due = "2026-08-31"
     #[test]
     fn an_unknown_token_class_is_refused_naming_the_card() {
         let error =
-            parse(MINIMAL_CARD.replace("token_class = \"input\"", "token_class = \"cached\""))
+            parse(&MINIMAL_CARD.replace("token_class = \"input\"", "token_class = \"cached\""))
                 .expect_err("unknown class must be refused");
         assert_eq!(error.card_index, 0);
         assert!(error.reason.contains("token_class"));
@@ -390,7 +390,7 @@ effective_start = "2026-01-01"
 
     #[test]
     fn a_bare_publication_date_anchors_at_midnight_utc() {
-        let book = parse_ok(MINIMAL_CARD.replace(
+        let book = parse_ok(&MINIMAL_CARD.replace(
             "effective_start = \"2026-06-24\"",
             "effective_start = \"2026-06-24\"\npublished_at = \"2026-06-24\"",
         ));
@@ -406,7 +406,7 @@ effective_start = "2026-01-01"
 
     #[test]
     fn missing_required_key_is_refused_by_name() {
-        let error = parse(MINIMAL_CARD.replace("vendor = \"anthropic\"", "vendor_missing = true"))
+        let error = parse(&MINIMAL_CARD.replace("vendor = \"anthropic\"", "vendor_missing = true"))
             .expect_err("missing vendor must be refused");
         assert!(error.reason.contains("vendor"), "{}", error.reason);
     }
