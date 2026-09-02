@@ -1,10 +1,10 @@
-error[E0277]: `Money<Usd>` doesn't implement `std::fmt::Display`
+error[E0277]: `Money<agent_usage_book::domain::money::Usd>` doesn't implement `std::fmt::Display`
  --> tests/compile_fail/money_display.rs:8:20
   |
 8 |     println!("{}", usd);
-  |               --   ^^^ `Money<Usd>` cannot be formatted with the default formatter
+  |               --   ^^^ `Money<agent_usage_book::domain::money::Usd>` cannot be formatted with the default formatter
   |               |
   |               required by this formatting parameter
   |
-  = help: the trait `std::fmt::Display` is not implemented for `Money<Usd>`
+  = help: the trait `std::fmt::Display` is not implemented for `Money<agent_usage_book::domain::money::Usd>`
   = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead

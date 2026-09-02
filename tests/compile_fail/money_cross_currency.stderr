@@ -4,5 +4,5 @@ error[E0308]: mismatched types
 9 |     let _sum = usd + eur;
   |                      ^^^ expected `Money<Usd>`, found `Money<Eur>`
   |
-  = note: expected struct `Money<Usd>`
-             found struct `Money<Eur>`
+  = note: expected struct `Money<agent_usage_book::domain::money::Usd>`
+             found struct `Money<agent_usage_book::domain::money::Eur>`

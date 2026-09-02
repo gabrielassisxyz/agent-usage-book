@@ -1,12 +1,12 @@
-error[E0369]: cannot add `Money<Usd>` to `QuotaUsed`
+error[E0369]: cannot add `Money<agent_usage_book::domain::money::Usd>` to `QuotaUsed`
   --> tests/compile_fail/quota_used_plus_money.rs:11:21
    |
 11 |     let _sum = used + money;
-   |                ---- ^ ----- Money<Usd>
+   |                ---- ^ ----- Money<agent_usage_book::domain::money::Usd>
    |                |
    |                QuotaUsed
    |
-note: `QuotaUsed` does not implement `Add<Money<Usd>>`
+note: `QuotaUsed` does not implement `Add<Money<agent_usage_book::domain::money::Usd>>`
   --> src/domain/quota.rs
    |
    | pub struct QuotaUsed(QuotaFractionPpm);

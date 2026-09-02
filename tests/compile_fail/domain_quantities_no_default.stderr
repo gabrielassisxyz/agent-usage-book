@@ -182,9 +182,9 @@ error[E0599]: no associated function or constant named `default` found for struc
   --> tests/compile_fail/domain_quantities_no_default.rs:33:27
    |
 33 |     let _ = Money::<Usd>::default();
-   |                           ^^^^^^^ associated function or constant not found in `Money<Usd>`
+   |                           ^^^^^^^ associated function or constant not found in `Money<agent_usage_book::domain::money::Usd>`
    |
-note: if you're trying to build a new `Money<Usd>`, consider using `Money::<C>::from_micros` which returns `Money<_>`
+note: if you're trying to build a new `Money<agent_usage_book::domain::money::Usd>`, consider using `Money::<C>::from_micros` which returns `Money<_>`
   --> src/domain/money.rs
    |
    |     pub const fn from_micros(micros: i64) -> Self {
@@ -194,9 +194,9 @@ error[E0599]: no associated function or constant named `default` found for struc
   --> tests/compile_fail/domain_quantities_no_default.rs:34:43
    |
 34 |     let _ = MoneyPerMillionTokens::<Usd>::default();
-   |                                           ^^^^^^^ associated function or constant not found in `MoneyPerMillionTokens<Usd>`
+   |                                           ^^^^^^^ associated function or constant not found in `MoneyPerMillionTokens<agent_usage_book::domain::money::Usd>`
    |
-note: if you're trying to build a new `MoneyPerMillionTokens<Usd>`, consider using `MoneyPerMillionTokens::<C>::from_micros_per_million` which returns `MoneyPerMillionTokens<_>`
+note: if you're trying to build a new `MoneyPerMillionTokens<agent_usage_book::domain::money::Usd>`, consider using `MoneyPerMillionTokens::<C>::from_micros_per_million` which returns `MoneyPerMillionTokens<_>`
   --> src/domain/money.rs
    |
    |     pub const fn from_micros_per_million(micros_per_million: i64) -> Self {
@@ -342,7 +342,7 @@ error[E0599]: no associated function or constant named `default` found for struc
 46 |     let _ = Interval::<TokenCount>::default();
    |                                     ^^^^^^^ associated function or constant not found in `Interval<TokenCount>`
    |
-note: if you're trying to build a new `Interval<TokenCount>`, consider using `Interval::<T>::new` which returns `Result<Interval<_>, IntervalError>`
+note: if you're trying to build a new `Interval<TokenCount>`, consider using `Interval::<T>::new` which returns `std::result::Result<Interval<_>, IntervalError>`
   --> src/domain/interval.rs
    |
    |     pub fn new(lower: T, upper: T) -> Result<Self, IntervalError> {
