@@ -523,18 +523,6 @@ mod tests {
             .collect()
     }
 
-    fn empty_pass(now: UtcTimestamp) -> IngestPass {
-        IngestPass {
-            events: Vec::new(),
-            sessions: Vec::new(),
-            watermarks: Vec::new(),
-            quarantined: Vec::new(),
-            collisions: Vec::new(),
-            whole_file_sources: Vec::new(),
-            created_at: now,
-        }
-    }
-
     fn pass_of(events: Vec<NormalizedUsageEvent>, now: UtcTimestamp) -> IngestPass {
         IngestPass {
             events: persist_events(&events),
