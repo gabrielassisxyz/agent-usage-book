@@ -50,6 +50,12 @@ pub enum ReportField {
     MeterQuotaRemaining { account: LogicalName },
     /// The token count of one spend group.
     SpendGroupTokens { key: LogicalName },
+    /// Canonical event records selected for a spend report.
+    SpendCanonicalRecords,
+    /// Replayed occurrences retained as diagnostics, not added to canonical usage.
+    SpendReplayedOccurrences,
+    /// Heuristic identities retained as diagnostics, never confused with replays.
+    SpendHeuristicIdentities,
     /// The coverage completeness of a coverage report.
     CoverageCompleteness,
     /// The row count of an export report.
@@ -68,6 +74,9 @@ impl ReportField {
             ReportField::SpendGroupTokens { key } => {
                 format!("spend_group_tokens[{}]", key.as_str())
             }
+            ReportField::SpendCanonicalRecords => "spend_canonical_records".to_string(),
+            ReportField::SpendReplayedOccurrences => "spend_replayed_occurrences".to_string(),
+            ReportField::SpendHeuristicIdentities => "spend_heuristic_identities".to_string(),
             ReportField::CoverageCompleteness => "coverage_completeness".to_string(),
             ReportField::ExportRows => "export_rows".to_string(),
             ReportField::CalibrationTokens => "calibration_tokens".to_string(),
@@ -79,6 +88,9 @@ impl ReportField {
         match self {
             ReportField::MeterQuotaRemaining { account } => account.as_str(),
             ReportField::SpendGroupTokens { key } => key.as_str(),
+            ReportField::SpendCanonicalRecords
+            | ReportField::SpendReplayedOccurrences
+            | ReportField::SpendHeuristicIdentities => "spend",
             ReportField::CoverageCompleteness => "all",
             ReportField::ExportRows => "export",
             ReportField::CalibrationTokens => "calibration",
@@ -243,6 +255,14 @@ impl ProvenanceGraph {
     /// The field-to-node pairs, in field order.
     pub fn iter(&self) -> impl Iterator<Item = (&ReportField, &ProvenanceNode)> {
         self.nodes.iter()
+    }
+
+    pub fn with_added(
+        mut self,
+        nodes: impl IntoIterator<Item = (ReportField, ProvenanceNode)>,
+    ) -> Self {
+        self.nodes.extend(nodes);
+        self
     }
 }
 

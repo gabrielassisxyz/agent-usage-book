@@ -20,8 +20,8 @@ use crate::presentation::render::{
 };
 use crate::report::ReportEnvelope;
 use crate::report::export::assemble as assemble_export;
-use crate::report::spend::{SpendWindow, assemble as assemble_spend};
-use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+use crate::report::spend::{SpendWindow, assemble_canonical as assemble_spend};
+use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, SpendGrouping, StatusReport};
 use crate::store::export::ExportKey;
 
 /// Declares [`Command`] and the derived list of its variants from one token list, so
@@ -387,9 +387,9 @@ impl Command {
     pub fn summary(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
-            Command::Spend => Some(
-                "token usage per UTC day and transcript source, read from the configured transcripts",
-            ),
+            Command::Spend => {
+                Some("canonical token usage grouped by day, session, project or repository")
+            }
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
             }
@@ -418,7 +418,9 @@ impl Command {
     pub fn question(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("how much quota does each configured account have left?"),
-            Command::Spend => Some("how many tokens did each transcript source use per UTC day?"),
+            Command::Spend => {
+                Some("how many canonical tokens were used, grouped by the requested dimensions?")
+            }
             Command::Config => Some("which configuration key resolved from where?"),
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::Backup => Some(
@@ -475,7 +477,9 @@ impl Command {
     /// has one.
     pub fn options_help(self) -> Option<&'static str> {
         match self {
-            Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
+            Command::Spend => Some(
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force",
+            ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => Some("DESTINATION | verify DESTINATION"),
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
@@ -878,7 +882,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    let window = spend_window(&invocation.rest, timestamp)?;
+    let options = spend_options(&invocation.rest, timestamp)?;
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -888,7 +892,43 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         file_contents.as_deref(),
         &file_path,
     )?;
-    let report = assemble_spend(&config, window, timestamp)?;
+    let mut conn = open_ledger(clock)?;
+    let mut refresh_failure = None;
+    let mut refresh_report = None;
+    if options.refresh != RefreshPolicy::Never {
+        let ingest_options = crate::ingest::IngestOptions {
+            source: None,
+            changed_only: options.refresh == RefreshPolicy::Auto,
+        };
+        match crate::ingest::run(&mut conn, &config, &ingest_options, timestamp) {
+            Ok(report) if report.unreadable_files.is_empty() => refresh_report = Some(report),
+            Ok(report) => {
+                refresh_failure = Some(format!(
+                    "refresh could not read {} file(s); retained the prior canonical subtotal",
+                    report.unreadable_files.len()
+                ));
+                refresh_report = Some(report);
+            }
+            Err(error) => {
+                refresh_failure = Some(format!(
+                    "refresh failed: {error}; retained the prior canonical subtotal"
+                ));
+            }
+        }
+    }
+    let mut report = assemble_spend(
+        &conn,
+        options.window,
+        timestamp,
+        options.grouping,
+        options.refresh != RefreshPolicy::Never,
+        refresh_failure.clone(),
+    )?;
+    if let Some(refresh) = refresh_report {
+        report.ingest.files_read = refresh.files_parsed;
+        report.ingest.files_skipped_before_window = refresh.files_skipped;
+        report.ingest.unreadable_files = refresh.unreadable_files;
+    }
     match invocation.format {
         OutputFormat::Text => println!(
             "{}",
@@ -899,7 +939,9 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             spend_json_with_explain(&report, run, invocation.explain)
         ),
     }
-    if report.ingest.unreadable_files.is_empty() {
+    if let Some(failure) = refresh_failure {
+        Err(Error::IngestIncomplete(failure))
+    } else if report.ingest.unreadable_files.is_empty() {
         Ok(())
     } else {
         Err(Error::IngestIncomplete(format!(
@@ -912,13 +954,28 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
 /// The window from `--today`, `--since YYYY-MM-DD` and `--days N`. Today is the
 /// default, in UTC, because the binary has no local time zone facility and must not
 /// pretend to. The window is always stated in the output.
-fn spend_window(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshPolicy {
+    Auto,
+    Never,
+    Force,
+}
+
+struct SpendOptions {
+    window: SpendWindow,
+    grouping: Vec<SpendGrouping>,
+    refresh: RefreshPolicy,
+}
+
+fn spend_options(
     rest: &[String],
     now: crate::domain::time::UtcTimestamp,
-) -> Result<SpendWindow, Error> {
+) -> Result<SpendOptions, Error> {
     let mut since: Option<UtcDate> = None;
     let mut days: i64 = 1;
-    let mut args = rest.iter();
+    let mut grouping = Vec::new();
+    let mut refresh = RefreshPolicy::Auto;
+    let mut args = rest.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--today" => since = Some(now.utc_date()),
@@ -936,6 +993,18 @@ fn spend_window(
                     .parse()
                     .map_err(|_| Error::Usage(format!("--days must be a number, got {value}")))?;
             }
+            "--group-by" => grouping
+                .push(parse_spend_grouping(args.next().ok_or_else(|| {
+                    Error::Usage("--group-by requires a dimension".into())
+                })?)?),
+            "--refresh" => {
+                refresh = match args.peek().map(|value| value.as_str()) {
+                    Some("auto" | "never" | "force") => {
+                        parse_refresh_policy(args.next().expect("peeked refresh value"))?
+                    }
+                    _ => RefreshPolicy::Force,
+                };
+            }
             other => match other.strip_prefix("--since=") {
                 Some(value) => since = Some(parse_date(value)?),
                 None => match other.strip_prefix("--days=") {
@@ -944,12 +1013,49 @@ fn spend_window(
                             Error::Usage(format!("--days must be a number, got {value}"))
                         })?
                     }
-                    None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                    None => match other.strip_prefix("--group-by=") {
+                        Some(value) => grouping.push(parse_spend_grouping(value)?),
+                        None => match other.strip_prefix("--refresh=") {
+                            Some(value) => refresh = parse_refresh_policy(value)?,
+                            None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                        },
+                    },
                 },
             },
         }
     }
-    SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)
+    Ok(SpendOptions {
+        window: SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)?,
+        grouping: if grouping.is_empty() {
+            vec![SpendGrouping::Day]
+        } else {
+            grouping
+        },
+        refresh,
+    })
+}
+
+fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
+    match value {
+        "day" => Ok(SpendGrouping::Day),
+        "session" => Ok(SpendGrouping::Session),
+        "project" => Ok(SpendGrouping::Project),
+        "repository" | "repo" => Ok(SpendGrouping::Repository),
+        _ => Err(Error::Usage(format!(
+            "--group-by must be day, session, project or repository, got {value}"
+        ))),
+    }
+}
+
+fn parse_refresh_policy(value: &str) -> Result<RefreshPolicy, Error> {
+    match value {
+        "auto" => Ok(RefreshPolicy::Auto),
+        "never" => Ok(RefreshPolicy::Never),
+        "force" => Ok(RefreshPolicy::Force),
+        _ => Err(Error::Usage(format!(
+            "--refresh must be auto, never or force, got {value}"
+        ))),
+    }
 }
 
 fn parse_date(value: &str) -> Result<UtcDate, Error> {
@@ -2250,26 +2356,38 @@ mod tests {
     /// The spend window: today by default, `--since` with `--days`, and a malformed
     /// date refused rather than guessed.
     #[test]
-    fn spend_window_defaults_to_the_utc_day_and_reads_its_flags() {
+    fn spend_options_default_to_the_utc_day_and_read_grouping_and_refresh_flags() {
         let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-08-30T23:30:00Z").unwrap();
-        let today = spend_window(&[], now).unwrap();
-        assert_eq!(today.since.iso(), "2026-08-30");
-        assert_eq!(today.until.iso(), "2026-08-31");
-        let explicit = spend_window(
+        let today = spend_options(&[], now).unwrap();
+        assert_eq!(today.window.since.iso(), "2026-08-30");
+        assert_eq!(today.window.until.iso(), "2026-08-31");
+        assert_eq!(today.grouping, vec![SpendGrouping::Day]);
+        assert_eq!(today.refresh, RefreshPolicy::Auto);
+        let explicit = spend_options(
             &[
                 "--since".into(),
                 "2026-08-25".into(),
                 "--days".into(),
                 "3".into(),
+                "--group-by=session".into(),
+                "--group-by".into(),
+                "repository".into(),
+                "--refresh=never".into(),
             ],
             now,
         )
         .unwrap();
-        assert_eq!(explicit.since.iso(), "2026-08-25");
-        assert_eq!(explicit.until.iso(), "2026-08-28");
-        assert!(spend_window(&["--since".into(), "25/08/2026".into()], now).is_err());
-        assert!(spend_window(&["--days".into(), "0".into()], now).is_err());
-        assert!(spend_window(&["--bogus".into()], now).is_err());
+        assert_eq!(explicit.window.since.iso(), "2026-08-25");
+        assert_eq!(explicit.window.until.iso(), "2026-08-28");
+        assert_eq!(
+            explicit.grouping,
+            vec![SpendGrouping::Session, SpendGrouping::Repository]
+        );
+        assert_eq!(explicit.refresh, RefreshPolicy::Never);
+        assert!(spend_options(&["--since".into(), "25/08/2026".into()], now).is_err());
+        assert!(spend_options(&["--days".into(), "0".into()], now).is_err());
+        assert!(spend_options(&["--group-by=account".into()], now).is_err());
+        assert!(spend_options(&["--bogus".into()], now).is_err());
     }
 
     #[test]

@@ -457,7 +457,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 10] = [
+    const KNOWN_SPEND_KEYS: [&str; 12] = [
         "schema",
         "command",
         "run",
@@ -467,6 +467,8 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "window",
         "groups",
         "ingest",
+        "ingestion_generation",
+        "grouping",
         "explain",
     ];
     for key in obj.keys() {
@@ -598,40 +600,7 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
     let groups = report
         .groups
         .iter()
-        .map(|group| {
-            let known = group.usage.known();
-            let kinds = TokenKind::ALL
-                .iter()
-                .map(|kind| {
-                    format!(
-                        "{}:{}",
-                        json_string(token_kind_key(*kind)),
-                        quantity_json(&known.value(*kind).to_string(), "tokens")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            let unknown = group
-                .usage
-                .unknown()
-                .iter()
-                .map(|(name, count)| {
-                    format!(
-                        "{}:{}",
-                        json_string(name),
-                        quantity_json(&count.value().to_string(), "tokens")
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
-            format!(
-                "{{\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{}}}",
-                json_string(group.key.as_str()),
-                coverage_and_quality_json(group.usage.coverage(), group.usage.quality())
-                    .trim_matches(|c| c == '{' || c == '}'),
-                provenance_json(&group.provenance),
-            )
-        })
+        .map(spend_group_json)
         .collect::<Vec<_>>()
         .join(",");
     let ingest = &report.ingest;
@@ -647,15 +616,33 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         .map(|file| json_string(file))
         .collect::<Vec<_>>()
         .join(",");
+    let grouping = report
+        .grouping
+        .iter()
+        .map(|dimension| json_string(dimension.as_str()))
+        .collect::<Vec<_>>()
+        .join(",");
+    let ingestion_generation = report
+        .metadata
+        .ingestion_generation
+        .map(|generation| generation.get().to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let refresh_failure = ingest
+        .refresh_failure
+        .as_deref()
+        .map(json_string)
+        .unwrap_or_else(|| "null".to_string());
     let mut body = format!(
-        "\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"groups\":[{groups}],\"ingest\":{{\"files_read\":{},\"files_skipped_before_window\":{},\"unreadable_files\":[{unreadable}],\"quarantined\":{{{quarantined}}},\"replayed_occurrences\":{},\"collisions\":{},\"without_identity\":{},\"undated_events\":{},\"events_outside_window\":{},\"events_in_window\":{}}}",
+        "\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"grouping\":[{grouping}],\"ingestion_generation\":{ingestion_generation},\"groups\":[{groups}],\"ingest\":{{\"refresh_attempted\":{},\"refresh_failure\":{refresh_failure},\"files_read\":{},\"files_skipped_before_window\":{},\"unreadable_files\":[{unreadable}],\"quarantined\":{{{quarantined}}},\"replayed_occurrences\":{},\"collisions\":{},\"without_identity\":{},\"heuristic_identities\":{},\"undated_events\":{},\"events_outside_window\":{},\"events_in_window\":{}}}",
         json_string(&report.since.iso()),
         json_string(&report.until.iso()),
+        ingest.refresh_attempted,
         ingest.files_read,
         ingest.files_skipped_before_window,
         ingest.replayed_occurrences,
         ingest.collisions,
         ingest.without_identity,
+        ingest.heuristic_identities,
         ingest.undated_events,
         ingest.events_outside_window,
         ingest.events_in_window,
@@ -667,6 +654,47 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ));
     }
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+fn spend_group_json(group: &crate::report::SpendGroup) -> String {
+    let known = group.usage.known();
+    let kinds = TokenKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{}:{}",
+                json_string(token_kind_key(*kind)),
+                quantity_json(&known.value(*kind).to_string(), "tokens")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let unknown = group
+        .usage
+        .unknown()
+        .iter()
+        .map(|(name, count)| {
+            format!(
+                "{}:{}",
+                json_string(name),
+                quantity_json(&count.value().to_string(), "tokens")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let children = group
+        .children
+        .iter()
+        .map(spend_group_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{},\"children\":[{children}]}}",
+        json_string(group.key.as_str()),
+        coverage_and_quality_json(group.usage.coverage(), group.usage.quality())
+            .trim_matches(|c| c == '{' || c == '}'),
+        provenance_json(&group.provenance),
+    )
 }
 
 /// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.

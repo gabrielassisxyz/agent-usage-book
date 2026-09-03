@@ -5,7 +5,7 @@ shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, 
 
 commands:
   status   render the last known meter reading per configured account
-  spend    token usage per UTC day and transcript source, read from the configured transcripts
+  spend    canonical token usage grouped by day, session, project or repository
   config   print every resolved configuration key with the source that won
   export   emit versioned JSONL usage rows keyed by session-id or run-id for external joins
   rate-card import, show and history the immutable dated vendor rate cards
@@ -20,10 +20,10 @@ status:
   format: text | json
 
 spend:
-  answers: how many tokens did each transcript source use per UTC day?
+  answers: how many canonical tokens were used, grouped by the requested dimensions?
   refuses: --account (spend has no account dimension until account attribution lands); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N
+  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force
 
 config:
   answers: which configuration key resolved from where?
