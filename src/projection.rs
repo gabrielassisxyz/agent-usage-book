@@ -43,6 +43,7 @@ use crate::store::meter_attempt::failure_class_sql;
 use crate::store::meter_evidence::{measurement_basis_sql, quantization_sql};
 
 pub mod build;
+pub mod reader;
 
 /// The ledger generation recorded in a projection file's text, or `None` when
 /// the text is not a projection file this schema wrote. One reader for the
@@ -205,7 +206,9 @@ pub struct TerminalOutcome {
 impl Projection {
     /// The file document: the schema version plus the carried state. Field
     /// names are the schema test's contract; no key outside them is written.
-    fn to_json(&self) -> Value {
+    /// `pub(crate)` so the reader's round-trip test drives the same
+    /// serializer the publisher uses.
+    pub(crate) fn to_json(&self) -> Value {
         json!({
             "schema_version": PROJECTION_SCHEMA_VERSION,
             "ledger_generation": self.ledger_generation.value(),

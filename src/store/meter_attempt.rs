@@ -605,6 +605,23 @@ pub fn attempts_with_outcomes_for_account_between(
         .map_err(|e| Error::Store(format!("cannot read coverage attempts: {e}")))
 }
 
+/// The most recently started attempt, or `None` while the table is empty: the
+/// attempt whose lifecycle the freshness computation reads. The lifecycle is
+/// append-only and starts are never deleted, so id order and start order are
+/// the same order, which makes id the stable tiebreak between equal
+/// `request_started_at` values.
+pub fn latest_attempt_row_id(
+    conn: &rusqlite::Connection,
+) -> Result<Option<MeterAttemptRowId>, Error> {
+    conn.query_row(
+        "SELECT id FROM meter_attempt ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0).map(MeterAttemptRowId::new),
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot read the latest meter attempt: {e}")))
+}
+
 /// The number of started attempts and the number of terminal results in the
 /// database. The read-back surface for the crash-injection hook (`aub-sth.6`):
 /// the two counts together state exactly what survived a kill between the two

@@ -616,6 +616,14 @@ pub fn reset_windows_for_account_between(
         .map_err(|e| Error::Store(format!("cannot read coverage resets: {e}")))
 }
 
+/// Counts how many observation rows exist in the database.
+pub fn count_observations(conn: &rusqlite::Connection) -> Result<u64, Error> {
+    conn.query_row("SELECT count(*) FROM meter_observation", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| Error::Store(format!("cannot count meter observations: {e}")))
+}
+
 /// The one current interpretation of an evidence row under a semantics
 /// version. `None` means no observation has been recorded for that pair yet.
 pub fn current_observation_id(

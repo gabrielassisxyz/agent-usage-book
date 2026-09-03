@@ -10,7 +10,6 @@
 use std::ffi::OsString;
 use std::io;
 
-use crate::domain::freshness::{FreshnessInput, compute_freshness};
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
 };
@@ -69,6 +68,8 @@ aub_command_enum! {
     ProjectionCrashHook,
     RateCard,
     Backup,
+    Ingest,
+    Rebuild,
     Doctor,
     Coverage,
 }
@@ -88,6 +89,7 @@ pub struct FlagPolicy {
     pub format: FlagSupport,
     pub explain: FlagSupport,
     pub account: FlagSupport,
+    pub model: FlagSupport,
     pub no_color: FlagSupport,
     pub verbosity: FlagSupport,
 }
@@ -98,7 +100,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 15] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -110,6 +112,8 @@ impl Command {
         Self::ProjectionCrashHook,
         Self::RateCard,
         Self::Backup,
+        Self::Ingest,
+        Self::Rebuild,
         Self::Doctor,
         Self::Coverage,
     ];
@@ -125,9 +129,8 @@ impl Command {
             Command::Status => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
-                account: FlagSupport::Rejected {
-                    reason: "status reports every configured account",
-                },
+                account: FlagSupport::Accepted,
+                model: FlagSupport::Accepted,
                 no_color: FlagSupport::Rejected {
                     reason: "status prints no color",
                 },
@@ -138,6 +141,9 @@ impl Command {
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
                     reason: "spend has no account dimension until account attribution lands",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "spend has no model dimension until a model selector is needed",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "spend prints no color",
@@ -154,6 +160,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "config prints every account at once",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "config prints every key at once",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "config prints no color",
                 },
@@ -168,6 +177,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "export reads every stored session, not one account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "export keys on session or run, not on a model",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "export prints no color",
@@ -184,6 +196,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "logging-fixture takes no account",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "logging-fixture takes no model",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "logging-fixture prints no color",
                 },
@@ -198,6 +213,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "state-check takes no account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "state-check takes no model",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "state-check prints no color",
@@ -214,6 +232,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "exit-class takes no account",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "exit-class takes no model",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "exit-class prints no color",
                 },
@@ -228,6 +249,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "attempt-crash-hook names its own fixture account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook drives the store, not a model",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "attempt-crash-hook prints plain counts",
@@ -244,6 +268,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "projection-crash-hook names its own fixture account",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "projection-crash-hook drives the store, not a model",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "projection-crash-hook prints plain counts",
                 },
@@ -258,6 +285,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "the rate book is reference data, not per-account state",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "the rate book is reference data, not per-model state",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "rate-card prints plain rows",
@@ -274,8 +304,47 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "backup covers the whole ledger",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "backup covers the whole ledger",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "backup prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Ingest => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "ingest prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "ingest derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "ingest reads the configured transcript sources",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "ingest reads transcript sources, not models",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "ingest prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Rebuild => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "rebuild prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "rebuild derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "rebuild sweeps whole materialization tables, not one account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "rebuild sweeps whole materialization tables, not models",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "rebuild prints no color",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -285,6 +354,9 @@ impl Command {
                     reason: "doctor derives no quantity",
                 },
                 account: FlagSupport::Rejected {
+                    reason: "doctor is a system-wide diagnostic",
+                },
+                model: FlagSupport::Rejected {
                     reason: "doctor is a system-wide diagnostic",
                 },
                 no_color: FlagSupport::Rejected {
@@ -298,6 +370,9 @@ impl Command {
                 account: FlagSupport::Accepted,
                 no_color: FlagSupport::Rejected {
                     reason: "coverage prints plain text or json",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "coverage reports every window of the account, not one model",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -319,6 +394,8 @@ impl Command {
             Command::ProjectionCrashHook => "__projection-crash-hook",
             Command::RateCard => "rate-card",
             Command::Backup => "backup",
+            Command::Ingest => "ingest",
+            Command::Rebuild => "rebuild",
             Command::Doctor => "doctor",
             Command::Coverage => "coverage",
         }
@@ -345,6 +422,12 @@ impl Command {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
             Command::Backup => Some("create or verify a consistent archive of durable state"),
+            Command::Ingest => Some(
+                "land the configured transcripts' normalized usage into the ledger, advancing the ingestion generation",
+            ),
+            Command::Rebuild => Some(
+                "destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence",
+            ),
             Command::Doctor => Some("health, drift and integrity diagnostics"),
             Command::Coverage => Some(
                 "did the sampler attempt what the policy owed, and did those attempts observe?",
@@ -362,6 +445,12 @@ impl Command {
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::Backup => Some(
                 "is there a consistent, verified archive of the durable state, and does it restore?",
+            ),
+            Command::Ingest => Some(
+                "have the transcript-derived tables been refreshed from the transcripts on disk, under one generation?",
+            ),
+            Command::Rebuild => Some(
+                "can the transcript-derived materializations be rebuilt from scratch while every irreplaceable record is left untouched?",
             ),
             Command::Doctor => Some(
                 "is the recorded evidence healthy, and does the transcript corpus still match its parsers?",
@@ -397,6 +486,7 @@ impl Command {
             ("--format", policy.format),
             ("--explain", policy.explain),
             ("--account", policy.account),
+            ("--model", policy.model),
             ("--no-color", policy.no_color),
         ] {
             if let FlagSupport::Rejected { reason } = support {
@@ -413,6 +503,8 @@ impl Command {
             Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => Some("DESTINATION | verify DESTINATION"),
+            Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
+            Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
             Command::Doctor => Some("--transcript-format-drift"),
             Command::Coverage => {
@@ -450,10 +542,11 @@ pub struct Invocation {
     pub verbosity: u8,
     pub explain: ExplainMode,
     /// The account the command line asked for, when the command's policy accepts
-    /// `--account`. No command accepts it yet (status's filtering arrives with
-    /// aub-me5.6), so this is always `None` in practice; the field is the
-    /// parser's contract for the flag, carried rather than dropped.
+    /// `--account`. Status accepts it and selects one configured account.
     pub account: Option<String>,
+    /// The model the command line asked for, when the command's policy accepts
+    /// `--model`. Status accepts it and scopes the rendered windows to it.
+    pub model: Option<String>,
     /// Whether `--no-color` was asked for, when the command's policy accepts it.
     /// No command accepts it yet, so this is always `false` in practice.
     pub no_color: bool,
@@ -504,6 +597,7 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
     let mut format = OutputFormat::Text;
     let mut explain = ExplainMode::Off;
     let mut account = None;
+    let mut model = None;
     let mut no_color = false;
     let mut rest = Vec::new();
     let mut args = args.peekable();
@@ -528,6 +622,13 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         } else {
             None
         };
+        let model_value = if let Some(value) = arg.strip_prefix("--model=") {
+            Some(value.to_string())
+        } else if arg == "--model" {
+            Some(next_arg(&mut args, "--model")?)
+        } else {
+            None
+        };
         match format_value {
             Some(value) => format = parse_format(command, &value)?,
             None if arg == "-v" => verbosity += 1,
@@ -536,9 +637,10 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
                 explain = parse_explain(command, Some(value))?
             }
             None if arg == "--no-color" => no_color = parse_no_color(command)?,
-            None => match account_value {
-                Some(value) => account = Some(parse_account(command, &value)?),
-                None => rest.push(arg),
+            None => match (account_value, model_value) {
+                (Some(value), _) => account = Some(parse_account(command, &value)?),
+                (None, Some(value)) => model = Some(parse_model(command, &value)?),
+                (None, None) => rest.push(arg),
             },
         }
     }
@@ -548,6 +650,7 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         verbosity,
         explain,
         account,
+        model,
         no_color,
         rest,
     }))
@@ -595,6 +698,16 @@ fn parse_account(command: Command, value: &str) -> Result<String, Error> {
     }
 }
 
+fn parse_model(command: Command, value: &str) -> Result<String, Error> {
+    match command.flag_policy().model {
+        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
+            "{} does not accept --model: {reason}; omit the flag",
+            command.name()
+        ))),
+        FlagSupport::Accepted => Ok(value.to_string()),
+    }
+}
+
 fn parse_no_color(command: Command) -> Result<bool, Error> {
     match command.flag_policy().no_color {
         FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
@@ -614,7 +727,7 @@ pub fn help_text() -> String {
         "aub: one ledger for LLM consumption".to_string(),
         String::new(),
         "usage: aub [-v...] <command> [--format text|json] [options]".to_string(),
-        "shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --no-color"
+        "shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --model MODEL, --no-color"
             .to_string(),
         String::new(),
         "commands:".to_string(),
@@ -675,6 +788,8 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 level,
                 invocation.format,
                 invocation.explain,
+                invocation.account.as_deref(),
+                invocation.model.as_deref(),
             )
         }
         Command::Spend => spend(&RealClock::new(), level, &invocation),
@@ -693,6 +808,8 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
+        Command::Ingest => ingest_command(&RealClock::new(), &invocation),
+        Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
     }
@@ -1162,6 +1279,8 @@ fn status(
     level: Level,
     format: OutputFormat,
     explain: ExplainMode,
+    account_selector: Option<&str>,
+    model_selector: Option<&str>,
 ) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
@@ -1175,9 +1294,10 @@ fn status(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    // The report is built from the configured accounts; until the projection
-    // exists (aub-me5.6) every account's reading is the never-observed state,
-    // computed through the freshness machine rather than constructed here.
+    // The status contract (PLAN.md section 16.2): minimal configuration
+    // sufficient to locate the projection, one bounded file read, freshness
+    // computation and formatting. Nothing else runs here, which the source
+    // contract test below and the boundary rules both hold this function to.
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -1188,26 +1308,64 @@ fn status(
         &file_path,
     )?;
 
-    let freshness = compute_freshness(
-        &FreshnessInput::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            config.freshness.meter,
-            config.sampling.command_budget,
-            status_clock_skew_envelope(),
-        ),
-        clock,
-    );
-    let accounts = config
-        .accounts
-        .iter()
-        .map(|account| MeterAccount::new(LogicalName::new(account.name.clone()), freshness.clone()))
-        .collect();
-    let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
-    let report = StatusReport::new(metadata, accounts, vec![]);
+    // The account selector names a configured account, so an unknown name is
+    // an argument error, reported through the typed usage condition rather
+    // than through the zero-exit display path.
+    if let Some(name) = account_selector
+        && !config.accounts.iter().any(|account| account.name == name)
+    {
+        return Err(Error::Usage(format!(
+            "unknown account '{name}': status --account names a configured account"
+        )));
+    }
+
+    let projection_path = crate::projection::projection_path_in(&config.state.dir);
+    let (projection_state, accounts, ledger_generation) =
+        match crate::projection::reader::read_projection(&projection_path) {
+            crate::projection::reader::ProjectionRead::Available(projection) => {
+                let accounts = projection_accounts(
+                    &config,
+                    &projection,
+                    account_selector,
+                    model_selector,
+                    clock,
+                );
+                logger
+                    .emit(
+                        timestamp,
+                        DiagnosticEvent::ProjectionRead,
+                        &[("state", &LogicalName::new("ok"))],
+                    )
+                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                let generation = LedgerGeneration::new(projection.ledger_generation.value());
+                (
+                    crate::report::ProjectionReadState::Read,
+                    accounts,
+                    generation,
+                )
+            }
+            crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
+                let state_name = unavailable.state_name();
+                let state = crate::report::ProjectionReadState::Unavailable {
+                    state: state_name,
+                    reason: unavailable.reason(),
+                };
+                logger
+                    .emit(
+                        timestamp,
+                        DiagnosticEvent::ProjectionRead,
+                        &[("state", &LogicalName::new(state_name))],
+                    )
+                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                // No account line exists when the projection is unreadable: the
+                // degraded form is the whole answer, and no value may be
+                // substituted for the readings that cannot be computed.
+                (state, Vec::new(), LedgerGeneration::new(0))
+            }
+        };
+
+    let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
+    let report = StatusReport::new(metadata, accounts, vec![], projection_state);
     match format {
         OutputFormat::Text => println!(
             "{}",
@@ -1221,6 +1379,53 @@ fn status(
         OutputFormat::Json => println!("{}", status_json_with_explain(&report, run, explain)),
     }
     Ok(())
+}
+
+/// Builds one report account per configured account from the projection's
+/// accounts, joined on the logical name. A configured account the projection
+/// says nothing about reports no reading rather than a fabricated value: the
+/// freshness machine then renders the never-observed form for it.
+fn projection_accounts(
+    config: &crate::config::Config,
+    projection: &crate::projection::Projection,
+    account_selector: Option<&str>,
+    model_selector: Option<&str>,
+    clock: &impl Clock,
+) -> Vec<MeterAccount> {
+    config
+        .accounts
+        .iter()
+        .filter(|account| match account_selector {
+            None => true,
+            Some(selected) => account.name == selected,
+        })
+        .map(|account| {
+            let projected = projection
+                .accounts
+                .iter()
+                .find(|projected| projected.logical_name == account.name);
+            let reading = crate::projection::reader::account_reading(
+                projected,
+                model_selector,
+                config.freshness.meter,
+                config.sampling.command_budget,
+                status_clock_skew_envelope(),
+                clock,
+            );
+            MeterAccount::from_projection(
+                LogicalName::new(account.name.clone()),
+                reading.freshness,
+                reading
+                    .limiting_window
+                    .map(|limit| crate::report::LimitingWindow {
+                        scope: limit.scope,
+                        nominal_duration: limit.nominal_duration,
+                    }),
+                reading.included_scopes,
+                model_selector.map(crate::domain::window::ModelId::new),
+            )
+        })
+        .collect()
 }
 
 fn logging_fixture(clock: &impl Clock, level: Level) -> Result<(), Error> {
@@ -1306,15 +1511,17 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
     Ok(())
 }
 
-/// Test-only surface: the crash-injection hook for the two-stage meter attempt
-/// lifecycle (`aub-sth.6`, PLAN.md section 34.7). `__attempt-crash-hook start`
-/// commits the attempt start through the real store APIs and then aborts the
-/// process, so a test can prove exactly what survives a kill between the two
-/// commits: the start with no result. `complete` is the adjacent positive
-/// control, running start then result then a clean exit, and `read-back`
-/// reports what the database actually holds.
+/// Test-only surface: the crash-injection harness for the write-path crash
+/// matrix (`aub-sth.14`, PLAN.md sections 13 and 34.7). Each injected stage
+/// drives the real store APIs through one write-path stage and then aborts the
+/// process at that injection point, so a test can prove exactly what survives
+/// a kill there. `complete` is the positive control running every stage and
+/// exiting cleanly; `read-back` counts what is durable; `drain` runs the
+/// startup recovery pass; `freshness` reads the latest attempt the way the
+/// freshness computation does. `start` remains accepted as the aub-sth.6 name
+/// of the second injection point.
 ///
-/// The hook's body lives in the store layer (`crate::store::attempt_crash_hook`)
+/// The harness's body lives in the store layer (`crate::store::attempt_crash_hook`)
 /// because it runs migrations, writes fixture rows and counts rows, all of
 /// which the boundary rules confine to `src/store/` (rules 15 and 16); this
 /// shim only parses the stage, resolves configuration and renders the outcome.
@@ -1323,12 +1530,28 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 /// `__exit-class`/`__state-check`.
 fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let stage = match invocation.rest.first().map(String::as_str) {
-        Some("start") => crate::store::attempt_crash_hook::CrashHookStage::Start,
+        Some("before-start-commit" | "point-1" | "1") => {
+            crate::store::attempt_crash_hook::CrashHookStage::BeforeStartCommit
+        }
+        Some("after-start-commit-before-request" | "point-2" | "2" | "start") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterStartCommitBeforeRequest
+        }
+        Some("after-parse-before-spool-write" | "point-3" | "3") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterParseBeforeSpoolWrite
+        }
+        Some("after-spool-write-before-sqlite-commit" | "point-4" | "4") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterSpoolWriteBeforeSqliteCommit
+        }
+        Some("after-sqlite-commit-before-pending-deletion" | "point-5" | "5") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterSqliteCommitBeforePendingDeletion
+        }
         Some("complete") => crate::store::attempt_crash_hook::CrashHookStage::Complete,
         Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
+        Some("drain") => crate::store::attempt_crash_hook::CrashHookStage::Drain,
+        Some("freshness") => crate::store::attempt_crash_hook::CrashHookStage::Freshness,
         other => {
             return Err(Error::Usage(format!(
-                "__attempt-crash-hook requires a stage (start | complete | read-back), got {other:?}"
+                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | drain | freshness), got {other:?}"
             )));
         }
     };
@@ -1348,6 +1571,7 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         &crate::store::startup::ProcMounts,
         || {
             crate::store::attempt_crash_hook::run_stage(
+                &config.state.dir,
                 &config.state.dir.join("attempt-crash-hook.db"),
                 stage,
                 config.sampling.request_timeout,
@@ -1363,8 +1587,31 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
                 attempt_row_id.value()
             );
         }
-        crate::store::attempt_crash_hook::CrashHookOutcome::Counts { starts, results } => {
-            println!("starts={starts} results={results}");
+        crate::store::attempt_crash_hook::CrashHookOutcome::Counts {
+            starts,
+            results,
+            observations,
+            pending,
+        } => {
+            println!(
+                "starts={starts} results={results} observations={observations} pending={pending}"
+            );
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::DrainReport {
+            applied,
+            already_applied,
+            quarantined,
+        } => {
+            println!(
+                "drain: applied={applied} already_applied={already_applied} quarantined={quarantined}"
+            );
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::FreshnessOutcome { kind, reason } => {
+            if let Some(reason) = reason {
+                println!("freshness: {kind} reason={reason}");
+            } else {
+                println!("freshness: {kind}");
+            }
         }
     }
     Ok(())
@@ -1643,6 +1890,151 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
     Ok(())
 }
 
+/// `aub ingest transcripts`: explicit transcript ingestion as an operation in
+/// its own right (aub-lqe.11, PLAN.md 6, 17.2, 27, 34.16). The window flags of
+/// spend do not exist here: ingestion is not windowed, it lands everything the
+/// configured sources currently hold, and reports what it read and the
+/// generation it advanced.
+fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let options = ingest_flags(&invocation.rest)?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let mut conn = open_ledger(clock)?;
+    let report = crate::ingest::run(&mut conn, &config, &options, clock.now())?;
+    println!(
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={}",
+        report.sources.join(","),
+        report.files_scanned,
+        report.files_parsed,
+        report.files_skipped,
+        report.unreadable_files.len(),
+        report.quarantined,
+        report.generation.value(),
+    );
+    let outcome = &report.outcome;
+    println!(
+        "  events: written={} already-ingested={} · occurrences: written={} already-ingested={} · components={} sessions={} replaced={}",
+        outcome.events_written.value(),
+        outcome.events_already_ingested.value(),
+        outcome.occurrences_written.value(),
+        outcome.occurrences_already_ingested.value(),
+        outcome.components_written.value(),
+        outcome.sessions_upserted.value(),
+        outcome.rows_replaced.value(),
+    );
+    if report.unreadable_files.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::IngestIncomplete(format!(
+            "{} file(s) could not be read; the landed batch excludes them",
+            report.unreadable_files.len()
+        )))
+    }
+}
+
+/// The ingest command's own flags: the `transcripts` subcommand word (required,
+/// the only rebuildable source class with parsers today), then `--source NAME`
+/// and `--changed-only`. Everything else is a usage error naming the argument.
+fn ingest_flags(rest: &[String]) -> Result<crate::ingest::IngestOptions, Error> {
+    let mut args = rest.iter();
+    match args.next() {
+        Some(word) if word == "transcripts" => {}
+        Some(other) => {
+            return Err(Error::Usage(format!(
+                "unknown ingest target: {other}; ingest reads transcripts"
+            )));
+        }
+        None => {
+            return Err(Error::Usage(
+                "ingest requires a target: ingest transcripts".into(),
+            ));
+        }
+    }
+    let mut options = crate::ingest::IngestOptions::default();
+    while let Some(arg) = args.next() {
+        let value = if let Some(inline) = arg.strip_prefix("--source=") {
+            Some(inline.to_string())
+        } else if arg == "--source" {
+            Some(
+                args.next()
+                    .cloned()
+                    .ok_or_else(|| Error::Usage("--source requires a source name".into()))?,
+            )
+        } else {
+            None
+        };
+        match value {
+            Some(name) => {
+                if options.source.is_some() {
+                    return Err(Error::Usage("--source was given more than once".into()));
+                }
+                options.source = Some(name);
+            }
+            None if arg == "--changed-only" => options.changed_only = true,
+            None => return Err(Error::Usage(format!("unknown argument: {arg}"))),
+        }
+    }
+    Ok(options)
+}
+
+/// `aub rebuild <target>`: explicit destructive rebuild of rebuildable
+/// materializations (aub-lqe.11, PLAN.md 6, 27, 34.16). The target resolves
+/// through the shared taxonomy's rebuild groups, so the command cannot name a
+/// class the taxonomy does not classify rebuildable, and the sweep it runs is
+/// the one [`crate::store::retention::delete_rebuildable`] derives from the
+/// taxonomy rather than a list declared here.
+fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let target_name = invocation.rest.first().cloned().ok_or_else(|| {
+        Error::Usage(format!(
+            "rebuild requires a target: {}",
+            crate::store::retention::RebuildGroup::ALL
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ))
+    })?;
+    if invocation.rest.len() > 1 {
+        return Err(Error::Usage(format!(
+            "unknown argument: {}",
+            invocation.rest[1]
+        )));
+    }
+    let group =
+        crate::store::retention::RebuildGroup::from_name(&target_name).ok_or_else(|| {
+            Error::Usage(format!(
+                "unknown rebuild target {target_name}; rebuildable targets are: {}",
+                crate::store::retention::RebuildGroup::ALL
+                    .iter()
+                    .map(|group| group.name())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ))
+        })?;
+    let mut conn = open_ledger(clock)?;
+    let report = crate::store::retention::delete_rebuildable(&mut conn, group)?;
+    println!(
+        "rebuild {}: deleted {} rows across {} tables",
+        report.group.name(),
+        report.total().value(),
+        report.deleted.len(),
+    );
+    for (class, count) in &report.deleted {
+        let table = class
+            .table_name()
+            .unwrap_or_else(|| unreachable!("a sweep class is a table class by construction"));
+        println!("  {table}: {} rows", count.value());
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1686,6 +2078,7 @@ mod tests {
                 ("--format", policy.format),
                 ("--explain", policy.explain),
                 ("--account", policy.account),
+                ("--model", policy.model),
                 ("--no-color", policy.no_color),
             ] {
                 if let FlagSupport::Rejected { reason } = support {
@@ -1799,9 +2192,8 @@ mod tests {
 
     /// `--account` is a parsed token for every command, and the parser honours the
     /// policy: a rejection emits the policy's reason, an acceptance lands as the
-    /// invocation's account. No command accepts it yet (status's filtering
-    /// arrives with aub-me5.6), so the loop's rejection arm is the one that
-    /// fires; the acceptance arm is the parser's contract for when one does.
+    /// invocation's account. Status is the one command that accepts it, and the
+    /// selector is why.
     #[test]
     fn the_parser_honours_the_account_policy_for_every_command() {
         for command in Command::ALL {
@@ -1855,6 +2247,47 @@ mod tests {
             Err(Error::Usage(_)) => {}
             Err(error) => panic!("an invalid coverage interval must be a usage error: {error:?}"),
             Ok(_) => panic!("an invalid coverage interval must be refused"),
+        }
+    }
+
+    /// `--model` is a parsed token for every command, both the `--model M` and
+    /// `--model=M` spellings, and the parser honours the policy: status is the
+    /// one command that accepts it, and the window selection is why.
+    #[test]
+    fn the_parser_honours_the_model_policy_for_every_command() {
+        for spelling in [
+            vec!["--model", "claude-model-x"],
+            vec!["--model=claude-model-x"],
+        ] {
+            let mut argv = vec![Command::Status.name()];
+            argv.extend(spelling);
+            let result = parse_invocation(args(&argv));
+            match result {
+                Ok(Request::Run(invocation)) => assert_eq!(
+                    invocation.model.as_deref(),
+                    Some("claude-model-x"),
+                    "status must parse --model as the value: {invocation:?}"
+                ),
+                other => panic!("status accepts --model but parsed as {other:?}"),
+            }
+        }
+
+        for command in Command::ALL {
+            if command == Command::Status {
+                continue;
+            }
+            let result = parse_invocation(args(&[command.name(), "--model", "m"]));
+            match command.flag_policy().model {
+                FlagSupport::Rejected { reason } => match result {
+                    Err(Error::Usage(message)) => {
+                        assert!(message.contains(reason), "{command:?}: {message}")
+                    }
+                    other => panic!("{command:?} rejects --model but parsed as {other:?}"),
+                },
+                FlagSupport::Accepted => {
+                    panic!("{command:?} declares --model accepted but status is the only selector")
+                }
+            }
         }
     }
 
@@ -2162,5 +2595,73 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             provenance.get("accounts"),
             Some(crate::config::ConfigSource::File)
         );
+    }
+
+    /// The status contract's shape (PLAN.md sections 16.2 and 43 workflow 4):
+    /// the status function's own source performs exactly configuration
+    /// resolution sufficient to locate the projection, one bounded file read,
+    /// freshness computation and formatting. Nothing else is referenced from
+    /// it, so a store, transcript, calibration, rate-card or write call that
+    /// joined the status path would fail here before it could block a status
+    /// bar on another aub operation.
+    #[test]
+    fn the_status_function_performs_only_the_status_contract() {
+        let source = include_str!("cli.rs");
+        // The status path is fn status and the helpers it alone uses, so the
+        // scan covers the bodies that carry its work, not just its own text.
+        let status_body = [
+            function_body(source, "fn status("),
+            function_body(source, "fn projection_accounts("),
+            function_body(source, "fn status_clock_skew_envelope("),
+        ]
+        .concat();
+
+        for forbidden in [
+            "rusqlite",
+            "Connection",
+            "store::connection",
+            "store::migrate",
+            "transcripts::",
+            "calibration",
+            "rate_book",
+            "ureq",
+            "reqwest",
+            "http",
+            "spool",
+            "fs::write",
+            "OpenOptions",
+            "create_dir",
+            "remove_file",
+        ] {
+            assert!(
+                !status_body.contains(forbidden),
+                "the status function's source must not reference {forbidden}: the status contract allows only configuration resolution, one bounded projection read, freshness computation and formatting"
+            );
+        }
+    }
+
+    /// The negative that keeps the scan above a test rather than a ritual: a
+    /// function body that does name the store fails the same scan.
+    #[test]
+    fn the_status_contract_scan_catches_a_forbidden_reference() {
+        // The poisoned sample spells the violation in this scanner's
+        // vocabulary but not in the literal the store-connection boundary
+        // rule greps for, so the negative never trips that rule on this file.
+        let poisoned = "fn status() { let probe = crate::store::connection::open(); }";
+        assert!(function_body(poisoned, "fn status(").contains("store::connection"));
+    }
+
+    /// The body of one function in this file: from its declaration to the
+    /// next top-level `fn`, or to the end of the file.
+    fn function_body(source: &str, declaration: &str) -> String {
+        let start = source
+            .find(declaration)
+            .unwrap_or_else(|| panic!("cli.rs must declare {declaration}"));
+        let rest = &source[start..];
+        let end = rest[declaration.len()..]
+            .find("\nfn ")
+            .map(|offset| offset + declaration.len() + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
     }
 }
