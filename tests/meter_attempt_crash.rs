@@ -16,8 +16,8 @@
 //! interruption rather than a timeout or a missing attempt. The property test
 //! walks randomized sequences of injections and restarts and holds that no
 //! attempt ever carries more than one observation. The unit test confines the
-//! injection hooks to the one harness module and off the shipping command
-//! surface.
+//! injection hooks to the crash-harness module family and off the shipping
+//! command surface.
 
 use std::process::Command;
 
@@ -504,26 +504,28 @@ proptest! {
     }
 }
 
-/// Unit: the injection hooks exist in exactly one place, off the shipping surface.
+/// Unit: the injection hooks exist only in crash-harness modules, off the shipping surface.
 ///
 /// The bead's criterion asks for injection hooks absent from a release binary,
-/// asserted by a symbol or feature check. The harness command ships in the
-/// binary by the architecture aub-sth.6 closed: the end-to-end case
-/// (`tests/e2e/cases/009-attempt-crash.sh`) drives the release binary through
-/// it and asserts the abort by signal, so a binary-contents absence check is
-/// impossible to satisfy, let alone to prove red. The property that does hold,
-/// asserted here at the source layer that can actually fail, is two-fold:
-/// every `process::abort` call site in src/ lives in the one test-surface
-/// harness module (no production write-path module carries an injection
-/// point), and no command on the shipping command surface reaches one. This
-/// is the same reasoning `bin/checks/65-synthetic-adapter-absent-from-release`
-/// documents: `[profile.release] strip = true` and dead-code elimination make
-/// a binary-strings check unprovable, so the structural check is the layer
-/// that can go red.
+/// asserted by a symbol or feature check. The harness commands ship in the
+/// binary by the architecture aub-sth.6 closed: the end-to-end cases drive the
+/// release binary through them and assert the abort by signal, so a
+/// binary-contents absence check is impossible to satisfy, let alone to prove
+/// red. The property that does hold, asserted here at the source layer that
+/// can actually fail, is two-fold: every `process::abort` call site in src/
+/// lives in a `*_crash_hook.rs` module under src/store/ (the harness family,
+/// of which this bead's `attempt_crash_hook.rs` and the projection bead's
+/// `projection_crash_hook.rs` are the members), and no command on the shipping
+/// command surface reaches one, which is checked by pattern so a future
+/// harness command cannot slip onto the surface by a name this test does not
+/// know. This is the same reasoning
+/// `bin/checks/65-synthetic-adapter-absent-from-release` documents:
+/// `[profile.release] strip = true` and dead-code elimination make a
+/// binary-strings check unprovable, so the structural check is the layer that
+/// can go red.
 #[test]
-fn injection_hooks_are_confined_to_the_harness_module_and_off_the_shipping_surface() {
+fn injection_hooks_are_confined_to_the_harness_modules_and_off_the_shipping_surface() {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let harness_module = manifest_dir.join("src/store/attempt_crash_hook.rs");
 
     let mut files_with_abort = Vec::new();
     let mut stack = vec![manifest_dir.join("src")];
@@ -542,27 +544,39 @@ fn injection_hooks_are_confined_to_the_harness_module_and_off_the_shipping_surfa
         }
     }
 
-    let mut sorted = files_with_abort.clone();
-    sorted.sort();
-    assert_eq!(
-        sorted,
-        vec![harness_module],
-        "every process::abort call site must live in the crash-harness module; \
-         the write path itself carries no injection point"
+    assert!(
+        !files_with_abort.is_empty(),
+        "the harness family must be present for this check to mean anything"
     );
-    assert_eq!(
-        files_with_abort.len(),
-        1,
-        "the harness module is the one injection surface"
-    );
+    for file in &files_with_abort {
+        let name = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("");
+        let in_store = file
+            .parent()
+            .is_some_and(|parent| parent == &manifest_dir.join("src/store"));
+        assert!(
+            in_store && name.ends_with("_crash_hook.rs"),
+            "every process::abort call site must live in a src/store/*_crash_hook.rs \
+             harness module; found {}: the write path itself carries no injection point",
+            file.display()
+        );
+    }
 
     let surface = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/e2e/command-surface.txt"
     ))
     .expect("command-surface.txt must be readable");
-    assert!(
-        !surface.contains("__attempt-crash-hook"),
-        "__attempt-crash-hook must not appear in the shipping command surface"
-    );
+    for line in surface.lines() {
+        let command = line.trim();
+        if command.is_empty() || command.starts_with('#') {
+            continue;
+        }
+        assert!(
+            !command.contains("crash-hook"),
+            "no crash-hook command may appear on the shipping command surface: {command}"
+        );
+    }
 }
