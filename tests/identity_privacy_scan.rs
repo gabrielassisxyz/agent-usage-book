@@ -41,9 +41,15 @@ use agent_usage_book::store::spool::{PendingTerminalBundle, PendingWindow, spool
 use test_support::sanitization::matched_patterns;
 
 /// A credential shaped to trip the shared forbidden-pattern list on its own
-/// (it carries the `sk-ant-` prefix), independent of the direct substring
-/// check this test also runs.
-const CREDENTIAL: &str = "sk-ant-oat01-privacy-scan-must-never-leak-9f2c";
+/// (it carries the `ghp_` prefix), independent of the direct substring check
+/// this test also runs. Deliberately not one of `sensitive_value`'s own
+/// hardcoded fallback shapes ("bearer ", "basic ", "sk-ant-",
+/// "session_token=" in `src/meter/evidence.rs`): the point of this test is
+/// the adapter telling the sanitizer about the credential it already knows
+/// (`SensitiveResponseMaterial::new([credential.expose(), token.as_str()])`),
+/// and a credential shape the hardcoded fallback would also catch cannot
+/// prove that path is the one doing the work.
+const CREDENTIAL: &str = "ghp_privacyScanMustNeverLeak9f2cAAAA";
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
