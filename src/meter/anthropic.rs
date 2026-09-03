@@ -804,9 +804,17 @@ mod tests {
         let capsule = captured
             .evidence
             .expect("a 200 response must carry an evidence capsule");
+        // Checked inside the canonical quota_response subtree specifically,
+        // not just anywhere in the serialized capsule: the raw-lexeme map
+        // also carries the field's JSON pointer path in its keys, so a
+        // substring check against the whole capsule would still pass even if
+        // the sanitizer dropped the field from quota_response itself.
+        let parsed: serde_json::Value = serde_json::from_str(capsule.serialized()).unwrap();
         assert!(
-            capsule.serialized().contains("unknown_top_level_metric"),
-            "the capsule must retain the unknown field: {}",
+            parsed["quota_response"]
+                .get("unknown_top_level_metric")
+                .is_some(),
+            "the capsule's quota_response must retain the unknown field: {}",
             capsule.serialized()
         );
     }

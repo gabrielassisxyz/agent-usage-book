@@ -257,7 +257,14 @@ fn contract_all_fourteen_cases() {
             let capsule = captured
                 .evidence
                 .expect("a 200 response must carry an evidence capsule");
-            assert!(capsule.serialized().contains("unknown_top_level_metric"));
+            let parsed: serde_json::Value = serde_json::from_str(capsule.serialized()).unwrap();
+            assert!(
+                parsed["quota_response"]
+                    .get("unknown_top_level_metric")
+                    .is_some(),
+                "the capsule's quota_response must retain the unknown field: {}",
+                capsule.serialized()
+            );
         }
         other => panic!("case 12 expected Measured, got {other:?}"),
     }
