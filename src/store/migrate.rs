@@ -126,11 +126,15 @@ fn store_error(context: &str, err: rusqlite::Error) -> Error {
 pub fn current_schema_version(conn: &rusqlite::Connection) -> Result<u32, Error> {
     conn.execute_batch(BOOTSTRAP_SQL)
         .map_err(|e| store_error("cannot bootstrap the schema version table", e))?;
-    read_schema_version(conn)
+    recorded_schema_version(conn)
 }
 
 /// Reads the recorded version, assuming the bookkeeping table exists.
-fn read_schema_version(conn: &rusqlite::Connection) -> Result<u32, Error> {
+///
+/// Backup verification uses this read-only form against the archived database.
+/// It must not bootstrap a missing table because verification never repairs the
+/// artifact it is judging.
+pub fn recorded_schema_version(conn: &rusqlite::Connection) -> Result<u32, Error> {
     conn.query_row(
         "SELECT COALESCE(MAX(version), 0) FROM schema_migration",
         [],
@@ -217,7 +221,7 @@ pub fn run_migrations(
             .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
             .map_err(|e| store_error("cannot take the migration lock", e))?;
 
-        let current_in_lock = read_schema_version(&tx)?;
+        let current_in_lock = recorded_schema_version(&tx)?;
         if current_in_lock >= migration.version {
             // Another process applied this version (or a later one) while this
             // process waited for the lock. Nothing to do; the transaction is
