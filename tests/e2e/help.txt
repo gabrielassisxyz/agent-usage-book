@@ -44,7 +44,7 @@ backup:
   answers: is there a consistent, verified archive of the durable state, and does it restore?
   refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --no-color (backup prints no color)
   format: text only: backup prints one operational result
-  options: DESTINATION | verify DESTINATION
+  options: DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]
 
 doctor:
   answers: is the recorded evidence healthy, and does the transcript corpus still match its parsers?
