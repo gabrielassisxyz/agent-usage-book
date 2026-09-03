@@ -68,6 +68,7 @@ pub enum DurableClass {
     SampleRun,
     SamplingPolicySnapshot,
     LedgerGeneration,
+    IngestionGeneration,
     SessionAccountMarker,
     MeterAttempt,
     MeterAttemptResult,
@@ -123,6 +124,7 @@ impl DurableClass {
         match self {
             Self::SampleRun
             | Self::LedgerGeneration
+            | Self::IngestionGeneration
             | Self::SessionAccountMarker
             | Self::MeterAttempt
             | Self::MeterAttemptResult
@@ -169,6 +171,7 @@ impl DurableClass {
             Self::SampleRun
             | Self::SamplingPolicySnapshot
             | Self::LedgerGeneration
+            | Self::IngestionGeneration
             | Self::MeterAttempt
             | Self::MeterAttemptResult
             | Self::MeterResponseEvidence
@@ -220,6 +223,7 @@ impl DurableClass {
             Self::SamplingPolicySnapshot => Some("sampling_policy_snapshot"),
             Self::SamplingLease => Some("sampling_lease"),
             Self::LedgerGeneration => Some("ledger_generation"),
+            Self::IngestionGeneration => Some("ingestion_generation"),
             Self::SessionAccountMarker => Some("session_account_marker"),
             Self::UsageOccurrence => Some("usage_occurrence"),
             Self::TranscriptFile => Some("transcript_file"),
@@ -290,6 +294,7 @@ impl DurableClass {
             Self::SamplingPolicySnapshot,
             Self::SamplingLease,
             Self::LedgerGeneration,
+            Self::IngestionGeneration,
             Self::SessionAccountMarker,
             Self::UsageOccurrence,
             Self::TranscriptFile,
@@ -331,6 +336,7 @@ impl DurableClass {
             Self::SamplingPolicySnapshot,
             Self::SamplingLease,
             Self::LedgerGeneration,
+            Self::IngestionGeneration,
             Self::SessionAccountMarker,
             Self::UsageOccurrence,
             Self::TranscriptFile,
@@ -818,17 +824,14 @@ mod tests {
     #[test]
     fn retained_provider_body_retention_boundary() {
         // The class must have CountBounded retention, not a clock-based rule.
-        match DurableClass::RetainedProviderBody.retention_rule() {
-            RetentionRule::CountBounded { max_entries } => {
-                assert_eq!(
-                    max_entries, 100,
-                    "aub-2r3 settled on 100 entries per provider and per source"
-                );
-            }
-            other => {
-                panic!("expected CountBounded retention for RetainedProviderBody, got {other:?}")
-            }
-        }
+        let rule = DurableClass::RetainedProviderBody.retention_rule();
+        let RetentionRule::CountBounded { max_entries } = rule else {
+            panic!("expected CountBounded retention for RetainedProviderBody, got {rule:?}")
+        };
+        assert_eq!(
+            max_entries, 100,
+            "aub-2r3 settled on 100 entries per provider and per source"
+        );
 
         // No PruneTarget variant exists for the retained body: routine maintenance
         // cannot address it. This is the structural guarantee that clearing requires
