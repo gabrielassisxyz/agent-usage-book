@@ -115,7 +115,7 @@ impl WitnessId {
     pub fn cost_model(&self) -> Option<&CostModelId> {
         match self {
             WitnessId::CostModel(id) => Some(id),
-            _ => None,
+            WitnessId::WindowCalibration(_) | WitnessId::RateCard(_) => None,
         }
     }
 
@@ -123,7 +123,7 @@ impl WitnessId {
     pub fn window_calibration(&self) -> Option<&WindowCalibrationId> {
         match self {
             WitnessId::WindowCalibration(id) => Some(id),
-            _ => None,
+            WitnessId::CostModel(_) | WitnessId::RateCard(_) => None,
         }
     }
 
@@ -131,7 +131,7 @@ impl WitnessId {
     pub fn rate_card(&self) -> Option<&RateCardId> {
         match self {
             WitnessId::RateCard(id) => Some(id),
-            _ => None,
+            WitnessId::CostModel(_) | WitnessId::WindowCalibration(_) => None,
         }
     }
 }

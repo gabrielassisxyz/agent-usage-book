@@ -61,6 +61,9 @@ fn observed_reading(ppm: u32) -> Observed<QuotaRemaining> {
     )
 }
 
+// A fixture builder takes one argument per provenance field on purpose: a struct of
+// options would hide which field a test varies.
+#[allow(clippy::too_many_arguments)]
 fn make_sample_node(
     evidence_names: &[&str],
     cost_model: Option<&str>,

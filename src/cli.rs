@@ -1254,26 +1254,24 @@ mod tests {
         for cmd in ["status", "spend"] {
             for val in ["--explain", "--explain=summary"] {
                 let parsed = parse_invocation(args(&[cmd, val])).expect("valid explain summary");
-                match parsed {
-                    Request::Run(inv) => assert_eq!(inv.explain, ExplainMode::Summary),
-                    other => panic!("expected Request::Run, got {other:?}"),
-                }
+                let Request::Run(inv) = parsed else {
+                    panic!("expected Request::Run, got {parsed:?}")
+                };
+                assert_eq!(inv.explain, ExplainMode::Summary);
             }
             let parsed_full =
                 parse_invocation(args(&[cmd, "--explain=full"])).expect("valid explain full");
-            match parsed_full {
-                Request::Run(inv) => assert_eq!(inv.explain, ExplainMode::Full),
-                other => panic!("expected Request::Run, got {other:?}"),
-            }
+            let Request::Run(inv) = parsed_full else {
+                panic!("expected Request::Run, got {parsed_full:?}")
+            };
+            assert_eq!(inv.explain, ExplainMode::Full);
             let err = parse_invocation(args(&[cmd, "--explain=invalid"]))
                 .expect_err("invalid explain value must error");
-            match err {
-                Error::Usage(msg) => {
-                    assert!(msg.contains("is not one of summary or full"), "{msg}");
-                    assert!(msg.contains("use --explain or --explain=full"), "{msg}");
-                }
-                other => panic!("expected Error::Usage, got {other:?}"),
-            }
+            let Error::Usage(msg) = err else {
+                panic!("expected Error::Usage, got {err:?}")
+            };
+            assert!(msg.contains("is not one of summary or full"), "{msg}");
+            assert!(msg.contains("use --explain or --explain=full"), "{msg}");
         }
     }
 
