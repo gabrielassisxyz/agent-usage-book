@@ -31,6 +31,7 @@ pub mod problem_code;
 pub mod projection;
 pub mod rate_book;
 pub mod report;
+pub mod restore;
 pub mod sessions;
 pub mod store;
 pub mod transcripts;

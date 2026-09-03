@@ -9,12 +9,13 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
 };
 use crate::error::Error;
-use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
+use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, Quantity, RunId};
 pub use crate::presentation::ExplainMode;
 use crate::presentation::json::{coverage_json, spend_json_with_explain, status_json_with_explain};
 use crate::presentation::render::{
@@ -24,8 +25,8 @@ use crate::presentation::render::{
 use crate::report::ReportEnvelope;
 use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as assemble_coverage};
 use crate::report::export::assemble as assemble_export;
-use crate::report::spend::{SpendWindow, assemble as assemble_spend};
-use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+use crate::report::spend::{SpendWindow, assemble_canonical as assemble_spend};
+use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, SpendGrouping, StatusReport};
 use crate::store::export::ExportKey;
 
 /// Declares [`Command`] and the derived list of its variants from one token list, so
@@ -423,9 +424,9 @@ impl Command {
     pub fn summary(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
-            Command::Spend => Some(
-                "token usage per UTC day and transcript source, read from the configured transcripts",
-            ),
+            Command::Spend => {
+                Some("canonical token usage grouped by day, session, project or repository")
+            }
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
             }
@@ -460,7 +461,9 @@ impl Command {
     pub fn question(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("how much quota does each configured account have left?"),
-            Command::Spend => Some("how many tokens did each transcript source use per UTC day?"),
+            Command::Spend => {
+                Some("how many canonical tokens were used, grouped by the requested dimensions?")
+            }
             Command::Config => Some("which configuration key resolved from where?"),
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::Backup => Some(
@@ -523,9 +526,13 @@ impl Command {
     /// has one.
     pub fn options_help(self) -> Option<&'static str> {
         match self {
-            Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
+            Command::Spend => Some(
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force",
+            ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
-            Command::Backup => Some("DESTINATION | verify DESTINATION"),
+            Command::Backup => {
+                Some("DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]")
+            }
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
@@ -830,11 +837,11 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 None => Err(Error::Usage("__exit-class requires a class 0..=8".into())),
             }
         }
-        Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
+        Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), level, &invocation),
         Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
-        Command::Ingest => ingest_command(&RealClock::new(), &invocation),
+        Command::Ingest => ingest_command(&RealClock::new(), level, &invocation),
         Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
@@ -1539,7 +1546,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    let window = spend_window(&invocation.rest, timestamp)?;
+    let options = spend_options(&invocation.rest, timestamp)?;
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -1549,7 +1556,45 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         file_contents.as_deref(),
         &file_path,
     )?;
-    let report = assemble_spend(&config, window, timestamp)?;
+    let mut conn = open_ledger(clock)?;
+    let mut refresh_failure = None;
+    let mut refresh_report = None;
+    if options.refresh != RefreshPolicy::Never {
+        let ingest_options = crate::ingest::IngestOptions {
+            source: None,
+            changed_only: options.refresh == RefreshPolicy::Auto,
+        };
+        // The spend refresh lands batches without observing them; the batch sink is the
+        // ingest command's diagnostic surface, not the spend command's.
+        match crate::ingest::run(&mut conn, &config, &ingest_options, clock, &mut |_| Ok(())) {
+            Ok(report) if report.unreadable_files.is_empty() => refresh_report = Some(report),
+            Ok(report) => {
+                refresh_failure = Some(format!(
+                    "refresh could not read {} file(s); retained the prior canonical subtotal",
+                    report.unreadable_files.len()
+                ));
+                refresh_report = Some(report);
+            }
+            Err(error) => {
+                refresh_failure = Some(format!(
+                    "refresh failed: {error}; retained the prior canonical subtotal"
+                ));
+            }
+        }
+    }
+    let mut report = assemble_spend(
+        &conn,
+        options.window,
+        timestamp,
+        options.grouping,
+        options.refresh != RefreshPolicy::Never,
+        refresh_failure.clone(),
+    )?;
+    if let Some(refresh) = refresh_report {
+        report.ingest.files_read = refresh.files_parsed;
+        report.ingest.files_skipped_before_window = refresh.files_skipped;
+        report.ingest.unreadable_files = refresh.unreadable_files;
+    }
     match invocation.format {
         OutputFormat::Text => println!(
             "{}",
@@ -1560,7 +1605,9 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             spend_json_with_explain(&report, run, invocation.explain)
         ),
     }
-    if report.ingest.unreadable_files.is_empty() {
+    if let Some(failure) = refresh_failure {
+        Err(Error::IngestIncomplete(failure))
+    } else if report.ingest.unreadable_files.is_empty() {
         Ok(())
     } else {
         Err(Error::IngestIncomplete(format!(
@@ -1573,13 +1620,28 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
 /// The window from `--today`, `--since YYYY-MM-DD` and `--days N`. Today is the
 /// default, in UTC, because the binary has no local time zone facility and must not
 /// pretend to. The window is always stated in the output.
-fn spend_window(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RefreshPolicy {
+    Auto,
+    Never,
+    Force,
+}
+
+struct SpendOptions {
+    window: SpendWindow,
+    grouping: Vec<SpendGrouping>,
+    refresh: RefreshPolicy,
+}
+
+fn spend_options(
     rest: &[String],
     now: crate::domain::time::UtcTimestamp,
-) -> Result<SpendWindow, Error> {
+) -> Result<SpendOptions, Error> {
     let mut since: Option<UtcDate> = None;
     let mut days: i64 = 1;
-    let mut args = rest.iter();
+    let mut grouping = Vec::new();
+    let mut refresh = RefreshPolicy::Auto;
+    let mut args = rest.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--today" => since = Some(now.utc_date()),
@@ -1597,6 +1659,18 @@ fn spend_window(
                     .parse()
                     .map_err(|_| Error::Usage(format!("--days must be a number, got {value}")))?;
             }
+            "--group-by" => grouping
+                .push(parse_spend_grouping(args.next().ok_or_else(|| {
+                    Error::Usage("--group-by requires a dimension".into())
+                })?)?),
+            "--refresh" => {
+                refresh = match args.peek().map(|value| value.as_str()) {
+                    Some("auto" | "never" | "force") => {
+                        parse_refresh_policy(args.next().expect("peeked refresh value"))?
+                    }
+                    _ => RefreshPolicy::Force,
+                };
+            }
             other => match other.strip_prefix("--since=") {
                 Some(value) => since = Some(parse_date(value)?),
                 None => match other.strip_prefix("--days=") {
@@ -1605,12 +1679,49 @@ fn spend_window(
                             Error::Usage(format!("--days must be a number, got {value}"))
                         })?
                     }
-                    None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                    None => match other.strip_prefix("--group-by=") {
+                        Some(value) => grouping.push(parse_spend_grouping(value)?),
+                        None => match other.strip_prefix("--refresh=") {
+                            Some(value) => refresh = parse_refresh_policy(value)?,
+                            None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                        },
+                    },
                 },
             },
         }
     }
-    SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)
+    Ok(SpendOptions {
+        window: SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)?,
+        grouping: if grouping.is_empty() {
+            vec![SpendGrouping::Day]
+        } else {
+            grouping
+        },
+        refresh,
+    })
+}
+
+fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
+    match value {
+        "day" => Ok(SpendGrouping::Day),
+        "session" => Ok(SpendGrouping::Session),
+        "project" => Ok(SpendGrouping::Project),
+        "repository" | "repo" => Ok(SpendGrouping::Repository),
+        _ => Err(Error::Usage(format!(
+            "--group-by must be day, session, project or repository, got {value}"
+        ))),
+    }
+}
+
+fn parse_refresh_policy(value: &str) -> Result<RefreshPolicy, Error> {
+    match value {
+        "auto" => Ok(RefreshPolicy::Auto),
+        "never" => Ok(RefreshPolicy::Never),
+        "force" => Ok(RefreshPolicy::Force),
+        _ => Err(Error::Usage(format!(
+            "--refresh must be auto, never or force, got {value}"
+        ))),
+    }
 }
 
 fn parse_date(value: &str) -> Result<UtcDate, Error> {
@@ -2021,6 +2132,12 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 /// freshness computation does. `start` remains accepted as the aub-sth.6 name
 /// of the second injection point.
 ///
+/// `sample [--attempts N]` runs the meter evidence cycle of PLAN.md section 13
+/// against the LEDGER database (`aub-lqe.18`), so it contends with a concurrent
+/// ingest the way the two real workloads do, and `sample-crash` is the
+/// documented injection point between the spool and the commit. The sample
+/// stages emit the drain and per-attempt diagnostics, correlated by attempt id.
+///
 /// The harness's body lives in the store layer (`crate::store::attempt_crash_hook`)
 /// because it runs migrations, writes fixture rows and counts rows, all of
 /// which the boundary rules confine to `src/store/` (rules 15 and 16); this
@@ -2028,8 +2145,13 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 /// Not part of the shipping command surface: `tests/e2e/command-surface.txt`
 /// deliberately excludes every `__`-prefixed hook, matching
 /// `__exit-class`/`__state-check`.
-fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let stage = match invocation.rest.first().map(String::as_str) {
+fn attempt_crash_hook(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let mut stage_args = invocation.rest.iter();
+    let stage = match stage_args.next().map(String::as_str) {
         Some("before-start-commit" | "point-1" | "1") => {
             crate::store::attempt_crash_hook::CrashHookStage::BeforeStartCommit
         }
@@ -2047,14 +2169,59 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         }
         Some("complete") => crate::store::attempt_crash_hook::CrashHookStage::Complete,
         Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
+        Some("commit-observation") => {
+            crate::store::attempt_crash_hook::CrashHookStage::CommitObservation
+        }
+        Some("spool-pending") => crate::store::attempt_crash_hook::CrashHookStage::SpoolPending,
+        Some("spool-orphan") => {
+            let raw = invocation.rest.get(1).ok_or_else(|| {
+                Error::Usage("spool-orphan requires the orphan attempt id".into())
+            })?;
+            let attempt_id = raw.parse::<i64>().map_err(|_| {
+                Error::Usage(format!("orphan attempt id must be an integer, got {raw:?}"))
+            })?;
+            crate::store::attempt_crash_hook::CrashHookStage::SpoolOrphan { attempt_id }
+        }
         Some("drain") => crate::store::attempt_crash_hook::CrashHookStage::Drain,
         Some("freshness") => crate::store::attempt_crash_hook::CrashHookStage::Freshness,
+        Some("sample") => {
+            let mut attempts = 1u32;
+            let mut rest = stage_args.clone();
+            while let Some(arg) = rest.next() {
+                if let Some(value) = arg.strip_prefix("--attempts=") {
+                    attempts = parse_attempts(value)?;
+                } else if arg == "--attempts" {
+                    let value = rest
+                        .next()
+                        .ok_or_else(|| Error::Usage("--attempts requires a count".into()))?;
+                    attempts = parse_attempts(value)?;
+                } else {
+                    return Err(Error::Usage(format!(
+                        "unknown __attempt-crash-hook sample argument: {arg}"
+                    )));
+                }
+            }
+            crate::store::attempt_crash_hook::CrashHookStage::Sample { attempts }
+        }
+        Some("sample-crash") => crate::store::attempt_crash_hook::CrashHookStage::SampleCrash,
         other => {
             return Err(Error::Usage(format!(
-                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | drain | freshness), got {other:?}"
+                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | commit-observation | spool-pending | spool-orphan ID | drain | freshness | sample | sample-crash), got {other:?}"
             )));
         }
     };
+
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("attempt-crash-hook");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
@@ -2066,13 +2233,35 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         &file_path,
     )?;
 
+    // The seeding stages write the ledger and spool a recovery drill counts
+    // and replays, and the sample stages run the meter evidence cycle against
+    // the one ledger database so they contend with a concurrent ingest the
+    // way the two real workloads do; the lifecycle and crash stages keep
+    // their own fixture database, which case 009's read-back counts.
+    let ledger_stage = matches!(
+        stage,
+        crate::store::attempt_crash_hook::CrashHookStage::CommitObservation
+            | crate::store::attempt_crash_hook::CrashHookStage::SpoolPending
+            | crate::store::attempt_crash_hook::CrashHookStage::SpoolOrphan { .. }
+            | crate::store::attempt_crash_hook::CrashHookStage::Sample { .. }
+            | crate::store::attempt_crash_hook::CrashHookStage::SampleCrash
+    );
+    let database = if ledger_stage {
+        config
+            .state
+            .dir
+            .join(crate::store::connection::LEDGER_DATABASE_FILE)
+    } else {
+        config.state.dir.join("attempt-crash-hook.db")
+    };
+
     let outcome = crate::store::startup::run_after_state_check(
         &config.state.dir,
         &crate::store::startup::ProcMounts,
         || {
             crate::store::attempt_crash_hook::run_stage(
                 &config.state.dir,
-                &config.state.dir.join("attempt-crash-hook.db"),
+                &database,
                 stage,
                 config.sampling.request_timeout,
                 config.sampling.command_budget,
@@ -2113,8 +2302,97 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
                 println!("freshness: {kind}");
             }
         }
+        crate::store::attempt_crash_hook::CrashHookOutcome::Sampled {
+            drain_applied,
+            drain_already_applied,
+            drain_quarantined,
+            attempts,
+        } => {
+            logger
+                .emit(
+                    clock.now(),
+                    DiagnosticEvent::MeterSpoolDrained,
+                    &[
+                        ("applied", &Quantity::new(drain_applied as u64, "records")),
+                        (
+                            "already_applied",
+                            &Quantity::new(drain_already_applied as u64, "records"),
+                        ),
+                        (
+                            "quarantined",
+                            &Quantity::new(drain_quarantined as u64, "records"),
+                        ),
+                    ],
+                )
+                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+            println!(
+                "drain applied={} already-applied={} quarantined={}",
+                drain_applied, drain_already_applied, drain_quarantined
+            );
+            let committed = attempts.iter().filter(|attempt| attempt.committed).count();
+            let spooled = attempts.len() - committed;
+            println!(
+                "sample attempts={} committed={committed} spooled={spooled}",
+                attempts.len()
+            );
+            for attempt in &attempts {
+                if attempt.committed {
+                    logger
+                        .emit(
+                            clock.now(),
+                            DiagnosticEvent::MeterAttemptCommitted,
+                            &[
+                                (
+                                    "attempt",
+                                    &Quantity::new(attempt.attempt_id.value() as u64, "id"),
+                                ),
+                                (
+                                    "busy_wait",
+                                    &Quantity::new(attempt.commit_wait.as_nanos(), "ns"),
+                                ),
+                            ],
+                        )
+                        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                    println!(
+                        "  attempt {} committed busy_wait_ns={}",
+                        attempt.attempt_id.value(),
+                        attempt.commit_wait.as_nanos()
+                    );
+                } else {
+                    logger
+                        .emit(
+                            clock.now(),
+                            DiagnosticEvent::MeterEvidenceSpooled,
+                            &[(
+                                "attempt",
+                                &Quantity::new(attempt.attempt_id.value() as u64, "id"),
+                            )],
+                        )
+                        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                    println!(
+                        "  attempt {} spooled: the writer slot stayed held; the record remains durable",
+                        attempt.attempt_id.value()
+                    );
+                }
+            }
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::Seeded { label, attempt_id } => {
+            println!("{label}={attempt_id}");
+        }
     }
     Ok(())
+}
+
+/// Parses the sample stage's `--attempts` count: a positive integer, because a
+/// stage that samples nothing would print a report about work it did not do.
+fn parse_attempts(value: &str) -> Result<u32, Error> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|_| Error::Usage(format!("--attempts: {value:?} is not a positive integer")))?;
+    if parsed == 0 {
+        return Err(Error::Usage("--attempts: must be at least 1".into()));
+    }
+    Ok(parsed)
 }
 
 /// Test-only surface: the crash-injection hook for the projection publication
@@ -2338,20 +2616,32 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
 }
 
 /// `aub backup DEST` creates a new archive; `aub backup verify DEST` clears
-/// and recomputes its verification result. The archive module owns the cut and
-/// verification protocol, while this layer only resolves configuration and
-/// renders the typed summary.
+/// and recomputes its verification result; `aub backup restore ARCHIVE DEST
+/// [--surviving DIR]` is the recovery path (`aub-sth.13`, docs/recovery.md).
+/// The archive module owns the cut and verification protocol, while this layer
+/// only resolves configuration and renders the typed summary.
 fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let (verify, destination) = match invocation.rest.as_slice() {
-        [destination] => (false, destination),
-        [subcommand, destination] if subcommand == "verify" => (true, destination),
+    match invocation.rest.as_slice() {
+        [subcommand, rest @ ..] if subcommand == "restore" => {
+            return restore_command(clock, rest);
+        }
+        [destination] => create_backup_archive(clock, destination)?,
+        [subcommand, destination] if subcommand == "verify" => {
+            verify_backup_archive(clock, destination)?
+        }
         rest => {
             return Err(Error::Usage(format!(
-                "backup requires DEST or `verify DEST`, got {rest:?}"
+                "backup requires DEST, `verify DEST` or `restore ARCHIVE DEST`, got {rest:?}"
             )));
         }
-    };
+    }
+    Ok(())
+}
 
+/// Resolves the configuration the backup family reads, the same way every
+/// command in it does, so the state directory the restore's refusals compare
+/// against is the one configuration actually names.
+fn resolve_backup_config() -> Result<crate::config::Config, Error> {
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -2361,23 +2651,24 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         file_contents.as_deref(),
         &file_path,
     )?;
+    Ok(config)
+}
+
+fn create_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
     let destination = std::path::Path::new(destination);
-    let summary = if verify {
-        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?
-    } else {
-        crate::store::startup::run_after_state_check(
-            &config.state.dir,
-            &crate::store::startup::ProcMounts,
-            || {
-                crate::backup::create_archive(
-                    &config.state.dir,
-                    destination,
-                    config.sampling.request_timeout,
-                    clock,
-                )
-            },
-        )??
-    };
+    let summary = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            crate::backup::create_archive(
+                &config.state.dir,
+                destination,
+                config.sampling.request_timeout,
+                clock,
+            )
+        },
+    )??;
     println!(
         "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
         summary.verified,
@@ -2390,13 +2681,147 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
     Ok(())
 }
 
+fn verify_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
+    let destination = std::path::Path::new(destination);
+    let summary =
+        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?;
+    println!(
+        "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
+        summary.verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_records,
+        summary.drain_completed,
+        summary.destination.display(),
+    );
+    Ok(())
+}
+
+/// `aub backup restore ARCHIVE DEST [--surviving DIR]`: the recovery path
+/// (`aub-sth.13`, docs/recovery.md). Reads the archive, restores it into the
+/// new directory DEST, replays pending evidence from the archive and, when
+/// given, from the surviving directory, and prints what it recovered and what
+/// it could not. The configured state directory is passed to the restore so
+/// the refusal against it is made of the same value every other command
+/// resolves, not of a second resolution this layer would own.
+fn restore_command(clock: &impl Clock, rest: &[String]) -> Result<(), Error> {
+    let (archive, destination, surviving) = parse_restore_args(rest)?;
+    let config = resolve_backup_config()?;
+    let summary = crate::restore::restore_archive(
+        &config.state.dir,
+        &archive,
+        &destination,
+        surviving.as_deref(),
+        config.sampling.request_timeout,
+        &crate::store::startup::ProcMounts,
+        clock,
+    )?;
+    render_restore_summary(&summary);
+    Ok(())
+}
+
+fn parse_restore_args(rest: &[String]) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
+    let mut args = rest.iter();
+    let archive = args
+        .next()
+        .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    let destination = args
+        .next()
+        .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    let mut surviving = None;
+    let mut positionals = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--surviving" {
+            if surviving.is_some() {
+                return Err(Error::Usage("--surviving was given twice".into()));
+            }
+            let value = args.next().ok_or_else(|| {
+                Error::Usage("--surviving requires the surviving directory".into())
+            })?;
+            surviving = Some(PathBuf::from(value));
+        } else {
+            positionals.push(arg.clone());
+        }
+    }
+    if !positionals.is_empty() {
+        return Err(Error::Usage(format!(
+            "restore takes ARCHIVE DEST and --surviving DIR, got {positionals:?}"
+        )));
+    }
+    Ok((
+        PathBuf::from(archive),
+        PathBuf::from(destination),
+        surviving,
+    ))
+}
+
+/// One operational result, in the same plain line-per-fact shape the backup
+/// command prints: the restored database's own numbers, the replay counts per
+/// source, the two recovery steps that have nothing to do in this phase with
+/// the reason each does not, and one line per unrecovered piece of evidence.
+fn render_restore_summary(summary: &crate::restore::RestoreSummary) {
+    println!(
+        "restore: destination={} archive_verified={} schema={} generation={} pending_restored={} migrations_applied={} observations={} unrecovered={} integrity=ok foreign_keys=ok",
+        summary.destination.display(),
+        summary.archive_verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_restored,
+        summary.migrations_applied,
+        summary.observation_count.value(),
+        summary.unrecovered.len(),
+    );
+    println!(
+        "replay: source=archive applied={} already_applied={} quarantined={}",
+        summary.archive_replay.applied,
+        summary.archive_replay.already_applied,
+        summary.archive_replay.quarantined.len(),
+    );
+    if let Some(report) = &summary.surviving_replay {
+        println!(
+            "replay: source=surviving applied={} already_applied={} quarantined={}",
+            report.applied,
+            report.already_applied,
+            report.quarantined.len(),
+        );
+    }
+    println!(
+        "projection: {} ({})",
+        summary.projection_recovery.disposition, summary.projection_recovery.reason,
+    );
+    println!(
+        "transcripts: {} ({})",
+        summary.transcript_recovery.disposition, summary.transcript_recovery.reason,
+    );
+    for item in &summary.unrecovered {
+        println!(
+            "unrecovered: {} {} {}",
+            item.source.as_str(),
+            item.file_name,
+            item.reason,
+        );
+    }
+}
+
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in
 /// its own right (aub-lqe.11, PLAN.md 6, 17.2, 27, 34.16). The window flags of
 /// spend do not exist here: ingestion is not windowed, it lands everything the
 /// configured sources currently hold, and reports what it read and the
 /// generation it advanced.
-fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
     let options = ingest_flags(&invocation.rest)?;
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("ingest");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -2407,9 +2832,32 @@ fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         &file_path,
     )?;
     let mut conn = open_ledger(clock)?;
-    let report = crate::ingest::run(&mut conn, &config, &options, clock.now())?;
+    // Each landed batch is announced while the pass is still running, with the
+    // batch's index, size, writer-slot hold and generation: the stable
+    // identifiers a contention log is correlated by (`aub-lqe.18`).
+    let mut batch_sink = |batch: &crate::ingest::LandedBatch| {
+        logger
+            .emit(
+                clock.now(),
+                DiagnosticEvent::IngestBatchLanded,
+                &[
+                    ("batch", &Quantity::new(batch.index, "index")),
+                    ("events", &Quantity::new(batch.events, "events")),
+                    (
+                        "writer_slot",
+                        &Quantity::new(batch.writer_slot.as_nanos(), "ns"),
+                    ),
+                    (
+                        "generation",
+                        &Quantity::new(batch.generation.value(), "generation"),
+                    ),
+                ],
+            )
+            .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))
+    };
+    let report = crate::ingest::run(&mut conn, &config, &options, clock, &mut batch_sink)?;
     println!(
-        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={}",
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={}",
         report.sources.join(","),
         report.files_scanned,
         report.files_parsed,
@@ -2417,6 +2865,7 @@ fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         report.unreadable_files.len(),
         report.quarantined,
         report.generation.value(),
+        report.batches.len(),
     );
     let outcome = &report.outcome;
     println!(
@@ -2942,26 +3391,38 @@ mod tests {
     /// The spend window: today by default, `--since` with `--days`, and a malformed
     /// date refused rather than guessed.
     #[test]
-    fn spend_window_defaults_to_the_utc_day_and_reads_its_flags() {
+    fn spend_options_default_to_the_utc_day_and_read_grouping_and_refresh_flags() {
         let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-08-30T23:30:00Z").unwrap();
-        let today = spend_window(&[], now).unwrap();
-        assert_eq!(today.since.iso(), "2026-08-30");
-        assert_eq!(today.until.iso(), "2026-08-31");
-        let explicit = spend_window(
+        let today = spend_options(&[], now).unwrap();
+        assert_eq!(today.window.since.iso(), "2026-08-30");
+        assert_eq!(today.window.until.iso(), "2026-08-31");
+        assert_eq!(today.grouping, vec![SpendGrouping::Day]);
+        assert_eq!(today.refresh, RefreshPolicy::Auto);
+        let explicit = spend_options(
             &[
                 "--since".into(),
                 "2026-08-25".into(),
                 "--days".into(),
                 "3".into(),
+                "--group-by=session".into(),
+                "--group-by".into(),
+                "repository".into(),
+                "--refresh=never".into(),
             ],
             now,
         )
         .unwrap();
-        assert_eq!(explicit.since.iso(), "2026-08-25");
-        assert_eq!(explicit.until.iso(), "2026-08-28");
-        assert!(spend_window(&["--since".into(), "25/08/2026".into()], now).is_err());
-        assert!(spend_window(&["--days".into(), "0".into()], now).is_err());
-        assert!(spend_window(&["--bogus".into()], now).is_err());
+        assert_eq!(explicit.window.since.iso(), "2026-08-25");
+        assert_eq!(explicit.window.until.iso(), "2026-08-28");
+        assert_eq!(
+            explicit.grouping,
+            vec![SpendGrouping::Session, SpendGrouping::Repository]
+        );
+        assert_eq!(explicit.refresh, RefreshPolicy::Never);
+        assert!(spend_options(&["--since".into(), "25/08/2026".into()], now).is_err());
+        assert!(spend_options(&["--days".into(), "0".into()], now).is_err());
+        assert!(spend_options(&["--group-by=account".into()], now).is_err());
+        assert!(spend_options(&["--bogus".into()], now).is_err());
     }
 
     #[test]

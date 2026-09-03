@@ -26,6 +26,14 @@
 //! transaction, so a crash between the delete and the insert leaves the store
 //! as it was.
 //!
+//! One call is one bounded batch: the caller (the ingest orchestrator, or a
+//! test driving the primitive directly) splits its resolved events into
+//! transactions of a documented maximum size (`config.ingest.max_batch_events`),
+//! so no single batch can monopolize the single SQLite writer slot the way one
+//! pass-sized transaction would (PLAN.md section 11.2). This module states the
+//! per-batch writer-slot budget the measurements are judged against and
+//! measures what each batch actually held, in [`PersistOutcome::writer_slot`].
+//!
 //! May not depend on:
 //! - HTTP or terminal-formatting crates
 //! - presentation
@@ -36,7 +44,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::domain::ids::SourceNamespace;
 use crate::domain::rows::RowCount;
-use crate::domain::time::UtcTimestamp;
+use crate::domain::time::{Clock, MonotonicDuration, UtcTimestamp};
 use crate::error::Error;
 use crate::store::ingest_quarantine::{
     DedupCollisionDescriptor, NewQuarantineItem, record_dedup_collision, record_quarantine,
@@ -49,7 +57,9 @@ use crate::transcripts::watermark::Watermark;
 /// One canonical event of a parsed batch, with the identity fields the store
 /// persists it under. Computed by the orchestrator through
 /// [`crate::dedup::canonical_identity`], so the store never re-derives what the
-/// deduplication framework has already decided.
+/// deduplication framework has already decided. Clone because a pass splits its
+/// resolved events into bounded batches, and each batch carries its slice.
+#[derive(Clone)]
 pub struct PersistEvent {
     /// The canonical (deduplicated) event itself.
     pub event: NormalizedUsageEvent,
@@ -111,7 +121,26 @@ pub struct PersistOutcome {
     pub quarantined_recorded: RowCount,
     /// The ingestion generation this pass landed as.
     pub generation: Generation,
+    /// How long this batch held the SQLite writer slot: from the moment its
+    /// write transaction was granted to the moment its commit returned. The
+    /// wait for a slot somebody else held is deliberately not part of this
+    /// number; the hold is what the budget below judges.
+    pub writer_slot: MonotonicDuration,
 }
+
+/// The stated per-batch writer-slot budget (PLAN.md section 11.2): no single
+/// ingest batch may hold the SQLite writer slot longer than this, because a
+/// meter write that arrives mid-batch must be served after at most one batch's
+/// hold. The value is the ordinary writer's own default busy bound
+/// (`sampling.request_timeout`, 5s), so a meter write arriving mid-batch
+/// waits at most one batch's hold plus its own wait, both inside the bound it
+/// already carries. The bound caps the transaction
+/// `config.ingest.max_batch_events` produces at the documented default; a
+/// batch that measures over it says so in its diagnostic rather than silently
+/// stretching the meter's worst-case wait. This is a measurement target the
+/// tests assert, not a runtime abort: killing a batch that already holds
+/// valid rows would discard work to enforce a number.
+pub const WRITER_SLOT_BUDGET_PER_BATCH: MonotonicDuration = MonotonicDuration::from_millis(5_000);
 
 /// Lands one parse batch in the rebuildable materialization tables.
 ///
@@ -123,6 +152,7 @@ pub struct PersistOutcome {
 pub fn persist_ingest_batch(
     conn: &mut rusqlite::Connection,
     pass: &IngestPass,
+    clock: &impl Clock,
 ) -> Result<PersistOutcome, Error> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -131,6 +161,10 @@ pub fn persist_ingest_batch(
                 "another writer holds the ledger database; ingest refuses to land partially: {e}"
             ))
         })?;
+    // The writer slot is held from here, not from the BEGIN IMMEDIATE above:
+    // the wait for a slot somebody else holds is the other writer's business,
+    // and what the budget judges is this batch's own hold.
+    let slot_start = clock.monotonic_now();
 
     let mut rows_replaced: usize = 0;
 
@@ -312,6 +346,7 @@ pub fn persist_ingest_batch(
 
     tx.commit()
         .map_err(|e| Error::Store(format!("cannot commit the ingest pass: {e}")))?;
+    let writer_slot = clock.monotonic_now().duration_since(slot_start);
 
     Ok(PersistOutcome {
         events_written: RowCount::new(events_written),
@@ -323,6 +358,7 @@ pub fn persist_ingest_batch(
         rows_replaced: RowCount::new(rows_replaced as u64),
         quarantined_recorded: RowCount::new(quarantined_recorded),
         generation,
+        writer_slot,
     })
 }
 
@@ -542,6 +578,16 @@ mod tests {
         .expect("row count must be readable") as u64
     }
 
+    /// Lands one batch through the store primitive under a fixture clock, so
+    /// every call site names the behaviour instead of the clock plumbing.
+    fn land(conn: &mut rusqlite::Connection, pass: &IngestPass) -> Result<PersistOutcome, Error> {
+        persist_ingest_batch(
+            conn,
+            pass,
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+        )
+    }
+
     fn component_count(
         conn: &rusqlite::Connection,
         canonical_event_id: &str,
@@ -572,7 +618,7 @@ mod tests {
             "a fresh database has completed no ingestion pass"
         );
 
-        let first = persist_ingest_batch(
+        let first = land(
             &mut conn,
             &pass_of(
                 vec![strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5)],
@@ -586,7 +632,7 @@ mod tests {
             Generation::new(1)
         );
 
-        let second = persist_ingest_batch(
+        let second = land(
             &mut conn,
             &pass_of(vec![strong_event("m2", "corpus/a.jsonl", 2_000, 7, 3)], now),
         )
@@ -620,7 +666,7 @@ mod tests {
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .unwrap();
 
-        let err = persist_ingest_batch(
+        let err = land(
             &mut conn,
             &pass_of(
                 vec![strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5)],
@@ -653,13 +699,13 @@ mod tests {
             now,
         );
 
-        let first = persist_ingest_batch(&mut conn, &batch).unwrap();
+        let first = land(&mut conn, &batch).unwrap();
         assert_eq!(first.events_written.value(), 1);
         assert_eq!(first.occurrences_written.value(), 1);
         assert_eq!(first.events_already_ingested.value(), 0);
         assert_eq!(first.occurrences_already_ingested.value(), 0);
 
-        let replay = persist_ingest_batch(&mut conn, &batch).unwrap();
+        let replay = land(&mut conn, &batch).unwrap();
         assert_eq!(
             replay.events_written.value(),
             0,
@@ -687,7 +733,7 @@ mod tests {
         let (_scratch, mut conn) = fixture_conn();
         let now = UtcTimestamp::from_unix_nanos(1_000_000);
 
-        persist_ingest_batch(
+        land(
             &mut conn,
             &pass_of(
                 vec![strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5)],
@@ -697,7 +743,7 @@ mod tests {
         .unwrap();
         assert_eq!(component_count(&conn, "event-id:m1", "output"), 5);
 
-        persist_ingest_batch(
+        land(
             &mut conn,
             &pass_of(
                 vec![strong_event("m1", "corpus/a.jsonl", 1_000, 10, 15)],
@@ -707,7 +753,7 @@ mod tests {
         .unwrap();
         assert_eq!(component_count(&conn, "event-id:m1", "output"), 15);
 
-        persist_ingest_batch(
+        land(
             &mut conn,
             &pass_of(
                 vec![strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5)],
@@ -732,7 +778,7 @@ mod tests {
         let (_scratch, mut conn) = fixture_conn();
         let now = UtcTimestamp::from_unix_nanos(1_000_000);
 
-        persist_ingest_batch(
+        land(
             &mut conn,
             &pass_of(
                 vec![strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5)],
@@ -744,7 +790,7 @@ mod tests {
 
         let mut replacement = pass_of(vec![strong_event("m2", "corpus/a.jsonl", 2_000, 8, 4)], now);
         replacement.whole_file_sources = vec!["corpus/a.jsonl".to_string()];
-        let outcome = persist_ingest_batch(&mut conn, &replacement).unwrap();
+        let outcome = land(&mut conn, &replacement).unwrap();
         // The old occurrence goes, and the canonical event it was the last
         // occurrence of follows it: two deletions, both reported here.
         assert_eq!(
@@ -793,7 +839,7 @@ mod tests {
             now,
         );
         first.sessions = vec![session(5_000, Some(9_000))];
-        persist_ingest_batch(&mut conn, &first).unwrap();
+        land(&mut conn, &first).unwrap();
 
         // A narrower pass must not shrink the stored bounds.
         let mut second = pass_of(
@@ -801,7 +847,7 @@ mod tests {
             now,
         );
         second.sessions = vec![session(6_000, Some(7_000))];
-        persist_ingest_batch(&mut conn, &second).unwrap();
+        land(&mut conn, &second).unwrap();
 
         let (start, end): (i64, i64) = conn
             .query_row(
@@ -822,7 +868,7 @@ mod tests {
             now,
         );
         third.sessions = vec![session(1_000, Some(12_000))];
-        persist_ingest_batch(&mut conn, &third).unwrap();
+        land(&mut conn, &third).unwrap();
         let (start, end): (i64, i64) = conn
             .query_row(
                 "SELECT start, end FROM session WHERE native_session_id = 's1'",
@@ -856,8 +902,8 @@ mod tests {
             now,
         );
         batch.quarantined = vec![item.clone()];
-        persist_ingest_batch(&mut conn, &batch).unwrap();
-        persist_ingest_batch(&mut conn, &batch).unwrap();
+        land(&mut conn, &batch).unwrap();
+        land(&mut conn, &batch).unwrap();
         assert_eq!(
             count(&conn, "ingest_quarantine"),
             1,

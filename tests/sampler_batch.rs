@@ -14,7 +14,9 @@
 //! - the fixture corpus or transcript modules
 //! - presentation
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::Duration;
 
 use agent_usage_book::domain::attempt::AttemptOutcome;
@@ -25,12 +27,15 @@ use agent_usage_book::meter::adapter::{CredentialHandle, MeterRequest};
 use agent_usage_book::meter::anthropic::AnthropicAdapter;
 use agent_usage_book::meter::sampler::{AccountDisposition, BatchAccount, SamplingOrchestrator};
 use agent_usage_book::meter::transport::BlockingTransport;
+use agent_usage_book::store::account::account_id_by_identity;
 use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
 use agent_usage_book::store::ledger_generation;
 use agent_usage_book::store::meter_attempt::{
     MeterAttemptRowId, attempt_by_row_id, count_attempts,
 };
-use agent_usage_book::store::meter_evidence::count_meter_observations;
+use agent_usage_book::store::meter_evidence::{
+    count_meter_observations, newest_observation_for_account,
+};
 use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::repository::Repository;
@@ -42,6 +47,10 @@ use test_support::{ScriptedOutcome, ScriptedResponseBody, SyntheticServer};
 /// A valid Anthropic usage body, so the adapter measures a reading from it.
 const ANTHROPIC_SUCCESS_BODY: &[u8] =
     br#"{"five_hour":{"utilization":10.0,"resets_at":"2026-01-01T00:00:00.000Z"},"seven_day":{"utilization":20.0,"resets_at":"2026-01-08T00:00:00.000Z"}}"#;
+
+const NAMED_ACCOUNT_AMBIENT_CREDENTIAL: &str = "ambient-credential-must-not-be-used";
+const NAMED_ACCOUNT_AMBIENT_CREDENTIAL_ENV: &str = "AUB_EUN_11_AMBIENT_CREDENTIAL";
+const NAMED_ACCOUNT_ISOLATION_CHILD_ENV: &str = "AUB_EUN_11_ISOLATION_CHILD";
 
 // --- fixture -----------------------------------------------------------------
 
@@ -111,6 +120,18 @@ fn batch_account(name: &str, endpoint: String) -> BatchAccount<AnthropicAdapter>
         forced: false,
         adapter_version: AdapterVersion::new("adapter-integration-v1"),
     }
+}
+
+fn batch_account_with_credential(
+    name: &str,
+    endpoint: String,
+    credential: &str,
+    credential_context_id: &str,
+) -> BatchAccount<AnthropicAdapter> {
+    let mut account = batch_account(name, endpoint);
+    account.credential = CredentialHandle::new(credential);
+    account.credential_context_id = Some(credential_context_id.to_string());
+    account
 }
 
 fn success_server() -> SyntheticServer {
@@ -426,6 +447,156 @@ fn bounded_concurrency_is_recorded_by_the_synthetic_server() {
         2,
         "the provider saw the configured bound of simultaneous connections, reached and never exceeded"
     );
+
+    server.stop();
+}
+
+/// Two configured accounts must carry their resolved credentials through the
+/// concurrent sampler independently of the process environment. The outer
+/// process starts a single-test child with a conspicuous ambient credential:
+/// this avoids mutating process-global environment state while Rust executes
+/// integration tests in parallel.
+#[test]
+fn named_accounts_are_isolated_from_ambient_credentials() {
+    if std::env::var_os(NAMED_ACCOUNT_ISOLATION_CHILD_ENV).is_none() {
+        let current_test_binary =
+            std::env::current_exe().expect("the integration test binary must be discoverable");
+        let output = Command::new(current_test_binary)
+            .args([
+                "--exact",
+                "named_accounts_are_isolated_from_ambient_credentials",
+                "--nocapture",
+            ])
+            .env(NAMED_ACCOUNT_ISOLATION_CHILD_ENV, "1")
+            .env(
+                NAMED_ACCOUNT_AMBIENT_CREDENTIAL_ENV,
+                NAMED_ACCOUNT_AMBIENT_CREDENTIAL,
+            )
+            .output()
+            .expect("the isolated named-account test process must start");
+        assert!(
+            output.status.success(),
+            "the isolated named-account test failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let ambient_credential = std::env::var(NAMED_ACCOUNT_AMBIENT_CREDENTIAL_ENV)
+        .expect("the child process must carry the conspicuous ambient credential");
+    assert_eq!(ambient_credential, NAMED_ACCOUNT_AMBIENT_CREDENTIAL);
+
+    let (_scratch, repository) = fixture_repository("named-account-isolation");
+    let mut server = SyntheticServer::start_with_response_delay(
+        vec![
+            ScriptedOutcome::Success(ScriptedResponseBody::json_ok(
+                ANTHROPIC_SUCCESS_BODY.to_vec(),
+            )),
+            ScriptedOutcome::Success(ScriptedResponseBody::json_ok(
+                ANTHROPIC_SUCCESS_BODY.to_vec(),
+            )),
+        ],
+        Duration::from_millis(150),
+    )
+    .expect("the synthetic provider must start");
+
+    let accounts = vec![
+        batch_account_with_credential(
+            "work",
+            format!("{}/usage/work", server.url()),
+            "work-explicit-credential",
+            "work-credential-context",
+        ),
+        batch_account_with_credential(
+            "personal",
+            format!("{}/usage/personal", server.url()),
+            "personal-explicit-credential",
+            "personal-credential-context",
+        ),
+    ];
+
+    let report = orchestrator(&repository, MonotonicDuration::from_seconds(30), 2)
+        .run(&accounts)
+        .expect("the configured accounts must sample");
+    assert_eq!(
+        report.workers_spawned, 2,
+        "both accounts must be concurrent"
+    );
+    assert_eq!(
+        report.workers_completed, 2,
+        "the scoped workers must both join"
+    );
+    for account_report in &report.accounts {
+        match &account_report.disposition {
+            AccountDisposition::Sampled(sampled) => {
+                assert_eq!(sampled.outcome, AttemptOutcome::Success);
+                assert!(sampled.observation_committed);
+            }
+            other => panic!("each configured account must sample successfully, got {other:?}"),
+        }
+    }
+
+    let received_credentials: BTreeMap<String, String> = server
+        .requests()
+        .into_iter()
+        .map(|request| {
+            let credential = request
+                .authorization()
+                .expect("each provider request must carry explicit authorization")
+                .to_string();
+            (request.path, credential)
+        })
+        .collect();
+    assert_eq!(
+        server.request_count(),
+        2,
+        "the provider must receive one request from each logical account"
+    );
+    assert!(
+        received_credentials
+            .values()
+            .all(|credential| credential != &format!("Bearer {ambient_credential}")),
+        "the ambient credential must not reach the provider"
+    );
+    assert_eq!(
+        received_credentials,
+        BTreeMap::from([
+            (
+                "/usage/work".to_string(),
+                "Bearer work-explicit-credential".to_string(),
+            ),
+            (
+                "/usage/personal".to_string(),
+                "Bearer personal-explicit-credential".to_string(),
+            ),
+        ]),
+        "each logical account's request must carry only its own explicit credential"
+    );
+    assert_eq!(
+        server.max_simultaneous_connections(),
+        2,
+        "the provider must observe the two logical accounts concurrently"
+    );
+
+    let conn = open(
+        repository.database_path(),
+        AccessMode::ReadOnly,
+        &busy_policy(),
+    )
+    .expect("the persisted observations must be readable");
+    for logical_name in ["work", "personal"] {
+        let account_id = account_id_by_identity(&conn, "anthropic", logical_name)
+            .expect("the account lookup must succeed")
+            .unwrap_or_else(|| panic!("the {logical_name} account must be recorded"));
+        let observation = newest_observation_for_account(&conn, account_id)
+            .expect("the observation lookup must succeed")
+            .unwrap_or_else(|| panic!("the {logical_name} account must have an observation"));
+        assert_eq!(
+            observation.account_id, account_id,
+            "the {logical_name} observation must remain under its logical account"
+        );
+    }
 
     server.stop();
 }

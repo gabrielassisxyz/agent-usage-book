@@ -136,6 +136,8 @@ fn contract_spend_json_matches_golden_fixture() {
         derivation_id,
     )];
     let ingest = IngestSummary {
+        refresh_attempted: false,
+        refresh_failure: None,
         files_read: 1,
         files_skipped_before_window: 0,
         unreadable_files: vec![],
@@ -143,6 +145,7 @@ fn contract_spend_json_matches_golden_fixture() {
         replayed_occurrences: 0,
         collisions: 0,
         without_identity: 0,
+        heuristic_identities: 0,
         undated_events: 0,
         events_outside_window: 0,
         events_in_window: 1,

@@ -5,6 +5,10 @@
   "generated_at": 2000,
   "knowledge_at": 1000,
   "ledger_generation": 7,
+  "grouping": [
+    "day"
+  ],
+  "ingestion_generation": null,
   "window": {
     "since": "2026-08-25",
     "until": "2026-08-26",
@@ -38,10 +42,13 @@
         "sources": [
           "claude-code:session-1"
         ]
-      }
+      },
+      "children": []
     }
   ],
   "ingest": {
+    "refresh_attempted": false,
+    "refresh_failure": null,
     "files_read": 1,
     "files_skipped_before_window": 0,
     "unreadable_files": [],
@@ -49,6 +56,7 @@
     "replayed_occurrences": 0,
     "collisions": 0,
     "without_identity": 0,
+    "heuristic_identities": 0,
     "undated_events": 0,
     "events_outside_window": 0,
     "events_in_window": 1

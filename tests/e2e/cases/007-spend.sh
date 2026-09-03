@@ -5,7 +5,7 @@
 # quarantine count and the skip count are all asserted, in both renderings.
 
 CASE_ID="007-spend"
-CASE_DESCRIPTION="aub spend reports per-day, per-source token usage with its ingest summary over a seeded corpus."
+CASE_DESCRIPTION="aub spend refreshes the canonical ledger and reports nested day, session, project and repository token subtotals."
 
 CONFIG_FILE=""
 
@@ -59,38 +59,46 @@ case_steps() {
     step "spend text" env \
         "HOME=$STATE_DIR/home" \
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        "$AUB_BIN" spend --since 2026-08-25 --days 2
+        "$AUB_BIN" spend --since 2026-08-25 --days 2 \
+        --group-by day --group-by session --group-by project --group-by repository --refresh force
     step "spend json" env \
         "HOME=$STATE_DIR/home" \
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        "$AUB_BIN" spend --since 2026-08-25 --days 2 --format json
+        "$AUB_BIN" spend --since 2026-08-25 --days 2 \
+        --group-by day --group-by session --group-by project --group-by repository \
+        --refresh never --format json
     step "spend empty window" env \
         "HOME=$STATE_DIR/home" \
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        "$AUB_BIN" spend --since 2026-08-27
+        "$AUB_BIN" spend --since 2026-08-27 --refresh never
 }
 
 case_assertions() {
     assert_exit 0 1
-    # The replayed message counts once, at its final output, and the two earlier
-    # snapshots are replays; the quarantined record is counted, not dropped.
-    assert_stdout_contains 1 "2026-08-25 claude-code  input 2 tokens · output 913 tokens · cache read 26000 tokens · cache write 30000 tokens (complete)"
-    assert_stdout_contains 1 "2026-08-26 claude-code  input 10 tokens · output 20 tokens · cache read 0 tokens · cache write 0 tokens (complete)"
-    # Codex: the last cumulative record, with its reasoning class preserved as an unknown component.
-    assert_stdout_contains 1 "2026-08-25 codex  input 3000 tokens · output 150 tokens · cache read 1200 tokens · cache write 0 tokens · reasoning_output_tokens 15 tokens (complete)"
-    assert_stdout_contains 1 "2026-08-25 pi  input 700 tokens · output 30 tokens · cache read 0 tokens · cache write 0 tokens · reasoning 12 tokens (complete)"
-    assert_stdout_contains 1 "ingest: 3 files read, 1 skipped (unchanged before the window), 0 unreadable · 4 canonical events in window, 0 outside, 0 undated · 2 replayed occurrences, 0 collisions, 1 without identity · 1 quarantined (wrong_field_type 1)"
+    # The report reads its canonical event store: the old-mtime transcript is no
+    # longer silently skipped, while the replay is still one canonical event.
+    assert_stdout_contains 1 "grouped by day, session, project, repository"
+    assert_stdout_contains 1 "ingestion generation: 1"
+    assert_stdout_contains 1 "day=2026-08-25  input 4701 tokens · output 2092 tokens · cache read 27200 tokens · cache write 30000 tokens"
+    assert_stdout_contains 1 "day=2026-08-26  input 10 tokens · output 20 tokens · cache read 0 tokens · cache write 0 tokens"
+    assert_stdout_contains 1 "session=claude-code:s-e2e-1"
+    assert_stdout_contains 1 "project=unknown-project"
+    assert_stdout_contains 1 "repository=unknown-repository"
 
     assert_exit 0 2
     assert_json_field 2 "command" "spend"
     assert_json_field 2 "schema" "1"
     assert_json_field 2 "window.since" "2026-08-25"
-    assert_json_field 2 "groups[0].tokens.output.value" "913"
+    assert_json_field 2 "ingestion_generation" "1"
+    assert_json_field 2 "grouping[0]" "day"
+    assert_json_field 2 "grouping[1]" "session"
+    assert_json_field 2 "groups[0].tokens.output.value" "2092"
     assert_json_field 2 "groups[0].tokens.output.unit" "tokens"
-    assert_json_field 2 "groups[0].coverage" "complete"
-    assert_json_field 2 "ingest.replayed_occurrences" "2"
+    assert_json_field 2 "groups[0].coverage" "partial"
+    assert_json_field 2 "groups[0].children[0].children[0].children[0].tokens.input.unit" "tokens"
+    assert_json_field 2 "ingest.refresh_attempted" "false"
     assert_json_field 2 "ingest.quarantined.wrong_field_type" "1"
-    assert_json_field 2 "ingest.files_skipped_before_window" "1"
+    assert_json_field 2 "ingest.files_skipped_before_window" "0"
 
     # A window with no events is reported as such, never as a bare zero.
     assert_exit 0 3

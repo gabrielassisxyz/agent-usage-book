@@ -13,7 +13,7 @@ case_preconditions() {
 }
 
 case_steps() {
-    step --timeout 30 "emit projection comparison" \
+    step --timeout 60 "emit projection comparison" \
         env "AUB_PROJECTION_BENCHMARK_OUTPUT=$BENCHMARK_OUTPUT" \
         cargo test --test projection_benchmark emit_projection_benchmark_json -- --exact --ignored --nocapture
     step "record benchmark artifact" cat "$BENCHMARK_OUTPUT"

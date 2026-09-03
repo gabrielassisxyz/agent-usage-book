@@ -244,6 +244,10 @@ pub struct SpendGroup {
     pub usage: UsageVector,
     pub provenance: Provenance,
     pub derivation_id: DerivationId,
+    /// Groups requested after this one. A report with more than one grouping
+    /// dimension is a tree, so every parent subtotal has the same typed usage
+    /// vector as its children rather than a lossy scalar total.
+    pub children: Vec<SpendGroup>,
 }
 
 impl SpendGroup {
@@ -258,6 +262,34 @@ impl SpendGroup {
             usage,
             provenance,
             derivation_id,
+            children: Vec::new(),
+        }
+    }
+
+    pub fn with_children(mut self, children: Vec<SpendGroup>) -> Self {
+        self.children = children;
+        self
+    }
+}
+
+/// A supported canonical-ledger grouping dimension. Future account, task,
+/// credits, calibrated-window and valuation work extends this enum in its own
+/// bead; Phase 5 deliberately exposes token-only dimensions only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum SpendGrouping {
+    Day,
+    Session,
+    Project,
+    Repository,
+}
+
+impl SpendGrouping {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Day => "day",
+            Self::Session => "session",
+            Self::Project => "project",
+            Self::Repository => "repository",
         }
     }
 }
@@ -267,6 +299,10 @@ impl SpendGroup {
 /// nothing was unreadable and nothing fell outside the window unexplained.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IngestSummary {
+    /// Whether this report asked the ingest path to refresh the canonical ledger.
+    pub refresh_attempted: bool,
+    /// A refresh failure that left a previously known canonical subtotal readable.
+    pub refresh_failure: Option<String>,
     /// Files opened and parsed.
     pub files_read: u64,
     /// Files skipped because their modification time predates the window; an
@@ -283,6 +319,9 @@ pub struct IngestSummary {
     pub collisions: u64,
     /// Canonical events that carried no strong identity.
     pub without_identity: u64,
+    /// Distinct heuristic identities retained in the canonical ledger. This is
+    /// diagnostic evidence, separate from canonical records and replays.
+    pub heuristic_identities: u64,
     /// Canonical events whose record carried no readable timestamp; never placed
     /// in a day.
     pub undated_events: u64,
@@ -296,6 +335,31 @@ pub struct IngestSummary {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendGroupProvenance {
     pub key: LogicalName,
+    pub node: ProvenanceNode,
+}
+
+/// A non-quantity spend diagnostic that is only rendered under `--explain`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendDiagnostic {
+    CanonicalRecords,
+    ReplayedOccurrences,
+    HeuristicIdentities,
+}
+
+impl SpendDiagnostic {
+    fn report_field(self) -> ReportField {
+        match self {
+            Self::CanonicalRecords => ReportField::SpendCanonicalRecords,
+            Self::ReplayedOccurrences => ReportField::SpendReplayedOccurrences,
+            Self::HeuristicIdentities => ReportField::SpendHeuristicIdentities,
+        }
+    }
+}
+
+/// Provenance for a separately counted canonical-ledger diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendDiagnosticProvenance {
+    pub diagnostic: SpendDiagnostic,
     pub node: ProvenanceNode,
 }
 
@@ -314,6 +378,8 @@ pub struct SpendReport {
     pub since: UtcDate,
     /// The first UTC day after the window, exclusive.
     pub until: UtcDate,
+    /// The ordered dimensions the group tree follows.
+    pub grouping: Vec<SpendGrouping>,
     pub groups: Vec<SpendGroup>,
     pub provenance: ProvenanceGraph,
     pub ingest: IngestSummary,
@@ -337,10 +403,25 @@ impl SpendReport {
             metadata,
             since,
             until,
+            grouping: vec![SpendGrouping::Day],
             groups,
             provenance,
             ingest,
         }
+    }
+
+    pub fn with_grouping(mut self, grouping: Vec<SpendGrouping>) -> Self {
+        self.grouping = grouping;
+        self
+    }
+
+    pub fn with_diagnostics(mut self, diagnostics: Vec<SpendDiagnosticProvenance>) -> Self {
+        self.provenance = self.provenance.with_added(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| (diagnostic.diagnostic.report_field(), diagnostic.node)),
+        );
+        self
     }
 }
 
@@ -1057,7 +1138,21 @@ mod tests {
                 node(),
             )],
             IngestSummary::default(),
-        );
+        )
+        .with_diagnostics(vec![
+            SpendDiagnosticProvenance {
+                diagnostic: SpendDiagnostic::CanonicalRecords,
+                node: node(),
+            },
+            SpendDiagnosticProvenance {
+                diagnostic: SpendDiagnostic::ReplayedOccurrences,
+                node: node(),
+            },
+            SpendDiagnosticProvenance {
+                diagnostic: SpendDiagnostic::HeuristicIdentities,
+                node: node(),
+            },
+        ]);
         let coverage = test_coverage_report(m.clone());
         let export = ExportReport::new(m.clone(), ExportKey::Run, true, vec![], 0, node());
         let calibrate = CalibrateReport::new(
@@ -1078,6 +1173,9 @@ mod tests {
             ReportField::SpendGroupTokens {
                 key: LogicalName::new("by-day"),
             },
+            ReportField::SpendCanonicalRecords,
+            ReportField::SpendReplayedOccurrences,
+            ReportField::SpendHeuristicIdentities,
             ReportField::Coverage {
                 account: LogicalName::new("research"),
             },
@@ -1092,6 +1190,11 @@ mod tests {
                 }
                 ReportField::SpendGroupTokens { key } => {
                     assert!(spend.provenance.resolve(field).is_some(), "{key:?}");
+                }
+                ReportField::SpendCanonicalRecords
+                | ReportField::SpendReplayedOccurrences
+                | ReportField::SpendHeuristicIdentities => {
+                    assert!(spend.provenance.resolve(field).is_some(), "{field:?}");
                 }
                 ReportField::Coverage { account } => {
                     assert!(coverage.provenance.resolve(field).is_some(), "{account:?}");

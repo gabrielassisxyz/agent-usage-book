@@ -191,11 +191,20 @@ pub fn render_spend_report(report: &SpendReport) -> String {
 
 /// Renders a spend report, optionally including the explain block.
 pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMode) -> String {
+    let grouping = report
+        .grouping
+        .iter()
+        .map(|dimension| dimension.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
     let mut lines = vec![format!(
-        "spend from {} to {} (UTC days, end exclusive), by day and source",
+        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}",
         report.since.iso(),
         report.until.iso()
     )];
+    if let Some(generation) = report.metadata.ingestion_generation {
+        lines.push(format!("ingestion generation: {}", generation.get()));
+    }
     if report.groups.is_empty() {
         lines.push(format!(
             "no usage events in the window: {} canonical events read, {} outside it, {} undated",
@@ -205,7 +214,7 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
         ));
     }
     for group in &report.groups {
-        lines.push(render_spend_group(group));
+        render_spend_group(group, 0, &mut lines);
     }
     lines.push(render_ingest_summary(report));
     let report_text = lines.join("\n");
@@ -301,7 +310,7 @@ pub fn render_explain(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
     lines.join("\n")
 }
 
-fn render_spend_group(group: &SpendGroup) -> String {
+fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>) {
     let known = group.usage.known();
     let mut parts: Vec<String> = TokenKind::ALL
         .iter()
@@ -320,12 +329,16 @@ fn render_spend_group(group: &SpendGroup) -> String {
         Some(term) => term,
         None => coverage_term(group.usage.coverage()),
     };
-    format!(
-        "{}  {} ({})",
+    lines.push(format!(
+        "{}{}  {} ({})",
+        "  ".repeat(depth),
         group.key.as_str(),
         parts.join(" · "),
         qualification.term()
-    )
+    ));
+    for child in &group.children {
+        render_spend_group(child, depth + 1, lines);
+    }
 }
 
 fn render_count(raw: u64) -> String {
@@ -363,6 +376,12 @@ fn render_ingest_summary(report: &SpendReport) -> String {
         ingest.without_identity,
         quarantined
     );
+    if ingest.refresh_attempted {
+        line.push_str(" · refresh requested");
+    }
+    if let Some(failure) = &ingest.refresh_failure {
+        line.push_str(&format!(" · refresh incomplete: {failure}"));
+    }
     if !by_class.is_empty() {
         line.push_str(&format!(" ({by_class})"));
     }

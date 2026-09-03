@@ -17,7 +17,8 @@ pub use models::{
     CoverageReport, CoverageReset, CoverageThreshold, DoctorReport, ExportReport, IngestReport,
     IngestSummary, IngestionGeneration, LedgerGeneration, LimitingWindow, MeterAccount,
     MeterReadingProvenance, NowReport, ProjectionReadState, ReportMetadata, SampleAttempt,
-    SampleReport, SpendGroup, SpendGroupProvenance, SpendReport, StatusReport, TaskReport,
+    SampleReport, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup, SpendGroupProvenance,
+    SpendGrouping, SpendReport, StatusReport, TaskReport,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

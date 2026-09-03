@@ -23,6 +23,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
@@ -355,6 +356,22 @@ pub fn insert_observation(
     .map_err(|e| Error::Store(format!("cannot record the observation preference: {e}")))?;
 
     Ok(row_id)
+}
+
+/// Counts the observation rows a ledger holds: the recovery's headline number.
+/// A restore asserts this count equals what the source held, exactly, because
+/// a replay that duplicated an observation would make the recovered series a
+/// different series than the one that was lost, and the difference would be
+/// invisible in any smaller check (PLAN.md section 38, step 6).
+pub fn observation_row_count(conn: &rusqlite::Connection) -> Result<RowCount, Error> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM meter_observation", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| Error::Store(format!("cannot count meter observations: {e}")))?;
+    Ok(RowCount::new(u64::try_from(count).map_err(|_| {
+        Error::Internal(format!("meter_observation count {count} is negative"))
+    })?))
 }
 
 const SELECT_OBSERVATION_COLUMNS: &str = "
