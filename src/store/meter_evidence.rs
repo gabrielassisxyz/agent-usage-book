@@ -561,8 +561,7 @@ pub fn newest_observation_for_account(
     account_id: AccountId,
 ) -> Result<Option<StoredMeterObservation>, Error> {
     conn.query_row(
-        &format!(
-            "SELECT meter_observation.id AS id,
+        "SELECT meter_observation.id AS id,
                     meter_observation.attempt_id AS attempt_id,
                     meter_observation.evidence_id AS evidence_id,
                     meter_observation.account_id AS account_id,
@@ -579,8 +578,7 @@ pub fn newest_observation_for_account(
              FROM meter_observation
              JOIN meter_attempt ON meter_attempt.id = meter_observation.attempt_id
              WHERE meter_attempt.account_id = ?1
-             ORDER BY meter_observation.id DESC LIMIT 1"
-        ),
+             ORDER BY meter_observation.id DESC LIMIT 1",
         params![account_id.value()],
         row_to_observation,
     )

@@ -1383,7 +1383,13 @@ mod tests {
                     "the next due instant is the cadence boundary from the fresh attempt"
                 );
             }
-            other => panic!("the fresh account must be not yet due, got {other:?}"),
+            other @ (AccountDisposition::DueLookupFailed { .. }
+            | AccountDisposition::LeaseHeld { .. }
+            | AccountDisposition::EligibilityFailed { .. }
+            | AccountDisposition::Sampled(_)
+            | AccountDisposition::PersistFailed { .. }) => {
+                panic!("the fresh account must be not yet due, got {other:?}")
+            }
         }
         assert_eq!(
             transport.calls("fresh"),
@@ -1687,7 +1693,9 @@ mod tests {
                 match &entry.disposition {
                     AccountDisposition::Sampled(_) => sampled_count += 1,
                     AccountDisposition::NotYet { .. } | AccountDisposition::LeaseHeld { .. } => {}
-                    other => panic!(
+                    other @ (AccountDisposition::DueLookupFailed { .. }
+                    | AccountDisposition::EligibilityFailed { .. }
+                    | AccountDisposition::PersistFailed { .. }) => panic!(
                         "a loser must report why it did not sample, never sample twice: {other:?}"
                     ),
                 }
@@ -1737,7 +1745,11 @@ mod tests {
             .flat_map(|report| report.accounts.iter())
             .find_map(|entry| match &entry.disposition {
                 AccountDisposition::Sampled(sampled) => sampled.publication.published_generation(),
-                _ => None,
+                AccountDisposition::NotYet { .. }
+                | AccountDisposition::DueLookupFailed { .. }
+                | AccountDisposition::LeaseHeld { .. }
+                | AccountDisposition::EligibilityFailed { .. }
+                | AccountDisposition::PersistFailed { .. } => None,
             })
             .expect("the winning invocation published");
         let conn = open(
