@@ -732,18 +732,17 @@ fn the_contract_suite_passes_over_the_real_socket() {
         ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
     );
 
-    // 12. unknown additional field: measured, and the payload is retained for
-    // the capsule builder (aub-eun.5 owns retention).
-    let obs = observe_outcome(
-        &transport,
-        &credential,
-        &request,
-        &clock,
-        fixture_body("unknown-fields.json"),
-    );
-    match obs {
-        ProviderObservation::Measured(ref r) => {
-            assert!(r.raw_payload.is_some());
+    // 12. unknown additional field: measured, and the field is retained in
+    // the evidence capsule (aub-eun.5 owns retention), over the real socket.
+    let server = SyntheticServer::start(vec![fixture_body("unknown-fields.json")]).unwrap();
+    let adapter = AnthropicAdapter::with_endpoint(server.url());
+    let captured = adapter.observe_with_evidence(&credential, &request, &transport, &clock);
+    match captured.observation {
+        ProviderObservation::Measured(_) => {
+            let capsule = captured
+                .evidence
+                .expect("a 200 response must carry an evidence capsule");
+            assert!(capsule.serialized().contains("unknown_top_level_metric"));
         }
         other => panic!("case 12 expected Measured, got {other:?}"),
     }

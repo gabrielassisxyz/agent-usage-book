@@ -247,12 +247,17 @@ fn contract_all_fourteen_cases() {
         ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
     );
 
-    // 12. unknown additional field
+    // 12. unknown additional field: retention is the evidence capsule's job
+    // (aub-eun.5), not the normalized reading's.
     let body = read_fixture("unknown-fields.json");
-    let obs = adapter.observe(&cred, &req, &MockTransport::ok(200, body), &clock);
-    match obs {
-        ProviderObservation::Measured(r) => {
-            assert!(r.raw_payload.is_some());
+    let captured =
+        adapter.observe_with_evidence(&cred, &req, &MockTransport::ok(200, body), &clock);
+    match captured.observation {
+        ProviderObservation::Measured(_) => {
+            let capsule = captured
+                .evidence
+                .expect("a 200 response must carry an evidence capsule");
+            assert!(capsule.serialized().contains("unknown_top_level_metric"));
         }
         other => panic!("case 12 expected Measured, got {other:?}"),
     }
