@@ -97,13 +97,33 @@ pub enum DiagnosticEvent {
     /// from a run's log is itself the proof that a refused run never reached the
     /// network.
     RequestAttempted,
+    /// One bounded ingest batch committed (`aub-lqe.18`). `batch` and
+    /// `generation` are the stable identifiers that correlate the batch with
+    /// its rows and the report; `writer_slot` is the hold the budget judges.
+    IngestBatchLanded,
+    /// A meter terminal bundle committed through the repository boundary.
+    /// `attempt` is the attempt the evidence belongs to and `busy_wait` is how
+    /// long the commit waited for the writer slot before it could run.
+    MeterAttemptCommitted,
+    /// A meter terminal bundle was spooled durably instead of committed: the
+    /// writer slot stayed held longer than the caller's bound, and the record
+    /// remains discoverable by the next drain. `attempt` names the evidence.
+    MeterEvidenceSpooled,
+    /// One pending-spool drain pass finished. `applied`, `already_applied` and
+    /// `quarantined` are the three dispositions, counted; the pass that applies
+    /// nothing still reports itself so a log shows the drain ran.
+    MeterSpoolDrained,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 7] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
+        Self::IngestBatchLanded,
+        Self::MeterAttemptCommitted,
+        Self::MeterEvidenceSpooled,
+        Self::MeterSpoolDrained,
     ];
 
     pub fn name(self) -> &'static str {
@@ -111,6 +131,10 @@ impl DiagnosticEvent {
             Self::RunStarted => "run_started",
             Self::ReportRendered => "report_rendered",
             Self::RequestAttempted => "request_attempted",
+            Self::IngestBatchLanded => "ingest_batch_landed",
+            Self::MeterAttemptCommitted => "meter_attempt_committed",
+            Self::MeterEvidenceSpooled => "meter_evidence_spooled",
+            Self::MeterSpoolDrained => "meter_spool_drained",
         }
     }
 
@@ -123,6 +147,10 @@ impl DiagnosticEvent {
             Self::RunStarted => "command",
             Self::ReportRendered => "report_kind",
             Self::RequestAttempted => "command",
+            Self::IngestBatchLanded => "batch, events, writer_slot, generation",
+            Self::MeterAttemptCommitted => "attempt, busy_wait",
+            Self::MeterEvidenceSpooled => "attempt",
+            Self::MeterSpoolDrained => "applied, already_applied, quarantined",
         }
     }
 }

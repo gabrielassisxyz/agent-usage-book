@@ -7,8 +7,20 @@
 //! report can be reproduced against a fixed ingestion generation. This module
 //! is the separated half: it walks the configured sources, parses what the
 //! caller asked for, deduplicates, and lands the batch through
-//! [`crate::store::ingest::persist_ingest_batch`] in one transaction, advancing
-//! the transcript ingestion generation the transaction's rows belong to.
+//! [`crate::store::ingest::persist_ingest_batch`] in bounded transactions
+//! (`aub-lqe.18`, PLAN.md 11.2, 17, 34.6), advancing the transcript ingestion
+//! generation each transaction's rows belong to.
+//!
+//! Batching is the concurrency obligation. One pass-sized transaction would
+//! hold the single SQLite writer slot for the whole corpus, starving meter
+//! writes behind it; so the pass splits into transactions of at most
+//! `config.ingest.max_batch_events` canonical events and yields the writer
+//! slot between batches. Each batch commits atomically or not at all; a crash
+//! mid-pass leaves only whole batches, and a re-run converges by replay:
+//! deduplication collapses what already landed. Watermarks are the exception
+//! that proves the rule: they land in the final batch, because a watermark
+//! claiming a file consumed while its events are still unlanded would let a
+//! later `--changed-only` pass skip exactly the rows a crash dropped.
 //!
 //! Two modes. The default pass parses every discovered file whole, and each
 //! file's fresh parse replaces its previous contribution, so a parser-version
@@ -32,6 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::time::Duration;
 
 use rusqlite::Connection;
 
@@ -40,7 +53,7 @@ use crate::dedup::{
     HeuristicKeyCollision, canonical_identity, canonical_payload_digest, deduplicate,
 };
 use crate::domain::ids::SourceNamespace;
-use crate::domain::time::UtcTimestamp;
+use crate::domain::time::{Clock, MonotonicDuration, UtcTimestamp};
 use crate::error::Error;
 use crate::store::ingest::PersistEvent;
 use crate::store::ingest_quarantine::{DedupCollisionDescriptor, NewQuarantineItem};
@@ -82,22 +95,61 @@ pub struct IngestReport {
     pub quarantined: u64,
     /// The generation the pass landed as, from the transaction's advance.
     pub generation: crate::store::ingestion_generation::Generation,
-    /// Rows landed, as the persistence path counted them.
+    /// Rows landed, as the persistence path counted them, summed over every
+    /// batch the pass landed; `generation` is the final batch's.
     pub outcome: crate::store::ingest::PersistOutcome,
+    /// One row per batch the pass landed, in landing order, with the writer
+    /// slot each batch held. The per-batch measurements the contention budget
+    /// is judged against live here and in the diagnostics, not only in sums.
+    pub batches: Vec<LandedBatch>,
 }
+
+/// One committed batch of an ingest pass, as the diagnostics and the report
+/// name it. The stable identifiers are the batch's index within the pass and
+/// the generation it landed as; a log line carrying both correlates the batch
+/// with the rows and the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedBatch {
+    /// The batch's index within the pass, counting from 1.
+    pub index: u64,
+    /// Canonical events the batch landed.
+    pub events: u64,
+    /// How long the batch held the SQLite writer slot.
+    pub writer_slot: MonotonicDuration,
+    /// The ingestion generation this batch landed as.
+    pub generation: crate::store::ingestion_generation::Generation,
+}
+
+/// The interval the pass yields the writer slot for between two consecutive
+/// batches. SQLite holds no queue: the next batch's BEGIN IMMEDIATE would
+/// otherwise race any writer already waiting, and a pass of many back-to-back
+/// batches could keep winning the slot it just released. One millisecond is
+/// far wider than a scheduler quantum for the waiting writer's retry, and a
+/// whole multi-thousand-batch pass pays seconds for it at most.
+const INTER_BATCH_YIELD: Duration = Duration::from_millis(1);
 
 /// Reads every configured transcript source and lands the parsed batch.
 ///
-/// One pass, one transaction: every row the pass writes, and the generation
-/// it is reported under, commit together or not at all. A file that cannot be
-/// read is named in the report and the remaining files still land; the caller
-/// decides the exit class from `unreadable_files`.
+/// One pass, bounded batches: the canonical events split into transactions of
+/// at most `config.ingest.max_batch_events`, each transaction atomic, the
+/// writer slot yielded between consecutive batches. Every row the pass writes,
+/// and the generation it is reported under, commit together or not at all
+/// within one batch. A file that cannot be read is named in the report and the
+/// remaining files still land; the caller decides the exit class from
+/// `unreadable_files`.
+///
+/// `batch_sink` observes each landed batch as it commits, in landing order,
+/// so a caller can emit the structured diagnostics that correlate batches by
+/// stable identifiers while the pass is still running. A sink error is a run
+/// error: diagnostics that silently stop mid-pass would read as progress.
 pub fn run(
     conn: &mut Connection,
     config: &Config,
     options: &IngestOptions,
-    now: UtcTimestamp,
+    clock: &impl Clock,
+    batch_sink: &mut dyn FnMut(&LandedBatch) -> Result<(), Error>,
 ) -> Result<IngestReport, Error> {
+    let now = clock.now();
     let sources = ingest_sources(config, options)?;
     let discovered = discover(&sources, &DiscoveryOptions::default()).map_err(discovery_error)?;
 
@@ -204,7 +256,7 @@ pub fn run(
     // One deduplication over the whole pass, exactly like the report path:
     // one message replayed across two configured roots is still one message.
     let deduplicated = deduplicate(events);
-    let collisions = collision_descriptors(&deduplicated.heuristic_collisions, now);
+    let mut collisions = collision_descriptors(&deduplicated.heuristic_collisions, now);
     let quarantined = quarantined_items.len() as u64 + collisions.len() as u64;
 
     let mut persist_events = Vec::with_capacity(deduplicated.canonical.len());
@@ -230,16 +282,116 @@ pub fn run(
         });
     }
 
-    let pass = crate::store::ingest::IngestPass {
-        events: persist_events,
-        sessions: session_pass(&deduplicated.canonical),
-        watermarks,
-        quarantined: quarantined_items,
-        collisions,
-        whole_file_sources,
-        created_at: now,
+    // Bounded batches (PLAN.md section 11.2): the pass lands its canonical
+    // events in transactions of at most the configured maximum, yielding the
+    // writer slot between consecutive batches. What rides with which batch is
+    // decided here, once, so each transaction stays atomic and the pass
+    // converges on a re-run after any interruption:
+    //
+    //   events        the chunk they were split into;
+    //   sessions      the bounds the chunk's own events imply;
+    //   watermarks    the final batch only: a watermark must never claim a
+    //                 file consumed while its events are still unlanded;
+    //   quarantine    the first batch, evidence of what was parsed, not of
+    //                 what landed;
+    //   whole-file    the chunk carrying that file's first event, so the old
+    //   replacement   contribution is deleted before the fresh rows land; a
+    //                 file that produced no events at all deletes its old
+    //                 contribution in the final batch, the last opinion the
+    //                 pass states about it.
+    let max_batch_events = config.ingest.max_batch_events as usize;
+    let mut first_chunk_of_file: BTreeMap<String, usize> = BTreeMap::new();
+    for (index, chunk) in persist_events.chunks(max_batch_events).enumerate() {
+        for persist in chunk {
+            first_chunk_of_file
+                .entry(persist.event.source_file().to_string())
+                .or_insert(index);
+        }
+    }
+
+    let mut batches: Vec<LandedBatch> = Vec::new();
+    let mut totals = crate::store::ingest::PersistOutcome {
+        events_written: crate::domain::rows::RowCount::new(0),
+        events_already_ingested: crate::domain::rows::RowCount::new(0),
+        occurrences_written: crate::domain::rows::RowCount::new(0),
+        occurrences_already_ingested: crate::domain::rows::RowCount::new(0),
+        components_written: crate::domain::rows::RowCount::new(0),
+        sessions_upserted: crate::domain::rows::RowCount::new(0),
+        rows_replaced: crate::domain::rows::RowCount::new(0),
+        quarantined_recorded: crate::domain::rows::RowCount::new(0),
+        generation: crate::store::ingestion_generation::Generation::new(0),
+        writer_slot: MonotonicDuration::from_nanos(0),
     };
-    let outcome = crate::store::ingest::persist_ingest_batch(conn, &pass)?;
+
+    for (index, chunk) in persist_events.chunks(max_batch_events).enumerate() {
+        let total_chunks = persist_events.len().div_ceil(max_batch_events);
+        if index > 0 {
+            // Yield the writer slot between consecutive batches so a meter
+            // write waiting for the slot is served after one batch's hold,
+            // never behind the whole pass.
+            std::thread::sleep(INTER_BATCH_YIELD);
+        }
+        let last = index + 1 == total_chunks;
+
+        let whole_file_chunk: Vec<String> = whole_file_sources
+            .iter()
+            .filter(|file| {
+                first_chunk_of_file
+                    .get(file.as_str())
+                    .map(|first| *first == index)
+                    .unwrap_or(last)
+            })
+            .cloned()
+            .collect();
+
+        let pass = crate::store::ingest::IngestPass {
+            events: chunk.to_vec(),
+            sessions: session_pass(chunk.iter().map(|persist| &persist.event)),
+            watermarks: if last { std::mem::take(&mut watermarks) } else { Vec::new() },
+            quarantined: if index == 0 {
+                std::mem::take(&mut quarantined_items)
+            } else {
+                Vec::new()
+            },
+            collisions: if index == 0 {
+                std::mem::take(&mut collisions)
+            } else {
+                Vec::new()
+            },
+            whole_file_sources: whole_file_chunk,
+            created_at: now,
+        };
+        let outcome = crate::store::ingest::persist_ingest_batch(conn, &pass, clock)?;
+
+        totals.events_written = sum_rows(totals.events_written, outcome.events_written);
+        totals.events_already_ingested =
+            sum_rows(totals.events_already_ingested, outcome.events_already_ingested);
+        totals.occurrences_written =
+            sum_rows(totals.occurrences_written, outcome.occurrences_written);
+        totals.occurrences_already_ingested = sum_rows(
+            totals.occurrences_already_ingested,
+            outcome.occurrences_already_ingested,
+        );
+        totals.components_written = sum_rows(totals.components_written, outcome.components_written);
+        totals.sessions_upserted = sum_rows(totals.sessions_upserted, outcome.sessions_upserted);
+        totals.rows_replaced = sum_rows(totals.rows_replaced, outcome.rows_replaced);
+        totals.quarantined_recorded =
+            sum_rows(totals.quarantined_recorded, outcome.quarantined_recorded);
+        totals.generation = outcome.generation;
+        totals.writer_slot = MonotonicDuration::from_nanos(
+            totals.writer_slot.as_nanos() + outcome.writer_slot.as_nanos(),
+        );
+
+        let landed = LandedBatch {
+            index: index as u64 + 1,
+            events: outcome.events_written.value() + outcome.events_already_ingested.value(),
+            writer_slot: outcome.writer_slot,
+            generation: outcome.generation,
+        };
+        batch_sink(&landed)?;
+        batches.push(landed);
+    }
+
     Ok(IngestReport {
         sources: discovered
             .iter()
@@ -250,9 +402,15 @@ pub fn run(
         files_skipped,
         unreadable_files,
         quarantined,
-        generation: outcome.generation,
-        outcome,
+        generation: totals.generation,
+        outcome: totals,
+        batches,
     })
+}
+
+/// Adds two row counts, the fold the multi-batch report sums with.
+fn sum_rows(left: crate::domain::rows::RowCount, right: crate::domain::rows::RowCount) -> crate::domain::rows::RowCount {
+    crate::domain::rows::RowCount::new(left.value() + right.value())
 }
 
 /// The configured sources this pass covers, filtered by the options.
@@ -360,9 +518,9 @@ fn collision_descriptors(
 }
 
 /// Session rows the pass's canonical events imply, bounds aggregated over the
-/// pass. A session whose events all lack a timestamp has no bounds to state,
-/// so it produces no row: an invented bound would be a fabricated fact.
-fn session_pass(events: &[NormalizedUsageEvent]) -> Vec<NewSession> {
+/// given events. A session whose events all lack a timestamp has no bounds to
+/// state, so it produces no row: an invented bound would be a fabricated fact.
+fn session_pass<'a>(events: impl IntoIterator<Item = &'a NormalizedUsageEvent>) -> Vec<NewSession> {
     let mut bounds: BTreeMap<(String, String), (Option<UtcTimestamp>, Option<UtcTimestamp>)> =
         BTreeMap::new();
     for event in events {

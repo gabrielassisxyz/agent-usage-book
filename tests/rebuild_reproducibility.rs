@@ -14,7 +14,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::config::{FakeEnv, Overrides, resolve};
 use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
-use agent_usage_book::ingest::{IngestOptions, run as run_ingest};
+use agent_usage_book::ingest::IngestOptions;
+use agent_usage_book::ingest::run as run_ingest_with_sink;
+
+/// Runs one ingest pass under a fixture clock with a sink that asserts nothing,
+/// so every call site below names the behaviour instead of the new plumbing.
+fn run_ingest(
+    conn: &mut rusqlite::Connection,
+    config: &agent_usage_book::config::Config,
+    options: &IngestOptions,
+    now: UtcTimestamp,
+) -> Result<agent_usage_book::ingest::IngestReport, agent_usage_book::error::Error> {
+    run_ingest_with_sink(conn, config, options, &FakeClock::new(now), &mut |_| Ok(()))
+}
 use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
 use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::migrations::registry;

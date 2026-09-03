@@ -174,6 +174,20 @@ pub struct SamplingConfig {
     pub command_budget: MonotonicDuration,
 }
 
+/// The transcript ingest batch policy (PLAN.md section 11.2: "Transcript ingest
+/// commits in bounded batches so it cannot monopolize the single SQLite writer
+/// slot"). One ingest pass lands its canonical usage events in transactions of
+/// at most `max_batch_events` events, releasing the writer slot between
+/// batches, so a concurrent meter write never waits behind one unbounded pass.
+#[derive(Debug, Clone)]
+pub struct IngestConfig {
+    /// The maximum number of canonical usage events one ingest batch lands in
+    /// one transaction. A batch commits atomically or not at all; the bound
+    /// caps how long any one batch can hold the writer slot. The value must be
+    /// at least 1: a zero bound would mean no batch could ever land a row.
+    pub max_batch_events: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct FreshnessConfig {
     pub meter: MonotonicDuration,
@@ -231,6 +245,7 @@ pub struct Config {
     pub freshness: FreshnessConfig,
     pub coverage: CoverageConfig,
     pub accounts: Vec<AccountConfig>,
+    pub ingest: IngestConfig,
     pub transcripts: Vec<TranscriptConfig>,
     pub tracker: Option<TrackerConfig>,
     pub valuation: ValuationConfig,
@@ -248,6 +263,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "schema",
     "state",
     "sampling",
+    "ingest",
     "freshness",
     "coverage",
     "accounts",
@@ -266,6 +282,7 @@ const SAMPLING_KEYS: &[&str] = &[
     "request_timeout",
     "command_budget",
 ];
+const INGEST_KEYS: &[&str] = &["max_batch_events"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
@@ -323,6 +340,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("sampling").and_then(toml::Value::as_table) {
         check_keys(t, SAMPLING_KEYS, "sampling", file_display)?;
+    }
+    if let Some(t) = table.get("ingest").and_then(toml::Value::as_table) {
+        check_keys(t, INGEST_KEYS, "ingest", file_display)?;
     }
     if let Some(t) = table.get("freshness").and_then(toml::Value::as_table) {
         check_keys(t, FRESHNESS_KEYS, "freshness", file_display)?;
@@ -461,6 +481,38 @@ fn resolve_duration(
     parse_duration(&raw).map_err(|e| Error::Usage(format!("{key}: {e}")))
 }
 
+/// Resolves a positive integer count: the four-level string order, then a
+/// parse that refuses zero and every non-number with the key named, so a
+/// mistyped value is a usage error rather than a silently zero batch bound.
+fn resolve_positive_count(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<u64, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a positive integer")))?;
+    if parsed == 0 {
+        return Err(Error::Usage(format!(
+            "{key}: must be at least 1, got {raw:?}"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn resolve_floor(
     key: &str,
     overrides: &Overrides,
@@ -534,6 +586,18 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?),
+    };
+
+    let ingest = IngestConfig {
+        max_batch_events: resolve_positive_count(
+            "ingest.max_batch_events",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "ingest", "max_batch_events"),
+            Some("5000"),
+            &file_display,
+            &mut provenance,
+        )?,
     };
 
     let sampling = SamplingConfig {
@@ -756,6 +820,7 @@ pub fn resolve(
         Config {
             state,
             sampling,
+            ingest,
             freshness,
             coverage,
             accounts,
@@ -981,6 +1046,35 @@ pattern = "**/*.jsonl"
         assert_eq!(config.transcripts.len(), 1);
         assert_eq!(config.transcripts[0].pattern, "**/*.jsonl");
         assert_eq!(provenance.get("accounts"), Some(ConfigSource::File));
+    }
+
+    /// The ingest batch bound defaults, is file-overridable and is provenance-
+    /// tracked like every other scalar section; a zero or non-numeric value is a
+    /// usage error naming the key, never a silently degenerate batch bound.
+    #[test]
+    fn ingest_batch_bound_resolves_and_refuses_zero_or_garbage() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(config.ingest.max_batch_events, 5000);
+        assert_eq!(
+            provenance.get("ingest.max_batch_events"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "\n[ingest]\nmax_batch_events = 250\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.ingest.max_batch_events, 250);
+        assert_eq!(
+            provenance.get("ingest.max_batch_events"),
+            Some(ConfigSource::File)
+        );
+
+        let zero = "\n[ingest]\nmax_batch_events = 0\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(zero)).unwrap_err();
+        assert!(error.to_string().contains("ingest.max_batch_events"), "{error}");
+
+        let garbage = "\n[ingest]\nmax_batch_events = \"lots\"\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
+        assert!(error.to_string().contains("ingest.max_batch_events"), "{error}");
     }
 
     #[test]

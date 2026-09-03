@@ -42,13 +42,15 @@ use crate::domain::window::{
 use crate::error::Error;
 use crate::store::account::AccountId;
 use crate::store::meter_attempt::{
-    MeterAttemptRowId, NewMeterAttemptResult, attempt_outcome_from_sql,
+    MeterAttemptRowId, NewMeterAttemptResult, attempt_outcome_as_sql, attempt_outcome_from_sql,
+    outcome_failure_fields,
 };
 use crate::store::meter_evidence::{
     NewMeterResponseEvidence, measurement_basis_sql, quantization_sql,
 };
 use crate::store::repository::{
-    NewMeterInterpretation, TerminalMeterBundle, commit_terminal_bundle_on_connection,
+    NewMeterInterpretation, Repository, TerminalBundleIds, TerminalMeterBundle,
+    commit_terminal_bundle_on_connection,
 };
 use crate::store::startup::{create_file_mode_0600, ensure_dir_mode_0700};
 
@@ -280,6 +282,79 @@ fn required_str(value: &Value, field: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing or non-string field {field:?}"))
 }
 
+impl PendingTerminalBundle {
+    /// The flat durable form of a terminal bundle the live path already holds
+    /// as domain types: the exact inverse of the reconstruction a drain
+    /// performs, so a bundle spooled now and drained later round-trips into
+    /// the same commit. The conversion is infallible because the bundle's
+    /// fields are already valid domain values; only the flattening happens
+    /// here, and the outcome's failure fields go through the one mapping the
+    /// live insert uses (`outcome_failure_fields`), so the two durable
+    /// spellings of one outcome cannot drift apart.
+    pub fn from_bundle(bundle: &TerminalMeterBundle) -> Self {
+        let result = bundle.result();
+        let evidence = bundle.evidence();
+        let interpretation = bundle.interpretation();
+        let (failure_class, retry_after_nanos) = outcome_failure_fields(&result.outcome);
+        Self {
+            attempt_id: result.attempt_id.value(),
+            completed_at_nanos: result.completed_at.unix_nanos(),
+            elapsed_nanos: result.elapsed.as_nanos() as i64,
+            outcome: attempt_outcome_as_sql(&result.outcome).to_owned(),
+            failure_class,
+            retry_after_nanos,
+            sanitized_error_classification: result.sanitized_error_classification.clone(),
+            retry_index: result.retry_index.map(i64::from),
+            clock_anomaly: result.clock_anomaly,
+            response_classification: evidence.response_classification.clone(),
+            received_at_nanos: evidence.received_at.unix_nanos(),
+            provider_observed_at_original: evidence.provider_observed_at_original.clone(),
+            evidence_capsule: evidence.evidence_capsule.clone(),
+            capsule_schema_version: evidence.capsule_schema_version.clone(),
+            sanitizer_version: evidence.sanitizer_version.clone(),
+            capture_truncated: evidence.capture_truncated,
+            account_id: interpretation.account_id.value(),
+            provider: interpretation.provider.clone(),
+            provider_observed_at_nanos: interpretation
+                .provider_observed_at
+                .map(|at| at.unix_nanos()),
+            measurement_basis: measurement_basis_sql::as_sql(interpretation.measurement_basis)
+                .to_owned(),
+            observed_plan: interpretation.observed_plan.clone(),
+            observed_tier: interpretation.observed_tier.clone(),
+            adapter_version: interpretation.adapter_version.as_str().to_owned(),
+            provider_contract_id: interpretation.provider_contract_id.as_str().to_owned(),
+            meter_semantics_id: interpretation.meter_semantics_id.as_str().to_owned(),
+            normalized_fingerprint: interpretation.normalized_fingerprint.clone(),
+            windows: bundle
+                .windows()
+                .iter()
+                .map(pending_window_from_window)
+                .collect(),
+        }
+    }
+}
+
+/// One window's flat durable form, the inverse of [`reconstruct_window`].
+fn pending_window_from_window(window: &MeterWindow) -> PendingWindow {
+    let (scope_kind, scoped_model) = match window.scope() {
+        WindowScope::AccountWide => ("account_wide".to_owned(), None),
+        WindowScope::ModelSpecific(model) => {
+            ("model_specific".to_owned(), Some(model.as_str().to_owned()))
+        }
+    };
+    PendingWindow {
+        semantic_key: window.semantic_key().as_str().to_owned(),
+        scope_kind,
+        scoped_model,
+        quota_used_ppm: i64::from(window.quota_used().as_ppm().get()),
+        reported_resolution_ppm: i64::from(window.reported_resolution().as_ppm().get()),
+        quantization: quantization_sql::as_sql(window.quantization()).to_owned(),
+        resets_at_nanos: window.resets_at().unix_nanos(),
+        nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
+    }
+}
+
 fn optional_str(value: &Value, field: &str) -> Option<String> {
     value.get(field).and_then(Value::as_str).map(str::to_owned)
 }
@@ -405,6 +480,70 @@ pub fn spool_pending(state_dir: &Path, bundle: &PendingTerminalBundle) -> Result
     drop(file);
     rename_into_place(state_dir, bundle.attempt_id, &temp_path)?;
     fsync_pending_dir(state_dir)
+}
+
+/// What [`spool_then_commit`] did with one terminal bundle, and how long the
+/// commit waited for the writer slot before it could run (or give up).
+#[derive(Debug)]
+pub enum SpoolCycleOutcome {
+    /// The bundle committed into SQLite and the pending record was deleted:
+    /// PLAN.md section 13's steps 5 through 7 completed. `commit_wait` is how
+    /// long the commit call took, which under contention is dominated by the
+    /// wait for the writer slot.
+    Committed {
+        ids: TerminalBundleIds,
+        commit_wait: crate::domain::time::MonotonicDuration,
+    },
+    /// The bundle could not commit (the writer slot stayed held past the
+    /// caller's busy bound, or the database refused), so the record remains
+    /// durably spooled and the next drain applies it. The error is returned
+    /// inside the outcome rather than propagated, because the spool means the
+    /// evidence is safe: the caller reports the store failure without the
+    /// observation being lost.
+    LeftPending {
+        error: Error,
+        commit_wait: crate::domain::time::MonotonicDuration,
+    },
+}
+
+/// The meter evidence cycle the sampling flow is specified as (PLAN.md
+/// section 13, steps 5 to 7): spool the terminal bundle durably, commit it
+/// through the same atomic repository boundary live sampling uses, and delete
+/// the pending record only once the commit is durable. A commit that cannot
+/// run leaves the record in the spool, which is the whole point: an
+/// irreplaceable meter result never disappears because SQLite was busy, and a
+/// crash between the spool and the commit leaves exactly the state a drain
+/// recovers once. A commit that succeeds removes the record, so replay after
+/// a post-commit crash finds evidence already present and deletes the file as
+/// a no-op.
+pub fn spool_then_commit(
+    repository: &Repository,
+    bundle: &TerminalMeterBundle,
+    clock: &impl crate::domain::time::Clock,
+) -> Result<SpoolCycleOutcome, Error> {
+    let state_dir = repository
+        .database_path()
+        .parent()
+        .unwrap_or_else(|| Path::new(""));
+    spool_pending(state_dir, &PendingTerminalBundle::from_bundle(bundle))?;
+    let commit_start = clock.monotonic_now();
+    match repository.commit_terminal_bundle(bundle) {
+        Ok(commit) => {
+            let commit_wait = clock.monotonic_now().duration_since(commit_start);
+            remove_pending_file(&pending_file_path(
+                state_dir,
+                bundle.result().attempt_id.value(),
+            ))?;
+            Ok(SpoolCycleOutcome::Committed {
+                ids: commit.ids,
+                commit_wait,
+            })
+        }
+        Err(error) => Ok(SpoolCycleOutcome::LeftPending {
+            error,
+            commit_wait: clock.monotonic_now().duration_since(commit_start),
+        }),
+    }
 }
 
 /// What happened to one pending record during a drain pass.
@@ -911,6 +1050,34 @@ mod tests {
         assert_eq!(parsed, bundle);
     }
 
+    /// The flat form a live caller produces (`from_bundle`) must be the exact
+    /// inverse of the reconstruction a drain performs, or a bundle spooled now
+    /// would commit differently after recovery. The fixture below covers the
+    /// fields the cycle actually carries: an unreachable outcome with a
+    /// rate-limit retry delay, and one account-wide plus one model-specific
+    /// window, because both scope kinds flatten differently.
+    #[test]
+    fn from_bundle_is_the_exact_inverse_of_reconstruction() {
+        let mut pending = sample_bundle(7);
+        pending.outcome = "unreachable".to_owned();
+        pending.failure_class = Some("rate_limited".to_owned());
+        pending.retry_after_nanos = Some(90_000);
+        pending.windows.push(PendingWindow {
+            semantic_key: "seven_day".to_owned(),
+            scope_kind: "model_specific".to_owned(),
+            scoped_model: Some("claude-sonnet-4".to_owned()),
+            quota_used_ppm: 400_000,
+            reported_resolution_ppm: 10_000,
+            quantization: "rounded_to_nearest".to_owned(),
+            resets_at_nanos: 6_000,
+            nominal_duration_nanos: 604_800_000_000_000,
+        });
+
+        let reconstructed = reconstruct(&pending).unwrap();
+        let flattened = PendingTerminalBundle::from_bundle(&reconstructed);
+        assert_eq!(flattened, pending);
+    }
+
     #[test]
     fn from_json_reports_the_missing_field_by_name_rather_than_a_generic_parse_error() {
         let broken = "{\"attempt_id\": 1, \"windows\": []}";
@@ -1118,5 +1285,120 @@ mod tests {
             "the pending record must already be drained by the time `then` runs"
         );
         assert!(evidence_exists_for_attempt(&conn, attempt_id).unwrap());
+    }
+
+    // --- the meter evidence cycle: spool, commit, delete ----------------
+
+    /// The happy cycle: the commit succeeds, the pending record is deleted, and
+    /// exactly one observation exists. This is PLAN.md section 13's steps 5 to
+    /// 7 completing, driven through the one boundary the live sampling flow
+    /// uses.
+    #[test]
+    fn spool_then_commit_lands_the_bundle_and_removes_the_pending_record() {
+        let scratch = ScratchDir::new();
+        let conn = migrated_conn(&scratch);
+        let account = seed_account(&conn);
+        let attempt_id = seed_attempt(&conn, account);
+        let bundle = reconstruct(&sample_bundle(attempt_id)).unwrap();
+        let repository = crate::store::repository::Repository::new(
+            scratch.path().join("spool-test.db"),
+            crate::store::connection::PragmaPolicy {
+                busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1_000),
+            },
+        );
+
+        let outcome = spool_then_commit(&repository, &bundle, &FakeClock::new(UtcTimestamp::from_unix_nanos(0)))
+            .unwrap();
+        let ids = match outcome {
+            SpoolCycleOutcome::Committed { ids, .. } => ids,
+            SpoolCycleOutcome::LeftPending { error, .. } => {
+                panic!("the commit must succeed with no competing writer: {error}")
+            }
+        };
+        assert!(evidence_exists_for_attempt(&conn, attempt_id).unwrap());
+        assert!(
+            !pending_file_path(scratch.path(), attempt_id).exists(),
+            "a committed bundle must not leave its pending record behind"
+        );
+        let observation: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meter_observation WHERE attempt_id = ?1",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observation, 1);
+        let _ = ids;
+    }
+
+    /// A commit that cannot take the writer slot leaves the record durably
+    /// spooled, and the next drain applies it exactly once. The planted
+    /// negative is the discard-on-busy path: no row may be lost because SQLite
+    /// was busy, and no second observation may appear after the drain.
+    #[test]
+    fn a_commit_refused_by_a_held_writer_slot_spools_and_drains_exactly_once() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("spool-test.db");
+        let mut conn = migrated_conn(&scratch);
+        let account = seed_account(&conn);
+        let attempt_id = seed_attempt(&conn, account);
+        let bundle = reconstruct(&sample_bundle(attempt_id)).unwrap();
+        let repository = crate::store::repository::Repository::new(
+            &db_path,
+            crate::store::connection::PragmaPolicy {
+                busy_timeout: crate::domain::time::MonotonicDuration::from_millis(150),
+            },
+        );
+
+        // Another writer holds the slot past the repository's busy bound.
+        let mut holder = crate::store::connection::open(
+            &db_path,
+            crate::store::connection::AccessMode::ReadWrite,
+            &crate::store::connection::PragmaPolicy {
+                busy_timeout: crate::domain::time::MonotonicDuration::from_millis(150),
+            },
+        )
+        .unwrap();
+        let held = holder
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .unwrap();
+
+        // A real clock, because the property under test is a wait duration the
+        // fake clock cannot produce: the refusal must be preceded by waiting.
+        let outcome = spool_then_commit(&repository, &bundle, &crate::domain::time::RealClock::new())
+            .unwrap();
+        let error = match outcome {
+            SpoolCycleOutcome::LeftPending { error, commit_wait } => {
+                assert!(
+                    commit_wait.as_nanos() > 0,
+                    "the refused commit must have waited before giving up"
+                );
+                error
+            }
+            SpoolCycleOutcome::Committed { .. } => {
+                panic!("a held writer slot must refuse the commit, not pass through")
+            }
+        };
+        assert!(
+            error.to_string().contains("busy") || error.to_string().contains("locked"),
+            "the refusal must be the SQLite busy class: {error}"
+        );
+        assert!(
+            pending_file_path(scratch.path(), attempt_id).exists(),
+            "the refused evidence must remain durably spooled"
+        );
+        drop(held);
+        drop(holder);
+
+        let report = drain_pending(&mut conn, scratch.path()).unwrap();
+        assert_eq!(report.applied, 1);
+        let observation: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM meter_observation WHERE attempt_id = ?1",
+                params![attempt_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(observation, 1, "draining must produce exactly one bundle");
     }
 }
