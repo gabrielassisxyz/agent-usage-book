@@ -30,7 +30,7 @@ same thing in both documents.
 | # | Invariant | Enforcing path | Test or constraint |
 |---:|---|---|---|
 | 1 | Provider quota attempts and observations are irreplaceable evidence. | tests/backup.rs | a_backup_taken_while_a_writer_is_active_verifies_with_both_checks_passing |
-| 2 | Transcript-derived spend is reconstructible. | unenforced aub-lqe.11 | (rebuild determinism test) |
+| 2 | Transcript-derived spend is reconstructible. | tests/sessions.rs | rebuild_determinism_property_over_sessions |
 | 3 | No semantically meaningful raw numeric primitive crosses a domain boundary. | src/domain/tokens.rs | tests::each_newtype_round_trips_its_value_including_the_maximum |
 | 4 | Freshness is an exhaustive three-way state. | src/domain/freshness.rs | tests::expanding_stale_reason_does_not_change_the_freshness_variant_count |
 | 5 | Sampling-attempt outcome is not the same dimension as freshness. | src/domain/attempt.rs | tests::started_and_result_are_separate_types_correlated_by_attempt_id |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 21 are enforced by mechanical checks present at HEAD (file paths and tests), and 6 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 22 are enforced by mechanical checks present at HEAD (file paths and tests), and 5 are unenforced and tracked by open beads in the tracker.

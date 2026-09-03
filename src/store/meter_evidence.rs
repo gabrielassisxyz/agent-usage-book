@@ -1063,34 +1063,6 @@ mod tests {
         );
     }
 
-    /// A second attempt the extra observations can hang off, with its own
-    /// request time.
-    fn coverage_attempt(
-        conn: &rusqlite::Connection,
-        run: crate::store::sample_run::SampleRunId,
-        account: AccountId,
-        snapshot: SamplingPolicySnapshotId,
-        at: i64,
-    ) -> MeterAttemptRowId {
-        start_meter_attempt(
-            conn,
-            &NewMeterAttempt {
-                run_id: run,
-                account_id: account,
-                provider: "test-provider".into(),
-                request_started_at: UtcTimestamp::from_unix_nanos(at),
-                credential_context_id: None,
-                policy_snapshot_id: snapshot,
-                due_at: UtcTimestamp::from_unix_nanos(at),
-                due_reason: DueReason::OrdinaryCadence,
-                due_basis: None,
-                provider_contract_id: "endpoint-schema-v3".into(),
-                meter_semantics_id: "account-5h-v2".into(),
-            },
-        )
-        .expect("the extra attempt must insert")
-    }
-
     /// Observation times read from the interval: oldest first, half-open at
     /// both ends.
     #[test]

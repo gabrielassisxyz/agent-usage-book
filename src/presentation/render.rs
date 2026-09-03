@@ -657,14 +657,6 @@ fn render_coverage_detail(
         ));
     }
     if severe {
-        let count = engine.reset_spanning_gaps.len();
-        let noun = if count == 1 { "reset" } else { "resets" };
-        let verb = if count == 1 {
-            "occurred without a successful observation in the surrounding interval"
-        } else {
-            "occurred without successful observations in the surrounding intervals"
-        };
-        let article = if count == 1 { "one" } else { "" };
         // The window length is the provider-reported nominal duration of the
         // reset the gap swallowed; it is rendered when one is known.
         let window_length = account
@@ -672,17 +664,18 @@ fn render_coverage_detail(
             .iter()
             .map(|reset| reset.window_length)
             .max();
-        match window_length {
-            Some(length) if length.as_nanos() > 0 => lines.push(format!(
-                "{article}{} {noun} {verb}",
+        match (engine.reset_spanning_gaps.len(), window_length) {
+            (1, Some(length)) if length.as_nanos() > 0 => lines.push(format!(
+                "one {} reset occurred without a successful observation in the surrounding interval",
                 render_coverage_duration(length)
             )),
-            _ => lines.push(format!("{article}{noun} {verb}")),
-        }
-        // "one" is glued to the noun; a count reads bare.
-        if count > 1 {
-            let last = lines.len() - 1;
-            lines[last] = format!("{count} {}", lines[last].trim_start());
+            (1, _) => lines.push(
+                "one reset occurred without a successful observation in the surrounding interval"
+                    .to_string(),
+            ),
+            (count, _) => lines.push(format!(
+                "{count} resets occurred without successful observations in the surrounding intervals"
+            )),
         }
     }
     Some(lines)
@@ -690,13 +683,12 @@ fn render_coverage_detail(
 
 /// The report-to-rendering seam for coverage: the interval, one row per
 /// covered account, and a detail block for every account whose numbers need
-/// explaining. The model arrives complete; this function formats it.
-pub fn render_coverage_report(report: &CoverageReport) -> String {
-    let interval_nanos = (report.until.unix_nanos() - report.since.unix_nanos()).max(0) as u64;
-    let mut lines = vec![format!(
-        "coverage - last {}",
-        render_coverage_duration(MonotonicDuration::from_nanos(interval_nanos))
-    )];
+/// explaining. The model arrives complete; this function formats it. The
+/// header echoes the window the command line asked for: "last 24h" is what
+/// the operator requested, and the interval itself is carried by the model's
+/// own timestamps.
+pub fn render_coverage_report(report: &CoverageReport, window: &str) -> String {
+    let mut lines = vec![format!("coverage - last {window}")];
     if report.accounts.is_empty() {
         if report.severe_only {
             lines.push("(no account has a severe interval)".to_string());
@@ -705,6 +697,8 @@ pub fn render_coverage_report(report: &CoverageReport) -> String {
         }
         return lines.join("\n");
     }
+
+    lines.push(String::new());
 
     let name_width = report
         .accounts

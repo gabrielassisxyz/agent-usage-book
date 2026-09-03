@@ -772,11 +772,15 @@ const DEFAULT_COVERAGE_WINDOW: MonotonicDuration = MonotonicDuration::from_secon
 /// `--severe`. Both compose with the shared `--account`.
 struct CoverageWindow {
     since: MonotonicDuration,
+    /// The window as the command line asked for it, echoed by the header:
+    /// "coverage - last 24h" is the request the interval answers.
+    description: String,
     severe_only: bool,
 }
 
 fn coverage_window(rest: &[String]) -> Result<CoverageWindow, Error> {
     let mut since = DEFAULT_COVERAGE_WINDOW;
+    let mut description = "24h".to_string();
     let mut severe_only = false;
     let mut args = rest.iter();
     while let Some(arg) = args.next() {
@@ -787,14 +791,22 @@ fn coverage_window(rest: &[String]) -> Result<CoverageWindow, Error> {
                     Error::Usage("--since requires a duration like 24h or 30d".into())
                 })?;
                 since = parse_since(value)?;
+                description = value.to_string();
             }
             other => match other.strip_prefix("--since=") {
-                Some(value) => since = parse_since(value)?,
+                Some(value) => {
+                    since = parse_since(value)?;
+                    description = value.to_string();
+                }
                 None => return Err(Error::Usage(format!("unknown argument: {other}"))),
             },
         }
     }
-    Ok(CoverageWindow { since, severe_only })
+    Ok(CoverageWindow {
+        since,
+        description,
+        severe_only,
+    })
 }
 
 fn parse_since(value: &str) -> Result<MonotonicDuration, Error> {
@@ -872,7 +884,7 @@ fn coverage_command(
     let report = assemble_coverage(&conn, since, timestamp, &selector, floors, timestamp)?;
 
     match invocation.format {
-        OutputFormat::Text => println!("{}", render_coverage_report(&report)),
+        OutputFormat::Text => println!("{}", render_coverage_report(&report, &window.description)),
         OutputFormat::Json => println!("{}", coverage_json(&report, run)),
     }
     if report.threshold.met {
@@ -1812,6 +1824,37 @@ mod tests {
                     other => panic!("{command:?} rejects --account but parsed as {other:?}"),
                 },
             }
+        }
+    }
+
+    #[test]
+    fn coverage_selectors_accept_both_since_spellings_and_compose_with_account() {
+        let parsed = parse_invocation(args(&[
+            "coverage",
+            "--account",
+            "research",
+            "--severe",
+            "--since=30d",
+        ]))
+        .expect("coverage selectors must parse");
+        let Request::Run(invocation) = parsed else {
+            panic!("coverage must produce an invocation")
+        };
+        assert_eq!(invocation.account.as_deref(), Some("research"));
+        let window = coverage_window(&invocation.rest).expect("selectors must be valid");
+        assert_eq!(window.since, MonotonicDuration::from_seconds(30 * 86_400));
+        assert_eq!(window.description, "30d");
+        assert!(window.severe_only);
+
+        let spaced = coverage_window(&["--since".to_string(), "2h".to_string()])
+            .expect("the spaced since form must parse");
+        assert_eq!(spaced.since, MonotonicDuration::from_seconds(2 * 3_600));
+        assert_eq!(spaced.description, "2h");
+
+        match coverage_window(&["--since=forever".to_string()]) {
+            Err(Error::Usage(_)) => {}
+            Err(error) => panic!("an invalid coverage interval must be a usage error: {error:?}"),
+            Ok(_) => panic!("an invalid coverage interval must be refused"),
         }
     }
 

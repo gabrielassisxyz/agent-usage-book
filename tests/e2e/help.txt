@@ -11,6 +11,7 @@ commands:
   rate-card import, show and history the immutable dated vendor rate cards
   backup   create or verify a consistent archive of durable state
   doctor   health, drift and integrity diagnostics
+  coverage did the sampler attempt what the policy owed, and did those attempts observe?
 
 status:
   answers: how much quota does each configured account have left?
@@ -51,5 +52,11 @@ doctor:
   refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
   format: text | json
   options: --transcript-format-drift
+
+coverage:
+  answers: did the sampler attempt what the policy owed, and did those attempts observe?
+  refuses: --no-color (coverage prints plain text or json)
+  format: text | json
+  options: --since DURATION (default 24h), --severe; --account is shared
 
 aub            prints the version; aub --help prints this

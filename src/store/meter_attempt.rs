@@ -955,7 +955,7 @@ mod tests {
 #[cfg(test)]
 mod coverage_query_tests {
     use super::*;
-    use crate::domain::failure::{FailureClass, HttpStatusClass};
+    use crate::domain::failure::FailureClass;
     use crate::store::account::AccountId;
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use crate::store::meter_attempt::{

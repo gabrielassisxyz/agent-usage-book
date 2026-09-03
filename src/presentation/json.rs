@@ -716,15 +716,20 @@ fn coverage_account_json(account: &crate::report::CoverageAccount) -> String {
     .collect::<Vec<_>>()
     .join(",");
     format!(
-        "{{\"account\":{},\"policy_unknown\":{policy_unknown},\"expected_opportunities\":{expected},\"
-         \"attempted_opportunities\":{},\"successful_observations\":{},\"started_without_terminal_result\":{},\"
-         \"attempt_coverage\":{},\"measurement_coverage\":{},\"longest_no_attempt_gap\":{},\"longest_no_observation_gap\":{},\"
-         \"reset_spanning_gaps\":{},\"severe\":{},\"most_recent_timer_run\":{},\"most_recent_successful_observation\":{},\"
-         \"resets_in_gaps\":[{resets}],\"failures\":{{{failures}}}}}",
+        "{{\"account\":{},\"policy_unknown\":{policy_unknown},\"expected_opportunities\":{expected},\"attempted_opportunities\":{},\"successful_observations\":{},\"started_without_terminal_result\":{},\"attempt_coverage\":{},\"measurement_coverage\":{},\"longest_no_attempt_gap\":{},\"longest_no_observation_gap\":{},\"reset_spanning_gaps\":{},\"severe\":{},\"most_recent_timer_run\":{},\"most_recent_successful_observation\":{},\"resets_in_gaps\":[{resets}],\"failures\":{{{failures}}}}}",
         json_string(account.name.as_str()),
-        quantity_json(&engine.attempted_opportunities.to_string(), OPPORTUNITY_UNIT),
-        quantity_json(&engine.successful_observations.to_string(), OBSERVATION_UNIT),
-        quantity_json(&engine.started_without_terminal_result.to_string(), ATTEMPT_UNIT),
+        quantity_json(
+            &engine.attempted_opportunities.to_string(),
+            OPPORTUNITY_UNIT
+        ),
+        quantity_json(
+            &engine.successful_observations.to_string(),
+            OBSERVATION_UNIT
+        ),
+        quantity_json(
+            &engine.started_without_terminal_result.to_string(),
+            ATTEMPT_UNIT
+        ),
         coverage_fraction_json(engine.attempt_coverage),
         coverage_fraction_json(engine.measurement_coverage),
         coverage_gap_json(engine.longest_no_attempt_gap),
@@ -763,22 +768,13 @@ pub fn coverage_json(report: &CoverageReport, run: RunId) -> String {
         .collect::<Vec<_>>()
         .join(",");
     let body = format!(
-        "\"interval\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"severe_only\":{},\"
-         \"threshold\":{{\"attempt_floor\":{},\"measurement_floor\":{},\"met\":{},\"breaches\":[{breaches}]}},\"
-         \"accounts\":[{accounts}]",
+        "\"interval\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"severe_only\":{},\"threshold\":{{\"attempt_floor\":{},\"measurement_floor\":{},\"met\":{},\"breaches\":[{breaches}]}},\"accounts\":[{accounts}]",
         report.since.unix_nanos(),
         report.until.unix_nanos(),
         report.severe_only,
+        quantity_json(&report.threshold.attempt_floor.as_ppm().to_string(), "ppm"),
         quantity_json(
-            &report.threshold.attempt_floor.as_ppm().to_string(),
-            "ppm"
-        ),
-        quantity_json(
-            &report
-                .threshold
-                .measurement_floor
-                .as_ppm()
-                .to_string(),
+            &report.threshold.measurement_floor.as_ppm().to_string(),
             "ppm"
         ),
         report.threshold.met,

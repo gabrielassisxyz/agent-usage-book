@@ -10,3 +10,4 @@ rate-card
 backup
 export
 doctor
+coverage
