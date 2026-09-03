@@ -1350,15 +1350,17 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
     Ok(())
 }
 
-/// Test-only surface: the crash-injection hook for the two-stage meter attempt
-/// lifecycle (`aub-sth.6`, PLAN.md section 34.7). `__attempt-crash-hook start`
-/// commits the attempt start through the real store APIs and then aborts the
-/// process, so a test can prove exactly what survives a kill between the two
-/// commits: the start with no result. `complete` is the adjacent positive
-/// control, running start then result then a clean exit, and `read-back`
-/// reports what the database actually holds.
+/// Test-only surface: the crash-injection harness for the write-path crash
+/// matrix (`aub-sth.14`, PLAN.md sections 13 and 34.7). Each injected stage
+/// drives the real store APIs through one write-path stage and then aborts the
+/// process at that injection point, so a test can prove exactly what survives
+/// a kill there. `complete` is the positive control running every stage and
+/// exiting cleanly; `read-back` counts what is durable; `drain` runs the
+/// startup recovery pass; `freshness` reads the latest attempt the way the
+/// freshness computation does. `start` remains accepted as the aub-sth.6 name
+/// of the second injection point.
 ///
-/// The hook's body lives in the store layer (`crate::store::attempt_crash_hook`)
+/// The harness's body lives in the store layer (`crate::store::attempt_crash_hook`)
 /// because it runs migrations, writes fixture rows and counts rows, all of
 /// which the boundary rules confine to `src/store/` (rules 15 and 16); this
 /// shim only parses the stage, resolves configuration and renders the outcome.
@@ -1367,12 +1369,28 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 /// `__exit-class`/`__state-check`.
 fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let stage = match invocation.rest.first().map(String::as_str) {
-        Some("start") => crate::store::attempt_crash_hook::CrashHookStage::Start,
+        Some("before-start-commit" | "point-1" | "1") => {
+            crate::store::attempt_crash_hook::CrashHookStage::BeforeStartCommit
+        }
+        Some("after-start-commit-before-request" | "point-2" | "2" | "start") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterStartCommitBeforeRequest
+        }
+        Some("after-parse-before-spool-write" | "point-3" | "3") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterParseBeforeSpoolWrite
+        }
+        Some("after-spool-write-before-sqlite-commit" | "point-4" | "4") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterSpoolWriteBeforeSqliteCommit
+        }
+        Some("after-sqlite-commit-before-pending-deletion" | "point-5" | "5") => {
+            crate::store::attempt_crash_hook::CrashHookStage::AfterSqliteCommitBeforePendingDeletion
+        }
         Some("complete") => crate::store::attempt_crash_hook::CrashHookStage::Complete,
         Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
+        Some("drain") => crate::store::attempt_crash_hook::CrashHookStage::Drain,
+        Some("freshness") => crate::store::attempt_crash_hook::CrashHookStage::Freshness,
         other => {
             return Err(Error::Usage(format!(
-                "__attempt-crash-hook requires a stage (start | complete | read-back), got {other:?}"
+                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | drain | freshness), got {other:?}"
             )));
         }
     };
@@ -1392,6 +1410,7 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         &crate::store::startup::ProcMounts,
         || {
             crate::store::attempt_crash_hook::run_stage(
+                &config.state.dir,
                 &config.state.dir.join("attempt-crash-hook.db"),
                 stage,
                 config.sampling.request_timeout,
@@ -1407,8 +1426,31 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
                 attempt_row_id.value()
             );
         }
-        crate::store::attempt_crash_hook::CrashHookOutcome::Counts { starts, results } => {
-            println!("starts={starts} results={results}");
+        crate::store::attempt_crash_hook::CrashHookOutcome::Counts {
+            starts,
+            results,
+            observations,
+            pending,
+        } => {
+            println!(
+                "starts={starts} results={results} observations={observations} pending={pending}"
+            );
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::DrainReport {
+            applied,
+            already_applied,
+            quarantined,
+        } => {
+            println!(
+                "drain: applied={applied} already_applied={already_applied} quarantined={quarantined}"
+            );
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::FreshnessOutcome { kind, reason } => {
+            if let Some(reason) = reason {
+                println!("freshness: {kind} reason={reason}");
+            } else {
+                println!("freshness: {kind}");
+            }
         }
     }
     Ok(())
