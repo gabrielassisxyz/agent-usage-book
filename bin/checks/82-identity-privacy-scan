@@ -38,8 +38,17 @@ if [ ! -f "$patterns_file" ]; then
     exit 2
 fi
 
+# Only the patterns above the boundary marker: see the comment at the top of
+# docs/forbidden-patterns.txt for why the field-name and identity patterns
+# below it belong to the fixture and database scans, never to this one. A
+# compiled binary's string table legitimately contains an "Authorization"
+# header name and a dependency's own absolute build path; a fixture or a
+# stored row never legitimately contains either.
 patterns=()
 while IFS= read -r pattern || [ -n "$pattern" ]; do
+    case "$pattern" in
+        '# === binary-scan patterns end here ==='*) break ;;
+    esac
     [ -z "$pattern" ] && continue
     case "$pattern" in
         '#'*) continue ;;
@@ -48,8 +57,9 @@ while IFS= read -r pattern || [ -n "$pattern" ]; do
 done <"$patterns_file"
 
 if [ "${#patterns[@]}" -eq 0 ]; then
-    echo "identity-privacy-scan: $patterns_file has no patterns (only comments or blank lines);" >&2
-    echo "  a scan with nothing to look for would pass every binary vacuously" >&2
+    echo "identity-privacy-scan: $patterns_file has no binary-scan patterns above its boundary" >&2
+    echo "  marker (only comments or blank lines); a scan with nothing to look for would" >&2
+    echo "  pass every binary vacuously" >&2
     exit 2
 fi
 
@@ -97,17 +107,25 @@ if [ ! -x "$aub_bin" ]; then
     exit 2
 fi
 
+# A here-string, not a `strings ... | grep -q` pipe: `grep -q` exits the
+# instant it finds a match, and under `pipefail` a producer still writing to
+# a reader that already closed gets SIGPIPE, which then outranks grep's own
+# success in the pipeline's exit status. That produced exactly one false
+# "clean" verdict while writing this check: the very first pattern in the
+# list matched near the start of a 400KB `strings` dump, tripped the
+# early-exit/SIGPIPE race, and the scan reported no findings at all. Reading
+# from a variable through `<<<` has no second process to race against.
 strings_output="$(strings "$aub_bin")"
 found=0
 
 for pattern in "${patterns[@]}"; do
-    if printf '%s' "$strings_output" | grep -qiF -- "$pattern"; then
+    if grep -qiF -- "$pattern" <<<"$strings_output"; then
         echo "identity-privacy-scan: release binary contains forbidden pattern: $pattern" >&2
         found=1
     fi
 done
 
-if printf '%s' "$strings_output" | grep -qF -- "$foreign_marker"; then
+if grep -qF -- "$foreign_marker" <<<"$strings_output"; then
     echo "identity-privacy-scan: release binary contains the foreign build path invented for" >&2
     echo "  this run ($foreign_marker); something bakes an absolute checkout path into it" >&2
     found=1
