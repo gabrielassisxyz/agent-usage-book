@@ -3,3 +3,5 @@
 //! May not depend on:
 //! - constructing calibration constants
 //! - presentation
+
+pub mod headroom;
