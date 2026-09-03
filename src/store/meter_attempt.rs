@@ -203,6 +203,35 @@ pub(crate) fn attempt_outcome_as_sql(outcome: &AttemptOutcome) -> &'static str {
     }
 }
 
+/// The failure fields one attempt outcome lands as: the failure class code
+/// when the outcome is unreachable, and the rate-limit retry delay in
+/// nanoseconds when the class carries one. One mapping, shared by the live
+/// insert and the pending-observation spool's flat form, so the two durable
+/// spellings of one outcome can never drift apart.
+pub(crate) fn outcome_failure_fields(outcome: &AttemptOutcome) -> (Option<String>, Option<i64>) {
+    match outcome {
+        AttemptOutcome::Unreachable(class) => {
+            let retry_after = match class {
+                FailureClass::RateLimited { retry_after } => {
+                    retry_after.map(|duration| duration.as_nanos() as i64)
+                }
+                FailureClass::DnsFailure
+                | FailureClass::ConnectTimeout
+                | FailureClass::ReadTimeout
+                | FailureClass::TotalBudgetExpired
+                | FailureClass::HttpStatus(_)
+                | FailureClass::MalformedBody
+                | FailureClass::MissingRequiredField => None,
+            };
+            (
+                Some(failure_class_sql::as_sql(class).to_owned()),
+                retry_after,
+            )
+        }
+        AttemptOutcome::Success | AttemptOutcome::AuthRequired => (None, None),
+    }
+}
+
 pub(crate) fn attempt_outcome_from_sql(
     outcome_sql: &str,
     failure_class_sql: Option<String>,
@@ -283,24 +312,7 @@ pub fn record_meter_attempt_result(
     result: &NewMeterAttemptResult,
 ) -> Result<(), Error> {
     let outcome_sql = attempt_outcome_as_sql(&result.outcome);
-    let (failure_class_sql, retry_after) = match &result.outcome {
-        AttemptOutcome::Unreachable(class) => {
-            let retry_after = match class {
-                FailureClass::RateLimited { retry_after } => {
-                    retry_after.map(|d| d.as_nanos() as i64)
-                }
-                FailureClass::DnsFailure
-                | FailureClass::ConnectTimeout
-                | FailureClass::ReadTimeout
-                | FailureClass::TotalBudgetExpired
-                | FailureClass::HttpStatus(_)
-                | FailureClass::MalformedBody
-                | FailureClass::MissingRequiredField => None,
-            };
-            (Some(failure_class_sql::as_sql(class)), retry_after)
-        }
-        AttemptOutcome::Success | AttemptOutcome::AuthRequired => (None, None),
-    };
+    let (failure_class_sql, retry_after) = outcome_failure_fields(&result.outcome);
     conn.execute(
         "INSERT INTO meter_attempt_result (
             attempt_id, completed_at, elapsed_nanos, outcome, failure_class,

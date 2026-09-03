@@ -14,7 +14,7 @@ use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
 };
 use crate::error::Error;
-use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
+use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, Quantity, RunId};
 pub use crate::presentation::ExplainMode;
 use crate::presentation::json::{coverage_json, spend_json_with_explain, status_json_with_explain};
 use crate::presentation::render::{
@@ -808,11 +808,11 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 None => Err(Error::Usage("__exit-class requires a class 0..=8".into())),
             }
         }
-        Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
+        Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), level, &invocation),
         Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
-        Command::Ingest => ingest_command(&RealClock::new(), &invocation),
+        Command::Ingest => ingest_command(&RealClock::new(), level, &invocation),
         Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
@@ -1627,6 +1627,12 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 /// freshness computation does. `start` remains accepted as the aub-sth.6 name
 /// of the second injection point.
 ///
+/// `sample [--attempts N]` runs the meter evidence cycle of PLAN.md section 13
+/// against the LEDGER database (`aub-lqe.18`), so it contends with a concurrent
+/// ingest the way the two real workloads do, and `sample-crash` is the
+/// documented injection point between the spool and the commit. The sample
+/// stages emit the drain and per-attempt diagnostics, correlated by attempt id.
+///
 /// The harness's body lives in the store layer (`crate::store::attempt_crash_hook`)
 /// because it runs migrations, writes fixture rows and counts rows, all of
 /// which the boundary rules confine to `src/store/` (rules 15 and 16); this
@@ -1634,8 +1640,13 @@ fn state_check(clock: &impl Clock, level: Level) -> Result<(), Error> {
 /// Not part of the shipping command surface: `tests/e2e/command-surface.txt`
 /// deliberately excludes every `__`-prefixed hook, matching
 /// `__exit-class`/`__state-check`.
-fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let stage = match invocation.rest.first().map(String::as_str) {
+fn attempt_crash_hook(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let mut stage_args = invocation.rest.iter();
+    let stage = match stage_args.next().map(String::as_str) {
         Some("before-start-commit" | "point-1" | "1") => {
             crate::store::attempt_crash_hook::CrashHookStage::BeforeStartCommit
         }
@@ -1655,12 +1666,44 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
         Some("drain") => crate::store::attempt_crash_hook::CrashHookStage::Drain,
         Some("freshness") => crate::store::attempt_crash_hook::CrashHookStage::Freshness,
+        Some("sample") => {
+            let mut attempts = 1u32;
+            let mut rest = stage_args.clone();
+            while let Some(arg) = rest.next() {
+                if let Some(value) = arg.strip_prefix("--attempts=") {
+                    attempts = parse_attempts(value)?;
+                } else if arg == "--attempts" {
+                    let value = rest
+                        .next()
+                        .ok_or_else(|| Error::Usage("--attempts requires a count".into()))?;
+                    attempts = parse_attempts(value)?;
+                } else {
+                    return Err(Error::Usage(format!(
+                        "unknown __attempt-crash-hook sample argument: {arg}"
+                    )));
+                }
+            }
+            crate::store::attempt_crash_hook::CrashHookStage::Sample { attempts }
+        }
+        Some("sample-crash") => crate::store::attempt_crash_hook::CrashHookStage::SampleCrash,
         other => {
             return Err(Error::Usage(format!(
-                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | drain | freshness), got {other:?}"
+                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | drain | freshness | sample | sample-crash), got {other:?}"
             )));
         }
     };
+
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("attempt-crash-hook");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
@@ -1672,13 +1715,30 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         &file_path,
     )?;
 
+    // The sample stages run the meter evidence cycle against the one ledger
+    // database, so they contend with a concurrent ingest the way the two real
+    // workloads do; the lifecycle stages keep their own fixture database.
+    let ledger = matches!(
+        stage,
+        crate::store::attempt_crash_hook::CrashHookStage::Sample { .. }
+            | crate::store::attempt_crash_hook::CrashHookStage::SampleCrash
+    );
+    let database = if ledger {
+        config
+            .state
+            .dir
+            .join(crate::store::connection::LEDGER_DATABASE_FILE)
+    } else {
+        config.state.dir.join("attempt-crash-hook.db")
+    };
+
     let outcome = crate::store::startup::run_after_state_check(
         &config.state.dir,
         &crate::store::startup::ProcMounts,
         || {
             crate::store::attempt_crash_hook::run_stage(
                 &config.state.dir,
-                &config.state.dir.join("attempt-crash-hook.db"),
+                &database,
                 stage,
                 config.sampling.request_timeout,
                 config.sampling.command_budget,
@@ -1719,8 +1779,94 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
                 println!("freshness: {kind}");
             }
         }
+        crate::store::attempt_crash_hook::CrashHookOutcome::Sampled {
+            drain_applied,
+            drain_already_applied,
+            drain_quarantined,
+            attempts,
+        } => {
+            logger
+                .emit(
+                    clock.now(),
+                    DiagnosticEvent::MeterSpoolDrained,
+                    &[
+                        ("applied", &Quantity::new(drain_applied as u64, "records")),
+                        (
+                            "already_applied",
+                            &Quantity::new(drain_already_applied as u64, "records"),
+                        ),
+                        (
+                            "quarantined",
+                            &Quantity::new(drain_quarantined as u64, "records"),
+                        ),
+                    ],
+                )
+                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+            println!(
+                "drain applied={} already-applied={} quarantined={}",
+                drain_applied, drain_already_applied, drain_quarantined
+            );
+            let committed = attempts.iter().filter(|attempt| attempt.committed).count();
+            let spooled = attempts.len() - committed;
+            println!(
+                "sample attempts={} committed={committed} spooled={spooled}",
+                attempts.len()
+            );
+            for attempt in &attempts {
+                if attempt.committed {
+                    logger
+                        .emit(
+                            clock.now(),
+                            DiagnosticEvent::MeterAttemptCommitted,
+                            &[
+                                (
+                                    "attempt",
+                                    &Quantity::new(attempt.attempt_id.value() as u64, "id"),
+                                ),
+                                (
+                                    "busy_wait",
+                                    &Quantity::new(attempt.commit_wait.as_nanos(), "ns"),
+                                ),
+                            ],
+                        )
+                        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                    println!(
+                        "  attempt {} committed busy_wait_ns={}",
+                        attempt.attempt_id.value(),
+                        attempt.commit_wait.as_nanos()
+                    );
+                } else {
+                    logger
+                        .emit(
+                            clock.now(),
+                            DiagnosticEvent::MeterEvidenceSpooled,
+                            &[(
+                                "attempt",
+                                &Quantity::new(attempt.attempt_id.value() as u64, "id"),
+                            )],
+                        )
+                        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                    println!(
+                        "  attempt {} spooled: the writer slot stayed held; the record remains durable",
+                        attempt.attempt_id.value()
+                    );
+                }
+            }
+        }
     }
     Ok(())
+}
+
+/// Parses the sample stage's `--attempts` count: a positive integer, because a
+/// stage that samples nothing would print a report about work it did not do.
+fn parse_attempts(value: &str) -> Result<u32, Error> {
+    let parsed: u32 = value
+        .parse()
+        .map_err(|_| Error::Usage(format!("--attempts: {value:?} is not a positive integer")))?;
+    if parsed == 0 {
+        return Err(Error::Usage("--attempts: must be at least 1".into()));
+    }
+    Ok(parsed)
 }
 
 /// Test-only surface: the crash-injection hook for the projection publication
@@ -2001,8 +2147,19 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
 /// spend do not exist here: ingestion is not windowed, it lands everything the
 /// configured sources currently hold, and reports what it read and the
 /// generation it advanced.
-fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
     let options = ingest_flags(&invocation.rest)?;
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("ingest");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -2013,9 +2170,32 @@ fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         &file_path,
     )?;
     let mut conn = open_ledger(clock)?;
-    let report = crate::ingest::run(&mut conn, &config, &options, clock.now())?;
+    // Each landed batch is announced while the pass is still running, with the
+    // batch's index, size, writer-slot hold and generation: the stable
+    // identifiers a contention log is correlated by (`aub-lqe.18`).
+    let mut batch_sink = |batch: &crate::ingest::LandedBatch| {
+        logger
+            .emit(
+                clock.now(),
+                DiagnosticEvent::IngestBatchLanded,
+                &[
+                    ("batch", &Quantity::new(batch.index, "index")),
+                    ("events", &Quantity::new(batch.events, "events")),
+                    (
+                        "writer_slot",
+                        &Quantity::new(batch.writer_slot.as_nanos(), "ns"),
+                    ),
+                    (
+                        "generation",
+                        &Quantity::new(batch.generation.value(), "generation"),
+                    ),
+                ],
+            )
+            .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))
+    };
+    let report = crate::ingest::run(&mut conn, &config, &options, clock, &mut batch_sink)?;
     println!(
-        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={}",
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={}",
         report.sources.join(","),
         report.files_scanned,
         report.files_parsed,
@@ -2023,6 +2203,7 @@ fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         report.unreadable_files.len(),
         report.quarantined,
         report.generation.value(),
+        report.batches.len(),
     );
     let outcome = &report.outcome;
     println!(
