@@ -49,7 +49,7 @@ same thing in both documents.
 | 18 | Dollar valuation and subscription credits are distinct dimensions. | tests/valuation.rs | tests::golden_hand_computed_exact_decimal_fixtures |
 | 19 | Meter residual is diagnostic and is not automatically called hidden token spend. | unenforced aub-dpn | (unexplained residual test) |
 | 20 | Estimated transcript usage is never silently promoted to measured usage. | src/evidence.rs | tests::quality_combine_never_recovers_measured_from_estimated |
-| 21 | The friction ledger remains external and joins only through stable IDs. | unenforced aub-xus.7 | (external friction ledger join test) |
+| 21 | The friction ledger remains external and joins only through stable IDs. | src/store/export.rs | tests::run_keyed_export_aggregates_every_session_carrying_the_run |
 | 22 | Irreplaceable meter history is backed up and never automatically pruned. | unenforced aub-sth.12 | (retention and restore test) |
 | 23 | An outbound meter request is never begun before its attempt identity is durable. | tests/meter_attempt_crash.rs | tests::killed_between_start_and_result_leaves_exactly_one_start_with_no_result |
 | 24 | An attempt without a terminal result is evidence of collector interruption, not evidence that no attempt occurred. | src/domain/freshness.rs | tests::started_attempt_past_command_horizon_yields_collector_interrupted |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 17 are enforced by mechanical checks present at HEAD (file paths and tests), and 10 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 18 are enforced by mechanical checks present at HEAD (file paths and tests), and 9 are unenforced and tracked by open beads in the tracker.
