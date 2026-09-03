@@ -24,6 +24,7 @@ pub mod error;
 pub mod error_output;
 pub mod evidence;
 pub mod ingest;
+pub mod legacy_meter;
 pub mod logging;
 pub mod meter;
 pub mod presentation;

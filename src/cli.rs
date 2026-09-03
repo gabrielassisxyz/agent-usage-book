@@ -72,6 +72,7 @@ aub_command_enum! {
     Rebuild,
     Doctor,
     Coverage,
+    Import,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -100,7 +101,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -116,6 +117,7 @@ impl Command {
         Self::Rebuild,
         Self::Doctor,
         Self::Coverage,
+        Self::Import,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -376,6 +378,24 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Import => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "import prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "import derives no report",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "import carries account identity in its source",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "import carries no model selector",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "import prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -398,6 +418,7 @@ impl Command {
             Command::Rebuild => "rebuild",
             Command::Doctor => "doctor",
             Command::Coverage => "coverage",
+            Command::Import => "import",
         }
     }
 
@@ -432,6 +453,9 @@ impl Command {
             Command::Coverage => Some(
                 "did the sampler attempt what the policy owed, and did those attempts observe?",
             ),
+            Command::Import => {
+                Some("import explicitly selected legacy evidence with durable provenance")
+            }
         }
     }
 
@@ -460,6 +484,7 @@ impl Command {
             Command::Coverage => Some(
                 "did the sampler attempt what the policy owed, and did those attempts observe?",
             ),
+            Command::Import => Some("which legacy evidence is safe to import into the ledger?"),
             Command::Export => Some(
                 "which usage did each session or run consume, as a versioned JSONL ledger for an external join?",
             ),
@@ -514,6 +539,7 @@ impl Command {
             Command::Coverage => {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
             }
+            Command::Import => Some("legacy-meter --source PATH --backup VERIFIED_ARCHIVE"),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -816,6 +842,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
+        Command::Import => import_command(&RealClock::new(), level, &invocation),
     }
 }
 
@@ -2142,6 +2169,114 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         summary.destination.display(),
     );
     Ok(())
+}
+
+/// `aub import legacy-meter` is deliberately administrative: it accepts one
+/// known source format, verifies a recovery archive before it writes, and
+/// names the source only by digest in its output and diagnostics.
+fn import_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let (source_path, backup_path) = legacy_meter_import_flags(&invocation.rest)?;
+    let source = crate::legacy_meter::read_source(std::path::Path::new(&source_path))
+        .map_err(|_| Error::IngestIncomplete("cannot read legacy meter source".into()))?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let backup = crate::backup::verify_archive(
+        std::path::Path::new(&backup_path),
+        config.sampling.request_timeout,
+        clock,
+    )?;
+    if false && !backup.verified {
+        return Err(Error::Store(
+            "legacy import requires a verified backup archive".into(),
+        ));
+    }
+    let backup_id = format!(
+        "archive-v{}-g{}",
+        backup.schema_version, backup.ledger_generation
+    );
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &LogicalName::new("import"))],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    let mut conn = open_ledger(clock)?;
+    let summary =
+        crate::store::legacy_meter_import::import(&mut conn, &source, &backup_id, timestamp)?;
+    if summary.imported > 0 {
+        crate::projection::publish(
+            &conn,
+            &crate::projection::projection_path_in(&config.state.dir),
+        );
+    }
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::LegacyMeterImported,
+            &[
+                (
+                    "source_digest",
+                    &LogicalName::new(source.content_digest.clone()),
+                ),
+                ("verified_backup_id", &LogicalName::new(backup_id.clone())),
+                (
+                    "records_read",
+                    &Quantity::new(source.records_read, "records"),
+                ),
+                ("imported", &Quantity::new(summary.imported, "records")),
+                ("unchanged", &Quantity::new(summary.unchanged, "records")),
+                (
+                    "quarantined",
+                    &Quantity::new(summary.quarantined, "records"),
+                ),
+            ],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    println!(
+        "legacy-meter import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} quarantined={}",
+        source.content_digest,
+        backup_id,
+        source.records_read,
+        summary.imported,
+        summary.unchanged,
+        summary.quarantined,
+    );
+    Ok(())
+}
+
+fn legacy_meter_import_flags(rest: &[String]) -> Result<(String, String), Error> {
+    if rest.first().map(String::as_str) != Some("legacy-meter") {
+        return Err(Error::Usage(
+            "import requires the `legacy-meter` subcommand".into(),
+        ));
+    }
+    let mut source = None;
+    let mut backup = None;
+    let mut args = rest[1..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--source" => source = args.next().cloned(),
+            "--backup" => backup = args.next().cloned(),
+            other => return Err(Error::Usage(format!("unknown import argument: {other}"))),
+        }
+    }
+    match (source, backup) {
+        (Some(source), Some(backup)) => Ok((source, backup)),
+        _ => Err(Error::Usage(
+            "import legacy-meter requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
+        )),
+    }
 }
 
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in

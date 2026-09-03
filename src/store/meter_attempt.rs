@@ -572,6 +572,11 @@ pub fn attempts_with_outcomes_for_account_between(
              LEFT JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
              WHERE ma.account_id = ?1
                AND ma.request_started_at >= ?2 AND ma.request_started_at < ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM meter_observation mo
+                   JOIN legacy_meter_import_record lir ON lir.observation_id = mo.id
+                   WHERE mo.attempt_id = ma.id
+               )
              ORDER BY ma.request_started_at, ma.id",
         )
         .map_err(|e| Error::Store(format!("cannot read coverage attempts: {e}")))?;

@@ -14,6 +14,7 @@ commands:
   rebuild  destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence
   doctor   health, drift and integrity diagnostics
   coverage did the sampler attempt what the policy owed, and did those attempts observe?
+  import   import explicitly selected legacy evidence with durable provenance
 
 status:
   answers: how much quota does each configured account have left?
@@ -72,5 +73,11 @@ coverage:
   refuses: --model (coverage reports every window of the account, not one model); --no-color (coverage prints plain text or json)
   format: text | json
   options: --since DURATION (default 24h), --severe; --account is shared
+
+import:
+  answers: which legacy evidence is safe to import into the ledger?
+  refuses: --format (import prints one operational result); --explain (import derives no report); --account (import carries account identity in its source); --model (import carries no model selector); --no-color (import prints no color)
+  format: text only: import prints one operational result
+  options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE
 
 aub            prints the version; aub --help prints this

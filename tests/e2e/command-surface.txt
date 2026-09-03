@@ -11,5 +11,6 @@ backup
 export
 doctor
 coverage
+import
 ingest
 rebuild

@@ -491,6 +491,9 @@ pub struct CoverageAccount {
     /// The known quota resets that fell inside a no-attempt gap, each with the
     /// nominal length of the window that reported it.
     pub resets_in_gaps: Vec<CoverageReset>,
+    /// Historical observations imported from the legacy series. They are
+    /// visible here, but excluded from the scheduler's attempt denominator.
+    pub legacy_evidence_present: bool,
     /// The provenance node for this account's coverage quantities.
     pub provenance: ProvenanceNode,
 }
@@ -824,6 +827,7 @@ mod tests {
                 },
                 failures: crate::report::coverage::CoverageFailureTally::default(),
                 resets_in_gaps: Vec::new(),
+                legacy_evidence_present: false,
                 provenance: node,
             }],
         )

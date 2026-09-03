@@ -789,13 +789,20 @@ pub fn render_coverage_report(report: &CoverageReport, window: &str) -> String {
         lines.push(cells.join("").trim_end().to_string());
     }
     for account in &report.accounts {
-        let Some(detail) = render_coverage_detail(report, account) else {
+        let detail = render_coverage_detail(report, account);
+        if detail.is_none() && !account.legacy_evidence_present {
             continue;
-        };
+        }
         lines.push(String::new());
         lines.push(format!("{}:", account.name.as_str()));
-        for line in detail {
+        for line in detail.unwrap_or_default() {
             lines.push(format!("  - {line}"));
+        }
+        if account.legacy_evidence_present {
+            lines.push(
+                "  - legacy observations are shown as historical evidence, not ordinary attempt coverage"
+                    .to_string(),
+            );
         }
     }
     lines.join("\n")

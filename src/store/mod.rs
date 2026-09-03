@@ -25,6 +25,7 @@ pub mod ingest;
 pub mod ingest_quarantine;
 pub mod ingestion_generation;
 pub mod ledger_generation;
+pub mod legacy_meter_import;
 pub mod meter_attempt;
 pub mod meter_evidence;
 pub mod migrate;
