@@ -309,6 +309,13 @@ pub fn run(
         }
     }
 
+    let chunks: Vec<&[PersistEvent]> = if persist_events.is_empty() {
+        vec![&[]]
+    } else {
+        persist_events.chunks(max_batch_events).collect()
+    };
+    let total_chunks = chunks.len();
+
     let mut batches: Vec<LandedBatch> = Vec::new();
     let mut totals = crate::store::ingest::PersistOutcome {
         events_written: crate::domain::rows::RowCount::new(0),
@@ -323,8 +330,7 @@ pub fn run(
         writer_slot: MonotonicDuration::from_nanos(0),
     };
 
-    for (index, chunk) in persist_events.chunks(max_batch_events).enumerate() {
-        let total_chunks = persist_events.len().div_ceil(max_batch_events);
+    for (index, chunk) in chunks.into_iter().enumerate() {
         if index > 0 {
             // Yield the writer slot between consecutive batches so a meter
             // write waiting for the slot is served after one batch's hold,
