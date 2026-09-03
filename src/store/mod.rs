@@ -16,6 +16,7 @@
 pub mod account;
 pub mod attempt_crash_hook;
 pub mod attribution_segment;
+pub mod backup;
 pub mod calibration;
 pub mod connection;
 pub mod cost_model;
@@ -28,6 +29,8 @@ pub mod meter_attempt;
 pub mod meter_evidence;
 pub mod migrate;
 pub mod migrations;
+pub mod projection_crash_hook;
+pub mod projection_source;
 pub mod rate_card;
 pub mod repository;
 pub mod retention;

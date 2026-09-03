@@ -91,6 +91,21 @@ pub fn observe_account(
     .map_err(|e| Error::Store(format!("cannot record account observation: {e}")))
 }
 
+/// Reads every account row in identity order.
+pub fn all_accounts(conn: &rusqlite::Connection) -> Result<Vec<Account>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id, logical_name, provider_key, first_observed_at, last_observed_at
+             FROM account ORDER BY id",
+        )
+        .map_err(|e| Error::Store(format!("cannot list accounts: {e}")))?;
+    let rows = statement
+        .query_map([], row_to_account)
+        .map_err(|e| Error::Store(format!("cannot list accounts: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read accounts: {e}")))
+}
+
 /// Reads one account by id, or `None` if no such account exists.
 pub fn account_by_id(conn: &rusqlite::Connection, id: AccountId) -> Result<Option<Account>, Error> {
     conn.query_row(
