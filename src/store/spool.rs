@@ -793,7 +793,7 @@ mod tests {
     fn from_json_reports_the_missing_field_by_name_rather_than_a_generic_parse_error() {
         let broken = "{\"attempt_id\": 1, \"windows\": []}";
         let error = PendingTerminalBundle::from_json(broken).unwrap_err();
-        assert!(error.contains("response_classification"), "{error}");
+        assert!(error.contains("completed_at_nanos"), "{error}");
     }
 
     // --- write sequence: the four crash points --------------------------
