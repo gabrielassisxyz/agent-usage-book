@@ -15,15 +15,17 @@ use std::time::{Duration, Instant};
 use rusqlite::TransactionBehavior;
 use serde_json::{Value, json};
 
-use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration};
-use crate::projection::build::projection;
-use crate::projection::reader::{
+use agent_usage_book::domain::time::{
+    Clock, ClockSkewEnvelope, FakeClock, MonotonicDuration, UtcTimestamp,
+};
+use agent_usage_book::projection::build::projection;
+use agent_usage_book::projection::reader::{
     ProjectedReading, ProjectionRead, account_reading, read_projection,
 };
-use crate::store::connection::{AccessMode, PragmaPolicy, open};
-use crate::store::ledger_generation::current;
-use crate::store::migrate::{Migration, run_migrations};
-use crate::store::projection_source::{account_meter_states, test_support::fixture};
+use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
+use agent_usage_book::store::ledger_generation::current;
+use agent_usage_book::store::migrate::{Migration, run_migrations};
+use agent_usage_book::store::projection_source::{account_meter_states, test_support::fixture};
 
 const BENCHMARK_SCHEMA: &str = "aub.projection_benchmark.v1";
 const SAMPLES_PER_CASE: usize = 8;
@@ -180,14 +182,14 @@ fn result_json(outcomes: &[ReadOutcome]) -> Value {
         .iter()
         .filter_map(|outcome| match outcome {
             ReadOutcome::Failed { detail, .. } => Some(detail.as_str()),
-            _ => None,
+            ReadOutcome::Completed { .. } | ReadOutcome::Busy { .. } => None,
         })
         .collect();
     let busy_details: Vec<&str> = outcomes
         .iter()
         .filter_map(|outcome| match outcome {
             ReadOutcome::Busy { detail, .. } => Some(detail.as_str()),
-            _ => None,
+            ReadOutcome::Completed { .. } | ReadOutcome::Failed { .. } => None,
         })
         .collect();
     json!({
@@ -202,15 +204,18 @@ fn result_json(outcomes: &[ReadOutcome]) -> Value {
     })
 }
 
-fn publish_seed(fixture: &crate::store::projection_source::test_support::Fixture) {
-    let publication = crate::projection::publish(&fixture.conn, &fixture.projection_path());
+fn publish_seed(fixture: &agent_usage_book::store::projection_source::test_support::Fixture) {
+    let publication =
+        agent_usage_book::projection::publish(&fixture.conn, &fixture.projection_path());
     assert!(
         publication.published_generation().is_some(),
         "the benchmark seed must publish a readable projection: {publication:?}"
     );
 }
 
-fn seed_large_database(fixture: &mut crate::store::projection_source::test_support::Fixture) {
+fn seed_large_database(
+    fixture: &mut agent_usage_book::store::projection_source::test_support::Fixture,
+) {
     fixture.seed_additional_accounts(LARGE_ACCOUNT_COUNT);
     publish_seed(fixture);
 }
@@ -255,7 +260,7 @@ fn hold_migration(database_path: &Path) -> thread::JoinHandle<()> {
             busy_timeout: MonotonicDuration::from_seconds(2),
         };
         let mut connection = open(&path, AccessMode::ReadWrite, &policy).unwrap();
-        let mut migrations = crate::store::migrations::registry();
+        let mut migrations = agent_usage_book::store::migrations::registry();
         migrations.push(Migration {
             version: migrations.last().unwrap().version + 1,
             rewrites_irreplaceable: false,
@@ -265,9 +270,7 @@ fn hold_migration(database_path: &Path) -> thread::JoinHandle<()> {
             &mut connection,
             &migrations,
             None,
-            &crate::domain::time::FakeClock::new(
-                crate::domain::time::UtcTimestamp::from_unix_nanos(99),
-            ),
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(99)),
         )
         .unwrap();
     });
@@ -277,11 +280,13 @@ fn hold_migration(database_path: &Path) -> thread::JoinHandle<()> {
 
 fn hold_benchmark_migration_lock(
     connection: &rusqlite::Connection,
-) -> Result<(), crate::error::Error> {
+) -> Result<(), agent_usage_book::error::Error> {
     connection
         .execute_batch("CREATE TABLE benchmark_migration_probe (id INTEGER PRIMARY KEY)")
         .map_err(|error| {
-            crate::error::Error::Store(format!("cannot create benchmark migration probe: {error}"))
+            agent_usage_book::error::Error::Store(format!(
+                "cannot create benchmark migration probe: {error}"
+            ))
         })?;
     MIGRATION_STARTED.store(true, Ordering::Release);
     thread::sleep(LOCK_HOLD);
@@ -395,98 +400,93 @@ fn benchmark_report() -> Value {
     })
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+#[test]
+fn direct_read_only_and_projection_paths_have_equivalent_typed_reports() {
+    let report = benchmark_case(CaseKind::Uncontended);
+    assert_eq!(report["case"], "uncontended");
+    assert_eq!(report["direct_sqlite_read_only"]["failed"], 0);
+}
 
-    #[test]
-    fn direct_read_only_and_projection_paths_have_equivalent_typed_reports() {
-        let report = benchmark_case(CaseKind::Uncontended);
-        assert_eq!(report["case"], "uncontended");
-        assert_eq!(report["direct_sqlite_read_only"]["failed"], 0);
-    }
+#[test]
+fn active_writer_completes_or_reports_busy_without_hanging() {
+    let report = benchmark_case(CaseKind::ActiveWriter);
+    assert_eq!(report["direct_sqlite_read_only"]["failed"], 0);
+    assert_eq!(
+        report["direct_sqlite_read_only"]["samples"],
+        SAMPLES_PER_CASE
+    );
+}
 
-    #[test]
-    fn active_writer_completes_or_reports_busy_without_hanging() {
-        let report = benchmark_case(CaseKind::ActiveWriter);
-        assert_eq!(report["direct_sqlite_read_only"]["failed"], 0);
-        assert_eq!(
-            report["direct_sqlite_read_only"]["samples"],
-            SAMPLES_PER_CASE
-        );
-    }
+#[test]
+fn active_migration_completes_or_reports_busy_without_hanging() {
+    let report = benchmark_case(CaseKind::ActiveMigration);
+    assert_eq!(report["direct_sqlite_read_only"]["failed"], 0);
+    assert_eq!(
+        report["direct_sqlite_read_only"]["samples"],
+        SAMPLES_PER_CASE
+    );
+}
 
-    #[test]
-    fn active_migration_completes_or_reports_busy_without_hanging() {
-        let report = benchmark_case(CaseKind::ActiveMigration);
-        assert_eq!(report["direct_sqlite_read_only"]["failed"], 0);
-        assert_eq!(
-            report["direct_sqlite_read_only"]["samples"],
-            SAMPLES_PER_CASE
-        );
-    }
-
-    #[test]
-    fn report_records_every_required_case_and_refuses_to_invent_a_budget() {
-        let report = benchmark_report();
-        assert_eq!(report["schema"], BENCHMARK_SCHEMA);
-        assert_eq!(
-            report["status_budget"]["value"], "unmeasured",
-            "the benchmark must record the pending budget instead of inventing one"
-        );
-        let cases = report["cases"].as_array().unwrap();
-        assert_eq!(cases.len(), 4);
-        assert_eq!(
-            cases
-                .iter()
-                .map(|case| case["case"].as_str().unwrap())
-                .collect::<Vec<_>>(),
-            [
-                "uncontended",
-                "large_populated",
-                "active_writer",
-                "active_migration",
-            ],
-            "aub-c5m needs every condition, not a same-sized substitute set"
-        );
-        for case in cases {
-            for path in ["projection", "direct_sqlite_read_only"] {
-                assert!(case[path]["p50_latency_ns"].is_number());
-                assert!(case[path]["p99_latency_ns"].is_number());
-                assert_eq!(case[path]["samples"], SAMPLES_PER_CASE);
-            }
-            assert!(case["database_size_bytes"].as_u64().unwrap() > 0);
+#[test]
+fn report_records_every_required_case_and_refuses_to_invent_a_budget() {
+    let report = benchmark_report();
+    assert_eq!(report["schema"], BENCHMARK_SCHEMA);
+    assert_eq!(
+        report["status_budget"]["value"], "unmeasured",
+        "the benchmark must record the pending budget instead of inventing one"
+    );
+    let cases = report["cases"].as_array().unwrap();
+    assert_eq!(cases.len(), 4);
+    assert_eq!(
+        cases
+            .iter()
+            .map(|case| case["case"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "uncontended",
+            "large_populated",
+            "active_writer",
+            "active_migration",
+        ],
+        "aub-c5m needs every condition, not a same-sized substitute set"
+    );
+    for case in cases {
+        for path in ["projection", "direct_sqlite_read_only"] {
+            assert!(case[path]["p50_latency_ns"].is_number());
+            assert!(case[path]["p99_latency_ns"].is_number());
+            assert_eq!(case[path]["samples"], SAMPLES_PER_CASE);
         }
+        assert!(case["database_size_bytes"].as_u64().unwrap() > 0);
     }
+}
 
-    #[test]
-    fn direct_comparator_is_scoped_to_read_only_store_access() {
-        let source = include_str!("benchmark.rs");
-        let start = source
-            .find("fn direct_read_only_status(")
-            .expect("the direct comparator must stay named");
-        let end = source[start..]
-            .find("\n}\n\nfn projection_status")
-            .map(|offset| start + offset)
-            .expect("the direct comparator must end before projection reading");
-        let comparator = &source[start..end];
-        assert!(comparator.contains("AccessMode::ReadOnly"));
-        assert!(!comparator.contains("AccessMode::ReadWrite"));
-        assert!(!comparator.contains("run_migrations"));
-        assert!(!comparator.contains("crate::meter"));
-    }
+#[test]
+fn direct_comparator_is_scoped_to_read_only_store_access() {
+    let source = include_str!("projection_benchmark.rs");
+    let start = source
+        .find("fn direct_read_only_status(")
+        .expect("the direct comparator must stay named");
+    let end = source[start..]
+        .find("\n}\n\nfn projection_status")
+        .map(|offset| start + offset)
+        .expect("the direct comparator must end before projection reading");
+    let comparator = &source[start..end];
+    assert!(comparator.contains("AccessMode::ReadOnly"));
+    assert!(!comparator.contains("AccessMode::ReadWrite"));
+    assert!(!comparator.contains("run_migrations"));
+    assert!(!comparator.contains("crate::meter"));
+}
 
-    /// The E2E runner sets the output path and bounds this child. The artifact
-    /// is therefore attached to the runner's lossless stdout/stderr and step
-    /// metadata, ready for aub-c5m to review without contacting a provider.
-    #[test]
-    #[ignore = "the E2E runner records this bounded benchmark run"]
-    fn emit_projection_benchmark_json() {
-        let output = std::env::var("AUB_PROJECTION_BENCHMARK_OUTPUT")
-            .expect("the E2E benchmark must provide an artifact output path");
-        let report = benchmark_report();
-        let rendered = serde_json::to_string_pretty(&report).unwrap();
-        std::fs::write(&output, &rendered).expect("the benchmark artifact must be writable");
-        println!("{rendered}");
-    }
+/// The E2E runner sets the output path and bounds this child. The artifact
+/// is therefore attached to the runner's lossless stdout/stderr and step
+/// metadata, ready for aub-c5m to review without contacting a provider.
+#[test]
+#[ignore = "the E2E runner records this bounded benchmark run"]
+fn emit_projection_benchmark_json() {
+    let output = std::env::var("AUB_PROJECTION_BENCHMARK_OUTPUT")
+        .expect("the E2E benchmark must provide an artifact output path");
+    let report = benchmark_report();
+    let rendered = serde_json::to_string_pretty(&report).unwrap();
+    std::fs::write(&output, &rendered).expect("the benchmark artifact must be writable");
+    println!("{rendered}");
 }

@@ -131,8 +131,7 @@ fn current_observation(
 /// through the real write path. It lives in the store because seeding runs
 /// migrations, and the status path's own module must never reference the
 /// migration framework.
-#[cfg(test)]
-pub(crate) mod test_support {
+pub mod test_support {
     use rusqlite::Connection;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -165,10 +164,10 @@ pub(crate) mod test_support {
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    pub(crate) struct ScratchDir(PathBuf);
+    pub struct ScratchDir(PathBuf);
 
     impl ScratchDir {
-        pub(crate) fn new(tag: &str) -> Self {
+        pub fn new(tag: &str) -> Self {
             let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = std::env::temp_dir().join(format!(
                 "aub-store-projection-source-test-{tag}-{}-{suffix}",
@@ -178,7 +177,7 @@ pub(crate) mod test_support {
             Self(path)
         }
 
-        pub(crate) fn path(&self) -> &Path {
+        pub fn path(&self) -> &Path {
             &self.0
         }
     }
@@ -189,16 +188,16 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) struct Fixture {
-        pub(crate) _scratch: ScratchDir,
-        pub(crate) conn: Connection,
-        pub(crate) account_id: AccountId,
-        pub(crate) run_id: SampleRunId,
-        pub(crate) policy_snapshot_id: SamplingPolicySnapshotId,
-        pub(crate) clock: FakeClock,
+    pub struct Fixture {
+        pub _scratch: ScratchDir,
+        pub conn: Connection,
+        pub account_id: AccountId,
+        pub run_id: SampleRunId,
+        pub policy_snapshot_id: SamplingPolicySnapshotId,
+        pub clock: FakeClock,
     }
 
-    pub(crate) fn fixture_policy() -> PragmaPolicy {
+    pub fn fixture_policy() -> PragmaPolicy {
         PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(2000),
         }
@@ -206,7 +205,7 @@ pub(crate) mod test_support {
 
     /// A migrated scratch database with one account, one run and one policy
     /// snapshot, at a clock advanced past the seeding writes.
-    pub(crate) fn fixture(tag: &str) -> Fixture {
+    pub fn fixture(tag: &str) -> Fixture {
         let scratch = ScratchDir::new(tag);
         let mut conn = open(
             &scratch.path().join("source.db"),
@@ -252,7 +251,7 @@ pub(crate) mod test_support {
         }
     }
 
-    pub(crate) fn resolved_policy() -> ResolvedSamplingPolicy {
+    pub fn resolved_policy() -> ResolvedSamplingPolicy {
         ResolvedSamplingPolicy {
             ordinary_cadence: MonotonicDuration::from_seconds(300),
             freshness_horizon: MonotonicDuration::from_seconds(900),
@@ -264,11 +263,11 @@ pub(crate) mod test_support {
     }
 
     impl Fixture {
-        pub(crate) fn database_path(&self) -> PathBuf {
+        pub fn database_path(&self) -> PathBuf {
             self._scratch.path().join("source.db")
         }
 
-        pub(crate) fn projection_path(&self) -> PathBuf {
+        pub fn projection_path(&self) -> PathBuf {
             self._scratch
                 .path()
                 .join(crate::projection::PROJECTION_FILE_NAME)
@@ -277,7 +276,7 @@ pub(crate) mod test_support {
         /// Adds a deliberately large population in one fixture transaction.
         /// The benchmark is measuring read shape, not the cost of synchronously
         /// committing thousands of independent account observations.
-        pub(crate) fn seed_additional_accounts(&mut self, count: usize) {
+        pub fn seed_additional_accounts(&mut self, count: usize) {
             let transaction = self.conn.transaction().unwrap();
             for index in 0..count {
                 transaction
@@ -295,7 +294,7 @@ pub(crate) mod test_support {
             transaction.commit().unwrap();
         }
 
-        pub(crate) fn start_attempt(&mut self) -> MeterAttemptRowId {
+        pub fn start_attempt(&mut self) -> MeterAttemptRowId {
             self.clock.advance(MonotonicDuration::from_seconds(10));
             let started_at = self.clock.now();
             let attempt = NewMeterAttempt {
@@ -317,16 +316,12 @@ pub(crate) mod test_support {
         /// Commits a success bundle through the same repository boundary live
         /// sampling uses, so the read side under test is fed by the real write
         /// path, including the generation advance.
-        pub(crate) fn commit_success_bundle(&mut self, attempt_id: MeterAttemptRowId) {
+        pub fn commit_success_bundle(&mut self, attempt_id: MeterAttemptRowId) {
             let bundle = self.success_bundle(attempt_id);
             commit_terminal_bundle_on_connection(&mut self.conn, &bundle, || Ok(())).unwrap();
         }
 
-        pub(crate) fn commit_failure(
-            &mut self,
-            attempt_id: MeterAttemptRowId,
-            class: FailureClass,
-        ) {
+        pub fn commit_failure(&mut self, attempt_id: MeterAttemptRowId, class: FailureClass) {
             self.clock.advance(MonotonicDuration::from_millis(500));
             let result = NewMeterAttemptResult {
                 attempt_id,
@@ -340,10 +335,7 @@ pub(crate) mod test_support {
             record_meter_attempt_result(&self.conn, &result).unwrap();
         }
 
-        pub(crate) fn success_bundle(
-            &mut self,
-            attempt_id: MeterAttemptRowId,
-        ) -> TerminalMeterBundle {
+        pub fn success_bundle(&mut self, attempt_id: MeterAttemptRowId) -> TerminalMeterBundle {
             self.clock.advance(MonotonicDuration::from_millis(500));
             let completed_at = self.clock.now();
             let window = MeterWindow::new(
