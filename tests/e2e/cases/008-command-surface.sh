@@ -27,8 +27,8 @@ case_steps() {
     step "unknown argument" "$AUB_BIN" --definitely-not-a-flag
     step "format refused" "$AUB_BIN" config --format json
     step "explain refused" "$AUB_BIN" config --explain
-    step "status json" "$AUB_BIN" status --format json
-    step "spend json" env "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" spend --format json
+    step "status json" env "HOME=$STATE_DIR/home" "$AUB_BIN" status --format json
+    step "spend json" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" spend --format json
 }
 
 case_assertions() {

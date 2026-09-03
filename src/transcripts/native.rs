@@ -185,6 +185,7 @@ struct RecordContext<'a> {
     event_id: Option<&'a str>,
     occurred_at: Option<UtcTimestamp>,
     session: Option<SessionId>,
+    model: Option<&'a str>,
 }
 
 /// Builds a measured event from the four kinds, unknown components, the source
@@ -198,6 +199,9 @@ fn event(
     let mut sources = vec![file.to_string()];
     if let Some(id) = context.event_id {
         sources.push(format!("{STRONG_IDENTITY_PREFIX}{id}"));
+    }
+    if let Some(model) = context.model {
+        sources.push(format!("model:{model}"));
     }
     let mut event = NormalizedUsageEvent::new(
         usage,
@@ -321,6 +325,7 @@ fn parse_claude_line(
             .get("sessionId")
             .and_then(Value::as_str)
             .map(|native| session_id(CLAUDE_CODE_NAMESPACE, native)),
+        model: message.get("model").and_then(Value::as_str),
     };
     Ok(Some(event(
         measured_usage(counts),
@@ -418,6 +423,7 @@ impl ParserAdapter for CodexParser {
                         event_id: None,
                         occurred_at,
                         session,
+                        model: None,
                     },
                     self.parser_version(),
                 )
@@ -561,6 +567,7 @@ fn parse_pi_line(
             .or_else(|| value.get("id").and_then(Value::as_str)),
         occurred_at: record_timestamp(&value),
         session,
+        model: message.get("model").and_then(Value::as_str),
     };
     Ok(PiLine::Usage(Box::new(event(
         measured_usage(counts),

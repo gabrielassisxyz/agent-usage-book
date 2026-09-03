@@ -151,6 +151,28 @@ pub fn count(connection: &rusqlite::Connection) -> Result<u64, Error> {
         .map_err(|error| Error::Store(format!("cannot count rate cards: {error}")))
 }
 
+/// The records whose review is due at or before an instant.
+pub fn stale_rate_cards(
+    connection: &rusqlite::Connection,
+    at: UtcTimestamp,
+) -> Result<Vec<RateCard>, Error> {
+    let day = at.utc_date().iso();
+    let mut statement = connection
+        .prepare(
+            "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
+                    billing_basis, effective_start, effective_end, published_at, source, review_due
+             FROM rate_card
+             WHERE review_due IS NOT NULL AND review_due <= ?1
+             ORDER BY vendor, model, token_class, effective_start, id",
+        )
+        .map_err(|error| Error::Store(format!("cannot read stale rate cards: {error}")))?;
+    let rows = statement
+        .query_map(params![day], row_to_card)
+        .map_err(|error| Error::Store(format!("cannot query stale rate cards: {error}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| Error::Store(format!("cannot decode rate card: {error}")))
+}
+
 fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
     let id: i64 = row.get(0)?;
     let imported_at: i64 = row.get(1)?;

@@ -11,7 +11,8 @@ use crate::config::CoverageFloor;
 use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
 use crate::domain::freshness::Freshness;
-use crate::domain::provenance::DerivationId;
+use crate::domain::money::Usd;
+use crate::domain::provenance::{DerivationId, RateCardId};
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
@@ -20,6 +21,7 @@ use crate::evidence::{Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
+use crate::valuation::ValuationOutcome;
 
 /// A monotonically increasing ledger generation.
 ///
@@ -66,6 +68,7 @@ pub struct ReportMetadata {
     pub knowledge_at: UtcTimestamp,
     pub ledger_generation: LedgerGeneration,
     pub ingestion_generation: Option<IngestionGeneration>,
+    pub rate_card_version: Option<RateCardId>,
 }
 
 impl ReportMetadata {
@@ -80,7 +83,13 @@ impl ReportMetadata {
             knowledge_at,
             ledger_generation,
             ingestion_generation,
+            rate_card_version: None,
         }
+    }
+
+    pub fn with_rate_card_version(mut self, rate_card_version: Option<RateCardId>) -> Self {
+        self.rate_card_version = rate_card_version;
+        self
     }
 }
 
@@ -242,6 +251,7 @@ impl NowReport {
 pub struct SpendGroup {
     pub key: LogicalName,
     pub usage: UsageVector,
+    pub valuation: Option<ValuationOutcome<Usd>>,
     pub provenance: Provenance,
     pub derivation_id: DerivationId,
     /// Groups requested after this one. A report with more than one grouping
@@ -260,10 +270,16 @@ impl SpendGroup {
         Self {
             key,
             usage,
+            valuation: None,
             provenance,
             derivation_id,
             children: Vec::new(),
         }
+    }
+
+    pub fn with_valuation(mut self, valuation: Option<ValuationOutcome<Usd>>) -> Self {
+        self.valuation = valuation;
+        self
     }
 
     pub fn with_children(mut self, children: Vec<SpendGroup>) -> Self {
@@ -383,6 +399,7 @@ pub struct SpendReport {
     pub groups: Vec<SpendGroup>,
     pub provenance: ProvenanceGraph,
     pub ingest: IngestSummary,
+    pub stale_rate_card_note: Option<String>,
 }
 
 impl SpendReport {
@@ -407,7 +424,13 @@ impl SpendReport {
             groups,
             provenance,
             ingest,
+            stale_rate_card_note: None,
         }
+    }
+
+    pub fn with_stale_rate_card_note(mut self, note: Option<String>) -> Self {
+        self.stale_rate_card_note = note;
+        self
     }
 
     pub fn with_grouping(mut self, grouping: Vec<SpendGrouping>) -> Self {

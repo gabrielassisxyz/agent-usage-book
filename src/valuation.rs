@@ -13,7 +13,8 @@
 //! - Currencies are distinct phantom-typed `Money<C>` parameters (PLAN.md 25.2).
 
 use crate::domain::money::{Currency, Money, MoneyPerMillionTokens};
-use crate::domain::rate_card::{CurrencyCode, RateCard, TokenClass};
+use crate::domain::provenance::RateCardId;
+use crate::domain::rate_card::{CurrencyCode, RateCard, ReviewDuePolicy, TokenClass};
 use crate::domain::time::UtcDate;
 use crate::domain::tokens::{TokenKind, UsageVector};
 
@@ -104,21 +105,109 @@ pub enum ValuationOutcome<C: Currency> {
     },
 }
 
+impl<C: Currency> ValuationOutcome<C> {
+    /// Combines two valuation outcomes, accumulating subtotals and missing rates.
+    pub fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Complete(a), Self::Complete(b)) => Self::Complete(a + b),
+            (
+                Self::Complete(a),
+                Self::Incomplete {
+                    known_price_subtotal,
+                    missing_rates,
+                },
+            ) => Self::Incomplete {
+                known_price_subtotal: a + known_price_subtotal,
+                missing_rates,
+            },
+            (
+                Self::Incomplete {
+                    known_price_subtotal,
+                    missing_rates,
+                },
+                Self::Complete(b),
+            ) => Self::Incomplete {
+                known_price_subtotal: known_price_subtotal + b,
+                missing_rates,
+            },
+            (
+                Self::Incomplete {
+                    known_price_subtotal: a,
+                    missing_rates: mut m_a,
+                },
+                Self::Incomplete {
+                    known_price_subtotal: b,
+                    missing_rates: m_b,
+                },
+            ) => {
+                m_a.extend(m_b);
+                Self::Incomplete {
+                    known_price_subtotal: a + b,
+                    missing_rates: m_a,
+                }
+            }
+            (Self::UnsupportedCurrency { found, expected }, _)
+            | (_, Self::UnsupportedCurrency { found, expected }) => {
+                Self::UnsupportedCurrency { found, expected }
+            }
+        }
+    }
+}
+
 /// An immutable in-memory book of versioned rate cards.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RateBook {
     cards: Vec<RateCard>,
+    explicit_version: Option<RateCardId>,
 }
 
 impl RateBook {
     /// Constructs a rate book from a slice of rate cards.
     pub fn new(cards: Vec<RateCard>) -> Self {
-        Self { cards }
+        Self {
+            cards,
+            explicit_version: None,
+        }
+    }
+
+    /// Constructs a rate book with an explicit version identifier.
+    pub fn with_version(cards: Vec<RateCard>, version: RateCardId) -> Self {
+        Self {
+            cards,
+            explicit_version: Some(version),
+        }
     }
 
     /// The list of rate cards in this book.
     pub fn cards(&self) -> &[RateCard] {
         &self.cards
+    }
+
+    /// The rate card version identifier for report metadata and explain provenance.
+    pub fn version(&self) -> Option<RateCardId> {
+        if let Some(explicit) = &self.explicit_version {
+            return Some(explicit.clone());
+        }
+        if self.cards.is_empty() {
+            return None;
+        }
+        let latest_date = self
+            .cards
+            .iter()
+            .map(|card| card.draft.effective_start)
+            .max()?;
+        Some(RateCardId::new(format!("rate-card-{}", latest_date.iso())))
+    }
+
+    /// Returns rate cards that have reached their configured review-due date.
+    pub fn stale_cards(&self, at: UtcDate) -> Vec<&RateCard> {
+        self.cards
+            .iter()
+            .filter(|card| match &card.draft.review_due {
+                ReviewDuePolicy::On(due_date) => at >= *due_date,
+                ReviewDuePolicy::None => false,
+            })
+            .collect()
     }
 
     /// Finds the rate card effective for a specific vendor, model, token class, and date.
@@ -141,13 +230,31 @@ impl RateBook {
                 let card_vendor = card.draft.vendor.trim().to_ascii_lowercase();
                 let card_model = card.draft.model.trim().to_ascii_lowercase();
 
-                card_vendor == normalized_vendor
-                    && (card_model == normalized_model || normalized_model.contains(&card_model))
+                let vendor_matches = card_vendor == normalized_vendor
+                    || normalized_vendor.contains(&card_vendor)
+                    || card_vendor.contains(&normalized_vendor);
+                let model_matches = normalized_model == "unknown"
+                    || normalized_model.is_empty()
+                    || card_model == normalized_model
+                    || normalized_model.contains(&card_model)
+                    || card_model.contains(&normalized_model);
+
+                vendor_matches
+                    && model_matches
                     && card.draft.token_class == token_class
                     && date >= card.draft.effective_start
                     && card.draft.effective_end.is_none_or(|end| date <= end)
             })
-            .max_by_key(|card| (card.draft.effective_start, card.id, card.imported_at))
+            .max_by_key(|card| {
+                let card_model = card.draft.model.trim().to_ascii_lowercase();
+                let exact_model = card_model == normalized_model;
+                (
+                    exact_model,
+                    card.draft.effective_start,
+                    card.id,
+                    card.imported_at,
+                )
+            })
     }
 
     /// Finds a rate card for an arbitrary / unknown token class name by string match.

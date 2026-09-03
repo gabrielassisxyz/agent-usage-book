@@ -459,7 +459,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 12] = [
+    const KNOWN_SPEND_KEYS: [&str; 14] = [
         "schema",
         "command",
         "run",
@@ -472,6 +472,8 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "ingestion_generation",
         "grouping",
         "explain",
+        "rate_card_version",
+        "stale_rate_card_note",
     ];
     for key in obj.keys() {
         if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
@@ -649,6 +651,15 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ingest.events_outside_window,
         ingest.events_in_window,
     );
+    if let Some(rc_ver) = &report.metadata.rate_card_version {
+        body.push_str(&format!(
+            ",\"rate_card_version\":{}",
+            json_string(rc_ver.as_str())
+        ));
+    }
+    if let Some(note) = &report.stale_rate_card_note {
+        body.push_str(&format!(",\"stale_rate_card_note\":{}", json_string(note)));
+    }
     if explain != ExplainMode::Off {
         body.push_str(&format!(
             ",\"explain\":{}",
@@ -690,13 +701,44 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
         .map(spend_group_json)
         .collect::<Vec<_>>()
         .join(",");
-    format!(
-        "{{\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{},\"children\":[{children}]}}",
+    let mut fields = format!(
+        "\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{},\"children\":[{children}]",
         json_string(group.key.as_str()),
         coverage_and_quality_json(group.usage.coverage(), group.usage.quality())
             .trim_matches(|c| c == '{' || c == '}'),
         provenance_json(&group.provenance),
-    )
+    );
+    if let Some(val) = &group.valuation {
+        match val {
+            crate::valuation::ValuationOutcome::Complete(equiv) => {
+                fields.push_str(&format!(
+                    ",\"api_list_price_equivalent\":{}",
+                    quantity_json(
+                        &crate::presentation::render::render_money_amount(equiv.amount()),
+                        "usd"
+                    )
+                ));
+            }
+            crate::valuation::ValuationOutcome::Incomplete {
+                known_price_subtotal,
+                ..
+            } => {
+                fields.push_str(&format!(
+                    ",\"api_list_price_equivalent\":{{\"status\":\"unavailable\",\"known_price_subtotal\":{}}}",
+                    quantity_json(
+                        &crate::presentation::render::render_money_amount(
+                            known_price_subtotal.amount()
+                        ),
+                        "usd"
+                    )
+                ));
+            }
+            crate::valuation::ValuationOutcome::UnsupportedCurrency { .. } => {
+                fields.push_str(",\"api_list_price_equivalent\":{\"status\":\"unavailable\"}");
+            }
+        }
+    }
+    format!("{{{fields}}}")
 }
 
 /// The unit every sampling-opportunity count is carried in.

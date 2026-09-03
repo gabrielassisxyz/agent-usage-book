@@ -23,6 +23,8 @@ pub struct CanonicalSpendEvent {
     pub evidence_kind: String,
     pub sources: BTreeSet<String>,
     pub components: BTreeMap<String, u64>,
+    pub vendor: Option<String>,
+    pub model: Option<String>,
 }
 
 /// Diagnostics that qualify a canonical spend query.
@@ -45,7 +47,8 @@ pub fn canonical_events(
         .prepare(
             "SELECT e.id, e.canonical_event_id, e.event_timestamp, e.session_id, \
                     e.evidence_kind, e.source_provenance, \
-                    (SELECT MIN(o.source_namespace) FROM usage_occurrence o WHERE o.event_id = e.id) \
+                    (SELECT MIN(o.source_namespace) FROM usage_occurrence o WHERE o.event_id = e.id), \
+                    e.model_id \
              FROM usage_event e \
              WHERE e.event_timestamp >= ?1 AND e.event_timestamp < ?2 \
              ORDER BY e.event_timestamp, e.canonical_event_id",
@@ -61,15 +64,43 @@ pub fn canonical_events(
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
                 row.get::<_, Option<String>>(6)?,
+                row.get::<_, Option<String>>(7)?,
             ))
         })
         .map_err(|error| Error::Store(format!("cannot query canonical spend rows: {error}")))?;
 
     let mut events = Vec::new();
     for row in rows {
-        let (event_id, canonical_id, occurred_at, session_id, evidence_kind, provenance, source) =
+        let (
+            event_id,
+            canonical_id,
+            occurred_at,
+            session_id,
+            evidence_kind,
+            provenance,
+            source,
+            model_id,
+        ) =
             row.map_err(|error| Error::Store(format!("cannot read canonical spend row: {error}")))?;
         let (project, repository) = session_labels(conn, source.as_deref(), session_id.as_deref())?;
+        let vendor = match source.as_deref() {
+            Some("claude-code" | "anthropic") => Some("anthropic".to_string()),
+            Some("codex" | "openai") => Some("openai".to_string()),
+            Some(other) => Some(other.to_string()),
+            None => {
+                if let Some(m) = &model_id {
+                    if m.starts_with("claude") {
+                        Some("anthropic".to_string())
+                    } else if m.starts_with("gpt") {
+                        Some("openai".to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            }
+        };
         events.push(CanonicalSpendEvent {
             canonical_id,
             occurred_at: UtcTimestamp::from_unix_nanos(occurred_at),
@@ -83,6 +114,8 @@ pub fn canonical_events(
                 .map(str::to_string)
                 .collect(),
             components: components(conn, event_id)?,
+            vendor,
+            model: model_id,
         });
     }
     Ok(events)

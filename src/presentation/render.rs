@@ -7,6 +7,7 @@
 
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
+use crate::domain::money::{Currency, Money};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
@@ -19,6 +20,7 @@ use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{CoverageReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
 use crate::transcripts::TranscriptDriftReport;
+use crate::valuation::ValuationOutcome;
 
 /// The explain level a command was asked for.
 ///
@@ -197,13 +199,22 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
         .map(|dimension| dimension.as_str())
         .collect::<Vec<_>>()
         .join(", ");
+    let is_valued = report.groups.iter().any(|g| g.valuation.is_some());
+    let valuation_clause = if is_valued {
+        ", valued at API list-price equivalent"
+    } else {
+        ""
+    };
     let mut lines = vec![format!(
-        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}",
+        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}{valuation_clause}",
         report.since.iso(),
         report.until.iso()
     )];
     if let Some(generation) = report.metadata.ingestion_generation {
         lines.push(format!("ingestion generation: {}", generation.get()));
+    }
+    if let Some(note) = &report.stale_rate_card_note {
+        lines.push(format!("note: {note}"));
     }
     if report.groups.is_empty() {
         lines.push(format!(
@@ -325,6 +336,19 @@ fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>)
     for (name, count) in group.usage.unknown() {
         parts.push(format!("{name} {}", render_count(count.value())));
     }
+    if let Some(valuation) = &group.valuation {
+        match valuation {
+            ValuationOutcome::Complete(equiv) => {
+                parts.push(format!(
+                    "API list-price equivalent ${}",
+                    render_money_amount(equiv.amount())
+                ));
+            }
+            ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+                parts.push("API list-price equivalent unavailable".to_string());
+            }
+        }
+    }
     let qualification = match quality_term(group.usage.quality()) {
         Some(term) => term,
         None => coverage_term(group.usage.coverage()),
@@ -339,6 +363,16 @@ fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>)
     for child in &group.children {
         render_spend_group(child, depth + 1, lines);
     }
+}
+
+/// Formats a typed monetary amount with two fractional digits.
+pub fn render_money_amount<C: Currency>(money: Money<C>) -> String {
+    let micros = money.micros();
+    let cents = (micros.abs() + 5_000) / 10_000;
+    let sign = if micros < 0 { "-" } else { "" };
+    let whole = cents / 100;
+    let frac = cents % 100;
+    format!("{sign}{whole}.{frac:02}")
 }
 
 fn render_count(raw: u64) -> String {

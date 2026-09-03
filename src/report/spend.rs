@@ -19,7 +19,8 @@ use std::path::Path;
 
 use crate::config::Config;
 use crate::dedup::deduplicate;
-use crate::domain::provenance::{DerivationId, EvidenceId, QuerySemantics};
+use crate::domain::money::Usd;
+use crate::domain::provenance::{DerivationId, EvidenceId, QuerySemantics, WitnessId};
 use crate::domain::time::{UtcDate, UtcTimestamp, unix_nanos};
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenCount,
@@ -35,12 +36,12 @@ use crate::report::models::{
     SpendDiagnosticProvenance, SpendGroup, SpendGroupProvenance, SpendGrouping, SpendReport,
 };
 use crate::report::provenance::{ProvenanceNode, ValueArithmetic};
+use crate::store::spend::CanonicalSpendEvent;
 use crate::transcripts::{
     DiscoveryError, DiscoveryOptions, NormalizedUsageEvent, ParserAdapter, ParserVersion,
     SourceLocation, discover, parser_for_format,
 };
-
-use crate::store::spend::CanonicalSpendEvent;
+use crate::valuation::{RateBook, ValuationOutcome};
 
 /// The UTC day range a spend report covers: `since` inclusive, `until` exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -421,6 +422,7 @@ pub fn assemble_canonical(
     grouping: Vec<SpendGrouping>,
     refresh_attempted: bool,
     refresh_failure: Option<String>,
+    rate_book: Option<&RateBook>,
 ) -> Result<SpendReport, Error> {
     let grouping = if grouping.is_empty() {
         vec![SpendGrouping::Day]
@@ -442,8 +444,9 @@ pub fn assemble_canonical(
         &window,
         partial,
         &mut provenance,
+        rate_book,
     );
-    let metadata = ReportMetadata::new(
+    let mut metadata = ReportMetadata::new(
         generated_at,
         generated_at,
         LedgerGeneration::new(crate::store::ledger_generation::current(conn)?.value()),
@@ -451,6 +454,24 @@ pub fn assemble_canonical(
             crate::store::ingestion_generation::current(conn)?.value(),
         )),
     );
+    let stale_note = if let Some(book) = rate_book {
+        metadata = metadata.with_rate_card_version(book.version());
+        let stale = book.stale_cards(generated_at.utc_date());
+        if !stale.is_empty() {
+            let first = &stale[0];
+            let due_str = match &first.draft.review_due {
+                crate::domain::rate_card::ReviewDuePolicy::On(d) => d.iso(),
+                crate::domain::rate_card::ReviewDuePolicy::None => String::new(),
+            };
+            Some(format!(
+                "rate card review is due (configured review-due date {due_str} has passed)"
+            ))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
     let ingest = IngestSummary {
         refresh_attempted,
         refresh_failure,
@@ -496,6 +517,7 @@ pub fn assemble_canonical(
         provenance,
         ingest,
     )
+    .with_stale_rate_card_note(stale_note)
     .with_grouping(grouping)
     .with_diagnostics(vec![
         SpendDiagnosticProvenance {
@@ -513,6 +535,7 @@ pub fn assemble_canonical(
     ]))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn canonical_groups(
     events: &[CanonicalSpendEvent],
     grouping: &[SpendGrouping],
@@ -521,6 +544,7 @@ fn canonical_groups(
     window: &SpendWindow,
     partial: bool,
     provenance: &mut Vec<SpendGroupProvenance>,
+    rate_book: Option<&RateBook>,
 ) -> Vec<SpendGroup> {
     let Some(dimension) = grouping.get(depth).copied() else {
         return Vec::new();
@@ -542,11 +566,18 @@ fn canonical_groups(
                 .iter()
                 .flat_map(|event| event.sources.iter().cloned())
                 .collect::<BTreeSet<_>>();
+            let valuation = rate_book.map(|book| value_events(&members, book));
+            let mut witnesses = Vec::new();
+            if let Some(book) = rate_book
+                && let Some(rc_id) = book.version()
+            {
+                witnesses.push(WitnessId::RateCard(rc_id));
+            }
             let node = ProvenanceNode::new(
                 members
                     .iter()
                     .map(|event| EvidenceId::new(event.canonical_id.clone())),
-                [],
+                witnesses,
                 QuerySemantics::new(
                     grouping[..=depth]
                         .iter()
@@ -569,12 +600,39 @@ fn canonical_groups(
                 window,
                 partial,
                 provenance,
+                rate_book,
             );
             path.pop();
             SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
+                .with_valuation(valuation)
                 .with_children(children)
         })
         .collect()
+}
+
+fn value_events(events: &[&CanonicalSpendEvent], book: &RateBook) -> ValuationOutcome<Usd> {
+    let mut outcome: Option<ValuationOutcome<Usd>> = None;
+    for event in events {
+        let usage = canonical_usage(&[event], false);
+        let vendor = event.vendor.as_deref().unwrap_or("unknown");
+        let model = event.model.as_deref().unwrap_or("unknown");
+        let event_val = crate::valuation::value_usage_vector::<Usd>(
+            book,
+            vendor,
+            model,
+            event.occurred_at.utc_date(),
+            &usage,
+        );
+        outcome = match outcome {
+            Some(prev) => Some(prev.combine(event_val)),
+            None => Some(event_val),
+        };
+    }
+    outcome.unwrap_or_else(|| {
+        ValuationOutcome::Complete(crate::valuation::ApiListPriceEquivalent::new(
+            crate::domain::money::Money::<Usd>::from_micros(0),
+        ))
+    })
 }
 
 fn group_value(event: &CanonicalSpendEvent, grouping: SpendGrouping) -> String {
@@ -809,6 +867,7 @@ mod tests {
             ],
             false,
             None,
+            None,
         )
         .unwrap();
 
@@ -873,6 +932,7 @@ mod tests {
             vec![SpendGrouping::Day],
             true,
             Some("refresh failed: fixture unreadable; retained prior subtotal".to_string()),
+            None,
         )
         .unwrap();
 
@@ -883,6 +943,54 @@ mod tests {
         assert!(json.contains("\"ingestion_generation\":0"));
         assert!(json.contains("\"refresh_failure\""));
         crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    #[test]
+    fn rate_card_version_populates_in_assemble_canonical() {
+        let (_root, conn) = canonical_conn("canonical-valuation-ver");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical(&conn, "e1", day + 1, "s1", "reported", &[("input", 100)]);
+
+        let cards = vec![crate::domain::rate_card::RateCard {
+            id: 1,
+            imported_at: UtcTimestamp::from_unix_nanos(100),
+            draft: crate::domain::rate_card::RateCardDraft {
+                vendor: "fixture".to_string(),
+                model: "model-1".to_string(),
+                token_class: crate::domain::rate_card::TokenClass::Input,
+                rate_micros: 3_000_000,
+                currency: crate::domain::rate_card::CurrencyCode::Usd,
+                billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
+                effective_start: UtcDate::parse("2026-08-01").unwrap(),
+                effective_end: None,
+                publication: crate::domain::rate_card::Publication {
+                    source: None,
+                    published_at: None,
+                },
+                review_due: crate::domain::rate_card::ReviewDuePolicy::None,
+            },
+        }];
+        let book = RateBook::new(cards);
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Day],
+            false,
+            None,
+            Some(&book),
+        )
+        .unwrap();
+
+        assert_eq!(
+            report
+                .metadata
+                .rate_card_version
+                .as_ref()
+                .map(|v| v.as_str()),
+            Some("rate-card-2026-08-01")
+        );
     }
 
     /// A replayed message counts once at its final output, a message on the next

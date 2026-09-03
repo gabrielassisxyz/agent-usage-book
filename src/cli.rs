@@ -503,7 +503,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => Some("DESTINATION | verify DESTINATION"),
@@ -836,7 +836,7 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
 
     for arg in &invocation.rest {
         match arg.as_str() {
-            "--transcript-format-drift" => {}
+            "--transcript-format-drift" | "--rate-card-staleness" => {}
             other => return Err(Error::Usage(format!("unknown argument: {other}"))),
         }
     }
@@ -852,6 +852,7 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     )?;
 
     let mut db_quarantine = None;
+    let mut stale_cards = Vec::new();
     let db_path = config
         .state
         .dir
@@ -860,14 +861,17 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         let policy = crate::store::connection::PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
         };
-        let summary_res = crate::store::connection::open(
+        if let Ok(conn) = crate::store::connection::open(
             &db_path,
             crate::store::connection::AccessMode::ReadOnly,
             &policy,
-        )
-        .and_then(|conn| crate::store::ingest_quarantine::quarantine_summary(&conn));
-        if let Ok(summary) = summary_res {
-            db_quarantine = Some(summary);
+        ) {
+            if let Ok(summary) = crate::store::ingest_quarantine::quarantine_summary(&conn) {
+                db_quarantine = Some(summary);
+            }
+            if let Ok(stale) = crate::store::rate_card::stale_rate_cards(&conn, timestamp) {
+                stale_cards = stale;
+            }
         }
     }
 
@@ -875,10 +879,28 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         crate::transcripts::detect_drift(&config, None, timestamp, db_quarantine.as_deref())?;
 
     match invocation.format {
-        OutputFormat::Text => println!(
-            "{}",
-            crate::presentation::render_doctor_drift_report(&report)
-        ),
+        OutputFormat::Text => {
+            println!(
+                "{}",
+                crate::presentation::render_doctor_drift_report(&report)
+            );
+            if !stale_cards.is_empty() {
+                println!("\nStale rate cards (review due):");
+                for card in &stale_cards {
+                    let due_str = match &card.draft.review_due {
+                        crate::domain::rate_card::ReviewDuePolicy::On(d) => d.iso(),
+                        crate::domain::rate_card::ReviewDuePolicy::None => String::new(),
+                    };
+                    println!(
+                        "  stale rate card: {} {} {} review due on {}",
+                        card.draft.vendor,
+                        card.draft.model,
+                        card.draft.token_class.as_str(),
+                        due_str
+                    );
+                }
+            }
+        }
         OutputFormat::Json => println!("{}", crate::presentation::doctor_drift_json(&report, run)),
     }
 
@@ -1079,6 +1101,13 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             }
         }
     }
+    let rate_book = match options.value {
+        Some(SpendValuationMode::ApiList) => {
+            let cards = crate::store::rate_card::history(&conn)?;
+            Some(crate::valuation::RateBook::new(cards))
+        }
+        None => None,
+    };
     let mut report = assemble_spend(
         &conn,
         options.window,
@@ -1086,6 +1115,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         options.grouping,
         options.refresh != RefreshPolicy::Never,
         refresh_failure.clone(),
+        rate_book.as_ref(),
     )?;
     if let Some(refresh) = refresh_report {
         report.ingest.files_read = refresh.files_parsed;
@@ -1124,10 +1154,16 @@ enum RefreshPolicy {
     Force,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpendValuationMode {
+    ApiList,
+}
+
 struct SpendOptions {
     window: SpendWindow,
     grouping: Vec<SpendGrouping>,
     refresh: RefreshPolicy,
+    value: Option<SpendValuationMode>,
 }
 
 fn spend_options(
@@ -1138,49 +1174,73 @@ fn spend_options(
     let mut days: i64 = 1;
     let mut grouping = Vec::new();
     let mut refresh = RefreshPolicy::Auto;
+    let mut value = None;
     let mut args = rest.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--today" => since = Some(now.utc_date()),
             "--since" => {
-                let value = args
+                let val_str = args
                     .next()
                     .ok_or_else(|| Error::Usage("--since requires YYYY-MM-DD".into()))?;
-                since = Some(parse_date(value)?);
+                since = Some(parse_date(val_str)?);
             }
             "--days" => {
-                let value = args
+                let val_str = args
                     .next()
                     .ok_or_else(|| Error::Usage("--days requires a number".into()))?;
-                days = value
+                days = val_str
                     .parse()
-                    .map_err(|_| Error::Usage(format!("--days must be a number, got {value}")))?;
+                    .map_err(|_| Error::Usage(format!("--days must be a number, got {val_str}")))?;
             }
             "--group-by" => grouping
                 .push(parse_spend_grouping(args.next().ok_or_else(|| {
                     Error::Usage("--group-by requires a dimension".into())
                 })?)?),
             "--refresh" => {
-                refresh = match args.peek().map(|value| value.as_str()) {
+                refresh = match args.peek().map(|val_str| val_str.as_str()) {
                     Some("auto" | "never" | "force") => {
                         parse_refresh_policy(args.next().expect("peeked refresh value"))?
                     }
                     _ => RefreshPolicy::Force,
                 };
             }
+            "--value" => {
+                let mode = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--value requires a mode".into()))?;
+                match mode.as_str() {
+                    "api-list" => value = Some(SpendValuationMode::ApiList),
+                    other => {
+                        return Err(Error::Usage(format!(
+                            "--value must be api-list, got {other}"
+                        )));
+                    }
+                }
+            }
             other => match other.strip_prefix("--since=") {
-                Some(value) => since = Some(parse_date(value)?),
+                Some(val_str) => since = Some(parse_date(val_str)?),
                 None => match other.strip_prefix("--days=") {
-                    Some(value) => {
-                        days = value.parse().map_err(|_| {
-                            Error::Usage(format!("--days must be a number, got {value}"))
+                    Some(val_str) => {
+                        days = val_str.parse().map_err(|_| {
+                            Error::Usage(format!("--days must be a number, got {val_str}"))
                         })?
                     }
                     None => match other.strip_prefix("--group-by=") {
-                        Some(value) => grouping.push(parse_spend_grouping(value)?),
+                        Some(val_str) => grouping.push(parse_spend_grouping(val_str)?),
                         None => match other.strip_prefix("--refresh=") {
-                            Some(value) => refresh = parse_refresh_policy(value)?,
-                            None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                            Some(val_str) => refresh = parse_refresh_policy(val_str)?,
+                            None => match other.strip_prefix("--value=") {
+                                Some("api-list") => value = Some(SpendValuationMode::ApiList),
+                                Some(val_str) => {
+                                    return Err(Error::Usage(format!(
+                                        "--value must be api-list, got {val_str}"
+                                    )));
+                                }
+                                None => {
+                                    return Err(Error::Usage(format!("unknown argument: {other}")));
+                                }
+                            },
                         },
                     },
                 },
@@ -1195,6 +1255,7 @@ fn spend_options(
             grouping
         },
         refresh,
+        value,
     })
 }
 
