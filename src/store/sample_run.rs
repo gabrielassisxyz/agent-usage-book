@@ -152,6 +152,30 @@ pub fn sample_run_by_id(
     .map_err(|e| Error::Store(format!("cannot read sample run {}: {e}", id.value())))
 }
 
+/// The started instants of every timer-triggered sample run in `[start, end)`,
+/// oldest first. The coverage engine reads these to report the most recent
+/// timer run the scheduler actually made (aub-me5.9).
+pub fn timer_run_times_between(
+    conn: &rusqlite::Connection,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+) -> Result<Vec<UtcTimestamp>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT started_at FROM sample_run
+             WHERE trigger = 'timer' AND started_at >= ?1 AND started_at < ?2
+             ORDER BY started_at",
+        )
+        .map_err(|e| Error::Store(format!("cannot read timer runs: {e}")))?;
+    let rows = statement
+        .query_map(params![start.unix_nanos(), end.unix_nanos()], |row| {
+            row.get::<_, i64>(0).map(UtcTimestamp::from_unix_nanos)
+        })
+        .map_err(|e| Error::Store(format!("cannot read timer runs: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read timer runs: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -234,5 +258,100 @@ mod tests {
         assert_eq!(run.aub_version(), crate::build_info::crate_version());
         assert_eq!(run.configuration_fingerprint(), "fp-abc");
         assert_eq!(run.ended_at(), None);
+    }
+}
+
+#[cfg(test)]
+mod coverage_query_tests {
+    use super::*;
+    use crate::domain::time::{MonotonicDuration, UtcTimestamp};
+    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::migrate::run_migrations;
+    use crate::store::migrations::registry;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aub-sample-run-coverage-test-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Timer runs are the scheduler's own trace: the coverage command reads
+    /// exactly the timer-triggered runs inside the interval, in order, and a
+    /// manual or hook run never reads as one.
+    #[test]
+    fn timer_runs_read_only_timer_triggers_inside_the_interval() {
+        let scratch = ScratchDir::new();
+        let policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = open(
+            &scratch.path().join("meter.db"),
+            AccessMode::ReadWrite,
+            &policy,
+        )
+        .expect("fixture connection must open");
+        let clock_at =
+            |nanos: i64| crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
+        run_migrations(&mut conn, &registry(), None, &clock_at(0))
+            .expect("fixture migrations must apply");
+
+        for (trigger, at) in [
+            (Trigger::Timer, 1_000),
+            (Trigger::Manual, 2_000),
+            (Trigger::Timer, 3_000),
+            (Trigger::Hook, 4_000),
+            (Trigger::Timer, 9_000),
+        ] {
+            start_sample_run(&conn, trigger, UtcTimestamp::from_unix_nanos(at), "test")
+                .expect("the sample run must insert");
+        }
+
+        let runs = timer_run_times_between(
+            &conn,
+            UtcTimestamp::from_unix_nanos(0),
+            UtcTimestamp::from_unix_nanos(5_000),
+        )
+        .expect("the timer read must succeed");
+        assert_eq!(
+            runs,
+            vec![
+                UtcTimestamp::from_unix_nanos(1_000),
+                UtcTimestamp::from_unix_nanos(3_000),
+            ],
+            "only timer-triggered runs inside the half-open interval, in order"
+        );
+
+        let empty = timer_run_times_between(
+            &conn,
+            UtcTimestamp::from_unix_nanos(5_000),
+            UtcTimestamp::from_unix_nanos(6_000),
+        )
+        .expect("the empty-window read must succeed");
+        assert!(
+            empty.is_empty(),
+            "an interval with no timer runs reads empty"
+        );
     }
 }
