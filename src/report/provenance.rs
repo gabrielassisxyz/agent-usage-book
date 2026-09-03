@@ -56,8 +56,8 @@ pub enum ReportField {
     SpendReplayedOccurrences,
     /// Heuristic identities retained as diagnostics, never confused with replays.
     SpendHeuristicIdentities,
-    /// The coverage completeness of a coverage report.
-    CoverageCompleteness,
+    /// The coverage quantities of one account in a coverage report.
+    Coverage { account: LogicalName },
     /// The row count of an export report.
     ExportRows,
     /// The derived token count of a calibration report.
@@ -77,7 +77,7 @@ impl ReportField {
             ReportField::SpendCanonicalRecords => "spend_canonical_records".to_string(),
             ReportField::SpendReplayedOccurrences => "spend_replayed_occurrences".to_string(),
             ReportField::SpendHeuristicIdentities => "spend_heuristic_identities".to_string(),
-            ReportField::CoverageCompleteness => "coverage_completeness".to_string(),
+            ReportField::Coverage { account } => format!("coverage[{}]", account.as_str()),
             ReportField::ExportRows => "export_rows".to_string(),
             ReportField::CalibrationTokens => "calibration_tokens".to_string(),
         }
@@ -91,7 +91,7 @@ impl ReportField {
             ReportField::SpendCanonicalRecords
             | ReportField::SpendReplayedOccurrences
             | ReportField::SpendHeuristicIdentities => "spend",
-            ReportField::CoverageCompleteness => "all",
+            ReportField::Coverage { account } => account.as_str(),
             ReportField::ExportRows => "export",
             ReportField::CalibrationTokens => "calibration",
         }
@@ -341,10 +341,21 @@ mod tests {
             1,
             ValueArithmetic::Direct,
         );
-        let graph = ProvenanceGraph::new([(ReportField::CoverageCompleteness, node)]);
+        let graph = ProvenanceGraph::new([(
+            ReportField::Coverage {
+                account: LogicalName::new("research"),
+            },
+            node,
+        )]);
 
         assert_eq!(graph.len(), 1);
-        assert!(graph.resolve(&ReportField::CoverageCompleteness).is_some());
+        assert!(
+            graph
+                .resolve(&ReportField::Coverage {
+                    account: LogicalName::new("research")
+                })
+                .is_some()
+        );
         assert!(
             graph.resolve(&ReportField::ExportRows).is_none(),
             "a field the graph was not given must not resolve"

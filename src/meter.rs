@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod due;
 pub mod evidence;
 pub mod retry;
+pub mod sampler;
 #[cfg(test)]
 pub mod synthetic;
 pub mod transport;

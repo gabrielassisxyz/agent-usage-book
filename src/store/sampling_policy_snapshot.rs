@@ -114,13 +114,14 @@ fn insert_snapshot(
     account_id: AccountId,
     effective_at: UtcTimestamp,
     policy: &ResolvedSamplingPolicy,
-) -> Result<SamplingPolicySnapshotId, Error> {
+) -> Result<Option<SamplingPolicySnapshotId>, Error> {
     conn.query_row(
         "INSERT INTO sampling_policy_snapshot
              (account_id, effective_at, ordinary_cadence_nanos, freshness_horizon_nanos,
               reset_edge_policy, retry_backoff_policy, command_budget_nanos,
               policy_algorithm_version)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (account_id, effective_at) DO NOTHING
          RETURNING id",
         params![
             account_id.value(),
@@ -134,8 +135,32 @@ fn insert_snapshot(
         ],
         |row| row.get(0),
     )
-    .map(SamplingPolicySnapshotId::new)
+    .optional()
+    .map(|inserted| inserted.map(SamplingPolicySnapshotId::new))
     .map_err(|e| Error::Store(format!("cannot insert policy snapshot: {e}")))
+}
+
+/// The snapshot recorded for `account_id` at exactly `effective_at`, or `None`
+/// when no row sits at that instant.
+fn snapshot_at_instant(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    effective_at: UtcTimestamp,
+) -> Result<Option<SamplingPolicySnapshot>, Error> {
+    conn.query_row(
+        &format!(
+            "SELECT {SELECT_COLUMNS} FROM sampling_policy_snapshot \
+             WHERE account_id = ?1 AND effective_at = ?2"
+        ),
+        params![account_id.value(), effective_at.unix_nanos()],
+        row_to_snapshot,
+    )
+    .optional()
+    .map_err(|e| {
+        Error::Store(format!(
+            "cannot read the policy snapshot at the effective instant: {e}"
+        ))
+    })
 }
 
 /// Records the policy in force for `account_id` as of `effective_at`: reuses
@@ -143,6 +168,14 @@ fn insert_snapshot(
 /// unchanged, and writes a new immutable snapshot otherwise (PLAN.md 12.2, "a
 /// policy snapshot is written whenever the resolved policy differs ... and
 /// reused otherwise").
+///
+/// Two callers racing to record the same policy at the same instant meet the
+/// table's uniqueness on `(account_id, effective_at)`: the loser reads the
+/// row the winner wrote and reuses it when it carries the same policy, which
+/// is the reuse rule reached from the other side, and refuses with both
+/// policies named when it does not, because two different policies at one
+/// effective instant for one account is a configuration conflict, not a row
+/// to overwrite.
 pub fn resolve_policy_snapshot(
     conn: &rusqlite::Connection,
     account_id: AccountId,
@@ -154,7 +187,24 @@ pub fn resolve_policy_snapshot(
     {
         return Ok(most_recent.id);
     }
-    insert_snapshot(conn, account_id, effective_at, policy)
+    match insert_snapshot(conn, account_id, effective_at, policy)? {
+        Some(id) => Ok(id),
+        None => match snapshot_at_instant(conn, account_id, effective_at)? {
+            Some(existing) if existing.policy == *policy => Ok(existing.id()),
+            Some(existing) => Err(Error::Store(format!(
+                "cannot record the policy snapshot for account {}: another writer already \
+                 recorded a different policy at the same effective instant: \
+                 wanted {policy:?}, found {:?}",
+                account_id.value(),
+                existing.policy
+            ))),
+            None => Err(Error::Store(
+                "cannot record the policy snapshot: the instant is taken by a row that \
+                 cannot be read back"
+                    .to_string(),
+            )),
+        },
+    }
 }
 
 /// The policy in force for `account_id` at instant `at`: the snapshot with the
@@ -176,6 +226,28 @@ pub fn effective_policy_at(
     )
     .optional()
     .map_err(|e| Error::Store(format!("cannot read the effective policy snapshot: {e}")))
+}
+
+/// Every policy snapshot recorded for one account, oldest first. The coverage
+/// command hands these to the engine, which reconstructs the denominator from
+/// the snapshot in force over each sub-interval (aub-me5.9, PLAN.md 12.2):
+/// snapshots recorded after the interval's end cannot be in force inside it,
+/// and the engine ignores them.
+pub fn snapshots_for_account(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+) -> Result<Vec<SamplingPolicySnapshot>, Error> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {SELECT_COLUMNS} FROM sampling_policy_snapshot \
+             WHERE account_id = ?1 ORDER BY effective_at"
+        ))
+        .map_err(|e| Error::Store(format!("cannot list policy snapshots: {e}")))?;
+    let rows = statement
+        .query_map([account_id.value()], row_to_snapshot)
+        .map_err(|e| Error::Store(format!("cannot list policy snapshots: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read policy snapshots: {e}")))
 }
 
 #[cfg(test)]
@@ -350,6 +422,100 @@ mod tests {
         assert!(
             err.to_string().to_lowercase().contains("foreign key"),
             "expected a foreign key violation: {err}"
+        );
+    }
+
+    /// Two writers racing to record the same policy at the same instant meet
+    /// the table's uniqueness: the loser reuses the winner's row instead of
+    /// failing, which is the reuse rule reached from the other side. A
+    /// different policy at the same instant is refused with both named.
+    ///
+    /// The race is staged deterministically: a newer snapshot under a
+    /// different policy sits between the winner's row and the loser's
+    /// resolve, so the loser's pre-read cannot reuse and its insert really
+    /// meets the constraint, exactly as it would had another writer committed
+    /// between its read and its write.
+    #[test]
+    fn a_policy_recorded_twice_at_one_instant_reuses_the_row_and_a_conflicting_one_is_refused() {
+        let (_scratch, conn) = fixture_conn();
+        let account =
+            observe_account(&conn, "anthropic", "work", UtcTimestamp::from_unix_nanos(0)).unwrap();
+        let instant = UtcTimestamp::from_unix_nanos(5_000);
+        let later_instant = UtcTimestamp::from_unix_nanos(6_000);
+        let policy_20m = ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(1_200),
+            ..policy_5m()
+        };
+
+        let winner = resolve_policy_snapshot(&conn, account, instant, &policy_5m()).unwrap();
+        resolve_policy_snapshot(&conn, account, later_instant, &policy_15m()).unwrap();
+
+        // The racing writer: same policy at the winner's instant. Its
+        // pre-read sees only the newer 15m snapshot, so its insert meets the
+        // uniqueness constraint and the winner's row is reused.
+        let loser = resolve_policy_snapshot(&conn, account, instant, &policy_5m()).unwrap();
+        assert_eq!(winner, loser, "both writers resolve to one snapshot row");
+
+        // A different policy at the same effective instant is a genuine
+        // conflict between two resolved configurations, and is refused with
+        // both policies named rather than overwritten.
+        let err = resolve_policy_snapshot(&conn, account, instant, &policy_20m).unwrap_err();
+        assert!(
+            err.to_string().contains("same effective instant"),
+            "the refusal must name the conflict: {err}"
+        );
+    }
+
+    /// The coverage command's read returns exactly the named account's
+    /// snapshots, oldest first, and never another account's.
+    #[test]
+    fn snapshots_for_account_reads_only_that_account_ordered_by_effective_at() {
+        let (_scratch, conn) = fixture_conn();
+        let account = observe_account(
+            &conn,
+            "test-provider",
+            "test-account",
+            UtcTimestamp::from_unix_nanos(1_000),
+        )
+        .unwrap();
+        let other = observe_account(
+            &conn,
+            "test-provider",
+            "other-account",
+            UtcTimestamp::from_unix_nanos(1_000),
+        )
+        .unwrap();
+
+        let later = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(9_000),
+            &policy_15m(),
+        )
+        .unwrap();
+        let earlier = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(2_000),
+            &policy_5m(),
+        )
+        .unwrap();
+        let _foreign = resolve_policy_snapshot(
+            &conn,
+            other,
+            UtcTimestamp::from_unix_nanos(3_000),
+            &policy_5m(),
+        )
+        .unwrap();
+
+        let snapshots = snapshots_for_account(&conn, account).unwrap();
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.id())
+                .collect::<Vec<_>>(),
+            vec![earlier, later],
+            "only the named account's snapshots, in effective order"
         );
     }
 }

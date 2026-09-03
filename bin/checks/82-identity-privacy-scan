@@ -1,0 +1,139 @@
+#!/usr/bin/env bash
+# Gate: the release binary carries no compiled identity and no configured
+# forbidden string (aub-n27.4; PLAN.md 3.4, 34.29; AGENTS.md correctness
+# invariant 4).
+#
+# Design: an ordinary `cargo build --release` in this checkout proves nothing
+# about identity leaks, because any absolute path such a build embeds already
+# matches the developer's own environment and looks harmless for exactly that
+# reason (PLAN.md 3.4's own framing: "and looks harmless because it matches
+# theirs"). This check instead builds from a fresh copy of the committed tree
+# (`git archive HEAD`), checked out under a fabricated home directory and
+# username invented for this run alone. If any source path bakes itself into
+# the binary, the fabricated marker is what shows up, not a name any real
+# machine has, so the scan needs no real identity data of its own.
+#
+# This is not a hypothetical: `src/transcripts/drift.rs` used to fall back to
+# `option_env!("CARGO_MANIFEST_DIR")`, baking the absolute path of whoever's
+# checkout built the binary into a compile-time constant present in every
+# release binary regardless of whether that branch ever ran. This check
+# caught it once (aub-n27.4) and the fallback was removed; it stays here to
+# catch a recurrence or a new one shaped the same way.
+#
+# The forbidden-string list is configuration (`docs/forbidden-patterns.txt`),
+# the one file every scan in this project reads: the fixture corpus audit
+# (tests/fixture_corpus_audit.rs), the parser's own fixture scan
+# (src/transcripts/native.rs), the full-sampling-run scan
+# (tests/identity_privacy_scan.rs), and this release-binary scan. A pattern
+# added there protects all four.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+cd "$repo_root"
+
+patterns_file="docs/forbidden-patterns.txt"
+if [ ! -f "$patterns_file" ]; then
+    echo "identity-privacy-scan: $patterns_file does not exist; refusing to scan against nothing" >&2
+    exit 2
+fi
+
+# Only the patterns above the boundary marker: see the comment at the top of
+# docs/forbidden-patterns.txt for why the field-name and identity patterns
+# below it belong to the fixture and database scans, never to this one. A
+# compiled binary's string table legitimately contains an "Authorization"
+# header name and a dependency's own absolute build path; a fixture or a
+# stored row never legitimately contains either.
+patterns=()
+while IFS= read -r pattern || [ -n "$pattern" ]; do
+    case "$pattern" in
+        '# === binary-scan patterns end here ==='*) break ;;
+    esac
+    [ -z "$pattern" ] && continue
+    case "$pattern" in
+        '#'*) continue ;;
+    esac
+    patterns+=("$pattern")
+done <"$patterns_file"
+
+if [ "${#patterns[@]}" -eq 0 ]; then
+    echo "identity-privacy-scan: $patterns_file has no binary-scan patterns above its boundary" >&2
+    echo "  marker (only comments or blank lines); a scan with nothing to look for would" >&2
+    echo "  pass every binary vacuously" >&2
+    exit 2
+fi
+
+# A fabricated identity invented for this run, and nowhere else: a build that
+# embeds a checkout-derived path embeds this string, and nothing legitimate
+# ever contains it.
+foreign_marker="aub-privacy-scan-$(date +%s)-$$"
+build_root="$(mktemp -d "${TMPDIR:-/tmp}/aub-identity-scan.XXXXXX")"
+foreign_home="$build_root/home/$foreign_marker"
+foreign_checkout="$foreign_home/agent-usage-book"
+mkdir -p "$foreign_checkout"
+
+cleanup() { rm -rf "$build_root"; }
+trap cleanup EXIT
+
+if ! git archive HEAD | tar -x -C "$foreign_checkout"; then
+    echo "identity-privacy-scan: could not archive HEAD into the foreign checkout" >&2
+    exit 2
+fi
+
+# rustup/cargo resolve their own state under $HOME by default; carrying the
+# real values through means the foreign $HOME only affects what a build
+# script or the program itself might read, never toolchain resolution.
+real_cargo_home="${CARGO_HOME:-$HOME/.cargo}"
+real_rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+
+if ! (
+    cd "$foreign_checkout" && \
+    env \
+        HOME="$foreign_home" \
+        USER="$foreign_marker" \
+        LOGNAME="$foreign_marker" \
+        CARGO_HOME="$real_cargo_home" \
+        RUSTUP_HOME="$real_rustup_home" \
+        cargo build --release
+); then
+    echo "==> identity-privacy-scan FAILED (release build under the foreign checkout failed)" >&2
+    exit 1
+fi
+
+target_dir="$(cargo metadata --format-version 1 --no-deps | jq -r '.target_directory')"
+aub_bin="$target_dir/release/aub"
+if [ ! -x "$aub_bin" ]; then
+    echo "identity-privacy-scan: no release binary at $aub_bin" >&2
+    exit 2
+fi
+
+# A here-string, not a `strings ... | grep -q` pipe: `grep -q` exits the
+# instant it finds a match, and under `pipefail` a producer still writing to
+# a reader that already closed gets SIGPIPE, which then outranks grep's own
+# success in the pipeline's exit status. That produced exactly one false
+# "clean" verdict while writing this check: the very first pattern in the
+# list matched near the start of a 400KB `strings` dump, tripped the
+# early-exit/SIGPIPE race, and the scan reported no findings at all. Reading
+# from a variable through `<<<` has no second process to race against.
+strings_output="$(strings "$aub_bin")"
+found=0
+
+for pattern in "${patterns[@]}"; do
+    if grep -qiF -- "$pattern" <<<"$strings_output"; then
+        echo "identity-privacy-scan: release binary contains forbidden pattern: $pattern" >&2
+        found=1
+    fi
+done
+
+if grep -qF -- "$foreign_marker" <<<"$strings_output"; then
+    echo "identity-privacy-scan: release binary contains the foreign build path invented for" >&2
+    echo "  this run ($foreign_marker); something bakes an absolute checkout path into it" >&2
+    found=1
+fi
+
+if [ "$found" -ne 0 ]; then
+    echo "==> identity-privacy-scan FAILED: $aub_bin carries compiled identity or a forbidden string" >&2
+    exit 1
+fi
+
+echo "identity-privacy-scan: release binary built under a foreign \$HOME and username carries none of the ${#patterns[@]} configured forbidden strings, and no trace of the foreign checkout path."

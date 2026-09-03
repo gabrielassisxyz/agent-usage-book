@@ -10,15 +10,19 @@
 use std::ffi::OsString;
 use std::io;
 
-use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate};
+use crate::domain::time::{
+    Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
+};
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
 pub use crate::presentation::ExplainMode;
-use crate::presentation::json::{spend_json_with_explain, status_json_with_explain};
+use crate::presentation::json::{coverage_json, spend_json_with_explain, status_json_with_explain};
 use crate::presentation::render::{
-    render_spend_report_with_explain, render_status_report_with_explain,
+    render_coverage_report, render_coverage_threshold_message, render_spend_report_with_explain,
+    render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
+use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as assemble_coverage};
 use crate::report::export::assemble as assemble_export;
 use crate::report::spend::{SpendWindow, assemble_canonical as assemble_spend};
 use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, SpendGrouping, StatusReport};
@@ -67,6 +71,7 @@ aub_command_enum! {
     Ingest,
     Rebuild,
     Doctor,
+    Coverage,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -95,7 +100,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -110,6 +115,7 @@ impl Command {
         Self::Ingest,
         Self::Rebuild,
         Self::Doctor,
+        Self::Coverage,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -358,6 +364,18 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Coverage => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Accepted,
+                account: FlagSupport::Accepted,
+                no_color: FlagSupport::Rejected {
+                    reason: "coverage prints plain text or json",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "coverage reports every window of the account, not one model",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -379,6 +397,7 @@ impl Command {
             Command::Ingest => "ingest",
             Command::Rebuild => "rebuild",
             Command::Doctor => "doctor",
+            Command::Coverage => "coverage",
         }
     }
 
@@ -410,6 +429,9 @@ impl Command {
                 "destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence",
             ),
             Command::Doctor => Some("health, drift and integrity diagnostics"),
+            Command::Coverage => Some(
+                "did the sampler attempt what the policy owed, and did those attempts observe?",
+            ),
         }
     }
 
@@ -434,6 +456,9 @@ impl Command {
             ),
             Command::Doctor => Some(
                 "is the recorded evidence healthy, and does the transcript corpus still match its parsers?",
+            ),
+            Command::Coverage => Some(
+                "did the sampler attempt what the policy owed, and did those attempts observe?",
             ),
             Command::Export => Some(
                 "which usage did each session or run consume, as a versioned JSONL ledger for an external join?",
@@ -486,6 +511,9 @@ impl Command {
             Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
             Command::Doctor => Some("--transcript-format-drift"),
+            Command::Coverage => {
+                Some("--since DURATION (default 24h), --severe; --account is shared")
+            }
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -787,6 +815,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Ingest => ingest_command(&RealClock::new(), &invocation),
         Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
+        Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
     }
 }
 
@@ -854,6 +883,138 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     }
 
     Ok(())
+}
+
+/// The default window `aub coverage` reports when the command line names none:
+/// the window the worked example in PLAN.md section 49 is written over.
+const DEFAULT_COVERAGE_WINDOW: MonotonicDuration = MonotonicDuration::from_seconds(86_400);
+
+/// The window flags of `aub coverage`: `--since DURATION` (default 24h) and
+/// `--severe`. Both compose with the shared `--account`.
+struct CoverageWindow {
+    since: MonotonicDuration,
+    /// The window as the command line asked for it, echoed by the header:
+    /// "coverage - last 24h" is the request the interval answers.
+    description: String,
+    severe_only: bool,
+}
+
+fn coverage_window(rest: &[String]) -> Result<CoverageWindow, Error> {
+    let mut since = DEFAULT_COVERAGE_WINDOW;
+    let mut description = "24h".to_string();
+    let mut severe_only = false;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--severe" => severe_only = true,
+            "--since" => {
+                let value = args.next().ok_or_else(|| {
+                    Error::Usage("--since requires a duration like 24h or 30d".into())
+                })?;
+                since = parse_since(value)?;
+                description = value.to_string();
+            }
+            other => match other.strip_prefix("--since=") {
+                Some(value) => {
+                    since = parse_since(value)?;
+                    description = value.to_string();
+                }
+                None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+            },
+        }
+    }
+    Ok(CoverageWindow {
+        since,
+        description,
+        severe_only,
+    })
+}
+
+fn parse_since(value: &str) -> Result<MonotonicDuration, Error> {
+    crate::config::parse_duration(value).map_err(|_| {
+        Error::Usage(format!(
+            "--since must be a duration like 24h or 30d, got {value}"
+        ))
+    })
+}
+
+/// `aub coverage`: attempt and measurement coverage per account over one
+/// interval, the failure classes behind each account's numbers, and the
+/// threshold exit. The ledger is read read-only and the command performs no
+/// network operation: the exit class is the whole notification mechanism's
+/// signal, and the binary answers without a daemon.
+fn coverage_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("coverage");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let window = coverage_window(&invocation.rest)?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let since_nanos = timestamp
+        .unix_nanos()
+        .saturating_sub(window.since.as_nanos() as i64);
+    let since = UtcTimestamp::from_unix_nanos(since_nanos);
+
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    if !db_path.is_file() {
+        return Err(Error::InsufficientEvidence(format!(
+            "no ledger exists at {}; nothing is recorded about sampling yet",
+            db_path.display()
+        )));
+    }
+    let policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: MonotonicDuration::from_millis(500),
+    };
+    let conn = crate::store::connection::open(
+        &db_path,
+        crate::store::connection::AccessMode::ReadOnly,
+        &policy,
+    )?;
+    let selector = CoverageSelector {
+        account: invocation.account.clone(),
+        severe_only: window.severe_only,
+    };
+    let floors = CoverageFloors {
+        attempt: config.coverage.attempt_floor,
+        measurement: config.coverage.measurement_floor,
+    };
+    let report = assemble_coverage(&conn, since, timestamp, &selector, floors, timestamp)?;
+
+    match invocation.format {
+        OutputFormat::Text => println!("{}", render_coverage_report(&report, &window.description)),
+        OutputFormat::Json => println!("{}", coverage_json(&report, run)),
+    }
+    if report.threshold.met {
+        Ok(())
+    } else {
+        Err(Error::ThresholdNotMet(render_coverage_threshold_message(
+            &report,
+        )))
+    }
 }
 
 fn reject_positionals(invocation: &Invocation) -> Result<(), Error> {
@@ -2161,6 +2322,37 @@ mod tests {
                     other => panic!("{command:?} rejects --account but parsed as {other:?}"),
                 },
             }
+        }
+    }
+
+    #[test]
+    fn coverage_selectors_accept_both_since_spellings_and_compose_with_account() {
+        let parsed = parse_invocation(args(&[
+            "coverage",
+            "--account",
+            "research",
+            "--severe",
+            "--since=30d",
+        ]))
+        .expect("coverage selectors must parse");
+        let Request::Run(invocation) = parsed else {
+            panic!("coverage must produce an invocation")
+        };
+        assert_eq!(invocation.account.as_deref(), Some("research"));
+        let window = coverage_window(&invocation.rest).expect("selectors must be valid");
+        assert_eq!(window.since, MonotonicDuration::from_seconds(30 * 86_400));
+        assert_eq!(window.description, "30d");
+        assert!(window.severe_only);
+
+        let spaced = coverage_window(&["--since".to_string(), "2h".to_string()])
+            .expect("the spaced since form must parse");
+        assert_eq!(spaced.since, MonotonicDuration::from_seconds(2 * 3_600));
+        assert_eq!(spaced.description, "2h");
+
+        match coverage_window(&["--since=forever".to_string()]) {
+            Err(Error::Usage(_)) => {}
+            Err(error) => panic!("an invalid coverage interval must be a usage error: {error:?}"),
+            Ok(_) => panic!("an invalid coverage interval must be refused"),
         }
     }
 

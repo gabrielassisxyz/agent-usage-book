@@ -234,18 +234,22 @@ pub fn extract_record_shape(value: &Value) -> RecordShape {
     }
 }
 
-/// Resolves the base fixture directory, checking CARGO_MANIFEST_DIR or relative path.
+/// Resolves the base fixture directory: the caller's explicit directory, or
+/// the default relative path.
+///
+/// This used to fall back to `option_env!("CARGO_MANIFEST_DIR")` joined onto
+/// the default path. That macro bakes the absolute path of whoever's checkout
+/// built the binary into a compile-time string constant, present in every
+/// release binary's `.rodata` regardless of whether this branch ever runs
+/// (aub-n27.4: the identity/privacy scan is what caught it). It bought
+/// nothing production needs: `cargo test` already runs with the package root
+/// as its working directory, so the relative path alone resolves the fixture
+/// corpus correctly for every test that calls this with `custom: None`, and a
+/// released binary never ships that corpus at all.
 fn resolve_fixture_base(custom: Option<&Path>) -> PathBuf {
-    if let Some(custom_dir) = custom {
-        return custom_dir.to_path_buf();
-    }
-    let manifest_dir = option_env!("CARGO_MANIFEST_DIR").unwrap_or(".");
-    let default_path = Path::new(manifest_dir).join(DEFAULT_FIXTURE_DIR);
-    if default_path.exists() {
-        default_path
-    } else {
-        PathBuf::from(DEFAULT_FIXTURE_DIR)
-    }
+    custom
+        .map(Path::to_path_buf)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_FIXTURE_DIR))
 }
 
 /// Loads and extracts all structural shapes from the fixture corpus for a specific format.
