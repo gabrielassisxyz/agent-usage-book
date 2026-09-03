@@ -14,8 +14,11 @@ use crate::domain::freshness::{FreshnessInput, compute_freshness};
 use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate};
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
-use crate::presentation::json::{spend_json, status_json};
-use crate::presentation::render::{render_spend_report, render_status_report};
+pub use crate::presentation::ExplainMode;
+use crate::presentation::json::{spend_json_with_explain, status_json_with_explain};
+use crate::presentation::render::{
+    render_spend_report_with_explain, render_status_report_with_explain,
+};
 use crate::report::ReportEnvelope;
 use crate::report::spend::{SpendWindow, assemble as assemble_spend};
 use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
@@ -107,10 +110,10 @@ impl Command {
         match self {
             Command::Status => FlagPolicy {
                 format: FlagSupport::Accepted,
-                explain: FlagSupport::Rejected {
-                    reason: "status reports no derived quantity",
+                explain: FlagSupport::Accepted,
+                account: FlagSupport::Rejected {
+                    reason: "status reports every configured account",
                 },
-                account: FlagSupport::Accepted,
                 no_color: FlagSupport::Rejected {
                     reason: "status prints no color",
                 },
@@ -118,9 +121,7 @@ impl Command {
             },
             Command::Spend => FlagPolicy {
                 format: FlagSupport::Accepted,
-                explain: FlagSupport::Rejected {
-                    reason: "spend prints its ingest summary on every run; --explain arrives with the provenance bead",
-                },
+                explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
                     reason: "spend has no account dimension until account attribution lands",
                 },
@@ -145,7 +146,9 @@ impl Command {
                 verbosity: FlagSupport::Accepted,
             },
             Command::LoggingFixture => FlagPolicy {
-                format: FlagSupport::Accepted,
+                format: FlagSupport::Rejected {
+                    reason: "logging-fixture emits diagnostic fixtures, not a report",
+                },
                 explain: FlagSupport::Rejected {
                     reason: "logging-fixture derives no quantity",
                 },
@@ -271,6 +274,62 @@ impl Command {
         }
     }
 
+    /// The question the command answers, for the per-command help block. A test
+    /// hook answers none and is not listed.
+    pub fn question(self) -> Option<&'static str> {
+        match self {
+            Command::Status => Some("how much quota does each configured account have left?"),
+            Command::Spend => Some("how many tokens did each transcript source use per UTC day?"),
+            Command::Config => Some("which configuration key resolved from where?"),
+            Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
+            Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
+            Command::AttemptCrashHook => None,
+        }
+    }
+
+    /// The `--format` line of the per-command help block: the accepted values, or
+    /// the policy's reason when the command rejects the flag.
+    pub fn format_help(self) -> String {
+        match self.flag_policy().format {
+            FlagSupport::Accepted => "text | json".to_string(),
+            FlagSupport::Rejected { reason } => format!("text only: {reason}"),
+        }
+    }
+
+    /// The refused shared flags of the per-command help block, each with the
+    /// policy's reason. Derived from the same policy the parser enforces, so the
+    /// help cannot drift from the rejection behaviour.
+    pub fn refused_flags(self) -> Vec<String> {
+        let policy = self.flag_policy();
+        let mut refused = Vec::new();
+        for (flag, support) in [
+            ("--format", policy.format),
+            ("--explain", policy.explain),
+            ("--account", policy.account),
+            ("--no-color", policy.no_color),
+        ] {
+            if let FlagSupport::Rejected { reason } = support {
+                refused.push(format!("{flag} ({reason})"));
+            }
+        }
+        refused
+    }
+
+    /// The command's own options line for the per-command help block, where it
+    /// has one.
+    pub fn options_help(self) -> Option<&'static str> {
+        match self {
+            Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
+            Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
+            Command::Status
+            | Command::LoggingFixture
+            | Command::StateCheck
+            | Command::ExitClass
+            | Command::AttemptCrashHook
+            | Command::RateCard => None,
+        }
+    }
+
     fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|command| command.name() == name)
     }
@@ -291,6 +350,15 @@ pub struct Invocation {
     pub command: Command,
     pub format: OutputFormat,
     pub verbosity: u8,
+    pub explain: ExplainMode,
+    /// The account the command line asked for, when the command's policy accepts
+    /// `--account`. No command accepts it yet (status's filtering arrives with
+    /// aub-me5.6), so this is always `None` in practice; the field is the
+    /// parser's contract for the flag, carried rather than dropped.
+    pub account: Option<String>,
+    /// Whether `--no-color` was asked for, when the command's policy accepts it.
+    /// No command accepts it yet, so this is always `false` in practice.
+    pub no_color: bool,
     pub rest: Vec<String>,
 }
 
@@ -329,16 +397,24 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         "--version" | "-V" => return Ok(Request::Version),
         _ => {}
     }
-    let command = Command::from_name(name)
-        .ok_or_else(|| Error::Usage(format!("unknown argument: {name}")))?;
+    let command = Command::from_name(name).ok_or_else(|| {
+        Error::Usage(format!(
+            "unknown argument: {name}; run aub --help to list commands"
+        ))
+    })?;
 
     let mut format = OutputFormat::Text;
+    let mut explain = ExplainMode::Off;
+    let mut account = None;
+    let mut no_color = false;
     let mut rest = Vec::new();
     let mut args = args.peekable();
     while let Some(arg) = args.next() {
         let arg = arg
             .to_str()
-            .ok_or_else(|| Error::Usage("argument is not valid UTF-8".into()))?
+            .ok_or_else(|| {
+                Error::Usage("argument is not valid UTF-8; pass only UTF-8 arguments".into())
+            })?
             .to_string();
         let format_value = if let Some(value) = arg.strip_prefix("--format=") {
             Some(value.to_string())
@@ -347,42 +423,101 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         } else {
             None
         };
+        let account_value = if let Some(value) = arg.strip_prefix("--account=") {
+            Some(value.to_string())
+        } else if arg == "--account" {
+            Some(next_arg(&mut args, "--account")?)
+        } else {
+            None
+        };
         match format_value {
             Some(value) => format = parse_format(command, &value)?,
             None if arg == "-v" => verbosity += 1,
-            None => rest.push(arg),
+            None if arg == "--explain" => explain = parse_explain(command, None)?,
+            None if let Some(value) = arg.strip_prefix("--explain=") => {
+                explain = parse_explain(command, Some(value))?
+            }
+            None if arg == "--no-color" => no_color = parse_no_color(command)?,
+            None => match account_value {
+                Some(value) => account = Some(parse_account(command, &value)?),
+                None => rest.push(arg),
+            },
         }
     }
     Ok(Request::Run(Invocation {
         command,
         format,
         verbosity,
+        explain,
+        account,
+        no_color,
         rest,
     }))
+}
+
+fn parse_explain(command: Command, value: Option<&str>) -> Result<ExplainMode, Error> {
+    match command.flag_policy().explain {
+        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
+            "{} does not accept --explain: {reason}; omit the flag",
+            command.name()
+        ))),
+        FlagSupport::Accepted => match value {
+            None | Some("") | Some("summary") => Ok(ExplainMode::Summary),
+            Some("full") => Ok(ExplainMode::Full),
+            Some(other) => Err(Error::Usage(format!(
+                "--explain={other} is not one of summary or full; use --explain or --explain=full"
+            ))),
+        },
+    }
 }
 
 fn parse_format(command: Command, value: &str) -> Result<OutputFormat, Error> {
     match command.flag_policy().format {
         FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
-            "{} does not accept --format: {reason}",
+            "{} does not accept --format: {reason}; omit the flag",
             command.name()
         ))),
         FlagSupport::Accepted => match value {
             "json" => Ok(OutputFormat::Json),
             "text" => Ok(OutputFormat::Text),
             other => Err(Error::Usage(format!(
-                "--format must be text or json, got {other}"
+                "--format must be text or json, got {other}; use --format text or --format json"
             ))),
         },
     }
 }
 
-/// The `--help` text: one line per shipping command, plus the shared flags.
+fn parse_account(command: Command, value: &str) -> Result<String, Error> {
+    match command.flag_policy().account {
+        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
+            "{} does not accept --account: {reason}; omit the flag",
+            command.name()
+        ))),
+        FlagSupport::Accepted => Ok(value.to_string()),
+    }
+}
+
+fn parse_no_color(command: Command) -> Result<bool, Error> {
+    match command.flag_policy().no_color {
+        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
+            "{} does not accept --no-color: {reason}; omit the flag",
+            command.name()
+        ))),
+        FlagSupport::Accepted => Ok(true),
+    }
+}
+
+/// The `--help` text: one line per shipping command, then a per-command block
+/// stating the question the command answers, the shared flags it refuses and
+/// why, and the formats it accepts. The refusal lines are derived from the same
+/// flag policy the parser enforces, so help cannot drift from behaviour.
 pub fn help_text() -> String {
     let mut lines = vec![
         "aub: one ledger for LLM consumption".to_string(),
         String::new(),
         "usage: aub [-v...] <command> [--format text|json] [options]".to_string(),
+        "shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --no-color"
+            .to_string(),
         String::new(),
         "commands:".to_string(),
     ];
@@ -391,13 +526,24 @@ pub fn help_text() -> String {
             lines.push(format!("  {:<8} {summary}", command.name()));
         }
     }
-    lines.extend([
-        String::new(),
-        "spend options: --today (default) | --since YYYY-MM-DD | --days N".to_string(),
-        "config options: --set key=value (repeatable), --config-file PATH".to_string(),
-        String::new(),
-        "aub            prints the version; aub --help prints this".to_string(),
-    ]);
+    for command in Command::ALL {
+        let Some(question) = command.question() else {
+            continue;
+        };
+        lines.push(String::new());
+        lines.push(format!("{}:", command.name()));
+        lines.push(format!("  answers: {question}"));
+        let refused = command.refused_flags();
+        if !refused.is_empty() {
+            lines.push(format!("  refuses: {}", refused.join("; ")));
+        }
+        lines.push(format!("  format: {}", command.format_help()));
+        if let Some(options) = command.options_help() {
+            lines.push(format!("  options: {options}"));
+        }
+    }
+    lines.push(String::new());
+    lines.push("aub            prints the version; aub --help prints this".to_string());
     lines.join("\n")
 }
 
@@ -426,7 +572,12 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     match invocation.command {
         Command::Status => {
             reject_positionals(&invocation)?;
-            status(&RealClock::new(), level, invocation.format)
+            status(
+                &RealClock::new(),
+                level,
+                invocation.format,
+                invocation.explain,
+            )
         }
         Command::Spend => spend(&RealClock::new(), level, &invocation),
         Command::Config => config_command(invocation.rest.into_iter().map(OsString::from)),
@@ -447,7 +598,9 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
 
 fn reject_positionals(invocation: &Invocation) -> Result<(), Error> {
     match invocation.rest.first() {
-        Some(extra) => Err(Error::Usage(format!("unknown argument: {extra}"))),
+        Some(extra) => Err(Error::Usage(format!(
+            "unknown argument: {extra}; run aub --help for command usage"
+        ))),
         None => Ok(()),
     }
 }
@@ -481,8 +634,14 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
     )?;
     let report = assemble_spend(&config, window, timestamp)?;
     match invocation.format {
-        OutputFormat::Text => println!("{}", render_spend_report(&report)),
-        OutputFormat::Json => println!("{}", spend_json(&report, run)),
+        OutputFormat::Text => println!(
+            "{}",
+            render_spend_report_with_explain(&report, invocation.explain)
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            spend_json_with_explain(&report, run, invocation.explain)
+        ),
     }
     if report.ingest.unreadable_files.is_empty() {
         Ok(())
@@ -625,7 +784,12 @@ fn status_clock_skew_envelope() -> ClockSkewEnvelope {
     ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60))
 }
 
-fn status(clock: &impl Clock, level: Level, format: OutputFormat) -> Result<(), Error> {
+fn status(
+    clock: &impl Clock,
+    level: Level,
+    format: OutputFormat,
+    explain: ExplainMode,
+) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
     let command = LogicalName::new("status");
@@ -674,9 +838,14 @@ fn status(clock: &impl Clock, level: Level, format: OutputFormat) -> Result<(), 
     match format {
         OutputFormat::Text => println!(
             "{}",
-            render_status_report(&report, timestamp, status_clock_skew_envelope())
+            render_status_report_with_explain(
+                &report,
+                timestamp,
+                status_clock_skew_envelope(),
+                explain
+            )
         ),
-        OutputFormat::Json => println!("{}", status_json(&report, run)),
+        OutputFormat::Json => println!("{}", status_json_with_explain(&report, run, explain)),
     }
     Ok(())
 }
@@ -1064,50 +1233,215 @@ mod tests {
                 FlagSupport::Accepted,
                 "{command:?} must accept verbosity"
             );
-            if let FlagSupport::Rejected { reason } = policy.format {
-                assert!(
-                    !reason.is_empty(),
-                    "{command:?} rejects --format without a reason"
-                );
+            for (flag, support) in [
+                ("--format", policy.format),
+                ("--explain", policy.explain),
+                ("--account", policy.account),
+                ("--no-color", policy.no_color),
+            ] {
+                if let FlagSupport::Rejected { reason } = support {
+                    assert!(
+                        !reason.is_empty(),
+                        "{command:?} rejects {flag} without a reason"
+                    );
+                }
             }
         }
     }
 
-    /// This bead ships no explain behaviour: every command keeps rejecting
-    /// `--explain`, with a reason, and no explain token is parsed. The explicit
-    /// pin makes that state a checked fact rather than an unstated one, so the
-    /// explain bead flips it deliberately instead of silently.
+    /// Every command declares whether it accepts or rejects `--explain`, and a
+    /// rejection states why rather than rejecting silently. The acceptance arm
+    /// pins the parser contract that the provenance work will enable.
     #[test]
-    fn every_command_rejects_explain() {
+    fn every_command_declares_an_explain_policy() {
         for command in Command::ALL {
             match command.flag_policy().explain {
                 FlagSupport::Rejected { reason } => assert!(
                     !reason.is_empty(),
                     "{command:?} rejects --explain without a reason"
                 ),
-                FlagSupport::Accepted => {
-                    panic!("{command:?} accepts --explain; no explain behaviour ships yet")
-                }
+                FlagSupport::Accepted => {}
             }
         }
     }
 
-    /// `--explain` is not a parsed token: the argument surface recognises only
-    /// `-v` and the command names, so an explain flag is an unknown argument.
-    /// This is the parser half of "no explain token is parsed".
+    /// `--explain` is a parsed token for every command whose policy accepts it, and
+    /// the parser honours the policy: a rejection emits the policy's reason, an
+    /// acceptance lands as `ExplainMode::Summary` (or `Full` for `--explain=full`).
+    /// A planted negative is a policy row that says `Accepted` for a command
+    /// whose parser path ignores the flag, which this loop reports by name.
     #[test]
-    fn explain_is_not_a_parsed_token() {
-        let result = parse_invocation([
-            OsString::from("aub"),
-            OsString::from("--explain"),
-            OsString::from("status"),
-        ]);
-        match result {
-            Err(Error::Usage(message)) => assert!(
-                message.contains("unknown argument"),
-                "--explain must be rejected as an unknown argument, got: {message}"
-            ),
-            other => panic!("--explain must be rejected as an unknown argument, got: {other:?}"),
+    fn the_parser_honours_the_explain_policy_for_every_command() {
+        for command in Command::ALL {
+            let result = parse_invocation(args(&[command.name(), "--explain"]));
+            match command.flag_policy().explain {
+                FlagSupport::Accepted => match result {
+                    Ok(Request::Run(invocation)) => {
+                        assert_eq!(
+                            invocation.explain,
+                            ExplainMode::Summary,
+                            "{command:?} parsed --explain as something other than Summary"
+                        );
+                    }
+                    other => panic!("{command:?} accepts --explain but parsed as {other:?}"),
+                },
+                FlagSupport::Rejected { reason } => match result {
+                    Err(Error::Usage(message)) => {
+                        assert!(message.contains(reason), "{command:?}: {message}")
+                    }
+                    other => panic!("{command:?} rejects --explain but parsed as {other:?}"),
+                },
+            }
+        }
+    }
+
+    /// `--explain=full` and `--explain=garbage` are both refused for a command
+    /// whose policy rejects the flag, with the policy's reason: the rejection
+    /// takes precedence over value validation, so a rejecting command never
+    /// accepts a value it cannot render.
+    #[test]
+    fn explain_values_are_refused_where_the_policy_rejects_the_flag() {
+        for value in ["--explain=full", "--explain=garbage"] {
+            let result = parse_invocation(args(&["config", value]));
+            match result {
+                Err(Error::Usage(message)) => {
+                    assert!(
+                        message.contains("does not accept --explain"),
+                        "{value} must be refused with the policy's reason: {message}"
+                    );
+                    assert!(
+                        message.contains("omit the flag"),
+                        "{value} must name the next action: {message}"
+                    );
+                }
+                other => panic!("{value} must be refused, got: {other:?}"),
+            }
+        }
+    }
+
+    /// For commands whose policy accepts `--explain`, `--explain` and `--explain=summary`
+    /// yield `ExplainMode::Summary`, `--explain=full` yields `ExplainMode::Full`,
+    /// and invalid values are rejected with actionable guidance.
+    #[test]
+    fn explain_values_are_validated_where_the_policy_accepts_the_flag() {
+        for cmd in ["status", "spend"] {
+            for val in ["--explain", "--explain=summary"] {
+                let parsed = parse_invocation(args(&[cmd, val])).expect("valid explain summary");
+                let Request::Run(inv) = parsed else {
+                    panic!("expected Request::Run, got {parsed:?}")
+                };
+                assert_eq!(inv.explain, ExplainMode::Summary);
+            }
+            let parsed_full =
+                parse_invocation(args(&[cmd, "--explain=full"])).expect("valid explain full");
+            let Request::Run(inv) = parsed_full else {
+                panic!("expected Request::Run, got {parsed_full:?}")
+            };
+            assert_eq!(inv.explain, ExplainMode::Full);
+            let err = parse_invocation(args(&[cmd, "--explain=invalid"]))
+                .expect_err("invalid explain value must error");
+            let Error::Usage(msg) = err else {
+                panic!("expected Error::Usage, got {err:?}")
+            };
+            assert!(msg.contains("is not one of summary or full"), "{msg}");
+            assert!(msg.contains("use --explain or --explain=full"), "{msg}");
+        }
+    }
+
+    /// `--account` is a parsed token for every command, and the parser honours the
+    /// policy: a rejection emits the policy's reason, an acceptance lands as the
+    /// invocation's account. No command accepts it yet (status's filtering
+    /// arrives with aub-me5.6), so the loop's rejection arm is the one that
+    /// fires; the acceptance arm is the parser's contract for when one does.
+    #[test]
+    fn the_parser_honours_the_account_policy_for_every_command() {
+        for command in Command::ALL {
+            let result = parse_invocation(args(&[command.name(), "--account", "work-a"]));
+            match command.flag_policy().account {
+                FlagSupport::Accepted => match result {
+                    Ok(Request::Run(invocation)) => {
+                        assert_eq!(
+                            invocation.account.as_deref(),
+                            Some("work-a"),
+                            "{command:?} parsed --account as something other than the value"
+                        );
+                    }
+                    other => panic!("{command:?} accepts --account but parsed as {other:?}"),
+                },
+                FlagSupport::Rejected { reason } => match result {
+                    Err(Error::Usage(message)) => {
+                        assert!(message.contains(reason), "{command:?}: {message}")
+                    }
+                    other => panic!("{command:?} rejects --account but parsed as {other:?}"),
+                },
+            }
+        }
+    }
+
+    /// `--no-color` is a parsed token for every command, and the parser honours
+    /// the policy: a rejection emits the policy's reason, an acceptance lands as
+    /// the invocation's no_color. No command accepts it yet, so the rejection
+    /// arm is the one that fires.
+    #[test]
+    fn the_parser_honours_the_no_color_policy_for_every_command() {
+        for command in Command::ALL {
+            let result = parse_invocation(args(&[command.name(), "--no-color"]));
+            match command.flag_policy().no_color {
+                FlagSupport::Accepted => match result {
+                    Ok(Request::Run(invocation)) => {
+                        assert!(
+                            invocation.no_color,
+                            "{command:?} parsed --no-color as false"
+                        );
+                    }
+                    other => panic!("{command:?} accepts --no-color but parsed as {other:?}"),
+                },
+                FlagSupport::Rejected { reason } => match result {
+                    Err(Error::Usage(message)) => {
+                        assert!(message.contains(reason), "{command:?}: {message}")
+                    }
+                    other => panic!("{command:?} rejects --no-color but parsed as {other:?}"),
+                },
+            }
+        }
+    }
+
+    /// Help states, for every shipping command, the question it answers, the
+    /// shared flags it refuses and why, and the formats it accepts - the refusal
+    /// lines derived from the same policy the parser enforces.
+    #[test]
+    fn help_states_question_refusal_and_format_for_every_command() {
+        let help = help_text();
+        for command in Command::ALL {
+            let Some(_summary) = command.summary() else {
+                assert!(
+                    command.question().is_none(),
+                    "{command:?} is hidden but exposes a help question"
+                );
+                continue;
+            };
+            let question = command
+                .question()
+                .unwrap_or_else(|| panic!("{command:?} has no help question"));
+            assert!(
+                help.contains(question),
+                "{command:?} help must state its question"
+            );
+            let refused_flags = command.refused_flags();
+            assert!(
+                !refused_flags.is_empty(),
+                "{command:?} help has no refusal boundary"
+            );
+            for refused in refused_flags {
+                assert!(
+                    help.contains(&refused),
+                    "{command:?} help must state the refusal: {refused}"
+                );
+            }
+            assert!(
+                help.contains(&command.format_help()),
+                "{command:?} help must state its format support"
+            );
         }
     }
 
@@ -1144,6 +1478,25 @@ mod tests {
                     }
                     other => panic!("{command:?} rejects --format but parsed as {other:?}"),
                 },
+            }
+        }
+    }
+
+    /// Verbosity has one spelling and one meaning on every command. The parser
+    /// accepts `-v` before or after the command and each occurrence raises the
+    /// same counter by one.
+    #[test]
+    fn verbosity_has_uniform_spelling_and_semantics() {
+        for command in Command::ALL {
+            assert_eq!(command.flag_policy().verbosity, FlagSupport::Accepted);
+            let before = parse_invocation(args(&["-v", command.name()])).unwrap();
+            let after = parse_invocation(args(&[command.name(), "-v", "-v"])).unwrap();
+            match (before, after) {
+                (Request::Run(before), Request::Run(after)) => {
+                    assert_eq!(before.verbosity, 1, "{command:?}");
+                    assert_eq!(after.verbosity, 2, "{command:?}");
+                }
+                other => panic!("{command:?} did not parse verbosity uniformly: {other:?}"),
             }
         }
     }
