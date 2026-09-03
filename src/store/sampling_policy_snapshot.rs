@@ -178,6 +178,28 @@ pub fn effective_policy_at(
     .map_err(|e| Error::Store(format!("cannot read the effective policy snapshot: {e}")))
 }
 
+/// Every policy snapshot recorded for one account, oldest first. The coverage
+/// command hands these to the engine, which reconstructs the denominator from
+/// the snapshot in force over each sub-interval (aub-me5.9, PLAN.md 12.2):
+/// snapshots recorded after the interval's end cannot be in force inside it,
+/// and the engine ignores them.
+pub fn snapshots_for_account(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+) -> Result<Vec<SamplingPolicySnapshot>, Error> {
+    let mut statement = conn
+        .prepare(&format!(
+            "SELECT {SELECT_COLUMNS} FROM sampling_policy_snapshot \
+             WHERE account_id = ?1 ORDER BY effective_at"
+        ))
+        .map_err(|e| Error::Store(format!("cannot list policy snapshots: {e}")))?;
+    let rows = statement
+        .query_map([account_id.value()], row_to_snapshot)
+        .map_err(|e| Error::Store(format!("cannot list policy snapshots: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read policy snapshots: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,6 +372,59 @@ mod tests {
         assert!(
             err.to_string().to_lowercase().contains("foreign key"),
             "expected a foreign key violation: {err}"
+        );
+    }
+
+    /// The coverage command's read returns exactly the named account's
+    /// snapshots, oldest first, and never another account's.
+    #[test]
+    fn snapshots_for_account_reads_only_that_account_ordered_by_effective_at() {
+        let (_scratch, conn) = fixture_conn();
+        let account = observe_account(
+            &conn,
+            "test-provider",
+            "test-account",
+            UtcTimestamp::from_unix_nanos(1_000),
+        )
+        .unwrap();
+        let other = observe_account(
+            &conn,
+            "test-provider",
+            "other-account",
+            UtcTimestamp::from_unix_nanos(1_000),
+        )
+        .unwrap();
+
+        let later = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(9_000),
+            &policy_15m(),
+        )
+        .unwrap();
+        let earlier = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(2_000),
+            &policy_5m(),
+        )
+        .unwrap();
+        let _foreign = resolve_policy_snapshot(
+            &conn,
+            other,
+            UtcTimestamp::from_unix_nanos(3_000),
+            &policy_5m(),
+        )
+        .unwrap();
+
+        let snapshots = snapshots_for_account(&conn, account).unwrap();
+        assert_eq!(
+            snapshots
+                .iter()
+                .map(|snapshot| snapshot.id())
+                .collect::<Vec<_>>(),
+            vec![earlier, later],
+            "only the named account's snapshots, in effective order"
         );
     }
 }
