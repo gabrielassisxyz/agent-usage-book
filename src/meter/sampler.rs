@@ -1105,7 +1105,12 @@ mod tests {
 
     fn policy() -> PragmaPolicy {
         PragmaPolicy {
-            busy_timeout: MonotonicDuration::from_millis(2_000),
+            // The concurrent-invocation test races three writer threads against
+            // one database while the rest of this file's tests run in the same
+            // process, on a machine that may be running other work too. Actual
+            // write transactions here take milliseconds; the timeout only has
+            // to survive scheduling contention, not real lock hold time.
+            busy_timeout: MonotonicDuration::from_millis(10_000),
         }
     }
 
