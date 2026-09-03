@@ -381,26 +381,22 @@ mod fingerprint {
         }
         match event.usage().quality() {
             EvidenceQuality::Measured => field(&mut payload, "quality", "measured"),
-            quality => {
-                let mut methods: Vec<&str> =
-                    quality.methods().iter().map(EstimatorId::as_str).collect();
-                methods.sort_unstable();
-                let bounds = match quality.uncertainty() {
-                    Some(interval) => {
-                        format!(":{}-{}", interval.lower().value(), interval.upper().value())
-                    }
-                    None => ":none".to_string(),
-                };
-                let variant = match quality {
-                    EvidenceQuality::Mixed { .. } => "mixed",
-                    _ => "estimated",
-                };
-                field(
-                    &mut payload,
-                    "quality",
-                    &format!("{}:{}{}", variant, methods.join(","), bounds),
-                );
-            }
+            EvidenceQuality::Estimated {
+                methods,
+                uncertainty,
+            } => field(
+                &mut payload,
+                "quality",
+                &digest_quality_form("estimated", methods, uncertainty.as_ref()),
+            ),
+            EvidenceQuality::Mixed {
+                methods,
+                uncertainty,
+            } => field(
+                &mut payload,
+                "quality",
+                &digest_quality_form("mixed", methods, uncertainty.as_ref()),
+            ),
         }
         match event.classification() {
             EvidenceClassification::Reported => field(&mut payload, "classification", "reported"),
@@ -424,6 +420,26 @@ mod fingerprint {
         out.push(':');
         out.push_str(value);
         out.push(';');
+    }
+
+    /// The digest form of a non-measured evidence quality: the variant, its
+    /// estimator methods, and the uncertainty bounds it carries.
+    fn digest_quality_form<T: crate::domain::interval::DomainQuantity>(
+        variant: &str,
+        methods: &std::collections::BTreeSet<EstimatorId>,
+        uncertainty: Option<&crate::domain::interval::Interval<T>>,
+    ) -> String {
+        let mut names: Vec<&str> = methods.iter().map(EstimatorId::as_str).collect();
+        names.sort_unstable();
+        let bounds = match uncertainty {
+            Some(interval) => format!(
+                ":{}-{}",
+                interval.lower().to_exact_string(),
+                interval.upper().to_exact_string()
+            ),
+            None => ":none".to_string(),
+        };
+        format!("{}:{}{}", variant, names.join(","), bounds)
     }
 
     /// The strongest replay discriminator this event carries beyond its counts.
