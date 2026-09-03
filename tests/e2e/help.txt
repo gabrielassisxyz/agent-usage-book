@@ -14,6 +14,7 @@ commands:
   rebuild  destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence
   doctor   health, drift and integrity diagnostics
   coverage did the sampler attempt what the policy owed, and did those attempts observe?
+  import   import explicitly selected legacy evidence with durable provenance
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
   now      force a persisted sampling attempt for the selected accounts and render the resulting state
 
@@ -26,7 +27,7 @@ spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions?
   refuses: --account (spend has no account dimension until account attribution lands); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force
+  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force | --value api-list
 
 config:
   answers: which configuration key resolved from where?
@@ -74,6 +75,12 @@ coverage:
   refuses: --model (coverage reports every window of the account, not one model); --no-color (coverage prints plain text or json)
   format: text | json
   options: --since DURATION (default 24h), --severe; --account is shared
+
+import:
+  answers: which legacy evidence is safe to import into the ledger?
+  refuses: --format (import prints one operational result); --explain (import derives no report); --account (import carries account identity in its source); --model (import carries no model selector); --no-color (import prints no color)
+  format: text only: import prints one operational result
+  options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE
 
 sample:
   answers: are configured accounts due for meter sampling, and what did the endpoints observe?

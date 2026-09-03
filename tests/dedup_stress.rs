@@ -656,6 +656,7 @@ fn criterion_3_same_transcript_added_from_second_path_does_not_double_count() {
         vec![SpendGrouping::Day],
         false,
         None,
+        None,
     )
     .unwrap();
     let spend_both = assemble_canonical(
@@ -664,6 +665,7 @@ fn criterion_3_same_transcript_added_from_second_path_does_not_double_count() {
         now,
         vec![SpendGrouping::Day],
         false,
+        None,
         None,
     )
     .unwrap();
@@ -921,9 +923,16 @@ fn criterion_6_rebuild_determinism_and_path_convergence() {
         "corpus must include quarantine data to prove quarantine rebuild coverage"
     );
 
-    let spend_before =
-        assemble_canonical(&conn, window, now, vec![SpendGrouping::Day], false, None)
-            .expect("spend report before rebuild");
+    let spend_before = assemble_canonical(
+        &conn,
+        window,
+        now,
+        vec![SpendGrouping::Day],
+        false,
+        None,
+        None,
+    )
+    .expect("spend report before rebuild");
 
     // Direct spend assembly from transcript files must match SQLite canonical assembly
     let file_spend_before =
@@ -971,9 +980,16 @@ fn criterion_6_rebuild_determinism_and_path_convergence() {
     let snapshot_after_rebuild = capture_materializations(&conn);
     assert_materializations_identical(&snapshot_before, &snapshot_after_rebuild);
 
-    let spend_after_rebuild =
-        assemble_canonical(&conn, window, now, vec![SpendGrouping::Day], false, None)
-            .expect("spend report after rebuild");
+    let spend_after_rebuild = assemble_canonical(
+        &conn,
+        window,
+        now,
+        vec![SpendGrouping::Day],
+        false,
+        None,
+        None,
+    )
+    .expect("spend report after rebuild");
 
     let (input_after_rebuild, output_after_rebuild) = spend_totals(&spend_after_rebuild);
 
@@ -1004,9 +1020,16 @@ fn criterion_6_rebuild_determinism_and_path_convergence() {
     let snapshot_after_refresh = capture_materializations(&conn);
     assert_materializations_identical(&snapshot_before, &snapshot_after_refresh);
 
-    let spend_after_refresh =
-        assemble_canonical(&conn, window, now, vec![SpendGrouping::Day], false, None)
-            .expect("spend report after refresh");
+    let spend_after_refresh = assemble_canonical(
+        &conn,
+        window,
+        now,
+        vec![SpendGrouping::Day],
+        false,
+        None,
+        None,
+    )
+    .expect("spend report after refresh");
     let (input_after_refresh, _) = spend_totals(&spend_after_refresh);
     assert_eq!(
         input_before, input_after_refresh,
@@ -1052,8 +1075,16 @@ fn criterion_7_suite_runs_within_documented_time_budget_with_generated_fixture()
     // 3. Spend assembly phase
     let spend_start = Instant::now();
     let window = SpendWindow::starting(UtcDate::parse("2026-08-25").unwrap(), 1).unwrap();
-    let spend =
-        assemble_canonical(&conn, window, now, vec![SpendGrouping::Day], false, None).unwrap();
+    let spend = assemble_canonical(
+        &conn,
+        window,
+        now,
+        vec![SpendGrouping::Day],
+        false,
+        None,
+        None,
+    )
+    .unwrap();
     let spend_elapsed = spend_start.elapsed();
 
     assert_eq!(spend.groups.len(), 1);

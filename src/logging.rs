@@ -118,10 +118,13 @@ pub enum DiagnosticEvent {
     /// and no store or network event, which is the observable half of the
     /// status contract (PLAN.md section 16.2).
     ProjectionRead,
+    /// A legacy quota-ledger source was imported. Its source is identified by
+    /// digest, never by path or raw record content.
+    LegacyMeterImported,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
@@ -130,6 +133,7 @@ impl DiagnosticEvent {
         Self::MeterEvidenceSpooled,
         Self::MeterSpoolDrained,
         Self::ProjectionRead,
+        Self::LegacyMeterImported,
     ];
 
     pub fn name(self) -> &'static str {
@@ -142,6 +146,7 @@ impl DiagnosticEvent {
             Self::MeterEvidenceSpooled => "meter_evidence_spooled",
             Self::MeterSpoolDrained => "meter_spool_drained",
             Self::ProjectionRead => "projection_read",
+            Self::LegacyMeterImported => "legacy_meter_imported",
         }
     }
 
@@ -155,6 +160,7 @@ impl DiagnosticEvent {
             | Self::MeterEvidenceSpooled
             | Self::MeterSpoolDrained => Level::Info,
             Self::ProjectionRead => Level::Debug,
+            Self::LegacyMeterImported => Level::Info,
         }
     }
 
@@ -168,6 +174,9 @@ impl DiagnosticEvent {
             Self::MeterEvidenceSpooled => "attempt",
             Self::MeterSpoolDrained => "applied, already_applied, quarantined",
             Self::ProjectionRead => "state",
+            Self::LegacyMeterImported => {
+                "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined"
+            }
         }
     }
 }

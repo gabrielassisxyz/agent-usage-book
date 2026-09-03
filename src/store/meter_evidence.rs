@@ -628,8 +628,12 @@ pub fn observation_times_for_account_between(
 ) -> Result<Vec<UtcTimestamp>, Error> {
     let mut statement = conn
         .prepare(
-            "SELECT received_at FROM meter_observation
+            "SELECT received_at FROM meter_observation mo
              WHERE account_id = ?1 AND received_at >= ?2 AND received_at < ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM legacy_meter_import_record lir
+                   WHERE lir.observation_id = mo.id
+               )
              ORDER BY received_at",
         )
         .map_err(|e| Error::Store(format!("cannot read coverage observations: {e}")))?;
@@ -661,6 +665,10 @@ pub fn reset_windows_for_account_between(
              JOIN meter_observation mo ON mo.id = mw.observation_id
              WHERE mo.account_id = ?1
                AND mw.resets_at >= ?2 AND mw.resets_at < ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM legacy_meter_import_record lir
+                   WHERE lir.observation_id = mo.id
+               )
              GROUP BY mw.resets_at
              ORDER BY mw.resets_at",
         )

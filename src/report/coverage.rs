@@ -209,6 +209,13 @@ pub fn assemble(
         let resets =
             meter_evidence::reset_windows_for_account_between(conn, recorded.id(), since, until)?;
         let snapshots = sampling_policy_snapshot::snapshots_for_account(conn, recorded.id())?;
+        let legacy_observations =
+            crate::store::legacy_meter_import::legacy_observation_count_between(
+                conn,
+                recorded.id(),
+                since,
+                until,
+            )?;
 
         let inputs = CoverageInputs {
             interval_start: since,
@@ -293,6 +300,7 @@ pub fn assemble(
             engine,
             failures,
             resets_in_gaps,
+            legacy_evidence_present: legacy_observations > 0,
             provenance: node,
         });
     }

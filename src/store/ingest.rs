@@ -422,11 +422,13 @@ fn evidence_kind_of(event: &NormalizedUsageEvent) -> String {
     }
 }
 
-/// The event's model identity, when the source wrote one. No parser extracts
-/// one today, so this is `None` everywhere; the column stays the parser's
-/// contract for the fact rather than a column nobody fills.
-fn model_id_of(_event: &NormalizedUsageEvent) -> Option<String> {
-    None
+/// The event's model identity, when the source wrote one.
+fn model_id_of(event: &NormalizedUsageEvent) -> Option<String> {
+    event
+        .provenance()
+        .sources()
+        .iter()
+        .find_map(|s| s.strip_prefix("model:").map(str::to_string))
 }
 
 #[cfg(test)]
