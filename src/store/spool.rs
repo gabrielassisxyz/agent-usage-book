@@ -269,7 +269,7 @@ pub fn quarantine_dir(state_dir: &Path) -> PathBuf {
     pending_dir(state_dir).join("quarantine")
 }
 
-fn pending_file_path(state_dir: &Path, attempt_id: i64) -> PathBuf {
+pub fn pending_file_path(state_dir: &Path, attempt_id: i64) -> PathBuf {
     pending_dir(state_dir).join(format!("attempt-{attempt_id}.json"))
 }
 
@@ -421,7 +421,7 @@ pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainRep
     Ok(report)
 }
 
-fn is_pending_record_name(path: &Path) -> bool {
+pub fn is_pending_record_name(path: &Path) -> bool {
     path.is_file()
         && path
             .file_name()
