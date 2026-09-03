@@ -15,6 +15,7 @@ commands:
   doctor   health, drift and integrity diagnostics
   coverage did the sampler attempt what the policy owed, and did those attempts observe?
   import   import explicitly selected legacy evidence with durable provenance
+  sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
 
 status:
   answers: how much quota does each configured account have left?
@@ -48,7 +49,7 @@ backup:
   answers: is there a consistent, verified archive of the durable state, and does it restore?
   refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --model (backup covers the whole ledger); --no-color (backup prints no color)
   format: text only: backup prints one operational result
-  options: DESTINATION | verify DESTINATION
+  options: DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]
 
 ingest:
   answers: have the transcript-derived tables been refreshed from the transcripts on disk, under one generation?
@@ -79,5 +80,11 @@ import:
   refuses: --format (import prints one operational result); --explain (import derives no report); --account (import carries account identity in its source); --model (import carries no model selector); --no-color (import prints no color)
   format: text only: import prints one operational result
   options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE
+
+sample:
+  answers: are configured accounts due for meter sampling, and what did the endpoints observe?
+  refuses: --explain (sample derives no quantity); --model (sample operates on configured accounts, not models); --no-color (sample prints plain status or json)
+  format: text | json
+  options: --due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success
 
 aub            prints the version; aub --help prints this

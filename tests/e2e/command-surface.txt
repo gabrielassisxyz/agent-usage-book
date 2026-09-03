@@ -14,3 +14,4 @@ coverage
 import
 ingest
 rebuild
+sample
