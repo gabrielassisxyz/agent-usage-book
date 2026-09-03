@@ -43,6 +43,7 @@ use crate::store::meter_attempt::failure_class_sql;
 use crate::store::meter_evidence::{measurement_basis_sql, quantization_sql};
 
 pub mod build;
+pub mod reader;
 
 /// The ledger generation recorded in a projection file's text, or `None` when
 /// the text is not a projection file this schema wrote. One reader for the

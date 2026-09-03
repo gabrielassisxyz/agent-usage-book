@@ -10,7 +10,6 @@
 use std::ffi::OsString;
 use std::io;
 
-use crate::domain::freshness::{FreshnessInput, compute_freshness};
 use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate};
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
@@ -83,6 +82,7 @@ pub struct FlagPolicy {
     pub format: FlagSupport,
     pub explain: FlagSupport,
     pub account: FlagSupport,
+    pub model: FlagSupport,
     pub no_color: FlagSupport,
     pub verbosity: FlagSupport,
 }
@@ -119,9 +119,8 @@ impl Command {
             Command::Status => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
-                account: FlagSupport::Rejected {
-                    reason: "status reports every configured account",
-                },
+                account: FlagSupport::Accepted,
+                model: FlagSupport::Accepted,
                 no_color: FlagSupport::Rejected {
                     reason: "status prints no color",
                 },
@@ -132,6 +131,9 @@ impl Command {
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
                     reason: "spend has no account dimension until account attribution lands",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "spend has no model dimension until a model selector is needed",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "spend prints no color",
@@ -148,6 +150,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "config prints every account at once",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "config prints every key at once",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "config prints no color",
                 },
@@ -162,6 +167,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "export reads every stored session, not one account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "export keys on session or run, not on a model",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "export prints no color",
@@ -178,6 +186,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "logging-fixture takes no account",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "logging-fixture takes no model",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "logging-fixture prints no color",
                 },
@@ -192,6 +203,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "state-check takes no account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "state-check takes no model",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "state-check prints no color",
@@ -208,6 +222,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "exit-class takes no account",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "exit-class takes no model",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "exit-class prints no color",
                 },
@@ -222,6 +239,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "attempt-crash-hook names its own fixture account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "attempt-crash-hook drives the store, not a model",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "attempt-crash-hook prints plain counts",
@@ -238,6 +258,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "projection-crash-hook names its own fixture account",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "projection-crash-hook drives the store, not a model",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "projection-crash-hook prints plain counts",
                 },
@@ -252,6 +275,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "the rate book is reference data, not per-account state",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "the rate book is reference data, not per-model state",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "rate-card prints plain rows",
@@ -268,6 +294,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "backup covers the whole ledger",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "backup covers the whole ledger",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "backup prints no color",
                 },
@@ -279,6 +308,9 @@ impl Command {
                     reason: "doctor derives no quantity",
                 },
                 account: FlagSupport::Rejected {
+                    reason: "doctor is a system-wide diagnostic",
+                },
+                model: FlagSupport::Rejected {
                     reason: "doctor is a system-wide diagnostic",
                 },
                 no_color: FlagSupport::Rejected {
@@ -375,6 +407,7 @@ impl Command {
             ("--format", policy.format),
             ("--explain", policy.explain),
             ("--account", policy.account),
+            ("--model", policy.model),
             ("--no-color", policy.no_color),
         ] {
             if let FlagSupport::Rejected { reason } = support {
@@ -425,10 +458,11 @@ pub struct Invocation {
     pub verbosity: u8,
     pub explain: ExplainMode,
     /// The account the command line asked for, when the command's policy accepts
-    /// `--account`. No command accepts it yet (status's filtering arrives with
-    /// aub-me5.6), so this is always `None` in practice; the field is the
-    /// parser's contract for the flag, carried rather than dropped.
+    /// `--account`. Status accepts it and selects one configured account.
     pub account: Option<String>,
+    /// The model the command line asked for, when the command's policy accepts
+    /// `--model`. Status accepts it and scopes the rendered windows to it.
+    pub model: Option<String>,
     /// Whether `--no-color` was asked for, when the command's policy accepts it.
     /// No command accepts it yet, so this is always `false` in practice.
     pub no_color: bool,
@@ -479,6 +513,7 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
     let mut format = OutputFormat::Text;
     let mut explain = ExplainMode::Off;
     let mut account = None;
+    let mut model = None;
     let mut no_color = false;
     let mut rest = Vec::new();
     let mut args = args.peekable();
@@ -503,6 +538,13 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         } else {
             None
         };
+        let model_value = if let Some(value) = arg.strip_prefix("--model=") {
+            Some(value.to_string())
+        } else if arg == "--model" {
+            Some(next_arg(&mut args, "--model")?)
+        } else {
+            None
+        };
         match format_value {
             Some(value) => format = parse_format(command, &value)?,
             None if arg == "-v" => verbosity += 1,
@@ -511,9 +553,10 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
                 explain = parse_explain(command, Some(value))?
             }
             None if arg == "--no-color" => no_color = parse_no_color(command)?,
-            None => match account_value {
-                Some(value) => account = Some(parse_account(command, &value)?),
-                None => rest.push(arg),
+            None => match (account_value, model_value) {
+                (Some(value), _) => account = Some(parse_account(command, &value)?),
+                (None, Some(value)) => model = Some(parse_model(command, &value)?),
+                (None, None) => rest.push(arg),
             },
         }
     }
@@ -523,6 +566,7 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         verbosity,
         explain,
         account,
+        model,
         no_color,
         rest,
     }))
@@ -570,6 +614,16 @@ fn parse_account(command: Command, value: &str) -> Result<String, Error> {
     }
 }
 
+fn parse_model(command: Command, value: &str) -> Result<String, Error> {
+    match command.flag_policy().model {
+        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
+            "{} does not accept --model: {reason}; omit the flag",
+            command.name()
+        ))),
+        FlagSupport::Accepted => Ok(value.to_string()),
+    }
+}
+
 fn parse_no_color(command: Command) -> Result<bool, Error> {
     match command.flag_policy().no_color {
         FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
@@ -589,7 +643,7 @@ pub fn help_text() -> String {
         "aub: one ledger for LLM consumption".to_string(),
         String::new(),
         "usage: aub [-v...] <command> [--format text|json] [options]".to_string(),
-        "shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --no-color"
+        "shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --model MODEL, --no-color"
             .to_string(),
         String::new(),
         "commands:".to_string(),
@@ -650,6 +704,8 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 level,
                 invocation.format,
                 invocation.explain,
+                invocation.account.as_deref(),
+                invocation.model.as_deref(),
             )
         }
         Command::Spend => spend(&RealClock::new(), level, &invocation),
@@ -1004,6 +1060,8 @@ fn status(
     level: Level,
     format: OutputFormat,
     explain: ExplainMode,
+    account_selector: Option<&str>,
+    model_selector: Option<&str>,
 ) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
@@ -1017,9 +1075,10 @@ fn status(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    // The report is built from the configured accounts; until the projection
-    // exists (aub-me5.6) every account's reading is the never-observed state,
-    // computed through the freshness machine rather than constructed here.
+    // The status contract (PLAN.md section 16.2): minimal configuration
+    // sufficient to locate the projection, one bounded file read, freshness
+    // computation and formatting. Nothing else runs here, which the source
+    // contract test below and the boundary rules both hold this function to.
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -1030,26 +1089,64 @@ fn status(
         &file_path,
     )?;
 
-    let freshness = compute_freshness(
-        &FreshnessInput::new(
-            None,
-            None,
-            None,
-            None,
-            None,
-            config.freshness.meter,
-            config.sampling.command_budget,
-            status_clock_skew_envelope(),
-        ),
-        clock,
-    );
-    let accounts = config
-        .accounts
-        .iter()
-        .map(|account| MeterAccount::new(LogicalName::new(account.name.clone()), freshness.clone()))
-        .collect();
-    let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
-    let report = StatusReport::new(metadata, accounts, vec![]);
+    // The account selector names a configured account, so an unknown name is
+    // an argument error, reported through the typed usage condition rather
+    // than through the zero-exit display path.
+    if let Some(name) = account_selector {
+        if !config.accounts.iter().any(|account| account.name == name) {
+            return Err(Error::Usage(format!(
+                "unknown account '{name}': status --account names a configured account"
+            )));
+        }
+    }
+
+    let projection_path = crate::projection::projection_path_in(&config.state.dir);
+    let (projection_state, accounts, ledger_generation) =
+        match crate::projection::reader::read_projection(&projection_path) {
+        crate::projection::reader::ProjectionRead::Available(projection) => {
+            let accounts = projection_accounts(
+                &config,
+                &projection,
+                account_selector,
+                model_selector,
+                clock,
+            );
+            logger
+                .emit(
+                    timestamp,
+                    DiagnosticEvent::ProjectionRead,
+                    &[("state", &LogicalName::new("ok"))],
+                )
+                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+            let generation = LedgerGeneration::new(projection.ledger_generation.value());
+            (
+                crate::report::ProjectionReadState::Read,
+                accounts,
+                generation,
+            )
+        }
+        crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
+            let state_name = unavailable.state_name();
+            let state = crate::report::ProjectionReadState::Unavailable {
+                state: state_name,
+                reason: unavailable.reason(),
+            };
+            logger
+                .emit(
+                    timestamp,
+                    DiagnosticEvent::ProjectionRead,
+                    &[("state", &LogicalName::new(state_name))],
+                )
+                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+            // No account line exists when the projection is unreadable: the
+            // degraded form is the whole answer, and no value may be
+            // substituted for the readings that cannot be computed.
+            (state, Vec::new(), LedgerGeneration::new(0))
+        }
+    };
+
+    let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
+    let report = StatusReport::new(metadata, accounts, vec![], projection_state);
     match format {
         OutputFormat::Text => println!(
             "{}",
@@ -1063,6 +1160,53 @@ fn status(
         OutputFormat::Json => println!("{}", status_json_with_explain(&report, run, explain)),
     }
     Ok(())
+}
+
+/// Builds one report account per configured account from the projection's
+/// accounts, joined on the logical name. A configured account the projection
+/// says nothing about reports no reading rather than a fabricated value: the
+/// freshness machine then renders the never-observed form for it.
+fn projection_accounts(
+    config: &crate::config::Config,
+    projection: &crate::projection::Projection,
+    account_selector: Option<&str>,
+    model_selector: Option<&str>,
+    clock: &impl Clock,
+) -> Vec<MeterAccount> {
+    config
+        .accounts
+        .iter()
+        .filter(|account| match account_selector {
+            None => true,
+            Some(selected) => account.name == selected,
+        })
+        .map(|account| {
+            let projected = projection
+                .accounts
+                .iter()
+                .find(|projected| projected.logical_name == account.name);
+            let reading = crate::projection::reader::account_reading(
+                projected,
+                model_selector,
+                config.freshness.meter,
+                config.sampling.command_budget,
+                status_clock_skew_envelope(),
+                clock,
+            );
+            MeterAccount::from_projection(
+                LogicalName::new(account.name.clone()),
+                reading.freshness,
+                reading
+                    .limiting_window
+                    .map(|limit| crate::report::LimitingWindow {
+                        scope: limit.scope,
+                        nominal_duration: limit.nominal_duration,
+                    }),
+                reading.included_scopes,
+                model_selector.map(crate::domain::window::ModelId::new),
+            )
+        })
+        .collect()
 }
 
 fn logging_fixture(clock: &impl Clock, level: Level) -> Result<(), Error> {

@@ -97,13 +97,19 @@ pub enum DiagnosticEvent {
     /// from a run's log is itself the proof that a refused run never reached the
     /// network.
     RequestAttempted,
+    /// The status path read its projection file, once, within its size bound.
+    /// Emitted at debug level: a status run's log then shows exactly one read
+    /// and no store or network event, which is the observable half of the
+    /// status contract (PLAN.md section 16.2).
+    ProjectionRead,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 3] = [
+    pub const ALL: [Self; 4] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
+        Self::ProjectionRead,
     ];
 
     pub fn name(self) -> &'static str {
@@ -111,11 +117,15 @@ impl DiagnosticEvent {
             Self::RunStarted => "run_started",
             Self::ReportRendered => "report_rendered",
             Self::RequestAttempted => "request_attempted",
+            Self::ProjectionRead => "projection_read",
         }
     }
 
     pub fn level(self) -> Level {
-        Level::Info
+        match self {
+            Self::RunStarted | Self::ReportRendered | Self::RequestAttempted => Level::Info,
+            Self::ProjectionRead => Level::Debug,
+        }
     }
 
     pub fn documented_fields(self) -> &'static str {
@@ -123,6 +133,7 @@ impl DiagnosticEvent {
             Self::RunStarted => "command",
             Self::ReportRendered => "report_kind",
             Self::RequestAttempted => "command",
+            Self::ProjectionRead => "state",
         }
     }
 }

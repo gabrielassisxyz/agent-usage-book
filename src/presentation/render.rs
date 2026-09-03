@@ -10,6 +10,7 @@ use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
+use crate::domain::window::NominalWindowDuration;
 use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
 use crate::domain::tokens::TokenKind;
 use crate::error::Error;
@@ -134,10 +135,34 @@ pub fn render_status_report_with_explain(
     envelope: ClockSkewEnvelope,
     explain: ExplainMode,
 ) -> String {
+    // A projection the status path could not read is the design's degraded
+    // form: the question mark, with a compact reason where the output mode
+    // permits. No account line is rendered, because no account value exists
+    // to render and none may be substituted.
+    if let crate::report::ProjectionReadState::Unavailable { state: _, reason } =
+        &report.projection_state
+    {
+        let mut line = String::from("aub ?");
+        if explain != ExplainMode::Off {
+            line.push_str(" · ");
+            line.push_str(reason);
+        }
+        return line;
+    }
     let mut lines: Vec<String> = Vec::with_capacity(report.accounts.len());
     for account in &report.accounts {
-        let reading = render_meter_reading(&account.reading, METER_UNIT, PERCENT, now, envelope);
-        lines.push(format!("{} {}", account.account.as_str(), reading));
+        let reading = render_meter_reading(
+            &account.reading,
+            METER_UNIT,
+            PERCENT,
+            now,
+            envelope,
+            account
+                .limiting_window
+                .as_ref()
+                .map(|limit| limit.nominal_duration),
+        );
+        lines.push(format!("aub {} {}", account.account.as_str(), reading));
     }
     let report_text = lines.join("\n");
     if explain == ExplainMode::Off {
@@ -471,14 +496,19 @@ pub fn render_meter_reading(
     precision: Precision,
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
+    limiting_window: Option<NominalWindowDuration>,
 ) -> String {
     match reading {
         Freshness::Fresh { observed, .. } => {
             let value = render_percentage(observed.value().as_ppm().get(), precision);
-            match observed_age(observed, now, envelope) {
-                Some(age) => format!("{value}{unit} left · {}", render_age(age)),
-                None => format!("{value}{unit} left"),
-            }
+            // The fresh line names the limiting window's nominal length, the
+            // suffix the design's example shows: "38% left · 5h". The window
+            // is part of the value's meaning, not of its freshness.
+            let window = limiting_window
+                .map(render_window_duration)
+                .map(|label| format!(" · {label}"))
+                .unwrap_or_default();
+            format!("{value}{unit} left{window}")
         }
         Freshness::Stale {
             last_good, reason, ..
@@ -548,6 +578,22 @@ pub fn render_failure_class(class: FailureClass) -> &'static str {
     }
 }
 
+/// Renders a nominal window duration as the compact human label the design's
+/// fresh status line shows: "38% left · 5h". Same ladder as an age, because a
+/// window length is a duration a human reads the same way.
+pub fn render_window_duration(duration: NominalWindowDuration) -> String {
+    let seconds = duration.as_nanos() / 1_000_000_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
 /// Renders an age as a compact human duration: seconds, minutes, hours or days.
 pub fn render_age(age: Age) -> String {
     let seconds = age.as_nanos() / 1_000_000_000;
@@ -608,9 +654,26 @@ mod tests {
             ),
             latest_attempt: AttemptId::new(1),
         };
+        // The suffix is the limiting window's nominal length, not the sample's
+        // age: the design's fresh line reads "38% left · 5h" for the 5-hour
+        // window, and a fresh reading's age is implied by the word fresh.
         assert_eq!(
-            render_meter_reading(&fresh, "%", precision, now, envelope),
+            render_meter_reading(
+                &fresh,
+                "%",
+                precision,
+                now,
+                envelope,
+                Some(NominalWindowDuration::from_nanos(
+                    5 * 3_600 * NANOS_PER_SECOND as u64
+                )),
+            ),
             "38% left · 5h"
+        );
+        // Without a window to name, the value is shown bare.
+        assert_eq!(
+            render_meter_reading(&fresh, "%", precision, now, envelope, None),
+            "38% left"
         );
 
         let stale_timeout = Freshness::Stale {
@@ -622,7 +685,7 @@ mod tests {
             reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
         };
         assert_eq!(
-            render_meter_reading(&stale_timeout, "%", precision, now, envelope),
+            render_meter_reading(&stale_timeout, "%", precision, now, envelope, None),
             "~38% · stale 14m · timeout"
         );
 
@@ -631,7 +694,7 @@ mod tests {
             latest_attempt: AttemptId::new(3),
         };
         assert_eq!(
-            render_meter_reading(&auth, "%", precision, now, envelope),
+            render_meter_reading(&auth, "%", precision, now, envelope, None),
             "auth!"
         );
 
@@ -644,7 +707,7 @@ mod tests {
             reason: StaleReason::CollectorInterrupted,
         };
         assert_eq!(
-            render_meter_reading(&stale_interrupted, "%", precision, now, envelope),
+            render_meter_reading(&stale_interrupted, "%", precision, now, envelope, None),
             "~38% · stale 9m · collector interrupted"
         );
 
@@ -654,7 +717,7 @@ mod tests {
             reason: StaleReason::NoSuccessfulObservation,
         };
         assert_eq!(
-            render_meter_reading(&never_observed, "%", precision, now, envelope),
+            render_meter_reading(&never_observed, "%", precision, now, envelope, None),
             "? · stale · no successful sample"
         );
     }
@@ -702,6 +765,7 @@ mod tests {
             crate::presentation::precision::PERCENT,
             now,
             envelope(),
+            None,
         );
         assert!(
             rendered.contains("stale"),
@@ -740,10 +804,14 @@ mod tests {
         };
 
         // No colour is ever added; the words alone distinguish the three states.
-        assert!(render_meter_reading(&fresh, "%", precision, now, envelope).contains("left"));
-        assert!(render_meter_reading(&stale, "%", precision, now, envelope).contains("stale"));
+        assert!(
+            render_meter_reading(&fresh, "%", precision, now, envelope, None).contains("left")
+        );
+        assert!(
+            render_meter_reading(&stale, "%", precision, now, envelope, None).contains("stale")
+        );
         assert_eq!(
-            render_meter_reading(&auth, "%", precision, now, envelope),
+            render_meter_reading(&auth, "%", precision, now, envelope, None),
             "auth!"
         );
     }
@@ -778,7 +846,7 @@ mod tests {
         let report = StatusReport::new(
             metadata,
             vec![
-                MeterAccount::new(
+                MeterAccount::from_projection(
                     LogicalName::new("work-a"),
                     Freshness::Fresh {
                         observed: observed(
@@ -789,6 +857,14 @@ mod tests {
                         ),
                         latest_attempt: AttemptId::new(1),
                     },
+                    Some(crate::report::LimitingWindow {
+                        scope: crate::domain::window::WindowScope::AccountWide,
+                        nominal_duration: NominalWindowDuration::from_nanos(
+                            5 * 3_600 * NANOS_PER_SECOND as u64,
+                        ),
+                    }),
+                    vec![],
+                    None,
                 ),
                 MeterAccount::new(
                     LogicalName::new("research"),
@@ -812,19 +888,20 @@ mod tests {
                 ),
             ],
             vec![],
+            crate::report::ProjectionReadState::Read,
         );
 
         let rendered = render_status_report(&report, now, envelope);
         assert!(
-            rendered.contains("work-a 38% left · 5h"),
+            rendered.contains("aub work-a 38% left · 5h"),
             "fresh fragment missing from rendering: {rendered}"
         );
         assert!(
-            rendered.contains("research ~38% · stale 14m · timeout"),
+            rendered.contains("aub research ~38% · stale 14m · timeout"),
             "stale fragment missing from rendering: {rendered}"
         );
         assert!(
-            rendered.contains("legacy auth!"),
+            rendered.contains("aub legacy auth!"),
             "auth fragment missing from rendering: {rendered}"
         );
     }
@@ -856,17 +933,26 @@ mod tests {
         );
         let report = StatusReport::new(
             metadata,
-            vec![MeterAccount::new(
+            vec![MeterAccount::from_projection(
                 LogicalName::new("work-primary"),
                 Freshness::Fresh {
                     observed,
                     latest_attempt: AttemptId::new(1),
                 },
+                Some(crate::report::LimitingWindow {
+                    scope: crate::domain::window::WindowScope::AccountWide,
+                    nominal_duration: NominalWindowDuration::from_nanos(
+                        5 * 3_600 * NANOS_PER_SECOND as u64,
+                    ),
+                }),
+                vec![],
+                None,
             )],
             vec![],
+            crate::report::ProjectionReadState::Read,
         );
 
         let rendered = render_status_report(&report, now, envelope);
-        assert_eq!(rendered, "work-primary 38% left · 5h");
+        assert_eq!(rendered, "aub work-primary 38% left · 5h");
     }
 }
