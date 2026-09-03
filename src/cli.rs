@@ -56,6 +56,7 @@ aub_command_enum! {
     StateCheck,
     ExitClass,
     AttemptCrashHook,
+    ProjectionCrashHook,
     RateCard,
 }
 
@@ -84,7 +85,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -92,6 +93,7 @@ impl Command {
         Self::StateCheck,
         Self::ExitClass,
         Self::AttemptCrashHook,
+        Self::ProjectionCrashHook,
         Self::RateCard,
     ];
 
@@ -204,6 +206,21 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::ProjectionCrashHook => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "projection-crash-hook drives the store, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "projection-crash-hook derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "projection-crash-hook names its own fixture account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "projection-crash-hook prints plain counts",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::RateCard => FlagPolicy {
                 format: FlagSupport::Rejected {
                     reason: "rate-card prints a price book, not a report",
@@ -233,6 +250,7 @@ impl Command {
             Command::StateCheck => "__state-check",
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
+            Command::ProjectionCrashHook => "__projection-crash-hook",
             Command::RateCard => "rate-card",
         }
     }
@@ -250,6 +268,7 @@ impl Command {
             }
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
+            Command::ProjectionCrashHook => None,
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
@@ -266,6 +285,7 @@ impl Command {
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
+            Command::ProjectionCrashHook => None,
         }
     }
 
@@ -308,6 +328,7 @@ impl Command {
             | Command::StateCheck
             | Command::ExitClass
             | Command::AttemptCrashHook
+            | Command::ProjectionCrashHook
             | Command::RateCard => None,
         }
     }
@@ -583,6 +604,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
             }
         }
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
+        Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
     }
 }
@@ -968,6 +990,82 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         crate::store::attempt_crash_hook::CrashHookOutcome::Counts { starts, results } => {
             println!("starts={starts} results={results}");
         }
+    }
+    Ok(())
+}
+
+/// Test-only surface: the crash-injection hook for the projection publication
+/// ordering contract (`aub-me5.5`, PLAN.md section 16.1). `__projection-crash-hook
+/// kill-before-publish` runs fixture sampling through the real repository path
+/// and aborts the process between the second bundle's commit and the projection
+/// replacement, so a test can prove exactly what survives a kill there: the
+/// projection older than the database, never ahead. `publish` is the adjacent
+/// positive control and `read-back` reports what the database and the file hold.
+///
+/// The hook's body lives in `crate::projection::crash_hook` beside the
+/// publication seam it exercises; this shim only parses the stage, resolves
+/// configuration and renders the outcome. Not part of the shipping command
+/// surface: `tests/e2e/command-surface.txt` deliberately excludes every
+/// `__`-prefixed hook.
+fn projection_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let stage = match invocation.rest.first().map(String::as_str) {
+        Some("publish") => crate::store::projection_crash_hook::CrashHookStage::Publish,
+        Some("kill-before-publish") => {
+            crate::store::projection_crash_hook::CrashHookStage::KillBeforePublish
+        }
+        Some("read-back") => crate::store::projection_crash_hook::CrashHookStage::ReadBack,
+        other => {
+            return Err(Error::Usage(format!(
+                "__projection-crash-hook requires a stage (publish | kill-before-publish | read-back), got {other:?}"
+            )));
+        }
+    };
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let outcome = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            crate::store::projection_crash_hook::run_stage(
+                &config.state.dir,
+                stage,
+                config.sampling.request_timeout,
+                config.sampling.command_budget,
+                clock,
+            )
+        },
+    )?;
+    match outcome? {
+        crate::store::projection_crash_hook::CrashHookOutcome::Published => {
+            println!("projection published from committed fixture state");
+        }
+        crate::store::projection_crash_hook::CrashHookOutcome::Counts {
+            results,
+            generation,
+            projection_generation,
+        } => match projection_generation {
+            Some(recorded) => {
+                println!(
+                    "results={results} generation={generation} projection_generation={recorded}",
+                    generation = generation
+                );
+            }
+            None => {
+                println!(
+                    "results={results} generation={generation} projection_generation=absent",
+                    generation = generation
+                );
+            }
+        },
     }
     Ok(())
 }

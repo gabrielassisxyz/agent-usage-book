@@ -15,9 +15,11 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::time::{MeasurementBasis, UtcTimestamp};
 use crate::domain::window::MeterWindow;
 use crate::error::Error;
+use crate::projection::{self, Publication};
 
 use super::account::AccountId;
 use super::connection::{self, AccessMode, PragmaPolicy};
+use super::ledger_generation;
 use super::meter_attempt::{self, MeterAttemptRowId, NewMeterAttempt, NewMeterAttemptResult};
 use super::meter_evidence::{
     self, EvidenceRowId, NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow,
@@ -43,8 +45,34 @@ impl Repository {
         &self.database_path
     }
 
+    /// The projection file this repository publishes: the state directory the
+    /// ledger lives in, named by the one constant the projection module owns.
+    /// Every projection-relevant commit below publishes there, so a caller
+    /// never derives the path itself.
+    pub fn projection_path(&self) -> PathBuf {
+        self.database_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(projection::PROJECTION_FILE_NAME)
+    }
+
     fn open_write(&self) -> Result<Connection, Error> {
         connection::open(&self.database_path, AccessMode::ReadWrite, &self.policy)
+    }
+
+    /// Opens one short read-only snapshot for the projection publisher, so the
+    /// generation and the state the file describes are read as one moment.
+    fn publish_projection(&self) -> Publication {
+        let reader = match connection::open(&self.database_path, AccessMode::ReadOnly, &self.policy)
+        {
+            Ok(reader) => reader,
+            Err(error) => {
+                return Publication::Deferred {
+                    reason: error.to_string(),
+                };
+            }
+        };
+        projection::publish(&reader, &self.projection_path())
     }
 
     fn with_read_connection<T>(
@@ -55,11 +83,28 @@ impl Repository {
         read(&conn)
     }
 
-    /// Commits an attempt start in its own transaction and returns only after the
-    /// attempt identity is durable.
+    /// Commits an attempt start in its own transaction, together with the
+    /// ledger generation advance (a started attempt is a freshness input, so
+    /// the start is projection-relevant durable meter state), and publishes
+    /// the projection once the commit is durable. Returns only after both are
+    /// done, so a caller that performs external work afterwards does so
+    /// against a database and a projection that agree.
     pub fn start_meter_attempt(&self, attempt: &NewMeterAttempt) -> Result<AttemptStarted, Error> {
-        let conn = self.open_write()?;
-        let row_id = meter_attempt::start_meter_attempt(&conn, attempt)?;
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction().map_err(|error| {
+            Error::Store(format!(
+                "cannot open the attempt-start transaction: {error}"
+            ))
+        })?;
+        let row_id = meter_attempt::start_meter_attempt(&tx, attempt)?;
+        ledger_generation::advance(&tx)?;
+        tx.commit()
+            .map_err(|error| Error::Store(format!("cannot commit the attempt start: {error}")))?;
+        drop(conn);
+        // A deferred publication here is healed by the terminal publication
+        // that always follows the same attempt, or by any later one; the
+        // attempt start itself is already durable either way.
+        self.publish_projection();
         Ok(AttemptStarted::new(
             row_id.as_attempt_id()?,
             attempt.request_started_at,
@@ -78,13 +123,74 @@ impl Repository {
         Ok(after_commit(started))
     }
 
-    /// Commits one complete terminal fact in one short write transaction.
+    /// Commits one complete terminal fact in one short write transaction, then
+    /// publishes the projection from the committed state. The commit precedes
+    /// publication in every path through this method, so a crash between them
+    /// can only leave the projection older, never ahead.
     pub fn commit_terminal_bundle(
+        &self,
+        bundle: &TerminalMeterBundle,
+    ) -> Result<TerminalBundleCommit, Error> {
+        self.commit_terminal_bundle_publishing_with(bundle, |reader, target| {
+            projection::publish(reader, target)
+        })
+    }
+
+    /// [`Self::commit_terminal_bundle`] with the publication step injected, the
+    /// crash-injection seam for the kill-between-commit-and-publication proof
+    /// (`__projection-crash-hook`): the bundle commit is fully durable before
+    /// `publish` is invoked, and `publish` is the next thing this method does.
+    pub(crate) fn commit_terminal_bundle_publishing_with(
+        &self,
+        bundle: &TerminalMeterBundle,
+        publish: impl FnOnce(&Connection, &Path) -> Publication,
+    ) -> Result<TerminalBundleCommit, Error> {
+        let ids = self.commit_terminal_bundle_only(bundle)?;
+        let publication = self.publish_with(publish);
+        Ok(TerminalBundleCommit { ids, publication })
+    }
+
+    fn commit_terminal_bundle_only(
         &self,
         bundle: &TerminalMeterBundle,
     ) -> Result<TerminalBundleIds, Error> {
         let mut conn = self.open_write()?;
         commit_terminal_bundle_on_connection(&mut conn, bundle, || Ok(()))
+    }
+
+    /// Commits one terminal result alone, in one short write transaction: the
+    /// failure-only batch path, where an attempt ended in authentication or
+    /// transport failure and has no response evidence to record. The ledger
+    /// generation advances inside the same transaction, and the projection is
+    /// published from the committed state, because a batch that produced only
+    /// failures changes what the status line must say just as a successful one
+    /// does.
+    pub fn commit_terminal_result(
+        &self,
+        result: &NewMeterAttemptResult,
+    ) -> Result<Publication, Error> {
+        let mut conn = self.open_write()?;
+        let tx = conn.transaction().map_err(|error| {
+            Error::Store(format!(
+                "cannot open the terminal-result transaction: {error}"
+            ))
+        })?;
+        meter_attempt::record_meter_attempt_result(&tx, result)?;
+        ledger_generation::advance(&tx)?;
+        tx.commit()
+            .map_err(|error| Error::Store(format!("cannot commit the terminal result: {error}")))?;
+        drop(conn);
+        Ok(self.publish_projection())
+    }
+
+    /// Publishes through an injected publisher over one fresh read snapshot.
+    fn publish_with(&self, publish: impl FnOnce(&Connection, &Path) -> Publication) -> Publication {
+        match connection::open(&self.database_path, AccessMode::ReadOnly, &self.policy) {
+            Ok(reader) => publish(&reader, &self.projection_path()),
+            Err(error) => Publication::Deferred {
+                reason: error.to_string(),
+            },
+        }
     }
 
     /// Reads one durable attempt start through a read-only, single-statement snapshot.
@@ -198,6 +304,16 @@ pub struct TerminalBundleIds {
     pub observation_id: ObservationRowId,
 }
 
+/// One committed terminal bundle together with the publication that followed
+/// its commit. The commit precedes the publication unconditionally; the
+/// publication outcome is carried so a caller can see a deferral instead of
+/// reading silence as a refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TerminalBundleCommit {
+    pub ids: TerminalBundleIds,
+    pub publication: Publication,
+}
+
 pub(crate) fn commit_terminal_bundle_on_connection(
     conn: &mut Connection,
     bundle: &TerminalMeterBundle,
@@ -245,6 +361,13 @@ pub(crate) fn commit_terminal_bundle_on_connection(
             },
         )?;
     }
+
+    // The terminal fact is projection-relevant durable meter state, so its
+    // generation advance belongs to this same transaction (PLAN.md section
+    // 11.6): a rollback of the bundle rolls the generation back, and a commit
+    // advances both together. Every caller of this boundary, live sampling and
+    // spool recovery alike, gets the bump here rather than by remembering it.
+    ledger_generation::advance(&tx)?;
 
     before_commit()?;
     tx.commit().map_err(|error| {
@@ -598,7 +721,12 @@ mod tests {
                 finished_tx.send((started_at.elapsed(), result)).unwrap();
             });
 
-            let allowed = Duration::from_nanos(policy().busy_timeout.as_nanos() + 250_000_000);
+            // The production write path commits and then publishes, so the
+            // window covers the busy bound plus the publication step's local
+            // file I/O. What this bound refuses is lock waiting: a write that
+            // blocked behind the reader would fail with busy after the busy
+            // timeout or hang here, and neither fits this window.
+            let allowed = Duration::from_nanos(policy().busy_timeout.as_nanos() + 2_000_000_000);
             let (elapsed, result) = finished_rx
                 .recv_timeout(allowed)
                 .expect("terminal write blocked behind a WAL reader beyond the busy bound");

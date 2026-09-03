@@ -374,12 +374,17 @@ enum DrainOutcome {
     Quarantined,
 }
 
-/// How many pending records a [`drain_pending`] pass disposed of, and how.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// How many pending records a [`drain_pending`] pass disposed of, and how,
+/// together with the publication that followed the pass. The publication is
+/// unconditional: draining is spool recovery, which is a projection-relevant
+/// change when it applies anything, and a pass that applies nothing still
+/// refreshes a projection a crash may have left older than the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainReport {
     pub applied: usize,
     pub already_applied: usize,
     pub quarantined: usize,
+    pub publication: crate::projection::Publication,
 }
 
 /// Drains every pending record into `conn`: applies it if its attempt has no
@@ -391,33 +396,45 @@ pub struct DrainReport {
 /// report a store-failure class and let a later drain retry it.
 pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainReport, Error> {
     let dir = pending_dir(state_dir);
-    if !dir.exists() {
-        return Ok(DrainReport::default());
-    }
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
-        .map_err(|error| {
-            Error::Store(format!(
-                "cannot list the pending directory {dir:?}: {error}"
-            ))
-        })?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| is_pending_record_name(path))
-        .collect();
-    // Deterministic order, oldest attempt first: filenames are `attempt-<id>.json`
-    // and a lexical sort over that shape sorts attempt ids ascending for any
-    // run whose ids share a digit width, which every test and every real
-    // run within one spool generation does.
-    entries.sort();
+    let mut report = DrainReport {
+        applied: 0,
+        already_applied: 0,
+        quarantined: 0,
+        publication: crate::projection::Publication::Deferred {
+            reason: "publication not attempted".to_string(),
+        },
+    };
+    if dir.exists() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot list the pending directory {dir:?}: {error}"
+                ))
+            })?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| is_pending_record_name(path))
+            .collect();
+        // Deterministic order, oldest attempt first: filenames are `attempt-<id>.json`
+        // and a lexical sort over that shape sorts attempt ids ascending for any
+        // run whose ids share a digit width, which every test and every real
+        // run within one spool generation does.
+        entries.sort();
 
-    let mut report = DrainReport::default();
-    for path in entries {
-        match drain_one(conn, state_dir, &path)? {
-            DrainOutcome::Applied => report.applied += 1,
-            DrainOutcome::AlreadyApplied => report.already_applied += 1,
-            DrainOutcome::Quarantined => report.quarantined += 1,
+        for path in entries {
+            match drain_one(conn, state_dir, &path)? {
+                DrainOutcome::Applied => report.applied += 1,
+                DrainOutcome::AlreadyApplied => report.already_applied += 1,
+                DrainOutcome::Quarantined => report.quarantined += 1,
+            }
         }
     }
+    // The pass's committed state is what the projection now describes. Every
+    // applied record advanced the ledger generation inside its own commit;
+    // publication after the pass covers all of them, and refreshes the file
+    // even when the pass applied nothing, repairing what a crash left older.
+    report.publication =
+        crate::projection::publish(conn, &crate::projection::projection_path_in(state_dir));
     Ok(report)
 }
 
@@ -806,10 +823,16 @@ mod tests {
         // Crash point 1: temp file written, never fsynced or renamed.
         let (_file, _temp_path) = write_temp_file(scratch.path(), &bundle).unwrap();
         let report = drain_pending(&mut migrated_conn(&scratch), scratch.path()).unwrap();
-        assert_eq!(
-            report,
-            DrainReport::default(),
-            "an unrenamed temp file must never be mistaken for a durable pending record"
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined, 0);
+        assert!(
+            matches!(
+                report.publication,
+                crate::projection::Publication::Published { .. }
+            ),
+            "an unrenamed temp file must never be mistaken for a durable pending record, \
+             and the pass still refreshes the projection"
         );
     }
 
@@ -822,7 +845,9 @@ mod tests {
         let (file, temp_path) = write_temp_file(scratch.path(), &bundle).unwrap();
         fsync_temp_file(&file, &temp_path).unwrap();
         let report = drain_pending(&mut migrated_conn(&scratch), scratch.path()).unwrap();
-        assert_eq!(report, DrainReport::default());
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined, 0);
     }
 
     #[test]
