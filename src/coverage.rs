@@ -784,7 +784,7 @@ mod tests {
                 let started_at = ts((attempt_seconds[i] % end_seconds) as i64);
                 let has_result = result_flags[i];
                 let has_observation = observation_flags[i] && has_result;
-                let result = has_result.then(|| AttemptResultRecord {
+                let result = has_result.then_some(AttemptResultRecord {
                     finished_at: started_at,
                     retry_after: None,
                 });
