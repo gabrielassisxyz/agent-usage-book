@@ -257,6 +257,27 @@ pub fn evidence_by_row_id(
     })
 }
 
+/// Reads the newest evidence row of one attempt, or `None` when the attempt
+/// carries no evidence (a failure that never received a response). The rowid
+/// order is the insert order; one attempt's evidence arrives in one commit.
+pub fn newest_evidence_for_attempt(
+    conn: &rusqlite::Connection,
+    attempt_id: MeterAttemptRowId,
+) -> Result<Option<EvidenceRowId>, Error> {
+    conn.query_row(
+        "SELECT id FROM meter_response_evidence WHERE attempt_id = ?1 ORDER BY id DESC LIMIT 1",
+        params![attempt_id.value()],
+        |row| row.get::<_, i64>(0).map(EvidenceRowId::new),
+    )
+    .optional()
+    .map_err(|e| {
+        Error::Store(format!(
+            "cannot read the evidence of attempt {}: {e}",
+            attempt_id.value()
+        ))
+    })
+}
+
 /// The single database spelling of a measurement basis, and back. One
 /// definition here and nowhere else.
 pub mod measurement_basis_sql {

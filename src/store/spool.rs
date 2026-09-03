@@ -458,12 +458,17 @@ pub struct RecoveryDrainReport {
     pub quarantined: Vec<QuarantinedRecord>,
 }
 
-/// How many pending records a [`drain_pending`] pass disposed of, and how.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// How many pending records a [`drain_pending`] pass disposed of, and how,
+/// together with the publication that followed the pass. The publication is
+/// unconditional: draining is spool recovery, which is a projection-relevant
+/// change when it applies anything, and a pass that applies nothing still
+/// refreshes a projection a crash may have left older than the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainReport {
     pub applied: usize,
     pub already_applied: usize,
     pub quarantined: usize,
+    pub publication: crate::projection::Publication,
 }
 
 /// Drains every pending record into `conn`: applies it if its attempt has no
@@ -499,7 +504,17 @@ pub fn drain_pending_recovering(
 }
 
 /// The drain implementation used after a caller has already excluded spool
-/// mutations with [`StateSnapshotBarrier`].
+/// mutations with [`StateSnapshotBarrier`]. This is the live path, and it is
+/// the only one of the two that publishes: the pass's committed state is what
+/// the projection now describes, so publication follows every pass
+/// unconditionally, including one that applied nothing, because a crash may
+/// have left the file older than the database. The recovery replay
+/// deliberately publishes nowhere: its second caller passes a surviving
+/// directory, and a publication there would write the restored ledger's
+/// generation into the damaged directory's own projection file, a claim about
+/// a ledger it does not describe. A restored directory starts with no
+/// projection file at all, which is the safe direction, and its first live
+/// drain writes one.
 pub(crate) fn drain_pending_while_snapshot_barrier_held(
     conn: &mut Connection,
     state_dir: &Path,
@@ -508,10 +523,17 @@ pub(crate) fn drain_pending_while_snapshot_barrier_held(
     // The FailStop policy quarantines only what parse or reconstruction
     // refused, exactly what this report has always counted; the names ride
     // with the recovery entry point, not this one.
+    // Every applied record advanced the ledger generation inside its own
+    // commit; publication after the pass covers all of them, and refreshes
+    // the file even when the pass applied nothing, repairing what a crash
+    // left older.
+    let publication =
+        crate::projection::publish(conn, &crate::projection::projection_path_in(state_dir));
     Ok(DrainReport {
         applied: report.applied,
         already_applied: report.already_applied,
         quarantined: report.quarantined.len(),
+        publication,
     })
 }
 
@@ -1013,10 +1035,16 @@ mod tests {
         // Crash point 1: temp file written, never fsynced or renamed.
         let (_file, _temp_path) = write_temp_file(scratch.path(), &bundle).unwrap();
         let report = drain_pending(&mut migrated_conn(&scratch), scratch.path()).unwrap();
-        assert_eq!(
-            report,
-            DrainReport::default(),
-            "an unrenamed temp file must never be mistaken for a durable pending record"
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined, 0);
+        assert!(
+            matches!(
+                report.publication,
+                crate::projection::Publication::Published { .. }
+            ),
+            "an unrenamed temp file must never be mistaken for a durable pending record, \
+             and the pass still refreshes the projection"
         );
     }
 
@@ -1029,7 +1057,9 @@ mod tests {
         let (file, temp_path) = write_temp_file(scratch.path(), &bundle).unwrap();
         fsync_temp_file(&file, &temp_path).unwrap();
         let report = drain_pending(&mut migrated_conn(&scratch), scratch.path()).unwrap();
-        assert_eq!(report, DrainReport::default());
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined, 0);
     }
 
     #[test]
