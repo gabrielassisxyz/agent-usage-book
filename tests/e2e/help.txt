@@ -8,6 +8,7 @@ commands:
   spend    token usage per UTC day and transcript source, read from the configured transcripts
   config   print every resolved configuration key with the source that won
   rate-card import, show and history the immutable dated vendor rate cards
+  doctor   health, drift and integrity diagnostics
 
 status:
   answers: how much quota does each configured account have left?
@@ -30,5 +31,11 @@ rate-card:
   answers: what do the immutable dated vendor rate cards contain?
   refuses: --format (rate-card prints a price book, not a report); --explain (rate-card derives no quantity); --account (the rate book is reference data, not per-account state); --no-color (rate-card prints plain rows)
   format: text only: rate-card prints a price book, not a report
+
+doctor:
+  answers: is the recorded evidence healthy, and does the transcript corpus still match its parsers?
+  refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
+  format: text | json
+  options: --transcript-format-drift
 
 aub            prints the version; aub --help prints this
