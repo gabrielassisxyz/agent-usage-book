@@ -395,6 +395,19 @@ pub trait Clock {
     fn monotonic_now(&self) -> MonotonicInstant;
 }
 
+/// Every clock is usable through a shared reference, so a caller that owns a
+/// clock can lend it to several threads at once, the shape scoped-thread
+/// sampling needs: the orchestrator and every worker read the same clock.
+impl<C: Clock + ?Sized> Clock for &C {
+    fn now(&self) -> UtcTimestamp {
+        (**self).now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        (**self).monotonic_now()
+    }
+}
+
 /// The real clock, reading the system clock.
 #[derive(Debug, Clone, Copy)]
 pub struct RealClock {

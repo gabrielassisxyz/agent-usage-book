@@ -152,6 +152,14 @@ pub fn sample_run_by_id(
     .map_err(|e| Error::Store(format!("cannot read sample run {}: {e}", id.value())))
 }
 
+/// The number of sample run rows in the database. The read-back surface for
+/// the batch cardinality contract: one invocation records exactly one run,
+/// and every attempt in the batch references it.
+pub fn count_sample_runs(conn: &rusqlite::Connection) -> Result<u64, Error> {
+    conn.query_row("SELECT count(*) FROM sample_run", [], |row| row.get(0))
+        .map_err(|e| Error::Store(format!("cannot count sample runs: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -218,6 +226,11 @@ mod tests {
             let run = sample_run_by_id(&conn, id).unwrap().unwrap();
             assert_eq!(run.trigger(), trigger);
         }
+        assert_eq!(
+            count_sample_runs(&conn).unwrap(),
+            4,
+            "one row per run started, no more"
+        );
     }
 
     #[test]

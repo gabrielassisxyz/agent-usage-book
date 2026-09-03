@@ -91,6 +91,24 @@ pub fn observe_account(
     .map_err(|e| Error::Store(format!("cannot record account observation: {e}")))
 }
 
+/// Reads the account row id for an identity pair, or `None` when no such
+/// account has ever been observed. This is the read half of the identity
+/// lookup the sampler's due decision needs before any attempt exists: an
+/// account with no row has no history, which is itself the due answer.
+pub fn account_id_by_identity(
+    conn: &rusqlite::Connection,
+    provider_key: &str,
+    logical_name: &str,
+) -> Result<Option<AccountId>, Error> {
+    conn.query_row(
+        "SELECT id FROM account WHERE provider_key = ?1 AND logical_name = ?2",
+        params![provider_key, logical_name],
+        |row| row.get::<_, i64>(0).map(AccountId::new),
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot look up the account row: {e}")))
+}
+
 /// Reads every account row in identity order.
 pub fn all_accounts(conn: &rusqlite::Connection) -> Result<Vec<Account>, Error> {
     let mut statement = conn
@@ -208,6 +226,23 @@ mod tests {
             observe_account(&conn, "anthropic", "work", UtcTimestamp::from_unix_nanos(0)).unwrap();
         let b = observe_account(&conn, "openai", "work", UtcTimestamp::from_unix_nanos(0)).unwrap();
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn identity_lookup_finds_an_observed_account_and_misses_an_unobserved_one() {
+        let (_scratch, conn) = fixture_conn();
+        let created =
+            observe_account(&conn, "anthropic", "work", UtcTimestamp::from_unix_nanos(0)).unwrap();
+        assert_eq!(
+            account_id_by_identity(&conn, "anthropic", "work").unwrap(),
+            Some(created),
+            "the identity pair of an observed account must resolve to its row"
+        );
+        assert_eq!(
+            account_id_by_identity(&conn, "anthropic", "never-sampled").unwrap(),
+            None,
+            "an account never observed has no row and no history"
+        );
     }
 
     /// Planted negative: the account row carries no plan-tier column at all, so

@@ -526,6 +526,16 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
     })
 }
 
+/// The number of meter observation rows in the database. The read-back
+/// surface for the batch cardinality contract: a batch with one measured
+/// reading among several attempts persists exactly one observation.
+pub fn count_meter_observations(conn: &rusqlite::Connection) -> Result<u64, Error> {
+    conn.query_row("SELECT count(*) FROM meter_observation", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| Error::Store(format!("cannot count meter observations: {e}")))
+}
+
 /// Reads every window row of one observation, in insertion order.
 pub fn windows_by_observation(
     conn: &rusqlite::Connection,
@@ -541,6 +551,45 @@ pub fn windows_by_observation(
         .map_err(|e| Error::Store(format!("cannot list meter windows: {e}")))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| Error::Store(format!("cannot read meter windows: {e}")))
+}
+
+/// Reads the newest observation recorded for any attempt of `account_id`,
+/// newest by rowid: insertion order is attempt order, so the newest row is
+/// the previous observation the due decision reads reset timestamps from.
+pub fn newest_observation_for_account(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+) -> Result<Option<StoredMeterObservation>, Error> {
+    conn.query_row(
+        &format!(
+            "SELECT meter_observation.id AS id,
+                    meter_observation.attempt_id AS attempt_id,
+                    meter_observation.evidence_id AS evidence_id,
+                    meter_observation.account_id AS account_id,
+                    meter_observation.provider AS provider,
+                    meter_observation.provider_observed_at AS provider_observed_at,
+                    meter_observation.received_at AS received_at,
+                    meter_observation.measurement_basis AS measurement_basis,
+                    meter_observation.observed_plan AS observed_plan,
+                    meter_observation.observed_tier AS observed_tier,
+                    meter_observation.adapter_version AS adapter_version,
+                    meter_observation.provider_contract_id AS provider_contract_id,
+                    meter_observation.meter_semantics_id AS meter_semantics_id,
+                    meter_observation.normalized_fingerprint AS normalized_fingerprint
+             FROM meter_observation
+             JOIN meter_attempt ON meter_attempt.id = meter_observation.attempt_id
+             WHERE meter_attempt.account_id = ?1
+             ORDER BY meter_observation.id DESC LIMIT 1"
+        ),
+        params![account_id.value()],
+        row_to_observation,
+    )
+    .optional()
+    .map_err(|e| {
+        Error::Store(format!(
+            "cannot read the newest observation for the account: {e}"
+        ))
+    })
 }
 
 /// The one current interpretation of an evidence row under a semantics
@@ -878,6 +927,68 @@ mod tests {
             negative_duration.to_string().contains("CHECK"),
             "the refusal must come from the constraint: {negative_duration}"
         );
+    }
+
+    /// The newest observation for an account is the last one recorded for any
+    /// of its attempts, and an account with no observation reads as `None`.
+    #[test]
+    fn newest_observation_for_account_reads_the_latest_and_none_before_any() {
+        let (_scratch, conn, run, account, snapshot, attempt) = fixture();
+        assert_eq!(
+            newest_observation_for_account(&conn, account).expect("the read must succeed"),
+            None,
+            "an account with no observation has no newest observation"
+        );
+
+        let evidence_id =
+            insert_response_evidence(&conn, &evidence(attempt)).expect("the evidence must insert");
+        let first = insert_observation(
+            &conn,
+            &observation(attempt, evidence_id, account, "semantics-v1", "fp-first"),
+        )
+        .expect("the first observation must insert");
+
+        // A second attempt for the same account, with its own observation.
+        let second_attempt = start_meter_attempt(
+            &conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "test-provider".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(40_000),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(39_000),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "account-5h-v2".into(),
+            },
+        )
+        .expect("the second attempt must insert");
+        let second_evidence_id = insert_response_evidence(&conn, &evidence(second_attempt))
+            .expect("the second evidence must insert");
+        let second = insert_observation(
+            &conn,
+            &observation(
+                second_attempt,
+                second_evidence_id,
+                account,
+                "semantics-v1",
+                "fp-second",
+            ),
+        )
+        .expect("the second observation must insert");
+
+        let newest = newest_observation_for_account(&conn, account)
+            .expect("the read must succeed")
+            .expect("the account has observations");
+        assert_eq!(
+            newest.row_id, second,
+            "the newest observation is the last one recorded, not the first"
+        );
+        assert_eq!(newest.normalized_fingerprint, "fp-second");
+        let _ = first;
     }
 
     /// Direct SQL `UPDATE` and `DELETE` against every irreplaceable table
