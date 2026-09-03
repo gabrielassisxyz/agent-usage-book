@@ -447,6 +447,29 @@ fn pending_bundle_json(attempt_id: i64, bundle: &TerminalMeterBundle) -> String 
     .to_json()
 }
 
+// --- integration: the attempt start publishes --------------------------------
+
+/// A started attempt is a freshness input: the projection must carry "the
+/// latest attempt timestamp with the fact that it has no terminal outcome"
+/// from the moment the start commits, not only once a result lands.
+#[test]
+fn publication_after_an_attempt_start_carries_the_started_attempt() {
+    let mut fixture = fixture("publication-after-start");
+    fixture.start_attempt();
+
+    let document = fixture.read_projection();
+    let latest = &document["accounts"][0]["latest_attempt"];
+    assert_eq!(latest["attempt_id"], 1);
+    assert!(
+        latest["result"].is_null(),
+        "the fact that the attempt has no terminal outcome is what the projection holds"
+    );
+    assert!(
+        document["accounts"][0]["last_successful_observation"].is_null(),
+        "a started attempt is not a success"
+    );
+}
+
 // --- integration: the kill between commit and publication ---------------------
 
 fn aub() -> Command {
