@@ -20,7 +20,8 @@ use crate::logging::RunId;
 use crate::presentation::render::ExplainMode;
 use crate::problem_code::ProblemCode;
 use crate::report::{
-    CoverageReport, LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport,
+    CoverageReport, LedgerGeneration, NowReport, ProvenanceGraph, ReportMetadata, SpendReport,
+    StatusReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 
@@ -317,6 +318,53 @@ pub fn validate_envelope_strict(json_str: &str) -> Result<ParsedEnvelope, JsonCo
     Ok(parsed)
 }
 
+/// Validates the `accounts` array shared by the `status` and `now` contracts:
+/// every entry names an account and carries exactly one freshness variant, and
+/// each variant carries the fields that variant's renderer emits. `status` and
+/// `now` map the same [`crate::report::MeterAccount`] into JSON through the same
+/// `status_account_json`, so they validate through this one function rather than
+/// through two copies that could drift apart.
+fn validate_freshness_accounts(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), JsonContractError> {
+    let accounts = obj
+        .get("accounts")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JsonContractError::MissingField("accounts"))?;
+    for account in accounts {
+        let acc_obj = account
+            .as_object()
+            .ok_or_else(|| JsonContractError::InvalidFormat {
+                field: "accounts[]",
+                message: "expected account object".to_string(),
+            })?;
+        if !acc_obj.contains_key("account") {
+            return Err(JsonContractError::MissingField("account"));
+        }
+        let freshness = acc_obj
+            .get("freshness")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JsonContractError::MissingField("freshness"))?;
+        let required: &[&'static str] = match freshness {
+            "fresh" => &["remaining", "latest_attempt"],
+            "stale" => &["reason", "last_good", "latest_attempt"],
+            "auth_required" => &["last_good", "latest_attempt"],
+            other => {
+                return Err(JsonContractError::InvalidFormat {
+                    field: "freshness",
+                    message: format!("unknown freshness state '{other}'"),
+                });
+            }
+        };
+        for &field in required {
+            if !acc_obj.contains_key(field) {
+                return Err(JsonContractError::MissingField(field));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates that a status report JSON string strictly conforms to schema version 1.
 pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
@@ -387,60 +435,51 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
                 })?;
         validate_explain_object(explain_obj)?;
     }
-    let accounts = obj
-        .get("accounts")
-        .and_then(serde_json::Value::as_array)
-        .ok_or(JsonContractError::MissingField("accounts"))?;
-    for account in accounts {
-        let acc_obj = account
-            .as_object()
-            .ok_or_else(|| JsonContractError::InvalidFormat {
-                field: "accounts[]",
-                message: "expected account object".to_string(),
-            })?;
-        if !acc_obj.contains_key("account") {
-            return Err(JsonContractError::MissingField("account"));
-        }
-        let freshness = acc_obj
-            .get("freshness")
-            .and_then(serde_json::Value::as_str)
-            .ok_or(JsonContractError::MissingField("freshness"))?;
-        match freshness {
-            "fresh" => {
-                if !acc_obj.contains_key("remaining") {
-                    return Err(JsonContractError::MissingField("remaining"));
-                }
-                if !acc_obj.contains_key("latest_attempt") {
-                    return Err(JsonContractError::MissingField("latest_attempt"));
-                }
-            }
-            "stale" => {
-                if !acc_obj.contains_key("reason") {
-                    return Err(JsonContractError::MissingField("reason"));
-                }
-                if !acc_obj.contains_key("last_good") {
-                    return Err(JsonContractError::MissingField("last_good"));
-                }
-                if !acc_obj.contains_key("latest_attempt") {
-                    return Err(JsonContractError::MissingField("latest_attempt"));
-                }
-            }
-            "auth_required" => {
-                if !acc_obj.contains_key("last_good") {
-                    return Err(JsonContractError::MissingField("last_good"));
-                }
-                if !acc_obj.contains_key("latest_attempt") {
-                    return Err(JsonContractError::MissingField("latest_attempt"));
-                }
-            }
-            other => {
-                return Err(JsonContractError::InvalidFormat {
-                    field: "freshness",
-                    message: format!("unknown freshness state '{other}'"),
-                });
-            }
+    validate_freshness_accounts(obj)?;
+    Ok(parsed)
+}
+
+/// Validates that a now report JSON string strictly conforms to schema version 1.
+pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "now" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'now', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_NOW_KEYS: [&str; 8] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "accounts",
+        "explain",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_NOW_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
         }
     }
+    if let Some(explain_val) = obj.get("explain") {
+        let explain_obj =
+            explain_val
+                .as_object()
+                .ok_or_else(|| JsonContractError::InvalidFormat {
+                    field: "explain",
+                    message: "expected explain object".to_string(),
+                })?;
+        validate_explain_object(explain_obj)?;
+    }
+    validate_freshness_accounts(obj)?;
     Ok(parsed)
 }
 
@@ -588,6 +627,29 @@ pub fn status_json_with_explain(report: &StatusReport, run: RunId, explain: Expl
         ));
     }
     JsonEnvelope::new("status", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// The now report under the envelope: one object per account with its freshness.
+pub fn now_json(report: &NowReport, run: RunId) -> String {
+    now_json_with_explain(report, run, ExplainMode::Off)
+}
+
+/// The now report under the envelope, optionally including explain provenance.
+pub fn now_json_with_explain(report: &NowReport, run: RunId, explain: ExplainMode) -> String {
+    let accounts = report
+        .accounts
+        .iter()
+        .map(status_account_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut body = format!("\"accounts\":[{accounts}]");
+    if explain != ExplainMode::Off {
+        body.push_str(&format!(
+            ",\"explain\":{}",
+            explain_json(&report.provenance, explain)
+        ));
+    }
+    JsonEnvelope::new("now", run, report.metadata.clone()).to_json_with(&body)
 }
 
 /// The spend report under the envelope: the window, one object per group with a

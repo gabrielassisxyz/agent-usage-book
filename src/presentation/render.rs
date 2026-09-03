@@ -17,7 +17,9 @@ use crate::error::Error;
 use crate::evidence::CoverageCompleteness;
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
-use crate::report::{CoverageReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
+use crate::report::{
+    CoverageReport, NowReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport,
+};
 use crate::transcripts::TranscriptDriftReport;
 
 /// The explain level a command was asked for.
@@ -149,31 +151,75 @@ pub fn render_status_report_with_explain(
         }
         return line;
     }
-    let mut lines: Vec<String> = Vec::with_capacity(report.accounts.len());
-    for account in &report.accounts {
-        let reading = render_meter_reading(
-            &account.reading,
-            METER_UNIT,
-            PERCENT,
-            now,
-            envelope,
-            account
-                .limiting_window
-                .as_ref()
-                .map(|limit| limit.nominal_duration),
-        );
-        lines.push(format!("aub {} {}", account.account.as_str(), reading));
-    }
+    let lines = meter_account_lines(&report.accounts, now, envelope);
+    join_report_with_explain(lines, &report.provenance, explain)
+}
+
+/// Renders a now live report.
+pub fn render_now_report(
+    report: &NowReport,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+) -> String {
+    render_now_report_with_explain(report, now, envelope, ExplainMode::Off)
+}
+
+/// Renders a now live report, optionally including the explain block.
+///
+/// `now` and `status` render one account line the same way, through the same
+/// [`meter_account_lines`] helper: a `now` immediately followed by a `status`
+/// cannot disagree on the text because neither has its own line format.
+pub fn render_now_report_with_explain(
+    report: &NowReport,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+    explain: ExplainMode,
+) -> String {
+    let lines = meter_account_lines(&report.accounts, now, envelope);
+    join_report_with_explain(lines, &report.provenance, explain)
+}
+
+/// One `aub <account> <reading>` line per account, in order, through the shared
+/// meter-reading fragment renderer so wording lives in one place.
+fn meter_account_lines(
+    accounts: &[crate::report::MeterAccount],
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+) -> Vec<String> {
+    accounts
+        .iter()
+        .map(|account| {
+            let reading = render_meter_reading(
+                &account.reading,
+                METER_UNIT,
+                PERCENT,
+                now,
+                envelope,
+                account
+                    .limiting_window
+                    .as_ref()
+                    .map(|limit| limit.nominal_duration),
+            );
+            format!("aub {} {}", account.account.as_str(), reading)
+        })
+        .collect()
+}
+
+/// Joins account lines and, when asked, the explain block below them.
+fn join_report_with_explain(
+    lines: Vec<String>,
+    provenance: &ProvenanceGraph,
+    explain: ExplainMode,
+) -> String {
     let report_text = lines.join("\n");
     if explain == ExplainMode::Off {
-        report_text
+        return report_text;
+    }
+    let explain_text = render_explain(provenance, explain);
+    if report_text.is_empty() {
+        explain_text
     } else {
-        let explain_text = render_explain(&report.provenance, explain);
-        if report_text.is_empty() {
-            explain_text
-        } else {
-            format!("{report_text}\n\n{explain_text}")
-        }
+        format!("{report_text}\n\n{explain_text}")
     }
 }
 

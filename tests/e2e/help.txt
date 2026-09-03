@@ -15,6 +15,7 @@ commands:
   doctor   health, drift and integrity diagnostics
   coverage did the sampler attempt what the policy owed, and did those attempts observe?
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
+  now      force a persisted sampling attempt for the selected accounts and render the resulting state
 
 status:
   answers: how much quota does each configured account have left?
@@ -79,5 +80,10 @@ sample:
   refuses: --explain (sample derives no quantity); --model (sample operates on configured accounts, not models); --no-color (sample prints plain status or json)
   format: text | json
   options: --due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success
+
+now:
+  answers: how much quota does each configured account have right now?
+  refuses: --model (now reports every window; only status takes a --model selector); --no-color (now prints no color)
+  format: text | json
 
 aub            prints the version; aub --help prints this

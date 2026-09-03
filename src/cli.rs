@@ -17,16 +17,20 @@ use crate::domain::time::{
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, Quantity, RunId};
 pub use crate::presentation::ExplainMode;
-use crate::presentation::json::{coverage_json, spend_json_with_explain, status_json_with_explain};
+use crate::presentation::json::{
+    coverage_json, now_json_with_explain, spend_json_with_explain, status_json_with_explain,
+};
 use crate::presentation::render::{
-    render_coverage_report, render_coverage_threshold_message, render_spend_report_with_explain,
-    render_status_report_with_explain,
+    render_coverage_report, render_coverage_threshold_message, render_now_report_with_explain,
+    render_spend_report_with_explain, render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
 use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as assemble_coverage};
 use crate::report::export::assemble as assemble_export;
 use crate::report::spend::{SpendWindow, assemble_canonical as assemble_spend};
-use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, SpendGrouping, StatusReport};
+use crate::report::{
+    LedgerGeneration, MeterAccount, NowReport, ReportMetadata, SpendGrouping, StatusReport,
+};
 use crate::store::export::ExportKey;
 
 /// Declares [`Command`] and the derived list of its variants from one token list, so
@@ -74,6 +78,7 @@ aub_command_enum! {
     Doctor,
     Coverage,
     Sample,
+    Now,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -102,7 +107,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 17] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -119,6 +124,7 @@ impl Command {
         Self::Doctor,
         Self::Coverage,
         Self::Sample,
+        Self::Now,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -393,6 +399,18 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Now => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Accepted,
+                account: FlagSupport::Accepted,
+                model: FlagSupport::Rejected {
+                    reason: "now reports every window; only status takes a --model selector",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "now prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -416,6 +434,7 @@ impl Command {
             Command::Doctor => "doctor",
             Command::Coverage => "coverage",
             Command::Sample => "sample",
+            Command::Now => "now",
         }
     }
 
@@ -453,6 +472,9 @@ impl Command {
             Command::Sample => Some(
                 "observe provider endpoints for due or selected accounts, recording session markers and evidence",
             ),
+            Command::Now => Some(
+                "force a persisted sampling attempt for the selected accounts and render the resulting state",
+            ),
         }
     }
 
@@ -487,6 +509,7 @@ impl Command {
             Command::Sample => Some(
                 "are configured accounts due for meter sampling, and what did the endpoints observe?",
             ),
+            Command::Now => Some("how much quota does each configured account have right now?"),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
@@ -549,7 +572,8 @@ impl Command {
             | Command::ExitClass
             | Command::AttemptCrashHook
             | Command::ProjectionCrashHook
-            | Command::RateCard => None,
+            | Command::RateCard
+            | Command::Now => None,
         }
     }
 
@@ -846,6 +870,10 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
         Command::Sample => sample_command(&RealClock::new(), level, &invocation),
+        Command::Now => {
+            reject_positionals(&invocation)?;
+            now_command(&RealClock::new(), level, &invocation)
+        }
     }
 }
 
@@ -1272,29 +1300,7 @@ pub(crate) fn sample_command(
         }
     }
 
-    for report in &batch_report.accounts {
-        if let crate::meter::sampler::AccountDisposition::PersistFailed { reason, .. } =
-            &report.disposition
-        {
-            return Err(Error::Store(format!(
-                "evidence could not be durably preserved: {reason}"
-            )));
-        }
-        if let crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } =
-            &report.disposition
-        {
-            return Err(Error::Store(format!(
-                "sampling due lookup failed: {reason}"
-            )));
-        }
-        if let crate::meter::sampler::AccountDisposition::EligibilityFailed { reason } =
-            &report.disposition
-        {
-            return Err(Error::Store(format!(
-                "sampling eligibility failed: {reason}"
-            )));
-        }
-    }
+    sampling_disposition_error(&batch_report.accounts)?;
 
     if require_success {
         for report in &batch_report.accounts {
@@ -1320,6 +1326,261 @@ pub(crate) fn sample_command(
     }
 
     Ok(())
+}
+
+/// `aub now`: force a persisted sampling attempt for the selected accounts
+/// and render the resulting current state.
+pub(crate) fn now_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("now");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    if let Some(name) = &invocation.account
+        && !config.accounts.iter().any(|acc| acc.name == *name)
+    {
+        return Err(Error::Usage(format!(
+            "unknown account '{name}': now --account names a configured account"
+        )));
+    }
+
+    // State readiness check before any network request or attempt start.
+    crate::store::startup::ensure_state_dir_ready(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+    )?;
+
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let busy_policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
+    crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
+    let repo = crate::store::repository::Repository::new(&db_path, busy_policy);
+
+    let target_accounts: Vec<&crate::config::AccountConfig> = match &invocation.account {
+        Some(name) => config
+            .accounts
+            .iter()
+            .filter(|acc| acc.name == *name)
+            .collect(),
+        None => config.accounts.iter().collect(),
+    };
+
+    if target_accounts.is_empty() {
+        // No account to sample: there is nothing to fetch and nothing to
+        // record, so this is not an unrecorded-fetch path. The empty current
+        // state is the whole answer.
+        let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
+        let report = NowReport::new(metadata, Vec::new(), Vec::new());
+        emit_now_report(&report, run, timestamp, invocation);
+        return Ok(());
+    }
+
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RequestAttempted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let mut batch_accounts = Vec::new();
+    for acc in &target_accounts {
+        let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
+        let credential_handle =
+            crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
+        let credential_context_id = Some(resolved.context_id.as_str().to_string());
+
+        let resolved_policy = crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
+            ordinary_cadence: config.sampling.default_interval,
+            freshness_horizon: config.freshness.meter,
+            reset_edge_policy: format!(
+                "lead-{}s",
+                config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
+            ),
+            retry_backoff_policy: "none".to_string(),
+            command_budget: config.sampling.command_budget,
+            policy_algorithm_version: "v1".to_string(),
+        };
+
+        let adapter = if acc.provider == "anthropic" {
+            let endpoint = std::env::var("AUB_ANTHROPIC_ENDPOINT").unwrap_or_else(|_| {
+                crate::meter::anthropic::AnthropicAdapter::DEFAULT_ENDPOINT.to_string()
+            });
+            crate::meter::anthropic::AnthropicAdapter::with_endpoint(endpoint)
+        } else {
+            return Err(Error::Usage(format!(
+                "unsupported provider '{}' for account '{}' (supported: anthropic)",
+                acc.provider, acc.name
+            )));
+        };
+
+        batch_accounts.push(crate::meter::sampler::BatchAccount {
+            name: crate::store::sampling_lease::AccountName::new(&acc.name),
+            provider_key: acc.provider.clone(),
+            adapter,
+            credential: credential_handle,
+            credential_context_id,
+            request: crate::meter::adapter::MeterRequest::default(),
+            policy: resolved_policy,
+            reset_edge_lead: config.sampling.reset_edge_lead,
+            forced: true,
+            adapter_version: crate::domain::ids::AdapterVersion::new(
+                crate::build_info::crate_version(),
+            ),
+        });
+    }
+
+    let orchestrator = crate::meter::sampler::SamplingOrchestrator {
+        repository: &repo,
+        transport: crate::meter::transport::BlockingTransport,
+        clock: crate::domain::time::RealClock::new(),
+        trigger: crate::store::sample_run::Trigger::Live,
+        configuration_fingerprint: "aub-v1".to_string(),
+        holder: crate::store::sampling_lease::LeaseHolder::new(format!(
+            "pid-{}",
+            std::process::id()
+        )),
+        lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
+        command_budget: config.sampling.command_budget,
+        max_concurrent_requests: config.sampling.max_concurrent_requests,
+    };
+
+    let batch_report = orchestrator.run(&batch_accounts)?;
+
+    // A disposition that failed to record the attempt or its terminal fact is a
+    // persistence failure, reported with the store class. The projection is not
+    // read and no reading is rendered: an unrecorded observation is never shown
+    // as though it were durable (correctness invariant 5).
+    sampling_disposition_error(&batch_report.accounts)?;
+
+    // Rendering reads the projection the batch just published and runs it
+    // through the same freshness function and report models `status` uses, so a
+    // `now` cannot disagree with a `status` taken a moment later.
+    let projection_path = crate::projection::projection_path_in(&config.state.dir);
+    let (accounts, ledger_generation) =
+        match crate::projection::reader::read_projection(&projection_path) {
+            crate::projection::reader::ProjectionRead::Available(projection) => {
+                let accounts = projection_accounts(
+                    &config,
+                    &projection,
+                    invocation.account.as_deref(),
+                    invocation.model.as_deref(),
+                    clock,
+                );
+                logger
+                    .emit(
+                        timestamp,
+                        DiagnosticEvent::ProjectionRead,
+                        &[("state", &LogicalName::new("ok"))],
+                    )
+                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                let generation = LedgerGeneration::new(projection.ledger_generation.value());
+                (accounts, generation)
+            }
+            crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
+                // The batch reported no persistence failure, so the projection it
+                // published should be readable now. If it is not, the state
+                // directory is the fault: report it with the store class rather
+                // than render an empty answer as if nothing were configured.
+                return Err(Error::Store(format!(
+                    "sampled accounts but the published projection could not be read: {}",
+                    unavailable.reason()
+                )));
+            }
+        };
+
+    let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
+    let report = NowReport::new(metadata, accounts, Vec::new());
+    emit_now_report(&report, run, timestamp, invocation);
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::ReportRendered,
+            &[("report_kind", &LogicalName::new("now"))],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    Ok(())
+}
+
+/// Returns the store-class error for the first disposition that failed to record
+/// its attempt or terminal fact. Shared by `sample` and `now`: both treat a
+/// persistence failure as fatal and neither renders a reading after one.
+fn sampling_disposition_error(
+    accounts: &[crate::meter::sampler::AccountReport],
+) -> Result<(), Error> {
+    for report in accounts {
+        match &report.disposition {
+            crate::meter::sampler::AccountDisposition::PersistFailed { reason, .. } => {
+                return Err(Error::Store(format!(
+                    "evidence could not be durably preserved: {reason}"
+                )));
+            }
+            crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } => {
+                return Err(Error::Store(format!(
+                    "sampling due lookup failed: {reason}"
+                )));
+            }
+            crate::meter::sampler::AccountDisposition::EligibilityFailed { reason } => {
+                return Err(Error::Store(format!(
+                    "sampling eligibility failed: {reason}"
+                )));
+            }
+            crate::meter::sampler::AccountDisposition::NotYet { .. }
+            | crate::meter::sampler::AccountDisposition::LeaseHeld { .. }
+            | crate::meter::sampler::AccountDisposition::Sampled(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Writes the `now` report in the requested format. One freshness variant per
+/// account travels in either format because both read the same [`NowReport`].
+fn emit_now_report(
+    report: &NowReport,
+    run: RunId,
+    timestamp: crate::domain::time::UtcTimestamp,
+    invocation: &Invocation,
+) {
+    match invocation.format {
+        OutputFormat::Text => println!(
+            "{}",
+            render_now_report_with_explain(
+                report,
+                timestamp,
+                status_clock_skew_envelope(),
+                invocation.explain,
+            )
+        ),
+        OutputFormat::Json => {
+            println!("{}", now_json_with_explain(report, run, invocation.explain))
+        }
+    }
 }
 
 /// `aub doctor`: operational health, drift and integrity diagnostics.
@@ -3610,6 +3871,43 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
         // rule greps for, so the negative never trips that rule on this file.
         let poisoned = "fn status() { let probe = crate::store::connection::open(); }";
         assert!(function_body(poisoned, "fn status(").contains("store::connection"));
+    }
+
+    /// `now` and `sample` both turn a persistence-failing disposition into a
+    /// store-class error and render nothing after it. The positive: a batch
+    /// whose every disposition recorded returns `Ok`. The planted negative,
+    /// near-identical, differs only in the one forbidden dimension: a
+    /// `PersistFailed` disposition must become `Error::Store`, never `Ok`, so a
+    /// fetched value is never rendered as though it had been recorded.
+    #[test]
+    fn a_persistence_failing_disposition_becomes_a_store_error() {
+        use crate::domain::attempt::{AttemptId, AttemptOutcome};
+        use crate::meter::sampler::{AccountDisposition, AccountReport};
+        use crate::store::sampling_lease::AccountName;
+
+        let recorded = AccountReport {
+            name: AccountName::new("work-a"),
+            disposition: AccountDisposition::NotYet {
+                next_due_at: crate::domain::time::UtcTimestamp::from_unix_nanos(1),
+            },
+        };
+        assert!(sampling_disposition_error(std::slice::from_ref(&recorded)).is_ok());
+
+        let persist_failed = AccountReport {
+            name: AccountName::new("work-a"),
+            disposition: AccountDisposition::PersistFailed {
+                attempt_id: AttemptId::new(7),
+                outcome: AttemptOutcome::Success,
+                reason: "disk full".to_string(),
+            },
+        };
+        match sampling_disposition_error(&[recorded, persist_failed]) {
+            Err(Error::Store(message)) => {
+                assert!(message.contains("durably preserved"), "{message:?}");
+                assert!(message.contains("disk full"), "{message:?}");
+            }
+            other => panic!("PersistFailed must map to Error::Store, got {other:?}"),
+        }
     }
 
     /// The body of one function in this file: from its declaration to the
