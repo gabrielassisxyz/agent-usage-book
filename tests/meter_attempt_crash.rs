@@ -555,7 +555,7 @@ fn injection_hooks_are_confined_to_the_harness_modules_and_off_the_shipping_surf
             .unwrap_or("");
         let in_store = file
             .parent()
-            .is_some_and(|parent| parent == &manifest_dir.join("src/store"));
+            .is_some_and(|parent| parent == manifest_dir.join("src/store"));
         assert!(
             in_store && name.ends_with("_crash_hook.rs"),
             "every process::abort call site must live in a src/store/*_crash_hook.rs \
