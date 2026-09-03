@@ -252,6 +252,11 @@ const POPULATION: &[(&str, Populate)] = &[
     ("attribution_segment", populate_attribution_segment),
     ("ingest_quarantine", populate_ingest_quarantine),
     ("ingestion_generation", populate_ingestion_generation),
+    ("legacy_meter_import", populate_legacy_meter_import),
+    (
+        "legacy_meter_import_record",
+        populate_legacy_meter_import_record,
+    ),
 ];
 
 fn populate_account(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -641,6 +646,26 @@ fn populate_ingestion_generation(conn: &rusqlite::Connection) -> Result<(), Stri
         conn,
         "ingestion_generation",
         "UPDATE ingestion_generation SET generation = 9223372036854775807 WHERE id = 1",
+    )
+}
+
+fn populate_legacy_meter_import(conn: &rusqlite::Connection) -> Result<(), String> {
+    exec(
+        conn,
+        "legacy_meter_import",
+        "INSERT INTO legacy_meter_import (source_digest, verified_backup_id, imported_at, records_read, records_quarantined) VALUES
+            ('1111111111111111111111111111111111111111111111111111111111111111', 'matrix-backup-1', 1000, 2, 0),
+            ('2222222222222222222222222222222222222222222222222222222222222222', 'matrix-backup-2', 2000, 1, 1)",
+    )
+}
+
+fn populate_legacy_meter_import_record(conn: &rusqlite::Connection) -> Result<(), String> {
+    exec(
+        conn,
+        "legacy_meter_import_record",
+        "INSERT INTO legacy_meter_import_record (source_digest, source_line, observation_id, marker_id) VALUES
+            ('1111111111111111111111111111111111111111111111111111111111111111', 1, 1, 1),
+            ('1111111111111111111111111111111111111111111111111111111111111111', 2, 2, 2)",
     )
 }
 

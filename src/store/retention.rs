@@ -74,6 +74,8 @@ pub enum DurableClass {
     MeterAttemptResult,
     MeterResponseEvidence,
     CalibrationExperiment,
+    LegacyMeterImport,
+    LegacyMeterImportRecord,
 
     // Core SQLite tables: Versioned interpretation
     MeterObservation,
@@ -129,7 +131,9 @@ impl DurableClass {
             | Self::MeterAttempt
             | Self::MeterAttemptResult
             | Self::MeterResponseEvidence
-            | Self::CalibrationExperiment => DurableClassCategory::Irreplaceable,
+            | Self::CalibrationExperiment
+            | Self::LegacyMeterImport
+            | Self::LegacyMeterImportRecord => DurableClassCategory::Irreplaceable,
 
             Self::SamplingPolicySnapshot
             | Self::MeterObservation
@@ -187,7 +191,9 @@ impl DurableClass {
             | Self::CostModel
             | Self::CostModelTerm
             | Self::CostModelLifecycle
-            | Self::RateCard => RetentionRule::Forever,
+            | Self::RateCard
+            | Self::LegacyMeterImport
+            | Self::LegacyMeterImportRecord => RetentionRule::Forever,
 
             Self::SessionAccountMarker => RetentionRule::ForeverUnlessExplicitlyPurged,
 
@@ -251,6 +257,8 @@ impl DurableClass {
             Self::CalibrationLifecycle => Some("calibration_lifecycle"),
             Self::AttributionSegment => Some("attribution_segment"),
             Self::IngestQuarantine => Some("ingest_quarantine"),
+            Self::LegacyMeterImport => Some("legacy_meter_import"),
+            Self::LegacyMeterImportRecord => Some("legacy_meter_import_record"),
             Self::StatusProjection | Self::PendingObservationSpool | Self::RetainedProviderBody => {
                 None
             }
@@ -319,6 +327,8 @@ impl DurableClass {
             | Self::MeterAttemptResult
             | Self::MeterResponseEvidence
             | Self::CalibrationExperiment
+            | Self::LegacyMeterImport
+            | Self::LegacyMeterImportRecord
             | Self::MeterObservation
             | Self::MeterWindow
             | Self::MeterObservationPreference
@@ -372,6 +382,8 @@ impl DurableClass {
             Self::CalibrationLifecycle,
             Self::AttributionSegment,
             Self::IngestQuarantine,
+            Self::LegacyMeterImport,
+            Self::LegacyMeterImportRecord,
             Self::StatusProjection,
             Self::PendingObservationSpool,
             Self::RetainedProviderBody,
@@ -414,6 +426,8 @@ impl DurableClass {
             Self::CalibrationLifecycle,
             Self::AttributionSegment,
             Self::IngestQuarantine,
+            Self::LegacyMeterImport,
+            Self::LegacyMeterImportRecord,
         ]
     }
 }

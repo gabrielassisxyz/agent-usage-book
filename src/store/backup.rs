@@ -135,7 +135,16 @@ pub fn verify_database(
         crate::store::connection::AccessMode::ReadOnly,
         &crate::store::connection::PragmaPolicy { busy_timeout },
     )?;
+    verify_database_on_connection(&connection)
+}
 
+/// The two checks against an already-open connection: the same queries
+/// [`verify_database`] runs, for the caller that holds the connection it just
+/// wrote through. A read-only reopen of a database carrying a live WAL
+/// sidecar is the case this split exists to avoid, not an optimisation.
+pub fn verify_database_on_connection(
+    connection: &rusqlite::Connection,
+) -> Result<Result<DatabaseVerification, DatabaseVerificationFailure>, Error> {
     let mut integrity = connection
         .prepare("PRAGMA integrity_check")
         .map_err(|error| Error::Store(format!("cannot prepare backup integrity check: {error}")))?;

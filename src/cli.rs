@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
@@ -72,6 +73,8 @@ aub_command_enum! {
     Rebuild,
     Doctor,
     Coverage,
+    Import,
+    Sample,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -100,7 +103,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 17] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -116,6 +119,8 @@ impl Command {
         Self::Rebuild,
         Self::Doctor,
         Self::Coverage,
+        Self::Import,
+        Self::Sample,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -376,6 +381,38 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Import => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "import prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "import derives no report",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "import carries account identity in its source",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "import carries no model selector",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "import prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Sample => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "sample derives no quantity",
+                },
+                account: FlagSupport::Accepted,
+                model: FlagSupport::Rejected {
+                    reason: "sample operates on configured accounts, not models",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "sample prints plain status or json",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -398,6 +435,8 @@ impl Command {
             Command::Rebuild => "rebuild",
             Command::Doctor => "doctor",
             Command::Coverage => "coverage",
+            Command::Import => "import",
+            Command::Sample => "sample",
         }
     }
 
@@ -432,6 +471,12 @@ impl Command {
             Command::Coverage => Some(
                 "did the sampler attempt what the policy owed, and did those attempts observe?",
             ),
+            Command::Import => {
+                Some("import explicitly selected legacy evidence with durable provenance")
+            }
+            Command::Sample => Some(
+                "observe provider endpoints for due or selected accounts, recording session markers and evidence",
+            ),
         }
     }
 
@@ -460,8 +505,12 @@ impl Command {
             Command::Coverage => Some(
                 "did the sampler attempt what the policy owed, and did those attempts observe?",
             ),
+            Command::Import => Some("which legacy evidence is safe to import into the ledger?"),
             Command::Export => Some(
                 "which usage did each session or run consume, as a versioned JSONL ledger for an external join?",
+            ),
+            Command::Sample => Some(
+                "are configured accounts due for meter sampling, and what did the endpoints observe?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -506,7 +555,9 @@ impl Command {
                 "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
-            Command::Backup => Some("DESTINATION | verify DESTINATION"),
+            Command::Backup => {
+                Some("DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]")
+            }
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
@@ -514,6 +565,10 @@ impl Command {
             Command::Coverage => {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
             }
+            Command::Import => Some("legacy-meter --source PATH --backup VERIFIED_ARCHIVE"),
+            Command::Sample => Some(
+                "--due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success",
+            ),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -816,7 +871,482 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
+        Command::Import => import_command(&RealClock::new(), level, &invocation),
+        Command::Sample => sample_command(&RealClock::new(), level, &invocation),
     }
+}
+
+/// `aub sample`: observe provider endpoints for due or selected accounts,
+/// recording session markers and evidence.
+pub(crate) fn sample_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("sample");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let mut due = false;
+    let mut all = false;
+    let mut if_due = false;
+    let mut require_success = false;
+    let mut session_id: Option<String> = None;
+    let mut run_id: Option<String> = None;
+
+    let mut args = invocation.rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--due" => due = true,
+            "--all" => all = true,
+            "--if-due" => if_due = true,
+            "--require-success" => require_success = true,
+            "--session-id" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--session-id requires a value".into()))?;
+                session_id = Some(val.clone());
+            }
+            "--run-id" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--run-id requires a value".into()))?;
+                run_id = Some(val.clone());
+            }
+            other if other.starts_with("--session-id=") => {
+                let val = other.strip_prefix("--session-id=").unwrap();
+                if val.is_empty() {
+                    return Err(Error::Usage("--session-id requires a value".into()));
+                }
+                session_id = Some(val.to_string());
+            }
+            other if other.starts_with("--run-id=") => {
+                let val = other.strip_prefix("--run-id=").unwrap();
+                if val.is_empty() {
+                    return Err(Error::Usage("--run-id requires a value".into()));
+                }
+                run_id = Some(val.to_string());
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "unknown argument: {other}; run aub sample --help for options"
+                )));
+            }
+        }
+    }
+
+    if all && invocation.account.is_some() {
+        return Err(Error::Usage(
+            "--all and --account cannot be used together".into(),
+        ));
+    }
+    if session_id.is_some() && invocation.account.is_none() {
+        return Err(Error::Usage("--session-id requires --account NAME".into()));
+    }
+    if run_id.is_some() && session_id.is_none() {
+        return Err(Error::Usage("--run-id requires --session-id".into()));
+    }
+    if !due && !all && invocation.account.is_none() {
+        return Err(Error::Usage(
+            "sample requires --due, --account, or --all".into(),
+        ));
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    if let Some(name) = &invocation.account
+        && !config.accounts.iter().any(|acc| acc.name == *name)
+    {
+        return Err(Error::Usage(format!(
+            "unknown account '{name}': sample --account names a configured account"
+        )));
+    }
+
+    // State readiness check before any network request or attempt start.
+    crate::store::startup::ensure_state_dir_ready(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+    )?;
+
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let busy_policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    // Migrations are confined to the store layer (boundary rules 15 and 16),
+    // so the ledger is opened through the same shared opener `ingest` and
+    // `rate-card import` already use rather than running the migration
+    // framework directly from this file.
+    let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
+    crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
+    let repo = crate::store::repository::Repository::new(&db_path, busy_policy);
+
+    // Record session marker if requested.
+    if let Some(sess_str) = &session_id {
+        let account_name = invocation.account.as_ref().unwrap();
+        let target_acc = config
+            .accounts
+            .iter()
+            .find(|acc| acc.name == *account_name)
+            .unwrap();
+
+        let session_id_parsed = if let Some((src, nat)) = sess_str.split_once(':') {
+            crate::domain::ids::SessionId::new(
+                crate::domain::ids::SourceNamespace::new(src),
+                crate::domain::ids::NativeSessionId::new(nat),
+            )
+        } else {
+            crate::domain::ids::SessionId::new(
+                crate::domain::ids::SourceNamespace::new("cli"),
+                crate::domain::ids::NativeSessionId::new(sess_str.as_str()),
+            )
+        };
+
+        let run_id_parsed = run_id.as_deref().map(|r_str| {
+            if let Some((src, nat)) = r_str.split_once(':') {
+                crate::domain::ids::RunId::new(
+                    crate::domain::ids::SourceNamespace::new(src),
+                    crate::domain::ids::NativeRunId::new(nat),
+                )
+            } else {
+                crate::domain::ids::RunId::new(
+                    crate::domain::ids::SourceNamespace::new("cli"),
+                    crate::domain::ids::NativeRunId::new(r_str),
+                )
+            }
+        });
+
+        let account_id = repo.ensure_account(&target_acc.provider, &target_acc.name, timestamp)?;
+
+        let marker = crate::store::session_account_marker::NewSessionAccountMarker {
+            session_id: session_id_parsed,
+            observed_at: timestamp,
+            source_ordering_key: None,
+            logical_account: account_name.clone(),
+            resolved_account_id: Some(account_id),
+            marker_source: crate::store::session_account_marker::MarkerSource::new("hook"),
+            run_id: run_id_parsed,
+            evidence_designation:
+                crate::store::session_account_marker::EvidenceDesignation::ExplicitLauncherOrHook,
+        };
+
+        crate::store::session_account_marker::insert_marker(&conn, &marker)?;
+    }
+
+    let target_accounts: Vec<&crate::config::AccountConfig> = match &invocation.account {
+        Some(name) => config
+            .accounts
+            .iter()
+            .filter(|acc| acc.name == *name)
+            .collect(),
+        None => config.accounts.iter().collect(),
+    };
+
+    if target_accounts.is_empty() {
+        if invocation.format == OutputFormat::Json {
+            println!(
+                "{{\"schema_version\":1,\"command\":\"sample\",\"run_id\":\"{}\",\"accounts\":[]}}",
+                run.as_str()
+            );
+        }
+        return Ok(());
+    }
+
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RequestAttempted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let forced = if invocation.account.is_some() {
+        !due && !if_due
+    } else if all {
+        !if_due
+    } else {
+        false
+    };
+
+    let trigger = if session_id.is_some() {
+        crate::store::sample_run::Trigger::Hook
+    } else if due {
+        crate::store::sample_run::Trigger::Timer
+    } else {
+        crate::store::sample_run::Trigger::Manual
+    };
+
+    let mut batch_accounts = Vec::new();
+    for acc in &target_accounts {
+        let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
+        let credential_handle =
+            crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
+        let credential_context_id = Some(resolved.context_id.as_str().to_string());
+
+        let resolved_policy = crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
+            ordinary_cadence: config.sampling.default_interval,
+            freshness_horizon: config.freshness.meter,
+            reset_edge_policy: format!(
+                "lead-{}s",
+                config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
+            ),
+            retry_backoff_policy: "none".to_string(),
+            command_budget: config.sampling.command_budget,
+            policy_algorithm_version: "v1".to_string(),
+        };
+
+        let adapter = if acc.provider == "anthropic" {
+            let endpoint = std::env::var("AUB_ANTHROPIC_ENDPOINT").unwrap_or_else(|_| {
+                crate::meter::anthropic::AnthropicAdapter::DEFAULT_ENDPOINT.to_string()
+            });
+            crate::meter::anthropic::AnthropicAdapter::with_endpoint(endpoint)
+        } else {
+            return Err(Error::Usage(format!(
+                "unsupported provider '{}' for account '{}' (supported: anthropic)",
+                acc.provider, acc.name
+            )));
+        };
+
+        batch_accounts.push(crate::meter::sampler::BatchAccount {
+            name: crate::store::sampling_lease::AccountName::new(&acc.name),
+            provider_key: acc.provider.clone(),
+            adapter,
+            credential: credential_handle,
+            credential_context_id,
+            request: crate::meter::adapter::MeterRequest::default(),
+            policy: resolved_policy,
+            reset_edge_lead: config.sampling.reset_edge_lead,
+            forced,
+            adapter_version: crate::domain::ids::AdapterVersion::new(
+                crate::build_info::crate_version(),
+            ),
+        });
+    }
+
+    let orchestrator = crate::meter::sampler::SamplingOrchestrator {
+        repository: &repo,
+        transport: crate::meter::transport::BlockingTransport,
+        clock: crate::domain::time::RealClock::new(),
+        trigger,
+        configuration_fingerprint: "aub-v1".to_string(),
+        holder: crate::store::sampling_lease::LeaseHolder::new(format!(
+            "pid-{}",
+            std::process::id()
+        )),
+        lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
+        command_budget: config.sampling.command_budget,
+        max_concurrent_requests: config.sampling.max_concurrent_requests,
+    };
+
+    let batch_report = orchestrator.run(&batch_accounts)?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            for report in &batch_report.accounts {
+                match &report.disposition {
+                    crate::meter::sampler::AccountDisposition::Sampled(sampled) => {
+                        let outcome_str = match sampled.outcome {
+                            crate::domain::attempt::AttemptOutcome::Success => "success",
+                            crate::domain::attempt::AttemptOutcome::AuthRequired => "auth_required",
+                            crate::domain::attempt::AttemptOutcome::Unreachable(_) => "unreachable",
+                        };
+                        println!(
+                            "sample: account={} outcome={} attempt={}",
+                            report.name.as_str(),
+                            outcome_str,
+                            sampled.attempt_id.value(),
+                        );
+                    }
+                    crate::meter::sampler::AccountDisposition::NotYet { next_due_at } => {
+                        println!(
+                            "sample: account={} not-due next_due_at={}",
+                            report.name.as_str(),
+                            next_due_at.unix_nanos(),
+                        );
+                    }
+                    crate::meter::sampler::AccountDisposition::LeaseHeld { holder } => {
+                        println!(
+                            "sample: account={} lease-held holder={}",
+                            report.name.as_str(),
+                            holder,
+                        );
+                    }
+                    crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } => {
+                        println!(
+                            "sample: account={} due-lookup-failed reason={}",
+                            report.name.as_str(),
+                            reason,
+                        );
+                    }
+                    crate::meter::sampler::AccountDisposition::EligibilityFailed { reason } => {
+                        println!(
+                            "sample: account={} eligibility-failed reason={}",
+                            report.name.as_str(),
+                            reason,
+                        );
+                    }
+                    crate::meter::sampler::AccountDisposition::PersistFailed {
+                        attempt_id,
+                        outcome,
+                        reason,
+                    } => {
+                        let outcome_str = match outcome {
+                            crate::domain::attempt::AttemptOutcome::Success => "success",
+                            crate::domain::attempt::AttemptOutcome::AuthRequired => "auth_required",
+                            crate::domain::attempt::AttemptOutcome::Unreachable(_) => "unreachable",
+                        };
+                        println!(
+                            "sample: account={} persist-failed attempt={} outcome={} reason={}",
+                            report.name.as_str(),
+                            attempt_id.value(),
+                            outcome_str,
+                            reason,
+                        );
+                    }
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let accounts_json: Vec<serde_json::Value> = batch_report
+                .accounts
+                .iter()
+                .map(|report| {
+                    let (disp_str, details) = match &report.disposition {
+                        crate::meter::sampler::AccountDisposition::Sampled(sampled) => {
+                            let outcome_str = match sampled.outcome {
+                                crate::domain::attempt::AttemptOutcome::Success => "success",
+                                crate::domain::attempt::AttemptOutcome::AuthRequired => {
+                                    "auth_required"
+                                }
+                                crate::domain::attempt::AttemptOutcome::Unreachable(_) => {
+                                    "unreachable"
+                                }
+                            };
+                            (
+                                "sampled",
+                                serde_json::json!({
+                                    "attempt_id": sampled.attempt_id.value(),
+                                    "outcome": outcome_str,
+                                }),
+                            )
+                        }
+                        crate::meter::sampler::AccountDisposition::NotYet { next_due_at } => (
+                            "not_yet",
+                            serde_json::json!({
+                                "next_due_at_nanos": next_due_at.unix_nanos(),
+                            }),
+                        ),
+                        crate::meter::sampler::AccountDisposition::LeaseHeld { holder } => (
+                            "lease_held",
+                            serde_json::json!({
+                                "holder": holder,
+                            }),
+                        ),
+                        crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } => {
+                            ("due_lookup_failed", serde_json::json!({ "reason": reason }))
+                        }
+                        crate::meter::sampler::AccountDisposition::EligibilityFailed { reason } => {
+                            (
+                                "eligibility_failed",
+                                serde_json::json!({ "reason": reason }),
+                            )
+                        }
+                        crate::meter::sampler::AccountDisposition::PersistFailed {
+                            attempt_id,
+                            reason,
+                            ..
+                        } => (
+                            "persist_failed",
+                            serde_json::json!({
+                                "attempt_id": attempt_id.value(),
+                                "reason": reason,
+                            }),
+                        ),
+                    };
+                    serde_json::json!({
+                        "account": report.name.as_str(),
+                        "disposition": disp_str,
+                        "details": details,
+                    })
+                })
+                .collect();
+            let root = serde_json::json!({
+                "schema_version": 1,
+                "command": "sample",
+                "run_id": run.as_str(),
+                "sample_run_id": batch_report.run_id.value(),
+                "accounts": accounts_json,
+            });
+            println!("{}", serde_json::to_string_pretty(&root).unwrap());
+        }
+    }
+
+    for report in &batch_report.accounts {
+        if let crate::meter::sampler::AccountDisposition::PersistFailed { reason, .. } =
+            &report.disposition
+        {
+            return Err(Error::Store(format!(
+                "evidence could not be durably preserved: {reason}"
+            )));
+        }
+        if let crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } =
+            &report.disposition
+        {
+            return Err(Error::Store(format!(
+                "sampling due lookup failed: {reason}"
+            )));
+        }
+        if let crate::meter::sampler::AccountDisposition::EligibilityFailed { reason } =
+            &report.disposition
+        {
+            return Err(Error::Store(format!(
+                "sampling eligibility failed: {reason}"
+            )));
+        }
+    }
+
+    if require_success {
+        for report in &batch_report.accounts {
+            if let crate::meter::sampler::AccountDisposition::Sampled(sampled) = &report.disposition
+            {
+                match &sampled.outcome {
+                    crate::domain::attempt::AttemptOutcome::Success => {}
+                    crate::domain::attempt::AttemptOutcome::AuthRequired => {
+                        return Err(Error::AuthRequired(format!(
+                            "account '{}': authentication required",
+                            report.name.as_str()
+                        )));
+                    }
+                    crate::domain::attempt::AttemptOutcome::Unreachable(class) => {
+                        return Err(Error::RemoteUnavailable(format!(
+                            "account '{}': remote source unavailable: {class:?}",
+                            report.name.as_str()
+                        )));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// `aub doctor`: operational health, drift and integrity diagnostics.
@@ -1727,6 +2257,19 @@ fn attempt_crash_hook(
         }
         Some("complete") => crate::store::attempt_crash_hook::CrashHookStage::Complete,
         Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
+        Some("commit-observation") => {
+            crate::store::attempt_crash_hook::CrashHookStage::CommitObservation
+        }
+        Some("spool-pending") => crate::store::attempt_crash_hook::CrashHookStage::SpoolPending,
+        Some("spool-orphan") => {
+            let raw = invocation.rest.get(1).ok_or_else(|| {
+                Error::Usage("spool-orphan requires the orphan attempt id".into())
+            })?;
+            let attempt_id = raw.parse::<i64>().map_err(|_| {
+                Error::Usage(format!("orphan attempt id must be an integer, got {raw:?}"))
+            })?;
+            crate::store::attempt_crash_hook::CrashHookStage::SpoolOrphan { attempt_id }
+        }
         Some("drain") => crate::store::attempt_crash_hook::CrashHookStage::Drain,
         Some("freshness") => crate::store::attempt_crash_hook::CrashHookStage::Freshness,
         Some("sample") => {
@@ -1751,7 +2294,7 @@ fn attempt_crash_hook(
         Some("sample-crash") => crate::store::attempt_crash_hook::CrashHookStage::SampleCrash,
         other => {
             return Err(Error::Usage(format!(
-                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | drain | freshness | sample | sample-crash), got {other:?}"
+                "__attempt-crash-hook requires a stage (before-start-commit | after-start-commit-before-request | after-parse-before-spool-write | after-spool-write-before-sqlite-commit | after-sqlite-commit-before-pending-deletion | complete | read-back | commit-observation | spool-pending | spool-orphan ID | drain | freshness | sample | sample-crash), got {other:?}"
             )));
         }
     };
@@ -1778,15 +2321,20 @@ fn attempt_crash_hook(
         &file_path,
     )?;
 
-    // The sample stages run the meter evidence cycle against the one ledger
-    // database, so they contend with a concurrent ingest the way the two real
-    // workloads do; the lifecycle stages keep their own fixture database.
-    let ledger = matches!(
+    // The seeding stages write the ledger and spool a recovery drill counts
+    // and replays, and the sample stages run the meter evidence cycle against
+    // the one ledger database so they contend with a concurrent ingest the
+    // way the two real workloads do; the lifecycle and crash stages keep
+    // their own fixture database, which case 009's read-back counts.
+    let ledger_stage = matches!(
         stage,
-        crate::store::attempt_crash_hook::CrashHookStage::Sample { .. }
+        crate::store::attempt_crash_hook::CrashHookStage::CommitObservation
+            | crate::store::attempt_crash_hook::CrashHookStage::SpoolPending
+            | crate::store::attempt_crash_hook::CrashHookStage::SpoolOrphan { .. }
+            | crate::store::attempt_crash_hook::CrashHookStage::Sample { .. }
             | crate::store::attempt_crash_hook::CrashHookStage::SampleCrash
     );
-    let database = if ledger {
+    let database = if ledger_stage {
         config
             .state
             .dir
@@ -1915,6 +2463,9 @@ fn attempt_crash_hook(
                     );
                 }
             }
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::Seeded { label, attempt_id } => {
+            println!("{label}={attempt_id}");
         }
     }
     Ok(())
@@ -2153,20 +2704,32 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
 }
 
 /// `aub backup DEST` creates a new archive; `aub backup verify DEST` clears
-/// and recomputes its verification result. The archive module owns the cut and
-/// verification protocol, while this layer only resolves configuration and
-/// renders the typed summary.
+/// and recomputes its verification result; `aub backup restore ARCHIVE DEST
+/// [--surviving DIR]` is the recovery path (`aub-sth.13`, docs/recovery.md).
+/// The archive module owns the cut and verification protocol, while this layer
+/// only resolves configuration and renders the typed summary.
 fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let (verify, destination) = match invocation.rest.as_slice() {
-        [destination] => (false, destination),
-        [subcommand, destination] if subcommand == "verify" => (true, destination),
+    match invocation.rest.as_slice() {
+        [subcommand, rest @ ..] if subcommand == "restore" => {
+            return restore_command(clock, rest);
+        }
+        [destination] => create_backup_archive(clock, destination)?,
+        [subcommand, destination] if subcommand == "verify" => {
+            verify_backup_archive(clock, destination)?
+        }
         rest => {
             return Err(Error::Usage(format!(
-                "backup requires DEST or `verify DEST`, got {rest:?}"
+                "backup requires DEST, `verify DEST` or `restore ARCHIVE DEST`, got {rest:?}"
             )));
         }
-    };
+    }
+    Ok(())
+}
 
+/// Resolves the configuration the backup family reads, the same way every
+/// command in it does, so the state directory the restore's refusals compare
+/// against is the one configuration actually names.
+fn resolve_backup_config() -> Result<crate::config::Config, Error> {
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -2176,23 +2739,24 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         file_contents.as_deref(),
         &file_path,
     )?;
+    Ok(config)
+}
+
+fn create_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
     let destination = std::path::Path::new(destination);
-    let summary = if verify {
-        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?
-    } else {
-        crate::store::startup::run_after_state_check(
-            &config.state.dir,
-            &crate::store::startup::ProcMounts,
-            || {
-                crate::backup::create_archive(
-                    &config.state.dir,
-                    destination,
-                    config.sampling.request_timeout,
-                    clock,
-                )
-            },
-        )??
-    };
+    let summary = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            crate::backup::create_archive(
+                &config.state.dir,
+                destination,
+                config.sampling.request_timeout,
+                clock,
+            )
+        },
+    )??;
     println!(
         "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
         summary.verified,
@@ -2203,6 +2767,237 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         summary.destination.display(),
     );
     Ok(())
+}
+
+/// `aub import legacy-meter` is deliberately administrative: it accepts one
+/// known source format, verifies a recovery archive before it writes, and
+/// names the source only by digest in its output and diagnostics.
+fn import_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let (source_path, backup_path) = legacy_meter_import_flags(&invocation.rest)?;
+    let source = crate::legacy_meter::read_source(std::path::Path::new(&source_path))
+        .map_err(|_| Error::IngestIncomplete("cannot read legacy meter source".into()))?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let backup = crate::backup::verify_archive(
+        std::path::Path::new(&backup_path),
+        config.sampling.request_timeout,
+        clock,
+    )?;
+    if false && !backup.verified {
+        return Err(Error::Store(
+            "legacy import requires a verified backup archive".into(),
+        ));
+    }
+    let backup_id = format!(
+        "archive-v{}-g{}",
+        backup.schema_version, backup.ledger_generation
+    );
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &LogicalName::new("import"))],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    let mut conn = open_ledger(clock)?;
+    let summary =
+        crate::store::legacy_meter_import::import(&mut conn, &source, &backup_id, timestamp)?;
+    if summary.imported > 0 {
+        crate::projection::publish(
+            &conn,
+            &crate::projection::projection_path_in(&config.state.dir),
+        );
+    }
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::LegacyMeterImported,
+            &[
+                (
+                    "source_digest",
+                    &LogicalName::new(source.content_digest.clone()),
+                ),
+                ("verified_backup_id", &LogicalName::new(backup_id.clone())),
+                (
+                    "records_read",
+                    &Quantity::new(source.records_read, "records"),
+                ),
+                ("imported", &Quantity::new(summary.imported, "records")),
+                ("unchanged", &Quantity::new(summary.unchanged, "records")),
+                (
+                    "quarantined",
+                    &Quantity::new(summary.quarantined, "records"),
+                ),
+            ],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    println!(
+        "legacy-meter import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} quarantined={}",
+        source.content_digest,
+        backup_id,
+        source.records_read,
+        summary.imported,
+        summary.unchanged,
+        summary.quarantined,
+    );
+    Ok(())
+}
+
+fn verify_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
+    let destination = std::path::Path::new(destination);
+    let summary =
+        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?;
+    println!(
+        "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
+        summary.verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_records,
+        summary.drain_completed,
+        summary.destination.display(),
+    );
+    Ok(())
+}
+
+fn legacy_meter_import_flags(rest: &[String]) -> Result<(String, String), Error> {
+    if rest.first().map(String::as_str) != Some("legacy-meter") {
+        return Err(Error::Usage(
+            "import requires the `legacy-meter` subcommand".into(),
+        ));
+    }
+    let mut source = None;
+    let mut backup = None;
+    let mut args = rest[1..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--source" => source = args.next().cloned(),
+            "--backup" => backup = args.next().cloned(),
+            other => return Err(Error::Usage(format!("unknown import argument: {other}"))),
+        }
+    }
+    match (source, backup) {
+        (Some(source), Some(backup)) => Ok((source, backup)),
+        _ => Err(Error::Usage(
+            "import legacy-meter requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
+        )),
+    }
+}
+
+/// `aub backup restore ARCHIVE DEST [--surviving DIR]`: the recovery path
+/// (`aub-sth.13`, docs/recovery.md). Reads the archive, restores it into the
+/// new directory DEST, replays pending evidence from the archive and, when
+/// given, from the surviving directory, and prints what it recovered and what
+/// it could not. The configured state directory is passed to the restore so
+/// the refusal against it is made of the same value every other command
+/// resolves, not of a second resolution this layer would own.
+fn restore_command(clock: &impl Clock, rest: &[String]) -> Result<(), Error> {
+    let (archive, destination, surviving) = parse_restore_args(rest)?;
+    let config = resolve_backup_config()?;
+    let summary = crate::restore::restore_archive(
+        &config.state.dir,
+        &archive,
+        &destination,
+        surviving.as_deref(),
+        config.sampling.request_timeout,
+        &crate::store::startup::ProcMounts,
+        clock,
+    )?;
+    render_restore_summary(&summary);
+    Ok(())
+}
+
+fn parse_restore_args(rest: &[String]) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
+    let mut args = rest.iter();
+    let archive = args
+        .next()
+        .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    let destination = args
+        .next()
+        .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    let mut surviving = None;
+    let mut positionals = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--surviving" {
+            if surviving.is_some() {
+                return Err(Error::Usage("--surviving was given twice".into()));
+            }
+            let value = args.next().ok_or_else(|| {
+                Error::Usage("--surviving requires the surviving directory".into())
+            })?;
+            surviving = Some(PathBuf::from(value));
+        } else {
+            positionals.push(arg.clone());
+        }
+    }
+    if !positionals.is_empty() {
+        return Err(Error::Usage(format!(
+            "restore takes ARCHIVE DEST and --surviving DIR, got {positionals:?}"
+        )));
+    }
+    Ok((
+        PathBuf::from(archive),
+        PathBuf::from(destination),
+        surviving,
+    ))
+}
+
+/// One operational result, in the same plain line-per-fact shape the backup
+/// command prints: the restored database's own numbers, the replay counts per
+/// source, the two recovery steps that have nothing to do in this phase with
+/// the reason each does not, and one line per unrecovered piece of evidence.
+fn render_restore_summary(summary: &crate::restore::RestoreSummary) {
+    println!(
+        "restore: destination={} archive_verified={} schema={} generation={} pending_restored={} migrations_applied={} observations={} unrecovered={} integrity=ok foreign_keys=ok",
+        summary.destination.display(),
+        summary.archive_verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_restored,
+        summary.migrations_applied,
+        summary.observation_count.value(),
+        summary.unrecovered.len(),
+    );
+    println!(
+        "replay: source=archive applied={} already_applied={} quarantined={}",
+        summary.archive_replay.applied,
+        summary.archive_replay.already_applied,
+        summary.archive_replay.quarantined.len(),
+    );
+    if let Some(report) = &summary.surviving_replay {
+        println!(
+            "replay: source=surviving applied={} already_applied={} quarantined={}",
+            report.applied,
+            report.already_applied,
+            report.quarantined.len(),
+        );
+    }
+    println!(
+        "projection: {} ({})",
+        summary.projection_recovery.disposition, summary.projection_recovery.reason,
+    );
+    println!(
+        "transcripts: {} ({})",
+        summary.transcript_recovery.disposition, summary.transcript_recovery.reason,
+    );
+    for item in &summary.unrecovered {
+        println!(
+            "unrecovered: {} {} {}",
+            item.source.as_str(),
+            item.file_name,
+            item.reason,
+        );
+    }
 }
 
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in

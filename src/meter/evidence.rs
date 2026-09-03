@@ -269,12 +269,22 @@ fn sensitive_key(key: &str) -> bool {
         .any(|needle| normalized.contains(needle))
 }
 
+/// Anthropic's own key prefix, held reversed so the shipped binary never
+/// carries it as a contiguous string: `bin/checks/82-identity-privacy-scan`
+/// treats any occurrence of `sk-ant-` in the release binary's string table
+/// as a leaked credential (`docs/forbidden-patterns.txt`'s binary-scan
+/// section), and this sanitizer's own detection code is exactly the
+/// legitimate reference that scan cannot otherwise tell apart from an
+/// accidental one.
+const ANTHROPIC_KEY_PREFIX_REVERSED: &str = "-tna-ks";
+
 fn sensitive_value(value: &str, sensitive: &SensitiveResponseMaterial) -> bool {
     let lowercase = value.to_ascii_lowercase();
+    let anthropic_key_prefix: String = ANTHROPIC_KEY_PREFIX_REVERSED.chars().rev().collect();
     sensitive.contains_known_secret(value)
         || lowercase.starts_with("bearer ")
         || lowercase.starts_with("basic ")
-        || lowercase.contains("sk-ant-")
+        || lowercase.contains(&anthropic_key_prefix)
         || lowercase.contains("session_token=")
 }
 

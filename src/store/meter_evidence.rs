@@ -23,6 +23,7 @@
 use rusqlite::{OptionalExtension, params};
 
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
@@ -357,6 +358,22 @@ pub fn insert_observation(
     Ok(row_id)
 }
 
+/// Counts the observation rows a ledger holds: the recovery's headline number.
+/// A restore asserts this count equals what the source held, exactly, because
+/// a replay that duplicated an observation would make the recovered series a
+/// different series than the one that was lost, and the difference would be
+/// invisible in any smaller check (PLAN.md section 38, step 6).
+pub fn observation_row_count(conn: &rusqlite::Connection) -> Result<RowCount, Error> {
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM meter_observation", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| Error::Store(format!("cannot count meter observations: {e}")))?;
+    Ok(RowCount::new(u64::try_from(count).map_err(|_| {
+        Error::Internal(format!("meter_observation count {count} is negative"))
+    })?))
+}
+
 const SELECT_OBSERVATION_COLUMNS: &str = "
     id, attempt_id, evidence_id, account_id, provider, provider_observed_at, received_at,
     measurement_basis, observed_plan, observed_tier, adapter_version, provider_contract_id,
@@ -611,8 +628,12 @@ pub fn observation_times_for_account_between(
 ) -> Result<Vec<UtcTimestamp>, Error> {
     let mut statement = conn
         .prepare(
-            "SELECT received_at FROM meter_observation
+            "SELECT received_at FROM meter_observation mo
              WHERE account_id = ?1 AND received_at >= ?2 AND received_at < ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM legacy_meter_import_record lir
+                   WHERE lir.observation_id = mo.id
+               )
              ORDER BY received_at",
         )
         .map_err(|e| Error::Store(format!("cannot read coverage observations: {e}")))?;
@@ -644,6 +665,10 @@ pub fn reset_windows_for_account_between(
              JOIN meter_observation mo ON mo.id = mw.observation_id
              WHERE mo.account_id = ?1
                AND mw.resets_at >= ?2 AND mw.resets_at < ?3
+               AND NOT EXISTS (
+                   SELECT 1 FROM legacy_meter_import_record lir
+                   WHERE lir.observation_id = mo.id
+               )
              GROUP BY mw.resets_at
              ORDER BY mw.resets_at",
         )
