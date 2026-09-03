@@ -18,7 +18,9 @@ use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
 use crate::presentation::render::ExplainMode;
 use crate::problem_code::ProblemCode;
-use crate::report::{CoverageReport, LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport};
+use crate::report::{
+    CoverageReport, LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport,
+};
 use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
@@ -686,10 +688,22 @@ fn coverage_account_json(account: &crate::report::CoverageAccount) -> String {
         .collect::<Vec<_>>()
         .join(",");
     let failures = [
-        (crate::report::coverage::CoverageFailureGroup::Authentication, account.failures.authentication),
-        (crate::report::coverage::CoverageFailureGroup::RateLimited, account.failures.rate_limited),
-        (crate::report::coverage::CoverageFailureGroup::ProviderUnreachable, account.failures.provider_unreachable),
-        (crate::report::coverage::CoverageFailureGroup::ResponseUnusable, account.failures.response_unusable),
+        (
+            crate::report::coverage::CoverageFailureGroup::Authentication,
+            account.failures.authentication,
+        ),
+        (
+            crate::report::coverage::CoverageFailureGroup::RateLimited,
+            account.failures.rate_limited,
+        ),
+        (
+            crate::report::coverage::CoverageFailureGroup::ProviderUnreachable,
+            account.failures.provider_unreachable,
+        ),
+        (
+            crate::report::coverage::CoverageFailureGroup::ResponseUnusable,
+            account.failures.response_unusable,
+        ),
     ]
     .iter()
     .map(|(group, count)| {
@@ -773,9 +787,7 @@ pub fn coverage_json(report: &CoverageReport, run: RunId) -> String {
 }
 
 /// Validates that a coverage report JSON strictly conforms to schema version 1.
-pub fn validate_coverage_report_json(
-    json_str: &str,
-) -> Result<ParsedEnvelope, JsonContractError> {
+pub fn validate_coverage_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "coverage" {
         return Err(JsonContractError::InvalidFormat {
@@ -809,15 +821,13 @@ pub fn validate_coverage_report_json(
     }
     for required in ["interval", "severe_only", "threshold", "accounts"] {
         if !obj.contains_key(required) {
-            return Err(JsonContractError::MissingField(
-                match required {
-                    "interval" => "interval",
-                    "severe_only" => "severe_only",
-                    "threshold" => "threshold",
-                    "accounts" => "accounts",
-                    _ => unreachable!(),
-                },
-            ));
+            return Err(JsonContractError::MissingField(match required {
+                "interval" => "interval",
+                "severe_only" => "severe_only",
+                "threshold" => "threshold",
+                "accounts" => "accounts",
+                _ => unreachable!(),
+            }));
         }
     }
     Ok(parsed)

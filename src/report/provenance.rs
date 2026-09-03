@@ -321,16 +321,21 @@ mod tests {
             1,
             ValueArithmetic::Direct,
         );
-        let graph = ProvenanceGraph::new([(ReportField::Coverage {
-            account: LogicalName::new("research"),
-        }, node)]);
+        let graph = ProvenanceGraph::new([(
+            ReportField::Coverage {
+                account: LogicalName::new("research"),
+            },
+            node,
+        )]);
 
         assert_eq!(graph.len(), 1);
-        assert!(graph
-            .resolve(&ReportField::Coverage {
-                account: LogicalName::new("research")
-            })
-            .is_some());
+        assert!(
+            graph
+                .resolve(&ReportField::Coverage {
+                    account: LogicalName::new("research")
+                })
+                .is_some()
+        );
         assert!(
             graph.resolve(&ReportField::ExportRows).is_none(),
             "a field the graph was not given must not resolve"

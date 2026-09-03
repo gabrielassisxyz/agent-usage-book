@@ -324,13 +324,8 @@ mod coverage_query_tests {
             (Trigger::Hook, 4_000),
             (Trigger::Timer, 9_000),
         ] {
-            start_sample_run(
-                &conn,
-                trigger,
-                UtcTimestamp::from_unix_nanos(at),
-                "test",
-            )
-            .expect("the sample run must insert");
+            start_sample_run(&conn, trigger, UtcTimestamp::from_unix_nanos(at), "test")
+                .expect("the sample run must insert");
         }
 
         let runs = timer_run_times_between(
@@ -354,6 +349,9 @@ mod coverage_query_tests {
             UtcTimestamp::from_unix_nanos(6_000),
         )
         .expect("the empty-window read must succeed");
-        assert!(empty.is_empty(), "an interval with no timer runs reads empty");
+        assert!(
+            empty.is_empty(),
+            "an interval with no timer runs reads empty"
+        );
     }
 }

@@ -115,7 +115,10 @@ impl CoverageFailureTally {
                 CoverageFailureGroup::ProviderUnreachable,
                 self.provider_unreachable,
             ),
-            (CoverageFailureGroup::ResponseUnusable, self.response_unusable),
+            (
+                CoverageFailureGroup::ResponseUnusable,
+                self.response_unusable,
+            ),
         ];
         let mut groups: Vec<(CoverageFailureGroup, u64)> =
             counts.into_iter().filter(|(_, count)| *count > 0).collect();
@@ -203,12 +206,8 @@ pub fn assemble(
             since,
             until,
         )?;
-        let resets = meter_evidence::reset_windows_for_account_between(
-            conn,
-            recorded.id(),
-            since,
-            until,
-        )?;
+        let resets =
+            meter_evidence::reset_windows_for_account_between(conn, recorded.id(), since, until)?;
         let snapshots = sampling_policy_snapshot::snapshots_for_account(conn, recorded.id())?;
 
         let inputs = CoverageInputs {

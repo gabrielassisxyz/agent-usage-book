@@ -1063,7 +1063,6 @@ mod tests {
         );
     }
 
-
     /// A second attempt the extra observations can hang off, with its own
     /// request time.
     fn coverage_attempt(
@@ -1101,11 +1100,13 @@ mod tests {
             .expect("fixture evidence must insert");
         let mut recorded = observation(attempt, evidence_row, account, "account-5h-v2", "fp-1");
         recorded.received_at = UtcTimestamp::from_unix_nanos(31_000);
-        let _first = insert_observation(&conn, &recorded).expect("the first observation must insert");
+        let _first =
+            insert_observation(&conn, &recorded).expect("the first observation must insert");
 
         let mut later = observation(attempt, evidence_row, account, "account-5h-v2", "fp-2");
         later.received_at = UtcTimestamp::from_unix_nanos(32_000);
-        let _second = insert_observation(&conn, &later).expect("the second observation must insert");
+        let _second =
+            insert_observation(&conn, &later).expect("the second observation must insert");
 
         let times = observation_times_for_account_between(
             &conn,

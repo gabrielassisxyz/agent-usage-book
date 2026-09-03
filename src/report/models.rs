@@ -768,10 +768,7 @@ mod tests {
                     IngestSummary::default(),
                 )),
             ),
-            (
-                "coverage",
-                Box::new(test_coverage_report(m.clone())),
-            ),
+            ("coverage", Box::new(test_coverage_report(m.clone()))),
             ("sample", Box::new(SampleReport::new(m.clone(), vec![]))),
             (
                 "ingest",

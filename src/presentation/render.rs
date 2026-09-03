@@ -574,7 +574,10 @@ fn coverage_cell(text: &str, width: usize) -> String {
 fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
     match engine.attempt_coverage {
         Some(fraction) => {
-            format!("{}%", render_percentage(fraction.as_ppm(), COVERAGE_PERCENT))
+            format!(
+                "{}%",
+                render_percentage(fraction.as_ppm(), COVERAGE_PERCENT)
+            )
         }
         None => match engine.expected_opportunities {
             None => "unknown".to_string(),
@@ -589,7 +592,10 @@ fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
 fn coverage_measurements_cell(engine: &crate::coverage::CoverageReport) -> String {
     match engine.measurement_coverage {
         Some(fraction) => {
-            format!("{}%", render_percentage(fraction.as_ppm(), COVERAGE_PERCENT))
+            format!(
+                "{}%",
+                render_percentage(fraction.as_ppm(), COVERAGE_PERCENT)
+            )
         }
         None => "none".to_string(),
     }
@@ -613,7 +619,11 @@ fn render_coverage_detail(
     let interrupted = engine.started_without_terminal_result > 0;
     let policy_unknown = engine.expected_opportunities.is_none();
     let severe = !engine.reset_spanning_gaps.is_empty();
-    if !policy_unknown && !attempt_below_floor && !measurement_below_floor && !interrupted && !severe
+    if !policy_unknown
+        && !attempt_below_floor
+        && !measurement_below_floor
+        && !interrupted
+        && !severe
     {
         return None;
     }
@@ -625,9 +635,7 @@ fn render_coverage_detail(
         match engine.attempt_coverage {
             // The scheduler line names the only fact a high attempt coverage
             // carries: the opportunities the policy owed were begun.
-            Some(_) if !attempt_below_floor => {
-                lines.push("scheduler ran normally".to_string())
-            }
+            Some(_) if !attempt_below_floor => lines.push("scheduler ran normally".to_string()),
             Some(_) => lines.push("attempt coverage is below the configured floor".to_string()),
             // Nothing was owed: there is no attempt coverage to judge.
             None => {}
@@ -665,12 +673,10 @@ fn render_coverage_detail(
             .map(|reset| reset.window_length)
             .max();
         match window_length {
-            Some(length) if length.as_nanos() > 0 => {
-                lines.push(format!(
-                    "{article}{} {noun} {verb}",
-                    render_coverage_duration(length)
-                ))
-            }
+            Some(length) if length.as_nanos() > 0 => lines.push(format!(
+                "{article}{} {noun} {verb}",
+                render_coverage_duration(length)
+            )),
             _ => lines.push(format!("{article}{noun} {verb}")),
         }
         // "one" is glued to the noun; a count reads bare.
@@ -737,12 +743,7 @@ pub fn render_coverage_report(report: &CoverageReport) -> String {
             ),
             engine.reset_spanning_gaps.len().to_string(),
         ];
-        lines.push(
-            cells
-                .join("")
-                .trim_end()
-                .to_string(),
-        );
+        lines.push(cells.join("").trim_end().to_string());
     }
     for account in &report.accounts {
         let Some(detail) = render_coverage_detail(report, account) else {
@@ -755,6 +756,36 @@ pub fn render_coverage_report(report: &CoverageReport) -> String {
         }
     }
     lines.join("\n")
+}
+
+/// The threshold-breach message the coverage command fails with, naming every
+/// breached account, the floor's dimension, the measured coverage and the
+/// floor itself. The report has already been printed; this message is what
+/// the exit class's prose names.
+pub fn render_coverage_threshold_message(report: &CoverageReport) -> String {
+    let parts: Vec<String> = report
+        .threshold
+        .breaches
+        .iter()
+        .map(|breach| {
+            let dimension = match breach.dimension {
+                crate::report::CoverageBreachDimension::Attempt => "attempt",
+                crate::report::CoverageBreachDimension::Measurement => "measurement",
+            };
+            format!(
+                "{} {} coverage {}% is below the {}% floor",
+                breach.account.as_str(),
+                dimension,
+                render_percentage(breach.coverage.as_ppm(), COVERAGE_PERCENT),
+                render_percentage(breach.floor.as_ppm(), COVERAGE_PERCENT),
+            )
+        })
+        .collect();
+    if parts.is_empty() {
+        "no threshold breach was recorded".to_string()
+    } else {
+        parts.join("; ")
+    }
 }
 
 /// Renders a failure class as the fixed human wording.

@@ -594,7 +594,10 @@ pub fn attempts_with_outcomes_for_account_between(
                         })
                     }
                 };
-                Ok(AttemptWithOutcome { started_at, terminal })
+                Ok(AttemptWithOutcome {
+                    started_at,
+                    terminal,
+                })
             },
         )
         .map_err(|e| Error::Store(format!("cannot read coverage attempts: {e}")))?;
@@ -953,6 +956,7 @@ mod tests {
 mod coverage_query_tests {
     use super::*;
     use crate::domain::failure::{FailureClass, HttpStatusClass};
+    use crate::store::account::AccountId;
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use crate::store::meter_attempt::{
         DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
@@ -960,7 +964,6 @@ mod coverage_query_tests {
     };
     use crate::store::migrate::run_migrations;
     use crate::store::migrations::registry;
-    use crate::store::account::AccountId;
     use crate::store::sample_run::{SampleRunId, Trigger, start_sample_run};
     use crate::store::sampling_policy_snapshot::{
         ResolvedSamplingPolicy, SamplingPolicySnapshotId, resolve_policy_snapshot,
@@ -1003,7 +1006,13 @@ mod coverage_query_tests {
         policy_algorithm_version: String::new(),
     };
 
-    fn fixture() -> (ScratchDir, rusqlite::Connection, SampleRunId, AccountId, SamplingPolicySnapshotId) {
+    fn fixture() -> (
+        ScratchDir,
+        rusqlite::Connection,
+        SampleRunId,
+        AccountId,
+        SamplingPolicySnapshotId,
+    ) {
         let scratch = ScratchDir::new();
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
@@ -1042,7 +1051,12 @@ mod coverage_query_tests {
         (scratch, conn, run, account, snapshot)
     }
 
-    fn started(run: SampleRunId, account: AccountId, snapshot: SamplingPolicySnapshotId, at: i64) -> NewMeterAttempt {
+    fn started(
+        run: SampleRunId,
+        account: AccountId,
+        snapshot: SamplingPolicySnapshotId,
+        at: i64,
+    ) -> NewMeterAttempt {
         NewMeterAttempt {
             run_id: run,
             account_id: account,
@@ -1108,16 +1122,30 @@ mod coverage_query_tests {
             UtcTimestamp::from_unix_nanos(5_000),
         )
         .expect("the coverage read must succeed");
-        assert_eq!(rows.len(), 4, "the interval is half-open: the fifth attempt stays out");
+        assert_eq!(
+            rows.len(),
+            4,
+            "the interval is half-open: the fifth attempt stays out"
+        );
         assert_eq!(rows[0].started_at, UtcTimestamp::from_unix_nanos(1_000));
-        let first_terminal = rows[0].terminal.as_ref().expect("the success carries a result");
+        let first_terminal = rows[0]
+            .terminal
+            .as_ref()
+            .expect("the success carries a result");
         assert_eq!(first_terminal.outcome, AttemptOutcome::Success);
         assert_eq!(first_terminal.retry_after, None);
         assert_eq!(
-            rows[1].terminal.as_ref().expect("the auth failure carries a result").outcome,
+            rows[1]
+                .terminal
+                .as_ref()
+                .expect("the auth failure carries a result")
+                .outcome,
             AttemptOutcome::AuthRequired
         );
-        let rate = rows[2].terminal.as_ref().expect("the rate limit carries a result");
+        let rate = rows[2]
+            .terminal
+            .as_ref()
+            .expect("the rate limit carries a result");
         assert_eq!(
             rate.outcome,
             AttemptOutcome::Unreachable(FailureClass::RateLimited {
