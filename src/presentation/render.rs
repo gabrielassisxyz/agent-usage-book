@@ -10,13 +10,13 @@ use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
-use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
+use crate::domain::time::{Age, ClockSkewEnvelope, MonotonicDuration, UtcTimestamp, age};
 use crate::domain::tokens::TokenKind;
 use crate::error::Error;
 use crate::evidence::CoverageCompleteness;
-use crate::presentation::precision::{PERCENT, TOKENS};
+use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
-use crate::report::{ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
+use crate::report::{CoverageReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
 use crate::transcripts::TranscriptDriftReport;
 
 /// The explain level a command was asked for.
@@ -533,6 +533,228 @@ pub fn render_stale_reason(reason: StaleReason) -> &'static str {
         StaleReason::CollectorInterrupted => "collector interrupted",
         StaleReason::CredentialChangedUnverified => "credential changed",
     }
+}
+
+/// Renders a duration the way the coverage table reads it: seconds, minutes,
+/// or hours and days with the remainder carried alongside ("9m", "2h 11m"),
+/// matching the worked example in PLAN.md section 49.
+fn render_coverage_duration(duration: MonotonicDuration) -> String {
+    let total_seconds = duration.as_nanos() / 1_000_000_000;
+    if total_seconds < 60 {
+        format!("{total_seconds}s")
+    } else if total_seconds < 3_600 {
+        format!("{}m", total_seconds / 60)
+    } else if total_seconds < 86_400 {
+        let hours = total_seconds / 3_600;
+        let minutes = (total_seconds % 3_600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else {
+        let days = total_seconds / 86_400;
+        let hours = (total_seconds % 86_400) / 3_600;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    }
+}
+
+/// One table cell of the coverage row.
+fn coverage_cell(text: &str, width: usize) -> String {
+    format!("{text:<width$}  ")
+}
+
+/// The attempts cell: the coverage percentage where one exists, the named
+/// refusal where the engine refused to compute one. A policy the ledger
+/// cannot reconstruct reads as "unknown", never as a number.
+fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
+    match engine.attempt_coverage {
+        Some(fraction) => {
+            format!("{}%", render_percentage(fraction.as_ppm(), COVERAGE_PERCENT))
+        }
+        None => match engine.expected_opportunities {
+            None => "unknown".to_string(),
+            Some(0) => "n/a".to_string(),
+            Some(_) => "unknown".to_string(),
+        },
+    }
+}
+
+/// The measurements cell: the conditional coverage over terminal attempts, or
+/// the named refusal when no attempt reached a terminal state.
+fn coverage_measurements_cell(engine: &crate::coverage::CoverageReport) -> String {
+    match engine.measurement_coverage {
+        Some(fraction) => {
+            format!("{}%", render_percentage(fraction.as_ppm(), COVERAGE_PERCENT))
+        }
+        None => "none".to_string(),
+    }
+}
+
+/// The detail block of one account, when its numbers need explaining: the
+/// scheduler line, the non-zero failure classes largest first, the
+/// interruptions, and the resets lost to blind gaps. A healthy account
+/// renders no block: the table row already carries its numbers.
+fn render_coverage_detail(
+    report: &CoverageReport,
+    account: &crate::report::CoverageAccount,
+) -> Option<Vec<String>> {
+    let engine = &account.engine;
+    let attempt_below_floor = engine
+        .attempt_coverage
+        .is_some_and(|coverage| coverage.as_f64() < report.threshold.attempt_floor.get());
+    let measurement_below_floor = engine
+        .measurement_coverage
+        .is_some_and(|coverage| coverage.as_f64() < report.threshold.measurement_floor.get());
+    let interrupted = engine.started_without_terminal_result > 0;
+    let policy_unknown = engine.expected_opportunities.is_none();
+    let severe = !engine.reset_spanning_gaps.is_empty();
+    if !policy_unknown && !attempt_below_floor && !measurement_below_floor && !interrupted && !severe
+    {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if policy_unknown {
+        lines.push("no sampling policy snapshot covers the whole interval".to_string());
+    } else {
+        match engine.attempt_coverage {
+            // The scheduler line names the only fact a high attempt coverage
+            // carries: the opportunities the policy owed were begun.
+            Some(_) if !attempt_below_floor => {
+                lines.push("scheduler ran normally".to_string())
+            }
+            Some(_) => lines.push("attempt coverage is below the configured floor".to_string()),
+            // Nothing was owed: there is no attempt coverage to judge.
+            None => {}
+        }
+    }
+    for (group, count) in account.failures.nonzero() {
+        let noun = if count == 1 { "attempt" } else { "attempts" };
+        lines.push(format!("{count} {noun} {}", group.phrase()));
+    }
+    if interrupted {
+        let noun = if engine.started_without_terminal_result == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
+        lines.push(format!(
+            "{} {noun} started without a terminal result",
+            engine.started_without_terminal_result
+        ));
+    }
+    if severe {
+        let count = engine.reset_spanning_gaps.len();
+        let noun = if count == 1 { "reset" } else { "resets" };
+        let verb = if count == 1 {
+            "occurred without a successful observation in the surrounding interval"
+        } else {
+            "occurred without successful observations in the surrounding intervals"
+        };
+        let article = if count == 1 { "one" } else { "" };
+        // The window length is the provider-reported nominal duration of the
+        // reset the gap swallowed; it is rendered when one is known.
+        let window_length = account
+            .resets_in_gaps
+            .iter()
+            .map(|reset| reset.window_length)
+            .max();
+        match window_length {
+            Some(length) if length.as_nanos() > 0 => {
+                lines.push(format!(
+                    "{article}{} {noun} {verb}",
+                    render_coverage_duration(length)
+                ))
+            }
+            _ => lines.push(format!("{article}{noun} {verb}")),
+        }
+        // "one" is glued to the noun; a count reads bare.
+        if count > 1 {
+            let last = lines.len() - 1;
+            lines[last] = format!("{count} {}", lines[last].trim_start());
+        }
+    }
+    Some(lines)
+}
+
+/// The report-to-rendering seam for coverage: the interval, one row per
+/// covered account, and a detail block for every account whose numbers need
+/// explaining. The model arrives complete; this function formats it.
+pub fn render_coverage_report(report: &CoverageReport) -> String {
+    let interval_nanos = (report.until.unix_nanos() - report.since.unix_nanos()).max(0) as u64;
+    let mut lines = vec![format!(
+        "coverage - last {}",
+        render_coverage_duration(MonotonicDuration::from_nanos(interval_nanos))
+    )];
+    if report.accounts.is_empty() {
+        if report.severe_only {
+            lines.push("(no account has a severe interval)".to_string());
+        } else {
+            lines.push("(no account has recorded sampling evidence in the ledger)".to_string());
+        }
+        return lines.join("\n");
+    }
+
+    let name_width = report
+        .accounts
+        .iter()
+        .map(|account| account.name.as_str().len())
+        .chain(std::iter::once("account".len()))
+        .max()
+        .unwrap_or(7);
+    let headers: [(&str, usize); 5] = [
+        ("account", name_width),
+        ("attempts", 9),
+        ("measurements", 12),
+        ("longest blind gap", 17),
+        ("reset gaps", 10),
+    ];
+    lines.push(
+        headers
+            .iter()
+            .map(|(header, width)| coverage_cell(header, *width))
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
+    );
+    for account in &report.accounts {
+        let engine = &account.engine;
+        let cells = [
+            coverage_cell(account.name.as_str(), name_width),
+            coverage_cell(&coverage_attempts_cell(engine), 9),
+            coverage_cell(&coverage_measurements_cell(engine), 12),
+            coverage_cell(
+                &engine
+                    .longest_no_attempt_gap
+                    .map(|gap| render_coverage_duration(gap.duration()))
+                    .unwrap_or_else(|| "none".to_string()),
+                17,
+            ),
+            engine.reset_spanning_gaps.len().to_string(),
+        ];
+        lines.push(
+            cells
+                .join("")
+                .trim_end()
+                .to_string(),
+        );
+    }
+    for account in &report.accounts {
+        let Some(detail) = render_coverage_detail(report, account) else {
+            continue;
+        };
+        lines.push(String::new());
+        lines.push(format!("{}:", account.name.as_str()));
+        for line in detail {
+            lines.push(format!("  - {line}"));
+        }
+    }
+    lines.join("\n")
 }
 
 /// Renders a failure class as the fixed human wording.

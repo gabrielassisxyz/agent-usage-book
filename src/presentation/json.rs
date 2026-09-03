@@ -18,7 +18,7 @@ use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
 use crate::presentation::render::ExplainMode;
 use crate::problem_code::ProblemCode;
-use crate::report::{LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport};
+use crate::report::{CoverageReport, LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport};
 use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
@@ -627,6 +627,200 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ));
     }
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// The unit every sampling-opportunity count is carried in.
+const OPPORTUNITY_UNIT: &str = "opportunities";
+/// The unit every attempt count is carried in.
+const ATTEMPT_UNIT: &str = "attempts";
+/// The unit every successful-observation count is carried in.
+const OBSERVATION_UNIT: &str = "observations";
+/// The unit every gap count is carried in.
+const GAP_UNIT: &str = "gaps";
+/// The unit every duration is carried in: nanoseconds, exact and unambiguous,
+/// matching the nanosecond timestamps the rest of the contract carries.
+const DURATION_UNIT: &str = "ns";
+
+fn coverage_fraction_json(fraction: Option<crate::coverage::CoverageFraction>) -> String {
+    match fraction {
+        Some(fraction) => coverage_fraction_value_json(fraction),
+        None => "null".to_string(),
+    }
+}
+
+fn coverage_fraction_value_json(fraction: crate::coverage::CoverageFraction) -> String {
+    quantity_json(&fraction.as_ppm().to_string(), "ppm")
+}
+
+fn coverage_gap_json(gap: Option<crate::coverage::Gap>) -> String {
+    match gap {
+        Some(gap) => quantity_json(&gap.duration().as_nanos().to_string(), DURATION_UNIT),
+        None => "null".to_string(),
+    }
+}
+
+fn coverage_timestamp_json(timestamp: Option<crate::domain::time::UtcTimestamp>) -> String {
+    match timestamp {
+        Some(timestamp) => timestamp.unix_nanos().to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn coverage_account_json(account: &crate::report::CoverageAccount) -> String {
+    let engine = &account.engine;
+    let policy_unknown = engine.expected_opportunities.is_none();
+    let expected = match engine.expected_opportunities {
+        Some(expected) => quantity_json(&expected.to_string(), OPPORTUNITY_UNIT),
+        None => "null".to_string(),
+    };
+    let resets = account
+        .resets_in_gaps
+        .iter()
+        .map(|reset| {
+            format!(
+                "{{\"at\":{},\"window_length\":{}}}",
+                reset.at.unix_nanos(),
+                quantity_json(&reset.window_length.as_nanos().to_string(), DURATION_UNIT)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let failures = [
+        (crate::report::coverage::CoverageFailureGroup::Authentication, account.failures.authentication),
+        (crate::report::coverage::CoverageFailureGroup::RateLimited, account.failures.rate_limited),
+        (crate::report::coverage::CoverageFailureGroup::ProviderUnreachable, account.failures.provider_unreachable),
+        (crate::report::coverage::CoverageFailureGroup::ResponseUnusable, account.failures.response_unusable),
+    ]
+    .iter()
+    .map(|(group, count)| {
+        format!(
+            "{}:{}",
+            json_string(group.key()),
+            quantity_json(&count.to_string(), ATTEMPT_UNIT)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    format!(
+        "{{\"account\":{},\"policy_unknown\":{policy_unknown},\"expected_opportunities\":{expected},\"
+         \"attempted_opportunities\":{},\"successful_observations\":{},\"started_without_terminal_result\":{},\"
+         \"attempt_coverage\":{},\"measurement_coverage\":{},\"longest_no_attempt_gap\":{},\"longest_no_observation_gap\":{},\"
+         \"reset_spanning_gaps\":{},\"severe\":{},\"most_recent_timer_run\":{},\"most_recent_successful_observation\":{},\"
+         \"resets_in_gaps\":[{resets}],\"failures\":{{{failures}}}}}",
+        json_string(account.name.as_str()),
+        quantity_json(&engine.attempted_opportunities.to_string(), OPPORTUNITY_UNIT),
+        quantity_json(&engine.successful_observations.to_string(), OBSERVATION_UNIT),
+        quantity_json(&engine.started_without_terminal_result.to_string(), ATTEMPT_UNIT),
+        coverage_fraction_json(engine.attempt_coverage),
+        coverage_fraction_json(engine.measurement_coverage),
+        coverage_gap_json(engine.longest_no_attempt_gap),
+        coverage_gap_json(engine.longest_no_observation_gap),
+        quantity_json(&engine.reset_spanning_gaps.len().to_string(), GAP_UNIT),
+        engine.severe,
+        coverage_timestamp_json(engine.most_recent_timer_run),
+        coverage_timestamp_json(engine.most_recent_successful_observation),
+    )
+}
+
+/// The coverage report under the envelope. Every quantity carries its unit;
+/// the two coverages are separate fields in the system's fraction unit (ppm);
+/// a quantity the engine refused to compute serializes as null beside the
+/// named refusal flag (`policy_unknown`), never as a substituted number.
+pub fn coverage_json(report: &CoverageReport, run: RunId) -> String {
+    let accounts = report
+        .accounts
+        .iter()
+        .map(coverage_account_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let breaches = report
+        .threshold
+        .breaches
+        .iter()
+        .map(|breach| {
+            format!(
+                "{{\"account\":{},\"dimension\":{},\"coverage\":{},\"floor\":{}}}",
+                json_string(breach.account.as_str()),
+                json_string(breach.dimension.key()),
+                coverage_fraction_value_json(breach.coverage),
+                quantity_json(&breach.floor.as_ppm().to_string(), "ppm"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        "\"interval\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"severe_only\":{},\"
+         \"threshold\":{{\"attempt_floor\":{},\"measurement_floor\":{},\"met\":{},\"breaches\":[{breaches}]}},\"
+         \"accounts\":[{accounts}]",
+        report.since.unix_nanos(),
+        report.until.unix_nanos(),
+        report.severe_only,
+        quantity_json(
+            &report.threshold.attempt_floor.as_ppm().to_string(),
+            "ppm"
+        ),
+        quantity_json(
+            &report
+                .threshold
+                .measurement_floor
+                .as_ppm()
+                .to_string(),
+            "ppm"
+        ),
+        report.threshold.met,
+    );
+    JsonEnvelope::new("coverage", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Validates that a coverage report JSON strictly conforms to schema version 1.
+pub fn validate_coverage_report_json(
+    json_str: &str,
+) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "coverage" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'coverage', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_COVERAGE_KEYS: [&str; 11] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "interval",
+        "severe_only",
+        "threshold",
+        "accounts",
+        "explain",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_COVERAGE_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    for required in ["interval", "severe_only", "threshold", "accounts"] {
+        if !obj.contains_key(required) {
+            return Err(JsonContractError::MissingField(
+                match required {
+                    "interval" => "interval",
+                    "severe_only" => "severe_only",
+                    "threshold" => "threshold",
+                    "accounts" => "accounts",
+                    _ => unreachable!(),
+                },
+            ));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.

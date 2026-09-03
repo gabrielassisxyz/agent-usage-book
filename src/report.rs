@@ -8,11 +8,13 @@
 pub mod models;
 pub mod provenance;
 
+pub mod coverage;
 pub mod export;
 pub mod spend;
 
 pub use models::{
-    BackupReport, CalibrateReport, CoverageReport, DoctorReport, ExportReport, IngestReport,
+    BackupReport, CalibrateReport, CoverageAccount, CoverageBreach, CoverageBreachDimension,
+    CoverageReport, CoverageReset, CoverageThreshold, DoctorReport, ExportReport, IngestReport,
     IngestSummary, IngestionGeneration, LedgerGeneration, MeterAccount, MeterReadingProvenance,
     NowReport, ReportMetadata, SampleAttempt, SampleReport, SpendGroup, SpendGroupProvenance,
     SpendReport, StatusReport, TaskReport,
