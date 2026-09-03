@@ -10,3 +10,5 @@ rate-card
 backup
 export
 doctor
+ingest
+rebuild

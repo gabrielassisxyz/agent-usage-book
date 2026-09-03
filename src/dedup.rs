@@ -47,11 +47,58 @@ use std::collections::BTreeMap;
 
 use crate::evidence::ComponentKind;
 use crate::transcripts::NormalizedUsageEvent;
-use crate::transcripts::parser::ParserVersion;
+use crate::transcripts::parser::{ParserVersion, STRONG_IDENTITY_PREFIX};
 
 pub use fingerprint::{HeuristicKey, canonical_payload_digest};
 
 pub mod cumulative;
+
+/// The canonical identity of one normalized event: the string the canonical
+/// store keys the event on, and the native or heuristic fields the occurrence
+/// row carries for the same fact.
+///
+/// Defined here, next to [`deduplicate`], because the dedup module owns the
+/// definition of event identity: the store keys an event on exactly the
+/// identity this framework routes by, so a canonical event and its occurrence
+/// rows can never disagree about what the event is. The string forms are
+/// self-describing: a strong identity keeps the source's own claim under the
+/// `event-id:` prefix, and a heuristic identity carries the parser version
+/// that scoped it, because the heuristic domain is per-parser at the database
+/// boundary too.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalIdentity {
+    /// The store-wide canonical event identifier (`usage_event.canonical_event_id`).
+    pub canonical_event_id: String,
+    /// The source-provided native identifier, when the event has a strong identity.
+    pub native_event_id: Option<String>,
+    /// The parser-scoped heuristic fingerprint, when the event has none.
+    pub heuristic_key: Option<String>,
+}
+
+/// Resolves the canonical identity of one event by the same order
+/// [`deduplicate`] routes by: a source-provided identifier is the identity,
+/// and only its absence computes the heuristic fingerprint.
+pub fn canonical_identity(event: &NormalizedUsageEvent) -> CanonicalIdentity {
+    match event.strong_identity() {
+        Some(native) => CanonicalIdentity {
+            canonical_event_id: format!("{STRONG_IDENTITY_PREFIX}{native}"),
+            native_event_id: Some(native.to_string()),
+            heuristic_key: None,
+        },
+        None => {
+            let key = HeuristicKey::compute(event);
+            CanonicalIdentity {
+                canonical_event_id: format!(
+                    "heuristic:{}:{}",
+                    event.parser_version().as_str(),
+                    key.as_str(),
+                ),
+                native_event_id: None,
+                heuristic_key: Some(key.as_str().to_string()),
+            }
+        }
+    }
+}
 
 /// The outcome of deduplicating one batch of events.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,6 +688,36 @@ mod tests {
             SourceNamespace::new("test"),
             NativeSessionId::new("s1"),
         ))
+    }
+
+    /// A strong-identity event resolves to the store-wide canonical id the
+    /// source's own claim defines, with the native identifier carried for the
+    /// occurrence row. The canonical id is the same string the provenance
+    /// carries, so the stored identity and the parsed identity cannot diverge.
+    #[test]
+    fn a_strong_identity_resolves_to_the_prefixed_native_id() {
+        let identity = canonical_identity(&event(Some("msg_abc"), 2, 913, 500));
+        assert_eq!(identity.canonical_event_id, "event-id:msg_abc");
+        assert_eq!(identity.native_event_id.as_deref(), Some("msg_abc"));
+        assert_eq!(identity.heuristic_key, None);
+    }
+
+    /// A no-identity event resolves to a parser-scoped heuristic canonical id:
+    /// the parser version is part of the string, because the heuristic domain
+    /// is per-parser at the database boundary and the canonical id must not
+    /// alias two parsers' fingerprints into one event.
+    #[test]
+    fn a_heuristic_identity_resolves_to_a_parser_scoped_canonical_id() {
+        let event = heuristic_event("file.jsonl", 1_000, "s1", 10, 5);
+        let identity = canonical_identity(&event);
+        assert_eq!(identity.native_event_id, None);
+        let key = HeuristicKey::compute(&event).as_str().to_string();
+        assert_eq!(
+            identity.canonical_event_id,
+            format!("heuristic:test-1:{key}"),
+            "the canonical id must carry the parser version and the fingerprint"
+        );
+        assert_eq!(identity.heuristic_key.as_deref(), Some(key.as_str()));
     }
 
     /// Three lines of one message with a growing output count collapse to the
