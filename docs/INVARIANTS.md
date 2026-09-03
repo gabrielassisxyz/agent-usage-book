@@ -55,8 +55,8 @@ same thing in both documents.
 | 24 | An attempt without a terminal result is evidence of collector interruption, not evidence that no attempt occurred. | src/domain/freshness.rs | tests::started_attempt_past_command_horizon_yields_collector_interrupted |
 | 25 | Provider response evidence and its normalized interpretation are separate records; a corrected adapter reinterprets retained evidence and never overwrites the earlier interpretation. | src/store/meter_evidence.rs | tests::switching_the_preference_keeps_both_interpretations_immutable |
 | 26 | Workload feasibility is evaluated against every constraining window in calibrated credits, never against the lowest remaining percentage alone. | src/domain/window.rs | tests::display_and_advice_select_different_windows_when_calibrations_diverge |
-| 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | unenforced aub-me5.8 | (policy snapshot denominator test) |
+| 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | src/coverage.rs | tests::a_cadence_change_mid_interval_follows_the_historical_policy |
 
 ## Enforcement status
 
-Of the 27 invariants above, 15 are enforced by mechanical checks present at HEAD (file paths and tests), and 12 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 16 are enforced by mechanical checks present at HEAD (file paths and tests), and 11 are unenforced and tracked by open beads in the tracker.
