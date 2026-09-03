@@ -1,7 +1,12 @@
-//! The `usage_occurrence` table repository (`aub-lqe.7`, `aub-lqe.8`).
+//! The `usage_occurrence` table repository (`aub-lqe.7`, `aub-lqe.8`, `aub-lqe.10`).
 //!
 //! Tracks where every normalized source record appeared, carrying identity strength,
 //! namespace, native identifier, heuristic version, and payload digest (PLAN.md 12.10).
+//! Also owns the heuristic-domain health surfaces built on those rows: the per-parser
+//! heuristic identity usage and collision counts the doctor reports, and the version
+//! check that forces a rebuild when the fingerprint algorithm has moved on.
+
+use std::collections::BTreeMap;
 
 use rusqlite::params;
 
@@ -205,6 +210,154 @@ pub fn count_occurrences_by_canonical_event(
     Ok(result)
 }
 
+/// Heuristic identity usage and collision counts for one parser: the data the
+/// doctor's heuristic-dedup check reports (aub-lqe.10, PLAN.md 12.10, 27, 36).
+/// A rising collision count is early evidence that a parser's heuristic has
+/// stopped discriminating, usually after a format change, which is why the
+/// count is surfaced rather than merely recorded.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeuristicDedupUsage {
+    pub parser: String,
+    /// Canonical occurrences resting on a heuristic identity: the share of the
+    /// ledger that rests on this system's inference rather than a source claim.
+    pub heuristic_identities: u64,
+    /// Quarantined collisions: pairs that shared a heuristic key but disagreed
+    /// materially on canonical payload, counted from the quarantine's
+    /// `dedup_collision` failure class.
+    pub collisions: u64,
+}
+
+/// Reports heuristic identity usage and collision counts per parser, ordered by
+/// parser name. A parser appears when it has either heuristic identities or
+/// collisions; a parser whose occurrences are all strong-identity appears
+/// nowhere, because there is nothing about its heuristic domain to report.
+pub fn heuristic_dedup_usage(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<HeuristicDedupUsage>, Error> {
+    let mut identities: BTreeMap<String, u64> = {
+        let mut stmt = conn
+            .prepare(
+                "SELECT parser_version, COUNT(*)
+                 FROM usage_occurrence
+                 WHERE heuristic_key IS NOT NULL
+                 GROUP BY parser_version",
+            )
+            .map_err(|e| {
+                Error::Store(format!("cannot prepare the heuristic identity scan: {e}"))
+            })?;
+        let rows = stmt
+            .query_map([], |row| {
+                let parser: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((parser, count as u64))
+            })
+            .map_err(|e| Error::Store(format!("cannot scan heuristic identities: {e}")))?;
+        let mut map = BTreeMap::new();
+        for row in rows {
+            let (parser, count) =
+                row.map_err(|e| Error::Store(format!("cannot read identity count: {e}")))?;
+            map.insert(parser, count);
+        }
+        map
+    };
+
+    let mut stmt = conn
+        .prepare(
+            "SELECT parser, COUNT(*)
+             FROM ingest_quarantine
+             WHERE failure_class = ?1
+             GROUP BY parser",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the collision scan: {e}")))?;
+    let rows = stmt
+        .query_map(
+            params![crate::store::ingest_quarantine::DEDUP_COLLISION_FAILURE_CLASS],
+            |row| {
+                let parser: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((parser, count as u64))
+            },
+        )
+        .map_err(|e| Error::Store(format!("cannot scan collisions: {e}")))?;
+    let mut collisions: BTreeMap<String, u64> = BTreeMap::new();
+    for row in rows {
+        let (parser, count) =
+            row.map_err(|e| Error::Store(format!("cannot read collision count: {e}")))?;
+        collisions.insert(parser, count);
+    }
+    let mut parsers: Vec<String> = identities
+        .keys()
+        .chain(collisions.keys())
+        .cloned()
+        .collect();
+    parsers.sort();
+    parsers.dedup();
+    let mut usage: Vec<HeuristicDedupUsage> = Vec::new();
+    for parser in parsers {
+        usage.push(HeuristicDedupUsage {
+            heuristic_identities: identities.remove(&parser).unwrap_or(0),
+            collisions: collisions.remove(&parser).unwrap_or(0),
+            parser,
+        });
+    }
+    Ok(usage)
+}
+
+/// A parser whose stored heuristic identities were computed under a different
+/// fingerprint algorithm version than the running code uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeuristicVersionMismatch {
+    pub parser: String,
+    /// The version the stored identities carry, when they carry one. A stored
+    /// row without a version is its own mismatch: an unversioned identity
+    /// cannot be silently extended either.
+    pub stored: Option<String>,
+    /// The version the running code computes keys under.
+    pub current: String,
+}
+
+/// Names every parser whose stored heuristic identities were computed under an
+/// algorithm version other than `current_version`, in parser order. Those
+/// parsers' heuristic identities must be rebuilt from the transcripts before
+/// ingestion continues: extending a ledger whose keys mean something else with
+/// new-version keys would silently fork the canonical identity of the same
+/// logical events, double-counting every replay crossing the boundary
+/// (aub-lqe.10, PLAN.md 12.10, 34.13). Detection reads the store and changes
+/// nothing; the rebuild itself is the rebuild command's verb.
+pub fn heuristic_rebuild_required(
+    conn: &rusqlite::Connection,
+    current_version: &str,
+) -> Result<Vec<HeuristicVersionMismatch>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT parser_version, heuristic_algorithm_version
+             FROM usage_occurrence
+             WHERE heuristic_key IS NOT NULL
+             ORDER BY parser_version, heuristic_algorithm_version",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the heuristic version scan: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| {
+            let parser: String = row.get(0)?;
+            let stored: Option<String> = row.get(1)?;
+            Ok((parser, stored))
+        })
+        .map_err(|e| Error::Store(format!("cannot scan heuristic versions: {e}")))?;
+    let mut mismatches = Vec::new();
+    for row in rows {
+        let (parser, stored) =
+            row.map_err(|e| Error::Store(format!("cannot read heuristic version: {e}")))?;
+        if stored.as_deref() != Some(current_version) {
+            mismatches.push(HeuristicVersionMismatch {
+                parser,
+                stored,
+                current: current_version.to_string(),
+            });
+        }
+    }
+    Ok(mismatches)
+}
+
 fn row_to_occurrence(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageOccurrenceRow> {
     let id_val: i64 = row.get(0)?;
     let namespace_str: String = row.get(1)?;
@@ -244,10 +397,12 @@ mod tests {
     use super::*;
     use crate::domain::time::{FakeClock, UtcTimestamp};
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::ingest_quarantine::{NewQuarantineItem, record_quarantine};
     use crate::store::usage_component::{
         NewUsageComponent, get_components_for_event, insert_component, insert_components,
     };
     use crate::store::usage_event::{NewUsageEvent, insert_event};
+    use crate::transcripts::parser::{QuarantineClass, QuarantineRecord, SourceLocation};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -618,6 +773,162 @@ mod tests {
             err.to_string().to_lowercase().contains("foreign key"),
             "orphan occurrence must fail foreign key constraint, got: {err}"
         );
+    }
+
+    fn heuristic_at_version<'a>(
+        namespace: &'a SourceNamespace,
+        parser_version: &'a ParserVersion,
+        heuristic_key: &'a str,
+        file: &'a str,
+        algorithm_version: Option<&'a str>,
+    ) -> NewUsageOccurrence<'a> {
+        NewUsageOccurrence {
+            heuristic_algorithm_version: algorithm_version,
+            ..heuristic(namespace, parser_version, heuristic_key, file)
+        }
+    }
+
+    fn collision_item(parser: &str) -> NewQuarantineItem {
+        NewQuarantineItem {
+            source_file: "a.jsonl".to_string(),
+            byte_offset: None,
+            line_number: None,
+            parser: parser.to_string(),
+            failure_class: crate::store::ingest_quarantine::DEDUP_COLLISION_FAILURE_CLASS
+                .to_string(),
+            excerpt_hash: "collision-hash".to_string(),
+            excerpt: None,
+            observed_at: UtcTimestamp::from_unix_nanos(500),
+        }
+    }
+
+    /// The doctor's heuristic-dedup data source reports identity usage and
+    /// collision counts per parser, and only for parsers that have either. A
+    /// parser whose occurrences are all strong-identity has no heuristic
+    /// domain to report on; a parse-failure quarantine row is not a collision.
+    #[test]
+    fn heuristic_dedup_usage_reports_identities_and_collisions_per_parser() {
+        let (_scratch, conn) = fixture_conn();
+        let namespace = claude_code_namespace();
+        let version = claude_code_parser_version();
+        insert_occurrence(
+            &conn,
+            &heuristic_at_version(
+                &namespace,
+                &version,
+                "t:1|s1|10:0:0",
+                "a.jsonl",
+                Some("hk1"),
+            ),
+        )
+        .unwrap();
+        insert_occurrence(
+            &conn,
+            &heuristic_at_version(
+                &namespace,
+                &version,
+                "t:2|s1|11:0:0",
+                "a.jsonl",
+                Some("hk1"),
+            ),
+        )
+        .unwrap();
+        // A strong-identity occurrence for the same parser never counts as a
+        // heuristic identity, and a parser with only strong occurrences has no
+        // row of its own.
+        let strong_only = SourceNamespace::new("codex");
+        let strong_version = ParserVersion::new("codex-1");
+        insert_occurrence(
+            &conn,
+            &strong(&strong_only, &strong_version, "m1", "b.jsonl"),
+        )
+        .unwrap();
+
+        record_quarantine(&conn, &collision_item("claude-code-1")).unwrap();
+        // A parse failure for the strong-only parser must not count as a
+        // collision anywhere.
+        let parse_failure = QuarantineRecord::new(
+            SourceLocation::new("b.jsonl", 3),
+            strong_version.clone(),
+            QuarantineClass::TruncatedStructure,
+        );
+        record_quarantine(
+            &conn,
+            &NewQuarantineItem::from_record(&parse_failure, UtcTimestamp::from_unix_nanos(200)),
+        )
+        .unwrap();
+
+        let usage = heuristic_dedup_usage(&conn).unwrap();
+        assert_eq!(usage.len(), 1, "only the heuristic parser is reported");
+        assert_eq!(usage[0].parser, "claude-code-1");
+        assert_eq!(usage[0].heuristic_identities, 2);
+        assert_eq!(usage[0].collisions, 1);
+    }
+
+    /// An algorithm version change is reported as a rebuild requirement per
+    /// parser, never silently absorbed: a stored identity under an older
+    /// version, and a stored identity with no version at all, both block
+    /// extending the ledger, while the current version reports nothing.
+    #[test]
+    fn a_version_change_is_reported_as_a_rebuild_not_a_silent_mutation() {
+        let (_scratch, conn) = fixture_conn();
+        let namespace = claude_code_namespace();
+        let version = claude_code_parser_version();
+        let current = crate::dedup::HeuristicKey::ALGORITHM_VERSION;
+        insert_occurrence(
+            &conn,
+            &heuristic_at_version(
+                &namespace,
+                &version,
+                "t:1|s1|10:0:0",
+                "a.jsonl",
+                Some(current),
+            ),
+        )
+        .unwrap();
+        let older_parser = SourceNamespace::new("gemini");
+        let older_version = ParserVersion::new("gemini-1");
+        insert_occurrence(
+            &conn,
+            &heuristic_at_version(
+                &older_parser,
+                &older_version,
+                "t:1|s1|10:0:0",
+                "g.jsonl",
+                Some("hk0"),
+            ),
+        )
+        .unwrap();
+        let unversioned = SourceNamespace::new("pi");
+        let unversioned_version = ParserVersion::new("pi-1");
+        insert_occurrence(
+            &conn,
+            &heuristic_at_version(
+                &unversioned,
+                &unversioned_version,
+                "t:1|s1|10:0:0",
+                "p.jsonl",
+                None,
+            ),
+        )
+        .unwrap();
+
+        let mismatches = heuristic_rebuild_required(&conn, current).unwrap();
+        assert_eq!(
+            mismatches
+                .iter()
+                .map(|m| (m.parser.as_str(), m.stored.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("gemini-1", Some("hk0")), ("pi-1", None)],
+            "the current parser stays out; the older and unversioned ones are named"
+        );
+        assert!(mismatches.iter().all(|m| m.current == current));
+
+        // The planted negative: running under an older version inverts the
+        // report instead of silently accepting every stored identity, which is
+        // what stops a version bump from being edited around.
+        let under_older = heuristic_rebuild_required(&conn, "hk0").unwrap();
+        assert_eq!(under_older[0].parser, "claude-code-1");
     }
 
     /// Integration: duplicate occurrence counts are retrievable per canonical event.
