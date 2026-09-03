@@ -1,0 +1,54 @@
+# Forbidden-pattern list (aub-n27.4)
+#
+# Credential-shaped and identity-shaped substrings that must never appear in a
+# committed transcript fixture, a release binary, or persisted meter evidence.
+# This is the single source every scan reads:
+#
+#   - the transcript fixture corpus audit (tests/fixture_corpus_audit.rs)
+#   - the parser's own fixture-directory scan (src/transcripts/native.rs)
+#   - the release-binary identity and privacy scan (bin/checks/)
+#   - the full-sampling-run credential test against the synthetic adapter
+#     (tests/identity_privacy_scan.rs)
+#
+# A pattern added here protects all four at once, and none of them keeps a
+# private copy of this list.
+#
+# Format: one pattern per line. A line starting with `#` is a comment and is
+# ignored. A blank line (zero characters) is ignored. Every other line is
+# taken verbatim, including trailing whitespace where a pattern needs it
+# (the "bearer " entry below carries a trailing space on purpose, to avoid
+# matching the ordinary English word "bearer"). Matching itself is a
+# case-insensitive substring test (test-support::sanitization::matched_patterns).
+#
+# An empty or missing list is a misconfiguration, not a clean bill of health:
+# the loader panics rather than let every scan pass with nothing to find.
+
+# --- credential key and token prefixes ---
+sk-ant-
+sk-proj-
+sk-or-
+ghp_
+github_pat_
+glpat-
+AKIA
+xoxb-
+xoxp-
+-----BEGIN
+
+# --- credential field names and header values ---
+bearer 
+api_key
+apikey
+api-key
+authorization
+password
+secret
+access_token
+accesstoken
+refresh_token
+refreshtoken
+
+# --- identity: absolute home paths and account identifiers ---
+/home/
+/users/
+@
