@@ -767,7 +767,7 @@ fn quality_name<T: DomainQuantity>(quality: &EvidenceQuality<T>) -> &'static str
 }
 
 /// Escapes a string for a JSON string literal.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
