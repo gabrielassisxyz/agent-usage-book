@@ -45,6 +45,11 @@ use crate::store::meter_evidence::{measurement_basis_sql, quantization_sql};
 pub mod build;
 pub mod reader;
 
+// The direct SQLite comparison is deliberately test-only. Production status
+// remains projection-backed until aub-c5m evaluates the recorded benchmark.
+#[cfg(test)]
+mod benchmark;
+
 /// The ledger generation recorded in a projection file's text, or `None` when
 /// the text is not a projection file this schema wrote. One reader for the
 /// format this module owns, so test surfaces and doctor compare against the

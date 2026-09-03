@@ -264,6 +264,37 @@ pub(crate) mod test_support {
     }
 
     impl Fixture {
+        pub(crate) fn database_path(&self) -> PathBuf {
+            self._scratch.path().join("source.db")
+        }
+
+        pub(crate) fn projection_path(&self) -> PathBuf {
+            self._scratch
+                .path()
+                .join(crate::projection::PROJECTION_FILE_NAME)
+        }
+
+        /// Adds a deliberately large population in one fixture transaction.
+        /// The benchmark is measuring read shape, not the cost of synchronously
+        /// committing thousands of independent account observations.
+        pub(crate) fn seed_additional_accounts(&mut self, count: usize) {
+            let transaction = self.conn.transaction().unwrap();
+            for index in 0..count {
+                transaction
+                    .execute(
+                        "INSERT INTO account (logical_name, provider_key, first_observed_at, last_observed_at) \
+                         VALUES (?1, ?2, ?3, ?3)",
+                        rusqlite::params![
+                            format!("large-{index:04}"),
+                            "benchmark",
+                            self.clock.now().unix_nanos(),
+                        ],
+                    )
+                    .unwrap();
+            }
+            transaction.commit().unwrap();
+        }
+
         pub(crate) fn start_attempt(&mut self) -> MeterAttemptRowId {
             self.clock.advance(MonotonicDuration::from_seconds(10));
             let started_at = self.clock.now();
