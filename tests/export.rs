@@ -248,7 +248,6 @@ fn re_rendering_unchanged_data_differs_only_in_generated_at() {
     );
 
     // Every header field other than generated_at is identical.
-    let volatile = "generated_at";
     for field in [
         "schema",
         "key",
@@ -273,14 +272,16 @@ fn re_rendering_unchanged_data_differs_only_in_generated_at() {
     assert_eq!(second_header["generated_at"], 9_000);
 }
 
-/// The privacy scan (`aub-xus.7`): over generated exports, no credential
-/// material, no absolute machine path and no transcript content appears. The
-/// adversarial material is planted in the places it genuinely lives: transcript
-/// file paths and credential-shaped strings in `usage_event.source_provenance`,
-/// transcript prose in the quarantine excerpts. A naive implementation that
-/// renders provenance alongside its rows, or walks the quarantine table, fails
-/// this scan; the near-identical positive control asserts the legitimate
-/// identifiers the same export was asked to include.
+// The privacy scan (`aub-xus.7`): over generated exports, no credential
+// material, no absolute machine path and no transcript content appears. The
+// adversarial material is planted in the places it genuinely lives: transcript
+// file paths and credential-shaped strings in `usage_event.source_provenance`,
+// transcript prose in the quarantine excerpts. A naive implementation that
+// renders provenance alongside its rows, or walks the quarantine table, fails
+// this scan; the near-identical positive control asserts the legitimate
+// identifiers the same export was asked to include.
+// The doc comment above is prose for the reader, not rustdoc: the attribute
+// below is consumed by the proptest macro, which cannot carry documentation.
 proptest::proptest! {
     #![proptest_config(proptest::prelude::ProptestConfig::with_cases(16))]
 
@@ -291,16 +292,20 @@ proptest::proptest! {
         prose_seed in proptest::prelude::any::<u64>(),
         credential_seed in proptest::prelude::any::<u64>(),
     ) {
-            let forbidden: Vec<String> = (0..session_count)
-                .map(|i| {
-                    [
-                        format!("/home/user{path_seed}/.claude/projects/p{i}/session-{i}.jsonl", path_seed = path_seed % 97),
-                        format!("The agent reasoned about topic {prose_seed}{i} and wrote {prose_seed}{i} characters of prose"),
-                        format!("sk-ant-api03-credential-{credential_seed}{i}{i}"),
-                    ]
-                })
-                .flatten()
-                .collect();
+        let forbidden: Vec<String> = (0..session_count)
+            .flat_map(|i| {
+                [
+                    format!(
+                        "/home/user{}/.claude/projects/p{i}/session-{i}.jsonl",
+                        path_seed % 97
+                    ),
+                    format!(
+                        "The agent reasoned about topic {prose_seed}{i} and wrote {prose_seed}{i} characters of prose"
+                    ),
+                    format!("sk-ant-api03-credential-{}{i}{i}", credential_seed % 97),
+                ]
+            })
+            .collect();
 
             let db = TestDb::new();
             let conn = db.open();
@@ -315,7 +320,10 @@ proptest::proptest! {
                     // file path; the credential string rides in a second row
                     // so both forbidden classes sit where a naive row renderer
                     // would pick them up.
-                    &format!("/home/user{path_seed}/.claude/projects/p{i}/session-{i}.jsonl", path_seed = path_seed % 97),
+                    &format!(
+                        "/home/user{}/.claude/projects/p{i}/session-{i}.jsonl",
+                        path_seed % 97
+                    ),
                     &[("input", 10 + i as u64)],
                 );
                 let event_id = EventId::new((i + 1) as i64);
@@ -327,7 +335,10 @@ proptest::proptest! {
                 record_quarantine(
                     &conn,
                     &NewQuarantineItem {
-                        source_file: format!("/home/user{path_seed}/.claude/projects/p{i}/session-{i}.jsonl", path_seed = path_seed % 97),
+                        source_file: format!(
+                            "/home/user{}/.claude/projects/p{i}/session-{i}.jsonl",
+                            path_seed % 97
+                        ),
                         byte_offset: Some(0),
                         line_number: Some(i as u64),
                         parser: "v1".to_string(),
@@ -351,7 +362,7 @@ proptest::proptest! {
                     event_timestamp: Some(UtcTimestamp::from_unix_nanos(10)),
                     model_id: None,
                     evidence_kind: "transcript",
-                    source_provenance: &format!("sk-ant-api03-credential-{credential_seed}00"),
+                    source_provenance: &format!("sk-ant-api03-credential-{}", credential_seed % 97),
                     parser_version: "v1",
                     created_at: UtcTimestamp::from_unix_nanos(10),
                 },
