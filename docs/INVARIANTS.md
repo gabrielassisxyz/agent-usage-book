@@ -29,7 +29,7 @@ same thing in both documents.
 
 | # | Invariant | Enforcing path | Test or constraint |
 |---:|---|---|---|
-| 1 | Provider quota attempts and observations are irreplaceable evidence. | unenforced aub-sth.12 | (backup restore test) |
+| 1 | Provider quota attempts and observations are irreplaceable evidence. | tests/backup.rs | a_backup_taken_while_a_writer_is_active_verifies_with_both_checks_passing |
 | 2 | Transcript-derived spend is reconstructible. | unenforced aub-lqe.11 | (rebuild determinism test) |
 | 3 | No semantically meaningful raw numeric primitive crosses a domain boundary. | src/domain/tokens.rs | tests::each_newtype_round_trips_its_value_including_the_maximum |
 | 4 | Freshness is an exhaustive three-way state. | src/domain/freshness.rs | tests::expanding_stale_reason_does_not_change_the_freshness_variant_count |
@@ -50,13 +50,13 @@ same thing in both documents.
 | 19 | Meter residual is diagnostic and is not automatically called hidden token spend. | unenforced aub-dpn | (unexplained residual test) |
 | 20 | Estimated transcript usage is never silently promoted to measured usage. | src/evidence.rs | tests::quality_combine_never_recovers_measured_from_estimated |
 | 21 | The friction ledger remains external and joins only through stable IDs. | tests/export.rs | tests::both_key_modes_produce_one_object_per_line_with_version_and_generations |
-| 22 | Irreplaceable meter history is backed up and never automatically pruned. | unenforced aub-sth.12 | (retention and restore test) |
+| 22 | Irreplaceable meter history is backed up and never automatically pruned. | tests/backup.rs | a_backup_is_not_a_blind_file_copy_of_a_live_wal_database |
 | 23 | An outbound meter request is never begun before its attempt identity is durable. | tests/meter_attempt_crash.rs | tests::killed_between_start_and_result_leaves_exactly_one_start_with_no_result |
 | 24 | An attempt without a terminal result is evidence of collector interruption, not evidence that no attempt occurred. | src/domain/freshness.rs | tests::started_attempt_past_command_horizon_yields_collector_interrupted |
 | 25 | Provider response evidence and its normalized interpretation are separate records; a corrected adapter reinterprets retained evidence and never overwrites the earlier interpretation. | src/store/meter_evidence.rs | tests::switching_the_preference_keeps_both_interpretations_immutable |
 | 26 | Workload feasibility is evaluated against every constraining window in calibrated credits, never against the lowest remaining percentage alone. | src/domain/window.rs | tests::display_and_advice_select_different_windows_when_calibrations_diverge |
-| 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | unenforced aub-me5.8 | (policy snapshot denominator test) |
+| 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | src/coverage.rs | tests::a_cadence_change_mid_interval_follows_the_historical_policy |
 
 ## Enforcement status
 
-Of the 27 invariants above, 17 are enforced by mechanical checks present at HEAD (file paths and tests), and 10 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 20 are enforced by mechanical checks present at HEAD (file paths and tests), and 7 are unenforced and tracked by open beads in the tracker.
