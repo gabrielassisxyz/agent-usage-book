@@ -37,14 +37,18 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use crate::domain::time::UtcTimestamp;
 use crate::domain::window::{
-    ModelId, NominalWindowDuration, ReportedResolution, WindowScope, WindowSemanticKey,
+    MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, WindowScope, WindowSemanticKey,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
-use crate::store::meter_attempt::MeterAttemptRowId;
+use crate::store::meter_attempt::{
+    MeterAttemptRowId, NewMeterAttemptResult, attempt_outcome_from_sql,
+};
 use crate::store::meter_evidence::{
-    NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
-    insert_response_evidence, insert_window, measurement_basis_sql, quantization_sql,
+    NewMeterResponseEvidence, measurement_basis_sql, quantization_sql,
+};
+use crate::store::repository::{
+    NewMeterInterpretation, TerminalMeterBundle, commit_terminal_bundle_on_connection,
 };
 use crate::store::startup::{create_file_mode_0600, ensure_dir_mode_0700};
 
@@ -66,14 +70,23 @@ pub struct PendingWindow {
     pub nominal_duration_nanos: i64,
 }
 
-/// The complete terminal bundle for one attempt: its response evidence, its
+/// The complete terminal bundle for one attempt: its result, response evidence,
 /// one observation, and that observation's windows, as flat primitives (see
-/// [`PendingWindow`] for why). `evidence_id` and `observation_id` are
-/// deliberately absent for the same reason: they do not exist until
-/// [`drain_pending`] performs the inserts.
+/// [`PendingWindow`] for why). Generated evidence and observation identifiers are
+/// deliberately absent because they do not exist until [`drain_pending`] inserts
+/// the bundle.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingTerminalBundle {
     pub attempt_id: i64,
+
+    pub completed_at_nanos: i64,
+    pub elapsed_nanos: i64,
+    pub outcome: String,
+    pub failure_class: Option<String>,
+    pub retry_after_nanos: Option<i64>,
+    pub sanitized_error_classification: Option<String>,
+    pub retry_index: Option<i64>,
+    pub clock_anomaly: bool,
 
     pub response_classification: String,
     pub received_at_nanos: i64,
@@ -130,6 +143,14 @@ impl PendingTerminalBundle {
     pub fn to_json(&self) -> String {
         let value = json!({
             "attempt_id": self.attempt_id,
+            "completed_at_nanos": self.completed_at_nanos,
+            "elapsed_nanos": self.elapsed_nanos,
+            "outcome": self.outcome,
+            "failure_class": self.failure_class,
+            "retry_after_nanos": self.retry_after_nanos,
+            "sanitized_error_classification": self.sanitized_error_classification,
+            "retry_index": self.retry_index,
+            "clock_anomaly": self.clock_anomaly,
             "response_classification": self.response_classification,
             "received_at_nanos": self.received_at_nanos,
             "provider_observed_at_original": self.provider_observed_at_original,
@@ -168,6 +189,17 @@ impl PendingTerminalBundle {
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             attempt_id: required_i64(&value, "attempt_id")?,
+            completed_at_nanos: required_i64(&value, "completed_at_nanos")?,
+            elapsed_nanos: required_i64(&value, "elapsed_nanos")?,
+            outcome: required_str(&value, "outcome")?,
+            failure_class: optional_str(&value, "failure_class"),
+            retry_after_nanos: optional_i64(&value, "retry_after_nanos")?,
+            sanitized_error_classification: optional_str(&value, "sanitized_error_classification"),
+            retry_index: optional_i64(&value, "retry_index")?,
+            clock_anomaly: value
+                .get("clock_anomaly")
+                .and_then(Value::as_bool)
+                .ok_or_else(|| "missing or non-boolean field \"clock_anomaly\"".to_owned())?,
             response_classification: required_str(&value, "response_classification")?,
             received_at_nanos: required_i64(&value, "received_at_nanos")?,
             provider_observed_at_original: optional_str(&value, "provider_observed_at_original"),
@@ -212,6 +244,16 @@ fn required_i64(value: &Value, field: &str) -> Result<i64, String> {
         .get(field)
         .and_then(Value::as_i64)
         .ok_or_else(|| format!("missing or non-integer field {field:?}"))
+}
+
+fn optional_i64(value: &Value, field: &str) -> Result<Option<i64>, String> {
+    match value.get(field) {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => value
+            .as_i64()
+            .map(Some)
+            .ok_or_else(|| format!("non-integer field {field:?}")),
+    }
 }
 
 /// The directory pending records are spooled into, inside the state
@@ -446,41 +488,33 @@ fn evidence_exists_for_attempt(conn: &Connection, attempt_id: i64) -> Result<boo
 /// types refuse) is distinguishable from a SQLite failure: the former means
 /// the record is malformed and belongs in quarantine, the latter means the
 /// record is fine and SQLite is the problem.
-struct Reconstructed {
-    evidence: NewMeterResponseEvidence,
-    observation_without_evidence_id: ObservationFields,
-    windows: Vec<WindowFields>,
-}
-
-/// [`NewMeterObservation`] minus `evidence_id`, which does not exist until
-/// the evidence row is inserted.
-struct ObservationFields {
-    attempt_id: MeterAttemptRowId,
-    account_id: AccountId,
-    provider: String,
-    provider_observed_at: Option<UtcTimestamp>,
-    received_at: UtcTimestamp,
-    measurement_basis: crate::domain::time::MeasurementBasis,
-    observed_plan: Option<String>,
-    observed_tier: Option<String>,
-    adapter_version: AdapterVersion,
-    provider_contract_id: ProviderContractId,
-    meter_semantics_id: MeterSemanticsId,
-    normalized_fingerprint: String,
-}
-
-/// [`NewMeterWindow`] minus `observation_id`, for the same reason.
-struct WindowFields {
-    semantic_key: WindowSemanticKey,
-    scope: WindowScope,
-    quota_used: QuotaUsed,
-    reported_resolution: ReportedResolution,
-    quantization: crate::domain::window::QuantizationSemantics,
-    resets_at: UtcTimestamp,
-    nominal_duration: NominalWindowDuration,
-}
-
-fn reconstruct(bundle: &PendingTerminalBundle) -> Result<Reconstructed, String> {
+fn reconstruct(bundle: &PendingTerminalBundle) -> Result<TerminalMeterBundle, String> {
+    if bundle.elapsed_nanos < 0 {
+        return Err(format!(
+            "elapsed_nanos {} must be non-negative",
+            bundle.elapsed_nanos
+        ));
+    }
+    let retry_index = bundle
+        .retry_index
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| format!("retry_index {:?} is out of range", bundle.retry_index))?;
+    let (outcome, _) = attempt_outcome_from_sql(
+        &bundle.outcome,
+        bundle.failure_class.clone(),
+        bundle.retry_after_nanos,
+    )
+    .map_err(|error| error.to_string())?;
+    let result = NewMeterAttemptResult {
+        attempt_id: MeterAttemptRowId::new(bundle.attempt_id),
+        completed_at: UtcTimestamp::from_unix_nanos(bundle.completed_at_nanos),
+        elapsed: crate::domain::time::MonotonicDuration::from_nanos(bundle.elapsed_nanos as u64),
+        outcome,
+        sanitized_error_classification: bundle.sanitized_error_classification.clone(),
+        retry_index,
+        clock_anomaly: bundle.clock_anomaly,
+    };
     let evidence = NewMeterResponseEvidence {
         attempt_id: MeterAttemptRowId::new(bundle.attempt_id),
         response_classification: bundle.response_classification.clone(),
@@ -500,8 +534,7 @@ fn reconstruct(bundle: &PendingTerminalBundle) -> Result<Reconstructed, String> 
             )
         })?;
 
-    let observation = ObservationFields {
-        attempt_id: MeterAttemptRowId::new(bundle.attempt_id),
+    let interpretation = NewMeterInterpretation {
         account_id: AccountId::new(bundle.account_id),
         provider: bundle.provider.clone(),
         provider_observed_at: bundle
@@ -523,14 +556,11 @@ fn reconstruct(bundle: &PendingTerminalBundle) -> Result<Reconstructed, String> 
         .map(reconstruct_window)
         .collect::<Result<Vec<_>, _>>()?;
 
-    Ok(Reconstructed {
-        evidence,
-        observation_without_evidence_id: observation,
-        windows,
-    })
+    TerminalMeterBundle::new(result, evidence, interpretation, windows)
+        .map_err(|error| error.to_string())
 }
 
-fn reconstruct_window(window: &PendingWindow) -> Result<WindowFields, String> {
+fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
     let scope = match (window.scope_kind.as_str(), &window.scoped_model) {
         ("account_wide", None) => WindowScope::AccountWide,
         ("model_specific", Some(model)) => WindowScope::ModelSpecific(ModelId::new(model.clone())),
@@ -556,67 +586,21 @@ fn reconstruct_window(window: &PendingWindow) -> Result<WindowFields, String> {
             ReportedResolution::new(ppm)
                 .ok_or_else(|| "reported_resolution_ppm must be non-zero".to_owned())
         })?;
-    Ok(WindowFields {
-        semantic_key: WindowSemanticKey::new(window.semantic_key.clone()),
+    Ok(MeterWindow::new(
+        WindowSemanticKey::new(window.semantic_key.clone()),
         scope,
         quota_used,
         reported_resolution,
         quantization,
-        resets_at: UtcTimestamp::from_unix_nanos(window.resets_at_nanos),
-        nominal_duration: NominalWindowDuration::from_nanos(window.nominal_duration_nanos as u64),
-    })
+        UtcTimestamp::from_unix_nanos(window.resets_at_nanos),
+        NominalWindowDuration::from_nanos(window.nominal_duration_nanos as u64),
+    ))
 }
 
-/// Commits the reconstructed bundle in one transaction: evidence, then its
-/// observation, then its windows, all or nothing. A failure here is always
-/// SQLite's, never the record's: [`reconstruct`] has already proven every
-/// value the domain types accept.
-fn apply(conn: &mut Connection, bundle: &Reconstructed) -> Result<(), Error> {
-    let tx = conn.transaction().map_err(|error| {
-        Error::Store(format!("cannot open the spool-drain transaction: {error}"))
-    })?;
-
-    let evidence_id = insert_response_evidence(&tx, &bundle.evidence)?;
-    let fields = &bundle.observation_without_evidence_id;
-    let observation_id = insert_observation(
-        &tx,
-        &NewMeterObservation {
-            attempt_id: fields.attempt_id,
-            evidence_id,
-            account_id: fields.account_id,
-            provider: fields.provider.clone(),
-            provider_observed_at: fields.provider_observed_at,
-            received_at: fields.received_at,
-            measurement_basis: fields.measurement_basis,
-            observed_plan: fields.observed_plan.clone(),
-            observed_tier: fields.observed_tier.clone(),
-            adapter_version: fields.adapter_version.clone(),
-            provider_contract_id: fields.provider_contract_id.clone(),
-            meter_semantics_id: fields.meter_semantics_id.clone(),
-            normalized_fingerprint: fields.normalized_fingerprint.clone(),
-        },
-    )?;
-    for window in &bundle.windows {
-        insert_window(
-            &tx,
-            &NewMeterWindow {
-                observation_id,
-                semantic_key: window.semantic_key.clone(),
-                scope: window.scope.clone(),
-                quota_used: window.quota_used,
-                reported_resolution: window.reported_resolution,
-                quantization: window.quantization,
-                resets_at: window.resets_at,
-                nominal_duration: window.nominal_duration,
-            },
-        )?;
-    }
-
-    tx.commit().map_err(|error| {
-        Error::Store(format!(
-            "cannot commit the spool-drain transaction: {error}"
-        ))
-    })
+/// Commits the reconstructed result and interpretation through the same atomic
+/// repository boundary used by live sampling.
+fn apply(conn: &mut Connection, bundle: &TerminalMeterBundle) -> Result<(), Error> {
+    commit_terminal_bundle_on_connection(conn, bundle, || Ok(())).map(|_| ())
 }
 
 fn quarantine(state_dir: &Path, path: &Path, reason: &str) -> Result<(), Error> {
@@ -644,6 +628,7 @@ mod tests {
     use super::*;
     use crate::domain::time::{FakeClock, UtcTimestamp};
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::meter_attempt::attempt_outcome_as_sql;
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -697,6 +682,15 @@ mod tests {
     fn sample_bundle(attempt_id: i64) -> PendingTerminalBundle {
         PendingTerminalBundle {
             attempt_id,
+            completed_at_nanos: 2_000,
+            elapsed_nanos: 1_000,
+            outcome: attempt_outcome_as_sql(&crate::domain::attempt::AttemptOutcome::Success)
+                .to_owned(),
+            failure_class: None,
+            retry_after_nanos: None,
+            sanitized_error_classification: None,
+            retry_index: None,
+            clock_anomaly: false,
             response_classification: "success".into(),
             received_at_nanos: 1_000,
             provider_observed_at_original: Some("2026-09-02T00:00:00Z".into()),
@@ -799,7 +793,7 @@ mod tests {
     fn from_json_reports_the_missing_field_by_name_rather_than_a_generic_parse_error() {
         let broken = "{\"attempt_id\": 1, \"windows\": []}";
         let error = PendingTerminalBundle::from_json(broken).unwrap_err();
-        assert!(error.contains("response_classification"), "{error}");
+        assert!(error.contains("completed_at_nanos"), "{error}");
     }
 
     // --- write sequence: the four crash points --------------------------

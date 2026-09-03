@@ -26,6 +26,7 @@ pub mod meter_evidence;
 pub mod migrate;
 pub mod migrations;
 pub mod rate_card;
+pub mod repository;
 pub mod sample_run;
 pub mod sampling_lease;
 pub mod sampling_policy_snapshot;

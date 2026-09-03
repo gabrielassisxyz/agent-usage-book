@@ -11,11 +11,59 @@ use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
 use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
 use crate::domain::tokens::TokenKind;
+use crate::error::Error;
 use crate::evidence::CoverageCompleteness;
 use crate::presentation::precision::{PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{SpendGroup, SpendReport, StatusReport};
 use crate::transcripts::TranscriptDriftReport;
+
+/// Renders a failure with a concrete recovery action and collapses the current
+/// home directory to `~`. The error type keeps the raw cause for diagnostics;
+/// this boundary owns what is safe and useful to print.
+pub(crate) fn render_actionable_failure_message(
+    error: &Error,
+    command: Option<&str>,
+    home: Option<&str>,
+) -> String {
+    let message = collapse_home_path(&error.to_string(), home);
+    let rerun = command
+        .map(|name| format!("aub {name}"))
+        .unwrap_or_else(|| "aub --help".to_string());
+    let action = match error {
+        Error::Internal(_) => format!("run {rerun} again with AUB_LOG_LEVEL=debug"),
+        Error::Usage(_) => "run aub --help".to_string(),
+        Error::AuthRequired(_) => {
+            format!("set accounts[].credential, then run {rerun} again")
+        }
+        Error::RemoteUnavailable(_) => {
+            format!("run {rerun} again after the named remote prerequisite is reachable")
+        }
+        Error::Store(_) => {
+            format!("check the state.dir database prerequisite, then run {rerun} again")
+        }
+        Error::InsufficientEvidence(_) => {
+            format!("run {rerun} again after collecting the named prerequisite")
+        }
+        Error::ThresholdNotMet(_) => {
+            format!("run {rerun} again after the named threshold condition changes")
+        }
+        Error::IngestIncomplete(_) => {
+            format!("fix the named local prerequisite, then run {rerun} again")
+        }
+    };
+    format!("{message}; next: {action}")
+}
+
+fn collapse_home_path(message: &str, home: Option<&str>) -> String {
+    let Some(home) = home.map(|path| path.trim_end_matches('/')) else {
+        return message.to_string();
+    };
+    if home.is_empty() || home == "/" {
+        return message.to_string();
+    }
+    message.replace(&format!("{home}/"), "~/")
+}
 
 /// Formats a raw integer with the given number of fractional digits, trimming
 /// trailing zeros. The raw value is already scaled to the display unit.
