@@ -17,6 +17,7 @@ use crate::evidence::CoverageCompleteness;
 use crate::presentation::precision::{PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
+use crate::transcripts::TranscriptDriftReport;
 
 /// The explain level a command was asked for.
 ///
@@ -344,6 +345,93 @@ fn render_ingest_summary(report: &SpendReport) -> String {
         line.push_str(&format!("\nunreadable: {file}"));
     }
     line
+}
+
+/// Renders a [`TranscriptDriftReport`] for `aub doctor --transcript-format-drift`.
+pub fn render_doctor_drift_report(report: &TranscriptDriftReport) -> String {
+    if !report.has_configured_roots {
+        return "Doctor: Transcript Format Drift\nNo configured transcript roots. Add [[transcripts]] entries to configuration to enable drift detection.".to_string();
+    }
+    let mut lines = Vec::new();
+    lines.push("Doctor: Transcript Format Drift".to_string());
+    for src in &report.sources {
+        lines.push(format!(
+            "Source: {} (format: {}, parser: {})",
+            src.source,
+            src.format,
+            src.parser_version.as_str()
+        ));
+        lines.push(format!(
+            "  Files scanned: {}, Records scanned: {}",
+            src.files_scanned, src.records_scanned
+        ));
+        lines.push(format!(
+            "  Quarantined records: {}",
+            src.quarantined_records
+        ));
+        for (class, count) in &src.quarantine_by_class {
+            lines.push(format!("    {class}: {count}"));
+        }
+        lines.push(format!("  Observed shapes: {}", src.shapes_seen.len()));
+        for s in &src.shapes_seen {
+            let kind = s.record_kind.as_deref().unwrap_or("record");
+            let marker = if src
+                .uncovered_shapes
+                .iter()
+                .any(|u| u.shape_hash == s.shape_hash)
+            {
+                " [UNCOVERED]"
+            } else {
+                ""
+            };
+            lines.push(format!(
+                "    {} ({kind}, {} fields, {} records){marker}",
+                s.shape_hash, s.field_count, s.occurrence_count
+            ));
+        }
+        if src.drift_detected {
+            lines.push("  UNCOVERED FORMAT DRIFT DETECTED:".to_string());
+            if !src.uncovered_fields.is_empty() {
+                let fields = src
+                    .uncovered_fields
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("    Uncovered fields: {fields}"));
+            }
+            if !src.uncovered_record_kinds.is_empty() {
+                let kinds = src
+                    .uncovered_record_kinds
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("    Uncovered record kinds: {kinds}"));
+            }
+            if !src.uncovered_evidence_classes.is_empty() {
+                let evs = src
+                    .uncovered_evidence_classes
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                lines.push(format!("    Uncovered evidence classes: {evs}"));
+            }
+            if !src.uncovered_shapes.is_empty() {
+                lines.push(format!(
+                    "    Uncovered shapes: {} shape(s) not in fixture corpus",
+                    src.uncovered_shapes.len()
+                ));
+            }
+            if let Some(ref rem) = src.remediation {
+                lines.push(format!("  Next action: {rem}"));
+            }
+        } else {
+            lines.push("  Status: All record shapes covered by committed fixtures.".to_string());
+        }
+    }
+    lines.join("\n")
 }
 
 /// Renders a quantity with its unit, precision and qualification.

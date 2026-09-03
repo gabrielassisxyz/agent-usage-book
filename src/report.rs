@@ -8,6 +8,7 @@
 pub mod models;
 pub mod provenance;
 
+pub mod export;
 pub mod spend;
 
 pub use models::{

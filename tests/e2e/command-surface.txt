@@ -8,3 +8,5 @@ spend
 config
 rate-card
 backup
+export
+doctor

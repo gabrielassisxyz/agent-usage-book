@@ -7,8 +7,10 @@ commands:
   status   render the last known meter reading per configured account
   spend    token usage per UTC day and transcript source, read from the configured transcripts
   config   print every resolved configuration key with the source that won
+  export   emit versioned JSONL usage rows keyed by session-id or run-id for external joins
   rate-card import, show and history the immutable dated vendor rate cards
   backup   create or verify a consistent archive of durable state
+  doctor   health, drift and integrity diagnostics
 
 status:
   answers: how much quota does each configured account have left?
@@ -27,6 +29,12 @@ config:
   format: text only: config prints provenance, not a report
   options: --set key=value (repeatable), --config-file PATH
 
+export:
+  answers: which usage did each session or run consume, as a versioned JSONL ledger for an external join?
+  refuses: --format (export is always versioned JSONL); --explain (export derives no quantity); --account (export reads every stored session, not one account); --no-color (export prints no color)
+  format: text only: export is always versioned JSONL
+  options: --key session-id|run-id (required), --include-logical-ids
+
 rate-card:
   answers: what do the immutable dated vendor rate cards contain?
   refuses: --format (rate-card prints a price book, not a report); --explain (rate-card derives no quantity); --account (the rate book is reference data, not per-account state); --no-color (rate-card prints plain rows)
@@ -37,5 +45,11 @@ backup:
   refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --no-color (backup prints no color)
   format: text only: backup prints one operational result
   options: DESTINATION | verify DESTINATION
+
+doctor:
+  answers: is the recorded evidence healthy, and does the transcript corpus still match its parsers?
+  refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
+  format: text | json
+  options: --transcript-format-drift
 
 aub            prints the version; aub --help prints this

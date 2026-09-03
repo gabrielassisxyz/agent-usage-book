@@ -19,6 +19,7 @@ use crate::logging::RunId;
 use crate::presentation::render::ExplainMode;
 use crate::problem_code::ProblemCode;
 use crate::report::{LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport};
+use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
 /// below pin the exact shape, so a field added without bumping this fails them.
@@ -628,6 +629,160 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
 }
 
+/// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.
+pub fn validate_doctor_drift_report_json(
+    json_str: &str,
+) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "doctor" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'doctor', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_DOCTOR_KEYS: [&str; 11] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "check",
+        "has_configured_roots",
+        "overall_drift_detected",
+        "remediation",
+        "sources",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_DOCTOR_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    let check = obj
+        .get("check")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(JsonContractError::MissingField("check"))?;
+    if check != "transcript-format-drift" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "check",
+            message: format!("expected 'transcript-format-drift', got '{check}'"),
+        });
+    }
+    let _sources = obj
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JsonContractError::MissingField("sources"))?;
+    Ok(parsed)
+}
+
+/// Serializes a [`TranscriptDriftReport`] under the shared JSON envelope.
+pub fn doctor_drift_json(report: &TranscriptDriftReport, run: RunId) -> String {
+    let sources_json = report
+        .sources
+        .iter()
+        .map(|src| {
+            let shapes_json = src
+                .shapes_seen
+                .iter()
+                .map(|s| {
+                    let kind_val = match &s.record_kind {
+                        Some(k) => json_string(k),
+                        None => "null".to_string(),
+                    };
+                    format!(
+                        "{{\"shape_hash\":{},\"record_kind\":{kind_val},\"field_count\":{},\"occurrence_count\":{}}}",
+                        json_string(&s.shape_hash),
+                        s.field_count,
+                        s.occurrence_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_shapes_json = src
+                .uncovered_shapes
+                .iter()
+                .map(|s| {
+                    let kind_val = match &s.record_kind {
+                        Some(k) => json_string(k),
+                        None => "null".to_string(),
+                    };
+                    format!(
+                        "{{\"shape_hash\":{},\"record_kind\":{kind_val},\"field_count\":{},\"occurrence_count\":{}}}",
+                        json_string(&s.shape_hash),
+                        s.field_count,
+                        s.occurrence_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_fields_json = src
+                .uncovered_fields
+                .iter()
+                .map(|f| json_string(f))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_kinds_json = src
+                .uncovered_record_kinds
+                .iter()
+                .map(|k| json_string(k))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_evs_json = src
+                .uncovered_evidence_classes
+                .iter()
+                .map(|e| json_string(e))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let quarantine_json = src
+                .quarantine_by_class
+                .iter()
+                .map(|(class, count)| format!("{}:{count}", json_string(class)))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let rem_json = match &src.remediation {
+                Some(r) => json_string(r),
+                None => "null".to_string(),
+            };
+
+            format!(
+                "{{\"source\":{},\"format\":{},\"parser_version\":{},\"files_scanned\":{},\"records_scanned\":{},\"quarantined_records\":{},\"quarantine_by_class\":{{{quarantine_json}}},\"shapes_seen\":[{shapes_json}],\"uncovered_fields\":[{uncovered_fields_json}],\"uncovered_record_kinds\":[{uncovered_kinds_json}],\"uncovered_evidence_classes\":[{uncovered_evs_json}],\"uncovered_shapes\":[{uncovered_shapes_json}],\"drift_detected\":{},\"remediation\":{rem_json}}}",
+                json_string(&src.source),
+                json_string(&src.format),
+                json_string(src.parser_version.as_str()),
+                src.files_scanned,
+                src.records_scanned,
+                src.quarantined_records,
+                src.drift_detected
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let overall_rem = match &report.remediation {
+        Some(r) => json_string(r),
+        None => "null".to_string(),
+    };
+
+    let body = format!(
+        "\"check\":\"transcript-format-drift\",\"has_configured_roots\":{},\"overall_drift_detected\":{},\"remediation\":{overall_rem},\"sources\":[{sources_json}]",
+        report.has_configured_roots, report.overall_drift_detected
+    );
+
+    JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
+}
+
 /// Serializes a provenance graph into its JSON explain representation.
 pub fn explain_json(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
     let mode_str = match mode {
@@ -941,7 +1096,7 @@ fn quality_name<T: DomainQuantity>(quality: &EvidenceQuality<T>) -> &'static str
 }
 
 /// Escapes a string for a JSON string literal.
-fn json_string(s: &str) -> String {
+pub(crate) fn json_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {

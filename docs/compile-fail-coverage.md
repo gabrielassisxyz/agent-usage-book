@@ -25,3 +25,11 @@ Case 10 is not a compile-fail case: `combine` returns `EvidenceQuality<T>` at ru
 The three deferred cases are attributed to the bead that introduces the type, with the
 consumer that would trip the case named alongside, so the owning bead knows what it is
 guarding when it lands.
+
+## Cases added after section 34.1
+
+Cases added by later beads are listed here so the coverage record stays in one place.
+
+| # | Bead | Case | Status | Fixture |
+| --- | --- | --- | --- | --- |
+| 13 | aub-sth.15 | DurableClass naming an irreplaceable table passed where PruneTarget is expected | covered | prune_target_cannot_name_irreplaceable_class.rs |

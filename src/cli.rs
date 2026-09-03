@@ -20,8 +20,10 @@ use crate::presentation::render::{
     render_spend_report_with_explain, render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
+use crate::report::export::assemble as assemble_export;
 use crate::report::spend::{SpendWindow, assemble as assemble_spend};
 use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+use crate::store::export::ExportKey;
 
 /// Declares [`Command`] and the derived list of its variants from one token list, so
 /// the list cannot drift from the enum: a variant joins both at once. [`Command::ALL`]
@@ -55,12 +57,14 @@ aub_command_enum! {
     Status,
     Spend,
     Config,
+    Export,
     LoggingFixture,
     StateCheck,
     ExitClass,
     AttemptCrashHook,
     RateCard,
     Backup,
+    Doctor,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -88,16 +92,18 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 11] = [
         Self::Status,
         Self::Spend,
         Self::Config,
+        Self::Export,
         Self::LoggingFixture,
         Self::StateCheck,
         Self::ExitClass,
         Self::AttemptCrashHook,
         Self::RateCard,
         Self::Backup,
+        Self::Doctor,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -142,6 +148,21 @@ impl Command {
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "config prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Export => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "export is always versioned JSONL",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "export derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "export reads every stored session, not one account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "export prints no color",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -235,6 +256,19 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Doctor => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "doctor derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "doctor is a system-wide diagnostic",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "doctor prints plain text or json",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -245,12 +279,14 @@ impl Command {
             Command::Status => "status",
             Command::Spend => "spend",
             Command::Config => "config",
+            Command::Export => "export",
             Command::LoggingFixture => "__logging-fixture",
             Command::StateCheck => "__state-check",
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
             Command::RateCard => "rate-card",
             Command::Backup => "backup",
+            Command::Doctor => "doctor",
         }
     }
 
@@ -265,12 +301,16 @@ impl Command {
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
             }
+            Command::Export => Some(
+                "emit versioned JSONL usage rows keyed by session-id or run-id for external joins",
+            ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
             Command::Backup => Some("create or verify a consistent archive of durable state"),
+            Command::Doctor => Some("health, drift and integrity diagnostics"),
         }
     }
 
@@ -284,6 +324,12 @@ impl Command {
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::Backup => Some(
                 "is there a consistent, verified archive of the durable state, and does it restore?",
+            ),
+            Command::Doctor => Some(
+                "is the recorded evidence healthy, and does the transcript corpus still match its parsers?",
+            ),
+            Command::Export => Some(
+                "which usage did each session or run consume, as a versioned JSONL ledger for an external join?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -325,6 +371,8 @@ impl Command {
             Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => Some("DESTINATION | verify DESTINATION"),
+            Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
+            Command::Doctor => Some("--transcript-format-drift"),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -585,6 +633,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Command::Spend => spend(&RealClock::new(), level, &invocation),
         Command::Config => config_command(invocation.rest.into_iter().map(OsString::from)),
+        Command::Export => export_command(&RealClock::new(), level, &invocation),
         Command::LoggingFixture => logging_fixture(&RealClock::new(), level),
         Command::StateCheck => state_check(&RealClock::new(), level),
         Command::ExitClass => {
@@ -597,7 +646,74 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
+        Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
     }
+}
+
+/// `aub doctor`: operational health, drift and integrity diagnostics.
+/// Supports `--transcript-format-drift` (aub-lqe.17).
+fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("doctor");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    for arg in &invocation.rest {
+        match arg.as_str() {
+            "--transcript-format-drift" => {}
+            other => return Err(Error::Usage(format!("unknown argument: {other}"))),
+        }
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let mut db_quarantine = None;
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    if db_path.is_file() {
+        let policy = crate::store::connection::PragmaPolicy {
+            busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+        };
+        let summary_res = crate::store::connection::open(
+            &db_path,
+            crate::store::connection::AccessMode::ReadOnly,
+            &policy,
+        )
+        .and_then(|conn| crate::store::ingest_quarantine::quarantine_summary(&conn));
+        if let Ok(summary) = summary_res {
+            db_quarantine = Some(summary);
+        }
+    }
+
+    let report =
+        crate::transcripts::detect_drift(&config, None, timestamp, db_quarantine.as_deref())?;
+
+    match invocation.format {
+        OutputFormat::Text => println!(
+            "{}",
+            crate::presentation::render_doctor_drift_report(&report)
+        ),
+        OutputFormat::Json => println!("{}", crate::presentation::doctor_drift_json(&report, run)),
+    }
+
+    Ok(())
 }
 
 fn reject_positionals(invocation: &Invocation) -> Result<(), Error> {
@@ -746,6 +862,79 @@ fn config_command(args: impl Iterator<Item = OsString>) -> Result<(), Error> {
         println!("{key:<32} {}", source.label());
     }
     Ok(())
+}
+
+/// `aub export`: versioned JSONL for external joins (`aub-xus.7`, PLAN.md 5,
+/// 27, 37). The output is one header line and one JSON object per row, always
+/// JSONL regardless of --format, because the format is a versioned contract
+/// with an external consumer rather than a rendering choice.
+///
+/// The logical project and repository identifiers cross the export boundary
+/// only when asked for: an export file travels further than the 0700 state
+/// directory it was produced in, so the default carries nothing that names a
+/// project or repository, and the header records what was included.
+fn export_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let (key, include_logical_ids) = export_flags(&invocation.rest)?;
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("export");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run);
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let conn = open_ledger(clock)?;
+    let report = assemble_export(&conn, key, include_logical_ids, timestamp)?;
+    print!(
+        "{}",
+        crate::presentation::export_jsonl::export_jsonl(&report)
+    );
+    Ok(())
+}
+
+/// The export's own flags: `--key session-id|run-id` (required, exactly once)
+/// and `--include-logical-ids` (optional). Everything else is a usage error
+/// naming the argument, so a mistyped flag cannot silently narrow the export.
+fn export_flags(rest: &[String]) -> Result<(ExportKey, bool), Error> {
+    let mut key: Option<ExportKey> = None;
+    let mut include_logical_ids = false;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        if arg == "--include-logical-ids" {
+            include_logical_ids = true;
+            continue;
+        }
+        let value = if let Some(inline) = arg.strip_prefix("--key=") {
+            inline.to_string()
+        } else if arg == "--key" {
+            args.next()
+                .cloned()
+                .ok_or_else(|| Error::Usage("--key requires session-id or run-id".into()))?
+        } else {
+            return Err(Error::Usage(format!("unknown argument: {arg}")));
+        };
+        if key.is_some() {
+            return Err(Error::Usage("--key was given more than once".into()));
+        }
+        key = Some(parse_export_key(&value)?);
+    }
+    let key =
+        key.ok_or_else(|| Error::Usage("export requires --key session-id or --key run-id".into()))?;
+    Ok((key, include_logical_ids))
+}
+
+fn parse_export_key(value: &str) -> Result<ExportKey, Error> {
+    match value {
+        "session-id" => Ok(ExportKey::Session),
+        "run-id" => Ok(ExportKey::Run),
+        other => Err(Error::Usage(format!(
+            "--key must be session-id or run-id, got {other}"
+        ))),
+    }
 }
 
 fn next_arg(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, Error> {
@@ -1020,10 +1209,10 @@ fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
 /// Opens the one production ledger database through the one connection path:
 /// state readiness first, then the store-side open (which runs migrations;
 /// `src/cli.rs` must never name the migration framework itself, boundary rule
-/// `15`). The rate card is the first production store user, so this is where
-/// the database file name resolves from
-/// [`crate::store::connection::LEDGER_DATABASE_FILE`].
-fn rate_card_open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Error> {
+/// `15`). Every production store user shares this: the database file name
+/// resolves from [`crate::store::connection::LEDGER_DATABASE_FILE`], and the
+/// readiness gate runs before any connection is made.
+fn open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Error> {
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -1055,7 +1244,7 @@ fn rate_card_import(clock: &impl Clock, invocation: &Invocation) -> Result<(), E
     })?;
     let book = crate::rate_book::parse(&text)
         .map_err(|error| Error::Usage(format!("rate book rejected: {error}")))?;
-    let conn = rate_card_open_ledger(clock)?;
+    let conn = open_ledger(clock)?;
     let summary = crate::store::rate_card::insert(&conn, &book.cards, clock.now())?;
     println!(
         "rate-card import: added={} unchanged={}",
@@ -1065,7 +1254,7 @@ fn rate_card_import(clock: &impl Clock, invocation: &Invocation) -> Result<(), E
 }
 
 fn rate_card_show(clock: &impl Clock) -> Result<(), Error> {
-    let conn = rate_card_open_ledger(clock)?;
+    let conn = open_ledger(clock)?;
     let total = crate::store::rate_card::count(&conn)?;
     if total == 0 {
         println!("no rate card records; import a book with `aub rate-card import`");
@@ -1085,7 +1274,7 @@ fn rate_card_show(clock: &impl Clock) -> Result<(), Error> {
 }
 
 fn rate_card_history(clock: &impl Clock) -> Result<(), Error> {
-    let conn = rate_card_open_ledger(clock)?;
+    let conn = open_ledger(clock)?;
     let cards = crate::store::rate_card::history(&conn)?;
     if cards.is_empty() {
         println!("no rate card records; import a book with `aub rate-card import`");
@@ -1567,6 +1756,55 @@ mod tests {
     #[test]
     fn apply_set_rejects_a_pair_with_no_equals_sign() {
         assert!(apply_set(crate::config::Overrides::new(), "state.dir").is_err());
+    }
+
+    /// The export flags: both `--key` spellings, the logical-identifier flag
+    /// defaulting off, and the near-identical negatives each naming what they
+    /// refused: a missing key, an unknown key value, a repeated key, and an
+    /// argument the command does not own.
+    #[test]
+    fn export_flags_read_the_key_and_the_logical_id_flag() {
+        let (key, ids) = export_flags(&["--key".into(), "session-id".into()]).unwrap();
+        assert_eq!(key, ExportKey::Session);
+        assert!(!ids, "logical ids are opt-in, never default");
+
+        let (key, ids) =
+            export_flags(&["--key=run-id".into(), "--include-logical-ids".into()]).unwrap();
+        assert_eq!(key, ExportKey::Run);
+        assert!(ids);
+
+        for (rest, expected) in [
+            (vec![], "--key session-id"),
+            (vec!["--key".to_string(), "bogus".to_string()], "bogus"),
+            (vec!["--key".to_string()], "--key requires"),
+            (
+                vec![
+                    "--key".to_string(),
+                    "run-id".to_string(),
+                    "--key".to_string(),
+                    "session-id".to_string(),
+                ],
+                "more than once",
+            ),
+            (
+                vec![
+                    "--key".to_string(),
+                    "run-id".to_string(),
+                    "--bogus".to_string(),
+                ],
+                "--bogus",
+            ),
+        ] {
+            match export_flags(&rest) {
+                Err(Error::Usage(message)) => {
+                    assert!(
+                        message.contains(expected),
+                        "{message:?} must name {expected:?}"
+                    )
+                }
+                other => panic!("expected a usage error naming {expected:?}, got {other:?}"),
+            }
+        }
     }
 
     #[test]

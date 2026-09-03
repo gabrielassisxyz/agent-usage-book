@@ -27,6 +27,7 @@ use rusqlite::Connection;
 use crate::domain::ids::{NativeRunId, NativeSessionId, SourceNamespace};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
+use crate::store::ingestion_generation;
 use crate::store::ledger_generation;
 
 /// Which shared identifier an export is keyed on.
@@ -53,7 +54,7 @@ impl ExportKey {
 pub struct UsageByTokenClass(BTreeMap<String, i64>);
 
 impl UsageByTokenClass {
-    fn add(&mut self, token_class: &str, count: i64) {
+    pub(crate) fn add(&mut self, token_class: &str, count: i64) {
         *self.0.entry(token_class.to_string()).or_insert(0) += count;
     }
 
@@ -96,6 +97,9 @@ pub struct ExportData {
     pub key: ExportKey,
     pub included_logical_ids: bool,
     pub ledger_generation: u64,
+    /// How many completed ingestion passes the exported usage reflects. Zero
+    /// until the ingest path lands and starts advancing the counter.
+    pub ingestion_generation: u64,
     /// Rows a source-ambiguous session string contributed to, which could not be
     /// attributed to one namespaced session. Zero in the common case.
     pub unresolved_events: u64,
@@ -128,6 +132,7 @@ pub fn assemble_export(
     include_logical_ids: bool,
 ) -> Result<ExportData, Error> {
     let ledger_generation = ledger_generation::current(conn)?.value();
+    let ingestion_generation = ingestion_generation::current(conn)?.value();
     let (sessions, unresolved_events) = session_usage(conn)?;
 
     let rows = match key {
@@ -139,6 +144,7 @@ pub fn assemble_export(
         key,
         included_logical_ids: include_logical_ids,
         ledger_generation,
+        ingestion_generation,
         unresolved_events,
         rows,
     })
@@ -404,6 +410,10 @@ mod tests {
 
         let data = assemble_export(&conn, ExportKey::Session, false).unwrap();
         assert_eq!(data.key, ExportKey::Session);
+        assert_eq!(
+            data.ingestion_generation, 0,
+            "a fresh database has no completed ingestion pass"
+        );
         assert_eq!(data.rows.len(), 1);
         let row = &data.rows[0];
         assert_eq!(row.key, "claude-code:sess-a");
