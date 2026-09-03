@@ -919,36 +919,10 @@ mod tests {
     use crate::store::migrate::run_migrations;
     use crate::store::migrations::registry;
     use std::collections::HashMap;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Barrier;
-    use std::sync::atomic::AtomicU64;
-
-    static COUNTER: AtomicU64 = AtomicU64::new(0);
-
-    struct ScratchDir(PathBuf);
-
-    impl ScratchDir {
-        fn new() -> Self {
-            let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aub-meter-sampler-test-{}-{suffix}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&path).expect("scratch dir must be creatable");
-            Self(path)
-        }
-
-        fn path(&self) -> &Path {
-            &self.0
-        }
-    }
-
-    impl Drop for ScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use test_support::StateDir;
 
     /// A clock shared between the orchestrator and the scripted transport, so
     /// a test can advance time from inside a request without racing the
@@ -1117,8 +1091,8 @@ mod tests {
     /// A migrated repository over a scratch state directory; the path is
     /// returned so a test thread can build its own repository over the same
     /// database, the way three concurrent invocations of the command would.
-    fn fixture_database() -> (ScratchDir, PathBuf) {
-        let scratch = ScratchDir::new();
+    fn fixture_database() -> (StateDir, PathBuf) {
+        let scratch = StateDir::new();
         let database_path = scratch.path().join("sampler.db");
         let mut conn = open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
         run_migrations(
