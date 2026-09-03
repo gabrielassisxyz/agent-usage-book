@@ -64,6 +64,8 @@ aub_command_enum! {
     ProjectionCrashHook,
     RateCard,
     Backup,
+    Ingest,
+    Rebuild,
     Doctor,
 }
 
@@ -93,7 +95,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 14] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -105,6 +107,8 @@ impl Command {
         Self::ProjectionCrashHook,
         Self::RateCard,
         Self::Backup,
+        Self::Ingest,
+        Self::Rebuild,
         Self::Doctor,
     ];
 
@@ -302,6 +306,36 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Ingest => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "ingest prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "ingest derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "ingest reads the configured transcript sources",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "ingest prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Rebuild => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "rebuild prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "rebuild derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "rebuild sweeps whole materialization tables, not one account",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "rebuild prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::Doctor => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Rejected {
@@ -336,6 +370,8 @@ impl Command {
             Command::ProjectionCrashHook => "__projection-crash-hook",
             Command::RateCard => "rate-card",
             Command::Backup => "backup",
+            Command::Ingest => "ingest",
+            Command::Rebuild => "rebuild",
             Command::Doctor => "doctor",
         }
     }
@@ -361,6 +397,12 @@ impl Command {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
             Command::Backup => Some("create or verify a consistent archive of durable state"),
+            Command::Ingest => Some(
+                "land the configured transcripts' normalized usage into the ledger, advancing the ingestion generation",
+            ),
+            Command::Rebuild => Some(
+                "destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence",
+            ),
             Command::Doctor => Some("health, drift and integrity diagnostics"),
         }
     }
@@ -375,6 +417,12 @@ impl Command {
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::Backup => Some(
                 "is there a consistent, verified archive of the durable state, and does it restore?",
+            ),
+            Command::Ingest => Some(
+                "have the transcript-derived tables been refreshed from the transcripts on disk, under one generation?",
+            ),
+            Command::Rebuild => Some(
+                "can the transcript-derived materializations be rebuilt from scratch while every irreplaceable record is left untouched?",
             ),
             Command::Doctor => Some(
                 "is the recorded evidence healthy, and does the transcript corpus still match its parsers?",
@@ -424,6 +472,8 @@ impl Command {
             Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => Some("DESTINATION | verify DESTINATION"),
+            Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
+            Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
             Command::Doctor => Some("--transcript-format-drift"),
             Command::Status
@@ -724,6 +774,8 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
+        Command::Ingest => ingest_command(&RealClock::new(), &invocation),
+        Command::Rebuild => rebuild_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
     }
 }
@@ -1626,6 +1678,151 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         summary.drain_completed,
         summary.destination.display(),
     );
+    Ok(())
+}
+
+/// `aub ingest transcripts`: explicit transcript ingestion as an operation in
+/// its own right (aub-lqe.11, PLAN.md 6, 17.2, 27, 34.16). The window flags of
+/// spend do not exist here: ingestion is not windowed, it lands everything the
+/// configured sources currently hold, and reports what it read and the
+/// generation it advanced.
+fn ingest_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let options = ingest_flags(&invocation.rest)?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let mut conn = open_ledger(clock)?;
+    let report = crate::ingest::run(&mut conn, &config, &options, clock.now())?;
+    println!(
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={}",
+        report.sources.join(","),
+        report.files_scanned,
+        report.files_parsed,
+        report.files_skipped,
+        report.unreadable_files.len(),
+        report.quarantined,
+        report.generation.value(),
+    );
+    let outcome = &report.outcome;
+    println!(
+        "  events: written={} already-ingested={} · occurrences: written={} already-ingested={} · components={} sessions={} replaced={}",
+        outcome.events_written.value(),
+        outcome.events_already_ingested.value(),
+        outcome.occurrences_written.value(),
+        outcome.occurrences_already_ingested.value(),
+        outcome.components_written.value(),
+        outcome.sessions_upserted.value(),
+        outcome.rows_replaced.value(),
+    );
+    if report.unreadable_files.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::IngestIncomplete(format!(
+            "{} file(s) could not be read; the landed batch excludes them",
+            report.unreadable_files.len()
+        )))
+    }
+}
+
+/// The ingest command's own flags: the `transcripts` subcommand word (required,
+/// the only rebuildable source class with parsers today), then `--source NAME`
+/// and `--changed-only`. Everything else is a usage error naming the argument.
+fn ingest_flags(rest: &[String]) -> Result<crate::ingest::IngestOptions, Error> {
+    let mut args = rest.iter();
+    match args.next() {
+        Some(word) if word == "transcripts" => {}
+        Some(other) => {
+            return Err(Error::Usage(format!(
+                "unknown ingest target: {other}; ingest reads transcripts"
+            )));
+        }
+        None => {
+            return Err(Error::Usage(
+                "ingest requires a target: ingest transcripts".into(),
+            ));
+        }
+    }
+    let mut options = crate::ingest::IngestOptions::default();
+    while let Some(arg) = args.next() {
+        let value = if let Some(inline) = arg.strip_prefix("--source=") {
+            Some(inline.to_string())
+        } else if arg == "--source" {
+            Some(
+                args.next()
+                    .cloned()
+                    .ok_or_else(|| Error::Usage("--source requires a source name".into()))?,
+            )
+        } else {
+            None
+        };
+        match value {
+            Some(name) => {
+                if options.source.is_some() {
+                    return Err(Error::Usage("--source was given more than once".into()));
+                }
+                options.source = Some(name);
+            }
+            None if arg == "--changed-only" => options.changed_only = true,
+            None => return Err(Error::Usage(format!("unknown argument: {arg}"))),
+        }
+    }
+    Ok(options)
+}
+
+/// `aub rebuild <target>`: explicit destructive rebuild of rebuildable
+/// materializations (aub-lqe.11, PLAN.md 6, 27, 34.16). The target resolves
+/// through the shared taxonomy's rebuild groups, so the command cannot name a
+/// class the taxonomy does not classify rebuildable, and the sweep it runs is
+/// the one [`crate::store::retention::delete_rebuildable`] derives from the
+/// taxonomy rather than a list declared here.
+fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let target_name = invocation.rest.first().cloned().ok_or_else(|| {
+        Error::Usage(format!(
+            "rebuild requires a target: {}",
+            crate::store::retention::RebuildGroup::ALL
+                .iter()
+                .map(|group| group.name())
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ))
+    })?;
+    if invocation.rest.len() > 1 {
+        return Err(Error::Usage(format!(
+            "unknown argument: {}",
+            invocation.rest[1]
+        )));
+    }
+    let group =
+        crate::store::retention::RebuildGroup::from_name(&target_name).ok_or_else(|| {
+            Error::Usage(format!(
+                "unknown rebuild target {target_name}; rebuildable targets are: {}",
+                crate::store::retention::RebuildGroup::ALL
+                    .iter()
+                    .map(|group| group.name())
+                    .collect::<Vec<_>>()
+                    .join(" | ")
+            ))
+        })?;
+    let mut conn = open_ledger(clock)?;
+    let report = crate::store::retention::delete_rebuildable(&mut conn, group)?;
+    println!(
+        "rebuild {}: deleted {} rows across {} tables",
+        report.group.name(),
+        report.total().value(),
+        report.deleted.len(),
+    );
+    for (class, count) in &report.deleted {
+        let table = class
+            .table_name()
+            .unwrap_or_else(|| unreachable!("a sweep class is a table class by construction"));
+        println!("  {table}: {} rows", count.value());
+    }
     Ok(())
 }
 

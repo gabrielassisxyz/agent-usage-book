@@ -1,0 +1,7 @@
+rebuild transcripts: deleted 18 rows across 6 tables
+  usage_occurrence: 3 rows
+  transcript_file: 1 rows
+  usage_event: 3 rows
+  usage_component: 8 rows
+  session: 2 rows
+  ingest_quarantine: 1 rows

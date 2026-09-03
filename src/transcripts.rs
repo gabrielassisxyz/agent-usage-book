@@ -17,7 +17,7 @@ pub use drift::{
     ShapeSummary, SourceDriftReport, TranscriptDriftReport, ValueType, collect_field_paths,
     detect_drift, extract_record_kind, extract_record_shape, load_fixture_corpus,
 };
-pub use native::{ClaudeCodeParser, CodexParser, PiParser};
+pub use native::{ClaudeCodeParser, CodexParser, PiParser, namespace_for_format};
 
 /// The parser for a source's declared `format`, or `None` for a format no parser
 /// reads. The three names are the configuration vocabulary; a report over a source
