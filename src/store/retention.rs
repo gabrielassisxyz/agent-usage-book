@@ -1063,19 +1063,16 @@ mod tests {
     #[test]
     fn rebuild_groups_partition_the_rebuildable_classes_and_nothing_else() {
         for class in DurableClass::all() {
-            match class.rebuild_group() {
-                Some(group) => {
-                    assert_eq!(
-                        class.category(),
-                        DurableClassCategory::Rebuildable,
-                        "class {class:?} is grouped for rebuild but not rebuildable"
-                    );
-                    assert!(
-                        group.classes().contains(class),
-                        "class {class:?} is grouped under {group:?} but absent from its sweep"
-                    );
-                }
-                None => {}
+            if let Some(group) = class.rebuild_group() {
+                assert_eq!(
+                    class.category(),
+                    DurableClassCategory::Rebuildable,
+                    "class {class:?} is grouped for rebuild but not rebuildable"
+                );
+                assert!(
+                    group.classes().contains(class),
+                    "class {class:?} is grouped under {group:?} but absent from its sweep"
+                );
             }
         }
         let mut grouped = 0;
