@@ -231,7 +231,7 @@ fn group_events(
     let mut reset_exclusions: BTreeMap<GroupKey, BTreeSet<ComponentKind>> = BTreeMap::new();
     for reset in &cumulative.resets {
         if let Some(occurred_at) = reset.rejected.occurred_at() {
-            let file = event_file(&reset.rejected);
+            let file = reset.rejected.source_file().to_string();
             let source = source_of_file
                 .get(&file)
                 .cloned()
@@ -247,6 +247,31 @@ fn group_events(
         }
     }
 
+    // A heuristic-key collision quarantined a pair, so the groups the pair's
+    // occurrences would have joined are missing everything the pair would have
+    // carried; the groups say so rather than reading as complete (aub-lqe.10).
+    // An occurrence with no timestamp joins no group, like any undated event.
+    let mut collision_exclusions: BTreeMap<GroupKey, BTreeSet<ComponentKind>> = BTreeMap::new();
+    for collision in &deduplicated.heuristic_collisions {
+        for occurrence in collision.occurrences() {
+            let Some(occurred_at) = occurrence.occurred_at() else {
+                continue;
+            };
+            let file = occurrence.source_file().to_string();
+            let source = source_of_file
+                .get(&file)
+                .cloned()
+                .unwrap_or_else(|| "unknown-source".to_string());
+            collision_exclusions
+                .entry(GroupKey {
+                    day: occurred_at.utc_date(),
+                    source,
+                })
+                .or_default()
+                .extend(collision.missing_components());
+        }
+    }
+
     let mut groups: BTreeMap<GroupKey, GroupAccumulator> = BTreeMap::new();
     for event in canonical {
         let Some(occurred_at) = event.occurred_at() else {
@@ -258,7 +283,7 @@ fn group_events(
             continue;
         }
         summary.events_in_window += 1;
-        let file = event_file(&event);
+        let file = event.source_file().to_string();
         let source = source_of_file
             .get(&file)
             .cloned()
@@ -286,7 +311,9 @@ fn group_events(
 
     groups
         .into_iter()
-        .map(|(key, group)| finish_group(key, group, window, &reset_exclusions))
+        .map(|(key, group)| {
+            finish_group(key, group, window, &reset_exclusions, &collision_exclusions)
+        })
         .collect()
 }
 
@@ -294,20 +321,8 @@ fn source_by_file(sources: &[String], events: &[NormalizedUsageEvent]) -> BTreeM
     sources
         .iter()
         .zip(events)
-        .map(|(source, event)| (event_file(event), source.clone()))
+        .map(|(source, event)| (event.source_file().to_string(), source.clone()))
         .collect()
-}
-
-/// The file an event was read from: the one provenance source that is not a
-/// strong-identity entry.
-fn event_file(event: &NormalizedUsageEvent) -> String {
-    event
-        .provenance()
-        .sources()
-        .iter()
-        .find(|source| !source.starts_with(crate::transcripts::parser::STRONG_IDENTITY_PREFIX))
-        .cloned()
-        .unwrap_or_default()
 }
 
 fn evidence_id(event: &NormalizedUsageEvent, file: &str) -> String {
@@ -339,6 +354,7 @@ fn finish_group(
     group: GroupAccumulator,
     window: SpendWindow,
     reset_exclusions: &BTreeMap<GroupKey, BTreeSet<ComponentKind>>,
+    collision_exclusions: &BTreeMap<GroupKey, BTreeSet<ComponentKind>>,
 ) -> (SpendGroup, SpendGroupProvenance) {
     let name = LogicalName::new(format!("{} {}", key.day.iso(), key.source));
     let node = ProvenanceNode::new(
@@ -358,22 +374,29 @@ fn finish_group(
     let usage = group
         .usage
         .expect("a spend group is created by the first event that lands in it");
-    // A counter reset excluded a delta this group would have carried: its
-    // components surface as partial coverage rather than the group reading as
-    // complete (aub-lqe.9, PLAN.md section 34.14).
-    let usage = match reset_exclusions.get(&key) {
-        None => usage,
-        Some(missing) => {
-            let merged = usage.coverage().combine(&CoverageCompleteness::Partial {
-                missing: missing.clone(),
-            });
-            UsageVector::new(
-                usage.known(),
-                usage.unknown().clone(),
-                merged,
-                usage.quality().clone(),
-            )
-        }
+    // Excluded material this group would have carried: a counter reset's
+    // rejected delta and a quarantined heuristic-collision pair both leave
+    // components missing from the total, and the group's coverage names them
+    // rather than reading as complete (aub-lqe.9, aub-lqe.10).
+    let mut excluded: BTreeSet<ComponentKind> = BTreeSet::new();
+    if let Some(kinds) = reset_exclusions.get(&key) {
+        excluded.extend(kinds.iter().cloned());
+    }
+    if let Some(kinds) = collision_exclusions.get(&key) {
+        excluded.extend(kinds.iter().cloned());
+    }
+    let usage = if excluded.is_empty() {
+        usage
+    } else {
+        let merged = usage
+            .coverage()
+            .combine(&CoverageCompleteness::Partial { missing: excluded });
+        UsageVector::new(
+            usage.known(),
+            usage.unknown().clone(),
+            merged,
+            usage.quality().clone(),
+        )
     };
     let spend_group = SpendGroup::new(
         name.clone(),
@@ -543,6 +566,64 @@ mod tests {
         let read = assemble(&config, window("2026-08-25", 1), now()).unwrap();
         assert_eq!(read.ingest.files_read, 1);
         assert_eq!(read.groups[0].usage.known().output().value(), 6);
+    }
+
+    /// A claude-code line with no message id rides the heuristic domain: same
+    /// timestamp, session and input as its sibling, no output count. The pair
+    /// shares a heuristic key but normalizes to different payloads (one counts
+    /// its output, one admits it does not know), so the pair is quarantined and
+    /// the day's aggregate is partial, naming what the pair would have carried.
+    /// The planted negative is the same fixture without the disagreeing line:
+    /// the surviving occurrence is canonical, the aggregate is complete, and
+    /// both occurrences' counts land.
+    #[test]
+    fn a_quarantined_collision_marks_its_groups_partial_and_counts_no_winner() {
+        let with_output = r#"{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","sessionId":"s1","message":{"usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        let without_output = r#"{"type":"assistant","timestamp":"2026-08-25T10:00:00Z","sessionId":"s1","message":{"usage":{"input_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+        let strong = r#"{"type":"assistant","timestamp":"2026-08-25T10:05:00Z","sessionId":"s1","message":{"id":"m9","usage":{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
+
+        let root = scratch("collision");
+        write(
+            &root.join("a.jsonl"),
+            &[
+                with_output.to_string(),
+                without_output.to_string(),
+                strong.to_string(),
+            ]
+            .join("\n"),
+        );
+        let config = config_with(vec![source("cc", &root, "claude-code")]);
+        let report = assemble(&config, window("2026-08-25", 1), now()).unwrap();
+
+        assert_eq!(report.groups.len(), 1);
+        let group = &report.groups[0];
+        assert_eq!(group.usage.known().input().value(), 100);
+        assert_eq!(group.usage.known().output().value(), 50);
+        let missing: Vec<String> = group
+            .usage
+            .coverage()
+            .missing()
+            .expect("the group must be partial")
+            .iter()
+            .map(|kind| kind.as_str().to_string())
+            .collect();
+        assert_eq!(missing, ["input", "output"]);
+
+        // The planted negative: remove the disagreeing line and the same day
+        // reads complete with both occurrences counted, so the partial
+        // coverage above is attributable to the collision and nothing else.
+        let root = scratch("collision-negative");
+        write(
+            &root.join("a.jsonl"),
+            &[with_output.to_string(), strong.to_string()].join("\n"),
+        );
+        let config = config_with(vec![source("cc", &root, "claude-code")]);
+        let report = assemble(&config, window("2026-08-25", 1), now()).unwrap();
+        assert_eq!(report.groups.len(), 1);
+        let group = &report.groups[0];
+        assert_eq!(group.usage.known().input().value(), 110);
+        assert_eq!(group.usage.known().output().value(), 55);
+        assert!(group.usage.coverage().missing().is_none());
     }
 
     /// Configuration mistakes are usage errors that name the source.

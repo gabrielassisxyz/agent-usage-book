@@ -11,12 +11,12 @@ use crate::domain::attempt::AttemptOutcome;
 use crate::domain::freshness::Freshness;
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
-use crate::domain::rows::RowCount;
 use crate::domain::time::{UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
-use crate::evidence::{CoverageCompleteness, Derivation, Provenance, Qualified};
+use crate::evidence::{CoverageCompleteness, Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
+pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
 
 /// A monotonically increasing ledger generation.
 ///
@@ -451,23 +451,42 @@ impl CalibrateReport {
 
 /// The export report for `aub export`.
 ///
-/// The row count is qualified rather than bare because an export is a view of the
-/// ledger and inherits its coverage: nine hundred rows written from an incomplete
-/// ingestion and nine hundred rows written from a complete one are the same integer
-/// and different facts, and only the coverage on the qualified value separates them.
+/// The rows are the typed records the store assembled; the renderer never
+/// recomputes any of them. The unresolved-event count is an operational
+/// counter describing what the assembly could not attribute, not a
+/// measurement it reports: it exists to say the export is incomplete, exactly
+/// as the ingest summary's counters say a spend report is incomplete.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExportReport {
     pub metadata: ReportMetadata,
-    pub rows: Qualified<RowCount>,
+    /// Which shared identifier the rows are keyed on.
+    pub key: ExportKey,
+    /// Whether logical project and repository identifiers were included in the
+    /// rows, recorded here so the header can say what the export carries.
+    pub included_logical_ids: bool,
+    pub rows: Vec<ExportRow>,
+    /// Usage events that could not be attributed to one namespaced session and
+    /// so appear in no row.
+    pub unresolved_events: u64,
     pub provenance: ProvenanceGraph,
 }
 
 impl ExportReport {
-    pub fn new(metadata: ReportMetadata, rows: Qualified<RowCount>, node: ProvenanceNode) -> Self {
+    pub fn new(
+        metadata: ReportMetadata,
+        key: ExportKey,
+        included_logical_ids: bool,
+        rows: Vec<ExportRow>,
+        unresolved_events: u64,
+        node: ProvenanceNode,
+    ) -> Self {
         let provenance = ProvenanceGraph::new([(ReportField::ExportRows, node)]);
         Self {
             metadata,
+            key,
+            included_logical_ids,
             rows,
+            unresolved_events,
             provenance,
         }
     }
@@ -563,15 +582,6 @@ mod tests {
         ExportReport,
     );
 
-    fn exported_rows(count: u64) -> Qualified<RowCount> {
-        Qualified::new(
-            RowCount::new(count),
-            CoverageCompleteness::Complete,
-            crate::evidence::EvidenceQuality::Measured,
-            Provenance::new(["ledger".to_string()]),
-        )
-    }
-
     /// One instance of every command's report model, each labelled with its command.
     fn every_model(m: ReportMetadata) -> Vec<(&'static str, Box<dyn CarriesMetadata>)> {
         let account = MeterAccount::new(
@@ -646,7 +656,14 @@ mod tests {
             ),
             (
                 "export",
-                Box::new(ExportReport::new(m.clone(), exported_rows(0), node())),
+                Box::new(ExportReport::new(
+                    m.clone(),
+                    ExportKey::Session,
+                    false,
+                    vec![],
+                    0,
+                    node(),
+                )),
             ),
         ]
     }
@@ -849,7 +866,7 @@ mod tests {
             IngestSummary::default(),
         );
         let coverage = CoverageReport::new(m.clone(), CoverageCompleteness::Complete, true, node());
-        let export = ExportReport::new(m.clone(), exported_rows(42), node());
+        let export = ExportReport::new(m.clone(), ExportKey::Run, true, vec![], 0, node());
         let calibrate = CalibrateReport::new(
             m.clone(),
             Derivation::Unavailable {
@@ -937,7 +954,7 @@ mod tests {
     #[test]
     fn every_node_in_a_report_graph_verifies() {
         let m = metadata();
-        let report = ExportReport::new(m, exported_rows(42), node());
+        let report = ExportReport::new(m, ExportKey::Session, false, vec![], 0, node());
         for (_, node) in report.provenance.iter() {
             assert!(node.verify());
         }
@@ -973,7 +990,7 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 2] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 3] = [
         (
             "IngestSummary",
             "*",
@@ -985,6 +1002,12 @@ mod tests {
             "usage",
             "a UsageVector carries its own coverage and evidence quality, with the \
              provenance and derivation identifier as sibling fields on the group",
+        ),
+        (
+            "ExportReport",
+            "unresolved_events",
+            "an operational counter describing what the assembly could not attribute, \
+             not a measurement it reports; it exists to say the export is incomplete",
         ),
     ];
 
@@ -1126,13 +1149,13 @@ mod tests {
         );
     }
 
-    /// The structurally qualified exceptions are exactly the two documented here,
-    /// each naming the reason it is not an unqualified number. A third one cannot
+    /// The structurally qualified exceptions are exactly the three documented here,
+    /// each naming the reason it is not an unqualified number. A fourth one cannot
     /// be added without this test being edited, which is the point: the list is a
     /// decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 2);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 3);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),

@@ -32,6 +32,11 @@ impl Digest {
     pub fn as_u64(self) -> u64 {
         self.0
     }
+
+    /// Formats the digest as a 16-character lowercase hex string.
+    pub fn to_hex(self) -> String {
+        format!("{:016x}", self.0)
+    }
 }
 
 /// A typed evidence identifier.
@@ -105,6 +110,32 @@ pub enum WitnessId {
     RateCard(RateCardId),
 }
 
+impl WitnessId {
+    /// Extracts the cost-model ID if this witness is one.
+    pub fn cost_model(&self) -> Option<&CostModelId> {
+        match self {
+            WitnessId::CostModel(id) => Some(id),
+            WitnessId::WindowCalibration(_) | WitnessId::RateCard(_) => None,
+        }
+    }
+
+    /// Extracts the window-calibration ID if this witness is one.
+    pub fn window_calibration(&self) -> Option<&WindowCalibrationId> {
+        match self {
+            WitnessId::WindowCalibration(id) => Some(id),
+            WitnessId::CostModel(_) | WitnessId::RateCard(_) => None,
+        }
+    }
+
+    /// Extracts the rate-card ID if this witness is one.
+    pub fn rate_card(&self) -> Option<&RateCardId> {
+        match self {
+            WitnessId::RateCard(id) => Some(id),
+            WitnessId::CostModel(_) | WitnessId::WindowCalibration(_) => None,
+        }
+    }
+}
+
 /// The query semantics a derivation was computed under.
 ///
 /// Two reports over the same evidence with different grouping or filtering are
@@ -122,6 +153,16 @@ impl QuerySemantics {
             grouping: grouping.into(),
             filtering: filtering.into(),
         }
+    }
+
+    /// The grouping dimension name.
+    pub fn grouping(&self) -> &str {
+        &self.grouping
+    }
+
+    /// The filtering predicate description.
+    pub fn filtering(&self) -> &str {
+        &self.filtering
     }
 
     /// The canonical serialization, used to hash the semantics.
@@ -222,6 +263,21 @@ impl DerivationId {
         bytes.extend_from_slice(&manifest.inputs_hash().as_u64().to_le_bytes());
         bytes.extend_from_slice(&manifest.query_semantics().as_bytes());
         DerivationId(Digest::of_bytes(&bytes))
+    }
+
+    /// The underlying digest value.
+    pub fn as_digest(&self) -> Digest {
+        self.0
+    }
+
+    /// The raw 64-bit value of the derivation identifier.
+    pub fn as_u64(&self) -> u64 {
+        self.0.as_u64()
+    }
+
+    /// Formats the derivation identifier as a 16-character lowercase hex string.
+    pub fn to_hex(&self) -> String {
+        self.0.to_hex()
     }
 }
 

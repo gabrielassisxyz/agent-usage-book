@@ -367,6 +367,19 @@ impl NormalizedUsageEvent {
         &self.usage
     }
 
+    /// The file the record was read from: the one provenance source that is not
+    /// a strong-identity entry. One definition, here, because the spend grouping,
+    /// the cumulative pipeline and the collision diagnostics all read the same
+    /// convention rather than each re-deriving it.
+    pub fn source_file(&self) -> &str {
+        self.provenance
+            .sources()
+            .iter()
+            .find(|source| !source.starts_with(STRONG_IDENTITY_PREFIX))
+            .map(String::as_str)
+            .unwrap_or_default()
+    }
+
     pub fn classification(&self) -> &EvidenceClassification {
         &self.classification
     }
