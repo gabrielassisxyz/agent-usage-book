@@ -35,7 +35,7 @@ forensic copy until the recovery has been reviewed.
 Run the scripted drill from the repository root:
 
 ```sh
-tests/e2e/run.sh --cases-dir tests/e2e/cases/013-restore-drill.sh
+tests/e2e/run.sh
 ```
 
 The drill creates a real archive, restores it into a new scratch directory,
