@@ -63,6 +63,7 @@ aub_command_enum! {
     ExitClass,
     AttemptCrashHook,
     RateCard,
+    Backup,
     Doctor,
 }
 
@@ -91,7 +92,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -101,6 +102,7 @@ impl Command {
         Self::ExitClass,
         Self::AttemptCrashHook,
         Self::RateCard,
+        Self::Backup,
         Self::Doctor,
     ];
 
@@ -239,6 +241,21 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Backup => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "backup prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "backup derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "backup covers the whole ledger",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "backup prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::Doctor => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Rejected {
@@ -268,6 +285,7 @@ impl Command {
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
             Command::RateCard => "rate-card",
+            Command::Backup => "backup",
             Command::Doctor => "doctor",
         }
     }
@@ -291,6 +309,7 @@ impl Command {
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
+            Command::Backup => Some("create or verify a consistent archive of durable state"),
             Command::Doctor => Some("health, drift and integrity diagnostics"),
         }
     }
@@ -303,6 +322,9 @@ impl Command {
             Command::Spend => Some("how many tokens did each transcript source use per UTC day?"),
             Command::Config => Some("which configuration key resolved from where?"),
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
+            Command::Backup => Some(
+                "is there a consistent, verified archive of the durable state, and does it restore?",
+            ),
             Command::Doctor => Some(
                 "is the recorded evidence healthy, and does the transcript corpus still match its parsers?",
             ),
@@ -348,6 +370,7 @@ impl Command {
         match self {
             Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
+            Command::Backup => Some("DESTINATION | verify DESTINATION"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
             Command::Doctor => Some("--transcript-format-drift"),
             Command::Status
@@ -622,6 +645,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
+        Command::Backup => backup_command(&RealClock::new(), &invocation),
         Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
     }
 }
@@ -1308,6 +1332,59 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
         line.push_str(&format!(" review-due {}", date.iso()));
     }
     line
+}
+
+/// `aub backup DEST` creates a new archive; `aub backup verify DEST` clears
+/// and recomputes its verification result. The archive module owns the cut and
+/// verification protocol, while this layer only resolves configuration and
+/// renders the typed summary.
+fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let (verify, destination) = match invocation.rest.as_slice() {
+        [destination] => (false, destination),
+        [subcommand, destination] if subcommand == "verify" => (true, destination),
+        rest => {
+            return Err(Error::Usage(format!(
+                "backup requires DEST or `verify DEST`, got {rest:?}"
+            )));
+        }
+    };
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let destination = std::path::Path::new(destination);
+    let summary = if verify {
+        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?
+    } else {
+        crate::store::startup::run_after_state_check(
+            &config.state.dir,
+            &crate::store::startup::ProcMounts,
+            || {
+                crate::backup::create_archive(
+                    &config.state.dir,
+                    destination,
+                    config.sampling.request_timeout,
+                    clock,
+                )
+            },
+        )??
+    };
+    println!(
+        "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
+        summary.verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_records,
+        summary.drain_completed,
+        summary.destination.display(),
+    );
+    Ok(())
 }
 
 #[cfg(test)]
