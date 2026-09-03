@@ -60,19 +60,10 @@ impl Repository {
         connection::open(&self.database_path, AccessMode::ReadWrite, &self.policy)
     }
 
-    /// Opens one short read-only snapshot for the projection publisher, so the
+    /// Publishes the projection over one fresh read-only snapshot, so the
     /// generation and the state the file describes are read as one moment.
     fn publish_projection(&self) -> Publication {
-        let reader = match connection::open(&self.database_path, AccessMode::ReadOnly, &self.policy)
-        {
-            Ok(reader) => reader,
-            Err(error) => {
-                return Publication::Deferred {
-                    reason: error.to_string(),
-                };
-            }
-        };
-        projection::publish(&reader, &self.projection_path())
+        self.publish_with(projection::publish)
     }
 
     fn with_read_connection<T>(
