@@ -1103,47 +1103,47 @@ fn status(
     let projection_path = crate::projection::projection_path_in(&config.state.dir);
     let (projection_state, accounts, ledger_generation) =
         match crate::projection::reader::read_projection(&projection_path) {
-        crate::projection::reader::ProjectionRead::Available(projection) => {
-            let accounts = projection_accounts(
-                &config,
-                &projection,
-                account_selector,
-                model_selector,
-                clock,
-            );
-            logger
-                .emit(
-                    timestamp,
-                    DiagnosticEvent::ProjectionRead,
-                    &[("state", &LogicalName::new("ok"))],
+            crate::projection::reader::ProjectionRead::Available(projection) => {
+                let accounts = projection_accounts(
+                    &config,
+                    &projection,
+                    account_selector,
+                    model_selector,
+                    clock,
+                );
+                logger
+                    .emit(
+                        timestamp,
+                        DiagnosticEvent::ProjectionRead,
+                        &[("state", &LogicalName::new("ok"))],
+                    )
+                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                let generation = LedgerGeneration::new(projection.ledger_generation.value());
+                (
+                    crate::report::ProjectionReadState::Read,
+                    accounts,
+                    generation,
                 )
-                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-            let generation = LedgerGeneration::new(projection.ledger_generation.value());
-            (
-                crate::report::ProjectionReadState::Read,
-                accounts,
-                generation,
-            )
-        }
-        crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
-            let state_name = unavailable.state_name();
-            let state = crate::report::ProjectionReadState::Unavailable {
-                state: state_name,
-                reason: unavailable.reason(),
-            };
-            logger
-                .emit(
-                    timestamp,
-                    DiagnosticEvent::ProjectionRead,
-                    &[("state", &LogicalName::new(state_name))],
-                )
-                .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-            // No account line exists when the projection is unreadable: the
-            // degraded form is the whole answer, and no value may be
-            // substituted for the readings that cannot be computed.
-            (state, Vec::new(), LedgerGeneration::new(0))
-        }
-    };
+            }
+            crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
+                let state_name = unavailable.state_name();
+                let state = crate::report::ProjectionReadState::Unavailable {
+                    state: state_name,
+                    reason: unavailable.reason(),
+                };
+                logger
+                    .emit(
+                        timestamp,
+                        DiagnosticEvent::ProjectionRead,
+                        &[("state", &LogicalName::new(state_name))],
+                    )
+                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+                // No account line exists when the projection is unreadable: the
+                // degraded form is the whole answer, and no value may be
+                // substituted for the readings that cannot be computed.
+                (state, Vec::new(), LedgerGeneration::new(0))
+            }
+        };
 
     let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
     let report = StatusReport::new(metadata, accounts, vec![], projection_state);
@@ -1672,6 +1672,7 @@ mod tests {
                 ("--format", policy.format),
                 ("--explain", policy.explain),
                 ("--account", policy.account),
+                ("--model", policy.model),
                 ("--no-color", policy.no_color),
             ] {
                 if let FlagSupport::Rejected { reason } = support {
@@ -1785,9 +1786,8 @@ mod tests {
 
     /// `--account` is a parsed token for every command, and the parser honours the
     /// policy: a rejection emits the policy's reason, an acceptance lands as the
-    /// invocation's account. No command accepts it yet (status's filtering
-    /// arrives with aub-me5.6), so the loop's rejection arm is the one that
-    /// fires; the acceptance arm is the parser's contract for when one does.
+    /// invocation's account. Status is the one command that accepts it, and the
+    /// selector is why.
     #[test]
     fn the_parser_honours_the_account_policy_for_every_command() {
         for command in Command::ALL {
@@ -1809,6 +1809,47 @@ mod tests {
                     }
                     other => panic!("{command:?} rejects --account but parsed as {other:?}"),
                 },
+            }
+        }
+    }
+
+    /// `--model` is a parsed token for every command, both the `--model M` and
+    /// `--model=M` spellings, and the parser honours the policy: status is the
+    /// one command that accepts it, and the window selection is why.
+    #[test]
+    fn the_parser_honours_the_model_policy_for_every_command() {
+        for spelling in [
+            vec!["--model", "claude-model-x"],
+            vec!["--model=claude-model-x"],
+        ] {
+            let mut argv = vec![Command::Status.name()];
+            argv.extend(spelling);
+            let result = parse_invocation(args(&argv));
+            match result {
+                Ok(Request::Run(invocation)) => assert_eq!(
+                    invocation.model.as_deref(),
+                    Some("claude-model-x"),
+                    "status must parse --model as the value: {invocation:?}"
+                ),
+                other => panic!("status accepts --model but parsed as {other:?}"),
+            }
+        }
+
+        for command in Command::ALL {
+            if command == Command::Status {
+                continue;
+            }
+            let result = parse_invocation(args(&[command.name(), "--model", "m"]));
+            match command.flag_policy().model {
+                FlagSupport::Rejected { reason } => match result {
+                    Err(Error::Usage(message)) => {
+                        assert!(message.contains(reason), "{command:?}: {message}")
+                    }
+                    other => panic!("{command:?} rejects --model but parsed as {other:?}"),
+                },
+                FlagSupport::Accepted => {
+                    panic!("{command:?} declares --model accepted but status is the only selector")
+                }
             }
         }
     }
@@ -2117,5 +2158,70 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             provenance.get("accounts"),
             Some(crate::config::ConfigSource::File)
         );
+    }
+
+    /// The status contract's shape (PLAN.md sections 16.2 and 43 workflow 4):
+    /// the status function's own source performs exactly configuration
+    /// resolution sufficient to locate the projection, one bounded file read,
+    /// freshness computation and formatting. Nothing else is referenced from
+    /// it, so a store, transcript, calibration, rate-card or write call that
+    /// joined the status path would fail here before it could block a status
+    /// bar on another aub operation.
+    #[test]
+    fn the_status_function_performs_only_the_status_contract() {
+        let source = include_str!("cli.rs");
+        // The status path is fn status and the helpers it alone uses, so the
+        // scan covers the bodies that carry its work, not just its own text.
+        let status_body = [
+            function_body(source, "fn status("),
+            function_body(source, "fn projection_accounts("),
+            function_body(source, "fn status_clock_skew_envelope("),
+        ]
+        .concat();
+
+        for forbidden in [
+            "rusqlite",
+            "Connection",
+            "store::connection",
+            "store::migrate",
+            "transcripts::",
+            "calibration",
+            "rate_book",
+            "ureq",
+            "reqwest",
+            "http",
+            "spool",
+            "fs::write",
+            "OpenOptions",
+            "create_dir",
+            "remove_file",
+        ] {
+            assert!(
+                !status_body.contains(forbidden),
+                "the status function's source must not reference {forbidden}: the status contract allows only configuration resolution, one bounded projection read, freshness computation and formatting"
+            );
+        }
+    }
+
+    /// The negative that keeps the scan above a test rather than a ritual: a
+    /// function body that does name the store fails the same scan.
+    #[test]
+    fn the_status_contract_scan_catches_a_forbidden_reference() {
+        let poisoned = "fn status() { let conn = rusqlite::Connection::open_in_memory(); }";
+        assert!(function_body(poisoned, "fn status(").contains("rusqlite"));
+    }
+
+    /// The body of one function in this file: from its declaration to the
+    /// next top-level `fn`, or to the end of the file.
+    fn function_body(source: &str, declaration: &str) -> String {
+        let start = source
+            .find(declaration)
+            .unwrap_or_else(|| panic!("cli.rs must declare {declaration}"));
+        let rest = &source[start..];
+        let end = rest[declaration.len()..]
+            .find("\nfn ")
+            .map(|offset| offset + declaration.len() + 1)
+            .unwrap_or(rest.len());
+        rest[..end].to_string()
     }
 }

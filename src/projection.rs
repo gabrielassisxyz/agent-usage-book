@@ -206,7 +206,9 @@ pub struct TerminalOutcome {
 impl Projection {
     /// The file document: the schema version plus the carried state. Field
     /// names are the schema test's contract; no key outside them is written.
-    fn to_json(&self) -> Value {
+    /// `pub(crate)` so the reader's round-trip test drives the same
+    /// serializer the publisher uses.
+    pub(crate) fn to_json(&self) -> Value {
         json!({
             "schema_version": PROJECTION_SCHEMA_VERSION,
             "ledger_generation": self.ledger_generation.value(),

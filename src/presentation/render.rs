@@ -10,9 +10,9 @@ use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
-use crate::domain::window::NominalWindowDuration;
 use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
 use crate::domain::tokens::TokenKind;
+use crate::domain::window::NominalWindowDuration;
 use crate::error::Error;
 use crate::evidence::CoverageCompleteness;
 use crate::presentation::precision::{PERCENT, TOKENS};
@@ -804,9 +804,7 @@ mod tests {
         };
 
         // No colour is ever added; the words alone distinguish the three states.
-        assert!(
-            render_meter_reading(&fresh, "%", precision, now, envelope, None).contains("left")
-        );
+        assert!(render_meter_reading(&fresh, "%", precision, now, envelope, None).contains("left"));
         assert!(
             render_meter_reading(&stale, "%", precision, now, envelope, None).contains("stale")
         );

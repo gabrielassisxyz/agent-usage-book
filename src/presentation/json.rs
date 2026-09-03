@@ -11,9 +11,9 @@ use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::interval::{DomainQuantity, Interval};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
-use crate::domain::window::WindowScope;
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
+use crate::domain::window::WindowScope;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
@@ -1001,7 +1001,10 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
         fields.push(format!("\"included_scopes\":[{scopes}]"));
     }
     if let Some(model) = &account.selected_model {
-        fields.push(format!("\"selected_model\":{}", json_string(model.as_str())));
+        fields.push(format!(
+            "\"selected_model\":{}",
+            json_string(model.as_str())
+        ));
     }
     if let Some(limit) = &account.limiting_window {
         let scope_part = match &limit.scope {

@@ -20,11 +20,11 @@ use std::path::Path;
 use serde_json::Value;
 
 use super::{
-    LatestAttempt, Projection, ProjectedAccount, ProjectedWindow, SuccessfulObservation,
-    TerminalOutcome, PROJECTION_SCHEMA_VERSION,
+    LatestAttempt, PROJECTION_SCHEMA_VERSION, ProjectedAccount, ProjectedWindow, Projection,
+    SuccessfulObservation, TerminalOutcome,
 };
 use crate::domain::attempt::{AttemptId, AttemptOutcome, AttemptResult, AttemptStarted};
-use crate::domain::freshness::{compute_freshness, Freshness, FreshnessInput, Observed};
+use crate::domain::freshness::{Freshness, FreshnessInput, Observed, compute_freshness};
 use crate::domain::ids::CredentialContextId;
 use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining, QuotaUsed};
 use crate::domain::time::{
@@ -34,7 +34,7 @@ use crate::domain::window::{ModelId, NominalWindowDuration, ReportedResolution, 
 use crate::store::account::AccountId;
 use crate::store::ledger_generation::Generation;
 use crate::store::meter_attempt::failure_class_sql;
-use crate::store::meter_evidence::{measurement_basis_sql, quantization_sql, ObservationRowId};
+use crate::store::meter_evidence::{ObservationRowId, measurement_basis_sql, quantization_sql};
 
 /// The read bound for one projection file. A projection is a bounded document
 /// by construction: one record per configured account. A file larger than this
@@ -81,9 +81,9 @@ impl ProjectionUnavailable {
     pub fn reason(&self) -> String {
         match self {
             ProjectionUnavailable::Missing => "projection not found".to_string(),
-            ProjectionUnavailable::TooLarge { limit_bytes } => format!(
-                "projection exceeds the read bound of {limit_bytes} bytes"
-            ),
+            ProjectionUnavailable::TooLarge { limit_bytes } => {
+                format!("projection exceeds the read bound of {limit_bytes} bytes")
+            }
             ProjectionUnavailable::Malformed { detail } => {
                 format!("projection malformed: {detail}")
             }
@@ -132,11 +132,10 @@ pub fn read_projection(path: &Path) -> ProjectionRead {
 /// schema version has been checked. An unsupported version never reaches the
 /// field parser, so a format this binary does not know cannot be misread.
 fn parse_projection(text: &str) -> Result<Projection, ProjectionUnavailable> {
-    let document: Value = serde_json::from_str(text).map_err(|error| {
-        ProjectionUnavailable::Malformed {
+    let document: Value =
+        serde_json::from_str(text).map_err(|error| ProjectionUnavailable::Malformed {
             detail: format!("not valid JSON: {error}"),
-        }
-    })?;
+        })?;
     let Some(version) = document.get("schema_version") else {
         return Err(ProjectionUnavailable::Malformed {
             detail: "no schema version".to_string(),
@@ -153,7 +152,8 @@ fn parse_projection(text: &str) -> Result<Projection, ProjectionUnavailable> {
             supported: PROJECTION_SCHEMA_VERSION,
         });
     }
-    projection_from_document(&document).map_err(|detail| ProjectionUnavailable::Malformed { detail })
+    projection_from_document(&document)
+        .map_err(|detail| ProjectionUnavailable::Malformed { detail })
 }
 
 fn projection_from_document(document: &Value) -> Result<Projection, String> {
@@ -278,9 +278,9 @@ fn terminal_outcome_from_document(value: &Value) -> Result<TerminalOutcome, Stri
                 .get("failure_class")
                 .and_then(Value::as_str)
                 .ok_or_else(|| "an unreachable outcome carries no failure class".to_string())?;
-            AttemptOutcome::Unreachable(failure_class_sql::from_sql(class).map_err(|error| {
-                error.to_string()
-            })?)
+            AttemptOutcome::Unreachable(
+                failure_class_sql::from_sql(class).map_err(|error| error.to_string())?,
+            )
         }
         other => return Err(format!("unknown attempt outcome {other:?}")),
     };
@@ -290,7 +290,10 @@ fn terminal_outcome_from_document(value: &Value) -> Result<TerminalOutcome, Stri
     })
 }
 
-fn as_object<'a>(value: &'a Value, what: &str) -> Result<&'a serde_json::Map<String, Value>, String> {
+fn as_object<'a>(
+    value: &'a Value,
+    what: &str,
+) -> Result<&'a serde_json::Map<String, Value>, String> {
     value
         .as_object()
         .ok_or_else(|| format!("{what} is not an object"))
@@ -310,7 +313,10 @@ fn required_i64(object: &serde_json::Map<String, Value>, key: &str) -> Result<i6
         .ok_or_else(|| format!("{key} is not an integer"))
 }
 
-fn required_str<'a>(object: &'a serde_json::Map<String, Value>, key: &str) -> Result<&'a str, String> {
+fn required_str<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'a str, String> {
     object
         .get(key)
         .and_then(Value::as_str)
@@ -501,8 +507,10 @@ mod tests {
                 Some(name) => WindowScope::ModelSpecific(ModelId::new(name.to_string())),
             },
             quota_used_ppm: QuotaUsed::new(QuotaFractionPpm::new(used_ppm).unwrap()),
-            reported_resolution_ppm: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
-                .unwrap(),
+            reported_resolution_ppm: ReportedResolution::new(
+                QuotaFractionPpm::new(10_000).unwrap(),
+            )
+            .unwrap(),
             quantization: QuantizationSemantics::Exact,
             resets_at: UtcTimestamp::from_unix_nanos(9_000),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
@@ -525,7 +533,11 @@ mod tests {
         assert_eq!(no_selector.len(), 3, "no selector: every window applies");
 
         let model_only = applicable_windows(&windows, Some("claude-model-x"));
-        assert_eq!(model_only.len(), 2, "the chosen model joins the account-wide windows");
+        assert_eq!(
+            model_only.len(),
+            2,
+            "the chosen model joins the account-wide windows"
+        );
         assert!(
             model_only
                 .iter()
@@ -542,10 +554,7 @@ mod tests {
             1,
             "an unknown model leaves only the account-wide windows"
         );
-        assert!(matches!(
-            unknown_model[0].scope,
-            WindowScope::AccountWide
-        ));
+        assert!(matches!(unknown_model[0].scope, WindowScope::AccountWide));
     }
 
     /// The limiting window is the applicable window with the least remaining
@@ -561,7 +570,10 @@ mod tests {
                 provider_observed_at: Some(UtcTimestamp::from_unix_nanos(1_000)),
                 received_at: UtcTimestamp::from_unix_nanos(1_100),
                 measurement_basis: MeasurementBasis::ProviderObserved,
-                windows: vec![window(100_000, None), window(620_000, Some("claude-model-x"))],
+                windows: vec![
+                    window(100_000, None),
+                    window(620_000, Some("claude-model-x")),
+                ],
             }),
             latest_attempt: Some(LatestAttempt {
                 attempt_id: AttemptId::new(2),
@@ -587,7 +599,9 @@ mod tests {
             panic!("an observation one second old within the horizon is fresh");
         };
         assert_eq!(observed.value().as_ppm().get(), 380_000);
-        let limit = reading.limiting_window.expect("a windowed observation names its limit");
+        let limit = reading
+            .limiting_window
+            .expect("a windowed observation names its limit");
         assert_eq!(limit.nominal_duration.as_nanos(), 18_000_000_000_000);
         assert_eq!(reading.included_scopes.len(), 2);
     }
@@ -620,7 +634,10 @@ mod tests {
             &clock,
         );
 
-        let Freshness::Stale { last_good, reason, .. } = &reading.freshness else {
+        let Freshness::Stale {
+            last_good, reason, ..
+        } = &reading.freshness
+        else {
             panic!("no applicable window means no reading value");
         };
         assert!(last_good.is_none());
@@ -663,7 +680,10 @@ mod tests {
             &clock,
         );
 
-        let Freshness::Stale { reason, last_good, .. } = &reading.freshness else {
+        let Freshness::Stale {
+            reason, last_good, ..
+        } = &reading.freshness
+        else {
             panic!("a resultless attempt past the command horizon is stale");
         };
         assert!(matches!(reason, StaleReason::CollectorInterrupted));
@@ -671,4 +691,234 @@ mod tests {
     }
 
     use crate::domain::freshness::StaleReason;
+}
+#[cfg(test)]
+mod read_tests {
+    use super::*;
+    use crate::domain::attempt::AttemptId;
+    use crate::domain::failure::FailureClass;
+    use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+    use crate::domain::time::MeasurementBasis;
+    use crate::domain::window::{QuantizationSemantics, ReportedResolution};
+    use crate::projection::{
+        LatestAttempt, PROJECTION_FILE_NAME, PROJECTION_SCHEMA_VERSION, ProjectedAccount,
+        ProjectedWindow, Projection, SuccessfulObservation, TerminalOutcome, recorded_generation,
+    };
+    use crate::store::account::AccountId;
+    use crate::store::meter_evidence::ObservationRowId;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aub-projection-reader-test-{}-{suffix}",
+                std::process::id()
+            ));
+            fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn sample() -> Projection {
+        Projection {
+            ledger_generation: Generation::new(12),
+            accounts: vec![ProjectedAccount {
+                account_id: AccountId::new(1),
+                logical_name: "work".to_string(),
+                provider: "anthropic".to_string(),
+                last_successful_observation: Some(SuccessfulObservation {
+                    observation_id: ObservationRowId::new(7),
+                    provider_observed_at: Some(UtcTimestamp::from_unix_nanos(3_400)),
+                    received_at: UtcTimestamp::from_unix_nanos(3_500),
+                    measurement_basis: MeasurementBasis::ProviderObserved,
+                    windows: vec![ProjectedWindow {
+                        semantic_key: "five_hour".to_string(),
+                        scope: WindowScope::ModelSpecific(ModelId::new(
+                            "claude-model-x".to_string(),
+                        )),
+                        quota_used_ppm: QuotaUsed::new(QuotaFractionPpm::new(620_000).unwrap()),
+                        reported_resolution_ppm: ReportedResolution::new(
+                            QuotaFractionPpm::new(10_000).unwrap(),
+                        )
+                        .unwrap(),
+                        quantization: QuantizationSemantics::RoundedToNearest,
+                        resets_at: UtcTimestamp::from_unix_nanos(9_000),
+                        nominal_duration_nanos: NominalWindowDuration::from_nanos(
+                            18_000_000_000_000,
+                        ),
+                    }],
+                }),
+                latest_attempt: Some(LatestAttempt {
+                    attempt_id: AttemptId::new(9),
+                    request_started_at: UtcTimestamp::from_unix_nanos(3_000),
+                    credential_context_id: Some("credential-context-v1".to_string()),
+                    // The file vocabulary names the transport-timeout class
+                    // once, and the reader reconstructs the representative
+                    // ReadTimeout: ConnectTimeout and ReadTimeout are the same
+                    // stored fact, which is why the round trip pins that one.
+                    result: Some(TerminalOutcome {
+                        completed_at: UtcTimestamp::from_unix_nanos(4_000),
+                        outcome: AttemptOutcome::Unreachable(FailureClass::ReadTimeout),
+                    }),
+                }),
+            }],
+        }
+    }
+
+    fn write_sample(dir: &ScratchDir) -> PathBuf {
+        let path = dir.path().join(crate::projection::PROJECTION_FILE_NAME);
+        let document = serde_json::to_vec(&sample().to_json()).unwrap();
+        fs::write(&path, document).unwrap();
+        path
+    }
+
+    /// The reader reads back exactly what the publisher writes: a full
+    /// round trip through the file, so the read side cannot grow a second,
+    /// drifting interpretation of the format.
+    #[test]
+    fn a_published_file_round_trips_through_the_reader() {
+        let scratch = ScratchDir::new();
+        let path = write_sample(&scratch);
+
+        let ProjectionRead::Available(read) = read_projection(&path) else {
+            panic!("a file this schema wrote must be readable");
+        };
+        assert_eq!(read, sample());
+        assert_eq!(read.ledger_generation.value(), 12);
+    }
+
+    /// An unsupported schema version is refused before any content is parsed:
+    /// the file below carries an account that would parse only incorrectly,
+    /// and the unavailable result carries no accounts at all.
+    #[test]
+    fn an_unsupported_schema_version_is_refused_without_optimistic_parsing() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join(crate::projection::PROJECTION_FILE_NAME);
+        let body = format!(
+            "{{\"schema_version\":{},\"ledger_generation\":12,\"accounts\":[{{\"account_id\":1,\"logical_name\":\"work\",\"provider\":\"anthropic\",\"last_successful_observation\":null,\"latest_attempt\":{{\"attempt_id\":\"not-a-number\",\"request_started_at_nanos\":0,\"credential_context_id\":null,\"result\":null}}}}]}}",
+            PROJECTION_SCHEMA_VERSION + 1
+        );
+        fs::write(&path, body).unwrap();
+
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("an unsupported schema version must be refused");
+        };
+        assert_eq!(unavailable.state_name(), "unsupported_schema");
+        let ProjectionUnavailable::UnsupportedSchema { found, supported } = &unavailable else {
+            panic!("the reason must name the version");
+        };
+        assert_eq!(*found, u64::from(PROJECTION_SCHEMA_VERSION) + 1);
+        assert_eq!(*supported, PROJECTION_SCHEMA_VERSION);
+        assert!(unavailable.reason().contains("newer"));
+    }
+
+    /// The same refusal for a schema version older than this reader: the
+    /// design's "too old" projection, rendered with its own reason.
+    #[test]
+    fn an_older_schema_version_is_refused_as_too_old() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join(crate::projection::PROJECTION_FILE_NAME);
+        fs::write(
+            &path,
+            "{\"schema_version\":0,\"ledger_generation\":1,\"accounts\":[]}",
+        )
+        .unwrap();
+
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("an older schema version must be refused");
+        };
+        assert!(unavailable.reason().contains("older"));
+    }
+
+    /// A malformed file is refused with a reason, and never becomes a zero or
+    /// a stale value labelled fresh.
+    #[test]
+    fn a_malformed_file_is_refused_with_a_reason() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join(crate::projection::PROJECTION_FILE_NAME);
+        fs::write(&path, "not json at all").unwrap();
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("garbage must be refused");
+        };
+        assert_eq!(unavailable.state_name(), "malformed");
+
+        // Valid JSON, wrong shape: the fields a reader requires are named.
+        fs::write(&path, "{}").unwrap();
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("an envelope without a schema version must be refused");
+        };
+        assert_eq!(unavailable.state_name(), "malformed");
+    }
+
+    /// A missing file is the design's most common degraded state, and it is a
+    /// fact about the world, not an error the caller must interpret.
+    #[test]
+    fn a_missing_file_is_unavailable_as_missing() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join(crate::projection::PROJECTION_FILE_NAME);
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("a missing file must be unavailable");
+        };
+        assert_eq!(unavailable.state_name(), "missing");
+        assert_eq!(unavailable.reason(), "projection not found");
+    }
+
+    /// The read is bounded: a file past the bound is refused unread.
+    #[test]
+    fn an_oversized_file_is_refused_unread() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join(crate::projection::PROJECTION_FILE_NAME);
+        let oversized = vec![b'x'; (MAX_PROJECTION_BYTES + 1) as usize];
+        fs::write(&path, oversized).unwrap();
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("an oversized file must be refused");
+        };
+        let ProjectionUnavailable::TooLarge { limit_bytes } = &unavailable else {
+            panic!("the reason must name the bound");
+        };
+        assert_eq!(*limit_bytes, MAX_PROJECTION_BYTES);
+    }
+
+    /// The negative that keeps the bound a real check: a file at the bound is
+    /// read (and then refused as malformed, which proves it was read).
+    #[test]
+    fn a_file_at_the_bound_is_still_read() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join(crate::projection::PROJECTION_FILE_NAME);
+        let at_bound = vec![b'x'; MAX_PROJECTION_BYTES as usize];
+        fs::write(&path, at_bound).unwrap();
+        let ProjectionRead::Unavailable(unavailable) = read_projection(&path) else {
+            panic!("an unreadable file must be unavailable");
+        };
+        assert_eq!(
+            unavailable.state_name(),
+            "malformed",
+            "the file was read and failed to parse, so the bound did not fire"
+        );
+    }
+
+    /// The recorded generation the reader saw is the one the file text names.
+    #[test]
+    fn the_recorded_generation_is_read_from_the_same_text() {
+        let scratch = ScratchDir::new();
+        let path = write_sample(&scratch);
+        let text = fs::read_to_string(&path).unwrap();
+        assert_eq!(recorded_generation(&text), Some(12));
+    }
 }
