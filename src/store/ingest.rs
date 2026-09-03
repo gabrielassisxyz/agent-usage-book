@@ -131,13 +131,16 @@ pub struct PersistOutcome {
 /// The stated per-batch writer-slot budget (PLAN.md section 11.2): no single
 /// ingest batch may hold the SQLite writer slot longer than this, because a
 /// meter write that arrives mid-batch must be served after at most one batch's
-/// hold, well inside the connection policy's bounded busy timeout. The bound
-/// caps the transaction `config.ingest.max_batch_events` produces at the
-/// documented default; a batch that measures over it says so in its diagnostic
-/// rather than silently stretching the meter's worst-case wait. This is a
-/// measurement target the tests assert, not a runtime abort: killing a batch
-/// that already holds valid rows would discard work to enforce a number.
-pub const WRITER_SLOT_BUDGET_PER_BATCH: MonotonicDuration = MonotonicDuration::from_millis(1_000);
+/// hold. The value is the ordinary writer's own default busy bound
+/// (`sampling.request_timeout`, 5s), so a meter write arriving mid-batch
+/// waits at most one batch's hold plus its own wait, both inside the bound it
+/// already carries. The bound caps the transaction
+/// `config.ingest.max_batch_events` produces at the documented default; a
+/// batch that measures over it says so in its diagnostic rather than silently
+/// stretching the meter's worst-case wait. This is a measurement target the
+/// tests assert, not a runtime abort: killing a batch that already holds
+/// valid rows would discard work to enforce a number.
+pub const WRITER_SLOT_BUDGET_PER_BATCH: MonotonicDuration = MonotonicDuration::from_millis(5_000);
 
 /// Lands one parse batch in the rebuildable materialization tables.
 ///

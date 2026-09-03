@@ -390,8 +390,10 @@ fn meter_first_holds_the_slot_and_the_ingest_batch_waits_without_losing_it() {
     let mut writer = ingest_conn(&fixture, 5_000);
     let started = std::time::Instant::now();
     let handle = std::thread::spawn(move || run_ingest_collecting(&mut writer, &config));
-    // Let the pass reach its first write transaction and block there.
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    // Let the pass reach its first write transaction and block there. The
+    // settle window is what makes the measurement claim decidable: the wall
+    // time provably contains it, and the honest writer-slot number must not.
+    std::thread::sleep(std::time::Duration::from_millis(4_000));
 
     // The meter write completes once the slot is free; the batch lands after.
     drop(held);
@@ -405,8 +407,19 @@ fn meter_first_holds_the_slot_and_the_ingest_batch_waits_without_losing_it() {
     let wall = started.elapsed();
     assert_eq!(report.batches.len(), 1);
     assert_eq!(report.outcome.events_written.value(), 2);
+    // The wall time provably contains the four-second settle window this
+    // schedule holds the slot for; the writer-slot number must exclude it.
+    // A measurement that starts before the BEGIN would absorb the settle
+    // window into the slot number and collapse the gap to the meter's own
+    // cycle. The gap is independent of how slow the machine makes the hold.
     assert!(
-        u128::from(batches[0].writer_slot.as_nanos()) < wall.as_nanos(),
+        batches[0].writer_slot.as_nanos() <= WRITER_SLOT_BUDGET_PER_BATCH.as_nanos(),
+        "the batch's own hold must respect the stated budget: {}ns",
+        batches[0].writer_slot.as_nanos()
+    );
+    assert!(
+        wall.as_nanos() - u128::from(batches[0].writer_slot.as_nanos())
+            > 3_000_000_000,
         "the writer-slot measurement must exclude the wait for a held slot: slot {}ns, wall {}ns",
         batches[0].writer_slot.as_nanos(),
         wall.as_nanos()
@@ -522,9 +535,22 @@ fn meter_writes_land_between_ingest_batches_while_the_pass_is_in_flight() {
         let mut landed = 0;
         for _ in 0..3 {
             let batch = batch_landed_rx
-                .recv()
+                .recv_timeout(std::time::Duration::from_secs(30))
                 .expect("the pass must announce each batch");
             assert!(batch.events <= 2, "no batch may exceed the bound");
+            // While the pass waits in the sink, the store must hold only whole
+            // facts: every canonical event landed so far carries its
+            // occurrence, and nothing is orphaned. A reader sampling between
+            // batches sees exactly this.
+            assert_eq!(
+                fixture.usage_reconciliation(),
+                (
+                    (landed + 1) as u64 * 2,
+                    (landed + 1) as u64 * 2,
+                    (landed + 1) as u64 * 2
+                ),
+                "between batches the store must hold whole batches only"
+            );
             // One meter write, start to terminal commit, between batches.
             let attempt = NewMeterAttempt {
                 run_id,
@@ -815,7 +841,7 @@ fn a_refused_batch_stops_the_pass_whole_and_a_rerun_converges() {
         });
 
         batch_landed_rx
-            .recv()
+            .recv_timeout(std::time::Duration::from_secs(30))
             .expect("batch one must land before the schedule holds the slot");
         let mut holder = extra_conn(&fixture, 150);
         let held = holder
