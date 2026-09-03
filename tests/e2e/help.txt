@@ -14,6 +14,7 @@ commands:
   rebuild  destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence
   doctor   health, drift and integrity diagnostics
   coverage did the sampler attempt what the policy owed, and did those attempts observe?
+  sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
 
 status:
   answers: how much quota does each configured account have left?
@@ -72,5 +73,11 @@ coverage:
   refuses: --model (coverage reports every window of the account, not one model); --no-color (coverage prints plain text or json)
   format: text | json
   options: --since DURATION (default 24h), --severe; --account is shared
+
+sample:
+  answers: are configured accounts due for meter sampling, and what did the endpoints observe?
+  refuses: --explain (sample derives no quantity); --model (sample operates on configured accounts, not models); --no-color (sample prints plain status or json)
+  format: text | json
+  options: --due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success
 
 aub            prints the version; aub --help prints this

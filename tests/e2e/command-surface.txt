@@ -13,3 +13,4 @@ doctor
 coverage
 ingest
 rebuild
+sample
