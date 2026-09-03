@@ -8,6 +8,7 @@ commands:
   spend    token usage per UTC day and transcript source, read from the configured transcripts
   config   print every resolved configuration key with the source that won
   rate-card import, show and history the immutable dated vendor rate cards
+  backup   create or verify a consistent archive of durable state
 
 status:
   answers: how much quota does each configured account have left?
@@ -30,5 +31,11 @@ rate-card:
   answers: what do the immutable dated vendor rate cards contain?
   refuses: --format (rate-card prints a price book, not a report); --explain (rate-card derives no quantity); --account (the rate book is reference data, not per-account state); --no-color (rate-card prints plain rows)
   format: text only: rate-card prints a price book, not a report
+
+backup:
+  answers: is there a consistent, verified archive of the durable state, and does it restore?
+  refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --no-color (backup prints no color)
+  format: text only: backup prints one operational result
+  options: DESTINATION | verify DESTINATION
 
 aub            prints the version; aub --help prints this

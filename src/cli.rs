@@ -282,6 +282,9 @@ impl Command {
             Command::Spend => Some("how many tokens did each transcript source use per UTC day?"),
             Command::Config => Some("which configuration key resolved from where?"),
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
+            Command::Backup => Some(
+                "is there a consistent, verified archive of the durable state, and does it restore?",
+            ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
         }
@@ -321,6 +324,7 @@ impl Command {
         match self {
             Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
+            Command::Backup => Some("DESTINATION | verify DESTINATION"),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck

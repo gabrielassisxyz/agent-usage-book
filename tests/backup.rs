@@ -87,6 +87,14 @@ fn migrated_state_dir() -> ScratchDir {
 fn undrainable_bundle(attempt_id: i64) -> PendingTerminalBundle {
     PendingTerminalBundle {
         attempt_id,
+        completed_at_nanos: 2_000,
+        elapsed_nanos: 1_000,
+        outcome: "success".into(),
+        failure_class: None,
+        retry_after_nanos: None,
+        sanitized_error_classification: None,
+        retry_index: None,
+        clock_anomaly: false,
         response_classification: "success".into(),
         received_at_nanos: 1_000,
         provider_observed_at_original: Some("2026-09-02T00:00:00Z".into()),
