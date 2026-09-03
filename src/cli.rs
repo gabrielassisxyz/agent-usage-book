@@ -1061,7 +1061,9 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             source: None,
             changed_only: options.refresh == RefreshPolicy::Auto,
         };
-        match crate::ingest::run(&mut conn, &config, &ingest_options, timestamp) {
+        // The spend refresh lands batches without observing them; the batch sink is the
+        // ingest command's diagnostic surface, not the spend command's.
+        match crate::ingest::run(&mut conn, &config, &ingest_options, clock, &mut |_| Ok(())) {
             Ok(report) if report.unreadable_files.is_empty() => refresh_report = Some(report),
             Ok(report) => {
                 refresh_failure = Some(format!(
