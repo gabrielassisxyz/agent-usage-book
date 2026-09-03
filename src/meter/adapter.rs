@@ -177,6 +177,19 @@ pub trait HttpTransport {
     ) -> Result<HttpResponse, FailureClass>;
 }
 
+/// Every transport is usable through a shared reference, so one transport can
+/// be lent to every scoped-thread worker at once without cloning it.
+impl<T: HttpTransport + ?Sized> HttpTransport for &T {
+    fn send(
+        &self,
+        request: &HttpRequest,
+        budget: &CommandBudget,
+        clock: &impl Clock,
+    ) -> Result<HttpResponse, FailureClass> {
+        (**self).send(request, budget, clock)
+    }
+}
+
 /// The provider adapter contract (sections 9 and 33 Phase 2).
 ///
 /// One method per attempt. The adapter receives what it needs from the

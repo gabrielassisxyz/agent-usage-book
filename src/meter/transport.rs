@@ -15,6 +15,7 @@ use std::time::Duration;
 
 use crate::domain::failure::{FailureClass, HttpStatusClass};
 use crate::domain::time::{Clock, MonotonicDuration, MonotonicInstant};
+use crate::meter::adapter::HttpTransport;
 
 /// Documented, tested shutdown tolerance for scoped-thread joins after budget expiry.
 pub const SHUTDOWN_TOLERANCE: MonotonicDuration = MonotonicDuration::from_millis(250);
@@ -196,6 +197,25 @@ impl<K> CorrelatedRequest<K> {
 pub struct CorrelatedResponse<K> {
     pub key: K,
     pub result: Result<HttpResponse, FailureClass>,
+}
+
+/// The production HTTP transport port: every request goes through
+/// [`execute_single`], the one place the blocking driver is referenced (rule
+/// `12`). The caller hands it a [`CommandBudget`], so the same request shape
+/// serves both the single-request path and the sampler's batch workers: the
+/// budget the caller passes is the one whose expiry clips every timeout.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct BlockingTransport;
+
+impl HttpTransport for BlockingTransport {
+    fn send(
+        &self,
+        request: &HttpRequest,
+        budget: &CommandBudget,
+        clock: &impl Clock,
+    ) -> Result<HttpResponse, FailureClass> {
+        execute_single(request, budget, clock)
+    }
 }
 
 /// Executes a single HTTP request respecting the command-wide budget.
@@ -684,6 +704,30 @@ mod tests {
         assert_eq!(
             clipped.total_timeout,
             Some(MonotonicDuration::from_millis(500))
+        );
+    }
+
+    /// The production port drives the same executor the free function is: a
+    /// request through [`BlockingTransport`] against a port nothing listens
+    /// on comes back classified, proving the impl is wired to the real
+    /// driver and not to silence.
+    #[test]
+    fn the_blocking_transport_port_drives_the_real_executor() {
+        let clock = RealClock::new();
+        let unused_port = {
+            let temp = TcpListener::bind("127.0.0.1:0").unwrap();
+            temp.local_addr().unwrap().port()
+        };
+        let request = HttpRequest::get(
+            format!("http://127.0.0.1:{unused_port}"),
+            timeouts(50, 50, Some(50)),
+        );
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
+        let result = BlockingTransport.send(&request, &budget, &clock);
+        assert_eq!(
+            result,
+            Err(FailureClass::ConnectTimeout),
+            "the port must classify a refused connection through execute_single"
         );
     }
 }

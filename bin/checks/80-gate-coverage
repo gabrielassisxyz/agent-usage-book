@@ -29,6 +29,7 @@ declared_checks=(
     78-pane-work-cycle
     80-batch-verify-close
     80-gate-coverage
+    82-identity-privacy-scan
 )
 
 declared_boundary_rules=(

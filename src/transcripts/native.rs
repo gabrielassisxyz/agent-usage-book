@@ -1178,7 +1178,9 @@ mod tests {
     }
 
     /// No fixture contains a credential pattern, a personal identifier, or an
-    /// absolute home path.
+    /// absolute home path. Reads the one shared forbidden-pattern list
+    /// (`docs/forbidden-patterns.txt`) rather than a private copy, so a
+    /// pattern added there protects this scan too (aub-n27.4).
     #[test]
     fn no_fixture_contains_a_credential_a_personal_identifier_or_a_home_path() {
         let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(FIXTURE_DIR);
@@ -1188,32 +1190,10 @@ mod tests {
                 continue;
             }
             let contents = std::fs::read_to_string(&path).expect("fixture must be readable");
-            let lower = contents.to_lowercase();
-            for pattern in [
-                "sk-ant-",
-                "sk-",
-                "api_key",
-                "apikey",
-                "access_token",
-                "accesstoken",
-                "refresh_token",
-                "refreshtoken",
-                "bearer",
-            ] {
-                assert!(
-                    !lower.contains(pattern),
-                    "fixture {} contains credential pattern {pattern:?}",
-                    path.display()
-                );
-            }
+            let hits = test_support::sanitization::matched_patterns(&contents);
             assert!(
-                !lower.contains('@'),
-                "fixture {} contains a personal identifier",
-                path.display()
-            );
-            assert!(
-                !lower.contains("/home/") && !lower.contains("/users/"),
-                "fixture {} contains an absolute home path",
+                hits.is_empty(),
+                "fixture {} matches forbidden patterns {hits:?}",
                 path.display()
             );
         }
