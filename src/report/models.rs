@@ -16,7 +16,7 @@ use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::evidence::{CoverageCompleteness, Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
-pub use crate::store::export::{ExportKey, ExportRow};
+pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
 
 /// A monotonically increasing ledger generation.
 ///

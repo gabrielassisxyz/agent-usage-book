@@ -135,10 +135,10 @@ mod tests {
     use crate::domain::provenance::QuerySemantics;
     use crate::domain::time::UtcTimestamp;
     use crate::report::models::{
-        ExportReport, IngestionGeneration, LedgerGeneration, ReportMetadata,
+        ExportKey, ExportReport, ExportRow, IngestionGeneration, LedgerGeneration, ReportMetadata,
+        UsageByTokenClass,
     };
     use crate::report::provenance::{ProvenanceNode, ValueArithmetic};
-    use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
 
     fn node() -> ProvenanceNode {
         ProvenanceNode::new(
