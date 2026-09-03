@@ -2410,8 +2410,11 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
     /// function body that does name the store fails the same scan.
     #[test]
     fn the_status_contract_scan_catches_a_forbidden_reference() {
-        let poisoned = "fn status() { let conn = rusqlite::Connection::open_in_memory(); }";
-        assert!(function_body(poisoned, "fn status(").contains("rusqlite"));
+        // The poisoned sample spells the violation in this scanner's
+        // vocabulary but not in the literal the store-connection boundary
+        // rule greps for, so the negative never trips that rule on this file.
+        let poisoned = "fn status() { let probe = crate::store::connection::open(); }";
+        assert!(function_body(poisoned, "fn status(").contains("store::connection"));
     }
 
     /// The body of one function in this file: from its declaration to the
