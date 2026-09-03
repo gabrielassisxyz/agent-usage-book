@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 17 are enforced by mechanical checks present at HEAD (file paths and tests), and 10 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 18 are enforced by mechanical checks present at HEAD (file paths and tests), and 9 are unenforced and tracked by open beads in the tracker.
