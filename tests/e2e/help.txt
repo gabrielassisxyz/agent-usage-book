@@ -11,12 +11,12 @@ commands:
 
 status:
   answers: how much quota does each configured account have left?
-  refuses: --explain (status has no provenance renderer); --account (status reports every configured account); --no-color (status prints no color)
+  refuses: --account (status reports every configured account); --no-color (status prints no color)
   format: text | json
 
 spend:
   answers: how many tokens did each transcript source use per UTC day?
-  refuses: --explain (spend has no provenance renderer); --account (spend has no account dimension until account attribution lands); --no-color (spend prints no color)
+  refuses: --account (spend has no account dimension until account attribution lands); --no-color (spend prints no color)
   format: text | json
   options: --today (default) | --since YYYY-MM-DD | --days N
 
