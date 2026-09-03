@@ -366,6 +366,94 @@ fn rebuild_then_reingest_reproduces_the_canonical_events_and_materializations() 
     assert_identical(&before, &after);
 }
 
+/// The `--source` filter restricts the pass to one configured source, and a
+/// filter naming nothing configured is a usage error naming what exists, never
+/// a silently empty pass. The report's scanned and parsed counts name the
+/// files of the covered source only.
+#[test]
+fn the_source_filter_restricts_the_pass_and_an_unknown_name_is_a_usage_error() {
+    let scratch = ScratchDir::new();
+    let first_root = scratch.path().join("first");
+    let second_root = scratch.path().join("second");
+    write_corpus(first_root.as_path());
+    fs::create_dir_all(second_root.join("claude-code")).expect("second corpus dir");
+    fs::write(
+        second_root.join("claude-code/other.jsonl"),
+        concat!(
+            r#"{"type":"assistant","timestamp":"2026-08-25T12:00:00.000Z","sessionId":"s9","message":{"id":"m4","usage":{"input_tokens":1,"output_tokens":1,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#,
+            "\n",
+        ),
+    )
+    .expect("second corpus file must be writable");
+
+    let toml = format!(
+        r#"
+[[transcripts]]
+name = "first"
+root = "{}"
+pattern = "**/*.jsonl"
+format = "claude-code"
+
+[[transcripts]]
+name = "second"
+root = "{}"
+pattern = "**/*.jsonl"
+format = "claude-code"
+"#,
+        first_root.display(),
+        second_root.display()
+    );
+    let config = {
+        let (cfg, _) = resolve(
+            &Overrides::new(),
+            &FakeEnv::new(),
+            Some(&toml),
+            "/virtual/aub.toml",
+        )
+        .expect("resolve test config");
+        cfg
+    };
+    let db_path = scratch.path().join("ledger.sqlite3");
+    let mut conn = migrated_conn(&db_path);
+    let now = UtcTimestamp::from_unix_nanos(50_000_000);
+
+    // One source only: the second corpus's file is never opened.
+    let options = IngestOptions {
+        source: Some("first".to_string()),
+        changed_only: false,
+    };
+    let report = run_ingest(&mut conn, &config, &options, now).expect("the filtered pass must run");
+    assert_eq!(report.sources, vec!["first".to_string()]);
+    assert_eq!(report.files_scanned, 2);
+    assert_eq!(report.outcome.events_written.value(), 3);
+
+    // The other source only.
+    let options = IngestOptions {
+        source: Some("second".to_string()),
+        changed_only: false,
+    };
+    let report = run_ingest(&mut conn, &config, &options, now).expect("the second pass must run");
+    assert_eq!(report.sources, vec!["second".to_string()]);
+    assert_eq!(report.files_scanned, 1);
+    assert_eq!(report.outcome.events_written.value(), 1);
+
+    // An unknown name is a usage error naming the sources that exist.
+    let options = IngestOptions {
+        source: Some("no-such-source".to_string()),
+        changed_only: false,
+    };
+    let err = run_ingest(&mut conn, &config, &options, now).unwrap_err();
+    let message = err.to_string();
+    assert!(
+        message.contains("unknown transcript source no-such-source"),
+        "the refusal must name the unknown source: {message}"
+    );
+    assert!(
+        message.contains("first") && message.contains("second"),
+        "the refusal must name the sources that exist: {message}"
+    );
+}
+
 /// The automatic refresh path (`--changed-only`) and the explicit full ingest
 /// path converge on the same canonical event set: an unchanged file skipped by
 /// the index leaves the store exactly where the full pass put it. PLAN.md
