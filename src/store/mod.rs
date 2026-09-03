@@ -20,6 +20,7 @@ pub mod calibration;
 pub mod connection;
 pub mod cost_model;
 pub mod export;
+pub mod ingest;
 pub mod ingest_quarantine;
 pub mod ingestion_generation;
 pub mod ledger_generation;

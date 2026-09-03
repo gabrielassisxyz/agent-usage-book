@@ -57,6 +57,19 @@ pub const CLAUDE_CODE_NAMESPACE: &str = "claude-code";
 pub const CODEX_NAMESPACE: &str = "codex";
 pub const PI_NAMESPACE: &str = "pi";
 
+/// The source namespace a declared format's events and sessions are attributed
+/// under, or `None` for a format no parser reads. One definition next to the
+/// constants: an occurrence row and the session rows the same parser produces
+/// always carry one spelling of the source, because both read this mapping.
+pub fn namespace_for_format(format: &str) -> Option<&'static str> {
+    match format {
+        "claude-code" => Some(CLAUDE_CODE_NAMESPACE),
+        "codex" => Some(CODEX_NAMESPACE),
+        "pi" => Some(PI_NAMESPACE),
+        _ => None,
+    }
+}
+
 /// The fixture directory for this parser, relative to the crate root.
 pub const FIXTURE_DIR: &str = "tests/fixtures/transcripts/native";
 
