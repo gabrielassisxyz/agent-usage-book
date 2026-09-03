@@ -316,6 +316,9 @@ impl Command {
                 account: FlagSupport::Rejected {
                     reason: "ingest reads the configured transcript sources",
                 },
+                model: FlagSupport::Rejected {
+                    reason: "ingest reads transcript sources, not models",
+                },
                 no_color: FlagSupport::Rejected {
                     reason: "ingest prints no color",
                 },
@@ -330,6 +333,9 @@ impl Command {
                 },
                 account: FlagSupport::Rejected {
                     reason: "rebuild sweeps whole materialization tables, not one account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "rebuild sweeps whole materialization tables, not models",
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "rebuild prints no color",

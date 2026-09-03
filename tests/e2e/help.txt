@@ -50,13 +50,13 @@ backup:
 
 ingest:
   answers: have the transcript-derived tables been refreshed from the transcripts on disk, under one generation?
-  refuses: --format (ingest prints one operational result); --explain (ingest derives no quantity); --account (ingest reads the configured transcript sources); --no-color (ingest prints no color)
+  refuses: --format (ingest prints one operational result); --explain (ingest derives no quantity); --account (ingest reads the configured transcript sources); --model (ingest reads transcript sources, not models); --no-color (ingest prints no color)
   format: text only: ingest prints one operational result
   options: transcripts [--source NAME] [--changed-only]
 
 rebuild:
   answers: can the transcript-derived materializations be rebuilt from scratch while every irreplaceable record is left untouched?
-  refuses: --format (rebuild prints one operational result); --explain (rebuild derives no quantity); --account (rebuild sweeps whole materialization tables, not one account); --no-color (rebuild prints no color)
+  refuses: --format (rebuild prints one operational result); --explain (rebuild derives no quantity); --account (rebuild sweeps whole materialization tables, not one account); --model (rebuild sweeps whole materialization tables, not models); --no-color (rebuild prints no color)
   format: text only: rebuild prints one operational result
   options: transcripts | attribution
 
