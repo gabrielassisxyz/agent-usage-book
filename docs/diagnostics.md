@@ -16,3 +16,4 @@ render as `[REDACTED]`. Quantities are JSON objects with `value` and `unit`.
 | meter_attempt_committed | info | attempt, busy_wait |
 | meter_evidence_spooled | info | attempt |
 | meter_spool_drained | info | applied, already_applied, quarantined |
+| projection_read | debug | state |

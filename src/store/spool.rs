@@ -389,7 +389,7 @@ pub fn quarantine_dir(state_dir: &Path) -> PathBuf {
     pending_dir(state_dir).join("quarantine")
 }
 
-fn pending_file_path(state_dir: &Path, attempt_id: i64) -> PathBuf {
+pub fn pending_file_path(state_dir: &Path, attempt_id: i64) -> PathBuf {
     pending_dir(state_dir).join(format!("attempt-{attempt_id}.json"))
 }
 
@@ -682,7 +682,7 @@ pub fn validate_pending_record(bytes: &[u8]) -> Result<(), String> {
     reconstruct(&bundle).map(|_| ())
 }
 
-fn is_pending_record_name(path: &Path) -> bool {
+pub fn is_pending_record_name(path: &Path) -> bool {
     path.is_file()
         && path
             .file_name()
@@ -1307,8 +1307,12 @@ mod tests {
             },
         );
 
-        let outcome = spool_then_commit(&repository, &bundle, &FakeClock::new(UtcTimestamp::from_unix_nanos(0)))
-            .unwrap();
+        let outcome = spool_then_commit(
+            &repository,
+            &bundle,
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+        )
+        .unwrap();
         let ids = match outcome {
             SpoolCycleOutcome::Committed { ids, .. } => ids,
             SpoolCycleOutcome::LeftPending { error, .. } => {
@@ -1365,8 +1369,9 @@ mod tests {
 
         // A real clock, because the property under test is a wait duration the
         // fake clock cannot produce: the refusal must be preceded by waiting.
-        let outcome = spool_then_commit(&repository, &bundle, &crate::domain::time::RealClock::new())
-            .unwrap();
+        let outcome =
+            spool_then_commit(&repository, &bundle, &crate::domain::time::RealClock::new())
+                .unwrap();
         let error = match outcome {
             SpoolCycleOutcome::LeftPending { error, commit_wait } => {
                 assert!(

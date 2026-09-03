@@ -13,6 +13,7 @@ use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::{UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
+use crate::domain::window::{ModelId, NominalWindowDuration, WindowScope};
 use crate::evidence::{CoverageCompleteness, Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
@@ -90,12 +91,63 @@ impl ReportMetadata {
 pub struct MeterAccount {
     pub account: LogicalName,
     pub reading: Freshness<QuotaRemaining>,
+    /// The window whose remaining fraction the reading reports, when the
+    /// reading was computed from a projection's windows. A reading without one
+    /// has no window to name, and the renderer shows the value bare.
+    pub limiting_window: Option<LimitingWindow>,
+    /// Every window scope included in the reading, when the reading came from
+    /// a projection; empty for a reading with no window context.
+    pub included_scopes: Vec<WindowScope>,
+    /// The model a `--model` selector chose, reported so the output identifies
+    /// the selection the reading was computed under.
+    pub selected_model: Option<ModelId>,
 }
 
 impl MeterAccount {
     pub fn new(account: LogicalName, reading: Freshness<QuotaRemaining>) -> Self {
-        Self { account, reading }
+        Self {
+            account,
+            reading,
+            limiting_window: None,
+            included_scopes: Vec::new(),
+            selected_model: None,
+        }
     }
+
+    /// A reading computed from a projection: it names the window it is limited
+    /// by, the scopes it included and the model selector it was computed under.
+    pub fn from_projection(
+        account: LogicalName,
+        reading: Freshness<QuotaRemaining>,
+        limiting_window: Option<LimitingWindow>,
+        included_scopes: Vec<WindowScope>,
+        selected_model: Option<ModelId>,
+    ) -> Self {
+        Self {
+            account,
+            reading,
+            limiting_window,
+            included_scopes,
+            selected_model,
+        }
+    }
+}
+
+/// The window behind a reading: its scope and the nominal length the design's
+/// fresh rendering shows beside the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitingWindow {
+    pub scope: WindowScope,
+    pub nominal_duration: NominalWindowDuration,
+}
+
+/// Whether the status command could read the projection, and why not when it
+/// could not. A report whose projection is unavailable carries no readings:
+/// the fact travels here instead of as a fabricated account value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionReadState {
+    Read,
+    Unavailable { state: &'static str, reason: String },
 }
 
 /// Provenance material for one account's meter reading.
@@ -115,11 +167,14 @@ impl MeterReadingProvenance {
 }
 
 /// The status projection: the current compact meter picture.
+/// The status projection: the current compact meter picture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub metadata: ReportMetadata,
     pub accounts: Vec<MeterAccount>,
     pub provenance: ProvenanceGraph,
+    /// Whether the projection behind every reading could be read.
+    pub projection_state: ProjectionReadState,
 }
 
 impl StatusReport {
@@ -127,6 +182,7 @@ impl StatusReport {
         metadata: ReportMetadata,
         accounts: Vec<MeterAccount>,
         readings: Vec<MeterReadingProvenance>,
+        projection_state: ProjectionReadState,
     ) -> Self {
         let provenance = ProvenanceGraph::new(readings.into_iter().map(|reading| {
             (
@@ -140,6 +196,7 @@ impl StatusReport {
             metadata,
             accounts,
             provenance,
+            projection_state,
         }
     }
 }
@@ -602,6 +659,7 @@ mod tests {
                         LogicalName::new("work-a"),
                         node(),
                     )],
+                    crate::report::ProjectionReadState::Read,
                 )) as Box<dyn CarriesMetadata>,
             ),
             (
@@ -845,6 +903,7 @@ mod tests {
                 LogicalName::new("work-a"),
                 node(),
             )],
+            crate::report::ProjectionReadState::Read,
         );
         let now = NowReport::new(
             m.clone(),
@@ -937,7 +996,12 @@ mod tests {
             },
         );
         // No provenance material: the constructor assembles an empty graph.
-        let report = StatusReport::new(m, vec![account], vec![]);
+        let report = StatusReport::new(
+            m,
+            vec![account],
+            vec![],
+            crate::report::ProjectionReadState::Read,
+        );
         assert!(
             report
                 .provenance

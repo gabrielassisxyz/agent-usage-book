@@ -580,11 +580,12 @@ mod tests {
 
     /// Lands one batch through the store primitive under a fixture clock, so
     /// every call site names the behaviour instead of the clock plumbing.
-    fn land(
-        conn: &mut rusqlite::Connection,
-        pass: &IngestPass,
-    ) -> Result<PersistOutcome, Error> {
-        persist_ingest_batch(conn, pass, &FakeClock::new(UtcTimestamp::from_unix_nanos(0)))
+    fn land(conn: &mut rusqlite::Connection, pass: &IngestPass) -> Result<PersistOutcome, Error> {
+        persist_ingest_batch(
+            conn,
+            pass,
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+        )
     }
 
     fn component_count(

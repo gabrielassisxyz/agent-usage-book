@@ -1070,11 +1070,17 @@ pattern = "**/*.jsonl"
 
         let zero = "\n[ingest]\nmax_batch_events = 0\n";
         let error = resolve_with(Overrides::new(), plain_env(), Some(zero)).unwrap_err();
-        assert!(error.to_string().contains("ingest.max_batch_events"), "{error}");
+        assert!(
+            error.to_string().contains("ingest.max_batch_events"),
+            "{error}"
+        );
 
         let garbage = "\n[ingest]\nmax_batch_events = \"lots\"\n";
         let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
-        assert!(error.to_string().contains("ingest.max_batch_events"), "{error}");
+        assert!(
+            error.to_string().contains("ingest.max_batch_events"),
+            "{error}"
+        );
     }
 
     #[test]

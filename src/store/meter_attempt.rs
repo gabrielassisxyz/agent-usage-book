@@ -208,9 +208,7 @@ pub(crate) fn attempt_outcome_as_sql(outcome: &AttemptOutcome) -> &'static str {
 /// nanoseconds when the class carries one. One mapping, shared by the live
 /// insert and the pending-observation spool's flat form, so the two durable
 /// spellings of one outcome can never drift apart.
-pub(crate) fn outcome_failure_fields(
-    outcome: &AttemptOutcome,
-) -> (Option<String>, Option<i64>) {
+pub(crate) fn outcome_failure_fields(outcome: &AttemptOutcome) -> (Option<String>, Option<i64>) {
     match outcome {
         AttemptOutcome::Unreachable(class) => {
             let retry_after = match class {
@@ -225,7 +223,10 @@ pub(crate) fn outcome_failure_fields(
                 | FailureClass::MalformedBody
                 | FailureClass::MissingRequiredField => None,
             };
-            (Some(failure_class_sql::as_sql(class).to_owned()), retry_after)
+            (
+                Some(failure_class_sql::as_sql(class).to_owned()),
+                retry_after,
+            )
         }
         AttemptOutcome::Success | AttemptOutcome::AuthRequired => (None, None),
     }
@@ -532,6 +533,23 @@ pub fn open_attempt_row_ids(conn: &rusqlite::Connection) -> Result<Vec<MeterAtte
     rows.map(|entry| entry.map(MeterAttemptRowId::new))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| Error::Store(format!("cannot read open meter attempts: {e}")))
+}
+
+/// The most recently started attempt, or `None` while the table is empty: the
+/// attempt whose lifecycle the freshness computation reads. The lifecycle is
+/// append-only and starts are never deleted, so id order and start order are
+/// the same order, which makes id the stable tiebreak between equal
+/// `request_started_at` values.
+pub fn latest_attempt_row_id(
+    conn: &rusqlite::Connection,
+) -> Result<Option<MeterAttemptRowId>, Error> {
+    conn.query_row(
+        "SELECT id FROM meter_attempt ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0).map(MeterAttemptRowId::new),
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot read the latest meter attempt: {e}")))
 }
 
 /// The number of started attempts and the number of terminal results in the

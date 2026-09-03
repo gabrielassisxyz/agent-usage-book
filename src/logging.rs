@@ -113,10 +113,15 @@ pub enum DiagnosticEvent {
     /// `quarantined` are the three dispositions, counted; the pass that applies
     /// nothing still reports itself so a log shows the drain ran.
     MeterSpoolDrained,
+    /// The status path read its projection file, once, within its size bound.
+    /// Emitted at debug level: a status run's log then shows exactly one read
+    /// and no store or network event, which is the observable half of the
+    /// status contract (PLAN.md section 16.2).
+    ProjectionRead,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
@@ -124,6 +129,7 @@ impl DiagnosticEvent {
         Self::MeterAttemptCommitted,
         Self::MeterEvidenceSpooled,
         Self::MeterSpoolDrained,
+        Self::ProjectionRead,
     ];
 
     pub fn name(self) -> &'static str {
@@ -135,11 +141,21 @@ impl DiagnosticEvent {
             Self::MeterAttemptCommitted => "meter_attempt_committed",
             Self::MeterEvidenceSpooled => "meter_evidence_spooled",
             Self::MeterSpoolDrained => "meter_spool_drained",
+            Self::ProjectionRead => "projection_read",
         }
     }
 
     pub fn level(self) -> Level {
-        Level::Info
+        match self {
+            Self::RunStarted
+            | Self::ReportRendered
+            | Self::RequestAttempted
+            | Self::IngestBatchLanded
+            | Self::MeterAttemptCommitted
+            | Self::MeterEvidenceSpooled
+            | Self::MeterSpoolDrained => Level::Info,
+            Self::ProjectionRead => Level::Debug,
+        }
     }
 
     pub fn documented_fields(self) -> &'static str {
@@ -151,6 +167,7 @@ impl DiagnosticEvent {
             Self::MeterAttemptCommitted => "attempt, busy_wait",
             Self::MeterEvidenceSpooled => "attempt",
             Self::MeterSpoolDrained => "applied, already_applied, quarantined",
+            Self::ProjectionRead => "state",
         }
     }
 }

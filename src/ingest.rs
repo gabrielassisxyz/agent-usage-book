@@ -347,7 +347,11 @@ pub fn run(
         let pass = crate::store::ingest::IngestPass {
             events: chunk.to_vec(),
             sessions: session_pass(chunk.iter().map(|persist| &persist.event)),
-            watermarks: if last { std::mem::take(&mut watermarks) } else { Vec::new() },
+            watermarks: if last {
+                std::mem::take(&mut watermarks)
+            } else {
+                Vec::new()
+            },
             quarantined: if index == 0 {
                 std::mem::take(&mut quarantined_items)
             } else {
@@ -364,8 +368,10 @@ pub fn run(
         let outcome = crate::store::ingest::persist_ingest_batch(conn, &pass, clock)?;
 
         totals.events_written = sum_rows(totals.events_written, outcome.events_written);
-        totals.events_already_ingested =
-            sum_rows(totals.events_already_ingested, outcome.events_already_ingested);
+        totals.events_already_ingested = sum_rows(
+            totals.events_already_ingested,
+            outcome.events_already_ingested,
+        );
         totals.occurrences_written =
             sum_rows(totals.occurrences_written, outcome.occurrences_written);
         totals.occurrences_already_ingested = sum_rows(
@@ -409,7 +415,10 @@ pub fn run(
 }
 
 /// Adds two row counts, the fold the multi-batch report sums with.
-fn sum_rows(left: crate::domain::rows::RowCount, right: crate::domain::rows::RowCount) -> crate::domain::rows::RowCount {
+fn sum_rows(
+    left: crate::domain::rows::RowCount,
+    right: crate::domain::rows::RowCount,
+) -> crate::domain::rows::RowCount {
     crate::domain::rows::RowCount::new(left.value() + right.value())
 }
 

@@ -127,6 +127,7 @@ fn seed_status_report() -> StatusReport {
             },
         )],
         readings,
+        agent_usage_book::report::ProjectionReadState::Read,
     )
 }
 

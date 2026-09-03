@@ -33,7 +33,9 @@ use agent_usage_book::store::meter_attempt::{
     DueReason, MeterAttemptRowId, NewMeterAttempt, NewMeterAttemptResult,
 };
 use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::repository::{NewMeterInterpretation, Repository, TerminalMeterBundle};
+use agent_usage_book::store::repository::{
+    NewMeterInterpretation, Repository, TerminalMeterBundle,
+};
 use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
 use agent_usage_book::store::sampling_policy_snapshot::{
     ResolvedSamplingPolicy, resolve_policy_snapshot,
@@ -83,8 +85,7 @@ struct Fixture {
     repository: Repository,
     account_id: agent_usage_book::store::account::AccountId,
     run_id: agent_usage_book::store::sample_run::SampleRunId,
-    policy_snapshot_id:
-        agent_usage_book::store::sampling_policy_snapshot::SamplingPolicySnapshotId,
+    policy_snapshot_id: agent_usage_book::store::sampling_policy_snapshot::SamplingPolicySnapshotId,
     conn: rusqlite::Connection,
 }
 
@@ -180,8 +181,12 @@ impl Fixture {
     /// already-started attempt: spool, commit, delete on success.
     fn meter_cycle(&self, attempt_id: MeterAttemptRowId) -> SpoolCycleOutcome {
         let bundle = self.terminal_bundle(attempt_id);
-        agent_usage_book::store::spool::spool_then_commit(&self.repository, &bundle, &RealClock::new())
-            .unwrap()
+        agent_usage_book::store::spool::spool_then_commit(
+            &self.repository,
+            &bundle,
+            &RealClock::new(),
+        )
+        .unwrap()
     }
 
     fn observation_count(&self) -> u64 {
@@ -194,11 +199,9 @@ impl Fixture {
 
     fn evidence_count(&self) -> u64 {
         self.conn
-            .query_row(
-                "SELECT COUNT(*) FROM meter_response_evidence",
-                [],
-                |row| row.get::<_, i64>(0),
-            )
+            .query_row("SELECT COUNT(*) FROM meter_response_evidence", [], |row| {
+                row.get::<_, i64>(0)
+            })
             .unwrap() as u64
     }
 
@@ -293,7 +296,7 @@ fn write_corpus(root: &Path, events: u64, files: u64) {
             let id = file * per_file + message;
             body.push_str(&format!(
                 r#"{{"type":"assistant","timestamp":"2026-08-25T10:{:02}:00.000Z","sessionId":"s{file}","message":{{"id":"m{id}","usage":{{"input_tokens":100,"output_tokens":50,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}}}}"#,
-                (message % 60) as u64
+                message % 60
             ));
             body.push('\n');
         }
@@ -418,8 +421,7 @@ fn meter_first_holds_the_slot_and_the_ingest_batch_waits_without_losing_it() {
         batches[0].writer_slot.as_nanos()
     );
     assert!(
-        wall.as_nanos() - u128::from(batches[0].writer_slot.as_nanos())
-            > 3_000_000_000,
+        wall.as_nanos() - u128::from(batches[0].writer_slot.as_nanos()) > 3_000_000_000,
         "the writer-slot measurement must exclude the wait for a held slot: slot {}ns, wall {}ns",
         batches[0].writer_slot.as_nanos(),
         wall.as_nanos()
@@ -663,7 +665,11 @@ fn every_batch_respects_the_stated_writer_slot_budget_and_the_pass_splits() {
         "five events under a bound of two must split into three batches"
     );
     for (index, batch) in batches.iter().enumerate() {
-        assert_eq!(batch.index, (index + 1) as u64, "batch indices count from 1");
+        assert_eq!(
+            batch.index,
+            (index + 1) as u64,
+            "batch indices count from 1"
+        );
         assert!(
             batch.writer_slot.as_nanos() <= WRITER_SLOT_BUDGET_PER_BATCH.as_nanos(),
             "batch {} held the writer slot {}ns, over the stated budget {}ns",
@@ -698,7 +704,14 @@ fn a_batch_whose_watermark_refuses_mid_transaction_rolls_back_its_event_rows() {
     let mut writer = ingest_conn(&fixture, 5_000);
 
     let pass_with = |relative_path: String| IngestPass {
-        events: vec![persist_event("m1", "corpus/a.jsonl", 1_000, 10, 5, &relative_path)],
+        events: vec![persist_event(
+            "m1",
+            "corpus/a.jsonl",
+            1_000,
+            10,
+            5,
+            &relative_path,
+        )],
         sessions: Vec::new(),
         watermarks: vec![agent_usage_book::transcripts::Watermark {
             source_key: "claude-code".into(),
@@ -761,8 +774,7 @@ fn persist_event(
     use agent_usage_book::dedup::{canonical_identity, canonical_payload_digest};
     use agent_usage_book::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
     use agent_usage_book::domain::tokens::{
-        CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
-        UsageVector,
+        CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, UsageVector,
     };
     use agent_usage_book::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
     use agent_usage_book::transcripts::NormalizedUsageEvent;
@@ -783,7 +795,10 @@ fn persist_event(
             EvidenceQuality::Measured,
         ),
         EvidenceClassification::Reported,
-        Provenance::new(vec![file.to_string(), format!("{STRONG_IDENTITY_PREFIX}{id}")]),
+        Provenance::new(vec![
+            file.to_string(),
+            format!("{STRONG_IDENTITY_PREFIX}{id}"),
+        ]),
         ParserVersion::new("test-1"),
     )
     .with_occurred_at(UtcTimestamp::from_unix_nanos(occurred_nanos))
