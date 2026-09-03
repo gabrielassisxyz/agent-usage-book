@@ -158,6 +158,14 @@ impl CoverageFloor {
     pub fn get(self) -> f64 {
         self.0
     }
+
+    /// The floor in parts per million, rounded half-up. The named conversion
+    /// from the configured fraction to the unit the rest of this project
+    /// expresses fractions in, so the JSON contract carries the floor in the
+    /// same unit as the coverages it judges.
+    pub fn as_ppm(self) -> u32 {
+        (self.0 * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +180,11 @@ pub struct SamplingConfig {
     pub reset_edge_lead: MonotonicDuration,
     pub request_timeout: MonotonicDuration,
     pub command_budget: MonotonicDuration,
+    /// The most provider requests one sampling batch may keep in flight.
+    /// Bounded so a machine with many configured accounts cannot open an
+    /// unbounded number of simultaneous connections; the default is small
+    /// because only a few accounts exist today.
+    pub max_concurrent_requests: usize,
 }
 
 /// The transcript ingest batch policy (PLAN.md section 11.2: "Transcript ingest
@@ -281,6 +294,7 @@ const SAMPLING_KEYS: &[&str] = &[
     "reset_edge_lead",
     "request_timeout",
     "command_budget",
+    "max_concurrent_requests",
 ];
 const INGEST_KEYS: &[&str] = &["max_batch_events"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
@@ -538,6 +552,38 @@ fn resolve_floor(
         .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
 }
 
+/// A count a configuration file expresses as a bare positive integer. A value
+/// of zero would sample nothing while reporting a completed batch, so it is
+/// refused at resolution time rather than discovered at sampling time.
+fn resolve_count(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<usize, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    let value: usize = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a whole number")))?;
+    if value == 0 {
+        return Err(Error::Usage(format!(
+            "{key}: a bound of zero would sample nothing; set it to at least 1"
+        )));
+    }
+    Ok(value)
+}
+
 /// Non-identifying platform defaults: derived from `$HOME` at resolution time, never
 /// from a compiled-in path. `home` is itself resolution's caller-supplied, so a test
 /// can prove no default leaks the *real* process's home directory by resolving under a
@@ -643,6 +689,15 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "command_budget"),
             Some("8s"),
+            &file_display,
+            &mut provenance,
+        )?,
+        max_concurrent_requests: resolve_count(
+            "sampling.max_concurrent_requests",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "max_concurrent_requests"),
+            Some("2"),
             &file_display,
             &mut provenance,
         )?,
@@ -971,6 +1026,60 @@ mod tests {
     fn no_tracker_section_at_all_is_not_a_missing_key_error() {
         let (config, _) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
         assert!(config.tracker.is_none());
+    }
+
+    // --- the concurrency bound ------------------------------------------------------
+
+    /// The documented small default: bounded concurrency is configuration,
+    /// not a constant, and its default is two.
+    #[test]
+    fn the_concurrency_bound_defaults_to_two() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(config.sampling.max_concurrent_requests, 2);
+        assert_eq!(
+            provenance.get("sampling.max_concurrent_requests"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    #[test]
+    fn the_concurrency_bound_resolves_from_the_file_and_the_environment() {
+        let file = "[sampling]\nmax_concurrent_requests = 4\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.sampling.max_concurrent_requests, 4);
+        assert_eq!(
+            provenance.get("sampling.max_concurrent_requests"),
+            Some(ConfigSource::File)
+        );
+
+        let env = plain_env().set("AUB_SAMPLING_MAX_CONCURRENT_REQUESTS", "6");
+        let (config, provenance) = resolve_with(Overrides::new(), env, Some(file)).unwrap();
+        assert_eq!(config.sampling.max_concurrent_requests, 6);
+        assert_eq!(
+            provenance.get("sampling.max_concurrent_requests"),
+            Some(ConfigSource::Environment)
+        );
+    }
+
+    /// Planted negative: a bound of zero would sample nothing while reporting
+    /// a completed batch, so it is refused at resolution time.
+    #[test]
+    fn a_zero_concurrency_bound_is_a_named_usage_error() {
+        let file = "[sampling]\nmax_concurrent_requests = 0\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("sampling.max_concurrent_requests"),
+            "the refusal must name the key: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_concurrency_bound_is_a_named_usage_error() {
+        let file = "[sampling]\nmax_concurrent_requests = \"many\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("not a whole number"), "{err}");
     }
 
     // --- no compiled identity -------------------------------------------------------

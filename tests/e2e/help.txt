@@ -13,6 +13,7 @@ commands:
   ingest   land the configured transcripts' normalized usage into the ledger, advancing the ingestion generation
   rebuild  destroy and recreate one rebuildable materialization group, never touching irreplaceable evidence
   doctor   health, drift and integrity diagnostics
+  coverage did the sampler attempt what the policy owed, and did those attempts observe?
 
 status:
   answers: how much quota does each configured account have left?
@@ -65,5 +66,11 @@ doctor:
   refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --model (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
   format: text | json
   options: --transcript-format-drift
+
+coverage:
+  answers: did the sampler attempt what the policy owed, and did those attempts observe?
+  refuses: --model (coverage reports every window of the account, not one model); --no-color (coverage prints plain text or json)
+  format: text | json
+  options: --since DURATION (default 24h), --severe; --account is shared
 
 aub            prints the version; aub --help prints this

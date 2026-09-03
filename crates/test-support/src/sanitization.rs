@@ -1,35 +1,47 @@
-//! The shared forbidden-pattern list for transcript fixtures.
+//! The shared forbidden-pattern list for transcript fixtures, the release
+//! binary and persisted meter evidence (aub-n27.4).
 //!
 //! Fixtures are committed, so they are publishable text, and a scan over the
 //! whole fixture directory is what enforces that rather than the care of
-//! whoever captured them. The list lives here, once, so the corpus audit and
-//! any capture-time scan read the same patterns instead of restating them.
+//! whoever captured them. A release binary and a sampled database are not
+//! committed, but the same leak (a credential, a home path, an account
+//! identifier) is exactly as unacceptable in either. The pattern list lives
+//! in `docs/forbidden-patterns.txt`, once, so the corpus audit, the
+//! release-binary scan and the sampling-run scan all read the same patterns
+//! instead of each restating them.
 //!
-//! The list is deliberately concrete: credential key prefixes and credential
-//! field labels, never bare words like "token" (token counts are the content
-//! of every fixture). Matching is case-insensitive, so `Authorization` and
-//! `authorization` are both caught.
+//! The list is deliberately concrete: credential key prefixes, credential
+//! field labels, absolute home paths and account-identifier shapes, never a
+//! bare word like "token" (token counts are the content of every fixture).
+//! Matching is case-insensitive, so `Authorization` and `authorization` are
+//! both caught.
 
-/// Credential-shaped substrings that must never appear in a committed fixture.
-pub const FORBIDDEN_PATTERNS: &[&str] = &[
-    "sk-ant-",       // Anthropic API key prefix
-    "sk-proj-",      // OpenAI project-scoped key prefix
-    "sk-or-",        // OpenAI organization key prefix
-    "ghp_",          // GitHub personal access token prefix
-    "github_pat_",   // GitHub fine-grained token prefix
-    "glpat-",        // GitLab personal access token prefix
-    "AKIA",          // AWS access key id prefix
-    "xoxb-",         // Slack bot token prefix
-    "xoxp-",         // Slack user token prefix
-    "-----BEGIN",    // private key block marker
-    "bearer ",       // authorization header value
-    "api_key",       // credential field name or label
-    "apikey",        // credential field name or label
-    "api-key",       // credential field name or label
-    "authorization", // credential field name or label
-    "password",      // credential field name
-    "secret",        // credential field name
-];
+use std::sync::LazyLock;
+
+/// The documented, single-source pattern file every scan reads.
+const FORBIDDEN_PATTERNS_SOURCE: &str = include_str!("../../../docs/forbidden-patterns.txt");
+
+/// Credential-shaped and identity-shaped substrings that must never appear in
+/// a committed fixture, a release binary, or persisted evidence.
+pub static FORBIDDEN_PATTERNS: LazyLock<Vec<&'static str>> =
+    LazyLock::new(|| parse_forbidden_patterns(FORBIDDEN_PATTERNS_SOURCE));
+
+/// Parses the forbidden-pattern file format: one pattern per line, verbatim
+/// (a pattern may carry meaningful trailing whitespace, so lines are never
+/// trimmed), with blank lines and lines starting with `#` ignored as
+/// comments. Panics on an empty result: a list edited down to nothing would
+/// make every caller's scan pass vacuously instead of failing loudly.
+fn parse_forbidden_patterns(source: &'static str) -> Vec<&'static str> {
+    let patterns: Vec<&'static str> = source
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect();
+    assert!(
+        !patterns.is_empty(),
+        "the forbidden-pattern list is empty: every scan that reads it would pass vacuously"
+    );
+    patterns
+}
 
 /// Every forbidden pattern present in `text`, in list order. An empty result
 /// means the text is clean.
@@ -72,5 +84,43 @@ mod tests {
     fn token_counts_are_not_credential_shaped() {
         let fixture = r#"{"type":"assistant","message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5,"cache_read_input_tokens":2}}}"#;
         assert!(matched_patterns(fixture).is_empty());
+    }
+
+    #[test]
+    fn an_absolute_home_path_is_caught() {
+        let dirty = r#"{"credential_detail":"/home/example-user/.config/aub/anthropic.json"}"#;
+        let hits = matched_patterns(dirty);
+        assert!(hits.contains(&"/home/"), "hits: {hits:?}");
+    }
+
+    #[test]
+    fn an_account_identifier_is_caught() {
+        let dirty = r#"{"account":"someone@example.com"}"#;
+        let hits = matched_patterns(dirty);
+        assert!(hits.contains(&"@"), "hits: {hits:?}");
+    }
+
+    #[test]
+    fn an_empty_pattern_source_panics_instead_of_passing_vacuously() {
+        let result = std::panic::catch_unwind(|| parse_forbidden_patterns(""));
+        assert!(
+            result.is_err(),
+            "an empty forbidden-pattern source must panic, not return an empty list"
+        );
+    }
+
+    #[test]
+    fn a_comment_only_pattern_source_panics_instead_of_passing_vacuously() {
+        let result = std::panic::catch_unwind(|| parse_forbidden_patterns("# nothing here\n\n"));
+        assert!(
+            result.is_err(),
+            "a comment-only forbidden-pattern source must panic, not return an empty list"
+        );
+    }
+
+    #[test]
+    fn a_pattern_with_trailing_whitespace_is_preserved_verbatim() {
+        let patterns = parse_forbidden_patterns("bearer \nauthorization\n");
+        assert_eq!(patterns, vec!["bearer ", "authorization"]);
     }
 }

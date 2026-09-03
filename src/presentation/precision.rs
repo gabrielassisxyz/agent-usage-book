@@ -15,5 +15,9 @@ pub const CREDITS: Precision = Precision::new(2);
 /// Token counts render with no fractional digits.
 pub const TOKENS: Precision = Precision::new(0);
 
+/// Coverage percentages render with one fractional digit, matching the worked
+/// example in PLAN.md section 49 ("99.3%", "71.5%").
+pub const COVERAGE_PERCENT: Precision = Precision::new(1);
+
 /// Money renders with two fractional digits.
 pub const MONEY: Precision = Precision::new(2);

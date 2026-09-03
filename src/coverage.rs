@@ -102,6 +102,15 @@ impl CoverageFraction {
     pub fn as_f64(self) -> f64 {
         self.0
     }
+
+    /// The fraction in parts per million, rounded half-up, saturating at the
+    /// full `1_000_000`. The named conversion from the fraction the engine
+    /// holds to the one unit the rest of this project expresses fractions in,
+    /// so a consumer of the JSON contract reads the same unit the quota
+    /// readings already carry.
+    pub fn as_ppm(self) -> u32 {
+        (self.0 * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
+    }
 }
 
 /// A maximal interval during which no attempt (or no observation) occurred.

@@ -50,8 +50,8 @@ pub enum ReportField {
     MeterQuotaRemaining { account: LogicalName },
     /// The token count of one spend group.
     SpendGroupTokens { key: LogicalName },
-    /// The coverage completeness of a coverage report.
-    CoverageCompleteness,
+    /// The coverage quantities of one account in a coverage report.
+    Coverage { account: LogicalName },
     /// The row count of an export report.
     ExportRows,
     /// The derived token count of a calibration report.
@@ -68,7 +68,7 @@ impl ReportField {
             ReportField::SpendGroupTokens { key } => {
                 format!("spend_group_tokens[{}]", key.as_str())
             }
-            ReportField::CoverageCompleteness => "coverage_completeness".to_string(),
+            ReportField::Coverage { account } => format!("coverage[{}]", account.as_str()),
             ReportField::ExportRows => "export_rows".to_string(),
             ReportField::CalibrationTokens => "calibration_tokens".to_string(),
         }
@@ -79,7 +79,7 @@ impl ReportField {
         match self {
             ReportField::MeterQuotaRemaining { account } => account.as_str(),
             ReportField::SpendGroupTokens { key } => key.as_str(),
-            ReportField::CoverageCompleteness => "all",
+            ReportField::Coverage { account } => account.as_str(),
             ReportField::ExportRows => "export",
             ReportField::CalibrationTokens => "calibration",
         }
@@ -321,10 +321,21 @@ mod tests {
             1,
             ValueArithmetic::Direct,
         );
-        let graph = ProvenanceGraph::new([(ReportField::CoverageCompleteness, node)]);
+        let graph = ProvenanceGraph::new([(
+            ReportField::Coverage {
+                account: LogicalName::new("research"),
+            },
+            node,
+        )]);
 
         assert_eq!(graph.len(), 1);
-        assert!(graph.resolve(&ReportField::CoverageCompleteness).is_some());
+        assert!(
+            graph
+                .resolve(&ReportField::Coverage {
+                    account: LogicalName::new("research")
+                })
+                .is_some()
+        );
         assert!(
             graph.resolve(&ReportField::ExportRows).is_none(),
             "a field the graph was not given must not resolve"
