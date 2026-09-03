@@ -6,11 +6,17 @@
 //! - subscription window capacity, API pricing, task history, or meter percentages
 
 pub mod discovery;
+pub mod drift;
 pub mod native;
 pub mod parser;
 pub mod watermark;
 
 pub use discovery::{DiscoveryError, DiscoveryOptions, SourceDiscovery, discover};
+pub use drift::{
+    DEFAULT_FIXTURE_DIR, FIXTURE_CAPTURE_PROCEDURE_DOC, FixtureCorpusShape, RecordShape,
+    ShapeSummary, SourceDriftReport, TranscriptDriftReport, ValueType, collect_field_paths,
+    detect_drift, extract_record_kind, extract_record_shape, load_fixture_corpus,
+};
 pub use native::{ClaudeCodeParser, CodexParser, PiParser};
 
 /// The parser for a source's declared `format`, or `None` for a format no parser

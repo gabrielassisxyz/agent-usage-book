@@ -45,7 +45,7 @@ same thing in both documents.
 | 14 | Passive calibration is evidence and candidate generation, not automatic truth. | unenforced aub-c0b.7 | (passive candidate test) |
 | 15 | `status` never opens SQLite, performs network I/O, or writes. | unenforced aub-me5.7 | (status no-store / no-network test) |
 | 16 | The projection is disposable and contains no stored freshness boolean. | unenforced aub-me5.5 | (disposable projection test) |
-| 17 | Task ambiguity becomes explicit overhead. | unenforced aub-eu7.2 | (temporal task segmentation test) |
+| 17 | Task ambiguity becomes explicit overhead. | src/attribution/segment.rs | tests::task_attributed_plus_overhead_equals_total_input_usage |
 | 18 | Dollar valuation and subscription credits are distinct dimensions. | tests/valuation.rs | tests::golden_hand_computed_exact_decimal_fixtures |
 | 19 | Meter residual is diagnostic and is not automatically called hidden token spend. | unenforced aub-dpn | (unexplained residual test) |
 | 20 | Estimated transcript usage is never silently promoted to measured usage. | src/evidence.rs | tests::quality_combine_never_recovers_measured_from_estimated |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 15 are enforced by mechanical checks present at HEAD (file paths and tests), and 12 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 16 are enforced by mechanical checks present at HEAD (file paths and tests), and 11 are unenforced and tracked by open beads in the tracker.

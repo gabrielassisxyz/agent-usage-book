@@ -57,6 +57,7 @@ aub_command_enum! {
     ExitClass,
     AttemptCrashHook,
     RateCard,
+    Doctor,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -84,7 +85,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 9] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -93,6 +94,7 @@ impl Command {
         Self::ExitClass,
         Self::AttemptCrashHook,
         Self::RateCard,
+        Self::Doctor,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -215,6 +217,19 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Doctor => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "doctor derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "doctor is a system-wide diagnostic",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "doctor prints plain text or json",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -230,6 +245,7 @@ impl Command {
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
             Command::RateCard => "rate-card",
+            Command::Doctor => "doctor",
         }
     }
 
@@ -249,6 +265,7 @@ impl Command {
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
+            Command::Doctor => Some("health, drift and integrity diagnostics"),
         }
     }
 
@@ -422,7 +439,74 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
+        Command::Doctor => doctor_command(&RealClock::new(), level, &invocation),
     }
+}
+
+/// `aub doctor`: operational health, drift and integrity diagnostics.
+/// Supports `--transcript-format-drift` (aub-lqe.17).
+fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("doctor");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    for arg in &invocation.rest {
+        match arg.as_str() {
+            "--transcript-format-drift" => {}
+            other => return Err(Error::Usage(format!("unknown argument: {other}"))),
+        }
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let mut db_quarantine = None;
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    if db_path.is_file() {
+        let policy = crate::store::connection::PragmaPolicy {
+            busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+        };
+        let summary_res = crate::store::connection::open(
+            &db_path,
+            crate::store::connection::AccessMode::ReadOnly,
+            &policy,
+        )
+        .and_then(|conn| crate::store::ingest_quarantine::quarantine_summary(&conn));
+        if let Ok(summary) = summary_res {
+            db_quarantine = Some(summary);
+        }
+    }
+
+    let report =
+        crate::transcripts::detect_drift(&config, None, timestamp, db_quarantine.as_deref())?;
+
+    match invocation.format {
+        OutputFormat::Text => println!(
+            "{}",
+            crate::presentation::render_doctor_drift_report(&report)
+        ),
+        OutputFormat::Json => println!("{}", crate::presentation::doctor_drift_json(&report, run)),
+    }
+
+    Ok(())
 }
 
 fn reject_positionals(invocation: &Invocation) -> Result<(), Error> {
