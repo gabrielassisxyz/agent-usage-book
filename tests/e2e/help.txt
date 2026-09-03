@@ -1,0 +1,34 @@
+aub: one ledger for LLM consumption
+
+usage: aub [-v...] <command> [--format text|json] [options]
+shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --no-color
+
+commands:
+  status   render the last known meter reading per configured account
+  spend    token usage per UTC day and transcript source, read from the configured transcripts
+  config   print every resolved configuration key with the source that won
+  rate-card import, show and history the immutable dated vendor rate cards
+
+status:
+  answers: how much quota does each configured account have left?
+  refuses: --explain (status has no provenance renderer); --account (status reports every configured account); --no-color (status prints no color)
+  format: text | json
+
+spend:
+  answers: how many tokens did each transcript source use per UTC day?
+  refuses: --explain (spend has no provenance renderer); --account (spend has no account dimension until account attribution lands); --no-color (spend prints no color)
+  format: text | json
+  options: --today (default) | --since YYYY-MM-DD | --days N
+
+config:
+  answers: which configuration key resolved from where?
+  refuses: --format (config prints provenance, not a report); --explain (config derives no quantity); --account (config prints every account at once); --no-color (config prints no color)
+  format: text only: config prints provenance, not a report
+  options: --set key=value (repeatable), --config-file PATH
+
+rate-card:
+  answers: what do the immutable dated vendor rate cards contain?
+  refuses: --format (rate-card prints a price book, not a report); --explain (rate-card derives no quantity); --account (the rate book is reference data, not per-account state); --no-color (rate-card prints plain rows)
+  format: text only: rate-card prints a price book, not a report
+
+aub            prints the version; aub --help prints this

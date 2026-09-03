@@ -405,10 +405,6 @@ mod tests {
         let result = validate_invariant_row(&row, dir.to_str().unwrap());
         let _ = fs::remove_dir_all(&dir);
         assert_eq!(result, Ok(InvariantRowValidation::TrackerMembershipSkipped));
-        eprintln!(
-            "{INVARIANT_TRACKER_MEMBERSHIP_SKIPPED_MARKER} fixture run: \
-             absent .beads/issues.jsonl skipped tracker membership"
-        );
     }
 
     /// Proves absence-tolerance for a missing tracker file (see the `NotFound` arm in

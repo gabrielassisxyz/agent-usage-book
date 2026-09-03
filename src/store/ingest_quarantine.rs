@@ -1,5 +1,8 @@
 //! The `ingest_quarantine` table: captures source records that could not be
-//! normalized (`aub-lqe.6`, PLAN.md 12.11, 29, 36, 37).
+//! normalized (`aub-lqe.6`, PLAN.md 12.11, 29, 36, 37), and the heuristic dedup
+//! collision pairs the identity framework quarantined (`aub-lqe.10`, PLAN.md
+//! 12.10, 18). Both are material that never became a canonical usage event, and
+//! a count of either that stays invisible reads as a smaller, correct ledger.
 //!
 //! Stored by excerpt hash rather than excerpt text by default (aub-2r3 retention
 //! policy), with opt-in bounded redacted excerpt only under explicit diagnostic
@@ -15,6 +18,13 @@ use rusqlite::{Connection, Row, params};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
 use crate::transcripts::parser::QuarantineRecord;
+
+/// The failure class recorded for a heuristic dedup collision (aub-lqe.10,
+/// PLAN.md 12.10, 18): two occurrences that shared one heuristic key but
+/// normalize to materially different canonical payloads. Recorded here rather
+/// than in the parser's `QuarantineClass` because a collision is an identity
+/// failure the dedup framework detects, not a record a parser failed to read.
+pub const DEDUP_COLLISION_FAILURE_CLASS: &str = "dedup_collision";
 
 /// One stored quarantine record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -271,6 +281,59 @@ pub fn quarantine_summary(conn: &Connection) -> Result<Vec<QuarantineSummaryGrou
     Ok(result)
 }
 
+/// One dedup collision pair, in the plain shapes the quarantine stores. The
+/// dedup layer owns detection and stays store-free; the ingest path translates
+/// the typed `crate::dedup::HeuristicKeyCollision` into this descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DedupCollisionDescriptor {
+    /// The parser whose heuristic key both occurrences shared.
+    pub parser: String,
+    /// The shared key, as stored in `usage_occurrence.heuristic_key`.
+    pub heuristic_key: String,
+    /// The file the first occurrence was seen in. A pair spanning two files
+    /// names the first-seen one: the collision's identity is the key and the
+    /// two payload digests, which the excerpt hash carries.
+    pub first_file: String,
+    /// The canonical payload digest of the first occurrence.
+    pub first_payload_digest: String,
+    /// The canonical payload digest of the second occurrence.
+    pub second_payload_digest: String,
+    /// When the collision was recorded.
+    pub observed_at: UtcTimestamp,
+}
+
+/// Records a dedup collision pair as one quarantine row whose failure class is
+/// [`DEDUP_COLLISION_FAILURE_CLASS`]. The excerpt hash hashes the collision's
+/// identity (parser, key, both payload digests) rather than any raw excerpt:
+/// there is no excerpt, and the hash is what recognises the same collision
+/// recurring, which merges into the existing row like any other quarantine
+/// item. Neither occurrence produces a usage occurrence row; the pair is
+/// quarantined, never merged and never selected.
+pub fn record_dedup_collision(
+    conn: &Connection,
+    collision: &DedupCollisionDescriptor,
+) -> Result<QuarantineRecordOutcome, Error> {
+    use sha2::{Digest, Sha256};
+    let identity = format!(
+        "{}|{}|{}|{}",
+        collision.parser,
+        collision.heuristic_key,
+        collision.first_payload_digest,
+        collision.second_payload_digest,
+    );
+    let item = NewQuarantineItem {
+        source_file: collision.first_file.clone(),
+        byte_offset: None,
+        line_number: None,
+        parser: collision.parser.clone(),
+        failure_class: DEDUP_COLLISION_FAILURE_CLASS.to_string(),
+        excerpt_hash: format!("{:x}", Sha256::digest(identity.as_bytes())),
+        excerpt: None,
+        observed_at: collision.observed_at,
+    };
+    record_quarantine(conn, &item)
+}
+
 /// Clears all quarantine records on whole-index rebuild.
 pub fn clear_all_quarantine(conn: &Connection) -> Result<usize, Error> {
     conn.execute("DELETE FROM ingest_quarantine", [])
@@ -468,5 +531,103 @@ mod tests {
 
         clear_all_quarantine(&conn).unwrap();
         assert_eq!(count_quarantined_records(&conn).unwrap(), 0);
+    }
+
+    fn collision(
+        parser: &str,
+        key: &str,
+        first_digest: &str,
+        second_digest: &str,
+    ) -> DedupCollisionDescriptor {
+        DedupCollisionDescriptor {
+            parser: parser.to_string(),
+            heuristic_key: key.to_string(),
+            first_file: "first.jsonl".to_string(),
+            first_payload_digest: first_digest.to_string(),
+            second_payload_digest: second_digest.to_string(),
+            observed_at: ts(1_000),
+        }
+    }
+
+    /// A dedup collision pair records as one quarantine row whose failure class
+    /// is the collision class, not one of the parser's parse-failure classes:
+    /// the pair never failed to parse, it failed to agree.
+    #[test]
+    fn a_dedup_collision_records_one_row_with_the_collision_class() {
+        let (_scratch, conn) = fixture_conn();
+        let outcome = record_dedup_collision(
+            &conn,
+            &collision("claude-code-1", "t:1000|s1|10:0:0", "aa", "bb"),
+        )
+        .unwrap();
+        assert_eq!(outcome, QuarantineRecordOutcome::Inserted);
+
+        let rows = load_all_quarantine(&conn).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].failure_class(), DEDUP_COLLISION_FAILURE_CLASS);
+        assert_eq!(rows[0].parser(), "claude-code-1");
+        assert_eq!(rows[0].source_file(), "first.jsonl");
+        assert_eq!(rows[0].excerpt(), None);
+    }
+
+    /// The planted negative: a parse-failure quarantine and a collision
+    /// quarantine are different rows with different classes, never merged into
+    /// one count, because the doctor distinguishes what failed to parse from
+    /// what collided after parsing.
+    #[test]
+    fn a_parse_failure_and_a_collision_are_distinct_quarantine_rows() {
+        let (_scratch, conn) = fixture_conn();
+        let parse_failure = QuarantineRecord::new(
+            SourceLocation::new("broken.jsonl", 7),
+            ParserVersion::new("claude-code-1"),
+            QuarantineClass::WrongFieldType,
+        );
+        record_quarantine(
+            &conn,
+            &NewQuarantineItem::from_record(&parse_failure, ts(100)),
+        )
+        .unwrap();
+        record_dedup_collision(
+            &conn,
+            &collision("claude-code-1", "t:1000|s1|10:0:0", "aa", "bb"),
+        )
+        .unwrap();
+
+        let rows = load_all_quarantine(&conn).unwrap();
+        assert_eq!(rows.len(), 2);
+        let classes: std::collections::BTreeSet<&str> =
+            rows.iter().map(|row| row.failure_class()).collect();
+        assert_eq!(classes.len(), 2, "the two classes must stay distinct");
+    }
+
+    /// The same collision recurring (the same key and payload digests, re-ingest)
+    /// merges into the existing row rather than duplicating it.
+    #[test]
+    fn the_same_collision_recurring_merges_instead_of_duplicating() {
+        let (_scratch, conn) = fixture_conn();
+        let first = collision("p1", "t:1000|s1|10:0:0", "aa", "bb");
+        let mut recurring = collision("p1", "t:1000|s1|10:0:0", "aa", "bb");
+        recurring.observed_at = ts(9_000);
+        record_dedup_collision(&conn, &first).unwrap();
+        assert_eq!(
+            record_dedup_collision(&conn, &recurring).unwrap(),
+            QuarantineRecordOutcome::UpdatedExisting
+        );
+
+        let rows = load_all_quarantine(&conn).unwrap();
+        assert_eq!(rows.len(), 1, "a recurring collision must not duplicate");
+        assert_eq!(rows[0].first_observed(), ts(1_000));
+        assert_eq!(rows[0].last_observed(), ts(9_000));
+    }
+
+    /// A different collision under the same parser (different key) is its own
+    /// row: the hash carries the collision's identity, so the doctor's per-key
+    /// evidence stays separable.
+    #[test]
+    fn a_different_collision_is_its_own_row() {
+        let (_scratch, conn) = fixture_conn();
+        record_dedup_collision(&conn, &collision("p1", "t:1000|s1|10:0:0", "aa", "bb")).unwrap();
+        record_dedup_collision(&conn, &collision("p1", "t:2000|s1|10:0:0", "aa", "bb")).unwrap();
+        assert_eq!(count_quarantined_records(&conn).unwrap(), 2);
     }
 }

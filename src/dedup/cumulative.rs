@@ -142,22 +142,9 @@ fn series_key(event: &NormalizedUsageEvent) -> SeriesKey {
             session.source().as_str(),
             session.native().as_str()
         ),
-        None => format!("file:{}", event_file(event)),
+        None => format!("file:{}", event.source_file()),
     };
     SeriesKey { parser, scope }
-}
-
-/// The file an event was read from: the one provenance source that is not a
-/// strong-identity entry. The same convention `report::spend` uses, defined
-/// there first; this module reads it rather than inventing a second.
-fn event_file(event: &NormalizedUsageEvent) -> String {
-    event
-        .provenance()
-        .sources()
-        .iter()
-        .find(|source| !source.starts_with(crate::transcripts::parser::STRONG_IDENTITY_PREFIX))
-        .cloned()
-        .unwrap_or_default()
 }
 
 /// Orders two records of one series.
@@ -176,7 +163,7 @@ fn compare_series_records(
         .cmp(&b.sequence())
         .then_with(|| a.occurred_at().cmp(&b.occurred_at()))
         .then_with(|| known_components(a).cmp(&known_components(b)))
-        .then_with(|| event_file(a).cmp(&event_file(b)))
+        .then_with(|| a.source_file().cmp(b.source_file()))
 }
 
 /// The four known components as an orderable tuple.
