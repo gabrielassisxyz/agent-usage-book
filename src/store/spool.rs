@@ -396,14 +396,9 @@ pub struct DrainReport {
 /// report a store-failure class and let a later drain retry it.
 pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainReport, Error> {
     let dir = pending_dir(state_dir);
-    let mut report = DrainReport {
-        applied: 0,
-        already_applied: 0,
-        quarantined: 0,
-        publication: crate::projection::Publication::Deferred {
-            reason: "publication not attempted".to_string(),
-        },
-    };
+    let mut applied = 0;
+    let mut already_applied = 0;
+    let mut quarantined = 0;
     if dir.exists() {
         let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
             .map_err(|error| {
@@ -423,9 +418,9 @@ pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainRep
 
         for path in entries {
             match drain_one(conn, state_dir, &path)? {
-                DrainOutcome::Applied => report.applied += 1,
-                DrainOutcome::AlreadyApplied => report.already_applied += 1,
-                DrainOutcome::Quarantined => report.quarantined += 1,
+                DrainOutcome::Applied => applied += 1,
+                DrainOutcome::AlreadyApplied => already_applied += 1,
+                DrainOutcome::Quarantined => quarantined += 1,
             }
         }
     }
@@ -433,9 +428,14 @@ pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainRep
     // applied record advanced the ledger generation inside its own commit;
     // publication after the pass covers all of them, and refreshes the file
     // even when the pass applied nothing, repairing what a crash left older.
-    report.publication =
+    let publication =
         crate::projection::publish(conn, &crate::projection::projection_path_in(state_dir));
-    Ok(report)
+    Ok(DrainReport {
+        applied,
+        already_applied,
+        quarantined,
+        publication,
+    })
 }
 
 fn is_pending_record_name(path: &Path) -> bool {

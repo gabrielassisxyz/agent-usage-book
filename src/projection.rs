@@ -708,24 +708,58 @@ mod tests {
 
     /// The `Done when` criterion: deleting the projection and re-running
     /// publication reproduces it byte for byte from the same database state.
-    /// Serialization is canonical and carries no wall clock, so this holds by
-    /// construction; the test proves it over real files.
+    /// Both publications build from a real seeded database through the real
+    /// read snapshot, so a wall clock, a map ordering or any other
+    /// nondeterminism in the construction fails here.
     #[test]
     fn deleting_the_projection_and_republishing_reproduces_it_byte_for_byte() {
-        let scratch = ScratchDir::new();
-        let target = scratch.path().join(PROJECTION_FILE_NAME);
-        let bytes = serde_json::to_vec(&full_projection().to_json()).unwrap();
+        let mut seeded = crate::store::projection_source::test_support::fixture("republish");
+        let attempt = seeded.start_attempt();
+        seeded.commit_success_bundle(attempt);
 
-        atomic_write(&target, &bytes).unwrap();
-        let first = fs::read(&target).unwrap();
+        let reader = crate::store::connection::open(
+            &seeded._scratch.path().join("source.db"),
+            crate::store::connection::AccessMode::ReadOnly,
+            &crate::store::projection_source::test_support::fixture_policy(),
+        )
+        .unwrap();
+        let target = seeded._scratch.path().join(PROJECTION_FILE_NAME);
+
+        let first = publish_checked(&reader, &target).unwrap();
+        let first_bytes = fs::read(&target).unwrap();
         fs::remove_file(&target).unwrap();
-        atomic_write(&target, &bytes).unwrap();
-        let second = fs::read(&target).unwrap();
+        let second = publish_checked(&reader, &target).unwrap();
+        let second_bytes = fs::read(&target).unwrap();
 
         assert_eq!(
             first, second,
-            "republishing must reproduce the file byte for byte"
+            "the recorded generation must be the same rebuild"
         );
+        assert_eq!(
+            first_bytes, second_bytes,
+            "republishing from the same database state must reproduce the file byte for byte"
+        );
+    }
+
+    /// The publication sequence the design states (PLAN.md section 16.1) is a
+    /// property of the production source, not of an observable run: a removed
+    /// fsync or a missing atomic rename changes durability and tear-safety
+    /// that no behavior test over a passing run can catch. This scans the
+    /// production half of this file for the sequence, the same convention the
+    /// ledger generation module uses for its own substitutes ban.
+    #[test]
+    fn the_publication_source_carries_the_stated_write_sequence() {
+        let source = include_str!("projection.rs");
+        let production_source = source
+            .split_once("#[cfg(test)]")
+            .expect("this module must have a #[cfg(test)] boundary")
+            .0;
+        for expected in ["write_all", "sync_all", "fs::rename", "sync_directory"] {
+            assert!(
+                production_source.contains(expected),
+                "the publication sequence must contain {expected}"
+            );
+        }
     }
 
     #[test]
