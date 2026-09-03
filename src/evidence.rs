@@ -17,6 +17,11 @@ impl ComponentKind {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
     }
+
+    /// The stable name of this component, as it renders and digests.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
 }
 
 /// An algorithm that reconstructed rather than measured a value.
@@ -26,6 +31,11 @@ pub struct EstimatorId(String);
 impl EstimatorId {
     pub fn new(value: impl Into<String>) -> Self {
         Self(value.into())
+    }
+
+    /// The stable identifier of this estimator, as it renders and digests.
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 

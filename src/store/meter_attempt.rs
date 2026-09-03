@@ -195,6 +195,42 @@ pub mod failure_class_sql {
     }
 }
 
+pub(crate) fn attempt_outcome_as_sql(outcome: &AttemptOutcome) -> &'static str {
+    match outcome {
+        AttemptOutcome::Success => "success",
+        AttemptOutcome::AuthRequired => "auth_required",
+        AttemptOutcome::Unreachable(_) => "unreachable",
+    }
+}
+
+pub(crate) fn attempt_outcome_from_sql(
+    outcome_sql: &str,
+    failure_class_sql: Option<String>,
+    retry_after_nanos: Option<i64>,
+) -> Result<(AttemptOutcome, Option<FailureClass>), Error> {
+    match outcome_sql {
+        "success" => Ok((AttemptOutcome::Success, None)),
+        "auth_required" => Ok((AttemptOutcome::AuthRequired, None)),
+        "unreachable" => {
+            let Some(code) = failure_class_sql.as_deref() else {
+                return Err(Error::Store(
+                    "a meter_attempt_result row is unreachable without a failure class".to_string(),
+                ));
+            };
+            let class = match (failure_class_sql::from_sql(code)?, retry_after_nanos) {
+                (FailureClass::RateLimited { .. }, Some(nanos)) => FailureClass::RateLimited {
+                    retry_after: Some(MonotonicDuration::from_nanos(nanos as u64)),
+                },
+                (class, _) => class,
+            };
+            Ok((AttemptOutcome::Unreachable(class), Some(class)))
+        }
+        other => Err(Error::Store(format!(
+            "unknown meter_attempt_result outcome stored in the database: {other:?}"
+        ))),
+    }
+}
+
 const INSERT_ATTEMPT: &str = "
 INSERT INTO meter_attempt (
     run_id, account_id, provider, request_started_at, credential_context_id,
@@ -246,11 +282,7 @@ pub fn record_meter_attempt_result(
     conn: &rusqlite::Connection,
     result: &NewMeterAttemptResult,
 ) -> Result<(), Error> {
-    let outcome_sql = match &result.outcome {
-        AttemptOutcome::Success => "success",
-        AttemptOutcome::AuthRequired => "auth_required",
-        AttemptOutcome::Unreachable(_) => "unreachable",
-    };
+    let outcome_sql = attempt_outcome_as_sql(&result.outcome);
     let (failure_class_sql, retry_after) = match &result.outcome {
         AttemptOutcome::Unreachable(class) => {
             let retry_after = match class {
@@ -369,40 +401,12 @@ pub fn attempt_by_row_id(
     row_id: MeterAttemptRowId,
 ) -> Result<Option<StoredMeterAttempt>, Error> {
     conn.query_row(
-        &format!("{SELECT_ATTEMPT_COLUMNS} FROM meter_attempt WHERE id = ?1"),
+        &format!("SELECT {SELECT_ATTEMPT_COLUMNS} FROM meter_attempt WHERE id = ?1"),
         params![row_id.value()],
         row_to_attempt,
     )
     .optional()
     .map_err(|e| Error::Store(format!("cannot read meter_attempt {}: {e}", row_id.value())))
-}
-
-fn failure_class_pair(
-    outcome_sql: &str,
-    failure_class_sql: Option<String>,
-    retry_after_nanos: Option<i64>,
-) -> Result<(AttemptOutcome, Option<FailureClass>), Error> {
-    match outcome_sql {
-        "success" => Ok((AttemptOutcome::Success, None)),
-        "auth_required" => Ok((AttemptOutcome::AuthRequired, None)),
-        "unreachable" => {
-            let Some(code) = failure_class_sql.as_deref() else {
-                return Err(Error::Store(
-                    "a meter_attempt_result row is unreachable without a failure class".to_string(),
-                ));
-            };
-            let class = match (failure_class_sql::from_sql(code)?, retry_after_nanos) {
-                (FailureClass::RateLimited { .. }, Some(nanos)) => FailureClass::RateLimited {
-                    retry_after: Some(MonotonicDuration::from_nanos(nanos as u64)),
-                },
-                (class, _) => class,
-            };
-            Ok((AttemptOutcome::Unreachable(class), Some(class)))
-        }
-        other => Err(Error::Store(format!(
-            "unknown meter_attempt_result outcome stored in the database: {other:?}"
-        ))),
-    }
 }
 
 const SELECT_RESULT_COLUMNS: &str = "
@@ -414,13 +418,15 @@ fn row_to_result(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterAttempt
     let failure_class_sql: Option<String> = row.get("failure_class")?;
     let retry_after_nanos: Option<i64> = row.get("retry_after_nanos")?;
     let (outcome, failure_class) =
-        failure_class_pair(&outcome_sql, failure_class_sql, retry_after_nanos).map_err(|e| {
-            rusqlite::Error::FromSqlConversionFailure(
-                3, // outcome, by position in SELECT_RESULT_COLUMNS
-                rusqlite::types::Type::Text,
-                Box::new(e),
-            )
-        })?;
+        attempt_outcome_from_sql(&outcome_sql, failure_class_sql, retry_after_nanos).map_err(
+            |e| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    3, // outcome, by position in SELECT_RESULT_COLUMNS
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            },
+        )?;
     Ok(StoredMeterAttemptResult {
         attempt_id: MeterAttemptRowId::new(row.get("attempt_id")?),
         completed_at: UtcTimestamp::from_unix_nanos(row.get("completed_at")?),

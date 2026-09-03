@@ -9,14 +9,17 @@
 
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::interval::{DomainQuantity, Interval};
+use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
+use crate::presentation::render::ExplainMode;
 use crate::problem_code::ProblemCode;
-use crate::report::{LedgerGeneration, ReportMetadata, SpendReport, StatusReport};
+use crate::report::{LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport};
+use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
 /// below pin the exact shape, so a field added without bumping this fails them.
@@ -326,7 +329,7 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_STATUS_KEYS: [&str; 7] = [
+    const KNOWN_STATUS_KEYS: [&str; 8] = [
         "schema",
         "command",
         "run",
@@ -334,11 +337,22 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
         "knowledge_at",
         "ledger_generation",
         "accounts",
+        "explain",
     ];
     for key in obj.keys() {
         if !KNOWN_STATUS_KEYS.contains(&key.as_str()) {
             return Err(JsonContractError::UnexpectedField(key.clone()));
         }
+    }
+    if let Some(explain_val) = obj.get("explain") {
+        let explain_obj =
+            explain_val
+                .as_object()
+                .ok_or_else(|| JsonContractError::InvalidFormat {
+                    field: "explain",
+                    message: "expected explain object".to_string(),
+                })?;
+        validate_explain_object(explain_obj)?;
     }
     let accounts = obj
         .get("accounts")
@@ -412,7 +426,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 9] = [
+    const KNOWN_SPEND_KEYS: [&str; 10] = [
         "schema",
         "command",
         "run",
@@ -422,6 +436,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "window",
         "groups",
         "ingest",
+        "explain",
     ];
     for key in obj.keys() {
         if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
@@ -437,25 +452,109 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
     if !obj.contains_key("ingest") {
         return Err(JsonContractError::MissingField("ingest"));
     }
+    if let Some(explain_val) = obj.get("explain") {
+        let explain_obj =
+            explain_val
+                .as_object()
+                .ok_or_else(|| JsonContractError::InvalidFormat {
+                    field: "explain",
+                    message: "expected explain object".to_string(),
+                })?;
+        validate_explain_object(explain_obj)?;
+    }
     Ok(parsed)
+}
+
+fn validate_explain_object(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), JsonContractError> {
+    let mode = obj
+        .get("mode")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(JsonContractError::MissingField("explain.mode"))?;
+    if mode != "summary" && mode != "full" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "explain.mode",
+            message: format!("expected summary or full, got {mode}"),
+        });
+    }
+    let nodes = obj
+        .get("nodes")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JsonContractError::MissingField("explain.nodes"))?;
+    for node in nodes {
+        let node_obj = node
+            .as_object()
+            .ok_or_else(|| JsonContractError::InvalidFormat {
+                field: "explain.nodes[]",
+                message: "expected node object".to_string(),
+            })?;
+        for required in [
+            "field",
+            "derivation_id",
+            "source_count",
+            "observation_count",
+            "manifest",
+            "account_attribution",
+            "cost_model",
+            "window_calibration",
+            "rate_card",
+            "coverage_and_quality",
+            "empirical_history",
+            "arithmetic",
+        ] {
+            if !node_obj.contains_key(required) {
+                return Err(JsonContractError::MissingField(required));
+            }
+        }
+        let manifest = node_obj
+            .get("manifest")
+            .and_then(serde_json::Value::as_object)
+            .ok_or(JsonContractError::MissingField("explain.nodes[].manifest"))?;
+        for req in ["inputs_hash", "input_count", "query_semantics"] {
+            if !manifest.contains_key(req) {
+                return Err(JsonContractError::MissingField(req));
+            }
+        }
+        if mode == "full" && !node_obj.contains_key("members") {
+            return Err(JsonContractError::MissingField("explain.nodes[].members"));
+        }
+    }
+    Ok(())
 }
 
 /// The status report under the envelope: one object per account with its freshness.
 pub fn status_json(report: &StatusReport, run: RunId) -> String {
+    status_json_with_explain(report, run, ExplainMode::Off)
+}
+
+/// The status report under the envelope, optionally including explain provenance.
+pub fn status_json_with_explain(report: &StatusReport, run: RunId, explain: ExplainMode) -> String {
     let accounts = report
         .accounts
         .iter()
         .map(|account| freshness_json(account.account.as_str(), &account.reading))
         .collect::<Vec<_>>()
         .join(",");
-    JsonEnvelope::new("status", run, report.metadata.clone())
-        .to_json_with(&format!("\"accounts\":[{accounts}]"))
+    let mut body = format!("\"accounts\":[{accounts}]");
+    if explain != ExplainMode::Off {
+        body.push_str(&format!(
+            ",\"explain\":{}",
+            explain_json(&report.provenance, explain)
+        ));
+    }
+    JsonEnvelope::new("status", run, report.metadata.clone()).to_json_with(&body)
 }
 
 /// The spend report under the envelope: the window, one object per group with a
 /// `{value, unit}` per token kind, and the ingest summary, so a consumer can read
 /// the counts and what qualifies them from one document.
 pub fn spend_json(report: &SpendReport, run: RunId) -> String {
+    spend_json_with_explain(report, run, ExplainMode::Off)
+}
+
+/// The spend report under the envelope, optionally including explain provenance.
+pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: ExplainMode) -> String {
     let groups = report
         .groups
         .iter()
@@ -508,7 +607,7 @@ pub fn spend_json(report: &SpendReport, run: RunId) -> String {
         .map(|file| json_string(file))
         .collect::<Vec<_>>()
         .join(",");
-    let body = format!(
+    let mut body = format!(
         "\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"groups\":[{groups}],\"ingest\":{{\"files_read\":{},\"files_skipped_before_window\":{},\"unreadable_files\":[{unreadable}],\"quarantined\":{{{quarantined}}},\"replayed_occurrences\":{},\"collisions\":{},\"without_identity\":{},\"undated_events\":{},\"events_outside_window\":{},\"events_in_window\":{}}}",
         json_string(&report.since.iso()),
         json_string(&report.until.iso()),
@@ -521,7 +620,237 @@ pub fn spend_json(report: &SpendReport, run: RunId) -> String {
         ingest.events_outside_window,
         ingest.events_in_window,
     );
+    if explain != ExplainMode::Off {
+        body.push_str(&format!(
+            ",\"explain\":{}",
+            explain_json(&report.provenance, explain)
+        ));
+    }
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.
+pub fn validate_doctor_drift_report_json(
+    json_str: &str,
+) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "doctor" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'doctor', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_DOCTOR_KEYS: [&str; 11] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "check",
+        "has_configured_roots",
+        "overall_drift_detected",
+        "remediation",
+        "sources",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_DOCTOR_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    let check = obj
+        .get("check")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(JsonContractError::MissingField("check"))?;
+    if check != "transcript-format-drift" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "check",
+            message: format!("expected 'transcript-format-drift', got '{check}'"),
+        });
+    }
+    let _sources = obj
+        .get("sources")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(JsonContractError::MissingField("sources"))?;
+    Ok(parsed)
+}
+
+/// Serializes a [`TranscriptDriftReport`] under the shared JSON envelope.
+pub fn doctor_drift_json(report: &TranscriptDriftReport, run: RunId) -> String {
+    let sources_json = report
+        .sources
+        .iter()
+        .map(|src| {
+            let shapes_json = src
+                .shapes_seen
+                .iter()
+                .map(|s| {
+                    let kind_val = match &s.record_kind {
+                        Some(k) => json_string(k),
+                        None => "null".to_string(),
+                    };
+                    format!(
+                        "{{\"shape_hash\":{},\"record_kind\":{kind_val},\"field_count\":{},\"occurrence_count\":{}}}",
+                        json_string(&s.shape_hash),
+                        s.field_count,
+                        s.occurrence_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_shapes_json = src
+                .uncovered_shapes
+                .iter()
+                .map(|s| {
+                    let kind_val = match &s.record_kind {
+                        Some(k) => json_string(k),
+                        None => "null".to_string(),
+                    };
+                    format!(
+                        "{{\"shape_hash\":{},\"record_kind\":{kind_val},\"field_count\":{},\"occurrence_count\":{}}}",
+                        json_string(&s.shape_hash),
+                        s.field_count,
+                        s.occurrence_count
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_fields_json = src
+                .uncovered_fields
+                .iter()
+                .map(|f| json_string(f))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_kinds_json = src
+                .uncovered_record_kinds
+                .iter()
+                .map(|k| json_string(k))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let uncovered_evs_json = src
+                .uncovered_evidence_classes
+                .iter()
+                .map(|e| json_string(e))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let quarantine_json = src
+                .quarantine_by_class
+                .iter()
+                .map(|(class, count)| format!("{}:{count}", json_string(class)))
+                .collect::<Vec<_>>()
+                .join(",");
+
+            let rem_json = match &src.remediation {
+                Some(r) => json_string(r),
+                None => "null".to_string(),
+            };
+
+            format!(
+                "{{\"source\":{},\"format\":{},\"parser_version\":{},\"files_scanned\":{},\"records_scanned\":{},\"quarantined_records\":{},\"quarantine_by_class\":{{{quarantine_json}}},\"shapes_seen\":[{shapes_json}],\"uncovered_fields\":[{uncovered_fields_json}],\"uncovered_record_kinds\":[{uncovered_kinds_json}],\"uncovered_evidence_classes\":[{uncovered_evs_json}],\"uncovered_shapes\":[{uncovered_shapes_json}],\"drift_detected\":{},\"remediation\":{rem_json}}}",
+                json_string(&src.source),
+                json_string(&src.format),
+                json_string(src.parser_version.as_str()),
+                src.files_scanned,
+                src.records_scanned,
+                src.quarantined_records,
+                src.drift_detected
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let overall_rem = match &report.remediation {
+        Some(r) => json_string(r),
+        None => "null".to_string(),
+    };
+
+    let body = format!(
+        "\"check\":\"transcript-format-drift\",\"has_configured_roots\":{},\"overall_drift_detected\":{},\"remediation\":{overall_rem},\"sources\":[{sources_json}]",
+        report.has_configured_roots, report.overall_drift_detected
+    );
+
+    JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a provenance graph into its JSON explain representation.
+pub fn explain_json(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
+    let mode_str = match mode {
+        ExplainMode::Off => "off",
+        ExplainMode::Summary => "summary",
+        ExplainMode::Full => "full",
+    };
+    let mut node_jsons = Vec::new();
+    for (field, node) in graph.iter() {
+        let manifest = node.manifest();
+        let derivation_id = DerivationId::from_manifest(manifest);
+        let cost_model = manifest
+            .witnesses()
+            .iter()
+            .find_map(|w| w.cost_model())
+            .map(|id| json_string(id.as_str()))
+            .unwrap_or_else(|| "null".to_string());
+        let window_cal = manifest
+            .witnesses()
+            .iter()
+            .find_map(|w| w.window_calibration())
+            .map(|id| json_string(id.as_str()))
+            .unwrap_or_else(|| "null".to_string());
+        let rate_card = manifest
+            .witnesses()
+            .iter()
+            .find_map(|w| w.rate_card())
+            .map(|id| json_string(id.as_str()))
+            .unwrap_or_else(|| "null".to_string());
+        let empirical = if manifest.query_semantics().filtering().contains("can-run") {
+            "can-run"
+        } else {
+            "none"
+        };
+
+        let mut node_body = format!(
+            "\"field\":{},\"derivation_id\":{},\"source_count\":{},\"observation_count\":{},\"manifest\":{{\"inputs_hash\":{},\"input_count\":{},\"query_semantics\":{{\"grouping\":{},\"filtering\":{}}}}},\"account_attribution\":{},\"cost_model\":{cost_model},\"window_calibration\":{window_cal},\"rate_card\":{rate_card},\"coverage_and_quality\":{},\"empirical_history\":{},\"arithmetic\":{}",
+            json_string(&field.label()),
+            json_string(&derivation_id.to_hex()),
+            node.source_count(),
+            node.observation_count(),
+            json_string(&manifest.inputs_hash().to_hex()),
+            manifest.input_count(),
+            json_string(manifest.query_semantics().grouping()),
+            json_string(manifest.query_semantics().filtering()),
+            json_string(field.account_attribution()),
+            json_string("complete"),
+            json_string(empirical),
+            json_string(&node.arithmetic().label()),
+        );
+
+        if mode == ExplainMode::Full {
+            let members = node
+                .members()
+                .iter()
+                .map(|m| json_string(m.as_str()))
+                .collect::<Vec<_>>()
+                .join(",");
+            node_body.push_str(&format!(",\"members\":[{members}]"));
+        }
+
+        node_jsons.push(format!("{{{node_body}}}"));
+    }
+    let nodes_str = node_jsons.join(",");
+    format!(
+        "{{\"mode\":{},\"nodes\":[{nodes_str}]}}",
+        json_string(mode_str)
+    )
 }
 
 /// Renders a failed command as the versioned JSON error envelope: the schema

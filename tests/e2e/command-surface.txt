@@ -8,3 +8,4 @@ spend
 config
 rate-card
 export
+doctor

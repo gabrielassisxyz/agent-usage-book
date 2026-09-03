@@ -161,37 +161,106 @@ cat > "$invariants" <<EOF
 Of the 1 invariants above, 0 are enforced by mechanical checks present at HEAD, and 1 are unenforced and tracked by open beads in the tracker.
 EOF
 
-assert_invariant_summary_matches_rows() { # $1 = INVARIANTS fixture
+assert_invariant_summary_matches_rows() { # $1 = INVARIANTS path
     local table="$1" enforced unenforced
     enforced="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 !~ /unenforced/ { count += 1 } END { print count + 0 }' "$table")"
     unenforced="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced/ { count += 1 } END { print count + 0 }' "$table")"
     if ! command grep -qF -- "$enforced are enforced" "$table" || ! command grep -qF -- "$unenforced are unenforced" "$table"; then
-        echo "integration: invariant summary does not match fixture rows" >&2
+        echo "invariant summary does not match rows in $table" >&2
         return 1
     fi
 }
 
-wave_close_allows_bead() { # $1 = bead id, $2 = INVARIANTS fixture
-    local candidate_bead="$1" table="$2"
-    if command grep -qF -- "| unenforced $candidate_bead |" "$table"; then
-        echo "integration: refusing close: $candidate_bead remains named by an unenforced invariant row" >&2
+wave_close_allows_bead() { # $1 = bead id, $2 = optional repo_dir or INVARIANTS path
+    local candidate_bead="$1"
+    local target="${2:-.}"
+    local table
+    if [ -f "$target" ]; then
+        table="$target"
+    elif [ -d "$target" ]; then
+        table="$target/docs/INVARIANTS.md"
+    else
+        table="docs/INVARIANTS.md"
+    fi
+
+    if [ ! -f "$table" ]; then
+        echo "refusing close: $table not found" >&2
         return 1
     fi
+
+    local matched_row
+    matched_row="$(awk -F '|' -v bead="$candidate_bead" '
+        /^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ ("unenforced[[:space:]]+" bead "([[:space:]]|$)") {
+            gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2);
+            print $2;
+            exit;
+        }
+    ' "$table")"
+
+    if [ -n "$matched_row" ]; then
+        echo "refusing close: invariant row $matched_row still names $candidate_bead as unenforced" >&2
+        return 1
+    fi
+
     assert_invariant_summary_matches_rows "$table"
 }
+
+# --- Unit assertions over refusal predicate against repo docs/INVARIANTS.md ---
+
+# Unit 1: A bead named by an unenforced row in the real repo INVARIANTS.md is refused with row and bead id
+real_unenforced_bead="aub-sth.12"
+refusal_out="$(wave_close_allows_bead "$real_unenforced_bead" 2>&1 || true)"
+if wave_close_allows_bead "$real_unenforced_bead" >/dev/null 2>&1; then
+    echo "unit: wave_close_allows_bead allowed close of $real_unenforced_bead which is unenforced in docs/INVARIANTS.md" >&2
+    fail=1
+fi
+if ! printf '%s' "$refusal_out" | command grep -qF "row 1" || ! printf '%s' "$refusal_out" | command grep -qF "$real_unenforced_bead"; then
+    echo "unit: refusal message did not name row number and bead id: '$refusal_out'" >&2
+    fail=1
+fi
+
+# Unit 2: Planted negative: a bead named by no row closes normally (not a blanket refusal)
+planted_negative_bead="aub-planted-negative-test-bead"
+if ! wave_close_allows_bead "$planted_negative_bead" >/dev/null 2>&1; then
+    echo "unit: wave_close_allows_bead refused $planted_negative_bead which is not named by any invariant row" >&2
+    fail=1
+fi
+
+# Unit 3: A bead whose row is enforced closes normally
+enforced_bead="aub-eu7.2"
+if ! wave_close_allows_bead "$enforced_bead" >/dev/null 2>&1; then
+    echo "unit: wave_close_allows_bead refused $enforced_bead whose invariant row is enforced" >&2
+    fail=1
+fi
 
 # Run the documented close command
 evidence="commit:0123456789abcdef suites:unit,integration,e2e"
 batch_summary="batch 42: union green across 5 beads"
 
-if wave_close_allows_bead "$bead_id" "$invariants" >/dev/null 2>&1; then
+# Before close: attempt close with unenforced invariant row; must refuse and leave tracker unchanged
+scratch_refusal_out="$(wave_close_allows_bead "$bead_id" "$scratch" 2>&1 || true)"
+if wave_close_allows_bead "$bead_id" "$scratch" >/dev/null 2>&1; then
     echo "integration: wave allowed a close while an unenforced invariant row named the bead" >&2
     fail=1
 fi
+if ! printf '%s' "$scratch_refusal_out" | command grep -qF "row 9" || ! printf '%s' "$scratch_refusal_out" | command grep -qF "$bead_id"; then
+    echo "integration: scratch refusal message did not name row 9 and bead id: '$scratch_refusal_out'" >&2
+    fail=1
+fi
 
+# Verify bead remains in batch_pending after refusal (tracker unchanged)
+initial_bead_json="$( (cd "$scratch" && br show --json "$bead_id") 2>/dev/null || true )"
+initial_status="$(printf '%s' "$initial_bead_json" | jq -r 'if type=="array" then .[0].status else .status end // empty')"
+if [ "$initial_status" != "batch_pending" ]; then
+    echo "integration: bead status changed despite refusal: expected 'batch_pending', got '$initial_status'" >&2
+    fail=1
+fi
+
+# Update fixture to enforce row 9 and update summary counts
 sed -i "s@| unenforced $bead_id |@| src/lib.rs |@; s@0 are enforced@1 are enforced@; s@1 are unenforced@0 are unenforced@" "$invariants"
 
-if ! wave_close_allows_bead "$bead_id" "$invariants"; then
+if ! wave_close_allows_bead "$bead_id" "$scratch"; then
+    echo "integration: wave refused close after row was updated to enforced" >&2
     fail=1
 elif ! (cd "$scratch" && br close "$bead_id" --reason "$evidence" --transition-comment "$batch_summary" >/dev/null 2>&1); then
     echo "integration: documented close command failed on batch_pending bead" >&2
