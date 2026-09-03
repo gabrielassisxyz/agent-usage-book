@@ -12,13 +12,14 @@
 //!
 //! May not depend on:
 //! - presentation
-//! - calibration, cost models, rate cards or meter observations
+//! - calibration, rate cards or meter observations
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use crate::config::Config;
 use crate::dedup::deduplicate;
+use crate::domain::credits::Credits;
 use crate::domain::money::Usd;
 use crate::domain::provenance::{DerivationId, EvidenceId, QuerySemantics, WitnessId};
 use crate::domain::time::{UtcDate, UtcTimestamp, unix_nanos};
@@ -28,14 +29,17 @@ use crate::domain::tokens::{
 };
 use crate::error::Error;
 use crate::evidence::{
-    ComponentKind, CoverageCompleteness, EstimatorId, EvidenceQuality, Provenance,
+    ComponentKind, CoverageCompleteness, Derivation, EstimatorId, EvidenceQuality, Provenance,
+    RequiredFact,
 };
 use crate::logging::LogicalName;
 use crate::report::models::{
     IngestSummary, IngestionGeneration, LedgerGeneration, ReportMetadata, SpendDiagnostic,
-    SpendDiagnosticProvenance, SpendGroup, SpendGroupProvenance, SpendGrouping, SpendReport,
+    SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
+    SpendGrouping, SpendReport,
 };
-use crate::report::provenance::{ProvenanceNode, ValueArithmetic};
+use crate::report::provenance::{ProvenanceNode, Unit, ValueArithmetic};
+use crate::store::cost_model::CostModel;
 use crate::store::spend::CanonicalSpendEvent;
 use crate::transcripts::{
     DiscoveryError, DiscoveryOptions, NormalizedUsageEvent, ParserAdapter, ParserVersion,
@@ -48,6 +52,15 @@ use crate::valuation::{RateBook, ValuationOutcome};
 pub struct SpendWindow {
     pub since: UtcDate,
     pub until: UtcDate,
+}
+
+/// Whether an `aub spend` caller requested the optional credit dimension and, when
+/// it did, the immutable model witness resolved from the repository.
+#[derive(Debug, Clone, Copy)]
+pub enum CreditReporting<'model> {
+    NotRequested,
+    Active(&'model CostModel),
+    NoActiveModel,
 }
 
 impl SpendWindow {
@@ -415,6 +428,11 @@ fn finish_group(
 /// Assembles `aub spend` from the durable canonical ledger. The optional refresh
 /// is performed by the CLI before this read; a failed refresh is carried as a
 /// qualification while this function still reports the last committed subtotal.
+///
+/// The optional dimensions arrive as separate arguments rather than a bundle: each
+/// is resolved by the CLI from a different repository and passed as its own witness,
+/// which is the property the fail-closed rule rests on.
+#[allow(clippy::too_many_arguments)]
 pub fn assemble_canonical(
     conn: &rusqlite::Connection,
     window: SpendWindow,
@@ -423,6 +441,7 @@ pub fn assemble_canonical(
     refresh_attempted: bool,
     refresh_failure: Option<String>,
     rate_book: Option<&RateBook>,
+    credit_reporting: CreditReporting<'_>,
 ) -> Result<SpendReport, Error> {
     let grouping = if grouping.is_empty() {
         vec![SpendGrouping::Day]
@@ -436,6 +455,7 @@ pub fn assemble_canonical(
     let heuristic_identities = diagnostics.heuristic_identities;
     let partial = refresh_failure.is_some() || !diagnostics.quarantined_by_class.is_empty();
     let mut provenance = Vec::new();
+    let mut credit_provenance = Vec::new();
     let groups = canonical_groups(
         &events,
         &grouping,
@@ -445,6 +465,8 @@ pub fn assemble_canonical(
         partial,
         &mut provenance,
         rate_book,
+        &mut credit_provenance,
+        credit_reporting,
     );
     let mut metadata = ReportMetadata::new(
         generated_at,
@@ -519,6 +541,11 @@ pub fn assemble_canonical(
     )
     .with_stale_rate_card_note(stale_note)
     .with_grouping(grouping)
+    .with_credit_model(match credit_reporting {
+        CreditReporting::Active(model) => Some(model.id().clone()),
+        CreditReporting::NotRequested | CreditReporting::NoActiveModel => None,
+    })
+    .with_credit_provenance(credit_provenance)
     .with_diagnostics(vec![
         SpendDiagnosticProvenance {
             diagnostic: SpendDiagnostic::CanonicalRecords,
@@ -545,6 +572,8 @@ fn canonical_groups(
     partial: bool,
     provenance: &mut Vec<SpendGroupProvenance>,
     rate_book: Option<&RateBook>,
+    credit_provenance: &mut Vec<SpendGroupCreditsProvenance>,
+    credit_reporting: CreditReporting<'_>,
 ) -> Vec<SpendGroup> {
     let Some(dimension) = grouping.get(depth).copied() else {
         return Vec::new();
@@ -592,6 +621,30 @@ fn canonical_groups(
             );
             let derivation_id = DerivationId::from_manifest(node.manifest());
             provenance.push(SpendGroupProvenance::new(key.clone(), node));
+            let credits = credit_derivation(credit_reporting, &usage);
+            if let CreditReporting::Active(model) = credit_reporting {
+                let credit_node = ProvenanceNode::new(
+                    members
+                        .iter()
+                        .map(|event| EvidenceId::new(event.canonical_id.clone())),
+                    [WitnessId::CostModel(model.id().clone())],
+                    QuerySemantics::new(
+                        grouping[..=depth]
+                            .iter()
+                            .map(|dimension| dimension.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        format!("{}..{}", window.since.iso(), window.until.iso()),
+                    ),
+                    sources.len() as u64,
+                    members.len() as u64,
+                    ValueArithmetic::Converted {
+                        from: Unit::Tokens,
+                        to: Unit::Credits,
+                    },
+                );
+                credit_provenance.push(SpendGroupCreditsProvenance::new(key.clone(), credit_node));
+            }
             let children = canonical_groups(
                 &members.into_iter().cloned().collect::<Vec<_>>(),
                 grouping,
@@ -601,11 +654,17 @@ fn canonical_groups(
                 partial,
                 provenance,
                 rate_book,
+                credit_provenance,
+                credit_reporting,
             );
             path.pop();
-            SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
+            let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
                 .with_valuation(valuation)
-                .with_children(children)
+                .with_children(children);
+            match credits {
+                Some(credits) => group.with_credits(credits),
+                None => group,
+            }
         })
         .collect()
 }
@@ -633,6 +692,27 @@ fn value_events(events: &[&CanonicalSpendEvent], book: &RateBook) -> ValuationOu
             crate::domain::money::Money::<Usd>::from_micros(0),
         ))
     })
+}
+
+/// The credit derivation for one spend group, or `None` when the caller did not ask
+/// for credits at all. A request that finds no active model still produces a
+/// derivation, so the refusal names the missing fact instead of reading as "not
+/// requested".
+fn credit_derivation(
+    reporting: CreditReporting<'_>,
+    usage: &UsageVector,
+) -> Option<Derivation<Credits>> {
+    match reporting {
+        CreditReporting::NotRequested => None,
+        CreditReporting::Active(model) => Some(crate::cost_model::convert(model, usage)),
+        CreditReporting::NoActiveModel => Some(
+            Derivation::unavailable(
+                [RequiredFact::new("active cost model")],
+                Provenance::new(["cost-model:unavailable".to_string()]),
+            )
+            .expect("the active cost model is a named missing fact"),
+        ),
+    }
 }
 
 fn group_value(event: &CanonicalSpendEvent, grouping: SpendGrouping) -> String {
@@ -868,6 +948,7 @@ mod tests {
             false,
             None,
             None,
+            CreditReporting::NotRequested,
         )
         .unwrap();
 
@@ -933,6 +1014,7 @@ mod tests {
             true,
             Some("refresh failed: fixture unreadable; retained prior subtotal".to_string()),
             None,
+            CreditReporting::NotRequested,
         )
         .unwrap();
 
@@ -980,6 +1062,7 @@ mod tests {
             false,
             None,
             Some(&book),
+            CreditReporting::NotRequested,
         )
         .unwrap();
 

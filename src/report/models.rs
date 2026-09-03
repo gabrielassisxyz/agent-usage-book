@@ -10,9 +10,10 @@ use std::collections::BTreeMap;
 use crate::config::CoverageFloor;
 use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
+use crate::domain::credits::Credits;
 use crate::domain::freshness::Freshness;
 use crate::domain::money::Usd;
-use crate::domain::provenance::{DerivationId, RateCardId};
+use crate::domain::provenance::{CostModelId, DerivationId, RateCardId};
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
@@ -254,6 +255,9 @@ pub struct SpendGroup {
     pub valuation: Option<ValuationOutcome<Usd>>,
     pub provenance: Provenance,
     pub derivation_id: DerivationId,
+    /// Subscription credits when the caller explicitly requested conversion.
+    /// A refusal stays alongside tokens, rather than suppressing the token report.
+    pub credits: Option<Derivation<Credits>>,
     /// Groups requested after this one. A report with more than one grouping
     /// dimension is a tree, so every parent subtotal has the same typed usage
     /// vector as its children rather than a lossy scalar total.
@@ -273,6 +277,7 @@ impl SpendGroup {
             valuation: None,
             provenance,
             derivation_id,
+            credits: None,
             children: Vec::new(),
         }
     }
@@ -284,6 +289,11 @@ impl SpendGroup {
 
     pub fn with_children(mut self, children: Vec<SpendGroup>) -> Self {
         self.children = children;
+        self
+    }
+
+    pub fn with_credits(mut self, credits: Derivation<Credits>) -> Self {
+        self.credits = Some(credits);
         self
     }
 }
@@ -385,6 +395,19 @@ impl SpendGroupProvenance {
     }
 }
 
+/// Provenance material for one spend group's requested credit conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendGroupCreditsProvenance {
+    pub key: LogicalName,
+    pub node: ProvenanceNode,
+}
+
+impl SpendGroupCreditsProvenance {
+    pub fn new(key: LogicalName, node: ProvenanceNode) -> Self {
+        Self { key, node }
+    }
+}
+
 /// The spend report for `aub spend`: the window it covers, the groups, the
 /// provenance graph and the ingestion summary the groups were built from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -400,6 +423,11 @@ pub struct SpendReport {
     pub provenance: ProvenanceGraph,
     pub ingest: IngestSummary,
     pub stale_rate_card_note: Option<String>,
+    /// The cost model the credit conversion was requested against, when it was
+    /// requested at all. Carried on the report rather than read back out of a
+    /// group's provenance so that a window whose every group refused conversion
+    /// still names the model the refusal was measured against.
+    pub credit_model: Option<CostModelId>,
 }
 
 impl SpendReport {
@@ -425,6 +453,7 @@ impl SpendReport {
             provenance,
             ingest,
             stale_rate_card_note: None,
+            credit_model: None,
         }
     }
 
@@ -435,6 +464,23 @@ impl SpendReport {
 
     pub fn with_grouping(mut self, grouping: Vec<SpendGrouping>) -> Self {
         self.grouping = grouping;
+        self
+    }
+
+    pub fn with_credit_model(mut self, model: Option<CostModelId>) -> Self {
+        self.credit_model = model;
+        self
+    }
+
+    pub fn with_credit_provenance(mut self, credits: Vec<SpendGroupCreditsProvenance>) -> Self {
+        self.provenance = self
+            .provenance
+            .with_added(credits.into_iter().map(|credit| {
+                (
+                    ReportField::SpendGroupCredits { key: credit.key },
+                    credit.node,
+                )
+            }));
         self
     }
 
@@ -1166,6 +1212,10 @@ mod tests {
             )],
             IngestSummary::default(),
         )
+        .with_credit_provenance(vec![SpendGroupCreditsProvenance::new(
+            LogicalName::new("by-day"),
+            node(),
+        )])
         .with_diagnostics(vec![
             SpendDiagnosticProvenance {
                 diagnostic: SpendDiagnostic::CanonicalRecords,
@@ -1200,6 +1250,9 @@ mod tests {
             ReportField::SpendGroupTokens {
                 key: LogicalName::new("by-day"),
             },
+            ReportField::SpendGroupCredits {
+                key: LogicalName::new("by-day"),
+            },
             ReportField::SpendCanonicalRecords,
             ReportField::SpendReplayedOccurrences,
             ReportField::SpendHeuristicIdentities,
@@ -1215,7 +1268,7 @@ mod tests {
                     assert!(status.provenance.resolve(field).is_some(), "{account:?}");
                     assert!(now.provenance.resolve(field).is_some(), "{account:?}");
                 }
-                ReportField::SpendGroupTokens { key } => {
+                ReportField::SpendGroupTokens { key } | ReportField::SpendGroupCredits { key } => {
                     assert!(spend.provenance.resolve(field).is_some(), "{key:?}");
                 }
                 ReportField::SpendCanonicalRecords

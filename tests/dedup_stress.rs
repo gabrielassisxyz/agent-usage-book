@@ -657,6 +657,7 @@ fn criterion_3_same_transcript_added_from_second_path_does_not_double_count() {
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .unwrap();
     let spend_both = assemble_canonical(
@@ -667,6 +668,7 @@ fn criterion_3_same_transcript_added_from_second_path_does_not_double_count() {
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .unwrap();
 
@@ -931,6 +933,7 @@ fn criterion_6_rebuild_determinism_and_path_convergence() {
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .expect("spend report before rebuild");
 
@@ -988,6 +991,7 @@ fn criterion_6_rebuild_determinism_and_path_convergence() {
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .expect("spend report after rebuild");
 
@@ -1028,6 +1032,7 @@ fn criterion_6_rebuild_determinism_and_path_convergence() {
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .expect("spend report after refresh");
     let (input_after_refresh, _) = spend_totals(&spend_after_refresh);
@@ -1083,6 +1088,7 @@ fn criterion_7_suite_runs_within_documented_time_budget_with_generated_fixture()
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .unwrap();
     let spend_elapsed = spend_start.elapsed();

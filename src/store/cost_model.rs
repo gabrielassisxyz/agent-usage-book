@@ -915,6 +915,43 @@ pub fn anthropic_claude_messages_v1(valid_from: UtcTimestamp) -> CostModel {
     .expect("valid anthropic-claude-messages-v1 cost model")
 }
 
+/// The same published model with its cache-write term removed, for exercising the
+/// fail-closed path through the release binary.
+///
+/// It lives here rather than in a test because [`CreditsPerToken`] is constructible
+/// only inside this crate: an integration test cannot build a model with a missing
+/// term, so a binary-level case for the defect this project exists to repair has no
+/// other way in.
+pub fn anthropic_claude_messages_incomplete_v1(valid_from: UtcTimestamp) -> CostModel {
+    let complete = anthropic_claude_messages_v1(valid_from);
+    let manifest = ProvenanceManifest::new(
+        [EvidenceId::new("anthropic-pricing-2024-06-01")],
+        [WitnessId::CostModel(CostModelId::new(
+            "anthropic-claude-messages-incomplete-v1",
+        ))],
+        QuerySemantics::new("cost_model", "published_seed_without_cache_write"),
+    );
+    CostModel::new(
+        CostModelId::new("anthropic-claude-messages-incomplete-v1"),
+        ProviderKey::new("anthropic"),
+        CostModelScope::ModelClass,
+        BillingSemanticsId::new("anthropic-messages-subscription-v1"),
+        None,
+        CostModelVersion::new("1.0-incomplete"),
+        ValidityInterval::new(valid_from, UtcTimestamp::from_unix_nanos(i64::MAX))
+            .expect("validity interval"),
+        valid_from,
+        ModelProvenance::from_manifest(&manifest),
+        complete
+            .terms()
+            .iter()
+            .filter(|term| term.token_kind() != TokenKind::CacheWrite)
+            .cloned()
+            .collect(),
+    )
+    .expect("valid anthropic-claude-messages-incomplete-v1 cost model")
+}
+
 /// Seeds the initial published cost model if no cost model is currently active,
 /// activating it at `event_at`. If a model is already active, returns the active model.
 pub fn seed_initial_cost_model(

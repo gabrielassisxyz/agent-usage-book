@@ -27,7 +27,7 @@ use crate::presentation::render::{
 use crate::report::ReportEnvelope;
 use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as assemble_coverage};
 use crate::report::export::assemble as assemble_export;
-use crate::report::spend::{SpendWindow, assemble_canonical as assemble_spend};
+use crate::report::spend::{CreditReporting, SpendWindow, assemble_canonical as assemble_spend};
 use crate::report::{
     LedgerGeneration, MeterAccount, NowReport, ReportMetadata, SpendGrouping, StatusReport,
 };
@@ -71,6 +71,7 @@ aub_command_enum! {
     ExitClass,
     AttemptCrashHook,
     ProjectionCrashHook,
+    CostModelFixture,
     RateCard,
     Backup,
     Ingest,
@@ -108,7 +109,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -118,6 +119,7 @@ impl Command {
         Self::ExitClass,
         Self::AttemptCrashHook,
         Self::ProjectionCrashHook,
+        Self::CostModelFixture,
         Self::RateCard,
         Self::Backup,
         Self::Ingest,
@@ -248,6 +250,24 @@ impl Command {
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "exit-class prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::CostModelFixture => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "cost-model-fixture drives the store, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "cost-model-fixture derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "a cost model is scoped to a provider, not to an account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "cost-model-fixture names its own model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "cost-model-fixture prints a plain activation line",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -447,6 +467,7 @@ impl Command {
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
             Command::ProjectionCrashHook => "__projection-crash-hook",
+            Command::CostModelFixture => "__cost-model-fixture",
             Command::RateCard => "rate-card",
             Command::Backup => "backup",
             Command::Ingest => "ingest",
@@ -476,6 +497,7 @@ impl Command {
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
+            Command::CostModelFixture => None,
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
@@ -538,6 +560,7 @@ impl Command {
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
+            Command::CostModelFixture => None,
         }
     }
 
@@ -575,7 +598,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force | --value api-list",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --credits | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -598,6 +621,7 @@ impl Command {
             | Command::ExitClass
             | Command::AttemptCrashHook
             | Command::ProjectionCrashHook
+            | Command::CostModelFixture
             | Command::RateCard
             | Command::Now => None,
         }
@@ -889,6 +913,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), level, &invocation),
         Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
+        Command::CostModelFixture => cost_model_fixture(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
         Command::Ingest => ingest_command(&RealClock::new(), level, &invocation),
@@ -1899,6 +1924,16 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         }
         None => None,
     };
+    let active_cost_model = if options.credits {
+        crate::store::cost_model::load_active_at(&conn, timestamp)?
+    } else {
+        None
+    };
+    let credit_reporting = match active_cost_model.as_ref() {
+        Some(model) => CreditReporting::Active(model),
+        None if options.credits => CreditReporting::NoActiveModel,
+        None => CreditReporting::NotRequested,
+    };
     let mut report = assemble_spend(
         &conn,
         options.window,
@@ -1907,6 +1942,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         options.refresh != RefreshPolicy::Never,
         refresh_failure.clone(),
         rate_book.as_ref(),
+        credit_reporting,
     )?;
     if let Some(refresh) = refresh_report {
         report.ingest.files_read = refresh.files_parsed;
@@ -1955,6 +1991,7 @@ struct SpendOptions {
     grouping: Vec<SpendGrouping>,
     refresh: RefreshPolicy,
     value: Option<SpendValuationMode>,
+    credits: bool,
 }
 
 fn spend_options(
@@ -1966,6 +2003,7 @@ fn spend_options(
     let mut grouping = Vec::new();
     let mut refresh = RefreshPolicy::Auto;
     let mut value = None;
+    let mut credits = false;
     let mut args = rest.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2009,6 +2047,7 @@ fn spend_options(
                     }
                 }
             }
+            "--credits" => credits = true,
             other => match other.strip_prefix("--since=") {
                 Some(val_str) => since = Some(parse_date(val_str)?),
                 None => match other.strip_prefix("--days=") {
@@ -2047,6 +2086,7 @@ fn spend_options(
         },
         refresh,
         value,
+        credits,
     })
 }
 
@@ -2824,6 +2864,37 @@ fn projection_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<
 /// refused by the command's policy. The store path follows the state-check and
 /// crash-hook commands: readiness first, then the one connection path, then
 /// migrations, then the operation.
+/// Activates one of the two published cost models against the ledger, superseding
+/// whatever is active. Nothing in the shipping surface activates a cost model yet, so
+/// without this hook `spend --credits` can only ever report the missing-model refusal
+/// and the conversion itself would go untested through the binary.
+fn cost_model_fixture(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let at = clock.now();
+    let model = match invocation.rest.first().map(String::as_str) {
+        Some("complete") => crate::store::cost_model::anthropic_claude_messages_v1(at),
+        Some("incomplete") => crate::store::cost_model::anthropic_claude_messages_incomplete_v1(at),
+        other => {
+            return Err(Error::Usage(format!(
+                "__cost-model-fixture requires complete or incomplete, got {other:?}"
+            )));
+        }
+    };
+    let mut conn = open_ledger(clock)?;
+    let active = crate::store::cost_model::load_active_at(&conn, at)?;
+    if active.as_ref().map(|current| current.id()) == Some(model.id()) {
+        println!("cost model {} already active", model.id().as_str());
+        return Ok(());
+    }
+    crate::store::cost_model::activate(
+        &mut conn,
+        &model,
+        at,
+        active.as_ref().map(|current| current.id()),
+    )?;
+    println!("cost model {} active", model.id().as_str());
+    Ok(())
+}
+
 fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let subcommand = invocation.rest.first().map(String::as_str);
     match subcommand {

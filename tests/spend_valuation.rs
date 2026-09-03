@@ -211,6 +211,7 @@ fn integration_unvalued_spend_with_no_rate_cards_produces_complete_report() {
         false,
         None,
         None,
+        agent_usage_book::report::spend::CreditReporting::NotRequested,
     )
     .expect("unvalued spend with no rate cards must produce a complete report");
     assert!(assembled.metadata.rate_card_version.is_none());

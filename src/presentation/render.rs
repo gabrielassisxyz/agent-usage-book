@@ -5,6 +5,7 @@
 //! user-visible surface because no helper here accepts one, and a bare total where
 //! known missing evidence affects the aggregate is refused by construction.
 
+use crate::domain::credits::Credits;
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::money::{Currency, Money};
@@ -15,7 +16,7 @@ use crate::domain::time::{Age, ClockSkewEnvelope, MonotonicDuration, UtcTimestam
 use crate::domain::tokens::TokenKind;
 use crate::domain::window::NominalWindowDuration;
 use crate::error::Error;
-use crate::evidence::CoverageCompleteness;
+use crate::evidence::{CoverageCompleteness, Derivation, RequiredFact};
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
@@ -251,8 +252,15 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
     } else {
         ""
     };
+    let credit_clause = match &report.credit_model {
+        Some(model) => format!(", converted to credits under cost model {}", model.as_str()),
+        None if report.groups.iter().any(|g| g.credits.is_some()) => {
+            ", credits requested with no active cost model".to_string()
+        }
+        None => String::new(),
+    };
     let mut lines = vec![format!(
-        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}{valuation_clause}",
+        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}{valuation_clause}{credit_clause}",
         report.since.iso(),
         report.until.iso()
     )];
@@ -395,6 +403,9 @@ fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>)
             }
         }
     }
+    if let Some(credits) = &group.credits {
+        parts.push(render_credits(credits));
+    }
     let qualification = match quality_term(group.usage.quality()) {
         Some(term) => term,
         None => coverage_term(group.usage.coverage()),
@@ -411,6 +422,45 @@ fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>)
     }
 }
 
+/// The credit term of a spend line: the qualified amount, or the refusal naming
+/// every fact it is missing. A refusal is rendered next to the tokens rather than
+/// in place of them, so a window whose credits cannot be derived still reports the
+/// usage it did measure.
+fn render_credits(credits: &Derivation<Credits>) -> String {
+    match credits {
+        Derivation::Available(qualified) => {
+            let (value, coverage, quality, _) = qualified.clone().into_parts();
+            let qualification = match quality_term(&quality) {
+                Some(term) => term,
+                None => coverage_term(&coverage),
+            };
+            format!(
+                "{} {CREDIT_UNIT} ({})",
+                render_credits_amount(value),
+                qualification.term()
+            )
+        }
+        Derivation::Unavailable { missing, .. } => format!(
+            "{CREDIT_UNIT} unavailable: {}",
+            missing
+                .iter()
+                .map(RequiredFact::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// Formats a credit amount with two fractional digits, the same precision the
+/// monetary renderer uses: a credit is a billing quantity and reads wrong at
+/// either full micro precision or as a bare integer.
+pub fn render_credits_amount(credits: Credits) -> String {
+    let micros = credits.micros();
+    let hundredths = (micros.abs() + 5_000) / 10_000;
+    let sign = if micros < 0 { "-" } else { "" };
+    format!("{sign}{}.{:02}", hundredths / 100, hundredths % 100)
+}
+
 /// Formats a typed monetary amount with two fractional digits.
 pub fn render_money_amount<C: Currency>(money: Money<C>) -> String {
     let micros = money.micros();
@@ -420,6 +470,9 @@ pub fn render_money_amount<C: Currency>(money: Money<C>) -> String {
     let frac = cents % 100;
     format!("{sign}{whole}.{frac:02}")
 }
+
+/// The unit every credit quantity is carried in.
+pub const CREDIT_UNIT: &str = "credits";
 
 fn render_count(raw: u64) -> String {
     format!("{} {TOKEN_UNIT}", format_number(&raw.to_string(), TOKENS))

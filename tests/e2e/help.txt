@@ -27,7 +27,7 @@ spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions?
   refuses: --account (spend has no account dimension until account attribution lands); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --refresh auto|never|force | --value api-list
+  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --credits | --refresh auto|never|force | --value api-list
 
 config:
   answers: which configuration key resolved from where?

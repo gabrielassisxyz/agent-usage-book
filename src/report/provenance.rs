@@ -50,6 +50,8 @@ pub enum ReportField {
     MeterQuotaRemaining { account: LogicalName },
     /// The token count of one spend group.
     SpendGroupTokens { key: LogicalName },
+    /// The subscription-credit derivation of one spend group.
+    SpendGroupCredits { key: LogicalName },
     /// Canonical event records selected for a spend report.
     SpendCanonicalRecords,
     /// Replayed occurrences retained as diagnostics, not added to canonical usage.
@@ -74,6 +76,9 @@ impl ReportField {
             ReportField::SpendGroupTokens { key } => {
                 format!("spend_group_tokens[{}]", key.as_str())
             }
+            ReportField::SpendGroupCredits { key } => {
+                format!("spend_group_credits[{}]", key.as_str())
+            }
             ReportField::SpendCanonicalRecords => "spend_canonical_records".to_string(),
             ReportField::SpendReplayedOccurrences => "spend_replayed_occurrences".to_string(),
             ReportField::SpendHeuristicIdentities => "spend_heuristic_identities".to_string(),
@@ -88,6 +93,7 @@ impl ReportField {
         match self {
             ReportField::MeterQuotaRemaining { account } => account.as_str(),
             ReportField::SpendGroupTokens { key } => key.as_str(),
+            ReportField::SpendGroupCredits { key } => key.as_str(),
             ReportField::SpendCanonicalRecords
             | ReportField::SpendReplayedOccurrences
             | ReportField::SpendHeuristicIdentities => "spend",

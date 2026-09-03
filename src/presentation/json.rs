@@ -7,6 +7,7 @@
 //! and the ledger generation. A consumer never has to infer a unit or a freshness
 //! state from a bare number or a timestamp.
 
+use crate::domain::credits::Credits;
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::interval::{DomainQuantity, Interval};
 use crate::domain::provenance::DerivationId;
@@ -15,9 +16,11 @@ use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
 use crate::domain::window::WindowScope;
 use crate::error::Error;
-use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
+use crate::evidence::{
+    CoverageCompleteness, Derivation, EvidenceQuality, Provenance, RequiredFact,
+};
 use crate::logging::RunId;
-use crate::presentation::render::ExplainMode;
+use crate::presentation::render::{CREDIT_UNIT, ExplainMode, render_credits_amount};
 use crate::problem_code::ProblemCode;
 use crate::report::{
     CoverageReport, LedgerGeneration, NowReport, ProvenanceGraph, ReportMetadata, SpendReport,
@@ -498,7 +501,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 14] = [
+    const KNOWN_SPEND_KEYS: [&str; 15] = [
         "schema",
         "command",
         "run",
@@ -513,6 +516,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "explain",
         "rate_card_version",
         "stale_rate_card_note",
+        "credit_model",
     ];
     for key in obj.keys() {
         if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
@@ -722,6 +726,12 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
     if let Some(note) = &report.stale_rate_card_note {
         body.push_str(&format!(",\"stale_rate_card_note\":{}", json_string(note)));
     }
+    if let Some(model) = &report.credit_model {
+        body.push_str(&format!(
+            ",\"credit_model\":{}",
+            json_string(model.as_str())
+        ));
+    }
     if explain != ExplainMode::Off {
         body.push_str(&format!(
             ",\"explain\":{}",
@@ -800,7 +810,49 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
             }
         }
     }
+    if let Some(credits) = &group.credits {
+        fields.push_str(&format!(",\"credits\":{}", credits_json(credits)));
+    }
     format!("{{{fields}}}")
+}
+
+/// One spend group's credit derivation. The refusal serializes under the same key as
+/// the success, so a consumer reads one field either way and finds the missing facts
+/// named rather than a null it has to interpret.
+fn credits_json(credits: &Derivation<Credits>) -> String {
+    match credits {
+        Derivation::Available(qualified) => {
+            let (value, coverage, quality, provenance) = qualified.clone().into_parts();
+            format!(
+                "{{{},{},\"provenance\":{}}}",
+                strip_braces(&quantity_json(&render_credits_amount(value), CREDIT_UNIT)),
+                strip_braces(&coverage_and_quality_json(&coverage, &quality)),
+                provenance_json(&provenance),
+            )
+        }
+        Derivation::Unavailable {
+            missing,
+            provenance,
+        } => format!(
+            "{{\"status\":\"unavailable\",\"unit\":{},\"missing\":[{}],\"provenance\":{}}}",
+            json_string(CREDIT_UNIT),
+            missing
+                .iter()
+                .map(|fact| json_string(RequiredFact::as_str(fact)))
+                .collect::<Vec<_>>()
+                .join(","),
+            provenance_json(provenance),
+        ),
+    }
+}
+
+/// The inner fields of a serialized object, for splicing one object's members into
+/// another. Only ever applied to output of this module's own helpers.
+fn strip_braces(object: &str) -> &str {
+    object
+        .strip_prefix('{')
+        .and_then(|rest| rest.strip_suffix('}'))
+        .unwrap_or(object)
 }
 
 /// The unit every sampling-opportunity count is carried in.
