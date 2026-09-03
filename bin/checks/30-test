@@ -12,10 +12,19 @@ if [ "$test_status" -ne 0 ]; then
     exit "$test_status"
 fi
 
-case "$test_output" in
-    *"[INVARIANT_TRACKER_MEMBERSHIP_SKIPPED]"*) ;;
-    *)
-        echo "invariant tracker-membership skip marker was not surfaced by cargo test" >&2
-        exit 1
-        ;;
-esac
+if [ -f .beads/issues.jsonl ]; then
+    case "$test_output" in
+        *"[INVARIANT_TRACKER_MEMBERSHIP_SKIPPED]"*)
+            echo "invariant tracker-membership skip marker was surfaced while .beads/issues.jsonl is present" >&2
+            exit 1
+            ;;
+    esac
+else
+    case "$test_output" in
+        *"[INVARIANT_TRACKER_MEMBERSHIP_SKIPPED]"*) ;;
+        *)
+            echo "invariant tracker-membership skip marker was not surfaced by cargo test when tracker is absent" >&2
+            exit 1
+            ;;
+    esac
+fi
