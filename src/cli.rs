@@ -9,6 +9,7 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::path::PathBuf;
 
 use crate::domain::freshness::{FreshnessInput, compute_freshness};
 use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate};
@@ -370,7 +371,9 @@ impl Command {
         match self {
             Command::Spend => Some("--today (default) | --since YYYY-MM-DD | --days N"),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
-            Command::Backup => Some("DESTINATION | verify DESTINATION"),
+            Command::Backup => {
+                Some("DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]")
+            }
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
             Command::Doctor => Some("--transcript-format-drift"),
             Command::Status
@@ -1146,9 +1149,23 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         Some("start") => crate::store::attempt_crash_hook::CrashHookStage::Start,
         Some("complete") => crate::store::attempt_crash_hook::CrashHookStage::Complete,
         Some("read-back") => crate::store::attempt_crash_hook::CrashHookStage::ReadBack,
+        Some("commit-observation") => {
+            crate::store::attempt_crash_hook::CrashHookStage::CommitObservation
+        }
+        Some("spool-pending") => crate::store::attempt_crash_hook::CrashHookStage::SpoolPending,
+        Some("spool-orphan") => {
+            let raw = invocation.rest.get(1).ok_or_else(|| {
+                Error::Usage("spool-orphan requires the orphan attempt id".into())
+            })?;
+            let attempt_id = raw.parse::<i64>().map_err(|_| {
+                Error::Usage(format!("orphan attempt id must be an integer, got {raw:?}"))
+            })?;
+            crate::store::attempt_crash_hook::CrashHookStage::SpoolOrphan { attempt_id }
+        }
         other => {
             return Err(Error::Usage(format!(
-                "__attempt-crash-hook requires a stage (start | complete | read-back), got {other:?}"
+                "__attempt-crash-hook requires a stage (start | complete | read-back | \
+                 commit-observation | spool-pending | spool-orphan ID), got {other:?}"
             )));
         }
     };
@@ -1163,12 +1180,30 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         &file_path,
     )?;
 
+    // The seeding stages write the ledger and spool a recovery drill counts
+    // and replays, so they run against the ledger database; the crash stages
+    // keep their own fixture database, which case 009's read-back counts.
+    let ledger_stage = matches!(
+        stage,
+        crate::store::attempt_crash_hook::CrashHookStage::CommitObservation
+            | crate::store::attempt_crash_hook::CrashHookStage::SpoolPending
+            | crate::store::attempt_crash_hook::CrashHookStage::SpoolOrphan { .. }
+    );
+    let database = if ledger_stage {
+        config
+            .state
+            .dir
+            .join(crate::store::connection::LEDGER_DATABASE_FILE)
+    } else {
+        config.state.dir.join("attempt-crash-hook.db")
+    };
+
     let outcome = crate::store::startup::run_after_state_check(
         &config.state.dir,
         &crate::store::startup::ProcMounts,
         || {
             crate::store::attempt_crash_hook::run_stage(
-                &config.state.dir.join("attempt-crash-hook.db"),
+                &database,
                 stage,
                 config.sampling.request_timeout,
                 config.sampling.command_budget,
@@ -1185,6 +1220,9 @@ fn attempt_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<(),
         }
         crate::store::attempt_crash_hook::CrashHookOutcome::Counts { starts, results } => {
             println!("starts={starts} results={results}");
+        }
+        crate::store::attempt_crash_hook::CrashHookOutcome::Seeded { label, attempt_id } => {
+            println!("{label}={attempt_id}");
         }
     }
     Ok(())
@@ -1335,20 +1373,32 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
 }
 
 /// `aub backup DEST` creates a new archive; `aub backup verify DEST` clears
-/// and recomputes its verification result. The archive module owns the cut and
-/// verification protocol, while this layer only resolves configuration and
-/// renders the typed summary.
+/// and recomputes its verification result; `aub backup restore ARCHIVE DEST
+/// [--surviving DIR]` is the recovery path (`aub-sth.13`, docs/recovery.md).
+/// The archive module owns the cut and verification protocol, while this layer
+/// only resolves configuration and renders the typed summary.
 fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let (verify, destination) = match invocation.rest.as_slice() {
-        [destination] => (false, destination),
-        [subcommand, destination] if subcommand == "verify" => (true, destination),
+    match invocation.rest.as_slice() {
+        [subcommand, rest @ ..] if subcommand == "restore" => {
+            return restore_command(clock, rest);
+        }
+        [destination] => create_backup_archive(clock, destination)?,
+        [subcommand, destination] if subcommand == "verify" => {
+            verify_backup_archive(clock, destination)?
+        }
         rest => {
             return Err(Error::Usage(format!(
-                "backup requires DEST or `verify DEST`, got {rest:?}"
+                "backup requires DEST, `verify DEST` or `restore ARCHIVE DEST`, got {rest:?}"
             )));
         }
-    };
+    }
+    Ok(())
+}
 
+/// Resolves the configuration the backup family reads, the same way every
+/// command in it does, so the state directory the restore's refusals compare
+/// against is the one configuration actually names.
+fn resolve_backup_config() -> Result<crate::config::Config, Error> {
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -1358,23 +1408,24 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         file_contents.as_deref(),
         &file_path,
     )?;
+    Ok(config)
+}
+
+fn create_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
     let destination = std::path::Path::new(destination);
-    let summary = if verify {
-        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?
-    } else {
-        crate::store::startup::run_after_state_check(
-            &config.state.dir,
-            &crate::store::startup::ProcMounts,
-            || {
-                crate::backup::create_archive(
-                    &config.state.dir,
-                    destination,
-                    config.sampling.request_timeout,
-                    clock,
-                )
-            },
-        )??
-    };
+    let summary = crate::store::startup::run_after_state_check(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+        || {
+            crate::backup::create_archive(
+                &config.state.dir,
+                destination,
+                config.sampling.request_timeout,
+                clock,
+            )
+        },
+    )??;
     println!(
         "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
         summary.verified,
@@ -1385,6 +1436,129 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         summary.destination.display(),
     );
     Ok(())
+}
+
+fn verify_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
+    let destination = std::path::Path::new(destination);
+    let summary =
+        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?;
+    println!(
+        "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
+        summary.verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_records,
+        summary.drain_completed,
+        summary.destination.display(),
+    );
+    Ok(())
+}
+
+/// `aub backup restore ARCHIVE DEST [--surviving DIR]`: the recovery path
+/// (`aub-sth.13`, docs/recovery.md). Reads the archive, restores it into the
+/// new directory DEST, replays pending evidence from the archive and, when
+/// given, from the surviving directory, and prints what it recovered and what
+/// it could not. The configured state directory is passed to the restore so
+/// the refusal against it is made of the same value every other command
+/// resolves, not of a second resolution this layer would own.
+fn restore_command(clock: &impl Clock, rest: &[String]) -> Result<(), Error> {
+    let (archive, destination, surviving) = parse_restore_args(rest)?;
+    let config = resolve_backup_config()?;
+    let summary = crate::restore::restore_archive(
+        &config.state.dir,
+        &archive,
+        &destination,
+        surviving.as_deref(),
+        config.sampling.request_timeout,
+        &crate::store::startup::ProcMounts,
+        clock,
+    )?;
+    render_restore_summary(&summary);
+    Ok(())
+}
+
+fn parse_restore_args(rest: &[String]) -> Result<(PathBuf, PathBuf, Option<PathBuf>), Error> {
+    let mut args = rest.iter();
+    let archive = args
+        .next()
+        .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    let destination = args
+        .next()
+        .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    let mut surviving = None;
+    let mut positionals = Vec::new();
+    while let Some(arg) = args.next() {
+        if arg == "--surviving" {
+            if surviving.is_some() {
+                return Err(Error::Usage("--surviving was given twice".into()));
+            }
+            let value = args.next().ok_or_else(|| {
+                Error::Usage("--surviving requires the surviving directory".into())
+            })?;
+            surviving = Some(PathBuf::from(value));
+        } else {
+            positionals.push(arg.clone());
+        }
+    }
+    if !positionals.is_empty() {
+        return Err(Error::Usage(format!(
+            "restore takes ARCHIVE DEST and --surviving DIR, got {positionals:?}"
+        )));
+    }
+    Ok((
+        PathBuf::from(archive),
+        PathBuf::from(destination),
+        surviving,
+    ))
+}
+
+/// One operational result, in the same plain line-per-fact shape the backup
+/// command prints: the restored database's own numbers, the replay counts per
+/// source, the two recovery steps that have nothing to do in this phase with
+/// the reason each does not, and one line per unrecovered piece of evidence.
+fn render_restore_summary(summary: &crate::restore::RestoreSummary) {
+    println!(
+        "restore: destination={} archive_verified={} schema={} generation={} pending_restored={} migrations_applied={} observations={} unrecovered={} integrity=ok foreign_keys=ok",
+        summary.destination.display(),
+        summary.archive_verified,
+        summary.schema_version,
+        summary.ledger_generation,
+        summary.pending_restored,
+        summary.migrations_applied,
+        summary.observation_count.value(),
+        summary.unrecovered.len(),
+    );
+    println!(
+        "replay: source=archive applied={} already_applied={} quarantined={}",
+        summary.archive_replay.applied,
+        summary.archive_replay.already_applied,
+        summary.archive_replay.quarantined.len(),
+    );
+    if let Some(report) = &summary.surviving_replay {
+        println!(
+            "replay: source=surviving applied={} already_applied={} quarantined={}",
+            report.applied,
+            report.already_applied,
+            report.quarantined.len(),
+        );
+    }
+    println!(
+        "projection: {} ({})",
+        summary.projection_recovery.disposition, summary.projection_recovery.reason,
+    );
+    println!(
+        "transcripts: {} ({})",
+        summary.transcript_recovery.disposition, summary.transcript_recovery.reason,
+    );
+    for item in &summary.unrecovered {
+        println!(
+            "unrecovered: {} {} {}",
+            item.source.as_str(),
+            item.file_name,
+            item.reason,
+        );
+    }
 }
 
 #[cfg(test)]

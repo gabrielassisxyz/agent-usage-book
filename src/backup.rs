@@ -494,6 +494,14 @@ fn read_manifest(destination: &Path) -> Result<ArchiveManifest, Error> {
     ArchiveManifest::from_json(&text)
 }
 
+/// The pending records a verified archive's manifest lists, the exact file
+/// inventory the verification stage validated. The restore path copies this
+/// list rather than trusting a directory listing, so the restore cannot carry
+/// a file the archive never verified.
+pub(crate) fn archived_pending_records(destination: &Path) -> Result<Vec<String>, Error> {
+    Ok(read_manifest(destination)?.pending_records)
+}
+
 fn write_file(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     let mut file = crate::store::startup::create_file_mode_0600(path)?;
     file.set_len(0)

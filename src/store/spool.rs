@@ -408,16 +408,54 @@ pub fn spool_pending(state_dir: &Path, bundle: &PendingTerminalBundle) -> Result
 }
 
 /// What happened to one pending record during a drain pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum DrainOutcome {
     /// Applied to SQLite for the first time.
     Applied,
     /// Evidence for this attempt was already in SQLite; the file was deleted
     /// without writing anything, per the idempotent-replay contract.
     AlreadyApplied,
-    /// The record could not be parsed or reconstructed and was moved to
-    /// quarantine with its reason.
-    Quarantined,
+    /// The record could not be parsed, reconstructed or applied and was moved
+    /// to quarantine with its reason.
+    Quarantined { file_name: String, reason: String },
+}
+
+/// What a drain does when the ledger refuses to apply a record whose parse and
+/// reconstruction both succeeded: an insert that fails (a foreign key against
+/// a row the ledger does not hold, for instance) is not a malformed record, so
+/// the two failure kinds need different dispositions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplyFailurePolicy {
+    /// Propagate the error and stop the pass, leaving the record exactly
+    /// where it was: the live startup drain's contract. A refusing ledger is
+    /// an infrastructure signal, and the evidence stays durable for a retry.
+    FailStop,
+    /// Quarantine the record with the failure reason and continue with the
+    /// rest of the pass: the recovery replay's contract. One damaged record
+    /// must not block the recovery of every record behind it, and quarantine
+    /// preserves the evidence rather than discarding it.
+    QuarantineAndContinue,
+}
+
+/// One pending record the replay could not apply, preserved in quarantine with
+/// the reason. This is the raw material of the recovery's unrecovered-evidence
+/// report: the record is evidence, and the reason is why the ledger could not
+/// take it back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuarantinedRecord {
+    pub file_name: String,
+    pub reason: String,
+}
+
+/// How many pending records a recovery replay disposed of, and which ones it
+/// could not. Unlike [`DrainReport`], a recovery names every quarantined
+/// record: the recovery's contract is to report unrecovered evidence, and an
+/// unnamed count would hide exactly the records somebody needs to see.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RecoveryDrainReport {
+    pub applied: usize,
+    pub already_applied: usize,
+    pub quarantined: Vec<QuarantinedRecord>,
 }
 
 /// How many pending records a [`drain_pending`] pass disposed of, and how.
@@ -440,15 +478,54 @@ pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainRep
     drain_pending_while_snapshot_barrier_held(conn, state_dir)
 }
 
+/// Drains every pending record into `conn` under the recovery policy: a record
+/// the ledger refuses is quarantined with its reason and the pass continues,
+/// so one damaged record cannot block the recovery of the records behind it.
+/// The result names every quarantined record, which is what the restore's
+/// unrecovered-evidence report is built from.
+///
+/// This is deliberately a separate entry point rather than a parameter of
+/// [`drain_pending`]: the two policies exist because the two callers disagree
+/// about what a refused insert means, and an enum parameter would let either
+/// caller pass either policy. Startup drain keeps [`DrainReport`]; recovery
+/// drain returns [`RecoveryDrainReport`], so no caller can read a quarantined
+/// count without also being handed the names.
+pub fn drain_pending_recovering(
+    conn: &mut Connection,
+    state_dir: &Path,
+) -> Result<RecoveryDrainReport, Error> {
+    let _lease = acquire_spool_mutation_lease(state_dir)?;
+    drain_all(conn, state_dir, ApplyFailurePolicy::QuarantineAndContinue)
+}
+
 /// The drain implementation used after a caller has already excluded spool
 /// mutations with [`StateSnapshotBarrier`].
 pub(crate) fn drain_pending_while_snapshot_barrier_held(
     conn: &mut Connection,
     state_dir: &Path,
 ) -> Result<DrainReport, Error> {
+    let report = drain_all(conn, state_dir, ApplyFailurePolicy::FailStop)?;
+    // The FailStop policy quarantines only what parse or reconstruction
+    // refused, exactly what this report has always counted; the names ride
+    // with the recovery entry point, not this one.
+    Ok(DrainReport {
+        applied: report.applied,
+        already_applied: report.already_applied,
+        quarantined: report.quarantined.len(),
+    })
+}
+
+/// The one drain loop both policies share: list the pending directory, sort it
+/// deterministically, and dispose of each record under `policy`'s rule for a
+/// record the ledger refuses.
+fn drain_all(
+    conn: &mut Connection,
+    state_dir: &Path,
+    policy: ApplyFailurePolicy,
+) -> Result<RecoveryDrainReport, Error> {
     let dir = pending_dir(state_dir);
     if !dir.exists() {
-        return Ok(DrainReport::default());
+        return Ok(RecoveryDrainReport::default());
     }
     let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
         .map_err(|error| {
@@ -466,12 +543,16 @@ pub(crate) fn drain_pending_while_snapshot_barrier_held(
     // run within one spool generation does.
     entries.sort();
 
-    let mut report = DrainReport::default();
+    let mut report = RecoveryDrainReport::default();
     for path in entries {
-        match drain_one(conn, state_dir, &path)? {
+        match drain_one(conn, state_dir, &path, policy)? {
             DrainOutcome::Applied => report.applied += 1,
             DrainOutcome::AlreadyApplied => report.already_applied += 1,
-            DrainOutcome::Quarantined => report.quarantined += 1,
+            DrainOutcome::Quarantined { file_name, reason } => {
+                report
+                    .quarantined
+                    .push(QuarantinedRecord { file_name, reason });
+            }
         }
     }
     Ok(report)
@@ -534,7 +615,17 @@ fn is_pending_record_name(path: &Path) -> bool {
             .is_some_and(|name| name.starts_with("attempt-") && name.ends_with(".json"))
 }
 
-fn drain_one(conn: &mut Connection, state_dir: &Path, path: &Path) -> Result<DrainOutcome, Error> {
+fn drain_one(
+    conn: &mut Connection,
+    state_dir: &Path,
+    path: &Path,
+    policy: ApplyFailurePolicy,
+) -> Result<DrainOutcome, Error> {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| Error::Store(format!("pending record {path:?} has no UTF-8 file name")))?
+        .to_owned();
     let text = fs::read_to_string(path).map_err(|error| {
         Error::Store(format!("cannot read the pending record {path:?}: {error}"))
     })?;
@@ -542,7 +633,7 @@ fn drain_one(conn: &mut Connection, state_dir: &Path, path: &Path) -> Result<Dra
         Ok(bundle) => bundle,
         Err(reason) => {
             quarantine(state_dir, path, &reason)?;
-            return Ok(DrainOutcome::Quarantined);
+            return Ok(DrainOutcome::Quarantined { file_name, reason });
         }
     };
 
@@ -555,13 +646,24 @@ fn drain_one(conn: &mut Connection, state_dir: &Path, path: &Path) -> Result<Dra
         Ok(reconstructed) => reconstructed,
         Err(reason) => {
             quarantine(state_dir, path, &reason)?;
-            return Ok(DrainOutcome::Quarantined);
+            return Ok(DrainOutcome::Quarantined { file_name, reason });
         }
     };
 
-    apply(conn, &reconstructed)?;
-    remove_pending_file(path)?;
-    Ok(DrainOutcome::Applied)
+    match apply(conn, &reconstructed) {
+        Ok(()) => {
+            remove_pending_file(path)?;
+            Ok(DrainOutcome::Applied)
+        }
+        Err(error) => match policy {
+            ApplyFailurePolicy::FailStop => Err(error),
+            ApplyFailurePolicy::QuarantineAndContinue => {
+                let reason = error.to_string();
+                quarantine(state_dir, path, &reason)?;
+                Ok(DrainOutcome::Quarantined { file_name, reason })
+            }
+        },
+    }
 }
 
 fn remove_pending_file(path: &Path) -> Result<(), Error> {
@@ -1000,6 +1102,54 @@ mod tests {
             count, 1,
             "replaying the same record twice must produce exactly one observation"
         );
+    }
+
+    // --- recovery drain policy -----------------------------------------
+
+    #[test]
+    fn the_recovery_policy_quarantines_a_refused_record_and_keeps_replaying_the_rest() {
+        let scratch = ScratchDir::new();
+        let mut conn = migrated_conn(&scratch);
+        let account = seed_account(&conn);
+        seed_attempt(&conn, account);
+        let good_attempt = seed_attempt(&conn, account);
+
+        // attempt-11 has no start row in this ledger, so the insert the drain
+        // attempts must fail on its foreign key. "attempt-11.json" sorts
+        // lexically before "attempt-2.json", so the refused record is the
+        // first one the pass reaches: the property under test is that the
+        // record behind it still applies.
+        spool_pending(scratch.path(), &sample_bundle(11)).unwrap();
+        spool_pending(scratch.path(), &sample_bundle(good_attempt)).unwrap();
+
+        let report = drain_pending_recovering(&mut conn, scratch.path()).unwrap();
+        assert_eq!(
+            report.applied, 1,
+            "a refused record must not block the record behind it"
+        );
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined.len(), 1);
+        assert_eq!(report.quarantined[0].file_name, "attempt-11.json");
+        assert!(
+            !report.quarantined[0].reason.is_empty(),
+            "an unnamed refusal hides the reason somebody recovering needs"
+        );
+
+        // The refused record is preserved in quarantine, with the same reason
+        // the report carries.
+        let quarantined = quarantine_dir(scratch.path()).join("attempt-11.json");
+        assert!(quarantined.exists());
+        let reason = fs::read_to_string(format!("{}.reason", quarantined.display())).unwrap();
+        assert_eq!(reason, report.quarantined[0].reason);
+
+        // Exactly one observation landed: the good record's, not the refused
+        // record's and not a duplicate of either.
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM meter_observation", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
     }
 
     // --- quarantine ---------------------------------------------------
