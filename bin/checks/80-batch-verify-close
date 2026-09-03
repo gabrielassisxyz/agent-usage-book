@@ -207,14 +207,21 @@ wave_close_allows_bead() { # $1 = bead id, $2 = optional repo_dir or INVARIANTS 
 
 # --- Unit assertions over refusal predicate against repo docs/INVARIANTS.md ---
 
-# Unit 1: A bead named by an unenforced row in the real repo INVARIANTS.md is refused with row and bead id
-real_unenforced_bead="aub-sth.12"
+# Unit 1: A bead named by an unenforced row in the real repo INVARIANTS.md is refused with row and bead id.
+# The row is read from the table rather than pinned, because every landed bead moves its row
+# from unenforced to enforced, and a pinned example goes stale the moment its bead lands.
+real_unenforced_row="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced[[:space:]]+aub-/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' docs/INVARIANTS.md)"
+real_unenforced_bead="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced[[:space:]]+aub-/ { sub(/.*unenforced[[:space:]]+/, "", $4); gsub(/[[:space:]]+$/, "", $4); print $4; exit }' docs/INVARIANTS.md)"
+if [ -z "$real_unenforced_bead" ]; then
+    echo "unit: docs/INVARIANTS.md has no unenforced row left to exercise the refusal predicate" >&2
+    fail=1
+fi
 refusal_out="$(wave_close_allows_bead "$real_unenforced_bead" 2>&1 || true)"
 if wave_close_allows_bead "$real_unenforced_bead" >/dev/null 2>&1; then
     echo "unit: wave_close_allows_bead allowed close of $real_unenforced_bead which is unenforced in docs/INVARIANTS.md" >&2
     fail=1
 fi
-if ! printf '%s' "$refusal_out" | command grep -qF "row 1" || ! printf '%s' "$refusal_out" | command grep -qF "$real_unenforced_bead"; then
+if ! printf '%s' "$refusal_out" | command grep -qF "row $real_unenforced_row" || ! printf '%s' "$refusal_out" | command grep -qF "$real_unenforced_bead"; then
     echo "unit: refusal message did not name row number and bead id: '$refusal_out'" >&2
     fail=1
 fi

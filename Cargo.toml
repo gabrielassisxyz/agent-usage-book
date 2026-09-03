@@ -32,7 +32,7 @@ toml = "1"
 # (AGENTS.md "Persistence"; PLAN.md section 11.2). Only src/store/ may reference
 # it; bin/checks/boundary-rules/11-store-connections-through-one-function
 # enforces that every connection goes through the one setup function.
-rusqlite = { version = "0.32", features = ["bundled"] }
+rusqlite = { version = "0.32", features = ["backup", "bundled"] }
 # The blocking HTTP client (aub-eun.2): wrapped behind an owned interface in
 # src/meter/transport.rs with explicit timeouts and command budget. No async
 # runtime is pulled in.

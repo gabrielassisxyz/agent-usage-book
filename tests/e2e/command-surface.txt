@@ -7,3 +7,6 @@ status
 spend
 config
 rate-card
+backup
+export
+doctor

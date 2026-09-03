@@ -52,6 +52,51 @@ use crate::store::repository::{
 };
 use crate::store::startup::{create_file_mode_0600, ensure_dir_mode_0700};
 
+const SNAPSHOT_BARRIER_FILE: &str = ".spool-snapshot.lock";
+
+/// An exclusive lease over the pending spool while a backup cut is captured.
+/// Ordinary spool writes and drains take a shared lease, so they may proceed
+/// together but cannot create, delete or quarantine a record during the cut.
+pub(crate) struct StateSnapshotBarrier {
+    _file: fs::File,
+}
+
+/// One pending file captured while [`StateSnapshotBarrier`] is held.
+pub(crate) struct PendingRecordSnapshot {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+fn open_snapshot_barrier_file(state_dir: &Path) -> Result<fs::File, Error> {
+    ensure_dir_mode_0700(state_dir)?;
+    create_file_mode_0600(&state_dir.join(SNAPSHOT_BARRIER_FILE))
+}
+
+fn acquire_spool_mutation_lease(state_dir: &Path) -> Result<fs::File, Error> {
+    let file = open_snapshot_barrier_file(state_dir)?;
+    file.lock_shared().map_err(|error| {
+        Error::Store(format!(
+            "cannot take the shared pending-spool lease: {error}"
+        ))
+    })?;
+    Ok(file)
+}
+
+/// Prevents spool creation, deletion and quarantine moves until the returned
+/// guard is dropped. The backup path holds this only across drain, SQLite
+/// snapshot and pending-file capture.
+pub(crate) fn acquire_state_snapshot_barrier(
+    state_dir: &Path,
+) -> Result<StateSnapshotBarrier, Error> {
+    let file = open_snapshot_barrier_file(state_dir)?;
+    file.lock().map_err(|error| {
+        Error::Store(format!(
+            "cannot take the exclusive pending-spool snapshot barrier: {error}"
+        ))
+    })?;
+    Ok(StateSnapshotBarrier { _file: file })
+}
+
 /// One provider-reported quota window, as flat primitives rather than the
 /// live domain types: the spool's on-disk format must survive a binary
 /// upgrade even if a domain type's internal representation changes, and
@@ -354,6 +399,7 @@ fn fsync_pending_dir(_state_dir: &Path) -> Result<(), Error> {
 /// directory, in that order. Returns only once the record is discoverable by
 /// [`drain_pending`] on this or a future process.
 pub fn spool_pending(state_dir: &Path, bundle: &PendingTerminalBundle) -> Result<(), Error> {
+    let _lease = acquire_spool_mutation_lease(state_dir)?;
     let (file, temp_path) = write_temp_file(state_dir, bundle)?;
     fsync_temp_file(&file, &temp_path)?;
     drop(file);
@@ -374,12 +420,17 @@ enum DrainOutcome {
     Quarantined,
 }
 
-/// How many pending records a [`drain_pending`] pass disposed of, and how.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// How many pending records a [`drain_pending`] pass disposed of, and how,
+/// together with the publication that followed the pass. The publication is
+/// unconditional: draining is spool recovery, which is a projection-relevant
+/// change when it applies anything, and a pass that applies nothing still
+/// refreshes a projection a crash may have left older than the database.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DrainReport {
     pub applied: usize,
     pub already_applied: usize,
     pub quarantined: usize,
+    pub publication: crate::projection::Publication,
 }
 
 /// Drains every pending record into `conn`: applies it if its attempt has no
@@ -390,11 +441,72 @@ pub struct DrainReport {
 /// rather than being discarded or quarantined: the caller's contract is to
 /// report a store-failure class and let a later drain retry it.
 pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainReport, Error> {
+    let _lease = acquire_spool_mutation_lease(state_dir)?;
+    drain_pending_while_snapshot_barrier_held(conn, state_dir)
+}
+
+/// The drain implementation used after a caller has already excluded spool
+/// mutations with [`StateSnapshotBarrier`].
+pub(crate) fn drain_pending_while_snapshot_barrier_held(
+    conn: &mut Connection,
+    state_dir: &Path,
+) -> Result<DrainReport, Error> {
+    let dir = pending_dir(state_dir);
+    let mut applied = 0;
+    let mut already_applied = 0;
+    let mut quarantined = 0;
+    if dir.exists() {
+        let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot list the pending directory {dir:?}: {error}"
+                ))
+            })?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| is_pending_record_name(path))
+            .collect();
+        // Deterministic order, oldest attempt first: filenames are `attempt-<id>.json`
+        // and a lexical sort over that shape sorts attempt ids ascending for any
+        // run whose ids share a digit width, which every test and every real
+        // run within one spool generation does.
+        entries.sort();
+
+        for path in entries {
+            match drain_one(conn, state_dir, &path)? {
+                DrainOutcome::Applied => applied += 1,
+                DrainOutcome::AlreadyApplied => already_applied += 1,
+                DrainOutcome::Quarantined => quarantined += 1,
+            }
+        }
+    }
+    // The pass's committed state is what the projection now describes. Every
+    // applied record advanced the ledger generation inside its own commit;
+    // publication after the pass covers all of them, and refreshes the file
+    // even when the pass applied nothing, repairing what a crash left older.
+    let publication =
+        crate::projection::publish(conn, &crate::projection::projection_path_in(state_dir));
+    Ok(DrainReport {
+        applied,
+        already_applied,
+        quarantined,
+        publication,
+    })
+}
+
+/// Reads the pending files that remain after the best-effort drain while the
+/// snapshot barrier is still held. The barrier argument makes it impossible to
+/// call this helper without demonstrating that deletion and rotation are
+/// excluded for the duration of the read.
+pub(crate) fn snapshot_pending_records(
+    state_dir: &Path,
+    _barrier: &StateSnapshotBarrier,
+) -> Result<Vec<PendingRecordSnapshot>, Error> {
     let dir = pending_dir(state_dir);
     if !dir.exists() {
-        return Ok(DrainReport::default());
+        return Ok(Vec::new());
     }
-    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)
+    let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
         .map_err(|error| {
             Error::Store(format!(
                 "cannot list the pending directory {dir:?}: {error}"
@@ -404,21 +516,31 @@ pub fn drain_pending(conn: &mut Connection, state_dir: &Path) -> Result<DrainRep
         .map(|entry| entry.path())
         .filter(|path| is_pending_record_name(path))
         .collect();
-    // Deterministic order, oldest attempt first: filenames are `attempt-<id>.json`
-    // and a lexical sort over that shape sorts attempt ids ascending for any
-    // run whose ids share a digit width, which every test and every real
-    // run within one spool generation does.
-    entries.sort();
+    paths.sort();
+    paths
+        .into_iter()
+        .map(|path| {
+            let file_name = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| {
+                    Error::Store(format!("pending record {path:?} has no UTF-8 file name"))
+                })?
+                .to_owned();
+            let bytes = fs::read(&path).map_err(|error| {
+                Error::Store(format!("cannot read the pending record {path:?}: {error}"))
+            })?;
+            Ok(PendingRecordSnapshot { file_name, bytes })
+        })
+        .collect()
+}
 
-    let mut report = DrainReport::default();
-    for path in entries {
-        match drain_one(conn, state_dir, &path)? {
-            DrainOutcome::Applied => report.applied += 1,
-            DrainOutcome::AlreadyApplied => report.already_applied += 1,
-            DrainOutcome::Quarantined => report.quarantined += 1,
-        }
-    }
-    Ok(report)
+/// Validates an archived pending record against both its durable JSON shape and
+/// the live domain constraints that a drain would enforce.
+pub fn validate_pending_record(bytes: &[u8]) -> Result<(), String> {
+    let text = std::str::from_utf8(bytes).map_err(|error| format!("invalid UTF-8: {error}"))?;
+    let bundle = PendingTerminalBundle::from_json(text)?;
+    reconstruct(&bundle).map(|_| ())
 }
 
 pub fn is_pending_record_name(path: &Path) -> bool {
@@ -806,10 +928,16 @@ mod tests {
         // Crash point 1: temp file written, never fsynced or renamed.
         let (_file, _temp_path) = write_temp_file(scratch.path(), &bundle).unwrap();
         let report = drain_pending(&mut migrated_conn(&scratch), scratch.path()).unwrap();
-        assert_eq!(
-            report,
-            DrainReport::default(),
-            "an unrenamed temp file must never be mistaken for a durable pending record"
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined, 0);
+        assert!(
+            matches!(
+                report.publication,
+                crate::projection::Publication::Published { .. }
+            ),
+            "an unrenamed temp file must never be mistaken for a durable pending record, \
+             and the pass still refreshes the projection"
         );
     }
 
@@ -822,7 +950,9 @@ mod tests {
         let (file, temp_path) = write_temp_file(scratch.path(), &bundle).unwrap();
         fsync_temp_file(&file, &temp_path).unwrap();
         let report = drain_pending(&mut migrated_conn(&scratch), scratch.path()).unwrap();
-        assert_eq!(report, DrainReport::default());
+        assert_eq!(report.applied, 0);
+        assert_eq!(report.already_applied, 0);
+        assert_eq!(report.quarantined, 0);
     }
 
     #[test]

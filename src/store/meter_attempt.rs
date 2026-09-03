@@ -409,6 +409,49 @@ pub fn attempt_by_row_id(
     .map_err(|e| Error::Store(format!("cannot read meter_attempt {}: {e}", row_id.value())))
 }
 
+/// Reads the newest attempt row of one account, or `None` before its first
+/// attempt. Newest by rowid: insertion order is the attempt order the rest of
+/// this schema is written in.
+pub fn latest_attempt_for_account(
+    conn: &rusqlite::Connection,
+    account_id: crate::store::account::AccountId,
+) -> Result<Option<StoredMeterAttempt>, Error> {
+    conn.query_row(
+        &format!(
+            "SELECT {SELECT_ATTEMPT_COLUMNS} FROM meter_attempt
+             WHERE account_id = ?1 ORDER BY id DESC LIMIT 1"
+        ),
+        params![account_id.value()],
+        row_to_attempt,
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot read the latest meter attempt: {e}")))
+}
+
+/// Reads the newest attempt of one account whose terminal outcome is success,
+/// or `None` when the account has never had a successful attempt. This is the
+/// anchor of "the last successful observation" (`aub-me5.5`): the success is a
+/// fact about the attempt, so the anchor is the attempt row and the evidence
+/// and interpretation hang off it.
+pub fn newest_successful_attempt_for_account(
+    conn: &rusqlite::Connection,
+    account_id: crate::store::account::AccountId,
+) -> Result<Option<StoredMeterAttempt>, Error> {
+    let success_sql = attempt_outcome_as_sql(&AttemptOutcome::Success);
+    conn.query_row(
+        &format!(
+            "SELECT {SELECT_ATTEMPT_COLUMNS} FROM meter_attempt
+             JOIN meter_attempt_result ON meter_attempt_result.attempt_id = meter_attempt.id
+             WHERE meter_attempt.account_id = ?1 AND meter_attempt_result.outcome = ?2
+             ORDER BY meter_attempt.id DESC LIMIT 1"
+        ),
+        params![account_id.value(), success_sql],
+        row_to_attempt,
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot read the latest successful attempt: {e}")))
+}
+
 const SELECT_RESULT_COLUMNS: &str = "
     attempt_id, completed_at, elapsed_nanos, outcome, failure_class,
     retry_after_nanos, sanitized_error_classification, retry_index, clock_anomaly";
