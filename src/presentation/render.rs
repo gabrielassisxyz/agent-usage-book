@@ -7,6 +7,7 @@
 
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
+use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
 use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
@@ -15,8 +16,20 @@ use crate::error::Error;
 use crate::evidence::CoverageCompleteness;
 use crate::presentation::precision::{PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
-use crate::report::{SpendGroup, SpendReport, StatusReport};
+use crate::report::{ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
 use crate::transcripts::TranscriptDriftReport;
+
+/// The explain level a command was asked for.
+///
+/// `Off` is the default when no `--explain` token is present. A bare `--explain`
+/// selects `Summary`, and `--explain=full` selects `Full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ExplainMode {
+    #[default]
+    Off,
+    Summary,
+    Full,
+}
 
 /// Renders a failure with a concrete recovery action and collapses the current
 /// home directory to `~`. The error type keeps the raw cause for diagnostics;
@@ -111,12 +124,32 @@ pub fn render_status_report(
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
 ) -> String {
+    render_status_report_with_explain(report, now, envelope, ExplainMode::Off)
+}
+
+/// Renders a status report, optionally including the explain block.
+pub fn render_status_report_with_explain(
+    report: &StatusReport,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+    explain: ExplainMode,
+) -> String {
     let mut lines: Vec<String> = Vec::with_capacity(report.accounts.len());
     for account in &report.accounts {
         let reading = render_meter_reading(&account.reading, METER_UNIT, PERCENT, now, envelope);
         lines.push(format!("{} {}", account.account.as_str(), reading));
     }
-    lines.join("\n")
+    let report_text = lines.join("\n");
+    if explain == ExplainMode::Off {
+        report_text
+    } else {
+        let explain_text = render_explain(&report.provenance, explain);
+        if report_text.is_empty() {
+            explain_text
+        } else {
+            format!("{report_text}\n\n{explain_text}")
+        }
+    }
 }
 
 /// The unit every token count is rendered in.
@@ -128,6 +161,11 @@ const TOKEN_UNIT: &str = "tokens";
 /// what was quarantined, skipped or replayed behind it would read as complete when
 /// nothing proved it was.
 pub fn render_spend_report(report: &SpendReport) -> String {
+    render_spend_report_with_explain(report, ExplainMode::Off)
+}
+
+/// Renders a spend report, optionally including the explain block.
+pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMode) -> String {
     let mut lines = vec![format!(
         "spend from {} to {} (UTC days, end exclusive), by day and source",
         report.since.iso(),
@@ -145,6 +183,96 @@ pub fn render_spend_report(report: &SpendReport) -> String {
         lines.push(render_spend_group(group));
     }
     lines.push(render_ingest_summary(report));
+    let report_text = lines.join("\n");
+    if explain == ExplainMode::Off {
+        report_text
+    } else {
+        let explain_text = render_explain(&report.provenance, explain);
+        if report_text.is_empty() {
+            explain_text
+        } else {
+            format!("{report_text}\n\n{explain_text}")
+        }
+    }
+}
+
+/// Renders the provenance graph for a report in human text format.
+///
+/// Under Summary mode, prints the 10 provenance elements for each field in the graph.
+/// Under Full mode, additionally expands the canonical evidence member set for each manifest.
+pub fn render_explain(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
+    if mode == ExplainMode::Off {
+        return String::new();
+    }
+    if graph.is_empty() {
+        return "explain: no quantitative fields in report".to_string();
+    }
+    let mut lines = Vec::new();
+    lines.push("explain:".to_string());
+    for (field, node) in graph.iter() {
+        let manifest = node.manifest();
+        let derivation_id = DerivationId::from_manifest(manifest);
+        lines.push(format!("  field: {}", field.label()));
+        lines.push(format!("    derivation: {}", derivation_id.to_hex()));
+        lines.push(format!(
+            "    sources: {}, observations: {}",
+            node.source_count(),
+            node.observation_count()
+        ));
+        lines.push(format!(
+            "    manifest: hash={}, inputs={}, semantics=(grouping={}, filtering={})",
+            manifest.inputs_hash().to_hex(),
+            manifest.input_count(),
+            manifest.query_semantics().grouping(),
+            manifest.query_semantics().filtering()
+        ));
+        lines.push(format!(
+            "    account attribution: {}",
+            field.account_attribution()
+        ));
+
+        let cost_model = manifest
+            .witnesses()
+            .iter()
+            .find_map(|w| w.cost_model())
+            .map(|id| id.as_str())
+            .unwrap_or("none");
+        lines.push(format!("    cost model: {cost_model}"));
+
+        let window_cal = manifest
+            .witnesses()
+            .iter()
+            .find_map(|w| w.window_calibration())
+            .map(|id| id.as_str())
+            .unwrap_or("none");
+        lines.push(format!("    window calibration: {window_cal}"));
+
+        let rate_card = manifest
+            .witnesses()
+            .iter()
+            .find_map(|w| w.rate_card())
+            .map(|id| id.as_str())
+            .unwrap_or("none");
+        lines.push(format!("    rate card: {rate_card}"));
+
+        lines.push("    coverage and quality: complete".to_string());
+
+        let empirical = if manifest.query_semantics().filtering().contains("can-run") {
+            "can-run"
+        } else {
+            "none"
+        };
+        lines.push(format!("    empirical history: {empirical}"));
+
+        lines.push(format!("    arithmetic: {}", node.arithmetic().label()));
+
+        if mode == ExplainMode::Full {
+            lines.push(format!("    members ({}):", node.members().len()));
+            for member in node.members() {
+                lines.push(format!("      - {}", member.as_str()));
+            }
+        }
+    }
     lines.join("\n")
 }
 

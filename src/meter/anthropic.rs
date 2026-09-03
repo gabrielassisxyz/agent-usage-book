@@ -35,6 +35,10 @@ use crate::meter::adapter::{
     AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
     ProviderObservation,
 };
+use crate::meter::evidence::{
+    CapturedProviderResponse, SensitiveResponseMaterial, capture_json_body, capture_json_response,
+    quota_response_from_capsule,
+};
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse, RequestTimeoutConfig};
 
 /// Extra usage configuration from an Anthropic response.
@@ -52,7 +56,6 @@ pub struct AnthropicReading {
     pub windows: Vec<MeterWindow>,
     pub provider_observed_at: Option<ProviderObservedAt>,
     pub extra_usage: Option<AnthropicExtraUsage>,
-    pub raw_payload: Option<serde_json::Value>,
 }
 
 impl AnthropicReading {
@@ -61,7 +64,6 @@ impl AnthropicReading {
             windows,
             provider_observed_at: None,
             extra_usage: None,
-            raw_payload: None,
         }
     }
 }
@@ -164,10 +166,26 @@ fn extract_bearer_token(credential: &CredentialHandle) -> Result<String, AuthRea
 /// Parses the JSON response body from Anthropic `/api/oauth/usage`.
 pub fn parse_anthropic_usage_body(
     body: &[u8],
+    request: &MeterRequest,
+) -> Result<AnthropicReading, FailureClass> {
+    let capsule = capture_json_body(body, &SensitiveResponseMaterial::default());
+    replay_anthropic_capsule(capsule.serialized(), request)
+}
+
+/// Reinterprets retained response evidence with the current Anthropic
+/// semantics. The stored capsule remains unchanged, so callers can persist a
+/// corrected observation beside the original interpretation.
+pub fn replay_anthropic_capsule(
+    capsule: &str,
     _request: &MeterRequest,
 ) -> Result<AnthropicReading, FailureClass> {
-    let val: serde_json::Value =
-        serde_json::from_slice(body).map_err(|_| FailureClass::MalformedBody)?;
+    let val = quota_response_from_capsule(capsule).map_err(|message| {
+        if message == "capsule does not contain a quota response" {
+            FailureClass::MalformedBody
+        } else {
+            FailureClass::MissingRequiredField
+        }
+    })?;
 
     let root = val.as_object().ok_or(FailureClass::MalformedBody)?;
 
@@ -220,7 +238,6 @@ pub fn parse_anthropic_usage_body(
         windows,
         provider_observed_at: None,
         extra_usage,
-        raw_payload: Some(val.clone()),
     })
 }
 
@@ -333,9 +350,24 @@ impl ProviderAdapter for AnthropicAdapter {
         transport: &impl HttpTransport,
         clock: &impl Clock,
     ) -> ProviderObservation<Self::Reading> {
+        self.observe_with_evidence(credential, request, transport, clock)
+            .observation
+    }
+
+    fn observe_with_evidence(
+        &self,
+        credential: &CredentialHandle,
+        request: &MeterRequest,
+        transport: &impl HttpTransport,
+        clock: &impl Clock,
+    ) -> CapturedProviderResponse<Self::Reading> {
         let token = match extract_bearer_token(credential) {
             Ok(token) => token,
-            Err(reason) => return ProviderObservation::AuthRequired(reason),
+            Err(reason) => {
+                return CapturedProviderResponse::without_response(
+                    ProviderObservation::AuthRequired(reason),
+                );
+            }
         };
 
         let timeouts = RequestTimeoutConfig::new(
@@ -354,11 +386,17 @@ impl ProviderAdapter for AnthropicAdapter {
 
         let response = match transport.send(&req, &budget, clock) {
             Ok(res) => res,
-            Err(failure) => return ProviderObservation::Unreachable(failure),
+            Err(failure) => {
+                return CapturedProviderResponse::without_response(
+                    ProviderObservation::Unreachable(failure),
+                );
+            }
         };
 
-        match response.status() {
-            200 => match parse_anthropic_usage_body(response.body(), request) {
+        let sensitive = SensitiveResponseMaterial::new([credential.expose(), token.as_str()]);
+        let evidence = capture_json_response(&response, &sensitive);
+        let observation = match response.status() {
+            200 => match replay_anthropic_capsule(evidence.serialized(), request) {
                 Ok(reading) => ProviderObservation::Measured(reading),
                 Err(failure) => ProviderObservation::Unreachable(failure),
             },
@@ -386,6 +424,22 @@ impl ProviderAdapter for AnthropicAdapter {
             _ => ProviderObservation::Unreachable(FailureClass::HttpStatus(
                 HttpStatusClass::ClientError,
             )),
+        };
+        let failed_body = match &observation {
+            ProviderObservation::Unreachable(
+                FailureClass::MalformedBody | FailureClass::MissingRequiredField,
+            ) => evidence
+                .sanitized_body_for_failure()
+                .map(|body| body.to_vec()),
+            ProviderObservation::Measured(_)
+            | ProviderObservation::AuthRequired(_)
+            | ProviderObservation::Unreachable(_) => None,
+        };
+
+        CapturedProviderResponse {
+            observation,
+            evidence: Some(evidence),
+            failed_body,
         }
     }
 }
@@ -735,17 +789,34 @@ mod tests {
         let adapter = test_adapter();
         let transport = MockTransport::ok(200, FIXTURE_UNKNOWN_FIELDS);
         let clock = test_clock();
-        let obs = adapter.observe(
+        let captured = adapter.observe_with_evidence(
             &test_credential(),
             &MeterRequest::default(),
             &transport,
             &clock,
         );
 
-        let reading = expect_measured(obs);
+        let reading = expect_measured(captured.observation);
         assert_eq!(reading.windows.len(), 2);
-        let payload = reading.raw_payload.expect("raw_payload must be retained");
-        assert!(payload.get("unknown_top_level_metric").is_some());
+        // Unknown-field retention is the capsule's job (aub-eun.5), not the
+        // normalized reading's: the field survives in the evidence capsule
+        // without ever becoming a required normalization field.
+        let capsule = captured
+            .evidence
+            .expect("a 200 response must carry an evidence capsule");
+        // Checked inside the canonical quota_response subtree specifically,
+        // not just anywhere in the serialized capsule: the raw-lexeme map
+        // also carries the field's JSON pointer path in its keys, so a
+        // substring check against the whole capsule would still pass even if
+        // the sanitizer dropped the field from quota_response itself.
+        let parsed: serde_json::Value = serde_json::from_str(capsule.serialized()).unwrap();
+        assert!(
+            parsed["quota_response"]
+                .get("unknown_top_level_metric")
+                .is_some(),
+            "the capsule's quota_response must retain the unknown field: {}",
+            capsule.serialized()
+        );
     }
 
     #[test]

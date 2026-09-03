@@ -14,8 +14,11 @@ use crate::domain::freshness::{FreshnessInput, compute_freshness};
 use crate::domain::time::{Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate};
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, RunId};
-use crate::presentation::json::{spend_json, status_json};
-use crate::presentation::render::{render_spend_report, render_status_report};
+pub use crate::presentation::ExplainMode;
+use crate::presentation::json::{spend_json_with_explain, status_json_with_explain};
+use crate::presentation::render::{
+    render_spend_report_with_explain, render_status_report_with_explain,
+};
 use crate::report::ReportEnvelope;
 use crate::report::spend::{SpendWindow, assemble as assemble_spend};
 use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
@@ -107,9 +110,7 @@ impl Command {
         match self {
             Command::Status => FlagPolicy {
                 format: FlagSupport::Accepted,
-                explain: FlagSupport::Rejected {
-                    reason: "status has no provenance renderer",
-                },
+                explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
                     reason: "status reports every configured account",
                 },
@@ -120,9 +121,7 @@ impl Command {
             },
             Command::Spend => FlagPolicy {
                 format: FlagSupport::Accepted,
-                explain: FlagSupport::Rejected {
-                    reason: "spend has no provenance renderer",
-                },
+                explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
                     reason: "spend has no account dimension until account attribution lands",
                 },
@@ -343,21 +342,6 @@ impl Command {
 pub enum OutputFormat {
     Text,
     Json,
-}
-
-/// The explain level a command was asked for, after the policy accepted it.
-///
-/// `Off` is the default when no `--explain` token is present. A bare `--explain`
-/// selects `Summary`, and `--explain=full` selects `Full`. `Off` says render the
-/// ordinary report; `Summary` says render the ordinary report plus a compact
-/// provenance block (manifest hashes and arithmetic); `Full` says render the
-/// summary plus the full canonical member set of every manifest.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ExplainMode {
-    #[default]
-    Off,
-    Summary,
-    Full,
 }
 
 /// What the command line asked for, before anything runs: the command, the shared
@@ -590,7 +574,12 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     match invocation.command {
         Command::Status => {
             reject_positionals(&invocation)?;
-            status(&RealClock::new(), level, invocation.format)
+            status(
+                &RealClock::new(),
+                level,
+                invocation.format,
+                invocation.explain,
+            )
         }
         Command::Spend => spend(&RealClock::new(), level, &invocation),
         Command::Config => config_command(invocation.rest.into_iter().map(OsString::from)),
@@ -713,8 +702,14 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
     )?;
     let report = assemble_spend(&config, window, timestamp)?;
     match invocation.format {
-        OutputFormat::Text => println!("{}", render_spend_report(&report)),
-        OutputFormat::Json => println!("{}", spend_json(&report, run)),
+        OutputFormat::Text => println!(
+            "{}",
+            render_spend_report_with_explain(&report, invocation.explain)
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            spend_json_with_explain(&report, run, invocation.explain)
+        ),
     }
     if report.ingest.unreadable_files.is_empty() {
         Ok(())
@@ -857,7 +852,12 @@ fn status_clock_skew_envelope() -> ClockSkewEnvelope {
     ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60))
 }
 
-fn status(clock: &impl Clock, level: Level, format: OutputFormat) -> Result<(), Error> {
+fn status(
+    clock: &impl Clock,
+    level: Level,
+    format: OutputFormat,
+    explain: ExplainMode,
+) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
     let command = LogicalName::new("status");
@@ -906,9 +906,14 @@ fn status(clock: &impl Clock, level: Level, format: OutputFormat) -> Result<(), 
     match format {
         OutputFormat::Text => println!(
             "{}",
-            render_status_report(&report, timestamp, status_clock_skew_envelope())
+            render_status_report_with_explain(
+                &report,
+                timestamp,
+                status_clock_skew_envelope(),
+                explain
+            )
         ),
-        OutputFormat::Json => println!("{}", status_json(&report, run)),
+        OutputFormat::Json => println!("{}", status_json_with_explain(&report, run, explain)),
     }
     Ok(())
 }
@@ -1308,12 +1313,11 @@ mod tests {
     /// `--explain=full` and `--explain=garbage` are both refused for a command
     /// whose policy rejects the flag, with the policy's reason: the rejection
     /// takes precedence over value validation, so a rejecting command never
-    /// accepts a value it cannot render. The value-validation path itself is
-    /// aub-xus.5's, which flips the policies to Accepted.
+    /// accepts a value it cannot render.
     #[test]
     fn explain_values_are_refused_where_the_policy_rejects_the_flag() {
         for value in ["--explain=full", "--explain=garbage"] {
-            let result = parse_invocation(args(&["status", value]));
+            let result = parse_invocation(args(&["config", value]));
             match result {
                 Err(Error::Usage(message)) => {
                     assert!(
@@ -1327,6 +1331,35 @@ mod tests {
                 }
                 other => panic!("{value} must be refused, got: {other:?}"),
             }
+        }
+    }
+
+    /// For commands whose policy accepts `--explain`, `--explain` and `--explain=summary`
+    /// yield `ExplainMode::Summary`, `--explain=full` yields `ExplainMode::Full`,
+    /// and invalid values are rejected with actionable guidance.
+    #[test]
+    fn explain_values_are_validated_where_the_policy_accepts_the_flag() {
+        for cmd in ["status", "spend"] {
+            for val in ["--explain", "--explain=summary"] {
+                let parsed = parse_invocation(args(&[cmd, val])).expect("valid explain summary");
+                let Request::Run(inv) = parsed else {
+                    panic!("expected Request::Run, got {parsed:?}")
+                };
+                assert_eq!(inv.explain, ExplainMode::Summary);
+            }
+            let parsed_full =
+                parse_invocation(args(&[cmd, "--explain=full"])).expect("valid explain full");
+            let Request::Run(inv) = parsed_full else {
+                panic!("expected Request::Run, got {parsed_full:?}")
+            };
+            assert_eq!(inv.explain, ExplainMode::Full);
+            let err = parse_invocation(args(&[cmd, "--explain=invalid"]))
+                .expect_err("invalid explain value must error");
+            let Error::Usage(msg) = err else {
+                panic!("expected Error::Usage, got {err:?}")
+            };
+            assert!(msg.contains("is not one of summary or full"), "{msg}");
+            assert!(msg.contains("use --explain or --explain=full"), "{msg}");
         }
     }
 
