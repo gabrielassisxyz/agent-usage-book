@@ -1,12 +1,9 @@
-//! Assembly of the spend report from configured transcript sources.
+//! Assembly of canonical and legacy spend reports.
 //!
-//! This is the in-memory path: every invocation discovers the files under each
-//! configured source, parses them with the parser the source declares, collapses
-//! replayed occurrences by strong identity, and groups what falls inside the
-//! requested window by UTC day and source. Nothing is persisted and nothing is
-//! cached, so the report is the transcripts as they are on disk at the moment of
-//! the call. The canonical store and the incremental index replace this path
-//! without changing what it reports.
+//! The command path reads canonical events from the ledger, groups them by the
+//! requested dimensions, and records the evidence that qualifies every subtotal.
+//! The older in-memory assembler remains for its focused parser and grouping
+//! tests while ingest is a separate operation.
 //!
 //! Two things are never done here. A count is never printed without the ingest
 //! summary that qualifies it, because a total with quarantined records behind it is
@@ -15,7 +12,6 @@
 //!
 //! May not depend on:
 //! - presentation
-//! - store
 //! - calibration, cost models, rate cards or meter observations
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -25,18 +21,26 @@ use crate::config::Config;
 use crate::dedup::deduplicate;
 use crate::domain::provenance::{DerivationId, EvidenceId, QuerySemantics};
 use crate::domain::time::{UtcDate, UtcTimestamp, unix_nanos};
-use crate::domain::tokens::{TokenCount, UsageVector};
+use crate::domain::tokens::{
+    CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenCount,
+    UsageVector,
+};
 use crate::error::Error;
-use crate::evidence::{ComponentKind, CoverageCompleteness, Provenance};
+use crate::evidence::{
+    ComponentKind, CoverageCompleteness, EstimatorId, EvidenceQuality, Provenance,
+};
 use crate::logging::LogicalName;
 use crate::report::models::{
-    IngestSummary, LedgerGeneration, ReportMetadata, SpendGroup, SpendGroupProvenance, SpendReport,
+    IngestSummary, IngestionGeneration, LedgerGeneration, ReportMetadata, SpendDiagnostic,
+    SpendDiagnosticProvenance, SpendGroup, SpendGroupProvenance, SpendGrouping, SpendReport,
 };
 use crate::report::provenance::{ProvenanceNode, ValueArithmetic};
 use crate::transcripts::{
     DiscoveryError, DiscoveryOptions, NormalizedUsageEvent, ParserAdapter, ParserVersion,
     SourceLocation, discover, parser_for_format,
 };
+
+use crate::store::spend::CanonicalSpendEvent;
 
 /// The UTC day range a spend report covers: `since` inclusive, `until` exclusive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -407,10 +411,235 @@ fn finish_group(
     (spend_group, SpendGroupProvenance::new(name, node))
 }
 
+/// Assembles `aub spend` from the durable canonical ledger. The optional refresh
+/// is performed by the CLI before this read; a failed refresh is carried as a
+/// qualification while this function still reports the last committed subtotal.
+pub fn assemble_canonical(
+    conn: &rusqlite::Connection,
+    window: SpendWindow,
+    generated_at: UtcTimestamp,
+    grouping: Vec<SpendGrouping>,
+    refresh_attempted: bool,
+    refresh_failure: Option<String>,
+) -> Result<SpendReport, Error> {
+    let grouping = if grouping.is_empty() {
+        vec![SpendGrouping::Day]
+    } else {
+        grouping
+    };
+    let events =
+        crate::store::spend::canonical_events(conn, window.since.start(), window.until.start())?;
+    let diagnostics = crate::store::spend::diagnostics(conn)?;
+    let replayed_occurrences = diagnostics.replayed_occurrences;
+    let heuristic_identities = diagnostics.heuristic_identities;
+    let partial = refresh_failure.is_some() || !diagnostics.quarantined_by_class.is_empty();
+    let mut provenance = Vec::new();
+    let groups = canonical_groups(
+        &events,
+        &grouping,
+        0,
+        &mut Vec::new(),
+        &window,
+        partial,
+        &mut provenance,
+    );
+    let metadata = ReportMetadata::new(
+        generated_at,
+        generated_at,
+        LedgerGeneration::new(crate::store::ledger_generation::current(conn)?.value()),
+        Some(IngestionGeneration::new(
+            crate::store::ingestion_generation::current(conn)?.value(),
+        )),
+    );
+    let ingest = IngestSummary {
+        refresh_attempted,
+        refresh_failure,
+        files_read: 0,
+        files_skipped_before_window: 0,
+        unreadable_files: Vec::new(),
+        quarantined_by_class: diagnostics.quarantined_by_class,
+        replayed_occurrences,
+        collisions: 0,
+        without_identity: 0,
+        heuristic_identities,
+        undated_events: 0,
+        events_outside_window: 0,
+        events_in_window: events.len() as u64,
+    };
+    let diagnostic_members = events
+        .iter()
+        .map(|event| EvidenceId::new(event.canonical_id.clone()))
+        .collect::<Vec<_>>();
+    let diagnostic_source_count = events
+        .iter()
+        .flat_map(|event| event.sources.iter())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    let diagnostic_node = |grouping: &str, count: u64| {
+        ProvenanceNode::new(
+            diagnostic_members.clone(),
+            [],
+            QuerySemantics::new(
+                grouping,
+                format!("{}..{}", window.since.iso(), window.until.iso()),
+            ),
+            diagnostic_source_count,
+            count,
+            ValueArithmetic::Count,
+        )
+    };
+    Ok(SpendReport::new(
+        metadata,
+        window.since,
+        window.until,
+        groups,
+        provenance,
+        ingest,
+    )
+    .with_grouping(grouping)
+    .with_diagnostics(vec![
+        SpendDiagnosticProvenance {
+            diagnostic: SpendDiagnostic::CanonicalRecords,
+            node: diagnostic_node("canonical_records", events.len() as u64),
+        },
+        SpendDiagnosticProvenance {
+            diagnostic: SpendDiagnostic::ReplayedOccurrences,
+            node: diagnostic_node("replayed_occurrences", replayed_occurrences),
+        },
+        SpendDiagnosticProvenance {
+            diagnostic: SpendDiagnostic::HeuristicIdentities,
+            node: diagnostic_node("heuristic_identities", heuristic_identities),
+        },
+    ]))
+}
+
+fn canonical_groups(
+    events: &[CanonicalSpendEvent],
+    grouping: &[SpendGrouping],
+    depth: usize,
+    path: &mut Vec<String>,
+    window: &SpendWindow,
+    partial: bool,
+    provenance: &mut Vec<SpendGroupProvenance>,
+) -> Vec<SpendGroup> {
+    let Some(dimension) = grouping.get(depth).copied() else {
+        return Vec::new();
+    };
+    let mut by_key: BTreeMap<String, Vec<&CanonicalSpendEvent>> = BTreeMap::new();
+    for event in events {
+        by_key
+            .entry(group_value(event, dimension))
+            .or_default()
+            .push(event);
+    }
+    by_key
+        .into_iter()
+        .map(|(value, members)| {
+            path.push(format!("{}={value}", dimension.as_str()));
+            let key = LogicalName::new(path.join(" / "));
+            let usage = canonical_usage(&members, partial);
+            let sources = members
+                .iter()
+                .flat_map(|event| event.sources.iter().cloned())
+                .collect::<BTreeSet<_>>();
+            let node = ProvenanceNode::new(
+                members
+                    .iter()
+                    .map(|event| EvidenceId::new(event.canonical_id.clone())),
+                [],
+                QuerySemantics::new(
+                    grouping[..=depth]
+                        .iter()
+                        .map(|dimension| dimension.as_str())
+                        .collect::<Vec<_>>()
+                        .join(","),
+                    format!("{}..{}", window.since.iso(), window.until.iso()),
+                ),
+                sources.len() as u64,
+                members.len() as u64,
+                ValueArithmetic::Sum,
+            );
+            let derivation_id = DerivationId::from_manifest(node.manifest());
+            provenance.push(SpendGroupProvenance::new(key.clone(), node));
+            let children = canonical_groups(
+                &members.into_iter().cloned().collect::<Vec<_>>(),
+                grouping,
+                depth + 1,
+                path,
+                window,
+                partial,
+                provenance,
+            );
+            path.pop();
+            SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
+                .with_children(children)
+        })
+        .collect()
+}
+
+fn group_value(event: &CanonicalSpendEvent, grouping: SpendGrouping) -> String {
+    match grouping {
+        SpendGrouping::Day => event.occurred_at.utc_date().iso(),
+        SpendGrouping::Session => event.session.clone(),
+        SpendGrouping::Project => event.project.clone(),
+        SpendGrouping::Repository => event.repository.clone(),
+    }
+}
+
+fn canonical_usage(events: &[&CanonicalSpendEvent], partial: bool) -> UsageVector {
+    let mut components = BTreeMap::<String, u64>::new();
+    let mut quality = EvidenceQuality::Measured;
+    for event in events {
+        for (kind, count) in &event.components {
+            *components.entry(kind.clone()).or_insert(0) += count;
+        }
+        let event_quality = if event.evidence_kind == "reported" {
+            EvidenceQuality::Measured
+        } else {
+            EvidenceQuality::estimated([EstimatorId::new(event.evidence_kind.clone())], None)
+        };
+        quality = quality.combine(&event_quality);
+    }
+    let known = KnownTokenVector::new(
+        InputTokens::new(components.remove("input").unwrap_or(0)),
+        OutputTokens::new(components.remove("output").unwrap_or(0)),
+        CacheReadTokens::new(components.remove("cache_read").unwrap_or(0)),
+        CacheWriteTokens::new(components.remove("cache_write").unwrap_or(0)),
+    );
+    let coverage = if partial {
+        CoverageCompleteness::partial([
+            ComponentKind::new("input"),
+            ComponentKind::new("output"),
+            ComponentKind::new("cache_read"),
+            ComponentKind::new("cache_write"),
+        ])
+    } else {
+        CoverageCompleteness::Complete
+    };
+    UsageVector::new(
+        known,
+        components
+            .into_iter()
+            .map(|(kind, count)| (kind, TokenCount::new(count)))
+            .collect(),
+        coverage,
+        quality,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::TranscriptConfig;
+    use crate::domain::ids::SourceNamespace;
+    use crate::domain::time::{FakeClock, MonotonicDuration};
+    use crate::sessions::{ProjectKey, RepositoryKey};
+    use crate::store::connection::{AccessMode, PragmaPolicy};
+    use crate::store::session::{NewSession, insert_session};
+    use crate::store::usage_component::insert_components;
+    use crate::store::usage_event::{NewUsageEvent, insert_event};
+    use crate::store::usage_occurrence::{NewUsageOccurrence, insert_occurrence};
+    use crate::transcripts::ParserVersion;
     use std::fs;
     use std::path::PathBuf;
 
@@ -460,6 +689,200 @@ mod tests {
 
     fn now() -> UtcTimestamp {
         UtcTimestamp::parse_rfc3339("2026-08-30T12:00:00Z").unwrap()
+    }
+
+    fn canonical_conn(tag: &str) -> (PathBuf, rusqlite::Connection) {
+        let root = scratch(tag);
+        let mut conn = crate::store::connection::open(
+            &root.join("ledger.db"),
+            AccessMode::ReadWrite,
+            &PragmaPolicy {
+                busy_timeout: MonotonicDuration::from_millis(100),
+            },
+        )
+        .unwrap();
+        crate::store::migrate::run_migrations(
+            &mut conn,
+            &crate::store::migrations::registry(),
+            None,
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+        )
+        .unwrap();
+        (root, conn)
+    }
+
+    fn seed_canonical(
+        conn: &rusqlite::Connection,
+        id: &str,
+        timestamp: i64,
+        session: &str,
+        evidence_kind: &str,
+        components: &[(&str, u64)],
+    ) {
+        let event = insert_event(
+            conn,
+            &NewUsageEvent {
+                canonical_event_id: id,
+                session_id: Some(session),
+                event_timestamp: Some(UtcTimestamp::from_unix_nanos(timestamp)),
+                model_id: None,
+                evidence_kind,
+                source_provenance: "fixture.jsonl",
+                parser_version: "fixture-v1",
+                created_at: UtcTimestamp::from_unix_nanos(timestamp),
+            },
+        )
+        .unwrap();
+        insert_components(conn, event, components).unwrap();
+        let namespace = SourceNamespace::new("fixture");
+        let version = ParserVersion::new("fixture-v1");
+        insert_occurrence(
+            conn,
+            &NewUsageOccurrence {
+                source_namespace: &namespace,
+                native_event_id: Some(id),
+                parser_version: &version,
+                heuristic_key: None,
+                source_file: "fixture.jsonl",
+                occurred_at_nanos: Some(timestamp),
+                event_id: Some(event),
+                transcript_file_id: None,
+                source_location: None,
+                canonical_fingerprint: None,
+                identity_strength: None,
+                heuristic_algorithm_version: None,
+                canonical_payload_digest: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_session(conn: &rusqlite::Connection, name: &str) {
+        insert_session(
+            conn,
+            &NewSession {
+                source: SourceNamespace::new("fixture"),
+                native_session_id: crate::domain::ids::NativeSessionId::new(name),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                run_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn canonical_groups_nest_and_reconcile_every_token_kind() {
+        let (_root, conn) = canonical_conn("canonical-groups");
+        seed_session(&conn, "s1");
+        seed_session(&conn, "s2");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical(
+            &conn,
+            "e1",
+            day + 1,
+            "s1",
+            "reported",
+            &[("input", 2), ("output", 3)],
+        );
+        seed_canonical(
+            &conn,
+            "e2",
+            day + 2,
+            "s2",
+            "derived",
+            &[("input", 5), ("output", 7)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![
+                SpendGrouping::Day,
+                SpendGrouping::Session,
+                SpendGrouping::Project,
+                SpendGrouping::Repository,
+            ],
+            false,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(report.metadata.ingestion_generation.unwrap().get(), 1);
+        assert_eq!(report.groups.len(), 1);
+        let day_group = &report.groups[0];
+        assert_eq!(day_group.key.as_str(), "day=2026-08-25");
+        assert_eq!(day_group.usage.known().input().value(), 7);
+        assert_eq!(day_group.usage.known().output().value(), 10);
+        assert_eq!(day_group.children.len(), 2);
+        let session_s1 = &day_group.children[0];
+        assert_eq!(
+            session_s1.key.as_str(),
+            "day=2026-08-25 / session=fixture:s1"
+        );
+        let project_group = &session_s1.children[0];
+        assert_eq!(
+            project_group.key.as_str(),
+            "day=2026-08-25 / session=fixture:s1 / project=project-a"
+        );
+        let repo_group = &project_group.children[0];
+        assert_eq!(
+            repo_group.key.as_str(),
+            "day=2026-08-25 / session=fixture:s1 / project=project-a / repository=repository-a"
+        );
+        let children_input: u64 = day_group
+            .children
+            .iter()
+            .map(|group| group.usage.known().input().value())
+            .sum();
+        let children_output: u64 = day_group
+            .children
+            .iter()
+            .map(|group| group.usage.known().output().value())
+            .sum();
+        assert_eq!(children_input, day_group.usage.known().input().value());
+        assert_eq!(children_output, day_group.usage.known().output().value());
+        assert!(matches!(
+            day_group.usage.quality(),
+            EvidenceQuality::Mixed { .. }
+        ));
+        let explain = crate::presentation::render_spend_report_with_explain(
+            &report,
+            crate::presentation::ExplainMode::Summary,
+        );
+        assert!(explain.contains("spend_canonical_records"));
+        assert!(explain.contains("spend_replayed_occurrences"));
+        assert!(explain.contains("spend_heuristic_identities"));
+    }
+
+    #[test]
+    fn a_failed_refresh_qualifies_the_known_canonical_subtotal() {
+        let (_root, conn) = canonical_conn("canonical-partial");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical(&conn, "e1", day + 1, "s1", "reported", &[("input", 9)]);
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Day],
+            true,
+            Some("refresh failed: fixture unreadable; retained prior subtotal".to_string()),
+        )
+        .unwrap();
+
+        assert_eq!(report.groups[0].usage.known().input().value(), 9);
+        assert!(report.groups[0].usage.coverage().missing().is_some());
+        assert!(crate::presentation::render_spend_report(&report).contains("refresh incomplete"));
+        let json = crate::presentation::spend_json(&report, crate::logging::RunId::new(now()));
+        assert!(json.contains("\"ingestion_generation\":0"));
+        assert!(json.contains("\"refresh_failure\""));
+        crate::presentation::validate_spend_report_json(&json).unwrap();
     }
 
     /// A replayed message counts once at its final output, a message on the next

@@ -23,6 +23,7 @@ pub mod domain;
 pub mod error;
 pub mod error_output;
 pub mod evidence;
+pub mod ingest;
 pub mod logging;
 pub mod meter;
 pub mod presentation;

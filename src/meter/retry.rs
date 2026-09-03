@@ -289,7 +289,7 @@ impl<T> RetryOutcome<T> {
 
 /// Reduces an adapter's classified observation to the one attempt outcome the
 /// retry policy and the attempt record both speak.
-fn attempt_outcome_of<T>(observation: &ProviderObservation<T>) -> AttemptOutcome {
+pub(crate) fn attempt_outcome_of<T>(observation: &ProviderObservation<T>) -> AttemptOutcome {
     match observation {
         ProviderObservation::Measured(_) => AttemptOutcome::Success,
         ProviderObservation::AuthRequired(_) => AttemptOutcome::AuthRequired,

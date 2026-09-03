@@ -6,18 +6,19 @@
 //! preference selector commit together. Repository reads open a read-only connection
 //! for one short snapshot and return typed values rather than exposing SQLite rows.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 use crate::domain::attempt::{AttemptId, AttemptResult, AttemptStarted};
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
-use crate::domain::time::{MeasurementBasis, UtcTimestamp};
+use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::MeterWindow;
 use crate::error::Error;
 use crate::projection::{self, Publication};
 
-use super::account::AccountId;
+use super::account::{self, AccountId};
 use super::connection::{self, AccessMode, PragmaPolicy};
 use super::ledger_generation;
 use super::meter_attempt::{self, MeterAttemptRowId, NewMeterAttempt, NewMeterAttemptResult};
@@ -25,6 +26,9 @@ use super::meter_evidence::{
     self, EvidenceRowId, NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow,
     ObservationRowId,
 };
+use super::sample_run::{self, SampleRunId, Trigger};
+use super::sampling_lease::{self, AccountName, LeaseHolder, LeaseOutcome};
+use super::sampling_policy_snapshot::{ResolvedSamplingPolicy, SamplingPolicySnapshotId};
 
 /// Opens repository operations against one ledger database under one pragma policy.
 #[derive(Debug, Clone)]
@@ -56,6 +60,132 @@ impl Repository {
             .join(projection::PROJECTION_FILE_NAME)
     }
 
+    /// Records the account identity if it has never been sampled, and advances
+    /// its last-sight timestamp if it has. The identity is the configured
+    /// `(provider_key, logical_name)` pair, the same pair the sampling lease
+    /// keys on, so the first-ever sample of a configured account creates the
+    /// row the attempt needs before the attempt is started.
+    pub fn ensure_account(
+        &self,
+        provider_key: &str,
+        logical_name: &str,
+        observed_at: UtcTimestamp,
+    ) -> Result<AccountId, Error> {
+        let conn = self.open_write()?;
+        account::observe_account(&conn, provider_key, logical_name, observed_at)
+    }
+
+    /// Reads one account's evidence snapshot for the due decision in one
+    /// read-only connection, so the decision is a function of one moment of
+    /// the database: whether the account has a row at all, its latest attempt
+    /// with the terminal result it ever reached, and the reset instants the
+    /// newest observation carries.
+    pub fn due_evidence_snapshot(
+        &self,
+        account_id: AccountId,
+    ) -> Result<DueEvidenceSnapshot, Error> {
+        self.with_read_connection(|conn| {
+            let latest_attempt = meter_attempt::latest_attempt_for_account(conn, account_id)?;
+            let latest_result = match &latest_attempt {
+                Some(stored) => meter_attempt::result_by_attempt_id(conn, stored.row_id)?,
+                None => None,
+            };
+            let known_resets =
+                match meter_evidence::newest_observation_for_account(conn, account_id)? {
+                    Some(observation) => {
+                        meter_evidence::windows_by_observation(conn, observation.row_id)?
+                            .into_iter()
+                            .map(|window| window.resets_at)
+                            .collect::<BTreeSet<_>>()
+                            .into_iter()
+                            .collect()
+                    }
+                    None => Vec::new(),
+                };
+            let latest_attempt_started = match latest_attempt {
+                Some(stored) => {
+                    let id = stored.row_id.as_attempt_id()?;
+                    Some(AttemptStarted::new(id, stored.request_started_at))
+                }
+                None => None,
+            };
+            let latest_result_typed = match latest_result {
+                Some(stored) => {
+                    let id = stored.attempt_id.as_attempt_id()?;
+                    Some(AttemptResult::new(
+                        id,
+                        stored.completed_at,
+                        stored.elapsed,
+                        stored.outcome,
+                    ))
+                }
+                None => None,
+            };
+            Ok(DueEvidenceSnapshot {
+                latest_attempt: latest_attempt_started,
+                latest_result: latest_result_typed,
+                known_resets,
+            })
+        })
+    }
+
+    /// Records the policy in force for `account_id` as of `effective_at`,
+    /// reusing the most recent snapshot when the resolved policy is unchanged.
+    pub fn resolve_policy_snapshot(
+        &self,
+        account_id: AccountId,
+        effective_at: UtcTimestamp,
+        policy: &ResolvedSamplingPolicy,
+    ) -> Result<SamplingPolicySnapshotId, Error> {
+        let conn = self.open_write()?;
+        super::sampling_policy_snapshot::resolve_policy_snapshot(
+            &conn,
+            account_id,
+            effective_at,
+            policy,
+        )
+    }
+
+    /// Opens the sampling batch: one durable `sample_run` row before any
+    /// account in the batch is sampled, so every attempt in the batch names
+    /// the invocation they had in common.
+    pub fn start_sample_run(
+        &self,
+        trigger: Trigger,
+        started_at: UtcTimestamp,
+        configuration_fingerprint: &str,
+    ) -> Result<SampleRunId, Error> {
+        let conn = self.open_write()?;
+        sample_run::start_sample_run(&conn, trigger, started_at, configuration_fingerprint)
+    }
+
+    /// Acquires the per-account sampling lease through one short immediate
+    /// transaction, timed by the caller's clock. The outcome names the live
+    /// lease when another holder has it, so a skipped account is reported
+    /// with who holds it, never as silence.
+    pub fn acquire_sampling_lease(
+        &self,
+        account: &AccountName,
+        holder: &LeaseHolder,
+        ttl: MonotonicDuration,
+        clock: &dyn crate::domain::time::Clock,
+    ) -> Result<LeaseOutcome, Error> {
+        let mut conn = self.open_write()?;
+        sampling_lease::acquire(&mut conn, account, holder, ttl, clock)
+    }
+
+    /// Releases the per-account sampling lease if this invocation still holds
+    /// it. A lease that expired and was taken over by another holder is not
+    /// released; the boolean reports whether a row was removed.
+    pub fn release_sampling_lease(
+        &self,
+        account: &AccountName,
+        holder: &LeaseHolder,
+    ) -> Result<bool, Error> {
+        let conn = self.open_write()?;
+        sampling_lease::release(&conn, account, holder)
+    }
+
     fn open_write(&self) -> Result<Connection, Error> {
         connection::open(&self.database_path, AccessMode::ReadWrite, &self.policy)
     }
@@ -82,11 +212,19 @@ impl Repository {
     /// against a database and a projection that agree.
     pub fn start_meter_attempt(&self, attempt: &NewMeterAttempt) -> Result<AttemptStarted, Error> {
         let mut conn = self.open_write()?;
-        let tx = conn.transaction().map_err(|error| {
-            Error::Store(format!(
-                "cannot open the attempt-start transaction: {error}"
-            ))
-        })?;
+        // IMMEDIATE, not deferred: a write transaction that starts as a read
+        // and upgrades at its first insert fails instantly with SQLITE_BUSY
+        // when another writer committed since its snapshot (WAL's
+        // BUSY_SNAPSHOT), and the busy timeout never runs. The meter's start
+        // must wait for the slot like any writer, so it takes the slot
+        // upfront.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot open the attempt-start transaction: {error}"
+                ))
+            })?;
         let row_id = meter_attempt::start_meter_attempt(&tx, attempt)?;
         ledger_generation::advance(&tx)?;
         tx.commit()
@@ -161,11 +299,17 @@ impl Repository {
         result: &NewMeterAttemptResult,
     ) -> Result<Publication, Error> {
         let mut conn = self.open_write()?;
-        let tx = conn.transaction().map_err(|error| {
-            Error::Store(format!(
-                "cannot open the terminal-result transaction: {error}"
-            ))
-        })?;
+        // IMMEDIATE for the same reason as every meter write below: a deferred
+        // start would race another writer's commit at its first insert and
+        // fail without waiting, which would spool evidence SQLite could have
+        // taken the slot for.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot open the terminal-result transaction: {error}"
+                ))
+            })?;
         meter_attempt::record_meter_attempt_result(&tx, result)?;
         ledger_generation::advance(&tx)?;
         tx.commit()
@@ -305,16 +449,36 @@ pub struct TerminalBundleCommit {
     pub publication: Publication,
 }
 
+/// One account's evidence for the due decision, read as one snapshot: whether
+/// the account has ever been observed, its latest attempt with the terminal
+/// result it ever reached, and the reset instants the newest observation
+/// carries. `None` attempt means the account has never been sampled, which is
+/// itself a due answer (an empty history is due on ordinary cadence).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DueEvidenceSnapshot {
+    pub latest_attempt: Option<AttemptStarted>,
+    pub latest_result: Option<AttemptResult>,
+    pub known_resets: Vec<UtcTimestamp>,
+}
+
 pub(crate) fn commit_terminal_bundle_on_connection(
     conn: &mut Connection,
     bundle: &TerminalMeterBundle,
     before_commit: impl FnOnce() -> Result<(), Error>,
 ) -> Result<TerminalBundleIds, Error> {
-    let tx = conn.transaction().map_err(|error| {
-        Error::Store(format!(
-            "cannot open the terminal-bundle transaction: {error}"
-        ))
-    })?;
+    // IMMEDIATE, not deferred: this is a write transaction, and a deferred
+    // start would take a read snapshot and then fail instantly with
+    // SQLITE_BUSY at the first insert whenever another writer committed in
+    // between (WAL's BUSY_SNAPSHOT path), spooling meter evidence that only
+    // needed to wait for the slot. Taking the write slot upfront makes the
+    // bounded busy timeout the real wait it is meant to be.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| {
+            Error::Store(format!(
+                "cannot open the terminal-bundle transaction: {error}"
+            ))
+        })?;
 
     meter_attempt::record_meter_attempt_result(&tx, bundle.result())?;
     let evidence_id = meter_evidence::insert_response_evidence(&tx, bundle.evidence())?;
@@ -742,5 +906,48 @@ mod tests {
             .unwrap()
             .expect("the complete terminal bundle must be visible after the snapshot closes");
         assert_eq!(stored.outcome(), AttemptOutcome::Success);
+    }
+
+    /// The due-evidence snapshot reads the account's latest attempt, the
+    /// terminal result that attempt reached, and the reset instants the newest
+    /// observation carries, and reports an empty snapshot for an account that
+    /// has never been sampled.
+    #[test]
+    fn due_evidence_snapshot_reads_history_and_resets_as_one_snapshot() {
+        let fixture = fixture();
+
+        // An account never sampled: no attempt, no result, no resets.
+        let fresh = fixture
+            .repository
+            .due_evidence_snapshot(fixture.account_id)
+            .unwrap();
+        assert_eq!(fresh.latest_attempt, None);
+        assert_eq!(fresh.latest_result, None);
+        assert_eq!(fresh.known_resets, Vec::new());
+
+        // After one sampled-and-committed attempt, the snapshot carries the
+        // attempt, its success result, and the windows' reset instants.
+        let started = fixture
+            .repository
+            .start_meter_attempt(&fixture.attempt)
+            .unwrap();
+        let bundle = terminal_bundle(started.attempt_id(), fixture.account_id);
+        fixture.repository.commit_terminal_bundle(&bundle).unwrap();
+
+        let sampled = fixture
+            .repository
+            .due_evidence_snapshot(fixture.account_id)
+            .unwrap();
+        assert_eq!(sampled.latest_attempt, Some(started));
+        let result = sampled
+            .latest_result
+            .expect("the committed bundle's result must be visible to the snapshot");
+        assert_eq!(result.attempt_id(), started.attempt_id());
+        assert_eq!(result.outcome(), AttemptOutcome::Success);
+        assert_eq!(
+            sampled.known_resets,
+            vec![UtcTimestamp::from_unix_nanos(9_000)],
+            "both fixture windows reset at the same instant, deduplicated to one"
+        );
     }
 }

@@ -13,7 +13,7 @@ pub fn parse_duration(raw: &str) -> Result<MonotonicDuration, String> {
     let raw = raw.trim();
     let Some((digits, unit, multiplier)) = split_unit(raw) else {
         return Err(format!(
-            "{raw:?} is not a duration: expected a number followed by s, m or h"
+            "{raw:?} is not a duration: expected a number followed by s, m, h or d"
         ));
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
@@ -38,6 +38,7 @@ fn split_unit(raw: &str) -> Option<(&str, &str, u64)> {
         Some(b's') => (1, 1),
         Some(b'm') => (60, 1),
         Some(b'h') => (3_600, 1),
+        Some(b'd') => (86_400, 1),
         _ => return None,
     };
     let split_at = raw.len() - unit_len;
@@ -56,6 +57,12 @@ mod tests {
             parse_duration("48h").unwrap().as_nanos(),
             48 * 3_600 * 1_000_000_000
         );
+        // Days joined the vocabulary with the coverage selector, whose plan
+        // example reads `--since 30d` (PLAN.md section 27).
+        assert_eq!(
+            parse_duration("30d").unwrap().as_nanos(),
+            30 * 86_400 * 1_000_000_000
+        );
     }
 
     #[test]
@@ -65,7 +72,7 @@ mod tests {
 
     #[test]
     fn rejects_an_unrecognized_unit() {
-        assert!(parse_duration("5d").is_err());
+        assert!(parse_duration("5w").is_err());
     }
 
     #[test]

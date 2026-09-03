@@ -18,7 +18,7 @@ use super::{
 ///
 /// Accounts carry their storage order (account-identity order), so the file
 /// is deterministic over unchanged database state.
-pub(crate) fn projection(generation: Generation, states: &[AccountMeterState]) -> Projection {
+pub fn projection(generation: Generation, states: &[AccountMeterState]) -> Projection {
     Projection {
         ledger_generation: generation,
         accounts: states.iter().map(projected_account).collect(),

@@ -225,7 +225,7 @@ assert_stderr_contains() {
 assert_json_field() {
     local step="$1" field="$2" value="$3"
     local observed
-    observed="$(jq -r ".$field // empty" "$(step_dir "$step")/stdout.bin" 2>/dev/null)"
+    observed="$(jq -r "if .$field == null then empty else .$field end" "$(step_dir "$step")/stdout.bin" 2>/dev/null)"
     if [ "$observed" = "$value" ]; then
         record_assertion "assert_json_field $field step $step" "$value" "$observed" "pass"
     else

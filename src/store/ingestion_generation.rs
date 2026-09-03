@@ -48,6 +48,24 @@ pub(crate) fn create_table(conn: &rusqlite::Connection) -> Result<(), Error> {
     .map_err(|e| Error::Store(format!("cannot create the ingestion_generation table: {e}")))
 }
 
+/// Advances the counter by one and returns the new value.
+///
+/// Called by the ingest path once per completed ingestion pass, inside the
+/// same transaction that lands the pass's rows, so a rollback of the pass
+/// rolls the generation back too and a commit advances both together. Like
+/// the ledger generation, SQLite's single-writer serialization means two
+/// concurrent passes cannot observe or produce the same post-increment value.
+pub fn advance(conn: &rusqlite::Connection) -> Result<Generation, Error> {
+    conn.query_row(
+        "UPDATE ingestion_generation SET generation = generation + 1 WHERE id = 1 \
+         RETURNING generation",
+        [],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|value| Generation::new(value as u64))
+    .map_err(|e| Error::Store(format!("cannot advance the ingestion generation: {e}")))
+}
+
 /// Reads the current value without advancing it.
 pub fn current(conn: &rusqlite::Connection) -> Result<Generation, Error> {
     conn.query_row(
@@ -117,6 +135,25 @@ mod tests {
     fn a_fresh_database_reads_generation_zero() {
         let (_scratch, conn) = fixture_conn();
         assert_eq!(current(&conn).unwrap(), Generation::new(0));
+    }
+
+    /// Each completed ingestion pass advances the counter by exactly one and
+    /// reads back the value it produced: the first pass lands as generation 1,
+    /// the second as 2, and the counter never skips or repeats (aub-lqe.11).
+    /// The planted negative is the naive implementation that reports the
+    /// pre-advance value or resets it: both fail here.
+    #[test]
+    fn each_completed_pass_advances_the_generation_by_exactly_one() {
+        let (_scratch, conn) = fixture_conn();
+        assert_eq!(current(&conn).unwrap(), Generation::new(0));
+
+        let first = advance(&conn).unwrap();
+        assert_eq!(first, Generation::new(1));
+        assert_eq!(current(&conn).unwrap(), Generation::new(1));
+
+        let second = advance(&conn).unwrap();
+        assert_eq!(second, Generation::new(2));
+        assert_eq!(current(&conn).unwrap(), Generation::new(2));
     }
 
     /// The counter survives a later migration unchanged, matching the ledger

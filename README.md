@@ -9,12 +9,11 @@ from one source instead of from several tools that quietly disagree.
 ## Status
 
 Early. The harness, the licence obligations and the correctness rules are in place, and
-the first half of the measurement exists: `aub spend` reads the transcripts Claude Code,
-Codex and pi leave on disk and reports token usage per UTC day and per source, with
-replayed records collapsed and every quarantined record, skipped file and undated event
-counted beside the totals. It re-reads the configured roots on every run; nothing is
-stored yet. Quota is not measured yet: `aub status` renders every configured account as
-never observed until the sampler lands. There is no release yet.
+the first half of the measurement exists: `aub spend` refreshes and reads the canonical
+ledger built from Claude Code, Codex and pi transcripts. It groups token vectors by day,
+session, project and repository, preserving evidence qualification and provenance at
+every subtotal. Quota is not measured yet: `aub status` renders every configured account
+as never observed until the sampler lands. There is no release yet.
 
 ## Why it exists
 
@@ -73,8 +72,9 @@ format = "claude-code"   # or "codex", "pi"
 ```
 
 `aub spend` reports today by default; `--since YYYY-MM-DD` and `--days N` widen the
-window, and `--format json` emits the versioned envelope with a `{value, unit}` per token
-kind.
+window. Repeat `--group-by day|session|project|repository` for nested subtotals and set
+`--refresh auto|never|force` to control transcript ingest. `--format json` emits the
+versioned envelope with a `{value, unit}` per token kind.
 
 ## Development
 

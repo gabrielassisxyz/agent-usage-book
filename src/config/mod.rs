@@ -158,6 +158,14 @@ impl CoverageFloor {
     pub fn get(self) -> f64 {
         self.0
     }
+
+    /// The floor in parts per million, rounded half-up. The named conversion
+    /// from the configured fraction to the unit the rest of this project
+    /// expresses fractions in, so the JSON contract carries the floor in the
+    /// same unit as the coverages it judges.
+    pub fn as_ppm(self) -> u32 {
+        (self.0 * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -172,6 +180,25 @@ pub struct SamplingConfig {
     pub reset_edge_lead: MonotonicDuration,
     pub request_timeout: MonotonicDuration,
     pub command_budget: MonotonicDuration,
+    /// The most provider requests one sampling batch may keep in flight.
+    /// Bounded so a machine with many configured accounts cannot open an
+    /// unbounded number of simultaneous connections; the default is small
+    /// because only a few accounts exist today.
+    pub max_concurrent_requests: usize,
+}
+
+/// The transcript ingest batch policy (PLAN.md section 11.2: "Transcript ingest
+/// commits in bounded batches so it cannot monopolize the single SQLite writer
+/// slot"). One ingest pass lands its canonical usage events in transactions of
+/// at most `max_batch_events` events, releasing the writer slot between
+/// batches, so a concurrent meter write never waits behind one unbounded pass.
+#[derive(Debug, Clone)]
+pub struct IngestConfig {
+    /// The maximum number of canonical usage events one ingest batch lands in
+    /// one transaction. A batch commits atomically or not at all; the bound
+    /// caps how long any one batch can hold the writer slot. The value must be
+    /// at least 1: a zero bound would mean no batch could ever land a row.
+    pub max_batch_events: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -231,6 +258,7 @@ pub struct Config {
     pub freshness: FreshnessConfig,
     pub coverage: CoverageConfig,
     pub accounts: Vec<AccountConfig>,
+    pub ingest: IngestConfig,
     pub transcripts: Vec<TranscriptConfig>,
     pub tracker: Option<TrackerConfig>,
     pub valuation: ValuationConfig,
@@ -248,6 +276,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "schema",
     "state",
     "sampling",
+    "ingest",
     "freshness",
     "coverage",
     "accounts",
@@ -265,7 +294,9 @@ const SAMPLING_KEYS: &[&str] = &[
     "reset_edge_lead",
     "request_timeout",
     "command_budget",
+    "max_concurrent_requests",
 ];
+const INGEST_KEYS: &[&str] = &["max_batch_events"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
@@ -323,6 +354,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("sampling").and_then(toml::Value::as_table) {
         check_keys(t, SAMPLING_KEYS, "sampling", file_display)?;
+    }
+    if let Some(t) = table.get("ingest").and_then(toml::Value::as_table) {
+        check_keys(t, INGEST_KEYS, "ingest", file_display)?;
     }
     if let Some(t) = table.get("freshness").and_then(toml::Value::as_table) {
         check_keys(t, FRESHNESS_KEYS, "freshness", file_display)?;
@@ -461,6 +495,38 @@ fn resolve_duration(
     parse_duration(&raw).map_err(|e| Error::Usage(format!("{key}: {e}")))
 }
 
+/// Resolves a positive integer count: the four-level string order, then a
+/// parse that refuses zero and every non-number with the key named, so a
+/// mistyped value is a usage error rather than a silently zero batch bound.
+fn resolve_positive_count(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<u64, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    let parsed = raw
+        .parse::<u64>()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a positive integer")))?;
+    if parsed == 0 {
+        return Err(Error::Usage(format!(
+            "{key}: must be at least 1, got {raw:?}"
+        )));
+    }
+    Ok(parsed)
+}
+
 fn resolve_floor(
     key: &str,
     overrides: &Overrides,
@@ -484,6 +550,38 @@ fn resolve_floor(
         .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a number")))?;
     CoverageFloor::new(value)
         .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
+}
+
+/// A count a configuration file expresses as a bare positive integer. A value
+/// of zero would sample nothing while reporting a completed batch, so it is
+/// refused at resolution time rather than discovered at sampling time.
+fn resolve_count(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<usize, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    let value: usize = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a whole number")))?;
+    if value == 0 {
+        return Err(Error::Usage(format!(
+            "{key}: a bound of zero would sample nothing; set it to at least 1"
+        )));
+    }
+    Ok(value)
 }
 
 /// Non-identifying platform defaults: derived from `$HOME` at resolution time, never
@@ -536,6 +634,18 @@ pub fn resolve(
         )?),
     };
 
+    let ingest = IngestConfig {
+        max_batch_events: resolve_positive_count(
+            "ingest.max_batch_events",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "ingest", "max_batch_events"),
+            Some("5000"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let sampling = SamplingConfig {
         scheduler_tick: resolve_duration(
             "sampling.scheduler_tick",
@@ -579,6 +689,15 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "command_budget"),
             Some("8s"),
+            &file_display,
+            &mut provenance,
+        )?,
+        max_concurrent_requests: resolve_count(
+            "sampling.max_concurrent_requests",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "max_concurrent_requests"),
+            Some("2"),
             &file_display,
             &mut provenance,
         )?,
@@ -756,6 +875,7 @@ pub fn resolve(
         Config {
             state,
             sampling,
+            ingest,
             freshness,
             coverage,
             accounts,
@@ -908,6 +1028,60 @@ mod tests {
         assert!(config.tracker.is_none());
     }
 
+    // --- the concurrency bound ------------------------------------------------------
+
+    /// The documented small default: bounded concurrency is configuration,
+    /// not a constant, and its default is two.
+    #[test]
+    fn the_concurrency_bound_defaults_to_two() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(config.sampling.max_concurrent_requests, 2);
+        assert_eq!(
+            provenance.get("sampling.max_concurrent_requests"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    #[test]
+    fn the_concurrency_bound_resolves_from_the_file_and_the_environment() {
+        let file = "[sampling]\nmax_concurrent_requests = 4\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.sampling.max_concurrent_requests, 4);
+        assert_eq!(
+            provenance.get("sampling.max_concurrent_requests"),
+            Some(ConfigSource::File)
+        );
+
+        let env = plain_env().set("AUB_SAMPLING_MAX_CONCURRENT_REQUESTS", "6");
+        let (config, provenance) = resolve_with(Overrides::new(), env, Some(file)).unwrap();
+        assert_eq!(config.sampling.max_concurrent_requests, 6);
+        assert_eq!(
+            provenance.get("sampling.max_concurrent_requests"),
+            Some(ConfigSource::Environment)
+        );
+    }
+
+    /// Planted negative: a bound of zero would sample nothing while reporting
+    /// a completed batch, so it is refused at resolution time.
+    #[test]
+    fn a_zero_concurrency_bound_is_a_named_usage_error() {
+        let file = "[sampling]\nmax_concurrent_requests = 0\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("sampling.max_concurrent_requests"),
+            "the refusal must name the key: {err}"
+        );
+    }
+
+    #[test]
+    fn a_non_numeric_concurrency_bound_is_a_named_usage_error() {
+        let file = "[sampling]\nmax_concurrent_requests = \"many\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("not a whole number"), "{err}");
+    }
+
     // --- no compiled identity -------------------------------------------------------
 
     #[test]
@@ -981,6 +1155,41 @@ pattern = "**/*.jsonl"
         assert_eq!(config.transcripts.len(), 1);
         assert_eq!(config.transcripts[0].pattern, "**/*.jsonl");
         assert_eq!(provenance.get("accounts"), Some(ConfigSource::File));
+    }
+
+    /// The ingest batch bound defaults, is file-overridable and is provenance-
+    /// tracked like every other scalar section; a zero or non-numeric value is a
+    /// usage error naming the key, never a silently degenerate batch bound.
+    #[test]
+    fn ingest_batch_bound_resolves_and_refuses_zero_or_garbage() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(config.ingest.max_batch_events, 5000);
+        assert_eq!(
+            provenance.get("ingest.max_batch_events"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "\n[ingest]\nmax_batch_events = 250\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.ingest.max_batch_events, 250);
+        assert_eq!(
+            provenance.get("ingest.max_batch_events"),
+            Some(ConfigSource::File)
+        );
+
+        let zero = "\n[ingest]\nmax_batch_events = 0\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(zero)).unwrap_err();
+        assert!(
+            error.to_string().contains("ingest.max_batch_events"),
+            "{error}"
+        );
+
+        let garbage = "\n[ingest]\nmax_batch_events = \"lots\"\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
+        assert!(
+            error.to_string().contains("ingest.max_batch_events"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -39,7 +39,7 @@ use crate::store::backup::{
     verify_database_on_connection,
 };
 use crate::store::connection::{AccessMode, LEDGER_DATABASE_FILE, PragmaPolicy, open};
-use crate::store::meter_evidence::count_observations;
+use crate::store::meter_evidence::observation_row_count;
 use crate::store::migrate::run_migrations;
 use crate::store::migrations::registry;
 use crate::store::spool::{RecoveryDrainReport, drain_pending_recovering};
@@ -220,7 +220,7 @@ pub fn restore_archive(
     // is about the database the operator is left holding, not the one it
     // started from.
     check_database(&conn)?;
-    let observation_count = count_observations(&conn)?;
+    let observation_count = observation_row_count(&conn)?;
     drop(conn);
     let (schema_version, ledger_generation) =
         archived_database_metadata(&destination_database, busy_timeout)?;

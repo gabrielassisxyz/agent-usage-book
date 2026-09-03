@@ -30,6 +30,7 @@ pub mod script;
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -112,6 +113,9 @@ pub struct SyntheticServer {
     script: Arc<Mutex<Vec<ScriptedOutcome>>>,
     script_exhausted: Arc<Mutex<bool>>,
     shutdown: Arc<Mutex<bool>>,
+    /// The most connections ever open at once. A caller that bounds its
+    /// concurrency to N must never see a peak above N here.
+    max_simultaneous: Arc<AtomicUsize>,
     thread: Option<JoinHandle<()>>,
 }
 
@@ -122,6 +126,17 @@ impl SyntheticServer {
     /// The script is the programmed sequence of responses the server will
     /// produce. One entry per expected request, in order.
     pub fn start(script: Vec<ScriptedOutcome>) -> Result<Self, SyntheticServerError> {
+        Self::start_with_response_delay(script, Duration::ZERO)
+    }
+
+    /// [`Self::start`] with every connection held for `response_delay` before
+    /// its scripted response is written. A concurrency-bound assertion needs
+    /// responses slow enough to overlap; responses fast enough never do, and
+    /// the bound would hold vacuously.
+    pub fn start_with_response_delay(
+        script: Vec<ScriptedOutcome>,
+        response_delay: Duration,
+    ) -> Result<Self, SyntheticServerError> {
         let listener =
             TcpListener::bind("127.0.0.1:0").map_err(SyntheticServerError::BindFailed)?;
         let address = listener
@@ -131,6 +146,8 @@ impl SyntheticServer {
         let script = Arc::new(Mutex::new(script));
         let script_exhausted = Arc::new(Mutex::new(false));
         let shutdown = Arc::new(Mutex::new(false));
+        let active_connections = Arc::new(AtomicUsize::new(0));
+        let max_simultaneous = Arc::new(AtomicUsize::new(0));
 
         let thread = spawn_acceptor(
             listener,
@@ -138,6 +155,9 @@ impl SyntheticServer {
             Arc::clone(&script),
             Arc::clone(&script_exhausted),
             Arc::clone(&shutdown),
+            active_connections,
+            Arc::clone(&max_simultaneous),
+            response_delay,
         );
 
         Ok(Self {
@@ -146,6 +166,7 @@ impl SyntheticServer {
             script,
             script_exhausted,
             shutdown,
+            max_simultaneous,
             thread: Some(thread),
         })
     }
@@ -175,6 +196,13 @@ impl SyntheticServer {
     /// How many requests the server has received.
     pub fn request_count(&self) -> usize {
         self.requests.lock().expect("requests mutex poisoned").len()
+    }
+
+    /// The most connections the server ever had open at once, counting from
+    /// accept to the end of each connection's handling. A client that bounds
+    /// its concurrent requests to N must never observe more than N here.
+    pub fn max_simultaneous_connections(&self) -> usize {
+        self.max_simultaneous.load(Ordering::SeqCst)
     }
 
     /// `true` if the script ran out of entries. A request received after
@@ -227,6 +255,9 @@ fn spawn_acceptor(
     script: Arc<Mutex<Vec<ScriptedOutcome>>>,
     script_exhausted: Arc<Mutex<bool>>,
     shutdown: Arc<Mutex<bool>>,
+    active_connections: Arc<AtomicUsize>,
+    max_simultaneous: Arc<AtomicUsize>,
+    response_delay: Duration,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let listener = listener;
@@ -251,8 +282,16 @@ fn spawn_acceptor(
             let reqs = Arc::clone(&requests);
             let sc = Arc::clone(&script);
             let exhausted = Arc::clone(&script_exhausted);
+            let active = Arc::clone(&active_connections);
+            let max = Arc::clone(&max_simultaneous);
             thread::spawn(move || {
-                handle_connection(stream, reqs, sc, exhausted);
+                // Counted for the whole handling of the connection, so the
+                // peak reflects what a client with bounded concurrency can
+                // keep open at once.
+                let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(now_active, Ordering::SeqCst);
+                handle_connection(stream, reqs, sc, exhausted, response_delay);
+                active.fetch_sub(1, Ordering::SeqCst);
             });
         }
     })
@@ -265,6 +304,7 @@ fn handle_connection(
     requests: Arc<Mutex<Vec<RecordedRequest>>>,
     script: Arc<Mutex<Vec<ScriptedOutcome>>>,
     script_exhausted: Arc<Mutex<bool>>,
+    response_delay: Duration,
 ) {
     let request = match read_request(&mut stream) {
         Ok(req) => req,
@@ -293,6 +333,9 @@ fn handle_connection(
         }
     };
 
+    if !response_delay.is_zero() {
+        std::thread::sleep(response_delay);
+    }
     if let Err(e) = write_outcome(&mut stream, &outcome) {
         // A write failure is the test client's read timeout firing before we
         // finished; nothing for the test to assert on.

@@ -127,6 +127,7 @@ fn seed_status_report() -> StatusReport {
             },
         )],
         readings,
+        agent_usage_book::report::ProjectionReadState::Read,
     )
 }
 
@@ -168,6 +169,8 @@ fn seed_spend_report() -> SpendReport {
         vec![group],
         prov,
         IngestSummary {
+            refresh_attempted: false,
+            refresh_failure: None,
             files_read: 1,
             files_skipped_before_window: 0,
             unreadable_files: vec![],
@@ -175,6 +178,7 @@ fn seed_spend_report() -> SpendReport {
             replayed_occurrences: 0,
             collisions: 0,
             without_identity: 0,
+            heuristic_identities: 0,
             undated_events: 0,
             events_outside_window: 0,
             events_in_window: 15,

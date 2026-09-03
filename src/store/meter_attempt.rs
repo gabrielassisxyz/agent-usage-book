@@ -203,6 +203,35 @@ pub(crate) fn attempt_outcome_as_sql(outcome: &AttemptOutcome) -> &'static str {
     }
 }
 
+/// The failure fields one attempt outcome lands as: the failure class code
+/// when the outcome is unreachable, and the rate-limit retry delay in
+/// nanoseconds when the class carries one. One mapping, shared by the live
+/// insert and the pending-observation spool's flat form, so the two durable
+/// spellings of one outcome can never drift apart.
+pub(crate) fn outcome_failure_fields(outcome: &AttemptOutcome) -> (Option<String>, Option<i64>) {
+    match outcome {
+        AttemptOutcome::Unreachable(class) => {
+            let retry_after = match class {
+                FailureClass::RateLimited { retry_after } => {
+                    retry_after.map(|duration| duration.as_nanos() as i64)
+                }
+                FailureClass::DnsFailure
+                | FailureClass::ConnectTimeout
+                | FailureClass::ReadTimeout
+                | FailureClass::TotalBudgetExpired
+                | FailureClass::HttpStatus(_)
+                | FailureClass::MalformedBody
+                | FailureClass::MissingRequiredField => None,
+            };
+            (
+                Some(failure_class_sql::as_sql(class).to_owned()),
+                retry_after,
+            )
+        }
+        AttemptOutcome::Success | AttemptOutcome::AuthRequired => (None, None),
+    }
+}
+
 pub(crate) fn attempt_outcome_from_sql(
     outcome_sql: &str,
     failure_class_sql: Option<String>,
@@ -283,24 +312,7 @@ pub fn record_meter_attempt_result(
     result: &NewMeterAttemptResult,
 ) -> Result<(), Error> {
     let outcome_sql = attempt_outcome_as_sql(&result.outcome);
-    let (failure_class_sql, retry_after) = match &result.outcome {
-        AttemptOutcome::Unreachable(class) => {
-            let retry_after = match class {
-                FailureClass::RateLimited { retry_after } => {
-                    retry_after.map(|d| d.as_nanos() as i64)
-                }
-                FailureClass::DnsFailure
-                | FailureClass::ConnectTimeout
-                | FailureClass::ReadTimeout
-                | FailureClass::TotalBudgetExpired
-                | FailureClass::HttpStatus(_)
-                | FailureClass::MalformedBody
-                | FailureClass::MissingRequiredField => None,
-            };
-            (Some(failure_class_sql::as_sql(class)), retry_after)
-        }
-        AttemptOutcome::Success | AttemptOutcome::AuthRequired => (None, None),
-    };
+    let (failure_class_sql, retry_after) = outcome_failure_fields(&result.outcome);
     conn.execute(
         "INSERT INTO meter_attempt_result (
             attempt_id, completed_at, elapsed_nanos, outcome, failure_class,
@@ -521,6 +533,105 @@ pub fn open_attempt_row_ids(conn: &rusqlite::Connection) -> Result<Vec<MeterAtte
     rows.map(|entry| entry.map(MeterAttemptRowId::new))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| Error::Store(format!("cannot read open meter attempts: {e}")))
+}
+
+/// One started attempt reduced to what the coverage command reads: when it
+/// started, and its terminal outcome when one exists. A start with `None` is
+/// the collector-interruption state, which the coverage engine reports
+/// separately from both coverage numbers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptWithOutcome {
+    pub started_at: UtcTimestamp,
+    pub terminal: Option<AttemptTerminalOutcome>,
+}
+
+/// The terminal outcome of one attempt, as the coverage command reads it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptTerminalOutcome {
+    pub finished_at: UtcTimestamp,
+    pub outcome: AttemptOutcome,
+    pub retry_after: Option<MonotonicDuration>,
+}
+
+/// Every attempt of one account started in `[start, end)`, oldest first, each
+/// with its terminal outcome when one exists. The coverage command's read
+/// (`aub-me5.9`): the engine reconstructs its denominators from these rows,
+/// and the failure tally groups the outcomes by the four classes PLAN.md
+/// section 15 distinguishes.
+pub fn attempts_with_outcomes_for_account_between(
+    conn: &rusqlite::Connection,
+    account_id: crate::store::account::AccountId,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+) -> Result<Vec<AttemptWithOutcome>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT ma.request_started_at, mar.completed_at, mar.outcome,
+                    mar.failure_class, mar.retry_after_nanos
+             FROM meter_attempt ma
+             LEFT JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
+             WHERE ma.account_id = ?1
+               AND ma.request_started_at >= ?2 AND ma.request_started_at < ?3
+             ORDER BY ma.request_started_at, ma.id",
+        )
+        .map_err(|e| Error::Store(format!("cannot read coverage attempts: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![account_id.value(), start.unix_nanos(), end.unix_nanos()],
+            |row| {
+                let started_at = UtcTimestamp::from_unix_nanos(row.get::<_, i64>(0)?);
+                let terminal = match row.get::<_, Option<i64>>(1)? {
+                    None => None,
+                    Some(completed_at) => {
+                        let outcome_sql: String = row.get(2)?;
+                        let failure_class_sql: Option<String> = row.get(3)?;
+                        let retry_after_nanos: Option<i64> = row.get(4)?;
+                        let (outcome, _) = attempt_outcome_from_sql(
+                            &outcome_sql,
+                            failure_class_sql,
+                            retry_after_nanos,
+                        )
+                        .map_err(|e| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2, // outcome, by position in the SELECT above
+                                rusqlite::types::Type::Text,
+                                Box::new(e),
+                            )
+                        })?;
+                        Some(AttemptTerminalOutcome {
+                            finished_at: UtcTimestamp::from_unix_nanos(completed_at),
+                            outcome,
+                            retry_after: retry_after_nanos
+                                .map(|nanos| MonotonicDuration::from_nanos(nanos as u64)),
+                        })
+                    }
+                };
+                Ok(AttemptWithOutcome {
+                    started_at,
+                    terminal,
+                })
+            },
+        )
+        .map_err(|e| Error::Store(format!("cannot read coverage attempts: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read coverage attempts: {e}")))
+}
+
+/// The most recently started attempt, or `None` while the table is empty: the
+/// attempt whose lifecycle the freshness computation reads. The lifecycle is
+/// append-only and starts are never deleted, so id order and start order are
+/// the same order, which makes id the stable tiebreak between equal
+/// `request_started_at` values.
+pub fn latest_attempt_row_id(
+    conn: &rusqlite::Connection,
+) -> Result<Option<MeterAttemptRowId>, Error> {
+    conn.query_row(
+        "SELECT id FROM meter_attempt ORDER BY id DESC LIMIT 1",
+        [],
+        |row| row.get::<_, i64>(0).map(MeterAttemptRowId::new),
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot read the latest meter attempt: {e}")))
 }
 
 /// The number of started attempts and the number of terminal results in the
@@ -867,5 +978,228 @@ mod tests {
                 let _ = ended;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod coverage_query_tests {
+    use super::*;
+    use crate::domain::failure::FailureClass;
+    use crate::store::account::AccountId;
+    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::meter_attempt::{
+        DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
+        start_meter_attempt,
+    };
+    use crate::store::migrate::run_migrations;
+    use crate::store::migrations::registry;
+    use crate::store::sample_run::{SampleRunId, Trigger, start_sample_run};
+    use crate::store::sampling_policy_snapshot::{
+        ResolvedSamplingPolicy, SamplingPolicySnapshotId, resolve_policy_snapshot,
+    };
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aub-meter-coverage-query-test-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
+        ordinary_cadence: MonotonicDuration::from_millis(300_000),
+        freshness_horizon: MonotonicDuration::from_millis(900_000),
+        reset_edge_policy: String::new(),
+        retry_backoff_policy: String::new(),
+        command_budget: MonotonicDuration::from_millis(60_000),
+        policy_algorithm_version: String::new(),
+    };
+
+    fn fixture() -> (
+        ScratchDir,
+        rusqlite::Connection,
+        SampleRunId,
+        AccountId,
+        SamplingPolicySnapshotId,
+    ) {
+        let scratch = ScratchDir::new();
+        let policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = open(
+            &scratch.path().join("meter.db"),
+            AccessMode::ReadWrite,
+            &policy,
+        )
+        .expect("fixture connection must open");
+        let clock_at =
+            |nanos: i64| crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
+        run_migrations(&mut conn, &registry(), None, &clock_at(9_000))
+            .expect("fixture migrations must apply");
+        let account = crate::store::account::observe_account(
+            &conn,
+            "test-provider",
+            "test-account",
+            UtcTimestamp::from_unix_nanos(10_000),
+        )
+        .expect("fixture account must insert");
+        let run = start_sample_run(
+            &conn,
+            Trigger::Manual,
+            UtcTimestamp::from_unix_nanos(10_000),
+            "test",
+        )
+        .expect("fixture sample run must insert");
+        let snapshot = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(10_000),
+            &POLICY,
+        )
+        .expect("fixture policy snapshot must insert");
+        (scratch, conn, run, account, snapshot)
+    }
+
+    fn started(
+        run: SampleRunId,
+        account: AccountId,
+        snapshot: SamplingPolicySnapshotId,
+        at: i64,
+    ) -> NewMeterAttempt {
+        NewMeterAttempt {
+            run_id: run,
+            account_id: account,
+            provider: "test-provider".into(),
+            request_started_at: UtcTimestamp::from_unix_nanos(at),
+            credential_context_id: None,
+            policy_snapshot_id: snapshot,
+            due_at: UtcTimestamp::from_unix_nanos(at),
+            due_reason: DueReason::OrdinaryCadence,
+            due_basis: None,
+            provider_contract_id: "endpoint-schema-v3".into(),
+            meter_semantics_id: "account-5h-v2".into(),
+        }
+    }
+
+    /// The coverage command's read returns exactly the account's attempts in
+    /// the interval, oldest first, each with the terminal outcome it carried,
+    /// and an open attempt reads as `None` rather than as a failure.
+    #[test]
+    fn coverage_attempts_read_the_interval_with_outcomes() {
+        let (_scratch, conn, run, account, snapshot) = fixture();
+        let success = start_meter_attempt(&conn, &started(run, account, snapshot, 1_000))
+            .expect("first attempt must insert");
+        let auth = start_meter_attempt(&conn, &started(run, account, snapshot, 2_000))
+            .expect("second attempt must insert");
+        let rate_limited = start_meter_attempt(&conn, &started(run, account, snapshot, 3_000))
+            .expect("third attempt must insert");
+        let _open = start_meter_attempt(&conn, &started(run, account, snapshot, 4_000))
+            .expect("fourth attempt must insert");
+        let _outside = start_meter_attempt(&conn, &started(run, account, snapshot, 9_000))
+            .expect("fifth attempt must insert");
+
+        for (row, result) in [
+            (success, UtcTimestamp::from_unix_nanos(1_500)),
+            (auth, UtcTimestamp::from_unix_nanos(2_500)),
+            (rate_limited, UtcTimestamp::from_unix_nanos(3_500)),
+        ] {
+            record_meter_attempt_result(
+                &conn,
+                &NewMeterAttemptResult {
+                    attempt_id: row,
+                    completed_at: result,
+                    elapsed: MonotonicDuration::from_millis(100),
+                    outcome: match row {
+                        _ if row == success => AttemptOutcome::Success,
+                        _ if row == auth => AttemptOutcome::AuthRequired,
+                        _ => AttemptOutcome::Unreachable(FailureClass::RateLimited {
+                            retry_after: Some(MonotonicDuration::from_seconds(60)),
+                        }),
+                    },
+                    sanitized_error_classification: None,
+                    retry_index: None,
+                    clock_anomaly: false,
+                },
+            )
+            .expect("the result must insert");
+        }
+
+        let rows = attempts_with_outcomes_for_account_between(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(1_000),
+            UtcTimestamp::from_unix_nanos(5_000),
+        )
+        .expect("the coverage read must succeed");
+        assert_eq!(
+            rows.len(),
+            4,
+            "the interval is half-open: the fifth attempt stays out"
+        );
+        assert_eq!(rows[0].started_at, UtcTimestamp::from_unix_nanos(1_000));
+        let first_terminal = rows[0]
+            .terminal
+            .as_ref()
+            .expect("the success carries a result");
+        assert_eq!(first_terminal.outcome, AttemptOutcome::Success);
+        assert_eq!(first_terminal.retry_after, None);
+        assert_eq!(
+            rows[1]
+                .terminal
+                .as_ref()
+                .expect("the auth failure carries a result")
+                .outcome,
+            AttemptOutcome::AuthRequired
+        );
+        let rate = rows[2]
+            .terminal
+            .as_ref()
+            .expect("the rate limit carries a result");
+        assert_eq!(
+            rate.outcome,
+            AttemptOutcome::Unreachable(FailureClass::RateLimited {
+                retry_after: Some(MonotonicDuration::from_seconds(60)),
+            })
+        );
+        assert_eq!(
+            rate.retry_after,
+            Some(MonotonicDuration::from_seconds(60)),
+            "the stored Retry-After rides along for the engine's postponement math"
+        );
+        assert_eq!(
+            rows[3].terminal, None,
+            "an open attempt is the interruption state, not a failure"
+        );
+
+        // The planted negative: the query filters, it does not list. A window
+        // that holds nothing returns nothing rather than every row.
+        let empty = attempts_with_outcomes_for_account_between(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(6_000),
+            UtcTimestamp::from_unix_nanos(7_000),
+        )
+        .expect("the empty-window read must succeed");
+        assert!(empty.is_empty(), "an interval with no attempts reads empty");
     }
 }

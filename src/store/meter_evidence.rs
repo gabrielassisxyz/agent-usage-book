@@ -24,7 +24,7 @@ use rusqlite::{OptionalExtension, params};
 
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::rows::RowCount;
-use crate::domain::time::{MeasurementBasis, UtcTimestamp};
+use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
     WindowSemanticKey,
@@ -363,7 +363,7 @@ pub fn insert_observation(
 /// a replay that duplicated an observation would make the recovered series a
 /// different series than the one that was lost, and the difference would be
 /// invisible in any smaller check (PLAN.md section 38, step 6).
-pub fn count_observations(conn: &rusqlite::Connection) -> Result<RowCount, Error> {
+pub fn observation_row_count(conn: &rusqlite::Connection) -> Result<RowCount, Error> {
     let count: i64 = conn
         .query_row("SELECT COUNT(*) FROM meter_observation", [], |row| {
             row.get(0)
@@ -543,6 +543,16 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
     })
 }
 
+/// The number of meter observation rows in the database. The read-back
+/// surface for the batch cardinality contract: a batch with one measured
+/// reading among several attempts persists exactly one observation.
+pub fn count_meter_observations(conn: &rusqlite::Connection) -> Result<u64, Error> {
+    conn.query_row("SELECT count(*) FROM meter_observation", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| Error::Store(format!("cannot count meter observations: {e}")))
+}
+
 /// Reads every window row of one observation, in insertion order.
 pub fn windows_by_observation(
     conn: &rusqlite::Connection,
@@ -558,6 +568,124 @@ pub fn windows_by_observation(
         .map_err(|e| Error::Store(format!("cannot list meter windows: {e}")))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|e| Error::Store(format!("cannot read meter windows: {e}")))
+}
+
+/// Reads the newest observation recorded for any attempt of `account_id`,
+/// newest by rowid: insertion order is attempt order, so the newest row is
+/// the previous observation the due decision reads reset timestamps from.
+pub fn newest_observation_for_account(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+) -> Result<Option<StoredMeterObservation>, Error> {
+    conn.query_row(
+        "SELECT meter_observation.id AS id,
+                    meter_observation.attempt_id AS attempt_id,
+                    meter_observation.evidence_id AS evidence_id,
+                    meter_observation.account_id AS account_id,
+                    meter_observation.provider AS provider,
+                    meter_observation.provider_observed_at AS provider_observed_at,
+                    meter_observation.received_at AS received_at,
+                    meter_observation.measurement_basis AS measurement_basis,
+                    meter_observation.observed_plan AS observed_plan,
+                    meter_observation.observed_tier AS observed_tier,
+                    meter_observation.adapter_version AS adapter_version,
+                    meter_observation.provider_contract_id AS provider_contract_id,
+                    meter_observation.meter_semantics_id AS meter_semantics_id,
+                    meter_observation.normalized_fingerprint AS normalized_fingerprint
+             FROM meter_observation
+             JOIN meter_attempt ON meter_attempt.id = meter_observation.attempt_id
+             WHERE meter_attempt.account_id = ?1
+             ORDER BY meter_observation.id DESC LIMIT 1",
+        params![account_id.value()],
+        row_to_observation,
+    )
+    .optional()
+    .map_err(|e| {
+        Error::Store(format!(
+            "cannot read the newest observation for the account: {e}"
+        ))
+    })
+}
+
+/// One known quota reset instant, with the nominal length of the window that
+/// reported it. The coverage command's detail rendering names this length when
+/// an account lost the peak of a window to a blind gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StoredResetWindow {
+    pub at: UtcTimestamp,
+    pub nominal_duration: MonotonicDuration,
+}
+
+/// Every successful observation's received instant for one account in
+/// `[start, end)`, oldest first. The measurement side of the coverage
+/// command's read: successful observations are the numerator of measurement
+/// coverage (aub-me5.9).
+pub fn observation_times_for_account_between(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+) -> Result<Vec<UtcTimestamp>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT received_at FROM meter_observation
+             WHERE account_id = ?1 AND received_at >= ?2 AND received_at < ?3
+             ORDER BY received_at",
+        )
+        .map_err(|e| Error::Store(format!("cannot read coverage observations: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![account_id.value(), start.unix_nanos(), end.unix_nanos()],
+            |row| row.get::<_, i64>(0).map(UtcTimestamp::from_unix_nanos),
+        )
+        .map_err(|e| Error::Store(format!("cannot read coverage observations: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read coverage observations: {e}")))
+}
+
+/// Every known quota reset for one account whose reset instant falls in
+/// `[start, end)`, deduplicated by instant: two windows of one observation can
+/// report the same reset, and that is one reset event, not two. When the
+/// duplicates disagree on the window's nominal length the longest reported
+/// value is kept, which is the conservative one for a lost peak.
+pub fn reset_windows_for_account_between(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+) -> Result<Vec<StoredResetWindow>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT mw.resets_at, MAX(mw.nominal_duration_nanos)
+             FROM meter_window mw
+             JOIN meter_observation mo ON mo.id = mw.observation_id
+             WHERE mo.account_id = ?1
+               AND mw.resets_at >= ?2 AND mw.resets_at < ?3
+             GROUP BY mw.resets_at
+             ORDER BY mw.resets_at",
+        )
+        .map_err(|e| Error::Store(format!("cannot read coverage resets: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![account_id.value(), start.unix_nanos(), end.unix_nanos()],
+            |row| {
+                Ok(StoredResetWindow {
+                    at: UtcTimestamp::from_unix_nanos(row.get::<_, i64>(0)?),
+                    nominal_duration: MonotonicDuration::from_nanos(row.get::<_, i64>(1)? as u64),
+                })
+            },
+        )
+        .map_err(|e| Error::Store(format!("cannot read coverage resets: {e}")))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read coverage resets: {e}")))
+}
+
+/// Counts how many observation rows exist in the database.
+pub fn count_observations(conn: &rusqlite::Connection) -> Result<u64, Error> {
+    conn.query_row("SELECT count(*) FROM meter_observation", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| Error::Store(format!("cannot count meter observations: {e}")))
 }
 
 /// The one current interpretation of an evidence row under a semantics
@@ -897,6 +1025,68 @@ mod tests {
         );
     }
 
+    /// The newest observation for an account is the last one recorded for any
+    /// of its attempts, and an account with no observation reads as `None`.
+    #[test]
+    fn newest_observation_for_account_reads_the_latest_and_none_before_any() {
+        let (_scratch, conn, run, account, snapshot, attempt) = fixture();
+        assert_eq!(
+            newest_observation_for_account(&conn, account).expect("the read must succeed"),
+            None,
+            "an account with no observation has no newest observation"
+        );
+
+        let evidence_id =
+            insert_response_evidence(&conn, &evidence(attempt)).expect("the evidence must insert");
+        let first = insert_observation(
+            &conn,
+            &observation(attempt, evidence_id, account, "semantics-v1", "fp-first"),
+        )
+        .expect("the first observation must insert");
+
+        // A second attempt for the same account, with its own observation.
+        let second_attempt = start_meter_attempt(
+            &conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "test-provider".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(40_000),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(39_000),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "account-5h-v2".into(),
+            },
+        )
+        .expect("the second attempt must insert");
+        let second_evidence_id = insert_response_evidence(&conn, &evidence(second_attempt))
+            .expect("the second evidence must insert");
+        let second = insert_observation(
+            &conn,
+            &observation(
+                second_attempt,
+                second_evidence_id,
+                account,
+                "semantics-v1",
+                "fp-second",
+            ),
+        )
+        .expect("the second observation must insert");
+
+        let newest = newest_observation_for_account(&conn, account)
+            .expect("the read must succeed")
+            .expect("the account has observations");
+        assert_eq!(
+            newest.row_id, second,
+            "the newest observation is the last one recorded, not the first"
+        );
+        assert_eq!(newest.normalized_fingerprint, "fp-second");
+        let _ = first;
+    }
+
     /// Direct SQL `UPDATE` and `DELETE` against every irreplaceable table
     /// owned here fail through the database triggers.
     #[test]
@@ -1004,6 +1194,85 @@ mod tests {
         assert_eq!(
             windows[0].quantization,
             QuantizationSemantics::RoundedToNearest
+        );
+    }
+
+    /// Observation times read from the interval: oldest first, half-open at
+    /// both ends.
+    #[test]
+    fn observation_times_read_the_interval_half_open() {
+        let (_scratch, conn, _run, account, _snapshot, attempt) = fixture();
+        let evidence_row = insert_response_evidence(&conn, &evidence(attempt))
+            .expect("fixture evidence must insert");
+        let mut recorded = observation(attempt, evidence_row, account, "account-5h-v2", "fp-1");
+        recorded.received_at = UtcTimestamp::from_unix_nanos(31_000);
+        let _first =
+            insert_observation(&conn, &recorded).expect("the first observation must insert");
+
+        let mut later = observation(attempt, evidence_row, account, "account-5h-v2", "fp-2");
+        later.received_at = UtcTimestamp::from_unix_nanos(32_000);
+        let _second =
+            insert_observation(&conn, &later).expect("the second observation must insert");
+
+        let times = observation_times_for_account_between(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(31_000),
+            UtcTimestamp::from_unix_nanos(32_000),
+        )
+        .expect("the coverage read must succeed");
+        assert_eq!(
+            times,
+            vec![UtcTimestamp::from_unix_nanos(31_000)],
+            "the interval is half-open: the 32_000 observation stays out"
+        );
+    }
+
+    /// Reset instants deduplicate by instant, keep the longest reported window
+    /// length, and respect the half-open interval on both ends.
+    #[test]
+    fn reset_windows_deduplicate_by_instant_and_keep_the_longest_window() {
+        let (_scratch, conn, _run, account, _snapshot, attempt) = fixture();
+        let evidence_row = insert_response_evidence(&conn, &evidence(attempt))
+            .expect("fixture evidence must insert");
+        let mut recorded = observation(attempt, evidence_row, account, "account-5h-v2", "fp-1");
+        recorded.received_at = UtcTimestamp::from_unix_nanos(31_000);
+        let observation_row =
+            insert_observation(&conn, &recorded).expect("the observation must insert");
+
+        // Two window rows reporting the same reset instant with different
+        // nominal lengths, plus one outside the interval on each side.
+        for (resets_at, nominal) in [
+            (30_000i64, 3_600_000_000_000i64),
+            (40_000, 18_000_000_000_000),
+            (40_000, 14_400_000_000_000),
+            (50_000, 18_000_000_000_000),
+        ] {
+            insert_window(
+                &conn,
+                &NewMeterWindow {
+                    resets_at: UtcTimestamp::from_unix_nanos(resets_at),
+                    nominal_duration: NominalWindowDuration::from_nanos(nominal as u64),
+                    ..window(observation_row, 410_000)
+                },
+            )
+            .expect("the window must insert");
+        }
+
+        let resets = reset_windows_for_account_between(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(31_000),
+            UtcTimestamp::from_unix_nanos(45_000),
+        )
+        .expect("the coverage read must succeed");
+        assert_eq!(
+            resets,
+            vec![StoredResetWindow {
+                at: UtcTimestamp::from_unix_nanos(40_000),
+                nominal_duration: MonotonicDuration::from_nanos(18_000_000_000_000),
+            }],
+            "one reset event at 40_000, deduplicated, keeping the longest window"
         );
     }
 }
