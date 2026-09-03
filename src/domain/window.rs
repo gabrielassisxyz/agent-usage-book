@@ -74,7 +74,7 @@ impl WindowScope {
         }
     }
 
-    fn constrains(&self, model: &ModelId) -> bool {
+    pub fn constrains(&self, model: &ModelId) -> bool {
         match self {
             Self::AccountWide => true,
             Self::ModelSpecific(scoped_model) => scoped_model == model,
@@ -194,11 +194,11 @@ impl MeterWindow {
         self.quota_used.complement()
     }
 
-    fn constrains(&self, model: &ModelId) -> bool {
+    pub fn constrains(&self, model: &ModelId) -> bool {
         self.scope.constrains(model)
     }
 
-    fn remaining_percentage_points(&self) -> PercentagePoints {
+    pub fn remaining_percentage_points(&self) -> PercentagePoints {
         self.remaining_fraction().as_ppm() - zero_fraction()
     }
 }
