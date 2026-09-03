@@ -89,6 +89,53 @@ fn window(used_ppm: i32) -> String {
     )
 }
 
+fn weekly_window(used_ppm: i32, model: &str) -> String {
+    format!(
+        r#"{{"semantic_key":"weekly","scope_kind":"model_specific","scoped_model":"{model}","quota_used_ppm":{used_ppm},"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{}}}"#,
+        now_nanos() + 3600 * NANOS_PER_SECOND,
+        7 * 86_400 * NANOS_PER_SECOND
+    )
+}
+
+fn projection_document(windows: &str, received: i64, outcome: &str, completed: i64) -> String {
+    let failure = if outcome == "unreachable" {
+        "transport_timeout"
+    } else {
+        "null"
+    };
+    serde_json::json!({
+        "schema_version": 1,
+        "ledger_generation": 12,
+        "accounts": [{
+            "account_id": 1,
+            "logical_name": "work-primary",
+            "provider": "anthropic",
+            "last_successful_observation": {
+                "observation_id": 7,
+                "provider_observed_at_nanos": received,
+                "received_at_nanos": received,
+                "measurement_basis": "provider_observed",
+                "windows": serde_json::from_str::<serde_json::Value>(
+                    &format!("[{windows}]"),
+                )
+                .expect("windows must be a JSON array"),
+            },
+            "latest_attempt": {
+                "attempt_id": 9,
+                "request_started_at_nanos": received,
+                "credential_context_id": "ctx",
+                "result": {
+                    "completed_at_nanos": completed,
+                    "outcome": outcome,
+                    "failure_class": serde_json::from_str::<serde_json::Value>(failure)
+                        .expect("failure class must be JSON"),
+                },
+            },
+        }],
+    })
+    .to_string()
+}
+
 fn projection_body(
     observation: Option<(i32, i64)>,
     attempt: Option<(&str, Option<i64>)>,
@@ -321,21 +368,10 @@ fn account_selector_renders_one_account() {
 fn model_selector_excludes_unrelated_model_windows() {
     let env = Environment::new("model-selector");
     let received = now_nanos() - 41 * NANOS_PER_SECOND;
-    let body = format!(
-        r#"{{"schema_version":1,"ledger_generation":12,"accounts":[{{"account_id":1,"logical_name":"work-primary","provider":"anthropic","last_successful_observation":{{"observation_id":7,"provider_observed_at_nanos":{received},"received_at_nanos":{received},"measurement_basis":"provider_observed","windows":[{wide},{scoped},{unrelated}]}},"latest_attempt":{{"attempt_id":9,"request_started_at_nanos":{received},"credential_context_id":"ctx","result":{{"completed_at_nanos":{received},"outcome":"success","failure_class":null}}}}}}]}}"#,
-        received = received,
-        wide = window(500_000),
-        scoped = format!(
-            r#"{{"semantic_key":"weekly","scope_kind":"model_specific","scoped_model":"claude-model-x","quota_used_ppm":700000,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{}}}"#,
-            now_nanos() + 3600 * NANOS_PER_SECOND,
-            7 * 86_400 * NANOS_PER_SECOND
-        ),
-        unrelated = format!(
-            r#"{{"semantic_key":"weekly","scope_kind":"model_specific","scoped_model":"claude-model-y","quota_used_ppm":950000,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{}}}"#,
-            now_nanos() + 3600 * NANOS_PER_SECOND,
-            7 * 86_400 * NANOS_PER_SECOND
-        ),
-    );
+    let scoped = weekly_window(700_000, "claude-model-x");
+    let unrelated = weekly_window(950_000, "claude-model-y");
+    let windows = [window(500_000), scoped, unrelated].join(",");
+    let body = projection_document(&windows, received, "success", received);
     env.write_projection(&body);
 
     // Without a selector every window applies, so the unrelated model's 95%
@@ -422,16 +458,9 @@ fn json_emits_exactly_one_freshness_variant_per_account() {
 fn json_identifies_the_selected_model_and_included_scopes() {
     let env = Environment::new("json-selector");
     let received = now_nanos() - 41 * NANOS_PER_SECOND;
-    let body = format!(
-        r#"{{"schema_version":1,"ledger_generation":12,"accounts":[{{"account_id":1,"logical_name":"work-primary","provider":"anthropic","last_successful_observation":{{"observation_id":7,"provider_observed_at_nanos":{received},"received_at_nanos":{received},"measurement_basis":"provider_observed","windows":[{wide},{scoped}]}},"latest_attempt":{{"attempt_id":9,"request_started_at_nanos":{received},"credential_context_id":"ctx","result":{{"completed_at_nanos":{received},"outcome":"success","failure_class":null}}}}}}]}}"#,
-        received = received,
-        wide = window(500_000),
-        scoped = format!(
-            r#"{{"semantic_key":"weekly","scope_kind":"model_specific","scoped_model":"claude-model-x","quota_used_ppm":700000,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{}}}"#,
-            now_nanos() + 3600 * NANOS_PER_SECOND,
-            7 * 86_400 * NANOS_PER_SECOND
-        ),
-    );
+    let scoped = weekly_window(700_000, "claude-model-x");
+    let windows = [window(500_000), scoped].join(",");
+    let body = projection_document(&windows, received, "success", received);
     env.write_projection(&body);
     let (code, stdout, _) = env.run(&["status", "--model", "claude-model-x", "--format", "json"]);
     assert_eq!(code, 0);

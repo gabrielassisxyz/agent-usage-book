@@ -420,30 +420,29 @@ pub fn account_reading(
     let mut limiting_window: Option<LimitingWindowRef> = None;
     let mut included_scopes: Vec<WindowScope> = Vec::new();
 
-    if let Some(account) = projected {
-        if let Some(success) = &account.last_successful_observation {
-            let applicable = applicable_windows(&success.windows, model);
-            for window in &applicable {
-                if !included_scopes.contains(&window.scope) {
-                    included_scopes.push(window.scope.clone());
-                }
+    let success = projected.and_then(|account| account.last_successful_observation.as_ref());
+    if let Some(success) = success {
+        let applicable = applicable_windows(&success.windows, model);
+        for window in &applicable {
+            if !included_scopes.contains(&window.scope) {
+                included_scopes.push(window.scope.clone());
             }
-            if let Some(limit) = applicable
-                .iter()
-                .max_by_key(|window| window.quota_used_ppm.as_ppm().get())
-            {
-                let remaining: QuotaRemaining = limit.quota_used_ppm.complement();
-                last_good = Some(Observed::new(
-                    remaining,
-                    success.provider_observed_at.map(ProviderObservedAt::new),
-                    ReceivedAt::new(success.received_at),
-                    success.measurement_basis,
-                ));
-                limiting_window = Some(LimitingWindowRef {
-                    scope: limit.scope.clone(),
-                    nominal_duration: limit.nominal_duration_nanos,
-                });
-            }
+        }
+        if let Some(limit) = applicable
+            .iter()
+            .max_by_key(|window| window.quota_used_ppm.as_ppm().get())
+        {
+            let remaining: QuotaRemaining = limit.quota_used_ppm.complement();
+            last_good = Some(Observed::new(
+                remaining,
+                success.provider_observed_at.map(ProviderObservedAt::new),
+                ReceivedAt::new(success.received_at),
+                success.measurement_basis,
+            ));
+            limiting_window = Some(LimitingWindowRef {
+                scope: limit.scope.clone(),
+                nominal_duration: limit.nominal_duration_nanos,
+            });
         }
     }
 
@@ -701,8 +700,8 @@ mod read_tests {
     use crate::domain::time::MeasurementBasis;
     use crate::domain::window::{QuantizationSemantics, ReportedResolution};
     use crate::projection::{
-        LatestAttempt, PROJECTION_FILE_NAME, PROJECTION_SCHEMA_VERSION, ProjectedAccount,
-        ProjectedWindow, Projection, SuccessfulObservation, TerminalOutcome, recorded_generation,
+        LatestAttempt, PROJECTION_SCHEMA_VERSION, ProjectedAccount, ProjectedWindow, Projection,
+        SuccessfulObservation, TerminalOutcome, recorded_generation,
     };
     use crate::store::account::AccountId;
     use crate::store::meter_evidence::ObservationRowId;

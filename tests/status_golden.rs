@@ -431,7 +431,7 @@ fn an_unreadable_projection_file_renders_the_question_mark_at_the_path() {
     let path = scratch.join("projection");
     std::fs::write(
         &path,
-        format!("{{\"schema_version\":99,\"ledger_generation\":1,\"accounts\":[]}}"),
+        "{\"schema_version\":99,\"ledger_generation\":1,\"accounts\":[]}",
     )
     .unwrap();
 

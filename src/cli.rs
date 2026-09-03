@@ -1092,12 +1092,12 @@ fn status(
     // The account selector names a configured account, so an unknown name is
     // an argument error, reported through the typed usage condition rather
     // than through the zero-exit display path.
-    if let Some(name) = account_selector {
-        if !config.accounts.iter().any(|account| account.name == name) {
-            return Err(Error::Usage(format!(
-                "unknown account '{name}': status --account names a configured account"
-            )));
-        }
+    if let Some(name) = account_selector
+        && !config.accounts.iter().any(|account| account.name == name)
+    {
+        return Err(Error::Usage(format!(
+            "unknown account '{name}': status --account names a configured account"
+        )));
     }
 
     let projection_path = crate::projection::projection_path_in(&config.state.dir);
