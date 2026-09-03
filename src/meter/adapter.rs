@@ -25,6 +25,7 @@ use crate::domain::failure::{AuthReason, FailureClass};
 use crate::domain::ids::{MeterSemanticsId, ProviderContractId};
 use crate::domain::time::{Clock, MeasurementBasis};
 use crate::domain::window::ModelId;
+use crate::meter::evidence::CapturedProviderResponse;
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 
 /// The authentication material an adapter authenticates a request with.
@@ -201,6 +202,21 @@ pub trait ProviderAdapter {
         transport: &impl HttpTransport,
         clock: &impl Clock,
     ) -> ProviderObservation<Self::Reading>;
+
+    /// One observation attempt with response evidence captured before the
+    /// adapter interprets it. Adapters without a response capsule keep the
+    /// legacy semantic result; response-capturing adapters override this seam.
+    fn observe_with_evidence(
+        &self,
+        credential: &CredentialHandle,
+        request: &MeterRequest,
+        transport: &impl HttpTransport,
+        clock: &impl Clock,
+    ) -> CapturedProviderResponse<Self::Reading> {
+        CapturedProviderResponse::without_response(
+            self.observe(credential, request, transport, clock),
+        )
+    }
 }
 
 #[cfg(test)]

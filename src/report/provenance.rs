@@ -58,6 +58,34 @@ pub enum ReportField {
     CalibrationTokens,
 }
 
+impl ReportField {
+    /// The canonical field label.
+    pub fn label(&self) -> String {
+        match self {
+            ReportField::MeterQuotaRemaining { account } => {
+                format!("meter_quota_remaining[{}]", account.as_str())
+            }
+            ReportField::SpendGroupTokens { key } => {
+                format!("spend_group_tokens[{}]", key.as_str())
+            }
+            ReportField::CoverageCompleteness => "coverage_completeness".to_string(),
+            ReportField::ExportRows => "export_rows".to_string(),
+            ReportField::CalibrationTokens => "calibration_tokens".to_string(),
+        }
+    }
+
+    /// The associated account or attribution key for this field.
+    pub fn account_attribution(&self) -> &str {
+        match self {
+            ReportField::MeterQuotaRemaining { account } => account.as_str(),
+            ReportField::SpendGroupTokens { key } => key.as_str(),
+            ReportField::CoverageCompleteness => "all",
+            ReportField::ExportRows => "export",
+            ReportField::CalibrationTokens => "calibration",
+        }
+    }
+}
+
 /// The arithmetic or conversion sequence that produced a value.
 ///
 /// `--explain` renders this so the reader sees whether a number was read,
@@ -74,6 +102,20 @@ pub enum ValueArithmetic {
     Converted { from: Unit, to: Unit },
 }
 
+impl ValueArithmetic {
+    /// The canonical label for the arithmetic operation.
+    pub fn label(&self) -> String {
+        match self {
+            ValueArithmetic::Direct => "direct".to_string(),
+            ValueArithmetic::Sum => "sum".to_string(),
+            ValueArithmetic::Count => "count".to_string(),
+            ValueArithmetic::Converted { from, to } => {
+                format!("converted from {} to {}", from.label(), to.label())
+            }
+        }
+    }
+}
+
 /// A unit a value can be expressed in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unit {
@@ -81,6 +123,18 @@ pub enum Unit {
     Cost,
     Credits,
     QuotaFraction,
+}
+
+impl Unit {
+    /// The unit identifier string.
+    pub fn label(self) -> &'static str {
+        match self {
+            Unit::Tokens => "tokens",
+            Unit::Cost => "cost",
+            Unit::Credits => "credits",
+            Unit::QuotaFraction => "quota_fraction",
+        }
+    }
 }
 
 /// A provenance node: the manifest, the canonical member set the manifest
