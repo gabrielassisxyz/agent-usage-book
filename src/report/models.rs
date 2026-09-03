@@ -7,13 +7,16 @@
 
 use std::collections::BTreeMap;
 
+use crate::config::CoverageFloor;
+use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
 use crate::domain::freshness::Freshness;
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
-use crate::domain::time::{UtcDate, UtcTimestamp};
+use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
-use crate::evidence::{CoverageCompleteness, Derivation, Provenance};
+use crate::domain::window::{ModelId, NominalWindowDuration, WindowScope};
+use crate::evidence::{Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
@@ -90,12 +93,63 @@ impl ReportMetadata {
 pub struct MeterAccount {
     pub account: LogicalName,
     pub reading: Freshness<QuotaRemaining>,
+    /// The window whose remaining fraction the reading reports, when the
+    /// reading was computed from a projection's windows. A reading without one
+    /// has no window to name, and the renderer shows the value bare.
+    pub limiting_window: Option<LimitingWindow>,
+    /// Every window scope included in the reading, when the reading came from
+    /// a projection; empty for a reading with no window context.
+    pub included_scopes: Vec<WindowScope>,
+    /// The model a `--model` selector chose, reported so the output identifies
+    /// the selection the reading was computed under.
+    pub selected_model: Option<ModelId>,
 }
 
 impl MeterAccount {
     pub fn new(account: LogicalName, reading: Freshness<QuotaRemaining>) -> Self {
-        Self { account, reading }
+        Self {
+            account,
+            reading,
+            limiting_window: None,
+            included_scopes: Vec::new(),
+            selected_model: None,
+        }
     }
+
+    /// A reading computed from a projection: it names the window it is limited
+    /// by, the scopes it included and the model selector it was computed under.
+    pub fn from_projection(
+        account: LogicalName,
+        reading: Freshness<QuotaRemaining>,
+        limiting_window: Option<LimitingWindow>,
+        included_scopes: Vec<WindowScope>,
+        selected_model: Option<ModelId>,
+    ) -> Self {
+        Self {
+            account,
+            reading,
+            limiting_window,
+            included_scopes,
+            selected_model,
+        }
+    }
+}
+
+/// The window behind a reading: its scope and the nominal length the design's
+/// fresh rendering shows beside the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LimitingWindow {
+    pub scope: WindowScope,
+    pub nominal_duration: NominalWindowDuration,
+}
+
+/// Whether the status command could read the projection, and why not when it
+/// could not. A report whose projection is unavailable carries no readings:
+/// the fact travels here instead of as a fabricated account value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProjectionReadState {
+    Read,
+    Unavailable { state: &'static str, reason: String },
 }
 
 /// Provenance material for one account's meter reading.
@@ -115,11 +169,14 @@ impl MeterReadingProvenance {
 }
 
 /// The status projection: the current compact meter picture.
+/// The status projection: the current compact meter picture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub metadata: ReportMetadata,
     pub accounts: Vec<MeterAccount>,
     pub provenance: ProvenanceGraph,
+    /// Whether the projection behind every reading could be read.
+    pub projection_state: ProjectionReadState,
 }
 
 impl StatusReport {
@@ -127,6 +184,7 @@ impl StatusReport {
         metadata: ReportMetadata,
         accounts: Vec<MeterAccount>,
         readings: Vec<MeterReadingProvenance>,
+        projection_state: ProjectionReadState,
     ) -> Self {
         let provenance = ProvenanceGraph::new(readings.into_iter().map(|reading| {
             (
@@ -140,6 +198,7 @@ impl StatusReport {
             metadata,
             accounts,
             provenance,
+            projection_state,
         }
     }
 }
@@ -285,29 +344,121 @@ impl SpendReport {
     }
 }
 
-/// The coverage report for `aub coverage`: expected-versus-observed sampling
-/// opportunities and the threshold verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// The coverage report for `aub coverage`: one row per covered account over
+/// the report's interval, the failure classes behind each account's numbers,
+/// and the threshold verdict over exactly the accounts the report shows.
+///
+/// Each account's numbers arrive in [`CoverageAccount`] as the coverage
+/// engine's own output. The engine's `Option` fields and `CoverageFraction`
+/// carry the refusal semantics (no policy snapshot in force, a zero
+/// denominator, no terminal attempt) into both renderings, so neither can
+/// invent a number where the engine refused one, and the renderer holds no
+/// quantity it could recompute.
+#[derive(Debug, Clone, PartialEq)]
 pub struct CoverageReport {
     pub metadata: ReportMetadata,
-    pub coverage: CoverageCompleteness,
-    pub threshold_met: bool,
+    /// The half-open interval `[since, until)` the report covers, in UTC.
+    pub since: UtcTimestamp,
+    pub until: UtcTimestamp,
+    /// Whether the command line asked for severe accounts only.
+    pub severe_only: bool,
+    /// The configured floors and the verdict over the accounts in this report.
+    pub threshold: CoverageThreshold,
+    /// One row per covered account, in the order the report covers them.
+    pub accounts: Vec<CoverageAccount>,
     pub provenance: ProvenanceGraph,
 }
 
 impl CoverageReport {
     pub fn new(
         metadata: ReportMetadata,
-        coverage: CoverageCompleteness,
-        threshold_met: bool,
-        node: ProvenanceNode,
+        since: UtcTimestamp,
+        until: UtcTimestamp,
+        severe_only: bool,
+        threshold: CoverageThreshold,
+        accounts: Vec<CoverageAccount>,
     ) -> Self {
-        let provenance = ProvenanceGraph::new([(ReportField::CoverageCompleteness, node)]);
+        let provenance = ProvenanceGraph::new(accounts.iter().map(|account| {
+            (
+                ReportField::Coverage {
+                    account: account.name.clone(),
+                },
+                account.provenance.clone(),
+            )
+        }));
         Self {
             metadata,
-            coverage,
-            threshold_met,
+            since,
+            until,
+            severe_only,
+            threshold,
+            accounts,
             provenance,
+        }
+    }
+}
+
+/// One account's coverage over the report's interval.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageAccount {
+    pub name: LogicalName,
+    /// The engine's own report over the interval.
+    pub engine: crate::coverage::CoverageReport,
+    /// Terminal failures grouped by the four classes PLAN.md section 15
+    /// distinguishes in measurement coverage.
+    pub failures: crate::report::coverage::CoverageFailureTally,
+    /// The known quota resets that fell inside a no-attempt gap, each with the
+    /// nominal length of the window that reported it.
+    pub resets_in_gaps: Vec<CoverageReset>,
+    /// The provenance node for this account's coverage quantities.
+    pub provenance: ProvenanceNode,
+}
+
+/// A known quota reset that fell inside a no-attempt gap, with the nominal
+/// length of the window that reported it. The window length is what the
+/// detail block names when the report says a reset was lost to a blind gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CoverageReset {
+    pub at: UtcTimestamp,
+    pub window_length: MonotonicDuration,
+}
+
+/// The configured floors and the verdict over the accounts the report covers.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageThreshold {
+    pub attempt_floor: CoverageFloor,
+    pub measurement_floor: CoverageFloor,
+    /// True when no account in this report breaches either floor. The
+    /// selectors are part of the verdict: only the accounts the report shows
+    /// are judged, so `--account` and `--severe` scope the exit decision to
+    /// exactly what the operator asked to see.
+    pub met: bool,
+    /// Every breach, in account order. Empty when `met`.
+    pub breaches: Vec<CoverageBreach>,
+}
+
+/// One floor breached by one account.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoverageBreach {
+    pub account: LogicalName,
+    pub dimension: CoverageBreachDimension,
+    pub coverage: CoverageFraction,
+    pub floor: CoverageFloor,
+}
+
+/// Which floor a breach is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CoverageBreachDimension {
+    Attempt,
+    Measurement,
+}
+
+impl CoverageBreachDimension {
+    /// The stable JSON key of this dimension.
+    pub fn key(self) -> &'static str {
+        match self {
+            CoverageBreachDimension::Attempt => "attempt",
+            CoverageBreachDimension::Measurement => "measurement",
         }
     }
 }
@@ -500,6 +651,7 @@ mod tests {
     use crate::domain::provenance::{EvidenceId, QuerySemantics, WitnessId};
     use crate::domain::quota::QuotaFractionPpm;
     use crate::domain::time::UtcTimestamp;
+    use crate::evidence::CoverageCompleteness;
     use crate::report::provenance::{ProvenanceNode, ReportField, ValueArithmetic};
 
     fn metadata() -> ReportMetadata {
@@ -546,6 +698,53 @@ mod tests {
             1,
             1,
             ValueArithmetic::Direct,
+        )
+    }
+
+    /// A canonical coverage report for tests: one account whose engine report
+    /// carries no numbers and whose graph resolves the account's field, so the
+    /// enumeration sweep can resolve every variant against a real model.
+    fn test_coverage_report(metadata: ReportMetadata) -> CoverageReport {
+        let name = LogicalName::new("research");
+        let node = ProvenanceNode::new(
+            [] as [EvidenceId; 0],
+            [] as [WitnessId; 0],
+            QuerySemantics::new("coverage", "interval"),
+            1,
+            0,
+            ValueArithmetic::Count,
+        );
+        CoverageReport::new(
+            metadata,
+            UtcTimestamp::from_unix_nanos(0),
+            UtcTimestamp::from_unix_nanos(1),
+            false,
+            CoverageThreshold {
+                attempt_floor: crate::config::CoverageFloor::new(0.98).unwrap(),
+                measurement_floor: crate::config::CoverageFloor::new(0.95).unwrap(),
+                met: true,
+                breaches: Vec::new(),
+            },
+            vec![CoverageAccount {
+                name: name.clone(),
+                engine: crate::coverage::CoverageReport {
+                    expected_opportunities: None,
+                    attempted_opportunities: 0,
+                    successful_observations: 0,
+                    started_without_terminal_result: 0,
+                    attempt_coverage: None,
+                    measurement_coverage: None,
+                    longest_no_attempt_gap: None,
+                    longest_no_observation_gap: None,
+                    reset_spanning_gaps: Vec::new(),
+                    most_recent_timer_run: None,
+                    most_recent_successful_observation: None,
+                    severe: false,
+                },
+                failures: crate::report::coverage::CoverageFailureTally::default(),
+                resets_in_gaps: Vec::new(),
+                provenance: node,
+            }],
         )
     }
 
@@ -602,6 +801,7 @@ mod tests {
                         LogicalName::new("work-a"),
                         node(),
                     )],
+                    crate::report::ProjectionReadState::Read,
                 )) as Box<dyn CarriesMetadata>,
             ),
             (
@@ -626,15 +826,7 @@ mod tests {
                     IngestSummary::default(),
                 )),
             ),
-            (
-                "coverage",
-                Box::new(CoverageReport::new(
-                    m.clone(),
-                    CoverageCompleteness::Complete,
-                    true,
-                    node(),
-                )),
-            ),
+            ("coverage", Box::new(test_coverage_report(m.clone()))),
             ("sample", Box::new(SampleReport::new(m.clone(), vec![]))),
             (
                 "ingest",
@@ -845,6 +1037,7 @@ mod tests {
                 LogicalName::new("work-a"),
                 node(),
             )],
+            crate::report::ProjectionReadState::Read,
         );
         let now = NowReport::new(
             m.clone(),
@@ -865,7 +1058,7 @@ mod tests {
             )],
             IngestSummary::default(),
         );
-        let coverage = CoverageReport::new(m.clone(), CoverageCompleteness::Complete, true, node());
+        let coverage = test_coverage_report(m.clone());
         let export = ExportReport::new(m.clone(), ExportKey::Run, true, vec![], 0, node());
         let calibrate = CalibrateReport::new(
             m.clone(),
@@ -885,7 +1078,9 @@ mod tests {
             ReportField::SpendGroupTokens {
                 key: LogicalName::new("by-day"),
             },
-            ReportField::CoverageCompleteness,
+            ReportField::Coverage {
+                account: LogicalName::new("research"),
+            },
             ReportField::ExportRows,
             ReportField::CalibrationTokens,
         ];
@@ -898,8 +1093,8 @@ mod tests {
                 ReportField::SpendGroupTokens { key } => {
                     assert!(spend.provenance.resolve(field).is_some(), "{key:?}");
                 }
-                ReportField::CoverageCompleteness => {
-                    assert!(coverage.provenance.resolve(field).is_some());
+                ReportField::Coverage { account } => {
+                    assert!(coverage.provenance.resolve(field).is_some(), "{account:?}");
                 }
                 ReportField::ExportRows => {
                     assert!(export.provenance.resolve(field).is_some());
@@ -937,7 +1132,12 @@ mod tests {
             },
         );
         // No provenance material: the constructor assembles an empty graph.
-        let report = StatusReport::new(m, vec![account], vec![]);
+        let report = StatusReport::new(
+            m,
+            vec![account],
+            vec![],
+            crate::report::ProjectionReadState::Read,
+        );
         assert!(
             report
                 .provenance

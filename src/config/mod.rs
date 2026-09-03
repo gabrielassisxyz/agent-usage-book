@@ -158,6 +158,14 @@ impl CoverageFloor {
     pub fn get(self) -> f64 {
         self.0
     }
+
+    /// The floor in parts per million, rounded half-up. The named conversion
+    /// from the configured fraction to the unit the rest of this project
+    /// expresses fractions in, so the JSON contract carries the floor in the
+    /// same unit as the coverages it judges.
+    pub fn as_ppm(self) -> u32 {
+        (self.0 * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
+    }
 }
 
 #[derive(Debug, Clone)]

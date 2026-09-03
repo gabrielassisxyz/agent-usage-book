@@ -1,0 +1,77 @@
+# Forbidden-pattern list (aub-n27.4)
+#
+# Credential-shaped and identity-shaped substrings that must never appear in a
+# committed transcript fixture, a release binary, or persisted meter evidence.
+# This is the single source every scan reads:
+#
+#   - the transcript fixture corpus audit (tests/fixture_corpus_audit.rs)
+#   - the parser's own fixture-directory scan (src/transcripts/native.rs)
+#   - the release-binary identity and privacy scan (bin/checks/)
+#   - the full-sampling-run credential test against the synthetic adapter
+#     (tests/identity_privacy_scan.rs)
+#
+# A pattern added here protects all four at once, and none of them keeps a
+# private copy of this list.
+#
+# Format: one pattern per line. A line starting with `#` is a comment and is
+# ignored. A blank line (zero characters) is ignored. Every other line is
+# taken verbatim, including trailing whitespace where a pattern needs it
+# (the "bearer " entry below carries a trailing space on purpose, to avoid
+# matching the ordinary English word "bearer"). Matching itself is a
+# case-insensitive substring test (test-support::sanitization::matched_patterns).
+#
+# An empty or missing list is a misconfiguration, not a clean bill of health:
+# the loader panics rather than let every scan pass with nothing to find.
+#
+# The release-binary scan reads only the patterns above the
+# "=== binary-scan patterns end here ===" marker below, never the full file.
+# The prefixes above it are unambiguous secret shapes: no legitimate program
+# string starts with "sk-ant-" or "AKIA" or contains "-----BEGIN", so finding
+# one in a binary's string table is always a real leak. The field-name and
+# identity patterns below the marker are the opposite kind of signal: they
+# are exactly what you would expect a real network client to contain
+# (an "Authorization" header name is not a leaked credential) or what any
+# nontrivial Rust binary's dependency closure incidentally contains (a stray
+# "@" in a vendored crate's license text, a "/home/" fragment in a panic
+# location string from a dependency built under the developer's own
+# $CARGO_HOME, which lives outside this project's own source and outside
+# this scan's blast radius). Confirmed while writing this scan: applying the
+# full list to an otherwise clean release binary reported "authorization",
+# "/home/" and "@" as findings on every single build, which is not a working
+# gate, it is a gate that never has anything left to say when something is
+# genuinely wrong. The fixture corpus audit and the full-sampling-run
+# database/spool scan both still read the whole file: a fixture or a stored
+# row is structured, narrow-context data where a bare "authorization" key or
+# a stray "@" is already suspicious on its own.
+
+# --- credential key and token prefixes ---
+sk-ant-
+sk-proj-
+sk-or-
+ghp_
+github_pat_
+glpat-
+AKIA
+xoxb-
+xoxp-
+-----BEGIN
+
+# === binary-scan patterns end here ===
+
+# --- credential field names and header values ---
+bearer 
+api_key
+apikey
+api-key
+authorization
+password
+secret
+access_token
+accesstoken
+refresh_token
+refreshtoken
+
+# --- identity: absolute home paths and account identifiers ---
+/home/
+/users/
+@

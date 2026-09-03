@@ -82,6 +82,7 @@ fn contract_status_json_matches_golden_fixture() {
             ),
         ],
         vec![],
+        agent_usage_book::report::ProjectionReadState::Read,
     );
 
     let generated_json = status_json(&report, test_run_id());

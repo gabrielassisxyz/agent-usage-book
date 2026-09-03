@@ -10,13 +10,14 @@ use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
-use crate::domain::time::{Age, ClockSkewEnvelope, UtcTimestamp, age};
+use crate::domain::time::{Age, ClockSkewEnvelope, MonotonicDuration, UtcTimestamp, age};
 use crate::domain::tokens::TokenKind;
+use crate::domain::window::NominalWindowDuration;
 use crate::error::Error;
 use crate::evidence::CoverageCompleteness;
-use crate::presentation::precision::{PERCENT, TOKENS};
+use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
-use crate::report::{ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
+use crate::report::{CoverageReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport};
 use crate::transcripts::TranscriptDriftReport;
 
 /// The explain level a command was asked for.
@@ -134,10 +135,34 @@ pub fn render_status_report_with_explain(
     envelope: ClockSkewEnvelope,
     explain: ExplainMode,
 ) -> String {
+    // A projection the status path could not read is the design's degraded
+    // form: the question mark, with a compact reason where the output mode
+    // permits. No account line is rendered, because no account value exists
+    // to render and none may be substituted.
+    if let crate::report::ProjectionReadState::Unavailable { state: _, reason } =
+        &report.projection_state
+    {
+        let mut line = String::from("aub ?");
+        if explain != ExplainMode::Off {
+            line.push_str(" · ");
+            line.push_str(reason);
+        }
+        return line;
+    }
     let mut lines: Vec<String> = Vec::with_capacity(report.accounts.len());
     for account in &report.accounts {
-        let reading = render_meter_reading(&account.reading, METER_UNIT, PERCENT, now, envelope);
-        lines.push(format!("{} {}", account.account.as_str(), reading));
+        let reading = render_meter_reading(
+            &account.reading,
+            METER_UNIT,
+            PERCENT,
+            now,
+            envelope,
+            account
+                .limiting_window
+                .as_ref()
+                .map(|limit| limit.nominal_duration),
+        );
+        lines.push(format!("aub {} {}", account.account.as_str(), reading));
     }
     let report_text = lines.join("\n");
     if explain == ExplainMode::Off {
@@ -471,14 +496,19 @@ pub fn render_meter_reading(
     precision: Precision,
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
+    limiting_window: Option<NominalWindowDuration>,
 ) -> String {
     match reading {
         Freshness::Fresh { observed, .. } => {
             let value = render_percentage(observed.value().as_ppm().get(), precision);
-            match observed_age(observed, now, envelope) {
-                Some(age) => format!("{value}{unit} left · {}", render_age(age)),
-                None => format!("{value}{unit} left"),
-            }
+            // The fresh line names the limiting window's nominal length, the
+            // suffix the design's example shows: "38% left · 5h". The window
+            // is part of the value's meaning, not of its freshness.
+            let window = limiting_window
+                .map(render_window_duration)
+                .map(|label| format!(" · {label}"))
+                .unwrap_or_default();
+            format!("{value}{unit} left{window}")
         }
         Freshness::Stale {
             last_good, reason, ..
@@ -535,6 +565,253 @@ pub fn render_stale_reason(reason: StaleReason) -> &'static str {
     }
 }
 
+/// Renders a duration the way the coverage table reads it: seconds, minutes,
+/// or hours and days with the remainder carried alongside ("9m", "2h 11m"),
+/// matching the worked example in PLAN.md section 49.
+fn render_coverage_duration(duration: MonotonicDuration) -> String {
+    let total_seconds = duration.as_nanos() / 1_000_000_000;
+    if total_seconds < 60 {
+        format!("{total_seconds}s")
+    } else if total_seconds < 3_600 {
+        format!("{}m", total_seconds / 60)
+    } else if total_seconds < 86_400 {
+        let hours = total_seconds / 3_600;
+        let minutes = (total_seconds % 3_600) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else {
+        let days = total_seconds / 86_400;
+        let hours = (total_seconds % 86_400) / 3_600;
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    }
+}
+
+/// One table cell of the coverage row.
+fn coverage_cell(text: &str, width: usize) -> String {
+    format!("{text:<width$}  ")
+}
+
+/// The attempts cell: the coverage percentage where one exists, the named
+/// refusal where the engine refused to compute one. A policy the ledger
+/// cannot reconstruct reads as "unknown", never as a number.
+fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
+    match engine.attempt_coverage {
+        Some(fraction) => {
+            format!(
+                "{}%",
+                render_percentage(fraction.as_ppm(), COVERAGE_PERCENT)
+            )
+        }
+        None => match engine.expected_opportunities {
+            None => "unknown".to_string(),
+            Some(0) => "n/a".to_string(),
+            Some(_) => "unknown".to_string(),
+        },
+    }
+}
+
+/// The measurements cell: the conditional coverage over terminal attempts, or
+/// the named refusal when no attempt reached a terminal state.
+fn coverage_measurements_cell(engine: &crate::coverage::CoverageReport) -> String {
+    match engine.measurement_coverage {
+        Some(fraction) => {
+            format!(
+                "{}%",
+                render_percentage(fraction.as_ppm(), COVERAGE_PERCENT)
+            )
+        }
+        None => "none".to_string(),
+    }
+}
+
+/// The detail block of one account, when its numbers need explaining: the
+/// scheduler line, the non-zero failure classes largest first, the
+/// interruptions, and the resets lost to blind gaps. A healthy account
+/// renders no block: the table row already carries its numbers.
+fn render_coverage_detail(
+    report: &CoverageReport,
+    account: &crate::report::CoverageAccount,
+) -> Option<Vec<String>> {
+    let engine = &account.engine;
+    let attempt_below_floor = engine
+        .attempt_coverage
+        .is_some_and(|coverage| coverage.as_f64() < report.threshold.attempt_floor.get());
+    let measurement_below_floor = engine
+        .measurement_coverage
+        .is_some_and(|coverage| coverage.as_f64() < report.threshold.measurement_floor.get());
+    let interrupted = engine.started_without_terminal_result > 0;
+    let policy_unknown = engine.expected_opportunities.is_none();
+    let severe = !engine.reset_spanning_gaps.is_empty();
+    if !policy_unknown
+        && !attempt_below_floor
+        && !measurement_below_floor
+        && !interrupted
+        && !severe
+    {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    if policy_unknown {
+        lines.push("no sampling policy snapshot covers the whole interval".to_string());
+    } else {
+        match engine.attempt_coverage {
+            // The scheduler line names the only fact a high attempt coverage
+            // carries: the opportunities the policy owed were begun.
+            Some(_) if !attempt_below_floor => lines.push("scheduler ran normally".to_string()),
+            Some(_) => lines.push("attempt coverage is below the configured floor".to_string()),
+            // Nothing was owed: there is no attempt coverage to judge.
+            None => {}
+        }
+    }
+    for (group, count) in account.failures.nonzero() {
+        let noun = if count == 1 { "attempt" } else { "attempts" };
+        lines.push(format!("{count} {noun} {}", group.phrase()));
+    }
+    if interrupted {
+        let noun = if engine.started_without_terminal_result == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
+        lines.push(format!(
+            "{} {noun} started without a terminal result",
+            engine.started_without_terminal_result
+        ));
+    }
+    if severe {
+        // The window length is the provider-reported nominal duration of the
+        // reset the gap swallowed; it is rendered when one is known.
+        let window_length = account
+            .resets_in_gaps
+            .iter()
+            .map(|reset| reset.window_length)
+            .max();
+        match (engine.reset_spanning_gaps.len(), window_length) {
+            (1, Some(length)) if length.as_nanos() > 0 => lines.push(format!(
+                "one {} reset occurred without a successful observation in the surrounding interval",
+                render_coverage_duration(length)
+            )),
+            (1, _) => lines.push(
+                "one reset occurred without a successful observation in the surrounding interval"
+                    .to_string(),
+            ),
+            (count, _) => lines.push(format!(
+                "{count} resets occurred without successful observations in the surrounding intervals"
+            )),
+        }
+    }
+    Some(lines)
+}
+
+/// The report-to-rendering seam for coverage: the interval, one row per
+/// covered account, and a detail block for every account whose numbers need
+/// explaining. The model arrives complete; this function formats it. The
+/// header echoes the window the command line asked for: "last 24h" is what
+/// the operator requested, and the interval itself is carried by the model's
+/// own timestamps.
+pub fn render_coverage_report(report: &CoverageReport, window: &str) -> String {
+    let mut lines = vec![format!("coverage - last {window}")];
+    if report.accounts.is_empty() {
+        if report.severe_only {
+            lines.push("(no account has a severe interval)".to_string());
+        } else {
+            lines.push("(no account has recorded sampling evidence in the ledger)".to_string());
+        }
+        return lines.join("\n");
+    }
+
+    lines.push(String::new());
+
+    let name_width = report
+        .accounts
+        .iter()
+        .map(|account| account.name.as_str().len())
+        .chain(std::iter::once("account".len()))
+        .max()
+        .unwrap_or(7);
+    let headers: [(&str, usize); 5] = [
+        ("account", name_width),
+        ("attempts", 9),
+        ("measurements", 12),
+        ("longest blind gap", 17),
+        ("reset gaps", 10),
+    ];
+    lines.push(
+        headers
+            .iter()
+            .map(|(header, width)| coverage_cell(header, *width))
+            .collect::<String>()
+            .trim_end()
+            .to_string(),
+    );
+    for account in &report.accounts {
+        let engine = &account.engine;
+        let cells = [
+            coverage_cell(account.name.as_str(), name_width),
+            coverage_cell(&coverage_attempts_cell(engine), 9),
+            coverage_cell(&coverage_measurements_cell(engine), 12),
+            coverage_cell(
+                &engine
+                    .longest_no_attempt_gap
+                    .map(|gap| render_coverage_duration(gap.duration()))
+                    .unwrap_or_else(|| "none".to_string()),
+                17,
+            ),
+            engine.reset_spanning_gaps.len().to_string(),
+        ];
+        lines.push(cells.join("").trim_end().to_string());
+    }
+    for account in &report.accounts {
+        let Some(detail) = render_coverage_detail(report, account) else {
+            continue;
+        };
+        lines.push(String::new());
+        lines.push(format!("{}:", account.name.as_str()));
+        for line in detail {
+            lines.push(format!("  - {line}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// The threshold-breach message the coverage command fails with, naming every
+/// breached account, the floor's dimension, the measured coverage and the
+/// floor itself. The report has already been printed; this message is what
+/// the exit class's prose names.
+pub fn render_coverage_threshold_message(report: &CoverageReport) -> String {
+    let parts: Vec<String> = report
+        .threshold
+        .breaches
+        .iter()
+        .map(|breach| {
+            let dimension = match breach.dimension {
+                crate::report::CoverageBreachDimension::Attempt => "attempt",
+                crate::report::CoverageBreachDimension::Measurement => "measurement",
+            };
+            format!(
+                "{} {} coverage {}% is below the {}% floor",
+                breach.account.as_str(),
+                dimension,
+                render_percentage(breach.coverage.as_ppm(), COVERAGE_PERCENT),
+                render_percentage(breach.floor.as_ppm(), COVERAGE_PERCENT),
+            )
+        })
+        .collect();
+    if parts.is_empty() {
+        "no threshold breach was recorded".to_string()
+    } else {
+        parts.join("; ")
+    }
+}
+
 /// Renders a failure class as the fixed human wording.
 pub fn render_failure_class(class: FailureClass) -> &'static str {
     match class {
@@ -545,6 +822,22 @@ pub fn render_failure_class(class: FailureClass) -> &'static str {
         FailureClass::HttpStatus(_) => "http error",
         FailureClass::RateLimited { .. } => "rate limited",
         FailureClass::MalformedBody | FailureClass::MissingRequiredField => "malformed response",
+    }
+}
+
+/// Renders a nominal window duration as the compact human label the design's
+/// fresh status line shows: "38% left · 5h". Same ladder as an age, because a
+/// window length is a duration a human reads the same way.
+pub fn render_window_duration(duration: NominalWindowDuration) -> String {
+    let seconds = duration.as_nanos() / 1_000_000_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
     }
 }
 
@@ -608,9 +901,26 @@ mod tests {
             ),
             latest_attempt: AttemptId::new(1),
         };
+        // The suffix is the limiting window's nominal length, not the sample's
+        // age: the design's fresh line reads "38% left · 5h" for the 5-hour
+        // window, and a fresh reading's age is implied by the word fresh.
         assert_eq!(
-            render_meter_reading(&fresh, "%", precision, now, envelope),
+            render_meter_reading(
+                &fresh,
+                "%",
+                precision,
+                now,
+                envelope,
+                Some(NominalWindowDuration::from_nanos(
+                    5 * 3_600 * NANOS_PER_SECOND as u64
+                )),
+            ),
             "38% left · 5h"
+        );
+        // Without a window to name, the value is shown bare.
+        assert_eq!(
+            render_meter_reading(&fresh, "%", precision, now, envelope, None),
+            "38% left"
         );
 
         let stale_timeout = Freshness::Stale {
@@ -622,7 +932,7 @@ mod tests {
             reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
         };
         assert_eq!(
-            render_meter_reading(&stale_timeout, "%", precision, now, envelope),
+            render_meter_reading(&stale_timeout, "%", precision, now, envelope, None),
             "~38% · stale 14m · timeout"
         );
 
@@ -631,7 +941,7 @@ mod tests {
             latest_attempt: AttemptId::new(3),
         };
         assert_eq!(
-            render_meter_reading(&auth, "%", precision, now, envelope),
+            render_meter_reading(&auth, "%", precision, now, envelope, None),
             "auth!"
         );
 
@@ -644,7 +954,7 @@ mod tests {
             reason: StaleReason::CollectorInterrupted,
         };
         assert_eq!(
-            render_meter_reading(&stale_interrupted, "%", precision, now, envelope),
+            render_meter_reading(&stale_interrupted, "%", precision, now, envelope, None),
             "~38% · stale 9m · collector interrupted"
         );
 
@@ -654,7 +964,7 @@ mod tests {
             reason: StaleReason::NoSuccessfulObservation,
         };
         assert_eq!(
-            render_meter_reading(&never_observed, "%", precision, now, envelope),
+            render_meter_reading(&never_observed, "%", precision, now, envelope, None),
             "? · stale · no successful sample"
         );
     }
@@ -702,6 +1012,7 @@ mod tests {
             crate::presentation::precision::PERCENT,
             now,
             envelope(),
+            None,
         );
         assert!(
             rendered.contains("stale"),
@@ -740,10 +1051,12 @@ mod tests {
         };
 
         // No colour is ever added; the words alone distinguish the three states.
-        assert!(render_meter_reading(&fresh, "%", precision, now, envelope).contains("left"));
-        assert!(render_meter_reading(&stale, "%", precision, now, envelope).contains("stale"));
+        assert!(render_meter_reading(&fresh, "%", precision, now, envelope, None).contains("left"));
+        assert!(
+            render_meter_reading(&stale, "%", precision, now, envelope, None).contains("stale")
+        );
         assert_eq!(
-            render_meter_reading(&auth, "%", precision, now, envelope),
+            render_meter_reading(&auth, "%", precision, now, envelope, None),
             "auth!"
         );
     }
@@ -778,7 +1091,7 @@ mod tests {
         let report = StatusReport::new(
             metadata,
             vec![
-                MeterAccount::new(
+                MeterAccount::from_projection(
                     LogicalName::new("work-a"),
                     Freshness::Fresh {
                         observed: observed(
@@ -789,6 +1102,14 @@ mod tests {
                         ),
                         latest_attempt: AttemptId::new(1),
                     },
+                    Some(crate::report::LimitingWindow {
+                        scope: crate::domain::window::WindowScope::AccountWide,
+                        nominal_duration: NominalWindowDuration::from_nanos(
+                            5 * 3_600 * NANOS_PER_SECOND as u64,
+                        ),
+                    }),
+                    vec![],
+                    None,
                 ),
                 MeterAccount::new(
                     LogicalName::new("research"),
@@ -812,19 +1133,20 @@ mod tests {
                 ),
             ],
             vec![],
+            crate::report::ProjectionReadState::Read,
         );
 
         let rendered = render_status_report(&report, now, envelope);
         assert!(
-            rendered.contains("work-a 38% left · 5h"),
+            rendered.contains("aub work-a 38% left · 5h"),
             "fresh fragment missing from rendering: {rendered}"
         );
         assert!(
-            rendered.contains("research ~38% · stale 14m · timeout"),
+            rendered.contains("aub research ~38% · stale 14m · timeout"),
             "stale fragment missing from rendering: {rendered}"
         );
         assert!(
-            rendered.contains("legacy auth!"),
+            rendered.contains("aub legacy auth!"),
             "auth fragment missing from rendering: {rendered}"
         );
     }
@@ -856,17 +1178,26 @@ mod tests {
         );
         let report = StatusReport::new(
             metadata,
-            vec![MeterAccount::new(
+            vec![MeterAccount::from_projection(
                 LogicalName::new("work-primary"),
                 Freshness::Fresh {
                     observed,
                     latest_attempt: AttemptId::new(1),
                 },
+                Some(crate::report::LimitingWindow {
+                    scope: crate::domain::window::WindowScope::AccountWide,
+                    nominal_duration: NominalWindowDuration::from_nanos(
+                        5 * 3_600 * NANOS_PER_SECOND as u64,
+                    ),
+                }),
+                vec![],
+                None,
             )],
             vec![],
+            crate::report::ProjectionReadState::Read,
         );
 
         let rendered = render_status_report(&report, now, envelope);
-        assert_eq!(rendered, "work-primary 38% left · 5h");
+        assert_eq!(rendered, "aub work-primary 38% left · 5h");
     }
 }

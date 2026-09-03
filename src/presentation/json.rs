@@ -13,12 +13,15 @@ use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::TokenKind;
+use crate::domain::window::WindowScope;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use crate::logging::RunId;
 use crate::presentation::render::ExplainMode;
 use crate::problem_code::ProblemCode;
-use crate::report::{LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport};
+use crate::report::{
+    CoverageReport, LedgerGeneration, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport,
+};
 use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
@@ -329,7 +332,7 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_STATUS_KEYS: [&str; 8] = [
+    const KNOWN_STATUS_KEYS: [&str; 9] = [
         "schema",
         "command",
         "run",
@@ -337,11 +340,41 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
         "knowledge_at",
         "ledger_generation",
         "accounts",
+        "projection",
         "explain",
     ];
     for key in obj.keys() {
         if !KNOWN_STATUS_KEYS.contains(&key.as_str()) {
             return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    if let Some(projection_val) = obj.get("projection") {
+        let projection_obj =
+            projection_val
+                .as_object()
+                .ok_or_else(|| JsonContractError::InvalidFormat {
+                    field: "projection",
+                    message: "expected object".to_string(),
+                })?;
+        for key in projection_obj.keys() {
+            if key != "state" && key != "reason" {
+                return Err(JsonContractError::UnexpectedField(key.clone()));
+            }
+        }
+        let state = projection_obj
+            .get("state")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(JsonContractError::MissingField("projection.state"))?;
+        const UNAVAILABLE_STATES: [&str; 4] =
+            ["missing", "malformed", "unsupported_schema", "too_large"];
+        if !UNAVAILABLE_STATES.contains(&state) {
+            return Err(JsonContractError::InvalidFormat {
+                field: "projection.state",
+                message: format!("expected an unavailable state, got '{state}'"),
+            });
+        }
+        if !projection_obj.contains_key("reason") {
+            return Err(JsonContractError::MissingField("projection.reason"));
         }
     }
     if let Some(explain_val) = obj.get("explain") {
@@ -533,10 +566,19 @@ pub fn status_json_with_explain(report: &StatusReport, run: RunId, explain: Expl
     let accounts = report
         .accounts
         .iter()
-        .map(|account| freshness_json(account.account.as_str(), &account.reading))
+        .map(status_account_json)
         .collect::<Vec<_>>()
         .join(",");
     let mut body = format!("\"accounts\":[{accounts}]");
+    if let crate::report::ProjectionReadState::Unavailable { state, reason } =
+        &report.projection_state
+    {
+        body.push_str(&format!(
+            ",\"projection\":{{\"state\":{},\"reason\":{}}}",
+            json_string(state),
+            json_string(reason),
+        ));
+    }
     if explain != ExplainMode::Off {
         body.push_str(&format!(
             ",\"explain\":{}",
@@ -627,6 +669,204 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ));
     }
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// The unit every sampling-opportunity count is carried in.
+const OPPORTUNITY_UNIT: &str = "opportunities";
+/// The unit every attempt count is carried in.
+const ATTEMPT_UNIT: &str = "attempts";
+/// The unit every successful-observation count is carried in.
+const OBSERVATION_UNIT: &str = "observations";
+/// The unit every gap count is carried in.
+const GAP_UNIT: &str = "gaps";
+/// The unit every duration is carried in: nanoseconds, exact and unambiguous,
+/// matching the nanosecond timestamps the rest of the contract carries.
+const DURATION_UNIT: &str = "ns";
+
+fn coverage_fraction_json(fraction: Option<crate::coverage::CoverageFraction>) -> String {
+    match fraction {
+        Some(fraction) => coverage_fraction_value_json(fraction),
+        None => "null".to_string(),
+    }
+}
+
+fn coverage_fraction_value_json(fraction: crate::coverage::CoverageFraction) -> String {
+    quantity_json(&fraction.as_ppm().to_string(), "ppm")
+}
+
+fn coverage_gap_json(gap: Option<crate::coverage::Gap>) -> String {
+    match gap {
+        Some(gap) => quantity_json(&gap.duration().as_nanos().to_string(), DURATION_UNIT),
+        None => "null".to_string(),
+    }
+}
+
+fn coverage_timestamp_json(timestamp: Option<crate::domain::time::UtcTimestamp>) -> String {
+    match timestamp {
+        Some(timestamp) => timestamp.unix_nanos().to_string(),
+        None => "null".to_string(),
+    }
+}
+
+fn coverage_account_json(account: &crate::report::CoverageAccount) -> String {
+    let engine = &account.engine;
+    let policy_unknown = engine.expected_opportunities.is_none();
+    let expected = match engine.expected_opportunities {
+        Some(expected) => quantity_json(&expected.to_string(), OPPORTUNITY_UNIT),
+        None => "null".to_string(),
+    };
+    let resets = account
+        .resets_in_gaps
+        .iter()
+        .map(|reset| {
+            format!(
+                "{{\"at\":{},\"window_length\":{}}}",
+                reset.at.unix_nanos(),
+                quantity_json(&reset.window_length.as_nanos().to_string(), DURATION_UNIT)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let failures = [
+        (
+            crate::report::coverage::CoverageFailureGroup::Authentication,
+            account.failures.authentication,
+        ),
+        (
+            crate::report::coverage::CoverageFailureGroup::RateLimited,
+            account.failures.rate_limited,
+        ),
+        (
+            crate::report::coverage::CoverageFailureGroup::ProviderUnreachable,
+            account.failures.provider_unreachable,
+        ),
+        (
+            crate::report::coverage::CoverageFailureGroup::ResponseUnusable,
+            account.failures.response_unusable,
+        ),
+    ]
+    .iter()
+    .map(|(group, count)| {
+        format!(
+            "{}:{}",
+            json_string(group.key()),
+            quantity_json(&count.to_string(), ATTEMPT_UNIT)
+        )
+    })
+    .collect::<Vec<_>>()
+    .join(",");
+    format!(
+        "{{\"account\":{},\"policy_unknown\":{policy_unknown},\"expected_opportunities\":{expected},\"attempted_opportunities\":{},\"successful_observations\":{},\"started_without_terminal_result\":{},\"attempt_coverage\":{},\"measurement_coverage\":{},\"longest_no_attempt_gap\":{},\"longest_no_observation_gap\":{},\"reset_spanning_gaps\":{},\"severe\":{},\"most_recent_timer_run\":{},\"most_recent_successful_observation\":{},\"resets_in_gaps\":[{resets}],\"failures\":{{{failures}}}}}",
+        json_string(account.name.as_str()),
+        quantity_json(
+            &engine.attempted_opportunities.to_string(),
+            OPPORTUNITY_UNIT
+        ),
+        quantity_json(
+            &engine.successful_observations.to_string(),
+            OBSERVATION_UNIT
+        ),
+        quantity_json(
+            &engine.started_without_terminal_result.to_string(),
+            ATTEMPT_UNIT
+        ),
+        coverage_fraction_json(engine.attempt_coverage),
+        coverage_fraction_json(engine.measurement_coverage),
+        coverage_gap_json(engine.longest_no_attempt_gap),
+        coverage_gap_json(engine.longest_no_observation_gap),
+        quantity_json(&engine.reset_spanning_gaps.len().to_string(), GAP_UNIT),
+        engine.severe,
+        coverage_timestamp_json(engine.most_recent_timer_run),
+        coverage_timestamp_json(engine.most_recent_successful_observation),
+    )
+}
+
+/// The coverage report under the envelope. Every quantity carries its unit;
+/// the two coverages are separate fields in the system's fraction unit (ppm);
+/// a quantity the engine refused to compute serializes as null beside the
+/// named refusal flag (`policy_unknown`), never as a substituted number.
+pub fn coverage_json(report: &CoverageReport, run: RunId) -> String {
+    let accounts = report
+        .accounts
+        .iter()
+        .map(coverage_account_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let breaches = report
+        .threshold
+        .breaches
+        .iter()
+        .map(|breach| {
+            format!(
+                "{{\"account\":{},\"dimension\":{},\"coverage\":{},\"floor\":{}}}",
+                json_string(breach.account.as_str()),
+                json_string(breach.dimension.key()),
+                coverage_fraction_value_json(breach.coverage),
+                quantity_json(&breach.floor.as_ppm().to_string(), "ppm"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!(
+        "\"interval\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"severe_only\":{},\"threshold\":{{\"attempt_floor\":{},\"measurement_floor\":{},\"met\":{},\"breaches\":[{breaches}]}},\"accounts\":[{accounts}]",
+        report.since.unix_nanos(),
+        report.until.unix_nanos(),
+        report.severe_only,
+        quantity_json(&report.threshold.attempt_floor.as_ppm().to_string(), "ppm"),
+        quantity_json(
+            &report.threshold.measurement_floor.as_ppm().to_string(),
+            "ppm"
+        ),
+        report.threshold.met,
+    );
+    JsonEnvelope::new("coverage", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Validates that a coverage report JSON strictly conforms to schema version 1.
+pub fn validate_coverage_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "coverage" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'coverage', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_COVERAGE_KEYS: [&str; 11] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "interval",
+        "severe_only",
+        "threshold",
+        "accounts",
+        "explain",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_COVERAGE_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    for required in ["interval", "severe_only", "threshold", "accounts"] {
+        if !obj.contains_key(required) {
+            return Err(JsonContractError::MissingField(match required {
+                "interval" => "interval",
+                "severe_only" => "severe_only",
+                "threshold" => "threshold",
+                "accounts" => "accounts",
+                _ => unreachable!(),
+            }));
+        }
+    }
+    Ok(parsed)
 }
 
 /// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.
@@ -884,16 +1124,17 @@ fn token_kind_key(kind: TokenKind) -> &'static str {
     }
 }
 
-/// Serializes a meter account's freshness: exactly one variant, machine-readable, so
-/// stale and auth-required are distinguishable without parsing prose.
-pub fn freshness_json(account: &str, freshness: &Freshness<QuotaRemaining>) -> String {
+/// The freshness variant's own fields, without the account key: exactly one
+/// variant is present, machine-readable, so stale and auth-required are
+/// distinguishable without parsing prose. The status account object appends
+/// its selection context after these; nothing else may.
+fn freshness_variant_fields(freshness: &Freshness<QuotaRemaining>) -> String {
     match freshness {
         Freshness::Fresh {
             observed,
             latest_attempt,
         } => format!(
-            "{{\"account\":{},\"freshness\":\"fresh\",\"remaining\":{},\"latest_attempt\":{}}}",
-            json_string(account),
+            "\"freshness\":\"fresh\",\"remaining\":{},\"latest_attempt\":{}",
             quantity_json(&observed.value().as_ppm().get().to_string(), "ppm"),
             latest_attempt.value(),
         ),
@@ -902,8 +1143,7 @@ pub fn freshness_json(account: &str, freshness: &Freshness<QuotaRemaining>) -> S
             latest_attempt,
             reason,
         } => format!(
-            "{{\"account\":{},\"freshness\":\"stale\",\"reason\":{},\"last_good\":{},\"latest_attempt\":{}}}",
-            json_string(account),
+            "\"freshness\":\"stale\",\"reason\":{},\"last_good\":{},\"latest_attempt\":{}",
             json_string(stale_reason_name(reason)),
             last_good_json(last_good),
             latest_attempt.value(),
@@ -912,12 +1152,74 @@ pub fn freshness_json(account: &str, freshness: &Freshness<QuotaRemaining>) -> S
             last_good,
             latest_attempt,
         } => format!(
-            "{{\"account\":{},\"freshness\":\"auth_required\",\"last_good\":{},\"latest_attempt\":{}}}",
-            json_string(account),
+            "\"freshness\":\"auth_required\",\"last_good\":{},\"latest_attempt\":{}",
             last_good_json(last_good),
             latest_attempt.value(),
         ),
     }
+}
+
+/// Serializes a meter account's freshness: exactly one variant, machine-readable, so
+/// stale and auth-required are distinguishable without parsing prose.
+pub fn freshness_json(account: &str, freshness: &Freshness<QuotaRemaining>) -> String {
+    format!(
+        "{{\"account\":{},{}}}",
+        json_string(account),
+        freshness_variant_fields(freshness)
+    )
+}
+
+/// The label of one window scope in the JSON contract: account-wide windows
+/// and model-scoped ones are distinguishable without parsing a window list.
+fn window_scope_label(scope: &WindowScope) -> String {
+    match scope {
+        WindowScope::AccountWide => "account_wide".to_string(),
+        WindowScope::ModelSpecific(model) => format!("model:{}", model.as_str()),
+    }
+}
+
+/// One status account object: the freshness variant plus the selection
+/// context the reading was computed under, when it was computed from a
+/// projection. The scopes the reading included are always named, so a
+/// consumer can see which windows the number is the minimum over.
+fn status_account_json(account: &crate::report::MeterAccount) -> String {
+    let mut fields = vec![format!(
+        "\"account\":{}",
+        json_string(account.account.as_str())
+    )];
+    fields.push(freshness_variant_fields(&account.reading));
+    // The included scopes travel only when the reading included windows: an
+    // account with no window context carries the fact by the field's absence
+    // rather than by an empty array that reads as a measured nothing.
+    if !account.included_scopes.is_empty() {
+        let scopes = account
+            .included_scopes
+            .iter()
+            .map(|scope| json_string(&window_scope_label(scope)))
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!("\"included_scopes\":[{scopes}]"));
+    }
+    if let Some(model) = &account.selected_model {
+        fields.push(format!(
+            "\"selected_model\":{}",
+            json_string(model.as_str())
+        ));
+    }
+    if let Some(limit) = &account.limiting_window {
+        let scope_part = match &limit.scope {
+            WindowScope::AccountWide => "\"scope\":\"account_wide\"".to_string(),
+            WindowScope::ModelSpecific(model) => format!(
+                "\"scope\":\"model\",\"model\":{}",
+                json_string(model.as_str())
+            ),
+        };
+        fields.push(format!(
+            "\"limiting_window\":{{{scope_part},\"nominal_duration_nanos\":{}}}",
+            limit.nominal_duration.as_nanos()
+        ));
+    }
+    format!("{{{}}}", fields.join(","))
 }
 
 /// Serializes coverage and evidence quality as two separate, independently readable

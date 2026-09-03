@@ -10,3 +10,6 @@ rate-card
 backup
 export
 doctor
+coverage
+ingest
+rebuild
