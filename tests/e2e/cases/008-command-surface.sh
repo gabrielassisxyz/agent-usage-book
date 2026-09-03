@@ -26,7 +26,7 @@ case_steps() {
     step "version" "$AUB_BIN" --version
     step "unknown argument" "$AUB_BIN" --definitely-not-a-flag
     step "format refused" "$AUB_BIN" config --format json
-    step "explain refused" "$AUB_BIN" status --explain
+    step "explain refused" "$AUB_BIN" config --explain
     step "status json" "$AUB_BIN" status --format json
     step "spend json" env "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" spend --format json
 }
@@ -44,7 +44,7 @@ case_assertions() {
     assert_exit 2 4
     assert_stderr_contains 4 "config prints provenance, not a report"
     assert_exit 2 5
-    assert_stderr_contains 5 "status does not accept --explain"
+    assert_stderr_contains 5 "config does not accept --explain: config derives no quantity"
     assert_stderr_contains 5 "next: run aub --help"
     assert_exit 0 6
     assert_json_field 6 command status

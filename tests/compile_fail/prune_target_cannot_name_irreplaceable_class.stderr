@@ -1,0 +1,23 @@
+warning: unreachable statement
+  --> tests/compile_fail/prune_target_cannot_name_irreplaceable_class.rs:14:5
+   |
+13 |     let conn = unimplemented!();
+   |                ---------------- any code following this expression is unreachable
+14 |     prune_target(&conn, DurableClass::MeterAttempt);
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ unreachable statement
+   |
+   = note: `#[warn(unreachable_code)]` (part of `#[warn(unused)]`) on by default
+
+error[E0308]: mismatched types
+  --> tests/compile_fail/prune_target_cannot_name_irreplaceable_class.rs:14:25
+   |
+14 |     prune_target(&conn, DurableClass::MeterAttempt);
+   |     ------------        ^^^^^^^^^^^^^^^^^^^^^^^^^^ expected `PruneTarget`, found `DurableClass`
+   |     |
+   |     arguments to this function are incorrect
+   |
+note: function defined here
+  --> src/store/retention.rs
+   |
+   | pub fn prune_target(conn: &Connection, target: PruneTarget) -> Result<usize, Error> {
+   |        ^^^^^^^^^^^^
