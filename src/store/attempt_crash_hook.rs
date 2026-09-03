@@ -156,7 +156,7 @@ pub fn run_stage(
         // records it in the same transaction as the evidence, the observation
         // and the windows, which is what makes the seeded row the same shape
         // a live sample produces rather than a hand-written half of one.
-        let bundle = terminal_bundle_for(row_id, account)?;
+        let bundle = terminal_bundle_for(row_id, account, started_at)?;
         commit_terminal_bundle_on_connection(&mut conn, &bundle, || Ok(()))?;
         return Ok(CrashHookOutcome::Seeded {
             label: "committed",
@@ -170,7 +170,7 @@ pub fn run_stage(
         })?;
         spool_pending(
             state_dir,
-            &pending_bundle_for(row_id.value(), account.value()),
+            &pending_bundle_for(row_id.value(), account.value(), started_at),
         )?;
         return Ok(CrashHookOutcome::Seeded {
             label: "spooled",
@@ -199,7 +199,10 @@ pub fn run_stage(
         let state_dir = db_path.parent().ok_or_else(|| {
             Error::Store(format!("database path {db_path:?} has no parent directory"))
         })?;
-        spool_pending(state_dir, &pending_bundle_for(attempt_id, account.value()))?;
+        spool_pending(
+            state_dir,
+            &pending_bundle_for(attempt_id, account.value(), started_at),
+        )?;
         return Ok(CrashHookOutcome::Seeded {
             label: "spooled-orphan",
             attempt_id,
@@ -232,11 +235,12 @@ pub fn run_stage(
 fn terminal_bundle_for(
     row_id: MeterAttemptRowId,
     account: crate::store::account::AccountId,
+    started_at: UtcTimestamp,
 ) -> Result<TerminalMeterBundle, Error> {
-    let received_at = UtcTimestamp::from_unix_nanos(1_000);
+    let received_at = UtcTimestamp::from_unix_nanos(started_at.unix_nanos().saturating_add(500));
     let result = NewMeterAttemptResult {
         attempt_id: row_id,
-        completed_at: UtcTimestamp::from_unix_nanos(2_000),
+        completed_at: UtcTimestamp::from_unix_nanos(started_at.unix_nanos().saturating_add(1_000)),
         elapsed: MonotonicDuration::from_nanos(1_000),
         outcome: AttemptOutcome::Success,
         sanitized_error_classification: None,
@@ -256,7 +260,7 @@ fn terminal_bundle_for(
     let interpretation = NewMeterInterpretation {
         account_id: account,
         provider: "fixture-provider".to_string(),
-        provider_observed_at: Some(UtcTimestamp::from_unix_nanos(900)),
+        provider_observed_at: Some(started_at),
         received_at,
         measurement_basis: MeasurementBasis::ProviderObserved,
         observed_plan: Some("fixture-plan".to_string()),
@@ -279,7 +283,7 @@ fn terminal_bundle_for(
             Error::Internal("fixture window reported_resolution_ppm must be non-zero".into())
         })?,
         QuantizationSemantics::Exact,
-        UtcTimestamp::from_unix_nanos(5_000),
+        UtcTimestamp::from_unix_nanos(started_at.unix_nanos().saturating_add(5_000)),
         NominalWindowDuration::from_nanos(18_000_000_000_000),
     );
     TerminalMeterBundle::new(result, evidence, interpretation, vec![window])
@@ -287,10 +291,14 @@ fn terminal_bundle_for(
 
 /// The same fixture bundle as [`terminal_bundle_for`], flattened into the
 /// spool's durable on-disk shape, for the two spooling stages.
-fn pending_bundle_for(attempt_id: i64, account_id: i64) -> PendingTerminalBundle {
+fn pending_bundle_for(
+    attempt_id: i64,
+    account_id: i64,
+    started_at: UtcTimestamp,
+) -> PendingTerminalBundle {
     PendingTerminalBundle {
         attempt_id,
-        completed_at_nanos: 2_000,
+        completed_at_nanos: started_at.unix_nanos().saturating_add(1_000),
         elapsed_nanos: 1_000,
         outcome: "success".into(),
         failure_class: None,
@@ -299,7 +307,7 @@ fn pending_bundle_for(attempt_id: i64, account_id: i64) -> PendingTerminalBundle
         retry_index: None,
         clock_anomaly: false,
         response_classification: "success".into(),
-        received_at_nanos: 1_000,
+        received_at_nanos: started_at.unix_nanos().saturating_add(500),
         provider_observed_at_original: Some("2026-09-02T00:00:00Z".into()),
         evidence_capsule: "{\"sanitized\":true}".into(),
         capsule_schema_version: "v1".into(),
@@ -307,7 +315,7 @@ fn pending_bundle_for(attempt_id: i64, account_id: i64) -> PendingTerminalBundle
         capture_truncated: false,
         account_id,
         provider: "fixture-provider".into(),
-        provider_observed_at_nanos: Some(900),
+        provider_observed_at_nanos: Some(started_at.unix_nanos()),
         measurement_basis: measurement_basis_sql::as_sql(MeasurementBasis::ProviderObserved)
             .to_owned(),
         observed_plan: Some("fixture-plan".into()),
@@ -323,7 +331,7 @@ fn pending_bundle_for(attempt_id: i64, account_id: i64) -> PendingTerminalBundle
             quota_used_ppm: 250_000,
             reported_resolution_ppm: 10_000,
             quantization: "exact".into(),
-            resets_at_nanos: 5_000,
+            resets_at_nanos: started_at.unix_nanos().saturating_add(5_000),
             nominal_duration_nanos: 18_000_000_000_000,
         }],
     }

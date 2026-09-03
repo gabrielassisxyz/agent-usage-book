@@ -191,22 +191,28 @@ pub fn restore_archive(
     // migration machinery rather than silently opened.
     let migration_summary = run_migrations(&mut conn, &registry(), None, clock)?;
 
-    // The surviving directory is scanned before the replay runs, so a record
-    // the replay itself quarantines is counted once, from the replay report,
-    // and never double-counted by a scan over the directory it just wrote.
-    let preexisting_surviving_quarantine = match surviving {
-        Some(dir) => scan_existing_quarantine(dir)?,
-        None => Vec::new(),
+    // The damaged directory is forensic evidence. Take one stable read-only
+    // snapshot of its active pending files and existing quarantine while the
+    // spool barrier excludes concurrent mutation, then replay only the copied
+    // files in the new destination. Draining the damaged directory directly
+    // would delete or quarantine its records and turn recovery into the
+    // destructive operation step 2 expressly forbids.
+    let (surviving_pending, preexisting_surviving_quarantine) = match surviving {
+        Some(dir) => snapshot_surviving_evidence(dir)?,
+        None => (Vec::new(), Vec::new()),
     };
 
     // Step 6: replay both sources, the archive's restored pending records
     // first. The drain is keyed on the attempt identifier, so a record the
     // two sources hold in common applies once: the archive's copy (the older
-    // evidence) wins, and the surviving copy is deleted as a no-op.
+    // evidence) wins, and the surviving snapshot is deleted as a no-op from
+    // the restored directory only.
     let archive_replay = drain_pending_recovering(&mut conn, destination)?;
-    let surviving_replay = match surviving {
-        Some(dir) => Some(drain_pending_recovering(&mut conn, dir)?),
-        None => None,
+    let surviving_replay = if surviving.is_some() {
+        copy_pending_snapshots(destination, &surviving_pending)?;
+        Some(drain_pending_recovering(&mut conn, destination)?)
+    } else {
+        None
     };
 
     // The final verdict: the checks run again over the restored database with
@@ -299,13 +305,6 @@ fn refuse_evidence_destroying_destinations(
                  happen to the directory the damaged state still lives in"
             )));
         }
-        if same_directory(dir, configured_state_dir) {
-            return Err(Error::Store(format!(
-                "surviving directory {dir:?} is the configured state directory; replaying its \
-                 pending spool into a restored copy would consume the live state directory's \
-                 newest evidence, which no scratch recovery may do"
-            )));
-        }
         if same_directory(dir, archive) {
             return Err(Error::Store(format!(
                 "surviving directory {dir:?} is the archive itself; replaying from it would \
@@ -347,7 +346,9 @@ fn normalize_components(path: &Path) -> PathBuf {
                 normalized.pop();
             }
             std::path::Component::CurDir => {}
-            other => normalized.push(other),
+            other @ std::path::Component::Prefix(_)
+            | other @ std::path::Component::RootDir
+            | other @ std::path::Component::Normal(_) => normalized.push(other),
         }
     }
     normalized
@@ -410,6 +411,51 @@ fn copy_pending_records(
         })?;
     }
     Ok(pending_records.len())
+}
+
+/// Captures the active pending files and existing quarantine from the damaged
+/// directory under one read-only snapshot barrier. The returned bytes are the
+/// only surviving-state inputs the replay writes or removes from thereafter.
+fn snapshot_surviving_evidence(
+    surviving: &Path,
+) -> Result<
+    (
+        Vec<crate::store::spool::PendingRecordSnapshot>,
+        Vec<crate::store::spool::QuarantinedRecord>,
+    ),
+    Error,
+> {
+    let barrier = crate::store::spool::acquire_state_snapshot_barrier(surviving)?;
+    let quarantine = scan_existing_quarantine(surviving)?;
+    let pending = crate::store::spool::snapshot_pending_records(surviving, &barrier)?;
+    Ok((pending, quarantine))
+}
+
+/// Materializes a read-only surviving snapshot in the restored pending spool.
+/// The snapshot is copied only after archive replay has removed or quarantined
+/// its active records, so a same-named source record replaces no evidence and
+/// is then evaluated by the normal idempotent drain.
+fn copy_pending_snapshots(
+    destination: &Path,
+    records: &[crate::store::spool::PendingRecordSnapshot],
+) -> Result<(), Error> {
+    for record in records {
+        let path = destination
+            .join(ARCHIVE_PENDING_DIR)
+            .join(&record.file_name);
+        let mut file = create_file_mode_0600(&path)?;
+        file.write_all(&record.bytes).map_err(|error| {
+            Error::Store(format!(
+                "cannot write surviving pending snapshot {path:?}: {error}"
+            ))
+        })?;
+        file.sync_all().map_err(|error| {
+            Error::Store(format!(
+                "cannot sync surviving pending snapshot {path:?}: {error}"
+            ))
+        })?;
+    }
+    Ok(())
 }
 
 fn quarantined_from(
@@ -646,6 +692,36 @@ mod tests {
         FakeMountTable::new()
     }
 
+    #[test]
+    fn recovery_documentation_keeps_the_eight_steps_in_order() {
+        let procedure = include_str!("../docs/recovery.md");
+        let steps = [
+            "1. Stop every mutating `aub` invocation",
+            "2. Preserve the damaged state directory.",
+            "3. Verify the archive checksum and manifest",
+            "4. Restore into a directory that does not exist yet:",
+            "5. Read the restore result.",
+            "6. Check both replay lines and the exact `observations=N` count.",
+            "7. Projection recovery is not applicable in Phase 1",
+            "8. Transcript-derived tables have no writer in Phase 1",
+        ];
+        let mut prior = 0;
+        for step in steps {
+            let position = procedure
+                .find(step)
+                .unwrap_or_else(|| panic!("recovery procedure is missing {step:?}"));
+            assert!(
+                position >= prior,
+                "recovery procedure puts {step:?} before its predecessor"
+            );
+            prior = position;
+        }
+        assert!(
+            procedure.contains("Do not overwrite it"),
+            "step 2 must forbid overwriting damaged evidence"
+        );
+    }
+
     // --- refusals --------------------------------------------------------
 
     #[test]
@@ -653,7 +729,7 @@ mod tests {
         let scratch = ScratchDir::new();
         let state_dir = scratch.path().join("aub");
         {
-            let mut conn = migrated_state_dir(&state_dir);
+            let conn = migrated_state_dir(&state_dir);
             let _first = seed_attempt(&conn);
         }
         ensure_dir_mode_0700(&state_dir).unwrap();
@@ -693,7 +769,7 @@ mod tests {
         let scratch = ScratchDir::new();
         let state_dir = scratch.path().join("aub");
         {
-            let mut conn = migrated_state_dir(&state_dir);
+            let conn = migrated_state_dir(&state_dir);
             let _first = seed_attempt(&conn);
         }
         let archive = scratch.path().join("archive");
@@ -725,11 +801,11 @@ mod tests {
     }
 
     #[test]
-    fn restore_refuses_a_surviving_directory_that_is_the_configured_state_directory() {
+    fn restore_snapshots_a_surviving_configured_state_directory_without_mutating_it() {
         let scratch = ScratchDir::new();
         let state_dir = scratch.path().join("aub");
         {
-            let mut conn = migrated_state_dir(&state_dir);
+            let conn = migrated_state_dir(&state_dir);
             let _first = seed_attempt(&conn);
         }
         let archive = scratch.path().join("archive");
@@ -742,19 +818,26 @@ mod tests {
         )
         .unwrap();
 
-        let error = restore_archive(
+        fs::write(state_dir.join("operator-file"), b"irreplaceable").unwrap();
+        let restored = scratch.path().join("restored");
+        let summary = restore_archive(
             &state_dir,
             &archive,
-            &scratch.path().join("restored"),
+            &restored,
             Some(&state_dir),
             MonotonicDuration::from_millis(1000),
             &mounts(),
             &clock,
         )
-        .unwrap_err();
+        .unwrap();
         assert!(
-            error.to_string().contains("newest evidence"),
-            "the refusal must name the live evidence it would consume: {error}"
+            summary.unrecovered.is_empty(),
+            "a clean configured-state snapshot has no unrecovered evidence: {:?}",
+            summary.unrecovered
+        );
+        assert_eq!(
+            fs::read(state_dir.join("operator-file")).unwrap(),
+            b"irreplaceable"
         );
     }
 
@@ -864,6 +947,21 @@ mod tests {
         spool_pending(&state_dir, &valid_bundle(fourth)).unwrap();
         drop(conn);
 
+        let surviving_before_restore = [
+            (
+                "attempt-11.json",
+                fs::read(state_dir.join("pending/attempt-11.json")).unwrap(),
+            ),
+            (
+                "attempt-3.json",
+                fs::read(state_dir.join("pending/attempt-3.json")).unwrap(),
+            ),
+            (
+                "attempt-4.json",
+                fs::read(state_dir.join("pending/attempt-4.json")).unwrap(),
+            ),
+        ];
+
         // The restored database starts from the archive, and the surviving
         // directory replays into it: attempt 3's record is in BOTH places,
         // and must land exactly once.
@@ -926,6 +1024,21 @@ mod tests {
         assert!(summary.unrecovered.iter().any(|item| item.source
             == UnrecoveredEvidenceSource::SurvivingDirectory
             && item.file_name == "attempt-4.json"));
+
+        // The damaged directory is evidence, not a second replay workspace.
+        // A direct drain would remove the duplicate record and quarantine the
+        // two rejected records; a snapshot replay leaves every source byte in
+        // place while still recovering the restored ledger.
+        for (name, expected) in surviving_before_restore {
+            assert_eq!(
+                fs::read(state_dir.join("pending").join(name)).unwrap(),
+                expected
+            );
+        }
+        assert!(
+            !state_dir.join("pending/quarantine").exists(),
+            "the recovery must not quarantine records in the damaged directory"
+        );
     }
 
     #[test]
