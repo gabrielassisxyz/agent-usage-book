@@ -1736,15 +1736,15 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     };
     let report = crate::ingest::run(&mut conn, &config, &options, clock, &mut batch_sink)?;
     println!(
-        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} batches={} generation={}",
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={}",
         report.sources.join(","),
         report.files_scanned,
         report.files_parsed,
         report.files_skipped,
         report.unreadable_files.len(),
         report.quarantined,
-        report.batches.len(),
         report.generation.value(),
+        report.batches.len(),
     );
     let outcome = &report.outcome;
     println!(

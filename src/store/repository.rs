@@ -82,11 +82,19 @@ impl Repository {
     /// against a database and a projection that agree.
     pub fn start_meter_attempt(&self, attempt: &NewMeterAttempt) -> Result<AttemptStarted, Error> {
         let mut conn = self.open_write()?;
-        let tx = conn.transaction().map_err(|error| {
-            Error::Store(format!(
-                "cannot open the attempt-start transaction: {error}"
-            ))
-        })?;
+        // IMMEDIATE, not deferred: a write transaction that starts as a read
+        // and upgrades at its first insert fails instantly with SQLITE_BUSY
+        // when another writer committed since its snapshot (WAL's
+        // BUSY_SNAPSHOT), and the busy timeout never runs. The meter's start
+        // must wait for the slot like any writer, so it takes the slot
+        // upfront.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot open the attempt-start transaction: {error}"
+                ))
+            })?;
         let row_id = meter_attempt::start_meter_attempt(&tx, attempt)?;
         ledger_generation::advance(&tx)?;
         tx.commit()
@@ -161,11 +169,17 @@ impl Repository {
         result: &NewMeterAttemptResult,
     ) -> Result<Publication, Error> {
         let mut conn = self.open_write()?;
-        let tx = conn.transaction().map_err(|error| {
-            Error::Store(format!(
-                "cannot open the terminal-result transaction: {error}"
-            ))
-        })?;
+        // IMMEDIATE for the same reason as every meter write below: a deferred
+        // start would race another writer's commit at its first insert and
+        // fail without waiting, which would spool evidence SQLite could have
+        // taken the slot for.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot open the terminal-result transaction: {error}"
+                ))
+            })?;
         meter_attempt::record_meter_attempt_result(&tx, result)?;
         ledger_generation::advance(&tx)?;
         tx.commit()
@@ -310,11 +324,19 @@ pub(crate) fn commit_terminal_bundle_on_connection(
     bundle: &TerminalMeterBundle,
     before_commit: impl FnOnce() -> Result<(), Error>,
 ) -> Result<TerminalBundleIds, Error> {
-    let tx = conn.transaction().map_err(|error| {
-        Error::Store(format!(
-            "cannot open the terminal-bundle transaction: {error}"
-        ))
-    })?;
+    // IMMEDIATE, not deferred: this is a write transaction, and a deferred
+    // start would take a read snapshot and then fail instantly with
+    // SQLITE_BUSY at the first insert whenever another writer committed in
+    // between (WAL's BUSY_SNAPSHOT path), spooling meter evidence that only
+    // needed to wait for the slot. Taking the write slot upfront makes the
+    // bounded busy timeout the real wait it is meant to be.
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|error| {
+            Error::Store(format!(
+                "cannot open the terminal-bundle transaction: {error}"
+            ))
+        })?;
 
     meter_attempt::record_meter_attempt_result(&tx, bundle.result())?;
     let evidence_id = meter_evidence::insert_response_evidence(&tx, bundle.evidence())?;
