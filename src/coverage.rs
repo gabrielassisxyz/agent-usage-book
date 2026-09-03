@@ -531,6 +531,26 @@ mod tests {
         );
     }
 
+    /// An interval whose only snapshot becomes effective mid-interval is also
+    /// `policy_unknown`: the head of the interval had no policy in force, and the
+    /// engine refuses to evaluate it against the later configuration.
+    #[test]
+    fn an_interval_with_a_head_before_the_first_snapshot_is_policy_unknown() {
+        let report = compute(&inputs(
+            0,
+            3_600,
+            vec![snapshot(1_800, 300)],
+            vec![],
+            vec![],
+        ));
+        assert_eq!(report.expected_opportunities, None);
+        assert_eq!(report.attempt_coverage, None);
+        assert!(
+            render(&report).contains("policy unknown"),
+            "the report must name the unknown policy"
+        );
+    }
+
     /// Started attempts with no terminal result are counted separately from both
     /// coverage numbers.
     #[test]
