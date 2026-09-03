@@ -1,7 +1,7 @@
 aub: one ledger for LLM consumption
 
 usage: aub [-v...] <command> [--format text|json] [options]
-shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --no-color
+shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, --model MODEL, --no-color
 
 commands:
   status   render the last known meter reading per configured account
@@ -14,41 +14,41 @@ commands:
 
 status:
   answers: how much quota does each configured account have left?
-  refuses: --account (status reports every configured account); --no-color (status prints no color)
+  refuses: --no-color (status prints no color)
   format: text | json
 
 spend:
   answers: how many tokens did each transcript source use per UTC day?
-  refuses: --account (spend has no account dimension until account attribution lands); --no-color (spend prints no color)
+  refuses: --account (spend has no account dimension until account attribution lands); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
   options: --today (default) | --since YYYY-MM-DD | --days N
 
 config:
   answers: which configuration key resolved from where?
-  refuses: --format (config prints provenance, not a report); --explain (config derives no quantity); --account (config prints every account at once); --no-color (config prints no color)
+  refuses: --format (config prints provenance, not a report); --explain (config derives no quantity); --account (config prints every account at once); --model (config prints every key at once); --no-color (config prints no color)
   format: text only: config prints provenance, not a report
   options: --set key=value (repeatable), --config-file PATH
 
 export:
   answers: which usage did each session or run consume, as a versioned JSONL ledger for an external join?
-  refuses: --format (export is always versioned JSONL); --explain (export derives no quantity); --account (export reads every stored session, not one account); --no-color (export prints no color)
+  refuses: --format (export is always versioned JSONL); --explain (export derives no quantity); --account (export reads every stored session, not one account); --model (export keys on session or run, not on a model); --no-color (export prints no color)
   format: text only: export is always versioned JSONL
   options: --key session-id|run-id (required), --include-logical-ids
 
 rate-card:
   answers: what do the immutable dated vendor rate cards contain?
-  refuses: --format (rate-card prints a price book, not a report); --explain (rate-card derives no quantity); --account (the rate book is reference data, not per-account state); --no-color (rate-card prints plain rows)
+  refuses: --format (rate-card prints a price book, not a report); --explain (rate-card derives no quantity); --account (the rate book is reference data, not per-account state); --model (the rate book is reference data, not per-model state); --no-color (rate-card prints plain rows)
   format: text only: rate-card prints a price book, not a report
 
 backup:
   answers: is there a consistent, verified archive of the durable state, and does it restore?
-  refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --no-color (backup prints no color)
+  refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --model (backup covers the whole ledger); --no-color (backup prints no color)
   format: text only: backup prints one operational result
   options: DESTINATION | verify DESTINATION
 
 doctor:
   answers: is the recorded evidence healthy, and does the transcript corpus still match its parsers?
-  refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
+  refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --model (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
   format: text | json
   options: --transcript-format-drift
 

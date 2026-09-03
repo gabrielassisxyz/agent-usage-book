@@ -1,34 +1,48 @@
-# The status command exits zero, emits a structured diagnostic event on stderr at
-# raised verbosity, and renders each configured account's meter reading through
-# the presentation layer: an account with no attempt history renders as never
-# successfully observed, never as the placeholder.
+# The status command reads the projection and nothing else: the degraded
+# question mark when the projection is missing, the never-observed rendering
+# for an account the projection says nothing about, and a structured
+# diagnostic run event on stderr at raised verbosity.
 
 CASE_ID="002-status"
-CASE_DESCRIPTION="The status command renders each configured account's reading through the presentation layer."
+CASE_DESCRIPTION="status renders the projection or the degraded question mark, and never blocks."
 
 CONFIG_FILE=""
 
 case_preconditions() {
     CONFIG_FILE="$STATE_DIR/aub.toml"
-    cat > "$CONFIG_FILE" <<'EOF'
+    cat > "$CONFIG_FILE" <<EOT
+state.dir = "$STATE_DIR/state"
+
 [[accounts]]
 name = "work-primary"
 provider = "provider-a"
-EOF
+EOT
+    mkdir -p "$STATE_DIR/state"
 }
 
 case_steps() {
-    step "status" env \
-        "HOME=$STATE_DIR/home" \
-        "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        "$AUB_BIN" -v status
+    step "status without projection" \
+        env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status
+    step "status verbose" \
+        env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" -v status
+    # The case seeds a projection for an account with no observation and no
+    # attempt: the state on disk is then the fixture the third step reads, and
+    # the step digests record exactly when it appeared.
+    cat > "$STATE_DIR/state/projection" <<EOT
+{"schema_version":1,"ledger_generation":12,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"provider-a","last_successful_observation":null,"latest_attempt":null}]}
+EOT
+    step "status with projection" \
+        env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status
 }
 
 case_assertions() {
+    # Missing projection: exit zero, the degraded question mark, no account
+    # value substituted for the readings that cannot exist.
     assert_exit 0 1
-    assert_stderr_contains 1 "run_started"
-    # Real rendered content from the presentation layer: the configured account
-    # name and the never-observed reading, not the placeholder string.
-    assert_stdout_contains 1 "work-primary"
-    assert_stdout_contains 1 "no successful sample"
+    assert_golden 1 "$REPO_ROOT/tests/e2e/status-missing-projection.txt"
+    assert_stdout_equals 1 "aub ?"
+    assert_exit 0 2
+    assert_stderr_contains 2 "run_started"
+    assert_exit 0 3
+    assert_stdout_contains 3 "aub work-primary ? · stale · no successful sample"
 }
