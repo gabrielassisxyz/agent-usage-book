@@ -86,6 +86,16 @@ neither a fresh backup nor a re-check can claim `verified=true` on faith.
 to the configured state directory: a restore only ever writes into a new
 directory, and the damaged state directory is never a valid destination.
 
+## `aub drill`
+
+**Answers:** does the documented recovery procedure actually recover a damaged state
+directory, and is that still true today?
+
+**Refuses:** to drill against the live state directory. Every case runs against a scratch
+destination given on the command line, because a drill that damages the thing it is meant
+to prove recoverable has proved the opposite. It also refuses `--account` and `--model`: a
+drill exercises the whole state directory, not one slice of it.
+
 ## `aub ingest`
 
 **Answers:** have the transcript-derived tables been refreshed from the
