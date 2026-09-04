@@ -47,7 +47,7 @@ same thing in both documents.
 | 16 | The projection is disposable and contains no stored freshness boolean. | src/projection.rs | tests::deleting_the_projection_and_republishing_reproduces_it_byte_for_byte |
 | 17 | Task ambiguity becomes explicit overhead. | src/attribution/segment.rs | tests::task_attributed_plus_overhead_equals_total_input_usage |
 | 18 | Dollar valuation and subscription credits are distinct dimensions. | tests/valuation.rs | tests::golden_hand_computed_exact_decimal_fixtures |
-| 19 | Meter residual is diagnostic and is not automatically called hidden token spend. | unenforced aub-dpn | (unexplained residual test) |
+| 19 | Meter residual is diagnostic and is not automatically called hidden token spend. | tests/reconciliation.rs | unit_diagnostic_patterns_reported_as_patterns_not_causes |
 | 20 | Estimated transcript usage is never silently promoted to measured usage. | src/evidence.rs | tests::quality_combine_never_recovers_measured_from_estimated |
 | 21 | The friction ledger remains external and joins only through stable IDs. | tests/export.rs | tests::both_key_modes_produce_one_object_per_line_with_version_and_generations |
 | 22 | Irreplaceable meter history is backed up and never automatically pruned. | tests/backup.rs | a_backup_is_not_a_blind_file_copy_of_a_live_wal_database |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 22 are enforced by mechanical checks present at HEAD (file paths and tests), and 5 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 23 are enforced by mechanical checks present at HEAD (file paths and tests), and 4 are unenforced and tracked by open beads in the tracker.
