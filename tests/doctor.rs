@@ -715,3 +715,366 @@ fn not_applicable_checks_provide_non_empty_reason() {
         "at least one check is not applicable with non-empty reason"
     );
 }
+
+fn run_aub(state_dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let config_path = state_dir.join("aub.toml");
+    if !config_path.exists() {
+        let toml = format!("[state]\ndir = {:?}\n", state_dir);
+        fs::write(&config_path, toml).expect("write config");
+    }
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_aub"))
+        .env("HOME", state_dir.join("home"))
+        .env("AUB_CONFIG_FILE", &config_path)
+        .args(args)
+        .output()
+        .expect("aub must execute");
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).into_owned(),
+        String::from_utf8_lossy(&out.stderr).into_owned(),
+    )
+}
+
+#[test]
+fn accumulated_diagnostic_material_empty_store_reports_zero() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let check = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::AccumulatedDiagnosticMaterial)
+        .expect("accumulated-diagnostic-material must be registered");
+    assert_eq!(check.owner_module, "store::retention");
+    assert_eq!(
+        check.condition,
+        "retained diagnostic capture material does not accumulate unnoticed"
+    );
+    assert!(!check.has_repair);
+    assert_eq!(
+        check.status,
+        CheckStatus::PassWithDetail(
+            "retained bodies: 0 (0 bytes); quarantine rows: 0; quarantine rows are not cleared by the clearing path".to_string()
+        )
+    );
+}
+
+#[test]
+fn check_fails_accumulated_diagnostic_material() {
+    use agent_usage_book::store::ingest_quarantine::{NewQuarantineItem, record_quarantine};
+    use agent_usage_book::store::retention::store_retained_body;
+
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let q_item = NewQuarantineItem {
+        source_file: "transcripts/claude.jsonl".to_string(),
+        byte_offset: Some(12),
+        line_number: Some(1),
+        parser: "claude-code".to_string(),
+        failure_class: "malformed_json".to_string(),
+        excerpt_hash: "hash123".to_string(),
+        excerpt: None,
+        observed_at: ts(1_700_000_000),
+    };
+    record_quarantine(&conn, &q_item).unwrap();
+
+    store_retained_body(
+        state.path(),
+        "anthropic",
+        "messages",
+        b"{\"error\":\"bad_request\"}",
+        ts(1_700_000_001),
+    )
+    .unwrap();
+    store_retained_body(
+        state.path(),
+        "anthropic",
+        "messages",
+        b"{\"error\":\"rate_limit\"}",
+        ts(1_700_000_001),
+    )
+    .unwrap();
+    store_retained_body(
+        state.path(),
+        "openai",
+        "responses",
+        b"server error",
+        ts(1_700_000_001),
+    )
+    .unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_002),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let check = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::AccumulatedDiagnosticMaterial)
+        .expect("accumulated-diagnostic-material must be registered");
+
+    match &check.status {
+        CheckStatus::Fail(detail) => {
+            assert!(
+                detail.contains("retained bodies: 3 (57 bytes)"),
+                "detail: {detail}"
+            );
+            assert!(
+                detail.contains("anthropic/messages: 2 (45 bytes)"),
+                "detail: {detail}"
+            );
+            assert!(
+                detail.contains("openai/responses: 1 (12 bytes)"),
+                "detail: {detail}"
+            );
+            assert!(
+                detail.contains("quarantine rows: 1 [claude-code: 1]"),
+                "detail: {detail}"
+            );
+            assert!(
+                detail.contains("quarantine rows are not cleared by the clearing path"),
+                "detail: {detail}"
+            );
+        }
+        other => panic!("expected CheckStatus::Fail, got {other:?}"),
+    }
+}
+
+#[test]
+fn clearing_command_removes_retained_bodies_and_agrees_with_doctor() {
+    use agent_usage_book::store::ingest_quarantine::{NewQuarantineItem, record_quarantine};
+    use agent_usage_book::store::retention::{count_retained_bodies, store_retained_body};
+
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let q_item = NewQuarantineItem {
+        source_file: "transcripts/claude.jsonl".to_string(),
+        byte_offset: None,
+        line_number: Some(5),
+        parser: "claude-code".to_string(),
+        failure_class: "malformed_json".to_string(),
+        excerpt_hash: "qhash999".to_string(),
+        excerpt: None,
+        observed_at: ts(1_700_000_000),
+    };
+    record_quarantine(&conn, &q_item).unwrap();
+    drop(conn);
+
+    store_retained_body(
+        state.path(),
+        "anthropic",
+        "messages",
+        b"payload-1",
+        ts(1_700_000_001),
+    )
+    .unwrap();
+    store_retained_body(
+        state.path(),
+        "anthropic",
+        "messages",
+        b"payload-2",
+        ts(1_700_000_001),
+    )
+    .unwrap();
+    store_retained_body(
+        state.path(),
+        "openai",
+        "completions",
+        b"payload-3",
+        ts(1_700_000_001),
+    )
+    .unwrap();
+
+    let (code, stdout, _) = run_aub(state.path(), &["doctor", "--format", "json"]);
+    assert_eq!(code, 0, "doctor command finishes successfully: {stdout}");
+    assert!(stdout.contains("\"accumulated-diagnostic-material\""));
+    assert!(stdout.contains("\"fail\""));
+
+    let (code, stdout, _) = run_aub(
+        state.path(),
+        &["clear-diagnostics", "--provider", "anthropic"],
+    );
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Cleared 2 retained bodies"));
+    assert!(stdout.contains("for provider 'anthropic'"));
+    assert_eq!(count_retained_bodies(state.path()).unwrap().0, 1);
+
+    let (code, stdout, _) = run_aub(state.path(), &["clear-captures", "--all"]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("Cleared 1 retained body"));
+    assert!(stdout.contains("in total"));
+    assert_eq!(count_retained_bodies(state.path()).unwrap().0, 0);
+
+    let (code, stdout, _) = run_aub(state.path(), &["doctor", "--format", "json"]);
+    assert_eq!(
+        code, 0,
+        "doctor passes when diagnostic captures are cleared: {stdout}"
+    );
+    let doc: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    let checks = doc["checks"].as_array().unwrap();
+    let diag_check = checks
+        .iter()
+        .find(|c| c["name"] == "accumulated-diagnostic-material")
+        .unwrap();
+    assert_eq!(diag_check["status"], "pass");
+    let reason = diag_check["reason"].as_str().unwrap();
+    assert!(reason.contains("retained bodies: 0 (0 bytes)"));
+    assert!(reason.contains("quarantine rows: 1 [claude-code: 1]"));
+    assert!(reason.contains("quarantine rows are not cleared by the clearing path"));
+}
+
+#[test]
+fn clearing_command_never_removes_quarantine_rows() {
+    use agent_usage_book::store::ingest_quarantine::{NewQuarantineItem, record_quarantine};
+    use agent_usage_book::store::retention::store_retained_body;
+
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let q1 = NewQuarantineItem {
+        source_file: "file1.jsonl".to_string(),
+        byte_offset: None,
+        line_number: Some(1),
+        parser: "claude-code".to_string(),
+        failure_class: "err1".to_string(),
+        excerpt_hash: "hash_one".to_string(),
+        excerpt: None,
+        observed_at: ts(100),
+    };
+    let q2 = NewQuarantineItem {
+        source_file: "file2.jsonl".to_string(),
+        byte_offset: None,
+        line_number: Some(2),
+        parser: "codex".to_string(),
+        failure_class: "err2".to_string(),
+        excerpt_hash: "hash_two".to_string(),
+        excerpt: None,
+        observed_at: ts(200),
+    };
+    record_quarantine(&conn, &q1).unwrap();
+    record_quarantine(&conn, &q2).unwrap();
+    drop(conn);
+
+    store_retained_body(state.path(), "anthropic", "messages", b"debug", ts(100)).unwrap();
+
+    let (code, _, _) = run_aub(state.path(), &["clear-diagnostics", "--all"]);
+    assert_eq!(code, 0);
+
+    let conn = open_ledger(state.path());
+    let count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM ingest_quarantine", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        count, 2,
+        "quarantine rows must never be removed by clearing command"
+    );
+
+    let mut stmt = conn
+        .prepare("SELECT excerpt_hash FROM ingest_quarantine ORDER BY id")
+        .unwrap();
+    let hashes: Vec<String> = stmt
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .map(|r| r.unwrap())
+        .collect();
+    assert_eq!(hashes, vec!["hash_one".to_string(), "hash_two".to_string()]);
+}
+
+#[test]
+fn clearing_retained_bodies_leaves_status_and_coverage_byte_identical() {
+    use agent_usage_book::store::retention::store_retained_body;
+
+    let state = StateDir::new();
+    let _conn = open_ledger(state.path());
+
+    let (code_status, status_txt_before, _) = run_aub(state.path(), &["status"]);
+    assert_eq!(code_status, 0);
+    let (code_status_json, status_json_before, _) =
+        run_aub(state.path(), &["status", "--format", "json"]);
+    assert_eq!(code_status_json, 0);
+
+    let (code_cov, cov_txt_before, _) = run_aub(state.path(), &["coverage"]);
+    assert_eq!(code_cov, 0);
+    let (code_cov_json, cov_json_before, _) =
+        run_aub(state.path(), &["coverage", "--format", "json"]);
+    assert_eq!(code_cov_json, 0);
+
+    for i in 0..10 {
+        store_retained_body(
+            state.path(),
+            "anthropic",
+            "messages",
+            format!("capture-{i}").as_bytes(),
+            ts(1_700_000_000),
+        )
+        .unwrap();
+    }
+
+    let (code_clear, stdout_clear, _) = run_aub(state.path(), &["clear-diagnostics", "--all"]);
+    assert_eq!(code_clear, 0);
+    assert!(stdout_clear.contains("Cleared 10 retained bodies"));
+
+    let (code_status, status_txt_after, _) = run_aub(state.path(), &["status"]);
+    assert_eq!(code_status, 0);
+    let (code_status_json, status_json_after, _) =
+        run_aub(state.path(), &["status", "--format", "json"]);
+    assert_eq!(code_status_json, 0);
+
+    let (code_cov, cov_txt_after, _) = run_aub(state.path(), &["coverage"]);
+    assert_eq!(code_cov, 0);
+    let (code_cov_json, cov_json_after, _) =
+        run_aub(state.path(), &["coverage", "--format", "json"]);
+    assert_eq!(code_cov_json, 0);
+
+    assert_eq!(
+        status_txt_before, status_txt_after,
+        "aub status text output must be byte-identical before and after clearing retained bodies"
+    );
+    assert_eq!(
+        cov_txt_before, cov_txt_after,
+        "aub coverage text output must be byte-identical before and after clearing retained bodies"
+    );
+
+    let mut doc_status_before: serde_json::Value =
+        serde_json::from_str(&status_json_before).unwrap();
+    let mut doc_status_after: serde_json::Value = serde_json::from_str(&status_json_after).unwrap();
+    doc_status_before["run"] = serde_json::json!("normalized");
+    doc_status_before["generated_at"] = serde_json::json!(0);
+    doc_status_before["knowledge_at"] = serde_json::json!(0);
+    doc_status_after["run"] = serde_json::json!("normalized");
+    doc_status_after["generated_at"] = serde_json::json!(0);
+    doc_status_after["knowledge_at"] = serde_json::json!(0);
+    assert_eq!(
+        doc_status_before, doc_status_after,
+        "stored measurements and quota readings must be identical before and after clearing"
+    );
+
+    let mut doc_cov_before: serde_json::Value = serde_json::from_str(&cov_json_before).unwrap();
+    let mut doc_cov_after: serde_json::Value = serde_json::from_str(&cov_json_after).unwrap();
+    doc_cov_before["run"] = serde_json::json!("normalized");
+    doc_cov_before["generated_at"] = serde_json::json!(0);
+    doc_cov_before["knowledge_at"] = serde_json::json!(0);
+    doc_cov_before["interval"] = serde_json::json!("normalized");
+    doc_cov_after["run"] = serde_json::json!("normalized");
+    doc_cov_after["generated_at"] = serde_json::json!(0);
+    doc_cov_after["knowledge_at"] = serde_json::json!(0);
+    doc_cov_after["interval"] = serde_json::json!("normalized");
+    assert_eq!(
+        doc_cov_before, doc_cov_after,
+        "coverage figures must be identical before and after clearing"
+    );
+}

@@ -87,6 +87,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         heuristic_dedup_counts(ctx),
         clock_skew(ctx),
         local_filesystem_and_wal_suitability(ctx),
+        accumulated_diagnostic_material(ctx),
     ]
 }
 
@@ -139,6 +140,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::HeuristicDedupCounts => "store::ingest_quarantine",
         CheckName::ClockSkew => "doctor",
         CheckName::LocalFilesystemAndWalSuitability => "store::startup",
+        CheckName::AccumulatedDiagnosticMaterial => "store::retention",
     }
 }
 
@@ -180,6 +182,9 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::LocalFilesystemAndWalSuitability => {
             "the state directory is local, mode 0700 and writable"
+        }
+        CheckName::AccumulatedDiagnosticMaterial => {
+            "retained diagnostic capture material does not accumulate unnoticed"
         }
     }
 }
@@ -770,6 +775,74 @@ fn local_filesystem_and_wal_suitability(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::LocalFilesystemAndWalSuitability, status)
 }
 
+/// Reports accumulated diagnostic material: retained bodies per provider and source,
+/// total bytes occupied, and quarantine rows.
+///
+/// Retained bodies are disposable captures cleared by operator command. Quarantine
+/// rows record parse and dedup failures and are never cleared by the clearing path.
+fn accumulated_diagnostic_material(ctx: &DoctorContext) -> CheckOutcome {
+    let summaries =
+        crate::store::retention::list_retained_bodies(&ctx.config.state.dir).unwrap_or_default();
+    let total_retained: u64 = summaries.iter().map(|s| s.count).sum();
+    let total_bytes: u64 = summaries.iter().map(|s| s.total_bytes).sum();
+
+    let mut quarantine_by_source: std::collections::BTreeMap<String, u64> =
+        std::collections::BTreeMap::new();
+    if let Some(conn) = ctx.db
+        && let Ok(groups) = crate::store::ingest_quarantine::quarantine_summary(conn)
+    {
+        for group in groups {
+            *quarantine_by_source.entry(group.parser).or_insert(0) += group.count;
+        }
+    }
+    let total_quarantine: u64 = quarantine_by_source.values().sum();
+
+    let retained_part = if total_retained == 0 {
+        "retained bodies: 0 (0 bytes)".to_string()
+    } else {
+        let details: Vec<String> = summaries
+            .iter()
+            .map(|s| {
+                format!(
+                    "{}/{}: {} ({} bytes)",
+                    s.provider, s.source, s.count, s.total_bytes
+                )
+            })
+            .collect();
+        format!(
+            "retained bodies: {} ({} bytes) [{}]",
+            total_retained,
+            total_bytes,
+            details.join(", ")
+        )
+    };
+
+    let quarantine_part = if total_quarantine == 0 {
+        "quarantine rows: 0".to_string()
+    } else {
+        let details: Vec<String> = quarantine_by_source
+            .iter()
+            .map(|(source, count)| format!("{source}: {count}"))
+            .collect();
+        format!(
+            "quarantine rows: {total_quarantine} [{}]",
+            details.join(", ")
+        )
+    };
+
+    let detail = format!(
+        "{retained_part}; {quarantine_part}; quarantine rows are not cleared by the clearing path"
+    );
+
+    let status = if total_retained > 0 {
+        CheckStatus::Fail(detail)
+    } else {
+        CheckStatus::PassWithDetail(detail)
+    };
+
+    outcome(CheckName::AccumulatedDiagnosticMaterial, status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -988,6 +1061,7 @@ mod tests {
                 assert!(!message.contains("backup:"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
                 panic!("expected a failure naming the missing drill record")
@@ -1043,6 +1117,7 @@ mod tests {
                 assert!(!message.contains("backup:"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
                 panic!("expected a failure naming only the stale drill")
@@ -1096,6 +1171,7 @@ mod tests {
                 assert!(!message.contains("drill:"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
                 panic!("expected a failure naming only the stale backup")

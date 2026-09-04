@@ -185,6 +185,20 @@ impl SessionAccountMarker {
     pub fn evidence_designation(&self) -> EvidenceDesignation {
         self.evidence_designation
     }
+
+    /// This row as the segmentation algorithm's input boundary. The mapping is
+    /// treated as validated: a persisted marker was accepted at write time, and
+    /// the flag is only consulted for the credential-mapping class anyway
+    /// (`AccountMarkerBoundary::effective_evidence_class`).
+    pub fn boundary(&self) -> crate::attribution::account_segment::AccountMarkerBoundary {
+        crate::attribution::account_segment::AccountMarkerBoundary::new(
+            self.logical_account.clone(),
+            self.observed_at,
+            self.source_ordering_key.map(SourceOrderingKey::value),
+            self.evidence_designation.into(),
+            true,
+        )
+    }
 }
 
 /// Parameters for creating a new session-account marker.

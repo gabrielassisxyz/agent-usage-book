@@ -742,12 +742,50 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ));
     }
     if explain != ExplainMode::Off {
-        body.push_str(&format!(
-            ",\"explain\":{}",
-            explain_json(&report.provenance, explain)
-        ));
+        // explain_json always yields a `{...}` object; splice the spend-only
+        // account_groups array in before its closing brace rather than
+        // widening the signature shared by status, now, coverage and export.
+        let mut explain_body = explain_json(&report.provenance, explain);
+        if !report.account_explain.is_empty() {
+            explain_body.pop();
+            explain_body.push_str(&format!(
+                ",\"account_groups\":[{}]}}",
+                account_groups_json(&report.account_explain)
+            ));
+        }
+        body.push_str(&format!(",\"explain\":{explain_body}"));
     }
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// The marker evidence behind every account group, mirroring the human
+/// `account explain:` block so a contract test can assert the two carry
+/// identical references and evidence classes (aub-mgv.4).
+fn account_groups_json(groups: &[crate::report::AccountGroupExplain]) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            let markers = group
+                .markers
+                .iter()
+                .map(|marker| {
+                    format!(
+                        "{{\"reference\":{},\"logical_account\":{},\"evidence_class\":{}}}",
+                        json_string(&marker.reference),
+                        json_string(&marker.logical_account),
+                        json_string(marker.evidence_class.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"key\":{},\"evidence_class\":{},\"markers\":[{markers}]}}",
+                json_string(group.key.as_str()),
+                json_string(group.evidence_class.as_str()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn spend_group_json(group: &crate::report::SpendGroup) -> String {
@@ -1233,7 +1271,8 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
             );
             match &outcome.status {
                 crate::doctor::CheckStatus::Fail(reason)
-                | crate::doctor::CheckStatus::NotApplicable(reason) => {
+                | crate::doctor::CheckStatus::NotApplicable(reason)
+                | crate::doctor::CheckStatus::PassWithDetail(reason) => {
                     fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
                 }
                 crate::doctor::CheckStatus::NotYetAvailable { owning_bead } => {
@@ -1282,6 +1321,25 @@ pub fn fix_report_json(
     let metadata =
         crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
     JsonEnvelope::new("doctor", run, metadata).to_json_with(&body)
+}
+
+/// Serializes a diagnostic capture clearing report into a JSON envelope.
+pub fn clear_diagnostics_json(
+    report: &crate::report::ClearDiagnosticsReport,
+    run: RunId,
+    at: crate::domain::time::UtcTimestamp,
+) -> String {
+    let provider_str = match &report.provider_filter {
+        Some(p) => json_string(p),
+        None => "null".to_string(),
+    };
+    let body = format!(
+        "\"provider\":{},\"entries_removed\":{},\"bytes_removed\":{}",
+        provider_str, report.entries_removed, report.bytes_removed
+    );
+    let metadata =
+        crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
+    JsonEnvelope::new("clear-diagnostics", run, metadata).to_json_with(&body)
 }
 
 /// Serializes a provenance graph into its JSON explain representation.

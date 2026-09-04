@@ -14,12 +14,16 @@
 //! maintenance pruning physically cannot address irreplaceable classes.
 
 use std::collections::BTreeSet;
+use std::fs;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 
 use rusqlite::Connection;
 
 use crate::domain::rows::RowCount;
-use crate::domain::time::Clock;
+use crate::domain::time::{Clock, UtcTimestamp};
 use crate::error::Error;
+use crate::store::startup::{create_file_mode_0600, ensure_dir_mode_0700};
 
 /// The durability classification for persisted state (PLAN.md 6, 11.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -821,6 +825,346 @@ pub fn audit_retention_health(conn: &Connection) -> Result<RetentionDoctorReport
     })
 }
 
+/// Maximum number of retained bodies per provider and per source.
+///
+/// Circular buffer bounded by count (PLAN.md 11.5, aub-2r3, aub-smqu),
+/// discarded by count, no clock.
+pub const RETAINED_BODIES_MAX_PER_SOURCE: usize = 100;
+
+/// The directory name under the state directory that holds retained bodies.
+pub const RETAINED_BODIES_DIR_NAME: &str = "retained-bodies";
+
+/// One stored retained provider body record on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedBodyRecord {
+    pub sequence: u64,
+    pub provider: String,
+    pub source: String,
+    pub captured_at_nanos: i64,
+    pub body_bytes: Vec<u8>,
+}
+
+impl RetainedBodyRecord {
+    pub fn byte_len(&self) -> u64 {
+        self.body_bytes.len() as u64
+    }
+
+    pub fn to_json(&self) -> String {
+        serde_json::json!({
+            "sequence": self.sequence,
+            "provider": self.provider,
+            "source": self.source,
+            "captured_at_nanos": self.captured_at_nanos,
+            "body_bytes": self.body_bytes,
+        })
+        .to_string()
+    }
+
+    pub fn from_json(text: &str) -> Result<Self, String> {
+        let val: serde_json::Value =
+            serde_json::from_str(text).map_err(|e| format!("invalid JSON: {e}"))?;
+        let sequence = val
+            .get("sequence")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| "missing sequence".to_string())?;
+        let provider = val
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing provider".to_string())?
+            .to_string();
+        let source = val
+            .get("source")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "missing source".to_string())?
+            .to_string();
+        let captured_at_nanos = val
+            .get("captured_at_nanos")
+            .and_then(|v| v.as_i64())
+            .ok_or_else(|| "missing captured_at_nanos".to_string())?;
+        let body_bytes = if let Some(arr) = val.get("body_bytes").and_then(|v| v.as_array()) {
+            arr.iter()
+                .filter_map(|b| b.as_u64().map(|n| n as u8))
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Ok(Self {
+            sequence,
+            provider,
+            source,
+            captured_at_nanos,
+            body_bytes,
+        })
+    }
+}
+
+/// Summary of retained bodies for one provider and source combination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetainedBodySummary {
+    pub provider: String,
+    pub source: String,
+    pub count: u64,
+    pub total_bytes: u64,
+}
+
+/// Report emitted when clearing retained diagnostic bodies.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearDiagnosticsReport {
+    pub entries_removed: u64,
+    pub bytes_removed: u64,
+    pub provider_filter: Option<String>,
+}
+
+/// Returns the path to the retained-bodies directory in the given state directory.
+pub fn retained_bodies_dir(state_dir: &Path) -> PathBuf {
+    state_dir.join(RETAINED_BODIES_DIR_NAME)
+}
+
+fn sanitize_path_segment(segment: &str) -> String {
+    let clean: String = segment
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if clean.is_empty() {
+        "unknown".to_string()
+    } else {
+        clean
+    }
+}
+
+/// Stores a retained provider body in the circular buffer under the state directory.
+///
+/// Discards oldest entries strictly by sequence (FIFO) when the count exceeds
+/// [`RETAINED_BODIES_MAX_PER_SOURCE`]. Eviction is never triggered by age.
+pub fn store_retained_body(
+    state_dir: &Path,
+    provider: &str,
+    source: &str,
+    body: &[u8],
+    captured_at: UtcTimestamp,
+) -> Result<u64, Error> {
+    let clean_provider = sanitize_path_segment(provider);
+    let clean_source = sanitize_path_segment(source);
+    let dir = retained_bodies_dir(state_dir)
+        .join(&clean_provider)
+        .join(&clean_source);
+    ensure_dir_mode_0700(&dir)?;
+
+    let mut existing_sequences: Vec<(u64, PathBuf)> = Vec::new();
+    if let Ok(entries) = fs::read_dir(&dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("json")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && let Ok(seq) = stem.parse::<u64>()
+            {
+                existing_sequences.push((seq, path));
+            }
+        }
+    }
+
+    let next_seq = existing_sequences
+        .iter()
+        .map(|(s, _)| *s)
+        .max()
+        .unwrap_or(0)
+        + 1;
+
+    let record = RetainedBodyRecord {
+        sequence: next_seq,
+        provider: provider.to_string(),
+        source: source.to_string(),
+        captured_at_nanos: captured_at.unix_nanos(),
+        body_bytes: body.to_vec(),
+    };
+
+    let payload = record.to_json();
+
+    let tmp_path = dir.join(format!("{next_seq:020}.tmp"));
+    let final_path = dir.join(format!("{next_seq:020}.json"));
+
+    let mut file = create_file_mode_0600(&tmp_path)?;
+    file.write_all(payload.as_bytes())
+        .map_err(|e| Error::Store(format!("cannot write retained body: {e}")))?;
+    file.sync_all()
+        .map_err(|e| Error::Store(format!("cannot sync retained body: {e}")))?;
+    drop(file);
+
+    fs::rename(&tmp_path, &final_path)
+        .map_err(|e| Error::Store(format!("cannot commit retained body: {e}")))?;
+
+    existing_sequences.push((next_seq, final_path));
+    existing_sequences.sort_by_key(|(s, _)| *s);
+
+    if existing_sequences.len() > RETAINED_BODIES_MAX_PER_SOURCE {
+        let excess = existing_sequences.len() - RETAINED_BODIES_MAX_PER_SOURCE;
+        for (_, old_path) in &existing_sequences[..excess] {
+            let _ = fs::remove_file(old_path);
+        }
+    }
+
+    Ok(next_seq)
+}
+
+/// Lists summaries of retained bodies grouped by provider and source.
+pub fn list_retained_bodies(state_dir: &Path) -> Result<Vec<RetainedBodySummary>, Error> {
+    let root = retained_bodies_dir(state_dir);
+    if !root.is_dir() {
+        return Ok(Vec::new());
+    }
+
+    let mut summaries = Vec::new();
+    let provider_entries = fs::read_dir(&root)
+        .map_err(|e| Error::Store(format!("cannot read retained-bodies dir: {e}")))?;
+
+    for p_entry in provider_entries.flatten() {
+        let p_path = p_entry.path();
+        if !p_path.is_dir() {
+            continue;
+        }
+        let provider_name = p_entry.file_name().to_string_lossy().to_string();
+        let source_entries = match fs::read_dir(&p_path) {
+            Ok(se) => se,
+            Err(_) => continue,
+        };
+        for s_entry in source_entries.flatten() {
+            let s_path = s_entry.path();
+            if !s_path.is_dir() {
+                continue;
+            }
+            let source_name = s_entry.file_name().to_string_lossy().to_string();
+            let mut count = 0u64;
+            let mut total_bytes = 0u64;
+
+            if let Ok(file_entries) = fs::read_dir(&s_path) {
+                for f_entry in file_entries.flatten() {
+                    let f_path = f_entry.path();
+                    if f_path.is_file()
+                        && f_path.extension().and_then(|s| s.to_str()) == Some("json")
+                        && let Ok(text) = fs::read_to_string(&f_path)
+                        && let Ok(record) = RetainedBodyRecord::from_json(&text)
+                    {
+                        count += 1;
+                        total_bytes += record.byte_len();
+                    }
+                }
+            }
+
+            if count > 0 {
+                summaries.push(RetainedBodySummary {
+                    provider: provider_name.clone(),
+                    source: source_name,
+                    count,
+                    total_bytes,
+                });
+            }
+        }
+    }
+
+    summaries.sort_by(|a, b| (&a.provider, &a.source).cmp(&(&b.provider, &b.source)));
+    Ok(summaries)
+}
+
+/// Computes the total count and total bytes of all retained bodies in the state directory.
+pub fn count_retained_bodies(state_dir: &Path) -> Result<(u64, u64), Error> {
+    let summaries = list_retained_bodies(state_dir)?;
+    let mut total_count = 0u64;
+    let mut total_bytes = 0u64;
+    for s in summaries {
+        total_count += s.count;
+        total_bytes += s.total_bytes;
+    }
+    Ok((total_count, total_bytes))
+}
+
+/// Clears retained provider bodies from the state directory, optionally scoped to one provider.
+///
+/// This function deletes retained body files only. It never touches database tables or quarantine rows.
+pub fn clear_retained_bodies(
+    state_dir: &Path,
+    provider_filter: Option<&str>,
+) -> Result<ClearDiagnosticsReport, Error> {
+    let root = retained_bodies_dir(state_dir);
+    if !root.is_dir() {
+        return Ok(ClearDiagnosticsReport {
+            entries_removed: 0,
+            bytes_removed: 0,
+            provider_filter: provider_filter.map(String::from),
+        });
+    }
+
+    let mut entries_removed = 0u64;
+    let mut bytes_removed = 0u64;
+
+    let target_providers: Vec<PathBuf> = if let Some(target_p) = provider_filter {
+        let clean = sanitize_path_segment(target_p);
+        let p_dir = root.join(&clean);
+        if p_dir.is_dir() {
+            vec![p_dir]
+        } else {
+            Vec::new()
+        }
+    } else {
+        let mut dirs = Vec::new();
+        if let Ok(entries) = fs::read_dir(&root) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    dirs.push(path);
+                }
+            }
+        }
+        dirs
+    };
+
+    for p_dir in target_providers {
+        if let Ok(source_entries) = fs::read_dir(&p_dir) {
+            for s_entry in source_entries.flatten() {
+                let s_path = s_entry.path();
+                if !s_path.is_dir() {
+                    continue;
+                }
+                if let Ok(file_entries) = fs::read_dir(&s_path) {
+                    for f_entry in file_entries.flatten() {
+                        let f_path = f_entry.path();
+                        if f_path.is_file()
+                            && f_path.extension().and_then(|s| s.to_str()) == Some("json")
+                        {
+                            if let Ok(text) = fs::read_to_string(&f_path)
+                                && let Ok(rec) = RetainedBodyRecord::from_json(&text)
+                            {
+                                bytes_removed += rec.byte_len();
+                            }
+                            if fs::remove_file(&f_path).is_ok() {
+                                entries_removed += 1;
+                            }
+                        }
+                    }
+                }
+                let _ = fs::remove_dir(&s_path);
+            }
+        }
+        let _ = fs::remove_dir(&p_dir);
+    }
+
+    if provider_filter.is_none() {
+        let _ = fs::remove_dir(&root);
+    }
+
+    Ok(ClearDiagnosticsReport {
+        entries_removed,
+        bytes_removed,
+        provider_filter: provider_filter.map(String::from),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1581,5 +1925,149 @@ mod tests {
                 "the refused rebuild must not have deleted from {class:?}"
             );
         }
+    }
+
+    struct TestDir(PathBuf);
+
+    impl TestDir {
+        fn new() -> Self {
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir()
+                .join(format!("aub-retention-test-dir-{}-{n}", std::process::id()));
+            let _ = fs::create_dir_all(&path);
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The circular buffer evicts the oldest entry at the 101st insert for one provider,
+    /// and an entry aged well past any plausible retention period is still present while
+    /// the buffer is under its bound. Eviction is never triggered by age.
+    #[test]
+    fn circular_buffer_evicts_at_101st_insert_fifo_never_by_age() {
+        let dir = TestDir::new();
+        let provider = "anthropic";
+        let source = "meter";
+
+        // Insert 100 entries with varying timestamps.
+        // Sequence 1 has a future timestamp.
+        // Sequence 50 has timestamp 0 (ancient).
+        for i in 1u64..=100u64 {
+            let ts = if i == 50 {
+                UtcTimestamp::from_unix_nanos(0)
+            } else if i == 1 {
+                UtcTimestamp::from_unix_nanos(2_000_000_000_000_000_000)
+            } else {
+                UtcTimestamp::from_unix_nanos(1_000_000_000_000_000_000 + (i as i64) * 1_000_000)
+            };
+            let body = format!("body payload {i}").into_bytes();
+            let seq = store_retained_body(dir.path(), provider, source, &body, ts).unwrap();
+            assert_eq!(seq, i);
+        }
+
+        let summaries = list_retained_bodies(dir.path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].count, 100);
+
+        // Ancient entry at sequence 50 must still be present under the bound.
+        let seq_50_path = retained_bodies_dir(dir.path())
+            .join(provider)
+            .join(source)
+            .join(format!("{:020}.json", 50));
+        assert!(
+            seq_50_path.is_file(),
+            "sequence 50 must still exist under bound"
+        );
+
+        // Insert 101st entry.
+        let ts_101 = UtcTimestamp::from_unix_nanos(1_500_000_000_000_000_000);
+        let seq_101 =
+            store_retained_body(dir.path(), provider, source, b"body payload 101", ts_101).unwrap();
+        assert_eq!(seq_101, 101);
+
+        let summaries = list_retained_bodies(dir.path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].count, 100);
+
+        // Oldest entry (sequence 1) must be evicted.
+        let seq_1_path = retained_bodies_dir(dir.path())
+            .join(provider)
+            .join(source)
+            .join(format!("{:020}.json", 1));
+        assert!(
+            !seq_1_path.exists(),
+            "sequence 1 must be evicted at 101st insert"
+        );
+
+        // Ancient entry at sequence 50 must still be present because FIFO eviction uses sequence, not age.
+        assert!(
+            seq_50_path.is_file(),
+            "sequence 50 with ancient timestamp must still survive after 101st insert"
+        );
+    }
+
+    /// The clearing command's scoping: clearing one provider leaves another
+    /// provider's retained bodies untouched.
+    #[test]
+    fn clearing_scoping_one_provider_cleared_leaves_other_providers_untouched() {
+        let dir = TestDir::new();
+        let ts = UtcTimestamp::from_unix_nanos(1_000_000_000);
+
+        store_retained_body(dir.path(), "anthropic", "meter", b"anthropic 1", ts).unwrap();
+        store_retained_body(dir.path(), "anthropic", "meter", b"anthropic 2", ts).unwrap();
+        store_retained_body(dir.path(), "openai", "meter", b"openai 1", ts).unwrap();
+        store_retained_body(dir.path(), "openai", "meter", b"openai 2", ts).unwrap();
+        store_retained_body(dir.path(), "openai", "meter", b"openai 3", ts).unwrap();
+
+        let (total_count, total_bytes) = count_retained_bodies(dir.path()).unwrap();
+        assert_eq!(total_count, 5);
+        assert_eq!(total_bytes, 11 + 11 + 8 + 8 + 8);
+
+        // Clear only anthropic.
+        let report = clear_retained_bodies(dir.path(), Some("anthropic")).unwrap();
+        assert_eq!(report.entries_removed, 2);
+        assert_eq!(report.bytes_removed, 22);
+        assert_eq!(report.provider_filter.as_deref(), Some("anthropic"));
+
+        // Openai entries remain intact.
+        let summaries = list_retained_bodies(dir.path()).unwrap();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].provider, "openai");
+        assert_eq!(summaries[0].count, 3);
+        assert_eq!(summaries[0].total_bytes, 24);
+
+        // Clear all remaining entries.
+        let report_all = clear_retained_bodies(dir.path(), None).unwrap();
+        assert_eq!(report_all.entries_removed, 3);
+        assert_eq!(report_all.bytes_removed, 24);
+        assert_eq!(report_all.provider_filter, None);
+
+        let (final_count, final_bytes) = count_retained_bodies(dir.path()).unwrap();
+        assert_eq!(final_count, 0);
+        assert_eq!(final_bytes, 0);
+    }
+
+    /// Entries aged well past any plausible retention period remain present while under bound.
+    #[test]
+    fn retained_bodies_under_bound_never_evicted_by_age() {
+        let dir = TestDir::new();
+        // Insert ancient entries from 1970.
+        for i in 1..=10 {
+            let ts = UtcTimestamp::from_unix_nanos(0);
+            let body = format!("ancient {i}").into_bytes();
+            store_retained_body(dir.path(), "provider_a", "source_x", &body, ts).unwrap();
+        }
+
+        let (count, _) = count_retained_bodies(dir.path()).unwrap();
+        assert_eq!(count, 10);
     }
 }

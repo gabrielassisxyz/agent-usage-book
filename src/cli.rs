@@ -81,6 +81,7 @@ aub_command_enum! {
     Import,
     Sample,
     Now,
+    ClearDiagnostics,
     Drill,
 }
 
@@ -110,7 +111,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -130,6 +131,7 @@ impl Command {
         Self::Import,
         Self::Sample,
         Self::Now,
+        Self::ClearDiagnostics,
         Self::Drill,
     ];
 
@@ -155,7 +157,7 @@ impl Command {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
-                    reason: "spend has no account dimension until account attribution lands",
+                    reason: "spend groups by account with --group-by account; it has no single-account filter",
                 },
                 model: FlagSupport::Rejected {
                     reason: "spend has no model dimension until a model selector is needed",
@@ -453,6 +455,22 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::ClearDiagnostics => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "clear-diagnostics derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "clear-diagnostics scopes by provider, not account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "clear-diagnostics takes no model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "clear-diagnostics prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::Drill => FlagPolicy {
                 format: FlagSupport::Rejected {
                     reason: "drill prints one operational result",
@@ -497,6 +515,7 @@ impl Command {
             Command::Import => "import",
             Command::Sample => "sample",
             Command::Now => "now",
+            Command::ClearDiagnostics => "clear-diagnostics",
             Command::Drill => "drill",
         }
     }
@@ -506,9 +525,9 @@ impl Command {
     pub fn summary(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
-            Command::Spend => {
-                Some("canonical token usage grouped by day, session, project or repository")
-            }
+            Command::Spend => Some(
+                "canonical token usage grouped by day, session, project, repository or account",
+            ),
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
             }
@@ -542,6 +561,7 @@ impl Command {
             Command::Now => Some(
                 "force a persisted sampling attempt for the selected accounts and render the resulting state",
             ),
+            Command::ClearDiagnostics => Some("clear retained diagnostic provider bodies"),
             Command::Drill => Some(
                 "damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive",
             ),
@@ -581,6 +601,7 @@ impl Command {
                 "are configured accounts due for meter sampling, and what did the endpoints observe?",
             ),
             Command::Now => Some("how much quota does each configured account have right now?"),
+            Command::ClearDiagnostics => Some("how many retained diagnostic bodies were cleared?"),
             Command::Drill => Some(
                 "does the documented recovery procedure actually recover a damaged state directory, and is that still true today?",
             ),
@@ -625,7 +646,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --credits | --refresh auto|never|force | --value api-list",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|account (repeatable) | --credits | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -644,6 +665,7 @@ impl Command {
             Command::Sample => Some(
                 "--due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success",
             ),
+            Command::ClearDiagnostics => Some("[--provider NAME | --all]"),
             Command::Drill => Some(
                 "--seed truncated-database|corrupted-projection|malformed-spool-record|unsupported-schema-version SCRATCH_DEST | --archive ARCHIVE SCRATCH_DEST",
             ),
@@ -660,6 +682,9 @@ impl Command {
     }
 
     fn from_name(name: &str) -> Option<Self> {
+        if name == "clear-captures" {
+            return Some(Self::ClearDiagnostics);
+        }
         Self::ALL.into_iter().find(|command| command.name() == name)
     }
 }
@@ -957,6 +982,9 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Now => {
             reject_positionals(&invocation)?;
             now_command(&RealClock::new(), level, &invocation)
+        }
+        Command::ClearDiagnostics => {
+            clear_diagnostics_command(&RealClock::new(), level, &invocation)
         }
         Command::Drill => drill_command(&RealClock::new(), &invocation),
     }
@@ -2303,8 +2331,9 @@ fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
         "session" => Ok(SpendGrouping::Session),
         "project" => Ok(SpendGrouping::Project),
         "repository" | "repo" => Ok(SpendGrouping::Repository),
+        "account" => Ok(SpendGrouping::Account),
         _ => Err(Error::Usage(format!(
-            "--group-by must be day, session, project or repository, got {value}"
+            "--group-by must be day, session, project, repository or account, got {value}"
         ))),
     }
 }
@@ -3100,6 +3129,18 @@ fn cost_model_fixture(clock: &impl Clock, invocation: &Invocation) -> Result<(),
     )?;
     println!("cost model {} active", model.id().as_str());
     Ok(())
+}
+
+/// Carries the store's clearing result across the presentation boundary as a report model,
+/// which is the only shape a renderer is allowed to see.
+fn clear_diagnostics_report(
+    report: &crate::store::retention::ClearDiagnosticsReport,
+) -> crate::report::ClearDiagnosticsReport {
+    crate::report::ClearDiagnosticsReport {
+        entries_removed: report.entries_removed,
+        bytes_removed: report.bytes_removed,
+        provider_filter: report.provider_filter.clone(),
+    }
 }
 
 fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
@@ -3948,6 +3989,101 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
     Ok(())
 }
 
+/// `aub clear-diagnostics`: clears retained diagnostic bodies, scoped per provider
+/// or in total. Never touches quarantine rows.
+fn clear_diagnostics_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("clear-diagnostics");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let mut provider: Option<String> = None;
+    let mut all = false;
+    let mut iter = invocation.rest.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if let Some(val) = arg.strip_prefix("--provider=") {
+            if provider.is_some() {
+                return Err(Error::Usage("--provider specified more than once".into()));
+            }
+            if val.is_empty() {
+                return Err(Error::Usage("--provider requires a non-empty name".into()));
+            }
+            provider = Some(val.to_string());
+        } else if arg == "--provider" {
+            if provider.is_some() {
+                return Err(Error::Usage("--provider specified more than once".into()));
+            }
+            let next_val = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--provider requires a provider name".into()))?;
+            if next_val.is_empty() {
+                return Err(Error::Usage("--provider requires a non-empty name".into()));
+            }
+            provider = Some(next_val.clone());
+        } else if arg == "--all" {
+            all = true;
+        } else if !arg.starts_with("--") {
+            if provider.is_some() {
+                return Err(Error::Usage(format!(
+                    "unexpected positional argument: {arg}"
+                )));
+            }
+            provider = Some(arg.clone());
+        } else {
+            return Err(Error::Usage(format!("unknown argument: {arg}")));
+        }
+    }
+
+    if all && provider.is_some() {
+        return Err(Error::Usage(
+            "--all cannot be combined with --provider".into(),
+        ));
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let report =
+        crate::store::retention::clear_retained_bodies(&config.state.dir, provider.as_deref())
+            .map_err(|error| Error::Store(format!("clear diagnostics: {error}")))?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!(
+                "{}",
+                crate::presentation::render_clear_diagnostics(&clear_diagnostics_report(&report))
+            )
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            crate::presentation::clear_diagnostics_json(
+                &clear_diagnostics_report(&report),
+                run,
+                timestamp,
+            )
+        ),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4497,7 +4633,13 @@ mod tests {
         assert_eq!(explicit.refresh, RefreshPolicy::Never);
         assert!(spend_options(&["--since".into(), "25/08/2026".into()], now).is_err());
         assert!(spend_options(&["--days".into(), "0".into()], now).is_err());
-        assert!(spend_options(&["--group-by=account".into()], now).is_err());
+        assert_eq!(
+            spend_options(&["--group-by=account".into()], now)
+                .unwrap()
+                .grouping,
+            vec![SpendGrouping::Account]
+        );
+        assert!(spend_options(&["--group-by=task".into()], now).is_err());
         assert!(spend_options(&["--bogus".into()], now).is_err());
     }
 
@@ -4722,6 +4864,43 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
                 assert!(message.contains("disk full"), "{message:?}");
             }
             other => panic!("PersistFailed must map to Error::Store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_diagnostics_alias_clear_captures_is_recognised() {
+        let req1 = parse_invocation(args(&["clear-diagnostics"])).unwrap();
+        let req2 = parse_invocation(args(&["clear-captures"])).unwrap();
+        match (req1, req2) {
+            (Request::Run(inv1), Request::Run(inv2)) => {
+                assert_eq!(inv1.command, Command::ClearDiagnostics);
+                assert_eq!(inv2.command, Command::ClearDiagnostics);
+            }
+            other => panic!("expected Request::Run for both aliases, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_diagnostics_accepts_format_and_provider_and_all() {
+        let req = parse_invocation(args(&[
+            "clear-diagnostics",
+            "--format",
+            "json",
+            "--provider",
+            "anthropic",
+        ]))
+        .unwrap();
+        match req {
+            Request::Run(inv) => {
+                assert_eq!(inv.format, OutputFormat::Json);
+                assert_eq!(
+                    inv.rest,
+                    vec!["--provider".to_string(), "anthropic".to_string()]
+                );
+            }
+            other @ (Request::Version | Request::Help) => {
+                panic!("unexpected parse result: {other:?}")
+            }
         }
     }
 

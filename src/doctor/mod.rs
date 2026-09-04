@@ -47,13 +47,13 @@ pub enum CheckName {
     HeuristicDedupCounts,
     ClockSkew,
     LocalFilesystemAndWalSuitability,
+    AccumulatedDiagnosticMaterial,
 }
 
 impl CheckName {
-    /// The design's full check list (PLAN.md 27, 36), encoded once so the registry
-    /// can be compared against it. Eighteen entries: the same count PLAN.md's own
-    /// prose gives ("Eighteen distinct conditions").
-    pub const EXPECTED: [CheckName; 18] = [
+    /// The design's full check list (PLAN.md 27, 36, aub-smqu), encoded once so the
+    /// registry can be compared against it. Nineteen entries.
+    pub const EXPECTED: [CheckName; 19] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -72,6 +72,7 @@ impl CheckName {
         Self::HeuristicDedupCounts,
         Self::ClockSkew,
         Self::LocalFilesystemAndWalSuitability,
+        Self::AccumulatedDiagnosticMaterial,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -95,6 +96,7 @@ impl CheckName {
             Self::HeuristicDedupCounts => "heuristic-dedup-counts",
             Self::ClockSkew => "clock-skew",
             Self::LocalFilesystemAndWalSuitability => "local-filesystem-and-wal-suitability",
+            Self::AccumulatedDiagnosticMaterial => "accumulated-diagnostic-material",
         }
     }
 }
@@ -106,6 +108,7 @@ impl CheckName {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckStatus {
     Pass,
+    PassWithDetail(String),
     Fail(String),
     NotApplicable(String),
     NotYetAvailable { owning_bead: &'static str },
@@ -116,7 +119,7 @@ impl CheckStatus {
     /// cannot drift from each other about what a state is called.
     pub fn label(&self) -> &'static str {
         match self {
-            Self::Pass => "pass",
+            Self::Pass | Self::PassWithDetail(_) => "pass",
             Self::Fail(_) => "fail",
             Self::NotApplicable(_) => "not_applicable",
             Self::NotYetAvailable { .. } => "not_yet_available",
@@ -149,7 +152,7 @@ impl DoctorReport {
     pub fn passed(&self) -> usize {
         self.outcomes
             .iter()
-            .filter(|o| o.status == CheckStatus::Pass)
+            .filter(|o| matches!(o.status, CheckStatus::Pass | CheckStatus::PassWithDetail(_)))
             .count()
     }
 
@@ -258,7 +261,10 @@ mod tests {
             CheckStatus::NotYetAvailable { owning_bead } => assert_eq!(owning_bead, "aub-mgv.3"),
             // Named rather than a wildcard: the crate denies a catch-all over an enum, so a
             // status added later fails this assertion instead of being folded into the panic.
-            CheckStatus::Pass | CheckStatus::Fail(_) | CheckStatus::NotApplicable(_) => {
+            CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
+            | CheckStatus::Fail(_)
+            | CheckStatus::NotApplicable(_) => {
                 panic!("expected not-yet-available")
             }
         }

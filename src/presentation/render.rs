@@ -294,13 +294,47 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
     if explain == ExplainMode::Off {
         report_text
     } else {
-        let explain_text = render_explain(&report.provenance, explain);
+        let mut explain_text = render_explain(&report.provenance, explain);
+        let account_text = render_account_explain(report);
+        if !account_text.is_empty() {
+            explain_text.push_str("\n\n");
+            explain_text.push_str(&account_text);
+        }
         if report_text.is_empty() {
             explain_text
         } else {
             format!("{report_text}\n\n{explain_text}")
         }
     }
+}
+
+/// The marker evidence behind every account group, under `--explain`. Empty
+/// unless the report was grouped by account. Each line names the account, its
+/// effective evidence class, and the exact markers that produced it, so the
+/// human output carries the same references the JSON explain does (aub-mgv.4).
+fn render_account_explain(report: &SpendReport) -> String {
+    if report.account_explain.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["account explain:".to_string()];
+    for group in &report.account_explain {
+        let markers = if group.markers.is_empty() {
+            "none".to_string()
+        } else {
+            group
+                .markers
+                .iter()
+                .map(|marker| format!("{} ({})", marker.reference, marker.evidence_class.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!(
+            "  {}  evidence_class={}  markers=[{markers}]",
+            group.key.as_str(),
+            group.evidence_class.as_str()
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Renders the provenance graph for a report in human text format.
@@ -709,14 +743,16 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
     let mut lines = vec![format!("Doctor: {} checks", report.outcomes.len())];
     for outcome in &report.outcomes {
         let marker = match &outcome.status {
-            CheckStatus::Pass => "PASS".to_string(),
+            CheckStatus::Pass | CheckStatus::PassWithDetail(_) => "PASS".to_string(),
             CheckStatus::Fail(_) => "FAIL".to_string(),
             CheckStatus::NotApplicable(_) => "N/A ".to_string(),
             CheckStatus::NotYetAvailable { .. } => "TODO".to_string(),
         };
         let mut line = format!("  [{marker}] {}", outcome.name.as_str());
         match &outcome.status {
-            CheckStatus::Fail(reason) | CheckStatus::NotApplicable(reason) => {
+            CheckStatus::Fail(reason)
+            | CheckStatus::NotApplicable(reason)
+            | CheckStatus::PassWithDetail(reason) => {
                 line.push_str(&format!(": {reason}"));
             }
             CheckStatus::NotYetAvailable { owning_bead } => {
@@ -1148,6 +1184,25 @@ pub fn render_age(age: Age) -> String {
         format!("{}h", seconds / 3_600)
     } else {
         format!("{}d", seconds / 86_400)
+    }
+}
+
+/// Formats a summary of cleared diagnostic capture bodies for operator display.
+pub fn render_clear_diagnostics(report: &crate::report::ClearDiagnosticsReport) -> String {
+    let unit = if report.entries_removed == 1 {
+        "body"
+    } else {
+        "bodies"
+    };
+    match &report.provider_filter {
+        Some(provider) => format!(
+            "Cleared {} retained {unit} ({} bytes) for provider '{provider}'",
+            report.entries_removed, report.bytes_removed
+        ),
+        None => format!(
+            "Cleared {} retained {unit} ({} bytes) in total",
+            report.entries_removed, report.bytes_removed
+        ),
     }
 }
 
