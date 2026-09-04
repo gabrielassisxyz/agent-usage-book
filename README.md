@@ -76,6 +76,13 @@ window. Repeat `--group-by day|session|project|repository` for nested subtotals 
 `--refresh auto|never|force` to control transcript ingest. `--format json` emits the
 versioned envelope with a `{value, unit}` per token kind.
 
+## Scheduling
+
+`aub` has no daemon: something external has to invoke `aub sample` on a cadence, and the
+agent session that starts should mark which account it belongs to. Example systemd and
+cron units, an example session-start hook, and the full reasoning are in
+[docs/scheduling.md](docs/scheduling.md).
+
 ## Development
 
 ```sh

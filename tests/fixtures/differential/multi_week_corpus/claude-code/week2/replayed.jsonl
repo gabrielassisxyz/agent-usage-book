@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-08-10T12:00:00.000Z","sessionId":"s-w2-replay","message":{"id":"msg_w2_rep","usage":{"input_tokens":1500,"output_tokens":300,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000}}}
+{"type":"assistant","timestamp":"2026-08-10T12:00:01.000Z","sessionId":"s-w2-replay","message":{"id":"msg_w2_rep","usage":{"input_tokens":1500,"output_tokens":700,"cache_creation_input_tokens":0,"cache_read_input_tokens":1000}}}

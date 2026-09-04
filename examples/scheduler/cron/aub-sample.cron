@@ -1,0 +1,12 @@
+# For platforms without systemd. Install with `crontab -e` (per-user) or as a
+# file under /etc/cron.d/ (system-wide; that form needs a user column between
+# the schedule and the command, e.g. "* * * * * root /usr/local/bin/aub ...").
+#
+# Runs `aub sample --due` once a minute; `aub` itself decides which configured
+# accounts are actually owed a request, so the tick only needs to be shorter
+# than the shortest configured sampling interval. See docs/scheduling.md.
+#
+# cron mails stdout by default, and a healthy tick prints one line per due
+# account every run; redirect it so a quiet cadence does not fill a mailbox.
+# stderr is left alone: it carries aub's own diagnostic log.
+* * * * * /usr/local/bin/aub sample --due >/dev/null

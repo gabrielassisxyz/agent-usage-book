@@ -1,0 +1,2 @@
+{"type":"assistant","timestamp":"2026-08-17T09:00:00.000Z","sessionId":"s-w3-main","message":{"id":"msg_w3_1","usage":{"input_tokens":1200,"output_tokens":600,"cache_creation_input_tokens":4000,"cache_read_input_tokens":2500}}}
+{"type":"assistant","timestamp":"2026-08-19T11:00:00.000Z","sessionId":"s-w3-2","message":{"id":"msg_w3_2","usage":{"input_tokens":900,"output_tokens":450,"cache_creation_input_tokens":0,"cache_read_input_tokens":1500}}}
