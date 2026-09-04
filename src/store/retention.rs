@@ -960,12 +960,12 @@ pub fn store_retained_body(
     if let Ok(entries) = fs::read_dir(&dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-                if let Some(stem) = path.file_stem().and_then(|s| s.to_str()) {
-                    if let Ok(seq) = stem.parse::<u64>() {
-                        existing_sequences.push((seq, path));
-                    }
-                }
+            if path.is_file()
+                && path.extension().and_then(|s| s.to_str()) == Some("json")
+                && let Some(stem) = path.file_stem().and_then(|s| s.to_str())
+                && let Ok(seq) = stem.parse::<u64>()
+            {
+                existing_sequences.push((seq, path));
             }
         }
     }
@@ -1048,13 +1048,11 @@ pub fn list_retained_bodies(state_dir: &Path) -> Result<Vec<RetainedBodySummary>
                     let f_path = f_entry.path();
                     if f_path.is_file()
                         && f_path.extension().and_then(|s| s.to_str()) == Some("json")
+                        && let Ok(text) = fs::read_to_string(&f_path)
+                        && let Ok(record) = RetainedBodyRecord::from_json(&text)
                     {
-                        if let Ok(text) = fs::read_to_string(&f_path) {
-                            if let Ok(record) = RetainedBodyRecord::from_json(&text) {
-                                count += 1;
-                                total_bytes += record.byte_len();
-                            }
-                        }
+                        count += 1;
+                        total_bytes += record.byte_len();
                     }
                 }
             }
@@ -1139,10 +1137,10 @@ pub fn clear_retained_bodies(
                         if f_path.is_file()
                             && f_path.extension().and_then(|s| s.to_str()) == Some("json")
                         {
-                            if let Ok(text) = fs::read_to_string(&f_path) {
-                                if let Ok(rec) = RetainedBodyRecord::from_json(&text) {
-                                    bytes_removed += rec.byte_len();
-                                }
+                            if let Ok(text) = fs::read_to_string(&f_path)
+                                && let Ok(rec) = RetainedBodyRecord::from_json(&text)
+                            {
+                                bytes_removed += rec.byte_len();
                             }
                             if fs::remove_file(&f_path).is_ok() {
                                 entries_removed += 1;

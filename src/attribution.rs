@@ -5,9 +5,14 @@
 //! - provider adapters
 
 pub mod account_segment;
+pub mod quality;
 pub mod segment;
 
 pub use account_segment::AccountEvidenceClass;
+pub use quality::{
+    AttributionFloorBreach, AttributionFraction, AttributionObservation, AttributionQuality,
+    AttributionQualityAssessment, AttributionQualityFloor, MetricScope, WindowedAttributionQuality,
+};
 
 use std::collections::BTreeMap;
 

@@ -1755,6 +1755,7 @@ fn doctor_transcript_drift_view(
 ) -> Result<(), Error> {
     let mut db_quarantine = None;
     let mut stale_cards = Vec::new();
+    let mut attribution_assessment = None;
     let db_path = config
         .state
         .dir
@@ -1773,6 +1774,22 @@ fn doctor_transcript_drift_view(
             }
             if let Ok(stale) = crate::store::rate_card::stale_rate_cards(&conn, timestamp) {
                 stale_cards = stale;
+            }
+            if let Ok(observations) =
+                crate::store::account_attribution_segment::attribution_observations(&conn)
+            {
+                let window_nanos =
+                    i64::try_from(config.attribution.recent_window.as_nanos()).unwrap_or(i64::MAX);
+                let window_since = crate::domain::time::UtcTimestamp::from_unix_nanos(
+                    timestamp.unix_nanos().saturating_sub(window_nanos),
+                );
+                attribution_assessment = Some(
+                    crate::attribution::quality::AttributionQualityAssessment::assess(
+                        observations,
+                        window_since,
+                        config.attribution.quality_floor,
+                    ),
+                );
             }
         }
     }
@@ -1806,7 +1823,46 @@ fn doctor_transcript_drift_view(
         OutputFormat::Json => println!("{}", crate::presentation::doctor_drift_json(&report, run)),
     }
 
+    if let Some(assessment) = &attribution_assessment {
+        if let OutputFormat::Text = invocation.format {
+            println!(
+                "\n{}",
+                crate::presentation::render_attribution_quality(assessment)
+            );
+        }
+        if let Some(error) = attribution_quality_breach_error(assessment) {
+            return Err(error);
+        }
+    }
+
     Ok(())
+}
+
+/// The doctor exit consequence of an attribution-quality assessment: a
+/// `ThresholdNotMet` error naming every token kind and scope that fell below
+/// the configured floor, or `None` when nothing did. Split out so the mapping
+/// is unit-tested without a live command.
+fn attribution_quality_breach_error(
+    assessment: &crate::attribution::quality::AttributionQualityAssessment,
+) -> Option<Error> {
+    if !assessment.has_breach() {
+        return None;
+    }
+    let kinds: Vec<String> = assessment
+        .breaches
+        .iter()
+        .map(|breach| {
+            let scope = match breach.scope {
+                crate::attribution::quality::MetricScope::AllHistory => "all history",
+                crate::attribution::quality::MetricScope::RecentWindow { .. } => "recent window",
+            };
+            format!("{} ({scope})", breach.kind.label())
+        })
+        .collect();
+    Some(Error::ThresholdNotMet(format!(
+        "attribution quality is below the configured floor for: {}",
+        kinds.join(", ")
+    )))
 }
 
 /// Builds the registry-report outcomes for one resolved configuration: opens the
@@ -3883,6 +3939,64 @@ mod tests {
     use super::*;
     use crate::config::FakeEnv;
 
+    #[test]
+    fn doctor_maps_an_attribution_floor_breach_to_threshold_not_met() {
+        use crate::attribution::account_segment::AccountEvidenceClass;
+        use crate::attribution::quality::{
+            AttributionObservation, AttributionQualityAssessment, AttributionQualityFloor,
+        };
+        use crate::domain::time::UtcTimestamp;
+        use crate::domain::tokens::{
+            CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
+        };
+
+        let tokens = |input: u64| {
+            KnownTokenVector::new(
+                InputTokens::new(input),
+                OutputTokens::new(0),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            )
+        };
+        let observations = vec![
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::ExplicitLauncherOrHook,
+                usage: tokens(10),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::Unattributed,
+                usage: tokens(90),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+        ];
+
+        // With a floor of 0.9, the 10% attributed fraction breaches it.
+        let breaching = AttributionQualityAssessment::assess(
+            observations.clone(),
+            UtcTimestamp::from_unix_nanos(0),
+            AttributionQualityFloor::new(0.9),
+        );
+        match attribution_quality_breach_error(&breaching) {
+            Some(Error::ThresholdNotMet(message)) => {
+                assert!(
+                    message.contains("input"),
+                    "{message:?} must name the token kind"
+                );
+            }
+            other => panic!("expected ThresholdNotMet, got {other:?}"),
+        }
+
+        // With no floor configured, the same corpus produces no error: the
+        // metric is reported, not judged.
+        let unjudged = AttributionQualityAssessment::assess(
+            observations,
+            UtcTimestamp::from_unix_nanos(0),
+            None,
+        );
+        assert!(attribution_quality_breach_error(&unjudged).is_none());
+    }
+
     /// `Command::ALL` must name every variant the enum declares. `DECLARED_VARIANTS`
     /// is derived from the enum's own declaration by [`aub_command_enum`], so the
     /// two can only disagree when a variant joined the enum without joining `ALL`;
@@ -4197,6 +4311,60 @@ mod tests {
             assert!(
                 help.contains(&command.format_help()),
                 "{command:?} help must state its format support"
+            );
+        }
+    }
+
+    /// `docs/commands.md` names every shipping command in a `## \`aub NAME\``
+    /// heading, each with a `**Refuses:**` line stating the behavioural
+    /// boundary `--help` does not carry (aub-n27.6). The documented set is
+    /// compared against [`Command::ALL`] filtered to the shipping subset
+    /// (`summary().is_some()`) rather than a hand-maintained list, so a
+    /// command added without a section fails here instead of only being
+    /// noticed by a human reading the file. The planted negative: a
+    /// documented command with no `**Refuses:**` line would still pass a
+    /// weaker check that only compared the name set.
+    #[test]
+    fn documented_command_list_matches_the_parser_and_states_a_refusal() {
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/commands.md"))
+                .expect("docs/commands.md must be readable");
+
+        let shipping: std::collections::BTreeSet<&str> = Command::ALL
+            .into_iter()
+            .filter(|command| command.summary().is_some())
+            .map(Command::name)
+            .collect();
+
+        let mut documented: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in docs.lines() {
+            let Some(rest) = line.strip_prefix("## `aub ") else {
+                continue;
+            };
+            let name = rest
+                .strip_suffix('`')
+                .unwrap_or_else(|| panic!("malformed command heading: {line:?}"));
+            documented.insert(name);
+        }
+
+        assert_eq!(
+            documented, shipping,
+            "docs/commands.md must document exactly the shipping commands"
+        );
+
+        for name in &documented {
+            let heading = format!("## `aub {name}`");
+            let start = docs
+                .find(&heading)
+                .unwrap_or_else(|| panic!("lost {heading:?} on the second pass"));
+            let section_end = docs[start..]
+                .find("\n## ")
+                .map(|offset| start + offset)
+                .unwrap_or(docs.len());
+            let section = &docs[start..section_end];
+            assert!(
+                section.contains("**Refuses:**"),
+                "docs/commands.md section for {name:?} has no **Refuses:** line"
             );
         }
     }
@@ -4574,7 +4742,9 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
                     vec!["--provider".to_string(), "anthropic".to_string()]
                 );
             }
-            other => panic!("unexpected parse result: {other:?}"),
+            other @ (Request::Version | Request::Help) => {
+                panic!("unexpected parse result: {other:?}")
+            }
         }
     }
 

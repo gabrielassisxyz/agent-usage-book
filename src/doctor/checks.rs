@@ -712,11 +712,11 @@ fn accumulated_diagnostic_material(ctx: &DoctorContext) -> CheckOutcome {
 
     let mut quarantine_by_source: std::collections::BTreeMap<String, u64> =
         std::collections::BTreeMap::new();
-    if let Some(conn) = ctx.db {
-        if let Ok(groups) = crate::store::ingest_quarantine::quarantine_summary(conn) {
-            for group in groups {
-                *quarantine_by_source.entry(group.parser).or_insert(0) += group.count;
-            }
+    if let Some(conn) = ctx.db
+        && let Ok(groups) = crate::store::ingest_quarantine::quarantine_summary(conn)
+    {
+        for group in groups {
+            *quarantine_by_source.entry(group.parser).or_insert(0) += group.count;
         }
     }
     let total_quarantine: u64 = quarantine_by_source.values().sum();
