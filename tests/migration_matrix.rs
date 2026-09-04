@@ -265,7 +265,24 @@ const POPULATION: &[(&str, Populate)] = &[
         "adapter_semantics_annotation",
         populate_adapter_semantics_annotation,
     ),
+    (
+        "account_attribution_segment",
+        populate_account_attribution_segment,
+    ),
 ];
+
+fn populate_account_attribution_segment(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Both arms of the target-kind CHECK: an attributed segment carries its logical
+    // account, and the unknown bucket carries none. A fixture holding only the first
+    // arm would survive a migration that dropped the second.
+    exec(
+        conn,
+        "account_attribution_segment",
+        "INSERT INTO account_attribution_segment (id, session_id, target_kind, logical_account, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, computed_at) VALUES
+            (1, 'matrix-session-1', 'account', 'matrix-account', 100, 20, 50, 10, 400),
+            (2, 'matrix-session-1', 'unknown_account', NULL, 7, 3, 0, 0, 410)",
+    )
+}
 
 fn populate_account(conn: &rusqlite::Connection) -> Result<(), String> {
     // Row 2 sits on the CHECK boundary: last observed equal to first.
