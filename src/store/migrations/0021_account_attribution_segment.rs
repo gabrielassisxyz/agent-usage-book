@@ -13,7 +13,7 @@ use crate::error::Error;
 use crate::store::migrate::Migration;
 
 /// The schema version this step produces.
-pub const VERSION: u32 = 20;
+pub const VERSION: u32 = 21;
 
 const CREATE_ACCOUNT_ATTRIBUTION_SEGMENT_TABLE: &str = "\
 CREATE TABLE account_attribution_segment (

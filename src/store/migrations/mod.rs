@@ -81,8 +81,11 @@ pub(crate) mod migration_0018;
 #[path = "0019_legacy_meter_import.rs"]
 pub(crate) mod migration_0019;
 
-#[path = "0020_account_attribution_segment.rs"]
+#[path = "0020_adapter_semantics_validation.rs"]
 pub(crate) mod migration_0020;
+
+#[path = "0021_account_attribution_segment.rs"]
+pub(crate) mod migration_0021;
 
 /// Every migration this binary knows, in version order.
 ///
@@ -110,5 +113,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0018::migration(),
         migration_0019::migration(),
         migration_0020::migration(),
+        migration_0021::migration(),
     ]
 }

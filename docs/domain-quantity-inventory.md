@@ -101,6 +101,10 @@ quantity, documented here with its reason for exclusion:
 - `QuerySemantics`, `ProvenanceManifest`, `Derived`: compound provenance aggregates and wrappers.
 - `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
 
+### Authoritative surface comparison (`authoritative_comparison.rs`)
+- `AuthoritativeComparisonVerdict`: tag enum with exactly two outcomes (agrees within granularity, unresolved mismatch), not a measured quantity. It has no `Default` and no free-standing formatting trait; `as_str` is an inherent method for the stable database spelling.
+- `DocumentedGranularity`: a thin newtype over `QuotaFractionPpm` carrying the smallest difference the provider's authoritative surface is able to express. Private representation, a public smart constructor, no `Default`, no `Display`. It delegates its numeric bound to `QuotaFractionPpm`, so it has no dedicated compile-fail fixture of its own.
+
 ### Rate cards (`rate_card.rs`)
 - `Publication`: provenance descriptor for one rate card, a source reference and a publication instant with absence explicit, not a quantity.
 - `RateCardDraft`: the import payload for one rate component, a composite record whose rate is stored as exact integer micros rather than as a measured-quantity newtype; the monetary arithmetic stays in the money module.

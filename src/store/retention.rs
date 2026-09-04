@@ -76,6 +76,8 @@ pub enum DurableClass {
     CalibrationExperiment,
     LegacyMeterImport,
     LegacyMeterImportRecord,
+    AuthoritativeSurfaceComparison,
+    AdapterSemanticsAnnotation,
 
     // Core SQLite tables: Versioned interpretation
     MeterObservation,
@@ -134,7 +136,9 @@ impl DurableClass {
             | Self::MeterResponseEvidence
             | Self::CalibrationExperiment
             | Self::LegacyMeterImport
-            | Self::LegacyMeterImportRecord => DurableClassCategory::Irreplaceable,
+            | Self::LegacyMeterImportRecord
+            | Self::AuthoritativeSurfaceComparison
+            | Self::AdapterSemanticsAnnotation => DurableClassCategory::Irreplaceable,
 
             Self::SamplingPolicySnapshot
             | Self::MeterObservation
@@ -195,7 +199,9 @@ impl DurableClass {
             | Self::CostModelLifecycle
             | Self::RateCard
             | Self::LegacyMeterImport
-            | Self::LegacyMeterImportRecord => RetentionRule::Forever,
+            | Self::LegacyMeterImportRecord
+            | Self::AuthoritativeSurfaceComparison
+            | Self::AdapterSemanticsAnnotation => RetentionRule::Forever,
 
             Self::SessionAccountMarker => RetentionRule::ForeverUnlessExplicitlyPurged,
 
@@ -263,6 +269,8 @@ impl DurableClass {
             Self::IngestQuarantine => Some("ingest_quarantine"),
             Self::LegacyMeterImport => Some("legacy_meter_import"),
             Self::LegacyMeterImportRecord => Some("legacy_meter_import_record"),
+            Self::AuthoritativeSurfaceComparison => Some("authoritative_surface_comparison"),
+            Self::AdapterSemanticsAnnotation => Some("adapter_semantics_annotation"),
             Self::StatusProjection | Self::PendingObservationSpool | Self::RetainedProviderBody => {
                 None
             }
@@ -334,6 +342,8 @@ impl DurableClass {
             | Self::CalibrationExperiment
             | Self::LegacyMeterImport
             | Self::LegacyMeterImportRecord
+            | Self::AuthoritativeSurfaceComparison
+            | Self::AdapterSemanticsAnnotation
             | Self::MeterObservation
             | Self::MeterWindow
             | Self::MeterObservationPreference
@@ -390,6 +400,8 @@ impl DurableClass {
             Self::IngestQuarantine,
             Self::LegacyMeterImport,
             Self::LegacyMeterImportRecord,
+            Self::AuthoritativeSurfaceComparison,
+            Self::AdapterSemanticsAnnotation,
             Self::StatusProjection,
             Self::PendingObservationSpool,
             Self::RetainedProviderBody,
@@ -435,6 +447,8 @@ impl DurableClass {
             Self::IngestQuarantine,
             Self::LegacyMeterImport,
             Self::LegacyMeterImportRecord,
+            Self::AuthoritativeSurfaceComparison,
+            Self::AdapterSemanticsAnnotation,
         ]
     }
 }

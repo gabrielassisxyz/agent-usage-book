@@ -18,3 +18,4 @@ render as `[REDACTED]`. Quantities are JSON objects with `value` and `unit`.
 | meter_spool_drained | info | applied, already_applied, quarantined |
 | projection_read | debug | state |
 | legacy_meter_imported | info | source_digest, verified_backup_id, records_read, imported, unchanged, quarantined |
+| seed_archive_imported | info | source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome |

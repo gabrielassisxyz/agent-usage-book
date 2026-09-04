@@ -15,6 +15,7 @@
 
 pub mod account;
 pub mod account_attribution_segment;
+pub mod adapter_semantics_validation;
 pub mod attempt_crash_hook;
 pub mod attribution_segment;
 pub mod backup;
@@ -40,6 +41,7 @@ pub mod sample_run;
 pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
 pub mod schema_audit;
+pub mod seed_archive_import;
 pub mod session;
 pub mod session_account_marker;
 pub mod spend;
