@@ -50,6 +50,37 @@ pub enum OverheadReason {
     UnclaimedSession,
 }
 
+impl OverheadReason {
+    /// The stable name this reason renders and serializes under, matching the
+    /// convention every other closed vocabulary in this crate follows
+    /// (`TaskKind::as_str`, `TaskEventKind::as_str`).
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::BeforeFirstClaim => "before_first_claim",
+            Self::AfterReleaseWithNoNextClaim => "after_release_with_no_next_claim",
+            Self::AmbiguousBoundary => "ambiguous_boundary",
+            Self::MissingTimestamp => "missing_timestamp",
+            Self::UnmappedSession => "unmapped_session",
+            Self::TrackerUnavailable => "tracker_unavailable",
+            Self::Contended => "contended",
+            Self::UnclaimedSession => "unclaimed_session",
+        }
+    }
+
+    /// Every variant, in a stable order. A unit test pins this array's length
+    /// against the enum's own variant count.
+    pub const ALL: [OverheadReason; 8] = [
+        Self::BeforeFirstClaim,
+        Self::AfterReleaseWithNoNextClaim,
+        Self::AmbiguousBoundary,
+        Self::MissingTimestamp,
+        Self::UnmappedSession,
+        Self::TrackerUnavailable,
+        Self::Contended,
+        Self::UnclaimedSession,
+    ];
+}
+
 /// Where one usage window's tokens land: a task, or a named overhead bucket.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SegmentTarget {
@@ -304,6 +335,61 @@ fn classify_window(window: &UsageWindow, intervals: &[TimeInterval]) -> SegmentT
     }
 }
 
+/// One usage window's classification, in the same order as `inputs.usage`.
+/// [`SegmentationResult`] discards this per-window detail once it sums into
+/// aggregate buckets; a caller that needs to rejoin a window's outcome back to
+/// its own identity (which session it came from, which canonical record it
+/// is) calls [`classify`] directly instead of re-deriving the interval
+/// timeline itself (`aub-eu7.4`: the rule that a report command carries no
+/// segmentation logic of its own applies here too, so this is the one place
+/// that logic lives).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowClassification {
+    pub target: SegmentTarget,
+}
+
+/// Classifies every window in `inputs.usage`, in input order, without
+/// aggregating. [`segment`] is [`classify`] folded into per-target sums; the
+/// two can never disagree because `segment` is defined in terms of this
+/// function rather than duplicating its rules.
+pub fn classify(inputs: &SegmentationInputs) -> Vec<WindowClassification> {
+    let short_circuit = if !inputs.context.session_is_mapped {
+        Some(OverheadReason::UnmappedSession)
+    } else if !inputs.context.tracker_available {
+        Some(OverheadReason::TrackerUnavailable)
+    } else {
+        None
+    };
+    if let Some(reason) = short_circuit {
+        return inputs
+            .usage
+            .iter()
+            .map(|_| WindowClassification {
+                target: SegmentTarget::Overhead(reason),
+            })
+            .collect();
+    }
+
+    let intervals = build_intervals(&inputs.boundaries);
+    if intervals.is_empty() {
+        return inputs
+            .usage
+            .iter()
+            .map(|_| WindowClassification {
+                target: SegmentTarget::Overhead(OverheadReason::UnclaimedSession),
+            })
+            .collect();
+    }
+
+    inputs
+        .usage
+        .iter()
+        .map(|window| WindowClassification {
+            target: classify_window(window, &intervals),
+        })
+        .collect()
+}
+
 /// Segments one session's usage set. The two session-level preconditions in
 /// `inputs.context` are checked first and short-circuit every window to the
 /// matching overhead bucket when false; a mapped, tracker-available session
@@ -317,37 +403,8 @@ fn classify_window(window: &UsageWindow, intervals: &[TimeInterval]) -> SegmentT
 /// surfaces during development rather than only under `cargo test`.
 pub fn segment(inputs: &SegmentationInputs) -> SegmentationResult {
     let mut result = SegmentationResult::default();
-
-    let short_circuit = if !inputs.context.session_is_mapped {
-        Some(OverheadReason::UnmappedSession)
-    } else if !inputs.context.tracker_available {
-        Some(OverheadReason::TrackerUnavailable)
-    } else {
-        None
-    };
-    if let Some(reason) = short_circuit {
-        for window in &inputs.usage {
-            result.add(SegmentTarget::Overhead(reason), window.usage);
-        }
-        debug_assert_conserves(inputs, &result);
-        return result;
-    }
-
-    let intervals = build_intervals(&inputs.boundaries);
-    if intervals.is_empty() {
-        for window in &inputs.usage {
-            result.add(
-                SegmentTarget::Overhead(OverheadReason::UnclaimedSession),
-                window.usage,
-            );
-        }
-        debug_assert_conserves(inputs, &result);
-        return result;
-    }
-
-    for window in &inputs.usage {
-        let target = classify_window(window, &intervals);
-        result.add(target, window.usage);
+    for (window, classification) in inputs.usage.iter().zip(classify(inputs)) {
+        result.add(classification.target, window.usage);
     }
     debug_assert_conserves(inputs, &result);
     result
@@ -677,6 +734,53 @@ mod tests {
             Some(tokens(9))
         );
         assert!(segment(&claimed_by_t2).task_usage(&task("T1")).is_none());
+    }
+
+    #[test]
+    fn overhead_reason_all_has_exactly_eight_variants() {
+        assert_eq!(OverheadReason::ALL.len(), 8);
+    }
+
+    /// `classify` returns one entry per input window, in the same order, and
+    /// `segment` (folded from `classify`) reports the exact same per-window
+    /// targets as sums: this is the property a caller that needs to rejoin a
+    /// window to its own session or canonical-event identity depends on.
+    #[test]
+    fn classify_returns_one_entry_per_window_in_input_order() {
+        let inputs = SegmentationInputs {
+            context: mapped_available(),
+            boundaries: vec![claim(task("T1"), 10), claim(task("T2"), 20)],
+            usage: vec![point(5, 1), point(15, 2), point(25, 3)],
+        };
+        let classified = classify(&inputs);
+        assert_eq!(classified.len(), 3);
+        assert_eq!(
+            classified[0].target,
+            SegmentTarget::Overhead(OverheadReason::BeforeFirstClaim)
+        );
+        assert_eq!(classified[1].target, SegmentTarget::Task(task("T1")));
+        assert_eq!(classified[2].target, SegmentTarget::Task(task("T2")));
+
+        // The planted negative: swapping the order of the same three windows
+        // must swap the order of the same three targets, proving the
+        // function does not silently sort or otherwise reorder its output.
+        let reordered = SegmentationInputs {
+            usage: vec![point(25, 3), point(5, 1), point(15, 2)],
+            ..inputs
+        };
+        let classified_reordered = classify(&reordered);
+        assert_eq!(
+            classified_reordered[0].target,
+            SegmentTarget::Task(task("T2"))
+        );
+        assert_eq!(
+            classified_reordered[1].target,
+            SegmentTarget::Overhead(OverheadReason::BeforeFirstClaim)
+        );
+        assert_eq!(
+            classified_reordered[2].target,
+            SegmentTarget::Task(task("T1"))
+        );
     }
 
     // --- property tests --------------------------------------------------

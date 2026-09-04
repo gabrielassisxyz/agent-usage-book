@@ -5,6 +5,7 @@
 //! user-visible surface because no helper here accepts one, and a bare total where
 //! known missing evidence affects the aggregate is refused by construction.
 
+use crate::attribution::TaskIdentityState;
 use crate::domain::credits::Credits;
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
@@ -13,7 +14,7 @@ use crate::domain::provenance::DerivationId;
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::render::Precision;
 use crate::domain::time::{Age, ClockSkewEnvelope, MonotonicDuration, UtcTimestamp, age};
-use crate::domain::tokens::TokenKind;
+use crate::domain::tokens::{TokenKind, UsageVector};
 use crate::domain::window::NominalWindowDuration;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, Derivation, RequiredFact};
@@ -21,6 +22,7 @@ use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
     CoverageReport, NowReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport,
+    TaskOverheadReport, TaskReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
@@ -522,6 +524,129 @@ fn render_ingest_summary(report: &SpendReport) -> String {
         line.push_str(&format!("\nunreadable: {file}"));
     }
     line
+}
+
+/// Renders one usage vector's token line: the four known kinds, any unknown
+/// component, and the coverage-or-quality qualification term, exactly the
+/// fragment `render_spend_group` builds for one spend group.
+fn render_usage_line(usage: &UsageVector) -> String {
+    let known = usage.known();
+    let mut parts: Vec<String> = TokenKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{} {}",
+                token_kind_label(*kind),
+                render_count(known.value(*kind))
+            )
+        })
+        .collect();
+    for (name, count) in usage.unknown() {
+        parts.push(format!("{name} {}", render_count(count.value())));
+    }
+    let qualification = match quality_term(usage.quality()) {
+        Some(term) => term,
+        None => coverage_term(usage.coverage()),
+    };
+    format!("{} ({})", parts.join(" · "), qualification.term())
+}
+
+/// Renders a task report for `aub task report TASK-ID`.
+pub fn render_task_report(report: &TaskReport) -> String {
+    render_task_report_with_explain(report, ExplainMode::Off)
+}
+
+/// Renders a task report, optionally including the explain block.
+pub fn render_task_report_with_explain(report: &TaskReport, explain: ExplainMode) -> String {
+    let mut lines = vec![format!("task {}", report.task_id.as_str())];
+    let kind_line = match &report.task_kind {
+        None => "task kind: no tracker evidence".to_string(),
+        Some(row) => {
+            let state = match row.state {
+                TaskIdentityState::Resolved => "resolved",
+                TaskIdentityState::Unknown => "unknown",
+                TaskIdentityState::Conflict => "conflict",
+            };
+            let kind = row.kind.map(|kind| kind.as_str()).unwrap_or("none");
+            format!(
+                "task kind: {state} ({kind}) · normalization v{} · evidence: {}",
+                row.normalization_version, row.evidence
+            )
+        }
+    };
+    lines.push(kind_line);
+    lines.push(format!("usage: {}", render_usage_line(&report.usage)));
+    lines.push(format!("credits: {}", render_credits(&report.credits)));
+    if report.sessions.is_empty() {
+        lines.push("sessions: none".to_string());
+    } else {
+        lines.push("sessions:".to_string());
+        for session in &report.sessions {
+            let run_clause = match &session.run {
+                Some(run) => format!(" run={}", run.as_str()),
+                None => String::new(),
+            };
+            lines.push(format!(
+                "  {}{run_clause}  {}",
+                session.session.as_str(),
+                render_usage_line(&session.usage)
+            ));
+        }
+    }
+    let report_text = lines.join("\n");
+    if explain == ExplainMode::Off {
+        report_text
+    } else {
+        format!(
+            "{report_text}\n\n{}",
+            render_explain(&report.provenance, explain)
+        )
+    }
+}
+
+/// Renders a task overhead report for `aub task overhead --since`.
+pub fn render_task_overhead_report(report: &TaskOverheadReport) -> String {
+    render_task_overhead_report_with_explain(report, ExplainMode::Off)
+}
+
+/// Renders a task overhead report, optionally including the explain block.
+/// Task-attributed consumption renders alongside the overhead buckets rather
+/// than behind a flag (`aub-eu7.3`'s restored criterion).
+pub fn render_task_overhead_report_with_explain(
+    report: &TaskOverheadReport,
+    explain: ExplainMode,
+) -> String {
+    let mut lines = vec![format!(
+        "task overhead from {} to {} (UTC days, end exclusive)",
+        report.since.iso(),
+        report.until.iso()
+    )];
+    lines.push(format!(
+        "task-attributed usage: {}",
+        render_usage_line(&report.task_usage)
+    ));
+    if report.buckets.is_empty() {
+        lines.push("overhead: none".to_string());
+    } else {
+        lines.push("overhead buckets:".to_string());
+        for bucket in &report.buckets {
+            lines.push(format!(
+                "  {} ({}% share)  {}",
+                bucket.reason.as_str(),
+                render_percentage(bucket.share.get(), PERCENT),
+                render_usage_line(&bucket.usage)
+            ));
+        }
+    }
+    let report_text = lines.join("\n");
+    if explain == ExplainMode::Off {
+        report_text
+    } else {
+        format!(
+            "{report_text}\n\n{}",
+            render_explain(&report.provenance, explain)
+        )
+    }
 }
 
 /// Renders a [`TranscriptDriftReport`] for `aub doctor --transcript-format-drift`.

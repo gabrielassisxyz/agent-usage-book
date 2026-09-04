@@ -5,7 +5,7 @@ shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, 
 
 commands:
   status   render the last known meter reading per configured account
-  spend    canonical token usage grouped by day, session, project or repository
+  spend    canonical token usage grouped by day, session, project, repository or task
   config   print every resolved configuration key with the source that won
   export   emit versioned JSONL usage rows keyed by session-id or run-id for external joins
   rate-card import, show and history the immutable dated vendor rate cards
@@ -17,6 +17,7 @@ commands:
   import   import explicitly selected legacy evidence with durable provenance
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
   now      force a persisted sampling attempt for the selected accounts and render the resulting state
+  task     ingest issue-tracker task-claim events and report per-task usage and overhead
 
 status:
   answers: how much quota does each configured account have left?
@@ -27,7 +28,7 @@ spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions?
   refuses: --account (spend has no account dimension until account attribution lands); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --credits | --refresh auto|never|force | --value api-list
+  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task (repeatable) | --credits | --refresh auto|never|force | --value api-list
 
 config:
   answers: which configuration key resolved from where?
@@ -92,5 +93,11 @@ now:
   answers: how much quota does each configured account have right now?
   refuses: --model (now reports every window; only status takes a --model selector); --no-color (now prints no color)
   format: text | json
+
+task:
+  answers: which task or named overhead bucket consumed this usage, by temporal segmentation of the issue tracker's claim history?
+  refuses: --account (task attribution has no account dimension); --model (task attribution has no model dimension); --no-color (task prints no color)
+  format: text | json
+  options: ingest | report TASK-ID | overhead [--today (default) | --since YYYY-MM-DD | --days N]
 
 aub            prints the version; aub --help prints this

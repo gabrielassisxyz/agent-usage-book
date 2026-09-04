@@ -7,6 +7,7 @@
 //! and the ledger generation. A consumer never has to infer a unit or a freshness
 //! state from a bare number or a timestamp.
 
+use crate::attribution::TaskIdentityState;
 use crate::domain::credits::Credits;
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::interval::{DomainQuantity, Interval};
@@ -24,8 +25,9 @@ use crate::presentation::render::{CREDIT_UNIT, ExplainMode, render_credits_amoun
 use crate::problem_code::ProblemCode;
 use crate::report::{
     CoverageReport, LedgerGeneration, NowReport, ProvenanceGraph, ReportMetadata, SpendReport,
-    StatusReport,
+    StatusReport, TaskOverheadReport, TaskReport,
 };
+use crate::store::task_event::IngestSummary as TaskIngestSummary;
 use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
@@ -844,6 +846,341 @@ fn credits_json(credits: &Derivation<Credits>) -> String {
             provenance_json(provenance),
         ),
     }
+}
+
+/// One `{value, unit}`-shaped token vector, shared by `task report` and
+/// `task overhead`'s JSON bodies, following the same shape `spend_group_json`
+/// uses for `SpendGroup`.
+fn usage_vector_json(usage: &crate::domain::tokens::UsageVector) -> String {
+    let known = usage.known();
+    let kinds = TokenKind::ALL
+        .iter()
+        .map(|kind| {
+            format!(
+                "{}:{}",
+                json_string(token_kind_key(*kind)),
+                quantity_json(&known.value(*kind).to_string(), "tokens")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let unknown = usage
+        .unknown()
+        .iter()
+        .map(|(name, count)| {
+            format!(
+                "{}:{}",
+                json_string(name),
+                quantity_json(&count.value().to_string(), "tokens")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{}",
+        coverage_and_quality_json(usage.coverage(), usage.quality())
+            .trim_matches(|c| c == '{' || c == '}'),
+    )
+}
+
+/// One task's resolved kind identity, or `null` when the tracker never
+/// supplied kind-asserting evidence for the task at all.
+fn task_kind_json(task_kind: &Option<crate::store::task_identity::TaskIdentityRow>) -> String {
+    match task_kind {
+        None => "null".to_string(),
+        Some(row) => {
+            let state = match row.state {
+                TaskIdentityState::Resolved => "resolved",
+                TaskIdentityState::Unknown => "unknown",
+                TaskIdentityState::Conflict => "conflict",
+            };
+            let kind = row
+                .kind
+                .map(|kind| json_string(kind.as_str()))
+                .unwrap_or_else(|| "null".to_string());
+            let winner = row
+                .winner
+                .as_ref()
+                .map(|origin| json_string(&origin.provenance_id()))
+                .unwrap_or_else(|| "null".to_string());
+            format!(
+                "{{\"state\":{},\"kind\":{kind},\"winner\":{winner},\"evidence\":{},\"normalization_version\":{}}}",
+                json_string(state),
+                json_string(&row.evidence),
+                row.normalization_version,
+            )
+        }
+    }
+}
+
+fn task_session_usage_json(session: &crate::report::TaskSessionUsage) -> String {
+    let run = session
+        .run
+        .as_ref()
+        .map(|run| json_string(run.as_str()))
+        .unwrap_or_else(|| "null".to_string());
+    format!(
+        "{{\"session\":{},\"run\":{run},{}}}",
+        json_string(session.session.as_str()),
+        usage_vector_json(&session.usage),
+    )
+}
+
+/// The task report under the envelope: the task's total usage, its resolved
+/// kind identity, subscription credits and the session breakdown.
+pub fn task_report_json(report: &TaskReport, run: RunId) -> String {
+    task_report_json_with_explain(report, run, ExplainMode::Off)
+}
+
+/// The task report under the envelope, optionally including explain provenance.
+pub fn task_report_json_with_explain(
+    report: &TaskReport,
+    run: RunId,
+    explain: ExplainMode,
+) -> String {
+    let sessions = report
+        .sessions
+        .iter()
+        .map(task_session_usage_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let ingestion_generation = report
+        .metadata
+        .ingestion_generation
+        .map(|generation| generation.get().to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let mut body = format!(
+        "\"ingestion_generation\":{ingestion_generation},\"task_id\":{},\"task_kind\":{},{},\"credits\":{},\"sessions\":[{sessions}]",
+        json_string(report.task_id.as_str()),
+        task_kind_json(&report.task_kind),
+        usage_vector_json(&report.usage),
+        credits_json(&report.credits),
+    );
+    if explain != ExplainMode::Off {
+        body.push_str(&format!(
+            ",\"explain\":{}",
+            explain_json(&report.provenance, explain)
+        ));
+    }
+    JsonEnvelope::new("task-report", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Strict validation of `aub task report`'s JSON contract.
+pub fn validate_task_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "task-report" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'task-report', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_TASK_REPORT_KEYS: [&str; 15] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "ingestion_generation",
+        "task_id",
+        "task_kind",
+        "tokens",
+        "unknown_components",
+        "coverage",
+        "evidence_quality",
+        "credits",
+        "sessions",
+    ];
+    for key in obj.keys() {
+        if key == "explain" {
+            continue;
+        }
+        if !KNOWN_TASK_REPORT_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    for required in ["task_id", "task_kind", "tokens", "credits", "sessions"] {
+        if !obj.contains_key(required) {
+            return Err(JsonContractError::MissingField(required));
+        }
+    }
+    if let Some(explain_val) = obj.get("explain") {
+        let explain_obj =
+            explain_val
+                .as_object()
+                .ok_or_else(|| JsonContractError::InvalidFormat {
+                    field: "explain",
+                    message: "expected explain object".to_string(),
+                })?;
+        validate_explain_object(explain_obj)?;
+    }
+    Ok(parsed)
+}
+
+/// The task overhead report under the envelope: the window, the total
+/// task-attributed usage, and every overhead bucket's magnitude and share.
+pub fn task_overhead_json(report: &TaskOverheadReport, run: RunId) -> String {
+    task_overhead_json_with_explain(report, run, ExplainMode::Off)
+}
+
+/// The task overhead report under the envelope, optionally including explain
+/// provenance.
+pub fn task_overhead_json_with_explain(
+    report: &TaskOverheadReport,
+    run: RunId,
+    explain: ExplainMode,
+) -> String {
+    let buckets = report
+        .buckets
+        .iter()
+        .map(|bucket| {
+            format!(
+                "{{\"reason\":{},{},\"share\":{}}}",
+                json_string(bucket.reason.as_str()),
+                usage_vector_json(&bucket.usage),
+                quantity_json(&bucket.share.get().to_string(), "ppm"),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let ingestion_generation = report
+        .metadata
+        .ingestion_generation
+        .map(|generation| generation.get().to_string())
+        .unwrap_or_else(|| "null".to_string());
+    let mut body = format!(
+        "\"ingestion_generation\":{ingestion_generation},\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"task_usage\":{{{}}},\"buckets\":[{buckets}]",
+        json_string(&report.since.iso()),
+        json_string(&report.until.iso()),
+        usage_vector_json(&report.task_usage),
+    );
+    if explain != ExplainMode::Off {
+        body.push_str(&format!(
+            ",\"explain\":{}",
+            explain_json(&report.provenance, explain)
+        ));
+    }
+    JsonEnvelope::new("task-overhead", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Strict validation of `aub task overhead`'s JSON contract.
+pub fn validate_task_overhead_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "task-overhead" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'task-overhead', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_TASK_OVERHEAD_KEYS: [&str; 9] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "ingestion_generation",
+        "window",
+        "task_usage",
+    ];
+    for key in obj.keys() {
+        if key == "explain" || key == "buckets" {
+            continue;
+        }
+        if !KNOWN_TASK_OVERHEAD_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    for required in ["window", "task_usage", "buckets"] {
+        if !obj.contains_key(required) {
+            return Err(JsonContractError::MissingField(required));
+        }
+    }
+    if let Some(explain_val) = obj.get("explain") {
+        let explain_obj =
+            explain_val
+                .as_object()
+                .ok_or_else(|| JsonContractError::InvalidFormat {
+                    field: "explain",
+                    message: "expected explain object".to_string(),
+                })?;
+        validate_explain_object(explain_obj)?;
+    }
+    Ok(parsed)
+}
+
+/// The task ingest summary under the envelope: events ingested, quarantined
+/// and unchanged.
+pub fn task_ingest_json(
+    summary: &TaskIngestSummary,
+    run: RunId,
+    metadata: ReportMetadata,
+) -> String {
+    let body = format!(
+        "\"events_inserted\":{},\"events_already_present\":{},\"quarantines_inserted\":{},\"quarantines_already_present\":{}",
+        summary.events_inserted,
+        summary.events_already_present,
+        summary.quarantines_inserted,
+        summary.quarantines_already_present,
+    );
+    JsonEnvelope::new("task-ingest", run, metadata).to_json_with(&body)
+}
+
+/// Strict validation of `aub task ingest`'s JSON contract.
+pub fn validate_task_ingest_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
+    let (parsed, value) = JsonEnvelope::parse(json_str)?;
+    if parsed.command != "task-ingest" {
+        return Err(JsonContractError::InvalidFormat {
+            field: "command",
+            message: format!("expected 'task-ingest', got '{}'", parsed.command),
+        });
+    }
+    let obj = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "root",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_TASK_INGEST_KEYS: [&str; 10] = [
+        "schema",
+        "command",
+        "run",
+        "generated_at",
+        "knowledge_at",
+        "ledger_generation",
+        "events_inserted",
+        "events_already_present",
+        "quarantines_inserted",
+        "quarantines_already_present",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_TASK_INGEST_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    for required in [
+        "events_inserted",
+        "events_already_present",
+        "quarantines_inserted",
+        "quarantines_already_present",
+    ] {
+        if !obj.contains_key(required) {
+            return Err(JsonContractError::MissingField(required));
+        }
+    }
+    Ok(parsed)
 }
 
 /// The inner fields of a serialized object, for splicing one object's members into

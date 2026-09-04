@@ -6,10 +6,13 @@
 
 use rusqlite::params;
 
+use crate::attribution::segment::ClaimBoundary;
 use crate::attribution::{
-    TaskEvent, TaskEventQuarantine, TrackerEventReader, TrackerEventRecord, normalize_tracker_event,
+    TaskEvent, TaskEventKind, TaskEventQuarantine, TrackerEventReader, TrackerEventRecord,
+    normalize_tracker_event,
 };
-use crate::domain::ids::SourceNamespace;
+use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
+use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
 
 /// A Beads `events` table reader. It receives an already-open connection and only
@@ -99,6 +102,72 @@ pub fn ingest<R: TrackerEventReader>(
         }
     }
     Ok(summary)
+}
+
+/// Opens the tracker's own SQLite database read-only, for wrapping in
+/// [`BeadsEventReader`].
+///
+/// Unlike [`crate::store::connection::open`], this applies no pragma policy:
+/// that policy verifies journal mode, synchronous level and foreign-key
+/// enforcement this project's own ledger is built to hold, and the tracker
+/// database belongs to a different project entirely. Enforcing `aub`'s
+/// pragma policy against a schema and file it does not own would refuse a
+/// healthy tracker database for disagreeing with settings it was never asked
+/// to hold.
+pub fn open_tracker_database(path: &std::path::Path) -> Result<rusqlite::Connection, Error> {
+    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|error| Error::Store(format!("cannot open tracker database {path:?}: {error}")))
+}
+
+/// Reads every durably ingested claim/release boundary, tracker-wide and
+/// ordered by occurrence, for the segmentation engine in
+/// [`crate::attribution::segment`]. A tracker event whose kind normalized to
+/// `TaskEventKind::Unknown` was retained at ingest time as durable history
+/// but carries no attribution meaning, so it is filtered out here rather than
+/// in the segmentation engine: `segment::build_intervals` already documents
+/// that it ignores `Unknown` boundaries, and filtering here means a caller
+/// never constructs one only to have it silently ignored two layers down.
+pub fn read_boundaries(connection: &rusqlite::Connection) -> Result<Vec<ClaimBoundary>, Error> {
+    let mut statement = connection
+        .prepare(
+            "SELECT task_source, task_native, occurred_at, event_kind \
+             FROM task_event WHERE event_kind IN ('claim', 'release') \
+             ORDER BY occurred_at",
+        )
+        .map_err(|error| Error::Store(format!("cannot prepare task boundary scan: {error}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })
+        .map_err(|error| Error::Store(format!("cannot query task boundaries: {error}")))?;
+    let mut boundaries = Vec::new();
+    for row in rows {
+        let (task_source, task_native, occurred_at, event_kind) =
+            row.map_err(|error| Error::Store(format!("cannot read task boundary row: {error}")))?;
+        let kind = match event_kind.as_str() {
+            "claim" => TaskEventKind::Claim,
+            "release" => TaskEventKind::Release,
+            other => {
+                return Err(Error::Store(format!(
+                    "task_event carries an unexpected boundary kind: {other}"
+                )));
+            }
+        };
+        boundaries.push(ClaimBoundary {
+            task_id: TaskId::new(
+                SourceNamespace::new(task_source),
+                NativeTaskId::new(task_native),
+            ),
+            occurred_at: UtcTimestamp::from_unix_nanos(occurred_at),
+            kind,
+        });
+    }
+    Ok(boundaries)
 }
 
 fn insert_event(connection: &rusqlite::Connection, event: &TaskEvent) -> Result<bool, Error> {
@@ -337,5 +406,75 @@ mod tests {
         assert_eq!(records[0].upstream_id, 7);
         assert_eq!(records[0].task_native, "aub-7");
         assert_eq!(records[0].actor.as_deref(), Some("agent-7"));
+    }
+
+    #[test]
+    fn open_tracker_database_opens_read_only_and_refuses_a_missing_file() {
+        let scratch = ScratchDir::new();
+        let path = scratch.path().join("beads.db");
+        rusqlite::Connection::open(&path)
+            .unwrap()
+            .execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY);")
+            .unwrap();
+
+        let conn = open_tracker_database(&path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        // The planted negative: a write attempt against the read-only handle
+        // must fail rather than silently succeed, proving the flags actually
+        // took effect and this is not merely a connection that happens not
+        // to have been written to yet.
+        assert!(
+            conn.execute("INSERT INTO probe DEFAULT VALUES", [])
+                .is_err()
+        );
+
+        let missing = scratch.path().join("does-not-exist.db");
+        assert!(open_tracker_database(&missing).is_err());
+    }
+
+    #[test]
+    fn read_boundaries_returns_claim_and_release_events_ordered_and_drops_unknown() {
+        let (_scratch, connection) = fixture_connection();
+        let reader = FixtureReader(vec![
+            record(
+                1,
+                "aub-1",
+                "status_changed",
+                Some("open"),
+                Some("in_progress"),
+                "2026-08-31T19:20:00Z",
+            ),
+            record(2, "aub-1", "commented", None, None, "2026-08-31T19:10:00Z"),
+            record(
+                3,
+                "aub-1",
+                "status_changed",
+                Some("in_progress"),
+                Some("open"),
+                "2026-08-31T19:05:00Z",
+            ),
+        ]);
+        ingest(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
+
+        let boundaries = read_boundaries(&connection).unwrap();
+
+        // The planted negative: a naive reader that forgot the `event_kind`
+        // filter would return three rows, including the `commented` event
+        // whose kind carries no attribution meaning.
+        assert_eq!(boundaries.len(), 2);
+        assert_eq!(boundaries[0].kind, TaskEventKind::Release);
+        assert_eq!(
+            boundaries[0].occurred_at,
+            UtcTimestamp::parse_rfc3339("2026-08-31T19:05:00Z").unwrap()
+        );
+        assert_eq!(boundaries[1].kind, TaskEventKind::Claim);
+        assert_eq!(
+            boundaries[1].occurred_at,
+            UtcTimestamp::parse_rfc3339("2026-08-31T19:20:00Z").unwrap()
+        );
+        assert_eq!(boundaries[0].task_id.native().as_str(), "aub-1");
     }
 }

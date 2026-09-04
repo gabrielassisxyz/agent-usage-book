@@ -12,6 +12,13 @@ use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
 use crate::sessions::{UNKNOWN_PROJECT, UNKNOWN_REPOSITORY};
 
+/// The session label a canonical event carries when its source or session id
+/// could not be resolved. Exported so a caller that needs to tell a resolved
+/// session apart from this fallback (`report::spend::task_label_map`, for
+/// task attribution's `session_is_mapped` context) reads the same constant
+/// [`session_label`] writes, rather than a second copy of the literal.
+pub const UNKNOWN_SESSION: &str = "unknown-session";
+
 /// One canonical event ready for report grouping.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CanonicalSpendEvent {
@@ -199,6 +206,6 @@ fn session_labels(
 fn session_label(source: Option<&str>, session: Option<&str>) -> String {
     match (source, session) {
         (Some(source), Some(session)) => format!("{source}:{session}"),
-        _ => "unknown-session".to_string(),
+        _ => UNKNOWN_SESSION.to_string(),
     }
 }
