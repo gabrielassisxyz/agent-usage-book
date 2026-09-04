@@ -4,6 +4,7 @@
 //! - presentation
 //! - provider adapters
 
+pub mod account_segment;
 pub mod segment;
 
 use std::collections::BTreeMap;
