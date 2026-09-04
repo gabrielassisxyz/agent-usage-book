@@ -408,6 +408,18 @@ impl SpendGroupCreditsProvenance {
     }
 }
 
+/// What `aub clear-diagnostics` removed, as the renderer sees it.
+///
+/// Separate from `store::retention`'s own result of the same name, and deliberately so:
+/// the store owns what happened on disk, this owns what is reported, and presentation may
+/// only see the second. `IngestReport` carries the same split for the same reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClearDiagnosticsReport {
+    pub entries_removed: u64,
+    pub bytes_removed: u64,
+    pub provider_filter: Option<String>,
+}
+
 /// The spend report for `aub spend`: the window it covers, the groups, the
 /// provenance graph and the ingestion summary the groups were built from.
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -3130,6 +3130,18 @@ fn cost_model_fixture(clock: &impl Clock, invocation: &Invocation) -> Result<(),
     Ok(())
 }
 
+/// Carries the store's clearing result across the presentation boundary as a report model,
+/// which is the only shape a renderer is allowed to see.
+fn clear_diagnostics_report(
+    report: &crate::store::retention::ClearDiagnosticsReport,
+) -> crate::report::ClearDiagnosticsReport {
+    crate::report::ClearDiagnosticsReport {
+        entries_removed: report.entries_removed,
+        bytes_removed: report.bytes_removed,
+        provider_filter: report.provider_filter.clone(),
+    }
+}
+
 fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let subcommand = invocation.rest.first().map(String::as_str);
     match subcommand {
@@ -4054,11 +4066,18 @@ fn clear_diagnostics_command(
 
     match invocation.format {
         OutputFormat::Text => {
-            println!("{}", crate::presentation::render_clear_diagnostics(&report))
+            println!(
+                "{}",
+                crate::presentation::render_clear_diagnostics(&clear_diagnostics_report(&report))
+            )
         }
         OutputFormat::Json => println!(
             "{}",
-            crate::presentation::clear_diagnostics_json(&report, run, timestamp)
+            crate::presentation::clear_diagnostics_json(
+                &clear_diagnostics_report(&report),
+                run,
+                timestamp,
+            )
         ),
     }
     Ok(())

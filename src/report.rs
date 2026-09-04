@@ -13,13 +13,13 @@ pub mod export;
 pub mod spend;
 
 pub use models::{
-    BackupReport, CalibrateReport, CoverageAccount, CoverageBreach, CoverageBreachDimension,
-    CoverageReport, CoverageReset, CoverageThreshold, DoctorReport, ExportReport, IngestReport,
-    IngestSummary, IngestionGeneration, LedgerGeneration, LimitingWindow, MeterAccount,
-    MeterReadingProvenance, NowReport, ProjectionReadState, ReportMetadata, SampleAttempt,
-    SampleReport, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
-    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport, StatusReport,
-    TaskReport,
+    BackupReport, CalibrateReport, ClearDiagnosticsReport, CoverageAccount, CoverageBreach,
+    CoverageBreachDimension, CoverageReport, CoverageReset, CoverageThreshold, DoctorReport,
+    ExportReport, IngestReport, IngestSummary, IngestionGeneration, LedgerGeneration,
+    LimitingWindow, MeterAccount, MeterReadingProvenance, NowReport, ProjectionReadState,
+    ReportMetadata, SampleAttempt, SampleReport, SpendDiagnostic, SpendDiagnosticProvenance,
+    SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport,
+    StatusReport, TaskReport,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

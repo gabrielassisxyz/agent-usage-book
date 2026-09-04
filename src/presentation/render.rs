@@ -1147,9 +1147,7 @@ pub fn render_age(age: Age) -> String {
 }
 
 /// Formats a summary of cleared diagnostic capture bodies for operator display.
-pub fn render_clear_diagnostics(
-    report: &crate::store::retention::ClearDiagnosticsReport,
-) -> String {
+pub fn render_clear_diagnostics(report: &crate::report::ClearDiagnosticsReport) -> String {
     let unit = if report.entries_removed == 1 {
         "body"
     } else {

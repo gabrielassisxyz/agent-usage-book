@@ -1278,7 +1278,7 @@ pub fn fix_report_json(
 
 /// Serializes a diagnostic capture clearing report into a JSON envelope.
 pub fn clear_diagnostics_json(
-    report: &crate::store::retention::ClearDiagnosticsReport,
+    report: &crate::report::ClearDiagnosticsReport,
     run: RunId,
     at: crate::domain::time::UtcTimestamp,
 ) -> String {
