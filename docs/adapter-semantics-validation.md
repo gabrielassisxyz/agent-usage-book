@@ -91,10 +91,16 @@ proved by `tests/adapter_semantics_validation.rs`. They are never pruned.
 ## Comparison log
 
 One comparison per adapter has to be performed and recorded against the real surface,
-and any mismatch has to be explained or carried as an open finding. The environment that
-added this procedure has no access to a provider account, so the first real comparison
-is outstanding.
+and any mismatch has to be explained or carried as an open finding. The first real comparison was performed on 2026-09-04 against the `max`
+subscription and both windows agreed.
+
+Two things it needed and did not have, so the row below is the human half of the record
+only. `store::adapter_semantics_validation::insert_comparison` has no caller outside its
+own tests, so a comparison cannot be recorded through the mechanism that computes the
+verdict, and there is no doctor check reporting the age of the last comparison. Until
+both exist, the age of a comparison is something someone has to remember, which is the
+condition this procedure's own bookkeeping was meant to remove.
 
 | date (local) | adapter | observation id | windows compared | result |
 |---|---|---|---|---|
-| _pending_ | Anthropic | _pending_ | _pending_ | first real comparison not yet performed |
+| 2026-09-04 | Anthropic | 2 (account `max`) | `five_hour`, `seven_day` | agrees within granularity on both: adapter 1% and 21%, surface 1% and 21% |
