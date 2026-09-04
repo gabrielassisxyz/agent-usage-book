@@ -1539,13 +1539,15 @@ fn sample_busy_policy(config: &crate::config::Config) -> crate::store::connectio
 /// exactly as it was: only how long the sampler waited before reaching it
 /// changes, not whether it can still be reached.
 fn name_busy_wait(error: Error, busy_timeout: crate::domain::time::MonotonicDuration) -> Error {
-    match error {
-        Error::Store(message) if message.contains("database is locked") => Error::Store(format!(
+    if let Error::Store(message) = &error
+        && message.contains("database is locked")
+    {
+        return Error::Store(format!(
             "{message} (waited up to {}ms)",
             busy_timeout.as_nanos() / 1_000_000
-        )),
-        other => other,
+        ));
     }
+    error
 }
 
 /// `aub now`: force a persisted sampling attempt for the selected accounts
