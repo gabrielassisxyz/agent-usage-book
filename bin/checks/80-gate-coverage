@@ -52,6 +52,7 @@ declared_boundary_rules=(
     16-sql-only-in-store
     17-provider-adapters-no-file-writes
     18-no-system-clock-outside-time
+    19-status-no-store-connection
 )
 
 # Mapping of check filenames to their required descriptive phrase in AGENTS.md:93-95
