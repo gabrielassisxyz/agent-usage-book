@@ -25,6 +25,11 @@ pub struct CanonicalSpendEvent {
     pub canonical_id: String,
     pub occurred_at: UtcTimestamp,
     pub session: String,
+    /// The source namespace and native id behind `session`, kept apart so the
+    /// account-marker join can address the session without re-splitting the
+    /// rendered label. `None` when the event carried no session identity.
+    pub session_source: Option<String>,
+    pub session_native: Option<String>,
     pub project: String,
     pub repository: String,
     pub evidence_kind: String,
@@ -112,6 +117,8 @@ pub fn canonical_events(
             canonical_id,
             occurred_at: UtcTimestamp::from_unix_nanos(occurred_at),
             session: session_label(source.as_deref(), session_id.as_deref()),
+            session_source: source.clone(),
+            session_native: session_id.clone(),
             project,
             repository,
             evidence_kind,

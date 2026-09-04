@@ -12,9 +12,10 @@
 //! refuses every destination that would destroy evidence, above all the
 //! configured state directory itself. Steps 3 through 6 (verify the archive,
 //! restore to a new directory, run integrity and migration checks, replay both
-//! pending sources idempotently) are performed here in that order. Steps 7 and
-//! 8 are reported, not attempted: see [`PROJECTION_RECOVERY`] and
-//! [`TRANSCRIPT_RECOVERY`].
+//! pending sources idempotently) are performed here in that order. Step 7
+//! (rebuild the projection) is performed too, by [`projection_recovery_status`];
+//! step 8 has nothing to attempt in this phase and is reported rather than
+//! silently skipped: see [`TRANSCRIPT_RECOVERY`].
 //!
 //! The replay's idempotence is not this module's own property: it is the spool
 //! drain's, keyed on the attempt identifier, so a record present in both the
@@ -51,15 +52,27 @@ use crate::store::startup::{
 const ARCHIVE_PENDING_DIR: &str = "pending";
 
 /// Step 7 of the recovery procedure (PLAN.md section 38: rebuild the
-/// projection). The projection is disposable by design (invariant 16), and in
-/// this phase it has neither a published file in a restored state directory
-/// nor a publisher that would produce one, so there is nothing a projection
-/// rebuild could act on. aub-n27.2 owns projection rebuilding once publication
-/// exists; until then the step is reported rather than silently skipped.
-pub const PROJECTION_RECOVERY: RecoveryStepStatus = RecoveryStepStatus {
-    disposition: "not-applicable",
-    reason: "the projection is disposable and has no published file or publisher in this phase; rebuilding it is owned by aub-n27.2",
-};
+/// projection). The projection is disposable by design (invariant 16): the
+/// archive never carries one (`backup::create_archive` writes only the
+/// database and pending evidence), so there is nothing to restore. A recovery
+/// that copied the damaged directory's own projection file forward would be
+/// testing the wrong behaviour, since a corrupted projection is exactly the
+/// case this step exists to not reproduce; it is rebuilt deterministically
+/// from the restored database's own state instead (`aub-n27.2`).
+fn projection_recovery_status(publication: &crate::projection::Publication) -> RecoveryStepStatus {
+    match publication {
+        crate::projection::Publication::Published { .. } => RecoveryStepStatus {
+            disposition: "rebuilt",
+            reason: "the projection carries no archived copy; it is rebuilt deterministically \
+                     from the restored database's own state rather than restored from evidence",
+        },
+        crate::projection::Publication::Deferred { .. } => RecoveryStepStatus {
+            disposition: "deferred",
+            reason: "the projection rebuild was deferred; the restored database is unaffected \
+                     and the next publish heals it",
+        },
+    }
+}
 
 /// Step 8 of the recovery procedure (PLAN.md section 38: rebuild
 /// transcript-derived tables if necessary). No transcript-derived table has a
@@ -221,6 +234,14 @@ pub fn restore_archive(
     // started from.
     check_database(&conn)?;
     let observation_count = observation_row_count(&conn)?;
+
+    // Step 7: rebuild the projection from the same restored, replayed state
+    // the operator is left holding, never from the archive (which carries
+    // none) or from the damaged directory's own copy (which may be exactly
+    // what this recovery was called in to fix).
+    let projection_target = crate::projection::projection_path_in(destination);
+    let publication = crate::projection::publish(&conn, &projection_target);
+    let projection_recovery = projection_recovery_status(&publication);
     drop(conn);
     let (schema_version, ledger_generation) =
         archived_database_metadata(&destination_database, busy_timeout)?;
@@ -266,7 +287,7 @@ pub fn restore_archive(
         surviving_replay,
         observation_count,
         unrecovered,
-        projection_recovery: PROJECTION_RECOVERY,
+        projection_recovery,
         transcript_recovery: TRANSCRIPT_RECOVERY,
     })
 }
@@ -327,7 +348,11 @@ fn refuse_evidence_destroying_destinations(
 /// non-existent paths compare lexically after component normalization; a
 /// missing destination next to an existing other path is a different directory
 /// by construction, because the destination is created fresh at restore time.
-fn same_directory(a: &Path, b: &Path) -> bool {
+///
+/// `pub(crate)` so the drill (`aub-n27.2`) can refuse the same way against the
+/// same configured state directory, without a second implementation of what
+/// "the same directory" means drifting from this one.
+pub(crate) fn same_directory(a: &Path, b: &Path) -> bool {
     match (fs::canonicalize(a), fs::canonicalize(b)) {
         (Ok(a), Ok(b)) => a == b,
         (Err(_), Err(_)) => normalize_components(a) == normalize_components(b),
@@ -702,7 +727,7 @@ mod tests {
             "4. Restore into a directory that does not exist yet:",
             "5. Read the restore result.",
             "6. Check both replay lines and the exact `observations=N` count.",
-            "7. Projection recovery is not applicable in Phase 1",
+            "7. The projection is rebuilt, never restored:",
             "8. Transcript-derived tables have no writer in Phase 1",
         ];
         let mut prior = 0;
@@ -900,8 +925,80 @@ mod tests {
             "a clean archive must recover everything: {:?}",
             summary.unrecovered
         );
-        assert_eq!(summary.projection_recovery, PROJECTION_RECOVERY);
+        assert_eq!(summary.projection_recovery.disposition, "rebuilt");
         assert_eq!(summary.transcript_recovery, TRANSCRIPT_RECOVERY);
+    }
+
+    // --- the projection is rebuilt, never restored -------------------------
+
+    /// The archive carries no projection file at all (`create_archive` writes
+    /// only the database and pending evidence), so a restored destination's
+    /// projection cannot be a copy of anything the archive held. This proves
+    /// the file that lands there instead is a deterministic function of the
+    /// restored database: rebuilding it a second time, from a fresh
+    /// connection to the same restored database, reproduces the exact bytes
+    /// `restore_archive` itself wrote.
+    #[test]
+    fn the_restored_projection_is_rebuilt_and_reproducible_from_the_restored_database() {
+        let scratch = ScratchDir::new();
+        let state_dir = scratch.path().join("aub");
+        let mut conn = migrated_state_dir(&state_dir);
+        let attempt = seed_attempt(&conn);
+        commit_observation(&state_dir, &mut conn, attempt);
+        drop(conn);
+
+        let archive = scratch.path().join("archive");
+        let clock = clock_at(5_000);
+        create_archive(
+            &state_dir,
+            &archive,
+            MonotonicDuration::from_millis(1000),
+            &clock,
+        )
+        .unwrap();
+        assert!(
+            !archive
+                .join(crate::projection::PROJECTION_FILE_NAME)
+                .exists(),
+            "the archive must carry no projection file for this to be a real rebuild proof"
+        );
+
+        let restored = scratch.path().join("restored");
+        let summary = restore_archive(
+            &scratch.path().join("unused-configured"),
+            &archive,
+            &restored,
+            None,
+            MonotonicDuration::from_millis(1000),
+            &mounts(),
+            &clock,
+        )
+        .unwrap();
+        assert_eq!(summary.projection_recovery.disposition, "rebuilt");
+
+        let rebuilt_bytes = fs::read(crate::projection::projection_path_in(&restored)).unwrap();
+
+        // A second, independent rebuild from a fresh connection to the same
+        // restored database: the deterministic-reconstruction proof the
+        // module doc comment promises (no wall clock in the content).
+        let policy = policy();
+        let reconnected = open(
+            &restored.join(LEDGER_DATABASE_FILE),
+            AccessMode::ReadOnly,
+            &policy,
+        )
+        .unwrap();
+        let reconstruction_path = restored.join("projection.reconstruction-check");
+        let publication = crate::projection::publish(&reconnected, &reconstruction_path);
+        assert!(matches!(
+            publication,
+            crate::projection::Publication::Published { .. }
+        ));
+        let reconstructed_bytes = fs::read(&reconstruction_path).unwrap();
+        assert_eq!(
+            rebuilt_bytes, reconstructed_bytes,
+            "the rebuilt projection must be a deterministic function of the restored database"
+        );
     }
 
     // --- the partial recovery: dual-source replay and the report ----------

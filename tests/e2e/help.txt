@@ -5,7 +5,7 @@ shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, 
 
 commands:
   status   render the last known meter reading per configured account
-  spend    canonical token usage grouped by day, session, project, repository or task
+  spend    canonical token usage grouped by day, session, project, repository, task or account
   config   print every resolved configuration key with the source that won
   export   emit versioned JSONL usage rows keyed by session-id or run-id for external joins
   rate-card import, show and history the immutable dated vendor rate cards
@@ -17,6 +17,8 @@ commands:
   import   import explicitly selected legacy evidence with durable provenance
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
   now      force a persisted sampling attempt for the selected accounts and render the resulting state
+  clear-diagnostics clear retained diagnostic provider bodies
+  drill    damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive
   task     ingest issue-tracker task-claim events and report per-task usage and overhead
 
 status:
@@ -26,9 +28,9 @@ status:
 
 spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions?
-  refuses: --account (spend has no account dimension until account attribution lands); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
+  refuses: --account (spend groups by account with --group-by account; it has no single-account filter); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task (repeatable) | --credits | --refresh auto|never|force | --value api-list
+  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --refresh auto|never|force | --value api-list
 
 config:
   answers: which configuration key resolved from where?
@@ -69,7 +71,7 @@ doctor:
   answers: is the recorded evidence healthy, and does the transcript corpus still match its parsers?
   refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --model (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
   format: text | json
-  options: --transcript-format-drift
+  options: --fix | --transcript-format-drift
 
 coverage:
   answers: did the sampler attempt what the policy owed, and did those attempts observe?
@@ -81,7 +83,7 @@ import:
   answers: which legacy evidence is safe to import into the ledger?
   refuses: --format (import prints one operational result); --explain (import derives no report); --account (import carries account identity in its source); --model (import carries no model selector); --no-color (import prints no color)
   format: text only: import prints one operational result
-  options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE
+  options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE
 
 sample:
   answers: are configured accounts due for meter sampling, and what did the endpoints observe?
@@ -93,6 +95,18 @@ now:
   answers: how much quota does each configured account have right now?
   refuses: --model (now reports every window; only status takes a --model selector); --no-color (now prints no color)
   format: text | json
+
+clear-diagnostics:
+  answers: how many retained diagnostic bodies were cleared?
+  refuses: --explain (clear-diagnostics derives no quantity); --account (clear-diagnostics scopes by provider, not account); --model (clear-diagnostics takes no model); --no-color (clear-diagnostics prints no color)
+  format: text | json
+  options: [--provider NAME | --all]
+
+drill:
+  answers: does the documented recovery procedure actually recover a damaged state directory, and is that still true today?
+  refuses: --format (drill prints one operational result); --explain (drill derives no quantity); --account (a drill exercises the whole state directory, not one account); --model (a drill exercises the whole state directory, not one model); --no-color (drill prints no color)
+  format: text only: drill prints one operational result
+  options: --seed truncated-database|corrupted-projection|malformed-spool-record|unsupported-schema-version SCRATCH_DEST | --archive ARCHIVE SCRATCH_DEST
 
 task:
   answers: which task or named overhead bucket consumed this usage, by temporal segmentation of the issue tracker's claim history?

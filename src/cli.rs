@@ -81,6 +81,8 @@ aub_command_enum! {
     Import,
     Sample,
     Now,
+    ClearDiagnostics,
+    Drill,
     Task,
 }
 
@@ -110,7 +112,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -130,6 +132,8 @@ impl Command {
         Self::Import,
         Self::Sample,
         Self::Now,
+        Self::ClearDiagnostics,
+        Self::Drill,
         Self::Task,
     ];
 
@@ -155,7 +159,7 @@ impl Command {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
-                    reason: "spend has no account dimension until account attribution lands",
+                    reason: "spend groups by account with --group-by account; it has no single-account filter",
                 },
                 model: FlagSupport::Rejected {
                     reason: "spend has no model dimension until a model selector is needed",
@@ -453,6 +457,40 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::ClearDiagnostics => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "clear-diagnostics derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "clear-diagnostics scopes by provider, not account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "clear-diagnostics takes no model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "clear-diagnostics prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::Drill => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "drill prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "drill derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "a drill exercises the whole state directory, not one account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "a drill exercises the whole state directory, not one model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "drill prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::Task => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
@@ -493,6 +531,8 @@ impl Command {
             Command::Import => "import",
             Command::Sample => "sample",
             Command::Now => "now",
+            Command::ClearDiagnostics => "clear-diagnostics",
+            Command::Drill => "drill",
             Command::Task => "task",
         }
     }
@@ -502,9 +542,9 @@ impl Command {
     pub fn summary(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
-            Command::Spend => {
-                Some("canonical token usage grouped by day, session, project, repository or task")
-            }
+            Command::Spend => Some(
+                "canonical token usage grouped by day, session, project, repository, task or account",
+            ),
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
             }
@@ -537,6 +577,10 @@ impl Command {
             ),
             Command::Now => Some(
                 "force a persisted sampling attempt for the selected accounts and render the resulting state",
+            ),
+            Command::ClearDiagnostics => Some("clear retained diagnostic provider bodies"),
+            Command::Drill => Some(
+                "damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive",
             ),
             Command::Task => Some(
                 "ingest issue-tracker task-claim events and report per-task usage and overhead",
@@ -577,6 +621,10 @@ impl Command {
                 "are configured accounts due for meter sampling, and what did the endpoints observe?",
             ),
             Command::Now => Some("how much quota does each configured account have right now?"),
+            Command::ClearDiagnostics => Some("how many retained diagnostic bodies were cleared?"),
+            Command::Drill => Some(
+                "does the documented recovery procedure actually recover a damaged state directory, and is that still true today?",
+            ),
             Command::Task => Some(
                 "which task or named overhead bucket consumed this usage, by temporal segmentation of the issue tracker's claim history?",
             ),
@@ -621,7 +669,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task (repeatable) | --credits | --refresh auto|never|force | --value api-list",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -630,13 +678,19 @@ impl Command {
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
-            Command::Doctor => Some("--transcript-format-drift"),
+            Command::Doctor => Some("--fix | --transcript-format-drift"),
             Command::Coverage => {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
             }
-            Command::Import => Some("legacy-meter --source PATH --backup VERIFIED_ARCHIVE"),
+            Command::Import => Some(
+                "legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE",
+            ),
             Command::Sample => Some(
                 "--due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success",
+            ),
+            Command::ClearDiagnostics => Some("[--provider NAME | --all]"),
+            Command::Drill => Some(
+                "--seed truncated-database|corrupted-projection|malformed-spool-record|unsupported-schema-version SCRATCH_DEST | --archive ARCHIVE SCRATCH_DEST",
             ),
             Command::Task => Some(
                 "ingest | report TASK-ID | overhead [--today (default) | --since YYYY-MM-DD | --days N]",
@@ -654,6 +708,9 @@ impl Command {
     }
 
     fn from_name(name: &str) -> Option<Self> {
+        if name == "clear-captures" {
+            return Some(Self::ClearDiagnostics);
+        }
         Self::ALL.into_iter().find(|command| command.name() == name)
     }
 }
@@ -952,6 +1009,10 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
             reject_positionals(&invocation)?;
             now_command(&RealClock::new(), level, &invocation)
         }
+        Command::ClearDiagnostics => {
+            clear_diagnostics_command(&RealClock::new(), level, &invocation)
+        }
+        Command::Drill => drill_command(&RealClock::new(), &invocation),
         Command::Task => task_command(&RealClock::new(), level, &invocation),
     }
 }
@@ -1662,8 +1723,9 @@ fn emit_now_report(
     }
 }
 
-/// `aub doctor`: operational health, drift and integrity diagnostics.
-/// Supports `--transcript-format-drift` (aub-lqe.17).
+/// `aub doctor`: the check registry (`aub-n27.7`) by default, the deeper
+/// `--transcript-format-drift` view of one check's own evidence, or `--fix` for
+/// the four permitted repairs.
 fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
@@ -1677,25 +1739,85 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
+    let mut legacy_drift_view = false;
+    let mut fix = false;
     for arg in &invocation.rest {
         match arg.as_str() {
-            "--transcript-format-drift" | "--rate-card-staleness" => {}
+            "--transcript-format-drift" | "--rate-card-staleness" => legacy_drift_view = true,
+            "--fix" => fix = true,
             other => return Err(Error::Usage(format!("unknown argument: {other}"))),
         }
+    }
+    if legacy_drift_view && fix {
+        return Err(Error::Usage(
+            "--fix cannot be combined with --transcript-format-drift or --rate-card-staleness"
+                .to_string(),
+        ));
     }
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
-    let (config, _provenance) = crate::config::resolve(
+    let config_result = crate::config::resolve(
         &crate::config::Overrides::new(),
         &env,
         file_contents.as_deref(),
         &file_path,
-    )?;
+    );
 
+    if legacy_drift_view {
+        let (config, _provenance) = config_result?;
+        return doctor_transcript_drift_view(&config, timestamp, run, invocation);
+    }
+    if fix {
+        let (config, _provenance) = config_result?;
+        let mut conn = open_ledger(clock)?;
+        let report = crate::doctor::run_fix(&mut conn, &config, clock)?;
+        match invocation.format {
+            OutputFormat::Text => println!("{}", crate::presentation::render_fix_report(&report)),
+            OutputFormat::Json => println!(
+                "{}",
+                crate::presentation::fix_report_json(&report, run, timestamp)
+            ),
+        }
+        return Ok(());
+    }
+
+    let (outcomes, residual) = match &config_result {
+        Ok((config, _provenance)) => doctor_registry_and_residual(config, timestamp),
+        Err(error) => (
+            crate::doctor::configuration_failed_registry(&error.to_string()),
+            None,
+        ),
+    };
+    let ledger_generation = match &config_result {
+        Ok((config, _provenance)) => current_ledger_generation_or_zero(config),
+        Err(_) => LedgerGeneration::new(0),
+    };
+    let report = crate::doctor::DoctorReport {
+        metadata: ReportMetadata::new(timestamp, timestamp, ledger_generation, None),
+        outcomes,
+        residual,
+    };
+    match invocation.format {
+        OutputFormat::Text => println!("{}", crate::presentation::render_doctor_report(&report)),
+        OutputFormat::Json => println!("{}", crate::presentation::doctor_report_json(&report, run)),
+    }
+    Ok(())
+}
+
+/// The `aub doctor --transcript-format-drift` / `--rate-card-staleness` view: the
+/// pre-registry report, kept verbatim so its own e2e case and unit tests keep
+/// passing unchanged.
+fn doctor_transcript_drift_view(
+    config: &crate::config::Config,
+    timestamp: UtcTimestamp,
+    run: RunId,
+    invocation: &Invocation,
+) -> Result<(), Error> {
     let mut db_quarantine = None;
     let mut stale_cards = Vec::new();
+    let mut attribution_assessment = None;
     let db_path = config
         .state
         .dir
@@ -1715,11 +1837,27 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
             if let Ok(stale) = crate::store::rate_card::stale_rate_cards(&conn, timestamp) {
                 stale_cards = stale;
             }
+            if let Ok(observations) =
+                crate::store::account_attribution_segment::attribution_observations(&conn)
+            {
+                let window_nanos =
+                    i64::try_from(config.attribution.recent_window.as_nanos()).unwrap_or(i64::MAX);
+                let window_since = crate::domain::time::UtcTimestamp::from_unix_nanos(
+                    timestamp.unix_nanos().saturating_sub(window_nanos),
+                );
+                attribution_assessment = Some(
+                    crate::attribution::quality::AttributionQualityAssessment::assess(
+                        observations,
+                        window_since,
+                        config.attribution.quality_floor,
+                    ),
+                );
+            }
         }
     }
 
     let report =
-        crate::transcripts::detect_drift(&config, None, timestamp, db_quarantine.as_deref())?;
+        crate::transcripts::detect_drift(config, None, timestamp, db_quarantine.as_deref())?;
 
     match invocation.format {
         OutputFormat::Text => {
@@ -1747,7 +1885,113 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         OutputFormat::Json => println!("{}", crate::presentation::doctor_drift_json(&report, run)),
     }
 
+    if let Some(assessment) = &attribution_assessment {
+        if let OutputFormat::Text = invocation.format {
+            println!(
+                "\n{}",
+                crate::presentation::render_attribution_quality(assessment)
+            );
+        }
+        if let Some(error) = attribution_quality_breach_error(assessment) {
+            return Err(error);
+        }
+    }
+
     Ok(())
+}
+
+/// The doctor exit consequence of an attribution-quality assessment: a
+/// `ThresholdNotMet` error naming every token kind and scope that fell below
+/// the configured floor, or `None` when nothing did. Split out so the mapping
+/// is unit-tested without a live command.
+fn attribution_quality_breach_error(
+    assessment: &crate::attribution::quality::AttributionQualityAssessment,
+) -> Option<Error> {
+    if !assessment.has_breach() {
+        return None;
+    }
+    let kinds: Vec<String> = assessment
+        .breaches
+        .iter()
+        .map(|breach| {
+            let scope = match breach.scope {
+                crate::attribution::quality::MetricScope::AllHistory => "all history",
+                crate::attribution::quality::MetricScope::RecentWindow { .. } => "recent window",
+            };
+            format!("{} ({scope})", breach.kind.label())
+        })
+        .collect();
+    Some(Error::ThresholdNotMet(format!(
+        "attribution quality is below the configured floor for: {}",
+        kinds.join(", ")
+    )))
+}
+
+/// Runs the doctor check registry against a configured ledger context, opening the
+/// ledger read-only when it exists, tolerating both its absence (a fresh install)
+/// and a failure to open it (a finding, not an absence).
+fn doctor_registry_and_residual(
+    config: &crate::config::Config,
+    timestamp: UtcTimestamp,
+) -> (
+    Vec<crate::doctor::CheckOutcome>,
+    Option<crate::reconciliation::RollingResidualHealth>,
+) {
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    let (db, db_missing, db_open_error) = if !db_path.is_file() {
+        (None, true, None)
+    } else {
+        match crate::store::connection::open(
+            &db_path,
+            crate::store::connection::AccessMode::ReadOnly,
+            &policy,
+        ) {
+            Ok(conn) => (Some(conn), false, None),
+            Err(error) => (None, false, Some(error.to_string())),
+        }
+    };
+    let ctx = crate::doctor::DoctorContext {
+        config,
+        timestamp,
+        db_path,
+        db: db.as_ref(),
+        db_missing,
+        db_open_error,
+    };
+    let outcomes = crate::doctor::build_registry(&ctx);
+    let residual = crate::doctor::checks::rolling_residual_health(&ctx);
+    (outcomes, residual)
+}
+
+/// The current ledger generation for the doctor report's metadata, or zero when
+/// no ledger exists yet: the same "nothing recorded yet" reading
+/// `TranscriptDriftReport`'s empty case uses, never a fabricated positive number.
+fn current_ledger_generation_or_zero(config: &crate::config::Config) -> LedgerGeneration {
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    if !db_path.is_file() {
+        return LedgerGeneration::new(0);
+    }
+    let policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    crate::store::connection::open(
+        &db_path,
+        crate::store::connection::AccessMode::ReadOnly,
+        &policy,
+    )
+    .ok()
+    .and_then(|conn| crate::store::ledger_generation::current(&conn).ok())
+    .map(|generation| LedgerGeneration::new(generation.value()))
+    .unwrap_or_else(|| LedgerGeneration::new(0))
 }
 
 /// The default window `aub coverage` reports when the command line names none:
@@ -2123,9 +2367,10 @@ fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
         "session" => Ok(SpendGrouping::Session),
         "project" => Ok(SpendGrouping::Project),
         "repository" | "repo" => Ok(SpendGrouping::Repository),
+        "account" => Ok(SpendGrouping::Account),
         "task" => Ok(SpendGrouping::Task),
         _ => Err(Error::Usage(format!(
-            "--group-by must be day, session, project, repository or task, got {value}"
+            "--group-by must be day, session, project, repository, task or account, got {value}"
         ))),
     }
 }
@@ -2923,6 +3168,18 @@ fn cost_model_fixture(clock: &impl Clock, invocation: &Invocation) -> Result<(),
     Ok(())
 }
 
+/// Carries the store's clearing result across the presentation boundary as a report model,
+/// which is the only shape a renderer is allowed to see.
+fn clear_diagnostics_report(
+    report: &crate::store::retention::ClearDiagnosticsReport,
+) -> crate::report::ClearDiagnosticsReport {
+    crate::report::ClearDiagnosticsReport {
+        entries_removed: report.entries_removed,
+        bytes_removed: report.bytes_removed,
+        provider_filter: report.provider_filter.clone(),
+    }
+}
+
 fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let subcommand = invocation.rest.first().map(String::as_str);
     match subcommand {
@@ -3129,11 +3386,21 @@ fn create_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Er
     Ok(())
 }
 
+fn import_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    match invocation.rest.first().map(String::as_str) {
+        Some("legacy-meter") => import_legacy_meter(clock, level, &invocation.rest),
+        Some("seed-archive") => import_seed_archive(clock, level, &invocation.rest),
+        _ => Err(Error::Usage(
+            "import requires either the `legacy-meter` or `seed-archive` subcommand".into(),
+        )),
+    }
+}
+
 /// `aub import legacy-meter` is deliberately administrative: it accepts one
 /// known source format, verifies a recovery archive before it writes, and
 /// names the source only by digest in its output and diagnostics.
-fn import_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
-    let (source_path, backup_path) = legacy_meter_import_flags(&invocation.rest)?;
+fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Result<(), Error> {
+    let (source_path, backup_path) = legacy_meter_import_flags(rest)?;
     let source = crate::legacy_meter::read_source(std::path::Path::new(&source_path))
         .map_err(|_| Error::IngestIncomplete("cannot read legacy meter source".into()))?;
     let env = crate::config::RealEnv;
@@ -3213,6 +3480,102 @@ fn import_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     Ok(())
 }
 
+/// `aub import seed-archive` is administrative: it accepts the seed archive format,
+/// verifies a recovery archive before it writes, and names the source only by digest.
+fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Result<(), Error> {
+    let (source_path, backup_path) = seed_archive_import_flags(rest)?;
+    let source =
+        crate::seed_archive::read_source(std::path::Path::new(&source_path)).map_err(|error| {
+            Error::IngestIncomplete(format!("cannot read seed archive source: {error}"))
+        })?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let backup = crate::backup::verify_archive(
+        std::path::Path::new(&backup_path),
+        config.sampling.request_timeout,
+        clock,
+    )?;
+    if !backup.verified {
+        return Err(Error::Store(
+            "seed archive import requires a verified backup archive".into(),
+        ));
+    }
+    let backup_id = format!(
+        "archive-v{}-g{}",
+        backup.schema_version, backup.ledger_generation
+    );
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &LogicalName::new("import"))],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    let mut conn = open_ledger(clock)?;
+    let summary =
+        crate::store::seed_archive_import::import(&mut conn, &source, &backup_id, timestamp)?;
+    if summary.imported > 0 {
+        crate::projection::publish(
+            &conn,
+            &crate::projection::projection_path_in(&config.state.dir),
+        );
+    }
+    let terminal_outcome = if summary.quarantined > 0 && summary.imported == 0 {
+        "quarantined"
+    } else if summary.imported > 0 {
+        "imported"
+    } else if summary.unchanged > 0 {
+        "unchanged"
+    } else {
+        "empty"
+    };
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::SeedArchiveImported,
+            &[
+                (
+                    "source_digest",
+                    &LogicalName::new(source.content_digest.clone()),
+                ),
+                ("verified_backup_id", &LogicalName::new(backup_id.clone())),
+                (
+                    "records_read",
+                    &Quantity::new(source.records_read, "records"),
+                ),
+                ("imported", &Quantity::new(summary.imported, "records")),
+                ("unchanged", &Quantity::new(summary.unchanged, "records")),
+                (
+                    "quarantined",
+                    &Quantity::new(summary.quarantined, "records"),
+                ),
+                ("terminal_outcome", &LogicalName::new(terminal_outcome)),
+            ],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    println!(
+        "seed-archive import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} quarantined={} terminal_outcome={}",
+        source.content_digest,
+        backup_id,
+        source.records_read,
+        summary.imported,
+        summary.unchanged,
+        summary.quarantined,
+        terminal_outcome,
+    );
+    Ok(())
+}
+
 fn verify_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
     let config = resolve_backup_config()?;
     let destination = std::path::Path::new(destination);
@@ -3250,6 +3613,30 @@ fn legacy_meter_import_flags(rest: &[String]) -> Result<(String, String), Error>
         (Some(source), Some(backup)) => Ok((source, backup)),
         _ => Err(Error::Usage(
             "import legacy-meter requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
+        )),
+    }
+}
+
+fn seed_archive_import_flags(rest: &[String]) -> Result<(String, String), Error> {
+    if rest.first().map(String::as_str) != Some("seed-archive") {
+        return Err(Error::Usage(
+            "import requires the `seed-archive` subcommand".into(),
+        ));
+    }
+    let mut source = None;
+    let mut backup = None;
+    let mut args = rest[1..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--source" => source = args.next().cloned(),
+            "--backup" => backup = args.next().cloned(),
+            other => return Err(Error::Usage(format!("unknown import argument: {other}"))),
+        }
+    }
+    match (source, backup) {
+        (Some(source), Some(backup)) => Ok((source, backup)),
+        _ => Err(Error::Usage(
+            "import seed-archive requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
         )),
     }
 }
@@ -3358,6 +3745,105 @@ fn render_restore_summary(summary: &crate::restore::RestoreSummary) {
             item.reason,
         );
     }
+}
+
+/// `aub drill`: damages a scratch state directory in one of four seeded ways,
+/// or runs against a real named archive, and drives it through the same
+/// documented recovery procedure `aub backup restore` follows by hand. Never
+/// touches the configured state directory in either mode (`aub-n27.2`,
+/// docs/recovery.md).
+fn drill_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
+    let report = match parse_drill_args(&invocation.rest)? {
+        DrillArgs::Seed { case, scratch } => crate::drill::run_seeded(
+            &config.state.dir,
+            case,
+            &scratch,
+            config.sampling.request_timeout,
+            &crate::store::startup::ProcMounts,
+            clock,
+        )?,
+        DrillArgs::Archive { archive, scratch } => crate::drill::run_archive(
+            &config.state.dir,
+            &archive,
+            &scratch,
+            config.sampling.request_timeout,
+            &crate::store::startup::ProcMounts,
+            clock,
+        )?,
+    };
+
+    render_drill_report(&report);
+
+    if let Some(result_path) = &config.drill.result {
+        crate::drill::record_run(
+            result_path,
+            &crate::drill::DrillRunRecord::from_report(&report),
+        )?;
+    }
+
+    if !report.passed() {
+        return Err(Error::Store(
+            "drill: the recovered state failed one of the drill's own checks; see the lines above"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+enum DrillArgs {
+    Seed {
+        case: crate::drill::DamageCase,
+        scratch: PathBuf,
+    },
+    Archive {
+        archive: PathBuf,
+        scratch: PathBuf,
+    },
+}
+
+fn parse_drill_args(rest: &[String]) -> Result<DrillArgs, Error> {
+    match rest {
+        [flag, value, scratch] if flag == "--seed" => {
+            let case = crate::drill::DamageCase::from_name(value).ok_or_else(|| {
+                Error::Usage(format!(
+                    "--seed {value} is not a known damage case; use truncated-database, \
+                     corrupted-projection, malformed-spool-record or unsupported-schema-version"
+                ))
+            })?;
+            Ok(DrillArgs::Seed {
+                case,
+                scratch: PathBuf::from(scratch),
+            })
+        }
+        [flag, archive, scratch] if flag == "--archive" => Ok(DrillArgs::Archive {
+            archive: PathBuf::from(archive),
+            scratch: PathBuf::from(scratch),
+        }),
+        other => Err(Error::Usage(format!(
+            "drill requires `--seed CASE SCRATCH_DEST` or `--archive ARCHIVE SCRATCH_DEST`, got {other:?}"
+        ))),
+    }
+}
+
+/// One operational result, the same plain line-per-fact shape backup and
+/// restore print: the source and scratch destination, the restore's own
+/// summary (`render_restore_summary`), then the two drill-specific proofs a
+/// bare restore does not carry, and the drill's own pass/fail verdict.
+fn render_drill_report(report: &crate::drill::DrillReport) {
+    println!(
+        "drill: source={} scratch_destination={}",
+        report.source.label(),
+        report.scratch_destination.display(),
+    );
+    render_restore_summary(&report.restore);
+    if let Some(preserved) = report.damaged_directory_preserved {
+        println!("drill: damaged_directory_preserved={preserved}");
+    }
+    if let Some(deterministic) = report.projection_deterministic {
+        println!("drill: projection_deterministic={deterministic}");
+    }
+    println!("drill: passed={}", report.passed());
 }
 
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in
@@ -3536,6 +4022,101 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
             .table_name()
             .unwrap_or_else(|| unreachable!("a sweep class is a table class by construction"));
         println!("  {table}: {} rows", count.value());
+    }
+    Ok(())
+}
+
+/// `aub clear-diagnostics`: clears retained diagnostic bodies, scoped per provider
+/// or in total. Never touches quarantine rows.
+fn clear_diagnostics_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("clear-diagnostics");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let mut provider: Option<String> = None;
+    let mut all = false;
+    let mut iter = invocation.rest.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if let Some(val) = arg.strip_prefix("--provider=") {
+            if provider.is_some() {
+                return Err(Error::Usage("--provider specified more than once".into()));
+            }
+            if val.is_empty() {
+                return Err(Error::Usage("--provider requires a non-empty name".into()));
+            }
+            provider = Some(val.to_string());
+        } else if arg == "--provider" {
+            if provider.is_some() {
+                return Err(Error::Usage("--provider specified more than once".into()));
+            }
+            let next_val = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--provider requires a provider name".into()))?;
+            if next_val.is_empty() {
+                return Err(Error::Usage("--provider requires a non-empty name".into()));
+            }
+            provider = Some(next_val.clone());
+        } else if arg == "--all" {
+            all = true;
+        } else if !arg.starts_with("--") {
+            if provider.is_some() {
+                return Err(Error::Usage(format!(
+                    "unexpected positional argument: {arg}"
+                )));
+            }
+            provider = Some(arg.clone());
+        } else {
+            return Err(Error::Usage(format!("unknown argument: {arg}")));
+        }
+    }
+
+    if all && provider.is_some() {
+        return Err(Error::Usage(
+            "--all cannot be combined with --provider".into(),
+        ));
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let report =
+        crate::store::retention::clear_retained_bodies(&config.state.dir, provider.as_deref())
+            .map_err(|error| Error::Store(format!("clear diagnostics: {error}")))?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!(
+                "{}",
+                crate::presentation::render_clear_diagnostics(&clear_diagnostics_report(&report))
+            )
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            crate::presentation::clear_diagnostics_json(
+                &clear_diagnostics_report(&report),
+                run,
+                timestamp,
+            )
+        ),
     }
     Ok(())
 }
@@ -3776,6 +4357,64 @@ fn task_overhead_window(rest: &[String], now: UtcTimestamp) -> Result<SpendWindo
 mod tests {
     use super::*;
     use crate::config::FakeEnv;
+
+    #[test]
+    fn doctor_maps_an_attribution_floor_breach_to_threshold_not_met() {
+        use crate::attribution::account_segment::AccountEvidenceClass;
+        use crate::attribution::quality::{
+            AttributionObservation, AttributionQualityAssessment, AttributionQualityFloor,
+        };
+        use crate::domain::time::UtcTimestamp;
+        use crate::domain::tokens::{
+            CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
+        };
+
+        let tokens = |input: u64| {
+            KnownTokenVector::new(
+                InputTokens::new(input),
+                OutputTokens::new(0),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            )
+        };
+        let observations = vec![
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::ExplicitLauncherOrHook,
+                usage: tokens(10),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::Unattributed,
+                usage: tokens(90),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+        ];
+
+        // With a floor of 0.9, the 10% attributed fraction breaches it.
+        let breaching = AttributionQualityAssessment::assess(
+            observations.clone(),
+            UtcTimestamp::from_unix_nanos(0),
+            AttributionQualityFloor::new(0.9),
+        );
+        match attribution_quality_breach_error(&breaching) {
+            Some(Error::ThresholdNotMet(message)) => {
+                assert!(
+                    message.contains("input"),
+                    "{message:?} must name the token kind"
+                );
+            }
+            other => panic!("expected ThresholdNotMet, got {other:?}"),
+        }
+
+        // With no floor configured, the same corpus produces no error: the
+        // metric is reported, not judged.
+        let unjudged = AttributionQualityAssessment::assess(
+            observations,
+            UtcTimestamp::from_unix_nanos(0),
+            None,
+        );
+        assert!(attribution_quality_breach_error(&unjudged).is_none());
+    }
 
     /// `Command::ALL` must name every variant the enum declares. `DECLARED_VARIANTS`
     /// is derived from the enum's own declaration by [`aub_command_enum`], so the
@@ -4095,6 +4734,60 @@ mod tests {
         }
     }
 
+    /// `docs/commands.md` names every shipping command in a `## \`aub NAME\``
+    /// heading, each with a `**Refuses:**` line stating the behavioural
+    /// boundary `--help` does not carry (aub-n27.6). The documented set is
+    /// compared against [`Command::ALL`] filtered to the shipping subset
+    /// (`summary().is_some()`) rather than a hand-maintained list, so a
+    /// command added without a section fails here instead of only being
+    /// noticed by a human reading the file. The planted negative: a
+    /// documented command with no `**Refuses:**` line would still pass a
+    /// weaker check that only compared the name set.
+    #[test]
+    fn documented_command_list_matches_the_parser_and_states_a_refusal() {
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/commands.md"))
+                .expect("docs/commands.md must be readable");
+
+        let shipping: std::collections::BTreeSet<&str> = Command::ALL
+            .into_iter()
+            .filter(|command| command.summary().is_some())
+            .map(Command::name)
+            .collect();
+
+        let mut documented: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in docs.lines() {
+            let Some(rest) = line.strip_prefix("## `aub ") else {
+                continue;
+            };
+            let name = rest
+                .strip_suffix('`')
+                .unwrap_or_else(|| panic!("malformed command heading: {line:?}"));
+            documented.insert(name);
+        }
+
+        assert_eq!(
+            documented, shipping,
+            "docs/commands.md must document exactly the shipping commands"
+        );
+
+        for name in &documented {
+            let heading = format!("## `aub {name}`");
+            let start = docs
+                .find(&heading)
+                .unwrap_or_else(|| panic!("lost {heading:?} on the second pass"));
+            let section_end = docs[start..]
+                .find("\n## ")
+                .map(|offset| start + offset)
+                .unwrap_or(docs.len());
+            let section = &docs[start..section_end];
+            assert!(
+                section.contains("**Refuses:**"),
+                "docs/commands.md section for {name:?} has no **Refuses:** line"
+            );
+        }
+    }
+
     fn args(items: &[&str]) -> Vec<OsString> {
         std::iter::once("aub")
             .chain(items.iter().copied())
@@ -4209,7 +4902,19 @@ mod tests {
         assert_eq!(explicit.refresh, RefreshPolicy::Never);
         assert!(spend_options(&["--since".into(), "25/08/2026".into()], now).is_err());
         assert!(spend_options(&["--days".into(), "0".into()], now).is_err());
-        assert!(spend_options(&["--group-by=account".into()], now).is_err());
+        assert_eq!(
+            spend_options(&["--group-by=account".into()], now)
+                .unwrap()
+                .grouping,
+            vec![SpendGrouping::Account]
+        );
+        assert_eq!(
+            spend_options(&["--group-by=task".into()], now)
+                .unwrap()
+                .grouping,
+            vec![SpendGrouping::Task]
+        );
+        assert!(spend_options(&["--group-by=model".into()], now).is_err());
         assert!(spend_options(&["--bogus".into()], now).is_err());
     }
 
@@ -4434,6 +5139,43 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
                 assert!(message.contains("disk full"), "{message:?}");
             }
             other => panic!("PersistFailed must map to Error::Store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_diagnostics_alias_clear_captures_is_recognised() {
+        let req1 = parse_invocation(args(&["clear-diagnostics"])).unwrap();
+        let req2 = parse_invocation(args(&["clear-captures"])).unwrap();
+        match (req1, req2) {
+            (Request::Run(inv1), Request::Run(inv2)) => {
+                assert_eq!(inv1.command, Command::ClearDiagnostics);
+                assert_eq!(inv2.command, Command::ClearDiagnostics);
+            }
+            other => panic!("expected Request::Run for both aliases, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_diagnostics_accepts_format_and_provider_and_all() {
+        let req = parse_invocation(args(&[
+            "clear-diagnostics",
+            "--format",
+            "json",
+            "--provider",
+            "anthropic",
+        ]))
+        .unwrap();
+        match req {
+            Request::Run(inv) => {
+                assert_eq!(inv.format, OutputFormat::Json);
+                assert_eq!(
+                    inv.rest,
+                    vec!["--provider".to_string(), "anthropic".to_string()]
+                );
+            }
+            other @ (Request::Version | Request::Help) => {
+                panic!("unexpected parse result: {other:?}")
+            }
         }
     }
 

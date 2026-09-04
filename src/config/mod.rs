@@ -23,8 +23,9 @@
 //! using exactly the four labels above: `flag`, `environment`, `file`, `default`.
 //!
 //! Scope, stated rather than left implicit: the four scalar sections (`state`,
-//! `sampling`, `freshness`, `coverage`) plus `backup.review_after` go through the full
-//! four-level order and are individually provenance-tracked, since those are the keys
+//! `sampling`, `freshness`, `coverage`) plus `backup.review_after` and `drill.max_age`
+//! go through the full four-level order and are individually provenance-tracked, since
+//! those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
 //! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
@@ -40,6 +41,7 @@ pub mod aliases;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::attribution::quality::AttributionQualityFloor;
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
 
@@ -212,9 +214,42 @@ pub struct CoverageConfig {
     pub measurement_floor: CoverageFloor,
 }
 
+/// The attribution-quality policy: the advisory floor for the attributed
+/// fraction and the recent window the metric is also computed over.
+#[derive(Debug, Clone)]
+pub struct AttributionConfig {
+    /// The advisory floor `doctor` flags a breach of. `None` until an operator
+    /// configures one (the value itself is decided by `aub-cab.7`): the metric
+    /// is still reported, just not judged.
+    pub quality_floor: Option<AttributionQualityFloor>,
+    /// The recent window the metric is computed over in addition to all
+    /// history, so a slow decline in attribution coverage is visible against a
+    /// lifetime average.
+    pub recent_window: MonotonicDuration,
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub review_after: MonotonicDuration,
+    /// Where `doctor` looks for the last verified backup. `aub backup` takes its
+    /// destination as an explicit argument and remembers nothing durably, so
+    /// without this the backup-age check would have nowhere to look. `None`
+    /// means backup age is not applicable rather than an assumed default path.
+    pub destination: Option<PathBuf>,
+}
+
+/// The periodic restore drill's own review policy, the same shape as
+/// [`BackupConfig`] and for the same reason: `aub drill` takes its scratch
+/// destination and source as explicit arguments and remembers nothing
+/// durably on its own, so `doctor` needs a configured place to read the last
+/// recorded run from.
+#[derive(Debug, Clone)]
+pub struct DrillConfig {
+    pub max_age: MonotonicDuration,
+    /// Where `aub drill` appends one durable JSON record per run, and where
+    /// `doctor` reads the age of the last successful one. `None` means drill
+    /// age is not applicable rather than an assumed default path.
+    pub result: Option<PathBuf>,
 }
 
 /// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
@@ -251,18 +286,37 @@ pub struct ValuationConfig {
     pub default_rate_book: Option<String>,
 }
 
+/// The rolling-residual self-audit policy `doctor` reads (PLAN.md section 35,
+/// aub-dpn.3). `doctor` reconciles observed meter movement against locally
+/// explained movement over recent eligible intervals; these two keys bound the
+/// window it looks back over and the fewest eligible intervals it will state a
+/// verdict from.
+#[derive(Debug, Clone)]
+pub struct ReconciliationConfig {
+    /// How far back `doctor` looks for eligible reconciliation intervals when it
+    /// reports rolling residual health.
+    pub residual_window: MonotonicDuration,
+    /// The fewest eligible intervals the window must hold before `doctor` states
+    /// a residual verdict. Below it the count is still reported and the verdict
+    /// is suppressed, never averaged out of too few points.
+    pub residual_min_eligible: usize,
+}
+
 #[derive(Debug, Clone)]
 pub struct Config {
     pub state: StateConfig,
     pub sampling: SamplingConfig,
     pub freshness: FreshnessConfig,
     pub coverage: CoverageConfig,
+    pub attribution: AttributionConfig,
+    pub reconciliation: ReconciliationConfig,
     pub accounts: Vec<AccountConfig>,
     pub ingest: IngestConfig,
     pub transcripts: Vec<TranscriptConfig>,
     pub tracker: Option<TrackerConfig>,
     pub valuation: ValuationConfig,
     pub backup: BackupConfig,
+    pub drill: DrillConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
@@ -279,11 +333,14 @@ const KNOWN_SECTIONS: &[&str] = &[
     "ingest",
     "freshness",
     "coverage",
+    "attribution",
+    "reconciliation",
     "accounts",
     "transcripts",
     "tracker",
     "valuation",
     "backup",
+    "drill",
     "projects",
     "repositories",
 ];
@@ -299,13 +356,16 @@ const SAMPLING_KEYS: &[&str] = &[
 const INGEST_KEYS: &[&str] = &["max_batch_events"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
+const ATTRIBUTION_KEYS: &[&str] = &["quality_floor", "recent_window"];
+const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
-const BACKUP_KEYS: &[&str] = &["review_after"];
+const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
+const DRILL_KEYS: &[&str] = &["max_age", "result"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -364,6 +424,12 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     if let Some(t) = table.get("coverage").and_then(toml::Value::as_table) {
         check_keys(t, COVERAGE_KEYS, "coverage", file_display)?;
     }
+    if let Some(t) = table.get("attribution").and_then(toml::Value::as_table) {
+        check_keys(t, ATTRIBUTION_KEYS, "attribution", file_display)?;
+    }
+    if let Some(t) = table.get("reconciliation").and_then(toml::Value::as_table) {
+        check_keys(t, RECONCILIATION_KEYS, "reconciliation", file_display)?;
+    }
     if let Some(t) = table.get("tracker").and_then(toml::Value::as_table) {
         check_keys(t, TRACKER_KEYS, "tracker", file_display)?;
     }
@@ -372,6 +438,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("backup").and_then(toml::Value::as_table) {
         check_keys(t, BACKUP_KEYS, "backup", file_display)?;
+    }
+    if let Some(t) = table.get("drill").and_then(toml::Value::as_table) {
+        check_keys(t, DRILL_KEYS, "drill", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -549,6 +618,40 @@ fn resolve_floor(
         .parse()
         .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a number")))?;
     CoverageFloor::new(value)
+        .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
+}
+
+/// An attribution-quality floor with no platform default: absent everywhere
+/// means `None`, and an operator opts in by setting it. Follows the same
+/// override, environment, file precedence as the other scalars, without the
+/// fourth (default) level.
+fn resolve_optional_floor(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    provenance: &mut Provenance,
+) -> Result<Option<AttributionQualityFloor>, Error> {
+    let raw = if let Some(v) = overrides.get(key) {
+        provenance.set(key, ConfigSource::Flag);
+        Some(v.to_string())
+    } else if let Some(v) = env.get(&env_var_name(key)) {
+        provenance.set(key, ConfigSource::Environment);
+        Some(v)
+    } else if let Some(v) = file_value {
+        provenance.set(key, ConfigSource::File);
+        Some(v)
+    } else {
+        None
+    };
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a number")))?;
+    AttributionQualityFloor::new(value)
+        .map(Some)
         .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
 }
 
@@ -736,6 +839,56 @@ pub fn resolve(
         )?,
     };
 
+    let attribution = AttributionConfig {
+        quality_floor: resolve_optional_floor(
+            "attribution.quality_floor",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "attribution", "quality_floor"),
+            &mut provenance,
+        )?,
+        recent_window: resolve_duration(
+            "attribution.recent_window",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "attribution", "recent_window"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
+    let reconciliation = ReconciliationConfig {
+        residual_window: resolve_duration(
+            "reconciliation.residual_window",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "reconciliation", "residual_window"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+        residual_min_eligible: resolve_positive_count(
+            "reconciliation.residual_min_eligible",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "reconciliation", "residual_min_eligible"),
+            Some("5"),
+            &file_display,
+            &mut provenance,
+        )? as usize,
+    };
+
+    let backup_destination = file
+        .as_ref()
+        .and_then(|t| t.get("backup"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("destination"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from);
+    if backup_destination.is_some() {
+        provenance.set("backup.destination", ConfigSource::File);
+    }
     let backup = BackupConfig {
         review_after: resolve_duration(
             "backup.review_after",
@@ -746,6 +899,30 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        destination: backup_destination,
+    };
+
+    let drill_result = file
+        .as_ref()
+        .and_then(|t| t.get("drill"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("result"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from);
+    if drill_result.is_some() {
+        provenance.set("drill.result", ConfigSource::File);
+    }
+    let drill = DrillConfig {
+        max_age: resolve_duration(
+            "drill.max_age",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "drill", "max_age"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+        result: drill_result,
     };
 
     let valuation = ValuationConfig {
@@ -878,11 +1055,14 @@ pub fn resolve(
             ingest,
             freshness,
             coverage,
+            attribution,
+            reconciliation,
             accounts,
             transcripts,
             tracker,
             valuation,
             backup,
+            drill,
             projects,
             repositories,
         },
@@ -1226,5 +1406,95 @@ credential = { kind = "unknown-future-kind", anything = "goes" }
         let file = "[coverage]\nattempt_floor = 0.9\n";
         let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
         assert_eq!(config.coverage.attempt_floor.get(), 0.9);
+    }
+
+    #[test]
+    fn the_attribution_quality_floor_is_absent_by_default_and_set_from_the_file() {
+        let (default_config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(
+            default_config.attribution.quality_floor.is_none(),
+            "no floor until an operator configures one"
+        );
+        assert!(provenance.get("attribution.quality_floor").is_none());
+        // The window still has a default and is provenance-tracked.
+        assert_eq!(
+            provenance.get("attribution.recent_window"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "[attribution]\nquality_floor = 0.8\nrecent_window = \"14d\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.attribution.quality_floor.map(|f| f.ppm()),
+            Some(800_000)
+        );
+        assert_eq!(
+            provenance.get("attribution.quality_floor"),
+            Some(ConfigSource::File)
+        );
+        assert_eq!(
+            config.attribution.recent_window,
+            MonotonicDuration::from_seconds(14 * 86_400)
+        );
+    }
+
+    #[test]
+    fn an_attribution_quality_floor_out_of_range_is_a_usage_error() {
+        let file = "[attribution]\nquality_floor = 1.4\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn an_unknown_key_under_attribution_is_a_usage_error() {
+        let file = "[attribution]\nnope = 1\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("attribution.nope"), "{err}");
+    }
+
+    #[test]
+    fn the_reconciliation_residual_policy_has_defaults_and_is_set_from_the_file() {
+        let (default_config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            default_config.reconciliation.residual_window,
+            MonotonicDuration::from_seconds(30 * 86_400)
+        );
+        assert_eq!(default_config.reconciliation.residual_min_eligible, 5);
+        assert_eq!(
+            provenance.get("reconciliation.residual_window"),
+            Some(ConfigSource::Default)
+        );
+        assert_eq!(
+            provenance.get("reconciliation.residual_min_eligible"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "[reconciliation]\nresidual_window = \"14d\"\nresidual_min_eligible = 8\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.reconciliation.residual_window,
+            MonotonicDuration::from_seconds(14 * 86_400)
+        );
+        assert_eq!(config.reconciliation.residual_min_eligible, 8);
+        assert_eq!(
+            provenance.get("reconciliation.residual_min_eligible"),
+            Some(ConfigSource::File)
+        );
+    }
+
+    #[test]
+    fn a_zero_residual_minimum_is_a_usage_error() {
+        let file = "[reconciliation]\nresidual_min_eligible = 0\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn an_unknown_key_under_reconciliation_is_a_usage_error() {
+        let file = "[reconciliation]\nnope = 1\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("reconciliation.nope"), "{err}");
     }
 }

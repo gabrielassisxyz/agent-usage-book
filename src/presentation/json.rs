@@ -666,6 +666,15 @@ pub fn spend_json(report: &SpendReport, run: RunId) -> String {
     spend_json_with_explain(report, run, ExplainMode::Off)
 }
 
+/// Serializes a reconciliation outcome to JSON (aub-dpn.1).
+///
+/// The output term is "unexplained_residual" on every JSON surface.
+pub fn reconciliation_json(
+    outcome: &crate::reconciliation::ReconciliationOutcome,
+) -> serde_json::Value {
+    crate::reconciliation::reconciliation_json(outcome)
+}
+
 /// The spend report under the envelope, optionally including explain provenance.
 pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: ExplainMode) -> String {
     let groups = report
@@ -734,12 +743,50 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ));
     }
     if explain != ExplainMode::Off {
-        body.push_str(&format!(
-            ",\"explain\":{}",
-            explain_json(&report.provenance, explain)
-        ));
+        // explain_json always yields a `{...}` object; splice the spend-only
+        // account_groups array in before its closing brace rather than
+        // widening the signature shared by status, now, coverage and export.
+        let mut explain_body = explain_json(&report.provenance, explain);
+        if !report.account_explain.is_empty() {
+            explain_body.pop();
+            explain_body.push_str(&format!(
+                ",\"account_groups\":[{}]}}",
+                account_groups_json(&report.account_explain)
+            ));
+        }
+        body.push_str(&format!(",\"explain\":{explain_body}"));
     }
     JsonEnvelope::new("spend", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// The marker evidence behind every account group, mirroring the human
+/// `account explain:` block so a contract test can assert the two carry
+/// identical references and evidence classes (aub-mgv.4).
+fn account_groups_json(groups: &[crate::report::AccountGroupExplain]) -> String {
+    groups
+        .iter()
+        .map(|group| {
+            let markers = group
+                .markers
+                .iter()
+                .map(|marker| {
+                    format!(
+                        "{{\"reference\":{},\"logical_account\":{},\"evidence_class\":{}}}",
+                        json_string(&marker.reference),
+                        json_string(&marker.logical_account),
+                        json_string(marker.evidence_class.as_str()),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"key\":{},\"evidence_class\":{},\"markers\":[{markers}]}}",
+                json_string(group.key.as_str()),
+                json_string(group.evidence_class.as_str()),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 fn spend_group_json(group: &crate::report::SpendGroup) -> String {
@@ -1541,6 +1588,131 @@ pub fn doctor_drift_json(report: &TranscriptDriftReport, run: RunId) -> String {
     );
 
     JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes the full check registry (`aub doctor`, `aub-n27.7`) under the shared
+/// envelope. Distinct from [`doctor_drift_json`], which is the deeper
+/// `--transcript-format-drift` view of one check's own evidence.
+pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> String {
+    let checks_json = report
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            let mut fields = format!(
+                "\"name\":{},\"status\":{},\"owner_module\":{},\"has_repair\":{}",
+                json_string(outcome.name.as_str()),
+                json_string(outcome.status.label()),
+                json_string(outcome.owner_module),
+                outcome.has_repair,
+            );
+            match &outcome.status {
+                crate::doctor::CheckStatus::Fail(reason)
+                | crate::doctor::CheckStatus::NotApplicable(reason)
+                | crate::doctor::CheckStatus::PassWithDetail(reason) => {
+                    fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
+                }
+                crate::doctor::CheckStatus::NotYetAvailable { owning_bead } => {
+                    fields.push_str(&format!(",\"owning_bead\":{}", json_string(owning_bead)));
+                }
+                crate::doctor::CheckStatus::Pass => {}
+            }
+            format!("{{{fields}}}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let mut body = format!(
+        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"not_applicable\":{},\"not_yet_available\":{}",
+        report.passed(),
+        report.failed(),
+        report.not_applicable(),
+        report.not_yet_available(),
+    );
+
+    if let Some(res) = &report.residual {
+        let fraction_json = match res.rolling_residual_fraction {
+            Some(f) => format!("{f:.6}"),
+            None => "null".to_string(),
+        };
+        let patterns_json = res
+            .patterns
+            .iter()
+            .map(|p| {
+                let mut p_fields = format!(
+                    "\"label\":{},\"explanation\":{}",
+                    json_string(p.label()),
+                    json_string(p.explanation())
+                );
+                if let Some(ptr) = p.calibration_pointer() {
+                    p_fields.push_str(&format!(",\"pointer\":{}", json_string(ptr)));
+                }
+                format!("{{{p_fields}}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let pointer_json = match res.pointer {
+            Some(ptr) => json_string(ptr),
+            None => "null".to_string(),
+        };
+        body.push_str(&format!(
+            ",\"residual\":{{\"window_seconds\":{},\"eligible_count\":{},\"min_eligible\":{},\"residual_interval\":{{\"lower\":{},\"upper\":{},\"unit\":\"credits\"}},\"fraction\":{},\"verdict\":{},\"patterns\":[{patterns_json}],\"pointer\":{pointer_json}}}",
+            res.window.as_nanos() / 1_000_000_000,
+            res.eligible_count,
+            res.min_eligible,
+            res.rolling_residual_interval.lower().micros(),
+            res.rolling_residual_interval.upper().micros(),
+            fraction_json,
+            json_string(res.verdict.as_str()),
+        ));
+    }
+
+    JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `doctor --fix` result under the shared envelope. `--fix` is an
+/// action log, not a ledger reading, so its own generation is always reported as
+/// zero rather than a number the action list does not actually justify; the
+/// caller's own run timestamp is both the generated and the knowledge instant.
+pub fn fix_report_json(
+    report: &crate::doctor::FixReport,
+    run: RunId,
+    at: crate::domain::time::UtcTimestamp,
+) -> String {
+    let actions_json = report
+        .actions
+        .iter()
+        .map(|outcome| {
+            format!(
+                "{{\"action\":{},\"detail\":{}}}",
+                json_string(outcome.action.as_str()),
+                json_string(&outcome.detail),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!("\"check\":\"fix\",\"actions\":[{actions_json}]");
+    let metadata =
+        crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
+    JsonEnvelope::new("doctor", run, metadata).to_json_with(&body)
+}
+
+/// Serializes a diagnostic capture clearing report into a JSON envelope.
+pub fn clear_diagnostics_json(
+    report: &crate::report::ClearDiagnosticsReport,
+    run: RunId,
+    at: crate::domain::time::UtcTimestamp,
+) -> String {
+    let provider_str = match &report.provider_filter {
+        Some(p) => json_string(p),
+        None => "null".to_string(),
+    };
+    let body = format!(
+        "\"provider\":{},\"entries_removed\":{},\"bytes_removed\":{}",
+        provider_str, report.entries_removed, report.bytes_removed
+    );
+    let metadata =
+        crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
+    JsonEnvelope::new("clear-diagnostics", run, metadata).to_json_with(&body)
 }
 
 /// Serializes a provenance graph into its JSON explain representation.

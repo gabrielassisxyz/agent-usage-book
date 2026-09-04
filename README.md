@@ -83,6 +83,23 @@ agent session that starts should mark which account it belongs to. Example syste
 cron units, an example session-start hook, and the full reasoning are in
 [docs/scheduling.md](docs/scheduling.md).
 
+## Documentation
+
+[docs/operations.md](docs/operations.md) is the operator's entry point: everything above,
+plus the backup policy and the recovery procedure, in the order a fresh machine needs
+them.
+
+- [docs/commands.md](docs/commands.md): what each command answers, and what it refuses.
+- [docs/scheduling.md](docs/scheduling.md): the scheduler and hook setup, with working
+  examples.
+- [docs/backup.md](docs/backup.md): the backup policy, as ordered steps.
+- [docs/recovery.md](docs/recovery.md): the recovery procedure, as ordered steps.
+- [docs/exit-classes.md](docs/exit-classes.md) and
+  [docs/problem-codes.md](docs/problem-codes.md): the scripting contract, checked against
+  their enums by the test suite.
+- [docs/diagnostics.md](docs/diagnostics.md): the structured diagnostic event vocabulary
+  on stderr.
+
 ## Development
 
 ```sh

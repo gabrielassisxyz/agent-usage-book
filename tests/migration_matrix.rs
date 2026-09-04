@@ -152,6 +152,20 @@ fn table_exists(conn: &rusqlite::Connection, name: &str) -> bool {
     .unwrap_or(false)
 }
 
+fn column_exists(conn: &rusqlite::Connection, table: &str, column: &str) -> bool {
+    let pragma = format!("PRAGMA table_info({table})");
+    let mut stmt = match conn.prepare(&pragma) {
+        Ok(stmt) => stmt,
+        Err(_) => return false,
+    };
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .ok()
+        .map(|rows| rows.filter_map(|r| r.ok()).collect::<Vec<_>>())
+        .unwrap_or_default();
+    names.iter().any(|c| c == column)
+}
+
 fn row_count(conn: &rusqlite::Connection, table: &str) -> Result<i64, String> {
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
         row.get(0)
@@ -257,7 +271,40 @@ const POPULATION: &[(&str, Populate)] = &[
         "legacy_meter_import_record",
         populate_legacy_meter_import_record,
     ),
+    (
+        "authoritative_surface_comparison",
+        populate_authoritative_surface_comparison,
+    ),
+    (
+        "adapter_semantics_annotation",
+        populate_adapter_semantics_annotation,
+    ),
+    (
+        "account_attribution_segment",
+        populate_account_attribution_segment,
+    ),
 ];
+
+fn populate_account_attribution_segment(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Both arms of the target-kind CHECK: an attributed segment carries its logical
+    // account, and the unknown bucket carries none. A fixture holding only the first
+    // arm would survive a migration that dropped the second.
+    exec(
+        conn,
+        "account_attribution_segment",
+        "INSERT INTO account_attribution_segment (id, session_id, target_kind, logical_account, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, computed_at) VALUES
+            (1, 'matrix-session-1', 'account', 'matrix-account', 100, 20, 50, 10, 400),
+            (2, 'matrix-session-1', 'unknown_account', NULL, 7, 3, 0, 0, 410)",
+    )?;
+    if column_exists(conn, "account_attribution_segment", "evidence_class") {
+        exec(
+            conn,
+            "account_attribution_segment",
+            "UPDATE account_attribution_segment SET evidence_class = 'explicit_launcher_or_hook' WHERE id = 1",
+        )?;
+    }
+    Ok(())
+}
 
 fn populate_account(conn: &rusqlite::Connection) -> Result<(), String> {
     // Row 2 sits on the CHECK boundary: last observed equal to first.
@@ -666,6 +713,31 @@ fn populate_legacy_meter_import_record(conn: &rusqlite::Connection) -> Result<()
         "INSERT INTO legacy_meter_import_record (source_digest, source_line, observation_id, marker_id) VALUES
             ('1111111111111111111111111111111111111111111111111111111111111111', 1, 1, 1),
             ('1111111111111111111111111111111111111111111111111111111111111111', 2, 2, 2)",
+    )
+}
+
+fn populate_authoritative_surface_comparison(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Row 1 sits on every quota-fraction floor: granularity and both readings
+    // exactly zero. Row 2 sits on every ceiling, and carries the other verdict.
+    exec(
+        conn,
+        "authoritative_surface_comparison",
+        "INSERT INTO authoritative_surface_comparison (id, observation_id, window_id, semantic_key, authoritative_surface, documented_granularity_ppm, adapter_quota_used_ppm, authoritative_quota_used_ppm, read_at, verdict) VALUES
+            (1, 1, 1, 'matrix-key-1', 'matrix-surface', 0, 0, 0, 100, 'agrees_within_granularity'),
+            (2, 2, 2, 'matrix-key-1', 'matrix-surface', 1000000, 1000000, 1000000, 200, 'unresolved_mismatch')",
+    )
+}
+
+fn populate_adapter_semantics_annotation(conn: &rusqlite::Connection) -> Result<(), String> {
+    // All three kinds, and both arms of the correction-link CHECK: a mismatch
+    // and an exclusion with no link, a correction that names the mismatch.
+    exec(
+        conn,
+        "adapter_semantics_annotation",
+        "INSERT INTO adapter_semantics_annotation (id, kind, comparison_id, observation_id, semantic_key, adapter_quota_used_ppm, authoritative_quota_used_ppm, corrects_annotation_id, detail, created_at) VALUES
+            (1, 'mismatch', 2, 2, 'matrix-key-1', 1000000, 0, NULL, 'matrix-mismatch', 300),
+            (2, 'correction', 2, 2, 'matrix-key-1', 1000000, 0, 1, 'matrix-correction', 310),
+            (3, 'exclusion', 1, 1, 'matrix-key-1', 0, 0, NULL, 'matrix-exclusion', 320)",
     )
 }
 

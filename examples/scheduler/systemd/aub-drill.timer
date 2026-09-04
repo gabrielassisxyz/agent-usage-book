@@ -1,0 +1,22 @@
+# Ticks aub-drill.service once a month.
+#
+# A drill is expensive relative to a sample tick: it restores a real archive
+# and reruns integrity and foreign-key checking against it, rather than
+# making one request. Its purpose is to notice slow drift in the recovery
+# procedure or in the archive itself, not to catch a fast-moving condition,
+# so the cadence here is deliberately coarse rather than copied from
+# aub-sample.timer's minutely one.
+#
+# Enable with: systemctl --user enable --now aub-drill.timer
+# (drop --user, and install under /etc/systemd/system/, for a system-wide
+# account instead of a per-user one.)
+[Unit]
+Description=Tick aub drill --archive once a month
+
+[Timer]
+OnCalendar=monthly
+AccuracySec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target

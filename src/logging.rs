@@ -121,10 +121,13 @@ pub enum DiagnosticEvent {
     /// A legacy quota-ledger source was imported. Its source is identified by
     /// digest, never by path or raw record content.
     LegacyMeterImported,
+    /// A pre-implementation seed archive was imported. Its source is identified by
+    /// digest, never by path or raw record content.
+    SeedArchiveImported,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 9] = [
+    pub const ALL: [Self; 10] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
@@ -134,6 +137,7 @@ impl DiagnosticEvent {
         Self::MeterSpoolDrained,
         Self::ProjectionRead,
         Self::LegacyMeterImported,
+        Self::SeedArchiveImported,
     ];
 
     pub fn name(self) -> &'static str {
@@ -147,6 +151,7 @@ impl DiagnosticEvent {
             Self::MeterSpoolDrained => "meter_spool_drained",
             Self::ProjectionRead => "projection_read",
             Self::LegacyMeterImported => "legacy_meter_imported",
+            Self::SeedArchiveImported => "seed_archive_imported",
         }
     }
 
@@ -160,7 +165,7 @@ impl DiagnosticEvent {
             | Self::MeterEvidenceSpooled
             | Self::MeterSpoolDrained => Level::Info,
             Self::ProjectionRead => Level::Debug,
-            Self::LegacyMeterImported => Level::Info,
+            Self::LegacyMeterImported | Self::SeedArchiveImported => Level::Info,
         }
     }
 
@@ -176,6 +181,9 @@ impl DiagnosticEvent {
             Self::ProjectionRead => "state",
             Self::LegacyMeterImported => {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined"
+            }
+            Self::SeedArchiveImported => {
+                "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome"
             }
         }
     }

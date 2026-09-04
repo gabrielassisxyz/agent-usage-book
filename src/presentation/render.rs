@@ -6,6 +6,7 @@
 //! known missing evidence affects the aggregate is refused by construction.
 
 use crate::attribution::TaskIdentityState;
+use crate::doctor::{CheckStatus, DoctorReport};
 use crate::domain::credits::Credits;
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
@@ -240,6 +241,13 @@ pub fn render_spend_report(report: &SpendReport) -> String {
     render_spend_report_with_explain(report, ExplainMode::Off)
 }
 
+/// Renders an interval reconciliation outcome for human display (aub-dpn.1).
+///
+/// The output term is "unexplained residual" on every human surface.
+pub fn render_reconciliation(outcome: &crate::reconciliation::ReconciliationOutcome) -> String {
+    crate::reconciliation::render_reconciliation_human(outcome)
+}
+
 /// Renders a spend report, optionally including the explain block.
 pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMode) -> String {
     let grouping = report
@@ -288,13 +296,47 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
     if explain == ExplainMode::Off {
         report_text
     } else {
-        let explain_text = render_explain(&report.provenance, explain);
+        let mut explain_text = render_explain(&report.provenance, explain);
+        let account_text = render_account_explain(report);
+        if !account_text.is_empty() {
+            explain_text.push_str("\n\n");
+            explain_text.push_str(&account_text);
+        }
         if report_text.is_empty() {
             explain_text
         } else {
             format!("{report_text}\n\n{explain_text}")
         }
     }
+}
+
+/// The marker evidence behind every account group, under `--explain`. Empty
+/// unless the report was grouped by account. Each line names the account, its
+/// effective evidence class, and the exact markers that produced it, so the
+/// human output carries the same references the JSON explain does (aub-mgv.4).
+fn render_account_explain(report: &SpendReport) -> String {
+    if report.account_explain.is_empty() {
+        return String::new();
+    }
+    let mut lines = vec!["account explain:".to_string()];
+    for group in &report.account_explain {
+        let markers = if group.markers.is_empty() {
+            "none".to_string()
+        } else {
+            group
+                .markers
+                .iter()
+                .map(|marker| format!("{} ({})", marker.reference, marker.evidence_class.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        lines.push(format!(
+            "  {}  evidence_class={}  markers=[{markers}]",
+            group.key.as_str(),
+            group.evidence_class.as_str()
+        ));
+    }
+    lines.join("\n")
 }
 
 /// Renders the provenance graph for a report in human text format.
@@ -649,6 +691,88 @@ pub fn render_task_overhead_report_with_explain(
     }
 }
 
+/// Renders the attribution-quality section of `aub doctor`: the metric over
+/// all history and over the recent window, and any configured-floor breach.
+///
+/// An empty metric is stated as "no account attribution segments recorded
+/// yet", never as `0%`: a fabricated zero would read as every token
+/// unattributed.
+pub fn render_attribution_quality(
+    assessment: &crate::attribution::quality::AttributionQualityAssessment,
+) -> String {
+    use crate::attribution::account_segment::AccountEvidenceClass;
+    use crate::attribution::quality::AttributionQuality;
+
+    fn percent(fraction: crate::attribution::quality::AttributionFraction) -> String {
+        match fraction.ppm() {
+            Some(ppm) => format!("{:.1}%", ppm as f64 / 10_000.0),
+            None => "no usage".to_string(),
+        }
+    }
+
+    fn render_metric(lines: &mut Vec<String>, quality: &AttributionQuality) {
+        if quality.is_empty() {
+            lines.push("  no account attribution segments recorded yet".to_string());
+            return;
+        }
+        for kind in TokenKind::ALL {
+            let breakdown = quality.breakdown(kind);
+            if breakdown.total() == 0 {
+                continue;
+            }
+            lines.push(format!(
+                "  {}: {} tokens, {} attributed",
+                token_kind_label(kind),
+                breakdown.total(),
+                percent(breakdown.attributed_fraction())
+            ));
+            for class in AccountEvidenceClass::ALL {
+                let tokens = breakdown.tokens(class);
+                if tokens == 0 {
+                    continue;
+                }
+                lines.push(format!(
+                    "    {}: {} ({})",
+                    class.as_str(),
+                    tokens,
+                    percent(breakdown.class_fraction(class))
+                ));
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Doctor: Attribution Quality".to_string());
+    lines.push("All history:".to_string());
+    render_metric(&mut lines, &assessment.all_history);
+    lines.push(format!(
+        "Recent window (since {}):",
+        assessment.recent_window.since.unix_nanos()
+    ));
+    render_metric(&mut lines, &assessment.recent_window.quality);
+    if assessment.recent_window.undated_observations > 0 {
+        lines.push(format!(
+            "  ({} observations with unknown session start excluded from the window)",
+            assessment.recent_window.undated_observations
+        ));
+    }
+    for breach in &assessment.breaches {
+        let scope = match breach.scope {
+            crate::attribution::quality::MetricScope::AllHistory => "all-history".to_string(),
+            crate::attribution::quality::MetricScope::RecentWindow { since } => {
+                format!("recent-window (since {})", since.unix_nanos())
+            }
+        };
+        lines.push(format!(
+            "FLOOR BREACH: {scope} {} attribution {} is below the configured floor of {:.1}%",
+            token_kind_label(breach.kind),
+            percent(breach.fraction),
+            breach.floor.as_f64() * 100.0
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Renders a [`TranscriptDriftReport`] for `aub doctor --transcript-format-drift`.
 pub fn render_doctor_drift_report(report: &TranscriptDriftReport) -> String {
     if !report.has_configured_roots {
@@ -732,6 +856,97 @@ pub fn render_doctor_drift_report(report: &TranscriptDriftReport) -> String {
         } else {
             lines.push("  Status: All record shapes covered by committed fixtures.".to_string());
         }
+    }
+    lines.join("\n")
+}
+
+/// Renders the full check registry for `aub doctor` (`aub-n27.7`): every registered
+/// check, its status and, where it has one, its reason. Distinct from
+/// [`render_doctor_drift_report`], which is the deeper `--transcript-format-drift`
+/// view of one check's own evidence.
+pub fn render_doctor_report(report: &DoctorReport) -> String {
+    let mut lines = vec![format!("Doctor: {} checks", report.outcomes.len())];
+    for outcome in &report.outcomes {
+        let marker = match &outcome.status {
+            CheckStatus::Pass | CheckStatus::PassWithDetail(_) => "PASS".to_string(),
+            CheckStatus::Fail(_) => "FAIL".to_string(),
+            CheckStatus::NotApplicable(_) => "N/A ".to_string(),
+            CheckStatus::NotYetAvailable { .. } => "TODO".to_string(),
+        };
+        let mut line = format!("  [{marker}] {}", outcome.name.as_str());
+        match &outcome.status {
+            CheckStatus::Fail(reason)
+            | CheckStatus::NotApplicable(reason)
+            | CheckStatus::PassWithDetail(reason) => {
+                line.push_str(&format!(": {reason}"));
+            }
+            CheckStatus::NotYetAvailable { owning_bead } => {
+                line.push_str(&format!(": not yet available ({owning_bead})"));
+            }
+            CheckStatus::Pass => {}
+        }
+        if outcome.has_repair {
+            line.push_str(" [repairable with --fix]");
+        }
+        lines.push(line);
+    }
+    lines.push(format!(
+        "Summary: {} passed, {} failed, {} not applicable, {} not yet available",
+        report.passed(),
+        report.failed(),
+        report.not_applicable(),
+        report.not_yet_available(),
+    ));
+    if let Some(residual) = &report.residual {
+        lines.push(String::new());
+        lines.push("Doctor: Rolling Residual Health".to_string());
+        lines.push(format!(
+            "  window: {} ({} eligible intervals, minimum: {})",
+            render_coverage_duration(residual.window),
+            residual.eligible_count,
+            residual.min_eligible
+        ));
+        lines.push(format!(
+            "  residual interval: [{} .. {}] credits",
+            residual.rolling_residual_interval.lower().micros(),
+            residual.rolling_residual_interval.upper().micros()
+        ));
+        if let Some(fraction) = residual.rolling_residual_fraction {
+            lines.push(format!("  residual fraction: {:+.2}%", fraction * 100.0));
+        } else {
+            lines.push("  residual fraction: n/a".to_string());
+        }
+        match &residual.verdict {
+            crate::reconciliation::RollingResidualVerdict::Suppressed {
+                eligible_count,
+                min_eligible,
+            } => {
+                lines.push(format!(
+                    "  verdict: suppressed ({eligible_count} eligible intervals below minimum {min_eligible})"
+                ));
+            }
+            crate::reconciliation::RollingResidualVerdict::ReconcilesWithinUncertainty => {
+                lines.push("  verdict: reconciles within uncertainty".to_string());
+            }
+            crate::reconciliation::RollingResidualVerdict::Discrepancy { .. } => {
+                lines.push("  verdict: discrepancy".to_string());
+            }
+        }
+        for pattern in &residual.patterns {
+            lines.push(format!("  {}", pattern.explanation()));
+        }
+        if let Some(pointer) = residual.pointer {
+            lines.push(format!("  {pointer}"));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Renders a `doctor --fix` result: one line per action performed, in order.
+pub fn render_fix_report(report: &crate::doctor::FixReport) -> String {
+    let mut lines = vec![format!("Fix: {} action(s) performed", report.actions.len())];
+    for outcome in &report.actions {
+        lines.push(format!("  {}: {}", outcome.action.as_str(), outcome.detail));
     }
     lines.join("\n")
 }
@@ -1139,6 +1354,25 @@ pub fn render_age(age: Age) -> String {
     }
 }
 
+/// Formats a summary of cleared diagnostic capture bodies for operator display.
+pub fn render_clear_diagnostics(report: &crate::report::ClearDiagnosticsReport) -> String {
+    let unit = if report.entries_removed == 1 {
+        "body"
+    } else {
+        "bodies"
+    };
+    match &report.provider_filter {
+        Some(provider) => format!(
+            "Cleared {} retained {unit} ({} bytes) for provider '{provider}'",
+            report.entries_removed, report.bytes_removed
+        ),
+        None => format!(
+            "Cleared {} retained {unit} ({} bytes) in total",
+            report.entries_removed, report.bytes_removed
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1151,6 +1385,61 @@ mod tests {
 
     fn now() -> UtcTimestamp {
         UtcTimestamp::from_unix_nanos(1_000_000 * NANOS_PER_SECOND)
+    }
+
+    #[test]
+    fn render_attribution_quality_states_empty_rather_than_zero_and_names_a_breach() {
+        use crate::attribution::account_segment::AccountEvidenceClass;
+        use crate::attribution::quality::{
+            AttributionObservation, AttributionQualityAssessment, AttributionQualityFloor,
+        };
+        use crate::domain::tokens::{
+            CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
+        };
+
+        // No observations: the metric must say so, never print 0%.
+        let empty = AttributionQualityAssessment::assess(
+            Vec::new(),
+            UtcTimestamp::from_unix_nanos(0),
+            None,
+        );
+        let empty_text = render_attribution_quality(&empty);
+        assert!(empty_text.contains("no account attribution segments recorded yet"));
+        assert!(!empty_text.contains('%'));
+
+        // A breaching corpus: the metric and a FLOOR BREACH line.
+        let tokens = |input: u64| {
+            KnownTokenVector::new(
+                InputTokens::new(input),
+                OutputTokens::new(0),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            )
+        };
+        let observations = vec![
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::ExplicitLauncherOrHook,
+                usage: tokens(20),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::Unattributed,
+                usage: tokens(80),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+        ];
+        let assessment = AttributionQualityAssessment::assess(
+            observations,
+            UtcTimestamp::from_unix_nanos(0),
+            AttributionQualityFloor::new(0.9),
+        );
+        let text = render_attribution_quality(&assessment);
+        assert!(
+            text.contains("input: 100 tokens, 20.0% attributed"),
+            "{text}"
+        );
+        assert!(text.contains("unattributed"));
+        assert!(text.contains("FLOOR BREACH"));
     }
 
     fn envelope() -> ClockSkewEnvelope {

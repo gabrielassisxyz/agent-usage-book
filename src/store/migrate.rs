@@ -275,6 +275,39 @@ pub fn run_migrations(
     })
 }
 
+/// Drill fixture: records a schema version past every version `migrations`
+/// knows, so [`run_migrations`] refuses this database exactly as it would
+/// refuse one a newer binary already migrated past this one's understanding.
+///
+/// Lives here, not in the drill module, because the SQL-only-in-store
+/// boundary rule forbids a second place that speaks to `schema_migration`;
+/// the drill seeds this damage case through the store like every other write
+/// it makes.
+pub fn seed_schema_version_beyond_registry(
+    conn: &rusqlite::Connection,
+    migrations: &[Migration],
+    clock: &dyn Clock,
+) -> Result<u32, Error> {
+    let unsupported = migrations
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap_or(INITIAL_SCHEMA_VERSION)
+        + 1000;
+    conn.execute(
+        "INSERT INTO schema_migration (version, applied_at, aub_version, source_revision) \
+         VALUES (?1, ?2, ?3, ?4)",
+        rusqlite::params![
+            unsupported,
+            clock.now().unix_nanos(),
+            "drill-fixture",
+            "drill-fixture"
+        ],
+    )
+    .map_err(|e| store_error("cannot seed an unsupported schema version", e))?;
+    Ok(unsupported)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,6 +675,29 @@ mod tests {
             2,
             "the newer database must not be touched"
         );
+    }
+
+    /// The drill fixture (`aub-n27.2`) seeds exactly the shape the check
+    /// above hand-built: a version past every version the registry knows,
+    /// refused by [`run_migrations`] with a message naming both versions.
+    #[test]
+    fn seed_schema_version_beyond_registry_produces_a_database_run_migrations_refuses() {
+        let scratch = ScratchDir::new();
+        let db_path = fixture_db(&scratch);
+        let conn = open(&db_path, AccessMode::ReadWrite, &policy(1000)).unwrap();
+        current_schema_version(&conn).unwrap();
+        let migrations = [migration(1, false, migration_one)];
+
+        let seeded = seed_schema_version_beyond_registry(&conn, &migrations, &clock_at(5_000))
+            .expect("seeding must succeed against a bootstrapped bookkeeping table");
+        assert!(
+            seeded > 1,
+            "the seeded version must exceed every version the registry knows"
+        );
+
+        let mut conn = conn;
+        let err = run_migrations(&mut conn, &migrations, None, &clock_at(5_000)).unwrap_err();
+        assert!(err.to_string().contains("newer"), "{err}");
     }
 
     // --- unit: rollback of a failed migration ---------------------------------------

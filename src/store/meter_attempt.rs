@@ -654,6 +654,22 @@ pub fn count_attempts(conn: &rusqlite::Connection) -> Result<(u64, u64), Error> 
         .map_err(|e| Error::Store(format!("cannot count meter attempt results: {e}")))?;
     Ok((starts, results))
 }
+
+/// Counts attempt results with clock anomalies recorded since `since`.
+pub fn count_clock_anomalies_since(
+    conn: &rusqlite::Connection,
+    since: UtcTimestamp,
+) -> Result<i64, Error> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM meter_attempt_result r
+         JOIN meter_attempt a ON a.id = r.attempt_id
+         WHERE r.clock_anomaly = 1 AND a.request_started_at >= ?1",
+        params![since.unix_nanos()],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("cannot count clock anomalies: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

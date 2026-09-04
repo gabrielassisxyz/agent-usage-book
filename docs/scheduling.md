@@ -45,6 +45,31 @@ exits non-zero only when it could not persist or operate at all. `aub coverage` 
 mechanism for alarming on a source that has failed for too long; the timer does not need
 to watch its own exit code for that.
 
+## Scheduling the periodic restore drill
+
+A verified backup proves the archive is intact; it says nothing about whether the
+documented recovery procedure (`docs/recovery.md`) still actually recovers it. `aub
+drill --archive ARCHIVE SCRATCH_DEST` runs that procedure end to end against a real
+archive, and `doctor` reports the age of the last one that passed alongside the age of
+the last verified backup, so a stale drill is visible the same way a stale backup is.
+
+Unlike `aub sample --due`, a scheduled drill cannot point at one fixed invocation:
+`aub drill` refuses an existing scratch destination on purpose, the same rule
+`aub backup restore` applies to its own destination, so a fixed path would only ever
+succeed on the first run. Both examples below pick a fresh, timestamped destination
+every run and prune drill output older than a week so the schedule does not grow
+unbounded.
+
+- **systemd**: [`examples/scheduler/systemd/aub-drill.service`](../examples/scheduler/systemd/aub-drill.service)
+  and [`aub-drill.timer`](../examples/scheduler/systemd/aub-drill.timer), installed and
+  enabled the same way as the sampling timer above.
+- **cron**: [`examples/scheduler/cron/aub-drill.cron`](../examples/scheduler/cron/aub-drill.cron).
+
+A drill is expensive relative to a sample tick, since it restores a real archive and
+reruns integrity and foreign-key checking rather than making one request, so the
+shipped cadence is monthly rather than minutely. `ARCHIVE` in both examples must name
+the same destination `aub backup` is scheduled to write.
+
 ## The hook integration
 
 An explicit session/account marker from the launcher is the strongest evidence `aub` can
@@ -86,3 +111,7 @@ launcher keybinding, at a copy of it with `ACCOUNT` filled in.
 4. Wire the session-start hook into whatever starts an agent session on this machine.
 5. `aub status` should move from `never observed` to a fresh reading within one sampling
    interval.
+6. Schedule `aub backup` by whatever means this machine already schedules periodic
+   jobs (PLAN.md section 38), then configure `[backup]` and `[drill]` in `aub.toml` and
+   install the drill timer or cron entry pointed at the same archive path. `doctor`
+   should report both ages once each has run once.

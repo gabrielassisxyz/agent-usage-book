@@ -6,6 +6,7 @@
 //! - any adapter, workflow, or presentation layer
 
 pub mod attempt;
+pub mod authoritative_comparison;
 pub mod credits;
 pub mod failure;
 pub mod freshness;

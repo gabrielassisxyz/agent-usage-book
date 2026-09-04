@@ -1227,6 +1227,42 @@ fn instant_before(at: UtcTimestamp) -> UtcTimestamp {
     UtcTimestamp::from_unix_nanos(at.unix_nanos().saturating_sub(1))
 }
 
+/// Returns distinct calibration scopes that have ever had a result fitted.
+pub fn fitted_calibration_scopes(conn: &Connection) -> Result<Vec<CalibrationScope>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT provider, plan_tier, window_semantic_key FROM window_calibration_result",
+        )
+        .map_err(|e| Error::Store(format!("cannot list calibration scopes: {e}")))?;
+    let rows = statement
+        .query_map([], |row| {
+            let provider: String = row.get(0)?;
+            let plan_tier: String = row.get(1)?;
+            let window_semantic_key: String = row.get(2)?;
+            Ok(CalibrationScope {
+                provider: ProviderKey::new(provider),
+                plan_tier: PlanTier::new(plan_tier),
+                window_semantic_key: WindowSemanticKey::new(window_semantic_key),
+            })
+        })
+        .map_err(|e| Error::Store(format!("cannot query calibration scopes: {e}")))?;
+    let mut scopes = Vec::new();
+    for row in rows {
+        scopes.push(
+            row.map_err(|e| Error::Store(format!("cannot read calibration scope row: {e}")))?,
+        );
+    }
+    Ok(scopes)
+}
+
+/// Returns the count of calibration lifecycle events.
+pub fn lifecycle_event_count(conn: &Connection) -> Result<i64, Error> {
+    conn.query_row("SELECT COUNT(*) FROM calibration_lifecycle", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| Error::Store(format!("cannot count calibration lifecycle events: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
