@@ -1224,7 +1224,8 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
             );
             match &outcome.status {
                 crate::doctor::CheckStatus::Fail(reason)
-                | crate::doctor::CheckStatus::NotApplicable(reason) => {
+                | crate::doctor::CheckStatus::NotApplicable(reason)
+                | crate::doctor::CheckStatus::PassWithDetail(reason) => {
                     fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
                 }
                 crate::doctor::CheckStatus::NotYetAvailable { owning_bead } => {
@@ -1273,6 +1274,25 @@ pub fn fix_report_json(
     let metadata =
         crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
     JsonEnvelope::new("doctor", run, metadata).to_json_with(&body)
+}
+
+/// Serializes a diagnostic capture clearing report into a JSON envelope.
+pub fn clear_diagnostics_json(
+    report: &crate::store::retention::ClearDiagnosticsReport,
+    run: RunId,
+    at: crate::domain::time::UtcTimestamp,
+) -> String {
+    let provider_str = match &report.provider_filter {
+        Some(p) => json_string(p),
+        None => "null".to_string(),
+    };
+    let body = format!(
+        "\"provider\":{},\"entries_removed\":{},\"bytes_removed\":{}",
+        provider_str, report.entries_removed, report.bytes_removed
+    );
+    let metadata =
+        crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
+    JsonEnvelope::new("clear-diagnostics", run, metadata).to_json_with(&body)
 }
 
 /// Serializes a provenance graph into its JSON explain representation.

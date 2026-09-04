@@ -620,14 +620,16 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
     let mut lines = vec![format!("Doctor: {} checks", report.outcomes.len())];
     for outcome in &report.outcomes {
         let marker = match &outcome.status {
-            CheckStatus::Pass => "PASS".to_string(),
+            CheckStatus::Pass | CheckStatus::PassWithDetail(_) => "PASS".to_string(),
             CheckStatus::Fail(_) => "FAIL".to_string(),
             CheckStatus::NotApplicable(_) => "N/A ".to_string(),
             CheckStatus::NotYetAvailable { .. } => "TODO".to_string(),
         };
         let mut line = format!("  [{marker}] {}", outcome.name.as_str());
         match &outcome.status {
-            CheckStatus::Fail(reason) | CheckStatus::NotApplicable(reason) => {
+            CheckStatus::Fail(reason)
+            | CheckStatus::NotApplicable(reason)
+            | CheckStatus::PassWithDetail(reason) => {
                 line.push_str(&format!(": {reason}"));
             }
             CheckStatus::NotYetAvailable { owning_bead } => {
@@ -1059,6 +1061,27 @@ pub fn render_age(age: Age) -> String {
         format!("{}h", seconds / 3_600)
     } else {
         format!("{}d", seconds / 86_400)
+    }
+}
+
+/// Formats a summary of cleared diagnostic capture bodies for operator display.
+pub fn render_clear_diagnostics(
+    report: &crate::store::retention::ClearDiagnosticsReport,
+) -> String {
+    let unit = if report.entries_removed == 1 {
+        "body"
+    } else {
+        "bodies"
+    };
+    match &report.provider_filter {
+        Some(provider) => format!(
+            "Cleared {} retained {unit} ({} bytes) for provider '{provider}'",
+            report.entries_removed, report.bytes_removed
+        ),
+        None => format!(
+            "Cleared {} retained {unit} ({} bytes) in total",
+            report.entries_removed, report.bytes_removed
+        ),
     }
 }
 

@@ -81,6 +81,7 @@ aub_command_enum! {
     Import,
     Sample,
     Now,
+    ClearDiagnostics,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -109,7 +110,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -129,6 +130,7 @@ impl Command {
         Self::Import,
         Self::Sample,
         Self::Now,
+        Self::ClearDiagnostics,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -451,6 +453,22 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::ClearDiagnostics => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "clear-diagnostics derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "clear-diagnostics scopes by provider, not account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "clear-diagnostics takes no model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "clear-diagnostics prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -477,6 +495,7 @@ impl Command {
             Command::Import => "import",
             Command::Sample => "sample",
             Command::Now => "now",
+            Command::ClearDiagnostics => "clear-diagnostics",
         }
     }
 
@@ -521,6 +540,7 @@ impl Command {
             Command::Now => Some(
                 "force a persisted sampling attempt for the selected accounts and render the resulting state",
             ),
+            Command::ClearDiagnostics => Some("clear retained diagnostic provider bodies"),
         }
     }
 
@@ -557,6 +577,7 @@ impl Command {
                 "are configured accounts due for meter sampling, and what did the endpoints observe?",
             ),
             Command::Now => Some("how much quota does each configured account have right now?"),
+            Command::ClearDiagnostics => Some("how many retained diagnostic bodies were cleared?"),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
@@ -617,6 +638,7 @@ impl Command {
             Command::Sample => Some(
                 "--due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success",
             ),
+            Command::ClearDiagnostics => Some("[--provider NAME | --all]"),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -630,6 +652,9 @@ impl Command {
     }
 
     fn from_name(name: &str) -> Option<Self> {
+        if name == "clear-captures" {
+            return Some(Self::ClearDiagnostics);
+        }
         Self::ALL.into_iter().find(|command| command.name() == name)
     }
 }
@@ -927,6 +952,9 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Now => {
             reject_positionals(&invocation)?;
             now_command(&RealClock::new(), level, &invocation)
+        }
+        Command::ClearDiagnostics => {
+            clear_diagnostics_command(&RealClock::new(), level, &invocation)
         }
     }
 }
@@ -3762,6 +3790,94 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
     Ok(())
 }
 
+/// `aub clear-diagnostics`: clears retained diagnostic bodies, scoped per provider
+/// or in total. Never touches quarantine rows.
+fn clear_diagnostics_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("clear-diagnostics");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let mut provider: Option<String> = None;
+    let mut all = false;
+    let mut iter = invocation.rest.iter().peekable();
+    while let Some(arg) = iter.next() {
+        if let Some(val) = arg.strip_prefix("--provider=") {
+            if provider.is_some() {
+                return Err(Error::Usage("--provider specified more than once".into()));
+            }
+            if val.is_empty() {
+                return Err(Error::Usage("--provider requires a non-empty name".into()));
+            }
+            provider = Some(val.to_string());
+        } else if arg == "--provider" {
+            if provider.is_some() {
+                return Err(Error::Usage("--provider specified more than once".into()));
+            }
+            let next_val = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--provider requires a provider name".into()))?;
+            if next_val.is_empty() {
+                return Err(Error::Usage("--provider requires a non-empty name".into()));
+            }
+            provider = Some(next_val.clone());
+        } else if arg == "--all" {
+            all = true;
+        } else if !arg.starts_with("--") {
+            if provider.is_some() {
+                return Err(Error::Usage(format!(
+                    "unexpected positional argument: {arg}"
+                )));
+            }
+            provider = Some(arg.clone());
+        } else {
+            return Err(Error::Usage(format!("unknown argument: {arg}")));
+        }
+    }
+
+    if all && provider.is_some() {
+        return Err(Error::Usage(
+            "--all cannot be combined with --provider".into(),
+        ));
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let report =
+        crate::store::retention::clear_retained_bodies(&config.state.dir, provider.as_deref())
+            .map_err(|error| Error::Store(format!("clear diagnostics: {error}")))?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!("{}", crate::presentation::render_clear_diagnostics(&report))
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            crate::presentation::clear_diagnostics_json(&report, run, timestamp)
+        ),
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4424,6 +4540,41 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
                 assert!(message.contains("disk full"), "{message:?}");
             }
             other => panic!("PersistFailed must map to Error::Store, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_diagnostics_alias_clear_captures_is_recognised() {
+        let req1 = parse_invocation(args(&["clear-diagnostics"])).unwrap();
+        let req2 = parse_invocation(args(&["clear-captures"])).unwrap();
+        match (req1, req2) {
+            (Request::Run(inv1), Request::Run(inv2)) => {
+                assert_eq!(inv1.command, Command::ClearDiagnostics);
+                assert_eq!(inv2.command, Command::ClearDiagnostics);
+            }
+            other => panic!("expected Request::Run for both aliases, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn clear_diagnostics_accepts_format_and_provider_and_all() {
+        let req = parse_invocation(args(&[
+            "clear-diagnostics",
+            "--format",
+            "json",
+            "--provider",
+            "anthropic",
+        ]))
+        .unwrap();
+        match req {
+            Request::Run(inv) => {
+                assert_eq!(inv.format, OutputFormat::Json);
+                assert_eq!(
+                    inv.rest,
+                    vec!["--provider".to_string(), "anthropic".to_string()]
+                );
+            }
+            other => panic!("unexpected parse result: {other:?}"),
         }
     }
 

@@ -17,6 +17,7 @@ commands:
   import   import explicitly selected legacy evidence with durable provenance
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
   now      force a persisted sampling attempt for the selected accounts and render the resulting state
+  clear-diagnostics clear retained diagnostic provider bodies
 
 status:
   answers: how much quota does each configured account have left?
@@ -92,5 +93,11 @@ now:
   answers: how much quota does each configured account have right now?
   refuses: --model (now reports every window; only status takes a --model selector); --no-color (now prints no color)
   format: text | json
+
+clear-diagnostics:
+  answers: how many retained diagnostic bodies were cleared?
+  refuses: --explain (clear-diagnostics derives no quantity); --account (clear-diagnostics scopes by provider, not account); --model (clear-diagnostics takes no model); --no-color (clear-diagnostics prints no color)
+  format: text | json
+  options: [--provider NAME | --all]
 
 aub            prints the version; aub --help prints this
