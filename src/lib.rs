@@ -21,6 +21,7 @@ pub mod coverage;
 pub mod dedup;
 pub mod doctor;
 pub mod domain;
+pub mod drill;
 pub mod error;
 pub mod error_output;
 pub mod evidence;

@@ -168,7 +168,10 @@ fn condition_of(name: CheckName) -> &'static str {
         CheckName::ProjectionVersusDatabaseGeneration => {
             "the published projection's generation matches the database's"
         }
-        CheckName::BackupAge => "the last verified backup is within its configured review horizon",
+        CheckName::BackupAge => {
+            "the last verified backup and the last successful drill are each within their \
+             configured review horizon"
+        }
         CheckName::MeterAnomalies => "no meter window carries an anomalous reading",
         CheckName::UnexplainedResidual => "rolling residual stays within its explained bound",
         CheckName::HeuristicDedupCounts => {
@@ -609,41 +612,114 @@ fn projection_versus_database_generation(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::ProjectionVersusDatabaseGeneration, status)
 }
 
-/// The age of the last verified backup, when `backup.destination` is configured.
-/// `store::backup::backup_health`'s own doc comment names this bead as the later
-/// doctor registry it was built to feed.
-fn backup_age(ctx: &DoctorContext) -> CheckOutcome {
-    let status = match &ctx.config.backup.destination {
-        None => CheckStatus::NotApplicable(
-            "backup.destination is not configured; aub backup takes its destination \
-             explicitly and none is remembered without it"
-                .to_string(),
-        ),
-        Some(destination) => {
-            match crate::backup::backup_health(
-                destination,
-                ctx.timestamp,
-                ctx.config.backup.review_after,
-            ) {
-                Err(error) => CheckStatus::Fail(format!("cannot read the backup: {error}")),
-                Ok(crate::backup::BackupHealth::Missing) => {
-                    CheckStatus::Fail(format!("no backup found at {}", destination.display()))
+/// Whether one of the two review-horizon subchecks below found something to
+/// report: configured and healthy, configured and stale or missing, or not
+/// configured at all. Kept distinct from [`CheckStatus`] because two of these
+/// combine into one [`CheckStatus`]: "neither configured" is the only
+/// [`CheckStatus::NotApplicable`] case, and either one being
+/// [`SubcheckVerdict::Failed`] fails the whole check, naming which.
+enum SubcheckVerdict {
+    NotConfigured,
+    Ok,
+    Failed(String),
+}
+
+/// The age of the last verified backup, when `backup.destination` is
+/// configured. `store::backup::backup_health`'s own doc comment names this
+/// bead as the later doctor registry it was built to feed.
+fn backup_subcheck(ctx: &DoctorContext) -> SubcheckVerdict {
+    match &ctx.config.backup.destination {
+        None => SubcheckVerdict::NotConfigured,
+        Some(destination) => match crate::backup::backup_health(
+            destination,
+            ctx.timestamp,
+            ctx.config.backup.review_after,
+        ) {
+            Err(error) => SubcheckVerdict::Failed(format!("cannot read the backup: {error}")),
+            Ok(crate::backup::BackupHealth::Missing) => {
+                SubcheckVerdict::Failed(format!("no backup found at {}", destination.display()))
+            }
+            Ok(crate::backup::BackupHealth::Unverified { .. }) => SubcheckVerdict::Failed(format!(
+                "a backup exists at {} but has not been verified",
+                destination.display()
+            )),
+            Ok(crate::backup::BackupHealth::Verified {
+                age,
+                review_due: true,
+                ..
+            }) => SubcheckVerdict::Failed(format!(
+                "the last verified backup is {}s old, past its review horizon",
+                age.as_nanos() / 1_000_000_000
+            )),
+            Ok(crate::backup::BackupHealth::Verified {
+                review_due: false, ..
+            }) => SubcheckVerdict::Ok,
+        },
+    }
+}
+
+/// The age of the last successful drill, when `drill.result` is configured.
+/// Mirrors [`backup_subcheck`] exactly, for the same reason `aub drill`
+/// mirrors `aub backup`: an untested restore path is a materially different
+/// risk from an unbacked-up ledger, and both ages are read independently so
+/// the finding can name which one is stale (`aub-n27.2`).
+fn drill_subcheck(ctx: &DoctorContext) -> SubcheckVerdict {
+    match &ctx.config.drill.result {
+        None => SubcheckVerdict::NotConfigured,
+        Some(result_path) => {
+            match crate::drill::drill_health(result_path, ctx.timestamp, ctx.config.drill.max_age) {
+                Err(error) => {
+                    SubcheckVerdict::Failed(format!("cannot read the drill result record: {error}"))
                 }
-                Ok(crate::backup::BackupHealth::Unverified { .. }) => CheckStatus::Fail(format!(
-                    "a backup exists at {} but has not been verified",
-                    destination.display()
+                Ok(crate::drill::DrillHealth::Missing) => SubcheckVerdict::Failed(format!(
+                    "no successful drill recorded at {}",
+                    result_path.display()
                 )),
-                Ok(crate::backup::BackupHealth::Verified {
+                Ok(crate::drill::DrillHealth::Verified {
                     age,
                     review_due: true,
                     ..
-                }) => CheckStatus::Fail(format!(
-                    "the last verified backup is {}s old, past its review horizon",
+                }) => SubcheckVerdict::Failed(format!(
+                    "the last successful drill is {}s old, past its review horizon",
                     age.as_nanos() / 1_000_000_000
                 )),
-                Ok(crate::backup::BackupHealth::Verified {
+                Ok(crate::drill::DrillHealth::Verified {
                     review_due: false, ..
-                }) => CheckStatus::Pass,
+                }) => SubcheckVerdict::Ok,
+            }
+        }
+    }
+}
+
+/// The age of the last verified backup and the age of the last successful
+/// drill, combined into one check because PLAN.md section 36 names one
+/// "last verified backup" review-horizon condition rather than two: a
+/// nineteenth [`CheckName`] would contradict the design's own stated count of
+/// eighteen. Both ages are still computed and reported independently by
+/// [`backup_subcheck`] and [`drill_subcheck`]; only neither being configured
+/// reads as not applicable, and either one failing fails the whole check,
+/// naming which.
+fn backup_age(ctx: &DoctorContext) -> CheckOutcome {
+    let backup = backup_subcheck(ctx);
+    let drill = drill_subcheck(ctx);
+    let status = match (&backup, &drill) {
+        (SubcheckVerdict::NotConfigured, SubcheckVerdict::NotConfigured) => {
+            CheckStatus::NotApplicable(
+                "neither backup.destination nor drill.result is configured".to_string(),
+            )
+        }
+        _ => {
+            let mut failures = Vec::new();
+            if let SubcheckVerdict::Failed(reason) = &backup {
+                failures.push(format!("backup: {reason}"));
+            }
+            if let SubcheckVerdict::Failed(reason) = &drill {
+                failures.push(format!("drill: {reason}"));
+            }
+            if failures.is_empty() {
+                CheckStatus::Pass
+            } else {
+                CheckStatus::Fail(failures.join("; "))
             }
         }
     };
@@ -933,6 +1009,217 @@ mod tests {
         let ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
         let outcome = backup_age(&ctx);
         assert!(matches!(outcome.status, CheckStatus::Fail(_)));
+    }
+
+    /// A migrated, empty ledger database at `dir`, ready for
+    /// `crate::backup::create_archive` to read: the directory is created at
+    /// the production mode first, because `open` creates the file, never its
+    /// parent directory.
+    fn seeded_ledger_dir(dir: &std::path::Path, clock: &impl crate::domain::time::Clock) {
+        crate::store::startup::ensure_dir_mode_0700(dir).unwrap();
+        let _ = crate::store::rate_card::open_ledger(
+            &dir.join(crate::store::connection::LEDGER_DATABASE_FILE),
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            clock,
+        )
+        .expect("a fresh ledger must open and migrate");
+    }
+
+    /// Mutation: a configured drill result with nothing recorded at it must
+    /// fail even though the backup itself is genuinely healthy. Two separate
+    /// numbers means a failure in either is never hidden by the other
+    /// passing.
+    #[test]
+    fn a_configured_but_missing_drill_result_fails_even_with_a_healthy_backup() {
+        let dir = scratch_dir("missing-drill");
+        let now = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let clock = crate::domain::time::FakeClock::new(now);
+        seeded_ledger_dir(&dir, &clock);
+        let backup_destination = dir.join("archive");
+        crate::backup::create_archive(
+            &dir,
+            &backup_destination,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &clock,
+        )
+        .expect("a fresh empty ledger must back up cleanly");
+
+        let drill_result = dir.join("drill-result.jsonl");
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[backup]\ndestination = {:?}\n\n[drill]\nresult = {:?}\n",
+            dir, backup_destination, drill_result,
+        );
+        let env = RealEnv;
+        let (config, _) =
+            resolve(&Overrides::new(), &env, Some(&toml), "aub.toml").expect("config must resolve");
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.timestamp = now;
+        let outcome = backup_age(&ctx);
+        match &outcome.status {
+            CheckStatus::Fail(message) => {
+                assert!(message.contains("drill:"), "{message}");
+                assert!(!message.contains("backup:"), "{message}");
+            }
+            CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!("expected a failure naming the missing drill record")
+            }
+        }
+    }
+
+    /// Both ages are reported independently: a healthy backup with a stale
+    /// drill fails naming the drill, and a stale backup with a healthy drill
+    /// fails naming the backup. Neither passing state masks the other's
+    /// finding.
+    #[test]
+    fn a_healthy_backup_and_a_stale_drill_fail_naming_only_the_drill() {
+        let dir = scratch_dir("stale-drill");
+        let now = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let clock = crate::domain::time::FakeClock::new(now);
+        seeded_ledger_dir(&dir, &clock);
+        let backup_destination = dir.join("archive");
+        crate::backup::create_archive(
+            &dir,
+            &backup_destination,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &clock,
+        )
+        .expect("a fresh empty ledger must back up cleanly");
+
+        let drill_result = dir.join("drill-result.jsonl");
+        crate::drill::record_run(
+            &drill_result,
+            &crate::drill::DrillRunRecord {
+                drilled_at: UtcTimestamp::from_unix_nanos(0),
+                source: "archive:/dev/null".to_string(),
+                scratch_destination: dir.join("drill-scratch"),
+                passed: true,
+            },
+        )
+        .expect("appending a drill record must succeed");
+
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[backup]\ndestination = {:?}\nreview_after = \"48h\"\n\n\
+             [drill]\nresult = {:?}\nmax_age = \"1h\"\n",
+            dir, backup_destination, drill_result,
+        );
+        let env = RealEnv;
+        let (config, _) =
+            resolve(&Overrides::new(), &env, Some(&toml), "aub.toml").expect("config must resolve");
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.timestamp = now;
+        let outcome = backup_age(&ctx);
+        match &outcome.status {
+            CheckStatus::Fail(message) => {
+                assert!(message.contains("drill:"), "{message}");
+                assert!(!message.contains("backup:"), "{message}");
+            }
+            CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!("expected a failure naming only the stale drill")
+            }
+        }
+    }
+
+    /// The other direction: a fresh drill and a backup past its own review
+    /// horizon fails naming the backup, not the drill.
+    #[test]
+    fn a_fresh_drill_and_a_stale_backup_fail_naming_only_the_backup() {
+        let dir = scratch_dir("stale-backup");
+        let seed_clock = crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(0));
+        seeded_ledger_dir(&dir, &seed_clock);
+        let backup_destination = dir.join("archive");
+        crate::backup::create_archive(
+            &dir,
+            &backup_destination,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &seed_clock,
+        )
+        .expect("a fresh empty ledger must back up cleanly");
+
+        let now = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let drill_result = dir.join("drill-result.jsonl");
+        crate::drill::record_run(
+            &drill_result,
+            &crate::drill::DrillRunRecord {
+                drilled_at: now,
+                source: "archive:/dev/null".to_string(),
+                scratch_destination: dir.join("drill-scratch"),
+                passed: true,
+            },
+        )
+        .expect("appending a drill record must succeed");
+
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[backup]\ndestination = {:?}\nreview_after = \"1h\"\n\n\
+             [drill]\nresult = {:?}\nmax_age = \"48h\"\n",
+            dir, backup_destination, drill_result,
+        );
+        let env = RealEnv;
+        let (config, _) =
+            resolve(&Overrides::new(), &env, Some(&toml), "aub.toml").expect("config must resolve");
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.timestamp = now;
+        let outcome = backup_age(&ctx);
+        match &outcome.status {
+            CheckStatus::Fail(message) => {
+                assert!(message.contains("backup:"), "{message}");
+                assert!(!message.contains("drill:"), "{message}");
+            }
+            CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!("expected a failure naming only the stale backup")
+            }
+        }
+    }
+
+    /// Both ages within their horizon: the whole check passes, exactly as it
+    /// would with only backup configured.
+    #[test]
+    fn a_healthy_backup_and_a_fresh_drill_both_pass() {
+        let dir = scratch_dir("both-healthy");
+        let now = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let clock = crate::domain::time::FakeClock::new(now);
+        seeded_ledger_dir(&dir, &clock);
+        let backup_destination = dir.join("archive");
+        crate::backup::create_archive(
+            &dir,
+            &backup_destination,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &clock,
+        )
+        .expect("a fresh empty ledger must back up cleanly");
+
+        let drill_result = dir.join("drill-result.jsonl");
+        crate::drill::record_run(
+            &drill_result,
+            &crate::drill::DrillRunRecord {
+                drilled_at: now,
+                source: "archive:/dev/null".to_string(),
+                scratch_destination: dir.join("drill-scratch"),
+                passed: true,
+            },
+        )
+        .expect("appending a drill record must succeed");
+
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[backup]\ndestination = {:?}\n\n\
+             [drill]\nresult = {:?}\n",
+            dir, backup_destination, drill_result,
+        );
+        let env = RealEnv;
+        let (config, _) =
+            resolve(&Overrides::new(), &env, Some(&toml), "aub.toml").expect("config must resolve");
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.timestamp = now;
+        let outcome = backup_age(&ctx);
+        assert_eq!(outcome.status, CheckStatus::Pass);
     }
 
     #[test]

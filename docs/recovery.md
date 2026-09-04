@@ -22,24 +22,56 @@ forensic copy until the recovery has been reviewed.
    surviving pending records are replayed idempotently, so a record found in
    both sources is counted once. Every `unrecovered:` line names evidence that
    was preserved but could not be applied, with its source and reason.
-7. Projection recovery is not applicable in Phase 1 because the projection
-   subsystem has no published file yet. The restore result states this
-   explicitly. Projection rebuilding is owned by `aub-n27.2` once publication
-   exists.
+7. The projection is rebuilt, never restored: the archive carries no
+   projection file, and the damaged directory's own copy may be exactly what
+   the recovery was called in to fix. `aub` rebuilds it deterministically
+   from the restored database's own state and reports `projection: rebuilt`.
+   A rebuild that could not run yet (the projection publish deferred) reports
+   `projection: deferred`; the restored database is unaffected either way,
+   and the next publish heals it.
 8. Transcript-derived tables have no writer in Phase 1, so there is nothing to
    rebuild. If a later phase adds one, rebuild those tables only from their
    durable inputs after the database and spool recovery succeeds.
 
 ## Periodic restore drill
 
-Run the scripted drill from the repository root:
+`aub drill` runs this procedure end to end and proves it still works, rather than
+leaving that as something an operator finds out mid-incident. It never targets the
+configured state directory, in either mode below.
+
+Against a real archive, the way a scheduled drill runs (see
+[`docs/scheduling.md`](scheduling.md#scheduling-the-periodic-restore-drill)):
+
+```sh
+aub drill --archive ARCHIVE SCRATCH_DEST
+```
+
+Against one of four seeded damage cases, for exercising the procedure without a real
+archive at hand:
+
+```sh
+aub drill --seed truncated-database SCRATCH_DEST
+aub drill --seed corrupted-projection SCRATCH_DEST
+aub drill --seed malformed-spool-record SCRATCH_DEST
+aub drill --seed unsupported-schema-version SCRATCH_DEST
+```
+
+Each seeded case damages a scratch copy of a small ledger in a different way, then
+restores a clean archive of it with the damaged copy as the surviving directory,
+exactly as the numbered steps above describe. `truncated-database` and
+`unsupported-schema-version` prove something stronger than "recovery works": that the
+procedure never opens the damaged directory's own database at all, only its pending
+spool. `corrupted-projection` proves step 7 rebuilds rather than restores. Every run
+prints `drill: passed=true` or `false`, and, when `drill.result` is configured, appends
+a durable record `doctor` reads for the age of the last successful one.
+
+The repository's own end-to-end suite additionally runs this procedure against the
+release binary as part of its regression coverage:
 
 ```sh
 tests/e2e/run.sh
 ```
 
-The drill creates a real archive, restores it into a new scratch directory,
-replays archive and surviving pending evidence, and checks exact observation
-and unrecovered-evidence counts. The end-to-end runner records every command,
-its exit status, and the state-directory digest before and after each step in
-its run log. It never targets an operator state directory.
+That runner records every command, its exit status, and the state-directory digest
+before and after each step in its run log; it is repository test infrastructure, not
+something an operator schedules.

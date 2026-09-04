@@ -1,0 +1,15 @@
+# For platforms without systemd. Install with `crontab -e` (per-user) or as a
+# file under /etc/cron.d/ (system-wide; that form needs a user column between
+# the schedule and the command, e.g. "15 3 1 * * root sh -c '...'").
+#
+# Runs the periodic restore drill once a month, at 03:15 on the first, into a
+# fresh timestamped destination (`aub drill` refuses an existing one on
+# purpose; see docs/recovery.md and aub-drill.service). Prunes drill output
+# older than a week first, so a recurring schedule does not grow unbounded.
+# `%` must be backslash-escaped here: cron treats an unescaped `%` as a
+# newline into the command's stdin, unlike a systemd unit or an interactive
+# shell.
+#
+# cron mails stdout by default; redirect it so a quiet cadence does not fill
+# a mailbox. stderr is left alone: it carries aub's own diagnostic log.
+15 3 1 * * ARCHIVE=/var/lib/aub/backup SCRATCH_ROOT=/var/lib/aub/drill-scratch sh -c 'mkdir -p "$SCRATCH_ROOT" && find "$SCRATCH_ROOT" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} +; /usr/local/bin/aub drill --archive "$ARCHIVE" "$SCRATCH_ROOT/$(date -u +\%Y\%m\%dT\%H\%M\%SZ)"' >/dev/null

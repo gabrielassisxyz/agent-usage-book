@@ -1,0 +1,26 @@
+# Runs one periodic restore drill against the configured backup archive.
+# Paired with aub-drill.timer, which decides how often this fires; see
+# docs/scheduling.md.
+#
+# `aub drill` refuses an existing destination on purpose (docs/recovery.md
+# applies the same rule to a drill's scratch destination that it applies to a
+# restore's), so a scheduled run cannot point at one fixed path: ExecStart
+# picks a fresh, timestamped destination under SCRATCH_ROOT every run.
+# ExecStartPre prunes drill output older than a week so a recurring schedule
+# does not grow unbounded.
+#
+# ExecStart names /usr/local/bin/aub as an absolute path for the same reason
+# aub-sample.service does: systemd services read no interactive shell's PATH.
+# Replace it, and ARCHIVE and SCRATCH_ROOT below, with wherever `aub backup`
+# actually writes and wherever this drill's own scratch output should live on
+# this machine.
+[Unit]
+Description=aub drill --archive (periodic restore drill)
+After=network-online.target
+
+[Service]
+Type=oneshot
+Environment=ARCHIVE=/var/lib/aub/backup
+Environment=SCRATCH_ROOT=/var/lib/aub/drill-scratch
+ExecStartPre=/bin/sh -c 'mkdir -p "$SCRATCH_ROOT" && find "$SCRATCH_ROOT" -mindepth 1 -maxdepth 1 -mtime +7 -exec rm -rf {} +'
+ExecStart=/bin/sh -c '/usr/local/bin/aub drill --archive "$ARCHIVE" "$SCRATCH_ROOT/$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"'

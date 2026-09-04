@@ -23,8 +23,9 @@
 //! using exactly the four labels above: `flag`, `environment`, `file`, `default`.
 //!
 //! Scope, stated rather than left implicit: the four scalar sections (`state`,
-//! `sampling`, `freshness`, `coverage`) plus `backup.review_after` go through the full
-//! four-level order and are individually provenance-tracked, since those are the keys
+//! `sampling`, `freshness`, `coverage`) plus `backup.review_after` and `drill.max_age`
+//! go through the full four-level order and are individually provenance-tracked, since
+//! those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
 //! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
@@ -237,6 +238,20 @@ pub struct BackupConfig {
     pub destination: Option<PathBuf>,
 }
 
+/// The periodic restore drill's own review policy, the same shape as
+/// [`BackupConfig`] and for the same reason: `aub drill` takes its scratch
+/// destination and source as explicit arguments and remembers nothing
+/// durably on its own, so `doctor` needs a configured place to read the last
+/// recorded run from.
+#[derive(Debug, Clone)]
+pub struct DrillConfig {
+    pub max_age: MonotonicDuration,
+    /// Where `aub drill` appends one durable JSON record per run, and where
+    /// `doctor` reads the age of the last successful one. `None` means drill
+    /// age is not applicable rather than an assumed default path.
+    pub result: Option<PathBuf>,
+}
+
 /// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
 /// of the file's `credential` table (`kind`, plus its `ref` or `path`): the typed,
 /// validated credential model belongs to `aub-eun.1`, which consumes this section.
@@ -284,6 +299,7 @@ pub struct Config {
     pub tracker: Option<TrackerConfig>,
     pub valuation: ValuationConfig,
     pub backup: BackupConfig,
+    pub drill: DrillConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
@@ -306,6 +322,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "tracker",
     "valuation",
     "backup",
+    "drill",
     "projects",
     "repositories",
 ];
@@ -329,6 +346,7 @@ const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_e
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
+const DRILL_KEYS: &[&str] = &["max_age", "result"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -398,6 +416,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("backup").and_then(toml::Value::as_table) {
         check_keys(t, BACKUP_KEYS, "backup", file_display)?;
+    }
+    if let Some(t) = table.get("drill").and_then(toml::Value::as_table) {
+        check_keys(t, DRILL_KEYS, "drill", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -838,6 +859,29 @@ pub fn resolve(
         destination: backup_destination,
     };
 
+    let drill_result = file
+        .as_ref()
+        .and_then(|t| t.get("drill"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("result"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from);
+    if drill_result.is_some() {
+        provenance.set("drill.result", ConfigSource::File);
+    }
+    let drill = DrillConfig {
+        max_age: resolve_duration(
+            "drill.max_age",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "drill", "max_age"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+        result: drill_result,
+    };
+
     let valuation = ValuationConfig {
         default_rate_book: file
             .as_ref()
@@ -974,6 +1018,7 @@ pub fn resolve(
             tracker,
             valuation,
             backup,
+            drill,
             projects,
             repositories,
         },

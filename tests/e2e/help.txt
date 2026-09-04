@@ -18,6 +18,7 @@ commands:
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
   now      force a persisted sampling attempt for the selected accounts and render the resulting state
   clear-diagnostics clear retained diagnostic provider bodies
+  drill    damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive
 
 status:
   answers: how much quota does each configured account have left?
@@ -99,5 +100,10 @@ clear-diagnostics:
   refuses: --explain (clear-diagnostics derives no quantity); --account (clear-diagnostics scopes by provider, not account); --model (clear-diagnostics takes no model); --no-color (clear-diagnostics prints no color)
   format: text | json
   options: [--provider NAME | --all]
+drill:
+  answers: does the documented recovery procedure actually recover a damaged state directory, and is that still true today?
+  refuses: --format (drill prints one operational result); --explain (drill derives no quantity); --account (a drill exercises the whole state directory, not one account); --model (a drill exercises the whole state directory, not one model); --no-color (drill prints no color)
+  format: text only: drill prints one operational result
+  options: --seed truncated-database|corrupted-projection|malformed-spool-record|unsupported-schema-version SCRATCH_DEST | --archive ARCHIVE SCRATCH_DEST
 
 aub            prints the version; aub --help prints this

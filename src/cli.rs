@@ -82,6 +82,7 @@ aub_command_enum! {
     Sample,
     Now,
     ClearDiagnostics,
+    Drill,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -110,7 +111,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -131,6 +132,7 @@ impl Command {
         Self::Sample,
         Self::Now,
         Self::ClearDiagnostics,
+        Self::Drill,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -469,6 +471,24 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Drill => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "drill prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "drill derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "a drill exercises the whole state directory, not one account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "a drill exercises the whole state directory, not one model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "drill prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -496,6 +516,7 @@ impl Command {
             Command::Sample => "sample",
             Command::Now => "now",
             Command::ClearDiagnostics => "clear-diagnostics",
+            Command::Drill => "drill",
         }
     }
 
@@ -541,6 +562,9 @@ impl Command {
                 "force a persisted sampling attempt for the selected accounts and render the resulting state",
             ),
             Command::ClearDiagnostics => Some("clear retained diagnostic provider bodies"),
+            Command::Drill => Some(
+                "damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive",
+            ),
         }
     }
 
@@ -578,6 +602,9 @@ impl Command {
             ),
             Command::Now => Some("how much quota does each configured account have right now?"),
             Command::ClearDiagnostics => Some("how many retained diagnostic bodies were cleared?"),
+            Command::Drill => Some(
+                "does the documented recovery procedure actually recover a damaged state directory, and is that still true today?",
+            ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
@@ -639,6 +666,9 @@ impl Command {
                 "--due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success",
             ),
             Command::ClearDiagnostics => Some("[--provider NAME | --all]"),
+            Command::Drill => Some(
+                "--seed truncated-database|corrupted-projection|malformed-spool-record|unsupported-schema-version SCRATCH_DEST | --archive ARCHIVE SCRATCH_DEST",
+            ),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -956,6 +986,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::ClearDiagnostics => {
             clear_diagnostics_command(&RealClock::new(), level, &invocation)
         }
+        Command::Drill => drill_command(&RealClock::new(), &invocation),
     }
 }
 
@@ -3664,6 +3695,105 @@ fn render_restore_summary(summary: &crate::restore::RestoreSummary) {
             item.reason,
         );
     }
+}
+
+/// `aub drill`: damages a scratch state directory in one of four seeded ways,
+/// or runs against a real named archive, and drives it through the same
+/// documented recovery procedure `aub backup restore` follows by hand. Never
+/// touches the configured state directory in either mode (`aub-n27.2`,
+/// docs/recovery.md).
+fn drill_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
+    let report = match parse_drill_args(&invocation.rest)? {
+        DrillArgs::Seed { case, scratch } => crate::drill::run_seeded(
+            &config.state.dir,
+            case,
+            &scratch,
+            config.sampling.request_timeout,
+            &crate::store::startup::ProcMounts,
+            clock,
+        )?,
+        DrillArgs::Archive { archive, scratch } => crate::drill::run_archive(
+            &config.state.dir,
+            &archive,
+            &scratch,
+            config.sampling.request_timeout,
+            &crate::store::startup::ProcMounts,
+            clock,
+        )?,
+    };
+
+    render_drill_report(&report);
+
+    if let Some(result_path) = &config.drill.result {
+        crate::drill::record_run(
+            result_path,
+            &crate::drill::DrillRunRecord::from_report(&report),
+        )?;
+    }
+
+    if !report.passed() {
+        return Err(Error::Store(
+            "drill: the recovered state failed one of the drill's own checks; see the lines above"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+enum DrillArgs {
+    Seed {
+        case: crate::drill::DamageCase,
+        scratch: PathBuf,
+    },
+    Archive {
+        archive: PathBuf,
+        scratch: PathBuf,
+    },
+}
+
+fn parse_drill_args(rest: &[String]) -> Result<DrillArgs, Error> {
+    match rest {
+        [flag, value, scratch] if flag == "--seed" => {
+            let case = crate::drill::DamageCase::from_name(value).ok_or_else(|| {
+                Error::Usage(format!(
+                    "--seed {value} is not a known damage case; use truncated-database, \
+                     corrupted-projection, malformed-spool-record or unsupported-schema-version"
+                ))
+            })?;
+            Ok(DrillArgs::Seed {
+                case,
+                scratch: PathBuf::from(scratch),
+            })
+        }
+        [flag, archive, scratch] if flag == "--archive" => Ok(DrillArgs::Archive {
+            archive: PathBuf::from(archive),
+            scratch: PathBuf::from(scratch),
+        }),
+        other => Err(Error::Usage(format!(
+            "drill requires `--seed CASE SCRATCH_DEST` or `--archive ARCHIVE SCRATCH_DEST`, got {other:?}"
+        ))),
+    }
+}
+
+/// One operational result, the same plain line-per-fact shape backup and
+/// restore print: the source and scratch destination, the restore's own
+/// summary (`render_restore_summary`), then the two drill-specific proofs a
+/// bare restore does not carry, and the drill's own pass/fail verdict.
+fn render_drill_report(report: &crate::drill::DrillReport) {
+    println!(
+        "drill: source={} scratch_destination={}",
+        report.source.label(),
+        report.scratch_destination.display(),
+    );
+    render_restore_summary(&report.restore);
+    if let Some(preserved) = report.damaged_directory_preserved {
+        println!("drill: damaged_directory_preserved={preserved}");
+    }
+    if let Some(deterministic) = report.projection_deterministic {
+        println!("drill: projection_deterministic={deterministic}");
+    }
+    println!("drill: passed={}", report.passed());
 }
 
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in

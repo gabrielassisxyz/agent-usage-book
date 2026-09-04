@@ -22,6 +22,8 @@ const EXAMPLES_INVOKING_THE_BINARY: &[&str] = &[
     "examples/scheduler/systemd/aub-sample.service",
     "examples/scheduler/cron/aub-sample.cron",
     "examples/hooks/aub-session-start.sh",
+    "examples/scheduler/systemd/aub-drill.service",
+    "examples/scheduler/cron/aub-drill.cron",
 ];
 
 fn repo_root() -> PathBuf {
@@ -146,4 +148,14 @@ fn systemd_service_example_verifies() {
 #[test]
 fn systemd_timer_example_verifies() {
     verify_systemd_unit("examples/scheduler/systemd/aub-sample.timer");
+}
+
+#[test]
+fn systemd_drill_service_example_verifies() {
+    verify_systemd_unit("examples/scheduler/systemd/aub-drill.service");
+}
+
+#[test]
+fn systemd_drill_timer_example_verifies() {
+    verify_systemd_unit("examples/scheduler/systemd/aub-drill.timer");
 }

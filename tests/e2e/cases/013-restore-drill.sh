@@ -76,7 +76,7 @@ case_assertions() {
     assert_stdout_contains 7 "replay: source=surviving applied=0 already_applied=1 quarantined=1"
     assert_stdout_contains 7 "unrecovered: archive attempt-0.json"
     assert_stdout_contains 7 "unrecovered: surviving attempt-0.json"
-    assert_stdout_contains 7 "projection: not-applicable"
+    assert_stdout_contains 7 "projection: rebuilt"
 
     assert_exit 0 8
     assert_exit 0 9
