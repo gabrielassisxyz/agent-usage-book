@@ -653,6 +653,101 @@ fn check_fails_local_filesystem_and_wal_suitability() {
     assert!(matches!(outcome.status, CheckStatus::Fail(ref msg) if msg.contains("symlink")));
 }
 
+// --- aub-va6s: the last sample tick's outcome -------------------------------
+
+#[test]
+fn last_sample_tick_is_not_applicable_before_any_tick_is_recorded() {
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::LastSampleTick)
+        .expect("LastSampleTick present");
+    assert_eq!(
+        outcome.status,
+        CheckStatus::NotApplicable("no sample tick has been recorded yet".to_string())
+    );
+}
+
+#[test]
+fn last_sample_tick_passes_when_the_last_recorded_tick_succeeded() {
+    use agent_usage_book::store::sample_tick::{LastSampleTick, TickOutcome, record_last_tick};
+
+    let state = StateDir::new();
+    record_last_tick(
+        state.path(),
+        &LastSampleTick {
+            started_at: ts(1_699_999_000),
+            outcome: TickOutcome::Success,
+        },
+    )
+    .unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::LastSampleTick)
+        .expect("LastSampleTick present");
+    assert_eq!(outcome.status, CheckStatus::Pass);
+}
+
+/// The acceptance criterion's exact case: a refused tick is a failed check,
+/// not a journal entry nothing else reads.
+#[test]
+fn check_fails_last_sample_tick_when_the_last_recorded_tick_was_refused() {
+    use agent_usage_book::store::sample_tick::{LastSampleTick, TickOutcome, record_last_tick};
+
+    let state = StateDir::new();
+    record_last_tick(
+        state.path(),
+        &LastSampleTick {
+            started_at: ts(1_699_999_000),
+            outcome: TickOutcome::Failed(
+                "cannot start sample run: database is locked (waited up to 5000ms)".to_string(),
+            ),
+        },
+    )
+    .unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::LastSampleTick)
+        .expect("LastSampleTick present");
+    assert!(
+        matches!(outcome.status, CheckStatus::Fail(ref reason) if reason.contains("waited up to 5000ms")),
+        "{:?}",
+        outcome.status
+    );
+}
+
 #[test]
 fn owned_checks_have_correct_owner_module() {
     let state = StateDir::new();

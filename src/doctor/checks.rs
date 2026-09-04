@@ -81,6 +81,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         local_filesystem_and_wal_suitability(ctx),
         accumulated_diagnostic_material(ctx),
         adapter_semantics_comparison_age(ctx),
+        last_sample_tick(ctx),
     ]
 }
 
@@ -135,6 +136,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::LocalFilesystemAndWalSuitability => "store::startup",
         CheckName::AccumulatedDiagnosticMaterial => "store::retention",
         CheckName::AdapterSemanticsComparisonAge => "store::adapter_semantics_validation",
+        CheckName::LastSampleTick => "store::sample_tick",
     }
 }
 
@@ -184,6 +186,7 @@ fn condition_of(name: CheckName) -> &'static str {
             "the newest adapter-semantics comparison against the provider's authoritative \
              surface is within its configured review horizon"
         }
+        CheckName::LastSampleTick => "the last aub sample invocation succeeded",
     }
 }
 
@@ -964,6 +967,24 @@ fn accumulated_diagnostic_material(ctx: &DoctorContext) -> CheckOutcome {
     };
 
     outcome(CheckName::AccumulatedDiagnosticMaterial, status)
+}
+
+/// The last `aub sample` invocation's own recorded outcome (`aub-va6s`),
+/// read from `crate::store::sample_tick` rather than from `ctx.db`: the
+/// marker exists precisely so a tick refused by a locked ledger still leaves
+/// something this check can read without touching the ledger itself. A run
+/// of refused ticks is otherwise visible only in the scheduler's own
+/// journal, which nothing here reads.
+fn last_sample_tick(ctx: &DoctorContext) -> CheckOutcome {
+    let status = match crate::store::sample_tick::read_last_tick(&ctx.config.state.dir) {
+        Ok(None) => CheckStatus::NotApplicable("no sample tick has been recorded yet".to_string()),
+        Ok(Some(tick)) => match tick.outcome {
+            crate::store::sample_tick::TickOutcome::Success => CheckStatus::Pass,
+            crate::store::sample_tick::TickOutcome::Failed(reason) => CheckStatus::Fail(reason),
+        },
+        Err(error) => CheckStatus::Fail(format!("cannot read the last sample tick: {error}")),
+    };
+    outcome(CheckName::LastSampleTick, status)
 }
 
 #[cfg(test)]

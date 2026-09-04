@@ -1160,9 +1160,7 @@ pub(crate) fn sample_command(
         .state
         .dir
         .join(crate::store::connection::LEDGER_DATABASE_FILE);
-    let busy_policy = crate::store::connection::PragmaPolicy {
-        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
-    };
+    let busy_policy = sample_busy_policy(&config);
     // Migrations are confined to the store layer (boundary rules 15 and 16),
     // so the ledger is opened through the same shared opener `ingest` and
     // `rate-card import` already use rather than running the migration
@@ -1328,7 +1326,25 @@ pub(crate) fn sample_command(
         max_concurrent_requests: config.sampling.max_concurrent_requests,
     };
 
-    let batch_report = orchestrator.run(&batch_accounts)?;
+    let run_result = orchestrator
+        .run(&batch_accounts)
+        .map_err(|error| name_busy_wait(error, busy_policy.busy_timeout));
+    // Recorded outside the ledger and unconditionally, so a tick refused by
+    // the very database it would have written to still leaves a durable
+    // trace `aub doctor` can read (`aub-va6s`). A marker-write failure is a
+    // diagnostic-aid failure, not the tick's own outcome, so it is not
+    // allowed to mask or replace the result the caller actually asked for.
+    let _ = crate::store::sample_tick::record_last_tick(
+        &config.state.dir,
+        &crate::store::sample_tick::LastSampleTick {
+            started_at: timestamp,
+            outcome: match &run_result {
+                Ok(_) => crate::store::sample_tick::TickOutcome::Success,
+                Err(error) => crate::store::sample_tick::TickOutcome::Failed(error.to_string()),
+            },
+        },
+    );
+    let batch_report = run_result?;
 
     match invocation.format {
         OutputFormat::Text => {
@@ -1497,6 +1513,39 @@ pub(crate) fn sample_command(
     }
 
     Ok(())
+}
+
+/// The pragma policy `aub sample` opens its ledger connection with
+/// (`aub-va6s`): the same `sampling.request_timeout` every other
+/// store-opening command in this file already uses, factored out here so the
+/// value is testable on its own rather than only as a side effect of a full
+/// sample run. Before this bead the busy timeout was hardcoded to 500ms,
+/// which refused a sampler on the first contended attempt instead of waiting
+/// through a batched ingest's brief holds of the writer slot, exactly the
+/// case a scheduled `aub sample --due` tick collides with on a machine that
+/// is also running its first ingest.
+fn sample_busy_policy(config: &crate::config::Config) -> crate::store::connection::PragmaPolicy {
+    crate::store::connection::PragmaPolicy {
+        busy_timeout: config.sampling.request_timeout,
+    }
+}
+
+/// Names how long a busy-database refusal waited, so the message
+/// distinguishes a sampler that waited its configured timeout from one that
+/// refused instantly (`aub-va6s`). `sample_run::start_sample_run` is the
+/// batch's one failure point that can carry this SQLite failure text (the
+/// only write the orchestrator performs before any account-level work); every
+/// other error passes through unchanged. The refusal path itself is kept
+/// exactly as it was: only how long the sampler waited before reaching it
+/// changes, not whether it can still be reached.
+fn name_busy_wait(error: Error, busy_timeout: crate::domain::time::MonotonicDuration) -> Error {
+    match error {
+        Error::Store(message) if message.contains("database is locked") => Error::Store(format!(
+            "{message} (waited up to {}ms)",
+            busy_timeout.as_nanos() / 1_000_000
+        )),
+        other => other,
+    }
 }
 
 /// `aub now`: force a persisted sampling attempt for the selected accounts
@@ -2201,9 +2250,17 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             source: None,
             changed_only: options.refresh == RefreshPolicy::Auto,
         };
-        // The spend refresh lands batches without observing them; the batch sink is the
-        // ingest command's diagnostic surface, not the spend command's.
-        match crate::ingest::run(&mut conn, &config, &ingest_options, clock, &mut |_| Ok(())) {
+        // The spend refresh lands batches without observing them; the batch
+        // sink and the progress sink are the ingest command's own diagnostic
+        // surface, not the spend command's.
+        match crate::ingest::run(
+            &mut conn,
+            &config,
+            &ingest_options,
+            clock,
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        ) {
             Ok(report) if report.unreadable_files.is_empty() => refresh_report = Some(report),
             Ok(report) => {
                 refresh_failure = Some(format!(
@@ -4219,6 +4276,20 @@ fn compare_uncompared_command(clock: &impl Clock, invocation: &Invocation) -> Re
     Ok(())
 }
 
+/// The `aub ingest transcripts` progress line's exact wording (`aub-va6s`),
+/// factored out so its format is a golden test target independent of
+/// actually running a pass long enough to trigger one.
+fn format_ingest_progress_line(progress: &crate::ingest::IngestProgress) -> String {
+    format!(
+        "ingest transcripts: progress files={}/{} sessions={} events={} elapsed={}s",
+        progress.files_done,
+        progress.files_total,
+        progress.sessions_written,
+        progress.events_written,
+        progress.elapsed.as_nanos() / 1_000_000_000,
+    )
+}
+
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in
 /// its own right (aub-lqe.11, PLAN.md 6, 17.2, 27, 34.16). The window flags of
 /// spend do not exist here: ingestion is not windowed, it lands everything the
@@ -4270,7 +4341,22 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
             )
             .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))
     };
-    let report = crate::ingest::run(&mut conn, &config, &options, clock, &mut batch_sink)?;
+    // Printed unconditionally to stderr, not gated by `--verbose` like the
+    // structured diagnostics above: a run that holds the writer lock for
+    // half an hour and prints nothing at the default log level reads as
+    // hung, which is the failure `aub-va6s` exists to close.
+    let mut progress_sink = |progress: &crate::ingest::IngestProgress| -> Result<(), Error> {
+        eprintln!("{}", format_ingest_progress_line(progress));
+        Ok(())
+    };
+    let report = crate::ingest::run(
+        &mut conn,
+        &config,
+        &options,
+        clock,
+        &mut batch_sink,
+        &mut progress_sink,
+    )?;
     println!(
         "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={}",
         report.sources.join(","),
@@ -4730,6 +4816,72 @@ fn task_overhead_window(rest: &[String], now: UtcTimestamp) -> Result<SpendWindo
 mod tests {
     use super::*;
     use crate::config::FakeEnv;
+
+    /// `aub sample` opens its ledger with the configured `sampling.request_timeout`,
+    /// not a hardcoded value (`aub-va6s`): a config naming a busy timeout
+    /// wider than the old hardcoded 500ms must actually reach the pragma
+    /// policy, which a hardcoded value, however large, could never do.
+    #[test]
+    fn sample_busy_policy_reads_the_configured_request_timeout_not_a_hardcoded_value() {
+        let toml = "[sampling]\nrequest_timeout = \"17s\"\n";
+        let (config, _) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &FakeEnv::new(),
+            Some(toml),
+            "/virtual/aub.toml",
+        )
+        .expect("config resolves");
+        assert_eq!(
+            sample_busy_policy(&config).busy_timeout,
+            crate::domain::time::MonotonicDuration::from_seconds(17),
+            "the sampler's busy timeout must track the configured value, not a fixed constant"
+        );
+    }
+
+    /// The waited duration is named on the exact refusal `aub sample`
+    /// reproduces (`aub-va6s`); every other store failure passes through with
+    /// its message untouched, so a caller cannot mistake an unrelated store
+    /// error for a busy-database refusal that happened to sit near one.
+    #[test]
+    fn name_busy_wait_names_the_duration_on_a_locked_database_refusal_and_leaves_others_alone() {
+        let busy_timeout = crate::domain::time::MonotonicDuration::from_millis(5_000);
+        let locked = Error::Store(
+            "cannot start sample run: database is locked (code 5, SQLITE_BUSY)".to_string(),
+        );
+        let named = name_busy_wait(locked, busy_timeout);
+        assert!(
+            matches!(named, Error::Store(ref m) if m.contains("waited up to 5000ms")),
+            "{named:?}"
+        );
+
+        let unrelated_text = "cannot read pragma journal_mode: disk I/O error";
+        let unchanged = name_busy_wait(Error::Store(unrelated_text.to_string()), busy_timeout);
+        assert_eq!(unchanged.to_string(), unrelated_text);
+
+        let other_class_text = "account 'work': authentication required";
+        let unchanged_class = name_busy_wait(
+            Error::AuthRequired(other_class_text.to_string()),
+            busy_timeout,
+        );
+        assert_eq!(unchanged_class.to_string(), other_class_text);
+    }
+
+    /// The progress line's exact wording is the golden target (`aub-va6s`):
+    /// files done of total, sessions and events landed so far, elapsed.
+    #[test]
+    fn golden_ingest_progress_line_format() {
+        let progress = crate::ingest::IngestProgress {
+            files_done: 100,
+            files_total: 3830,
+            sessions_written: 12,
+            events_written: 4_567,
+            elapsed: crate::domain::time::MonotonicDuration::from_seconds(37),
+        };
+        assert_eq!(
+            format_ingest_progress_line(&progress),
+            "ingest transcripts: progress files=100/3830 sessions=12 events=4567 elapsed=37s"
+        );
+    }
 
     fn parse_percent(raw: &str) -> Result<u32, Error> {
         let args = [raw.to_string()];
