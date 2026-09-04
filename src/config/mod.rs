@@ -192,8 +192,9 @@ pub struct SamplingConfig {
 /// The transcript ingest batch policy (PLAN.md section 11.2: "Transcript ingest
 /// commits in bounded batches so it cannot monopolize the single SQLite writer
 /// slot"). One ingest pass lands its canonical usage events in transactions of
-/// at most `max_batch_events` events, releasing the writer slot between
-/// batches, so a concurrent meter write never waits behind one unbounded pass.
+/// at most `max_batch_events` events or `max_batch_files` files, whichever
+/// comes first, releasing the writer slot between batches, so a concurrent
+/// meter write never waits behind one unbounded pass.
 #[derive(Debug, Clone)]
 pub struct IngestConfig {
     /// The maximum number of canonical usage events one ingest batch lands in
@@ -201,6 +202,13 @@ pub struct IngestConfig {
     /// caps how long any one batch can hold the writer slot. The value must be
     /// at least 1: a zero bound would mean no batch could ever land a row.
     pub max_batch_events: u64,
+    /// The maximum number of source files one ingest batch may span (`aub-va6s`).
+    /// A file's events are never split across two batches, so this is the
+    /// commit boundary that actually bounds how long the corpus goes without a
+    /// commit when files carry few events each: `max_batch_events` alone
+    /// would let a batch of many small files grow unbounded in file count and
+    /// wall time before it ever landed. The value must be at least 1.
+    pub max_batch_files: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -368,7 +376,7 @@ const SAMPLING_KEYS: &[&str] = &[
     "command_budget",
     "max_concurrent_requests",
 ];
-const INGEST_KEYS: &[&str] = &["max_batch_events"];
+const INGEST_KEYS: &[&str] = &["max_batch_events", "max_batch_files"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
 const ATTRIBUTION_KEYS: &[&str] = &["quality_floor", "recent_window"];
@@ -766,6 +774,15 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "ingest", "max_batch_events"),
             Some("5000"),
+            &file_display,
+            &mut provenance,
+        )?,
+        max_batch_files: resolve_positive_count(
+            "ingest.max_batch_files",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "ingest", "max_batch_files"),
+            Some("200"),
             &file_display,
             &mut provenance,
         )?,
@@ -1403,6 +1420,41 @@ pattern = "**/*.jsonl"
         let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
         assert!(
             error.to_string().contains("ingest.max_batch_events"),
+            "{error}"
+        );
+    }
+
+    /// The file-count batch bound (`aub-va6s`): same four-level resolution and
+    /// the same refusal of zero or garbage as `max_batch_events`, checked
+    /// independently because the two bound different axes of one batch.
+    #[test]
+    fn ingest_batch_file_bound_resolves_and_refuses_zero_or_garbage() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(config.ingest.max_batch_files, 200);
+        assert_eq!(
+            provenance.get("ingest.max_batch_files"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "\n[ingest]\nmax_batch_files = 3\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.ingest.max_batch_files, 3);
+        assert_eq!(
+            provenance.get("ingest.max_batch_files"),
+            Some(ConfigSource::File)
+        );
+
+        let zero = "\n[ingest]\nmax_batch_files = 0\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(zero)).unwrap_err();
+        assert!(
+            error.to_string().contains("ingest.max_batch_files"),
+            "{error}"
+        );
+
+        let garbage = "\n[ingest]\nmax_batch_files = \"lots\"\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
+        assert!(
+            error.to_string().contains("ingest.max_batch_files"),
             "{error}"
         );
     }
