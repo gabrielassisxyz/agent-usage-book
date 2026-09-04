@@ -97,7 +97,7 @@ fn every_sample_tick_gets_through_a_batched_ingest_within_the_busy_timeout() {
     });
 
     // The sampler's own busy timeout: what `sample_command` now opens the
-    // store with (`config.sampling.request_timeout`), generous enough to
+    // store with (`config.sampling.busy_timeout`), generous enough to
     // outlast one batch's hold, unlike the hardcoded 500ms this bead fixed
     // to be exactly this instead of a hardcoded value below any batch hold.
     let sampler_policy = PragmaPolicy {

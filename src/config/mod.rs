@@ -181,6 +181,11 @@ pub struct SamplingConfig {
     pub default_interval: MonotonicDuration,
     pub reset_edge_lead: MonotonicDuration,
     pub request_timeout: MonotonicDuration,
+    /// How long `aub sample` waits for the ledger's write slot before refusing
+    /// a tick. Its own key rather than `request_timeout`: that one bounds a
+    /// provider request, and an operator raising it for a slow provider must
+    /// not thereby lengthen a lock wait, nor push it past the store's bound.
+    pub busy_timeout: MonotonicDuration,
     pub command_budget: MonotonicDuration,
     /// The most provider requests one sampling batch may keep in flight.
     /// Bounded so a machine with many configured accounts cannot open an
@@ -373,6 +378,7 @@ const SAMPLING_KEYS: &[&str] = &[
     "default_interval",
     "reset_edge_lead",
     "request_timeout",
+    "busy_timeout",
     "command_budget",
     "max_concurrent_requests",
 ];
@@ -822,6 +828,18 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "request_timeout"),
             Some("5s"),
+            &file_display,
+            &mut provenance,
+        )?,
+        // Default sized against a batched ingest's commit cadence (about 5000 events,
+        // seconds at most per batch) and under the store's 30s bound; a lock held
+        // longer than this is a stuck writer, not a batch, and refusing is right.
+        busy_timeout: resolve_duration(
+            "sampling.busy_timeout",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "busy_timeout"),
+            Some("10s"),
             &file_display,
             &mut provenance,
         )?,

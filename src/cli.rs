@@ -1526,7 +1526,7 @@ pub(crate) fn sample_command(
 /// is also running its first ingest.
 fn sample_busy_policy(config: &crate::config::Config) -> crate::store::connection::PragmaPolicy {
     crate::store::connection::PragmaPolicy {
-        busy_timeout: config.sampling.request_timeout,
+        busy_timeout: config.sampling.busy_timeout,
     }
 }
 
@@ -4824,8 +4824,10 @@ mod tests {
     /// wider than the old hardcoded 500ms must actually reach the pragma
     /// policy, which a hardcoded value, however large, could never do.
     #[test]
-    fn sample_busy_policy_reads_the_configured_request_timeout_not_a_hardcoded_value() {
-        let toml = "[sampling]\nrequest_timeout = \"17s\"\n";
+    fn sample_busy_policy_reads_the_configured_busy_timeout_not_the_request_timeout() {
+        // request_timeout is set too, to a different value: the policy must follow the
+        // lock-wait key and not the provider-request one it was first wired to.
+        let toml = "[sampling]\nrequest_timeout = \"3s\"\nbusy_timeout = \"17s\"\n";
         let (config, _) = crate::config::resolve(
             &crate::config::Overrides::new(),
             &FakeEnv::new(),
