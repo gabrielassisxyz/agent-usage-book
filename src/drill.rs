@@ -754,6 +754,18 @@ mod tests {
 
     // --- every damage case recovers, and preserves the damaged directory --
 
+    /// Planted negative: a case dropped from [`DamageCase::ALL`] shrinks the
+    /// count silently unless something asserts on it directly, since the
+    /// loop-based tests below only ever check the cases that are still
+    /// there.
+    #[test]
+    fn exactly_four_damage_cases_are_declared() {
+        assert_eq!(DamageCase::ALL.len(), 4);
+        let distinct: std::collections::BTreeSet<&str> =
+            DamageCase::ALL.iter().map(|case| case.as_str()).collect();
+        assert_eq!(distinct.len(), 4, "every case name must be distinct");
+    }
+
     #[test]
     fn every_seeded_damage_case_recovers_and_preserves_the_damaged_directory() {
         for case in DamageCase::ALL {
@@ -799,6 +811,48 @@ mod tests {
         assert_ne!(
             before, after,
             "a one-byte change anywhere under the tree must change the snapshot"
+        );
+    }
+
+    /// Mutation-shaped proof that the preservation check actually detects
+    /// damage rather than always reading true: draining the surviving
+    /// directory directly, the exact mistake `restore.rs`'s own module doc
+    /// comment warns against ("draining the damaged directory directly would
+    /// delete or quarantine its records"), changes its snapshot.
+    #[test]
+    fn draining_the_surviving_directory_directly_would_change_its_snapshot() {
+        let scratch = ScratchDir::new("preservation-sensitivity");
+        let configured = scratch.path().join("unused-configured-state-dir");
+        let scratch_dest = scratch.path().join("scratch");
+        let clock = clock_at(10_000);
+        let report = run_seeded(
+            &configured,
+            DamageCase::MalformedSpoolRecord,
+            &scratch_dest,
+            busy_timeout(),
+            &mounts(),
+            &clock,
+        )
+        .unwrap();
+        let damaged_dir = report.damaged_directory.as_ref().unwrap();
+        let before = snapshot_directory(damaged_dir).unwrap();
+
+        let policy = PragmaPolicy {
+            busy_timeout: busy_timeout(),
+        };
+        let mut conn = open(
+            &scratch_dest.join("restored").join(LEDGER_DATABASE_FILE),
+            AccessMode::ReadWrite,
+            &policy,
+        )
+        .unwrap();
+        crate::store::spool::drain_pending(&mut conn, damaged_dir).unwrap();
+
+        let after = snapshot_directory(damaged_dir).unwrap();
+        assert_ne!(
+            before, after,
+            "draining the surviving directory in place must change its snapshot; \
+             the preservation check exists to catch exactly this"
         );
     }
 
