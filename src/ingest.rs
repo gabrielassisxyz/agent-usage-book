@@ -749,6 +749,17 @@ mod progress_gate_tests {
         clock.monotonic_now()
     }
 
+    /// The acceptance criterion's literal numbers (`aub-va6s`): every 100
+    /// files or 30 seconds, whichever first. The symbolic tests below prove
+    /// the gate logic against the constants; this one pins the constants
+    /// themselves, since a gate that used the right logic against the wrong
+    /// numbers would still pass every other test here.
+    #[test]
+    fn the_configured_interval_is_exactly_100_files_or_30_seconds() {
+        assert_eq!(PROGRESS_FILE_INTERVAL, 100);
+        assert_eq!(PROGRESS_TIME_INTERVAL, MonotonicDuration::from_seconds(30));
+    }
+
     /// The file-count side fires at exactly [`PROGRESS_FILE_INTERVAL`] files
     /// since the last report, not one file later or earlier (`aub-va6s`).
     #[test]
