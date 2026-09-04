@@ -217,7 +217,13 @@ impl AccountMarkerBoundary {
             AccountEvidenceClass::ConfiguredCredentialMapping if !self.mapping_validated => {
                 AccountEvidenceClass::ConservativeTemporalInference
             }
-            other => other,
+            // Spelled out rather than a wildcard: the crate denies a catch-all over an
+            // enum so that a sixth evidence class cannot pass through here unexamined.
+            class @ (AccountEvidenceClass::ExplicitLauncherOrHook
+            | AccountEvidenceClass::ExplicitProviderIdentity
+            | AccountEvidenceClass::ConfiguredCredentialMapping
+            | AccountEvidenceClass::ConservativeTemporalInference
+            | AccountEvidenceClass::Unattributed) => class,
         }
     }
 }
