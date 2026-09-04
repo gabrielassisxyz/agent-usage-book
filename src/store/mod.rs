@@ -39,6 +39,7 @@ pub mod reconciliation;
 pub mod repository;
 pub mod retention;
 pub mod sample_run;
+pub mod sample_tick;
 pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
 pub mod schema_audit;
