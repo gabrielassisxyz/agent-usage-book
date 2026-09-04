@@ -1385,7 +1385,7 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 3] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 4] = [
         (
             "IngestSummary",
             "*",
@@ -1397,6 +1397,13 @@ mod tests {
             "usage",
             "a UsageVector carries its own coverage and evidence quality, with the \
              provenance and derivation identifier as sibling fields on the group",
+        ),
+        (
+            "ClearDiagnosticsReport",
+            "*",
+            "operational counters describing what the clearing run removed, not \
+             measurements it reports; there is no coverage question in a count of \
+             files this command itself deleted",
         ),
         (
             "ExportReport",
