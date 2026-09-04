@@ -29,22 +29,197 @@
 //! timestamp falls into exactly one interval.
 
 use std::collections::HashMap;
+use std::fmt;
+use std::str::FromStr;
 
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
 };
+use crate::error::Error;
+
+/// The five account attribution evidence classes in descending confidence order
+/// (PLAN.md 19.2, aub-mgv.2):
+/// 1. explicit session and account marker from launcher or hook;
+/// 2. explicit provider or account identity returned during that session;
+/// 3. configured credential-source identity with validated mapping;
+/// 4. conservative temporal inference;
+/// 5. unattributed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum AccountEvidenceClass {
+    /// Explicit session and account marker from launcher or hook (Rank 1).
+    ExplicitLauncherOrHook = 1,
+    /// Explicit provider or account identity returned during that session (Rank 2).
+    ExplicitProviderIdentity = 2,
+    /// Configured credential-source identity with validated mapping (Rank 3).
+    ConfiguredCredentialMapping = 3,
+    /// Conservative temporal inference (Rank 4).
+    ConservativeTemporalInference = 4,
+    /// Unattributed (Rank 5).
+    Unattributed = 5,
+}
+
+impl AccountEvidenceClass {
+    /// The five evidence classes in precedence order (highest confidence first).
+    pub const ALL: [Self; 5] = [
+        Self::ExplicitLauncherOrHook,
+        Self::ExplicitProviderIdentity,
+        Self::ConfiguredCredentialMapping,
+        Self::ConservativeTemporalInference,
+        Self::Unattributed,
+    ];
+
+    /// Precedence rank from 1 (highest confidence) to 5 (unattributed).
+    pub const fn rank(self) -> u8 {
+        match self {
+            Self::ExplicitLauncherOrHook => 1,
+            Self::ExplicitProviderIdentity => 2,
+            Self::ConfiguredCredentialMapping => 3,
+            Self::ConservativeTemporalInference => 4,
+            Self::Unattributed => 5,
+        }
+    }
+
+    /// Returns true if `self` has higher precedence than `other`.
+    pub const fn takes_precedence_over(self, other: Self) -> bool {
+        self.rank() < other.rank()
+    }
+
+    /// True when this evidence class represents conservative temporal inference.
+    /// Sufficient for `aub-c0b.7` to reject inferred attribution without reconstructing provenance.
+    pub const fn is_inferred(self) -> bool {
+        matches!(self, Self::ConservativeTemporalInference)
+    }
+
+    /// True when this class represents explicit evidence (ranks 1 and 2).
+    pub const fn is_explicit(self) -> bool {
+        matches!(
+            self,
+            Self::ExplicitLauncherOrHook | Self::ExplicitProviderIdentity
+        )
+    }
+
+    /// True when this class is eligible for passive calibration (`aub-c0b.7`).
+    /// Inferred attribution and unattributed usage are ineligible.
+    pub const fn is_eligible_for_passive_calibration(self) -> bool {
+        !self.is_inferred() && !matches!(self, Self::Unattributed)
+    }
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::ExplicitLauncherOrHook => "explicit_launcher_or_hook",
+            Self::ExplicitProviderIdentity => "explicit_provider_identity",
+            Self::ConfiguredCredentialMapping => "configured_credential_mapping",
+            Self::ConservativeTemporalInference => "conservative_temporal_inference",
+            Self::Unattributed => "unattributed",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "explicit_launcher_or_hook" | "launcher_or_hook" => Some(Self::ExplicitLauncherOrHook),
+            "explicit_provider_identity" | "provider_identity" => {
+                Some(Self::ExplicitProviderIdentity)
+            }
+            "configured_credential_mapping" | "credential_mapping" => {
+                Some(Self::ConfiguredCredentialMapping)
+            }
+            "conservative_temporal_inference" | "temporal_inference" | "inferred" => {
+                Some(Self::ConservativeTemporalInference)
+            }
+            "unattributed" => Some(Self::Unattributed),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for AccountEvidenceClass {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for AccountEvidenceClass {
+    type Err = Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s).ok_or_else(|| Error::Store(format!("unknown account evidence class: '{s}'")))
+    }
+}
 
 /// One account marker as the segmentation algorithm sees it: the account it
-/// names, when it was observed, and the source's own ordering key if the
-/// source provided one. The store maps its persisted `SessionAccountMarker`
-/// rows into this before calling [`segment`]; this type carries no store
-/// identity because the algorithm is pure over its inputs.
+/// names, when it was observed, the source's own ordering key if the source
+/// provided one, its evidence class, and whether its credential mapping has
+/// been validated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AccountMarkerBoundary {
     pub logical_account: String,
     pub observed_at: UtcTimestamp,
     pub source_ordering_key: Option<i64>,
+    pub evidence_class: AccountEvidenceClass,
+    pub mapping_validated: bool,
+}
+
+impl AccountMarkerBoundary {
+    pub fn new(
+        logical_account: impl Into<String>,
+        observed_at: UtcTimestamp,
+        source_ordering_key: Option<i64>,
+        evidence_class: AccountEvidenceClass,
+        mapping_validated: bool,
+    ) -> Self {
+        Self {
+            logical_account: logical_account.into(),
+            observed_at,
+            source_ordering_key,
+            evidence_class,
+            mapping_validated,
+        }
+    }
+
+    /// Creates an explicit launcher or hook marker boundary.
+    pub fn explicit(
+        logical_account: impl Into<String>,
+        observed_at: UtcTimestamp,
+        source_ordering_key: Option<i64>,
+    ) -> Self {
+        Self::new(
+            logical_account,
+            observed_at,
+            source_ordering_key,
+            AccountEvidenceClass::ExplicitLauncherOrHook,
+            true,
+        )
+    }
+
+    /// Creates a conservative temporal inference marker boundary.
+    pub fn inferred(
+        logical_account: impl Into<String>,
+        observed_at: UtcTimestamp,
+        source_ordering_key: Option<i64>,
+    ) -> Self {
+        Self::new(
+            logical_account,
+            observed_at,
+            source_ordering_key,
+            AccountEvidenceClass::ConservativeTemporalInference,
+            true,
+        )
+    }
+
+    /// The effective evidence class of this marker.
+    ///
+    /// Where a credential-source identity is used, the mapping must be
+    /// validated, and an unvalidated mapping falls through to the next
+    /// class (`ConservativeTemporalInference`).
+    pub fn effective_evidence_class(&self) -> AccountEvidenceClass {
+        match self.evidence_class {
+            AccountEvidenceClass::ConfiguredCredentialMapping if !self.mapping_validated => {
+                AccountEvidenceClass::ConservativeTemporalInference
+            }
+            other => other,
+        }
+    }
 }
 
 /// One usage record to segment: a single timestamp and its per-kind usage.
@@ -86,19 +261,27 @@ pub struct AccountSegmentationInputs {
 /// than storing attribution as an immutable fact.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AccountSegmentationResult {
-    per_account: HashMap<String, KnownTokenVector>,
+    per_account: HashMap<String, (KnownTokenVector, AccountEvidenceClass)>,
     unknown_account: Option<KnownTokenVector>,
 }
 
 impl AccountSegmentationResult {
-    fn add(&mut self, target: AccountSegmentTarget, usage: KnownTokenVector) {
+    fn add(
+        &mut self,
+        target: AccountSegmentTarget,
+        usage: KnownTokenVector,
+        evidence_class: AccountEvidenceClass,
+    ) {
         match target {
             AccountSegmentTarget::Account(logical_account) => {
                 let entry = self
                     .per_account
                     .entry(logical_account)
-                    .or_insert_with(zero_vector);
-                *entry = *entry + usage;
+                    .or_insert_with(|| (zero_vector(), evidence_class));
+                entry.0 = entry.0 + usage;
+                if evidence_class.takes_precedence_over(entry.1) {
+                    entry.1 = evidence_class;
+                }
             }
             AccountSegmentTarget::UnknownAccount => {
                 let entry = self.unknown_account.get_or_insert_with(zero_vector);
@@ -109,7 +292,17 @@ impl AccountSegmentationResult {
 
     /// The usage attributed to one account, or `None` if it received none.
     pub fn account_usage(&self, logical_account: &str) -> Option<KnownTokenVector> {
-        self.per_account.get(logical_account).copied()
+        self.per_account
+            .get(logical_account)
+            .map(|(usage, _)| *usage)
+    }
+
+    /// The evidence class justifying the usage attributed to one account,
+    /// or `None` if the account received no attribution.
+    pub fn account_evidence_class(&self, logical_account: &str) -> Option<AccountEvidenceClass> {
+        self.per_account
+            .get(logical_account)
+            .map(|(_, evidence)| *evidence)
     }
 
     /// The usage landed in the unknown-account bucket, or `None` if it is empty.
@@ -117,11 +310,25 @@ impl AccountSegmentationResult {
         self.unknown_account
     }
 
+    /// The evidence class for the unknown-account bucket: always `Unattributed`.
+    pub fn unknown_account_evidence_class(&self) -> AccountEvidenceClass {
+        AccountEvidenceClass::Unattributed
+    }
+
     /// Every account that received usage, with its total.
     pub fn accounts(&self) -> impl Iterator<Item = (&str, &KnownTokenVector)> {
         self.per_account
             .iter()
-            .map(|(account, usage)| (account.as_str(), usage))
+            .map(|(account, (usage, _))| (account.as_str(), usage))
+    }
+
+    /// Every account that received usage, with its total and justifying evidence class.
+    pub fn accounts_with_evidence(
+        &self,
+    ) -> impl Iterator<Item = (&str, &KnownTokenVector, AccountEvidenceClass)> {
+        self.per_account
+            .iter()
+            .map(|(account, (usage, evidence))| (account.as_str(), usage, *evidence))
     }
 
     /// The conservation total: every account's usage plus the unknown-account
@@ -131,6 +338,7 @@ impl AccountSegmentationResult {
     pub fn total(&self) -> KnownTokenVector {
         self.per_account
             .values()
+            .map(|(usage, _)| usage)
             .chain(self.unknown_account.iter())
             .fold(zero_vector(), |acc, usage| acc + *usage)
     }
@@ -143,37 +351,40 @@ struct MarkerInterval {
     lo: UtcTimestamp,
     hi: Option<UtcTimestamp>,
     logical_account: String,
+    evidence_class: AccountEvidenceClass,
 }
 
-/// Sorts markers into their total, deterministic order: primarily by
-/// timestamp; when two markers share a timestamp, a marker with no
-/// source-provided ordering key sorts before one that has a key, and two
-/// markers that both have keys sort by that key; any tie still remaining
-/// (no key on either side, or equal keys, which is what "duplicate markers"
-/// looks like) falls back to input order, which [`Vec::sort_by`]'s stability
-/// preserves. Documenting this here is the tie-breaking rule the interval
-/// timestamp semantics need: usage exactly on a marker's own timestamp
-/// belongs to the interval that starts there (see [`build_intervals`]), so
-/// which marker starts an interval at a shared timestamp is decided by this
-/// order and nothing else.
-fn sorted_markers(markers: &[AccountMarkerBoundary]) -> Vec<&AccountMarkerBoundary> {
-    let mut sorted: Vec<&AccountMarkerBoundary> = markers.iter().collect();
+/// Builds the marker-to-marker interval timeline.
+///
+/// Precedence rule: markers are grouped by effective evidence rank. Lower-confidence
+/// markers (such as conservative temporal inference when explicit markers exist) cannot
+/// overwrite higher-confidence markers, regardless of arrival order. Only markers at the
+/// winning (highest confidence) rank form the active timeline.
+///
+/// Within the winning rank, markers are ordered by timestamp, source ordering key,
+/// and input stability fallback.
+fn build_intervals(markers: &[AccountMarkerBoundary]) -> Vec<MarkerInterval> {
+    if markers.is_empty() {
+        return Vec::new();
+    }
+    let winning_rank = markers
+        .iter()
+        .map(|m| m.effective_evidence_class().rank())
+        .min()
+        .expect("markers is non-empty");
+
+    let qualifying: Vec<&AccountMarkerBoundary> = markers
+        .iter()
+        .filter(|m| m.effective_evidence_class().rank() == winning_rank)
+        .collect();
+
+    let mut sorted = qualifying;
     sorted.sort_by(|a, b| {
         a.observed_at
             .cmp(&b.observed_at)
             .then_with(|| a.source_ordering_key.cmp(&b.source_ordering_key))
     });
-    sorted
-}
 
-/// Builds the marker-to-marker interval timeline: marker `i`'s account
-/// applies over `[marker_i.observed_at, marker_{i+1}.observed_at)`, and the
-/// last marker's account applies unbounded forward. Empty input (no markers
-/// at all, covering both the "no marker" and the empty-session cases)
-/// produces no intervals, and every usage event then falls through to the
-/// unknown-account bucket in [`segment`].
-fn build_intervals(markers: &[AccountMarkerBoundary]) -> Vec<MarkerInterval> {
-    let sorted = sorted_markers(markers);
     let mut intervals = Vec::with_capacity(sorted.len());
     for (index, marker) in sorted.iter().enumerate() {
         let hi = sorted.get(index + 1).map(|next| next.observed_at);
@@ -181,6 +392,7 @@ fn build_intervals(markers: &[AccountMarkerBoundary]) -> Vec<MarkerInterval> {
             lo: marker.observed_at,
             hi,
             logical_account: marker.logical_account.clone(),
+            evidence_class: marker.effective_evidence_class(),
         });
     }
     intervals
@@ -212,11 +424,17 @@ pub fn segment(inputs: &AccountSegmentationInputs) -> AccountSegmentationResult 
     let intervals = build_intervals(&inputs.markers);
 
     for event in &inputs.usage {
-        let target = match locate(&intervals, event.occurred_at) {
-            Some(interval) => AccountSegmentTarget::Account(interval.logical_account.clone()),
-            None => AccountSegmentTarget::UnknownAccount,
+        let (target, evidence_class) = match locate(&intervals, event.occurred_at) {
+            Some(interval) => (
+                AccountSegmentTarget::Account(interval.logical_account.clone()),
+                interval.evidence_class,
+            ),
+            None => (
+                AccountSegmentTarget::UnknownAccount,
+                AccountEvidenceClass::Unattributed,
+            ),
         };
-        result.add(target, event.usage);
+        result.add(target, event.usage, evidence_class);
     }
 
     debug_assert_conserves(inputs, &result);
@@ -267,6 +485,24 @@ mod tests {
             logical_account: account.to_owned(),
             observed_at: t(at),
             source_ordering_key: ordering_key,
+            evidence_class: AccountEvidenceClass::ExplicitLauncherOrHook,
+            mapping_validated: true,
+        }
+    }
+
+    fn marker_with_class(
+        account: &str,
+        at: i64,
+        ordering_key: Option<i64>,
+        evidence_class: AccountEvidenceClass,
+        mapping_validated: bool,
+    ) -> AccountMarkerBoundary {
+        AccountMarkerBoundary {
+            logical_account: account.to_owned(),
+            observed_at: t(at),
+            source_ordering_key: ordering_key,
+            evidence_class,
+            mapping_validated,
         }
     }
 
@@ -464,6 +700,288 @@ mod tests {
             segment(&under_account_b)
                 .account_usage("account-a")
                 .is_none()
+        );
+    }
+
+    // --- evidence ranking and precedence ----------------------------------
+
+    #[test]
+    fn precedence_across_all_five_evidence_classes_tested_pairwise() {
+        let classes = AccountEvidenceClass::ALL;
+        assert_eq!(classes.len(), 5);
+
+        // Verify ranks: 1 through 5 strictly ascending.
+        assert_eq!(AccountEvidenceClass::ExplicitLauncherOrHook.rank(), 1);
+        assert_eq!(AccountEvidenceClass::ExplicitProviderIdentity.rank(), 2);
+        assert_eq!(AccountEvidenceClass::ConfiguredCredentialMapping.rank(), 3);
+        assert_eq!(
+            AccountEvidenceClass::ConservativeTemporalInference.rank(),
+            4
+        );
+        assert_eq!(AccountEvidenceClass::Unattributed.rank(), 5);
+
+        for (i, &a) in classes.iter().enumerate() {
+            // Irreflexivity: a does not take precedence over a.
+            assert!(!a.takes_precedence_over(a));
+
+            for (j, &b) in classes.iter().enumerate() {
+                if i < j {
+                    // a comes before b in the precedence order, so a takes precedence over b.
+                    assert!(
+                        a.takes_precedence_over(b),
+                        "{a:?} (rank {}) must take precedence over {b:?} (rank {})",
+                        a.rank(),
+                        b.rank()
+                    );
+                    // Asymmetry: b cannot take precedence over a.
+                    assert!(
+                        !b.takes_precedence_over(a),
+                        "{b:?} must not take precedence over {a:?}"
+                    );
+                } else if i > j {
+                    assert!(
+                        !a.takes_precedence_over(b),
+                        "{a:?} (rank {}) must not take precedence over {b:?} (rank {})",
+                        a.rank(),
+                        b.rank()
+                    );
+                }
+            }
+        }
+
+        // Transitivity: for all a, b, c, if a > b and b > c then a > c.
+        for &a in &classes {
+            for &b in &classes {
+                for &c in &classes {
+                    if a.takes_precedence_over(b) && b.takes_precedence_over(c) {
+                        assert!(
+                            a.takes_precedence_over(c),
+                            "transitivity failed: {a:?} > {b:?} and {b:?} > {c:?} but not {a:?} > {c:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        // Test is_inferred, is_explicit, is_eligible_for_passive_calibration.
+        assert!(AccountEvidenceClass::ConservativeTemporalInference.is_inferred());
+        assert!(!AccountEvidenceClass::ExplicitLauncherOrHook.is_inferred());
+        assert!(!AccountEvidenceClass::ExplicitProviderIdentity.is_inferred());
+        assert!(!AccountEvidenceClass::ConfiguredCredentialMapping.is_inferred());
+        assert!(!AccountEvidenceClass::Unattributed.is_inferred());
+
+        assert!(AccountEvidenceClass::ExplicitLauncherOrHook.is_explicit());
+        assert!(AccountEvidenceClass::ExplicitProviderIdentity.is_explicit());
+        assert!(!AccountEvidenceClass::ConfiguredCredentialMapping.is_explicit());
+        assert!(!AccountEvidenceClass::ConservativeTemporalInference.is_explicit());
+        assert!(!AccountEvidenceClass::Unattributed.is_explicit());
+
+        assert!(AccountEvidenceClass::ExplicitLauncherOrHook.is_eligible_for_passive_calibration());
+        assert!(
+            AccountEvidenceClass::ExplicitProviderIdentity.is_eligible_for_passive_calibration()
+        );
+        assert!(
+            AccountEvidenceClass::ConfiguredCredentialMapping.is_eligible_for_passive_calibration()
+        );
+        assert!(
+            !AccountEvidenceClass::ConservativeTemporalInference
+                .is_eligible_for_passive_calibration()
+        );
+        assert!(!AccountEvidenceClass::Unattributed.is_eligible_for_passive_calibration());
+
+        // Test string parsing and display round-trip for all 5.
+        for &class in &classes {
+            let s = class.as_str();
+            assert_eq!(AccountEvidenceClass::parse(s), Some(class));
+            assert_eq!(s.parse::<AccountEvidenceClass>().unwrap(), class);
+            assert_eq!(class.to_string(), s);
+        }
+    }
+
+    #[test]
+    fn unvalidated_credential_source_mapping_falls_through_to_next_class() {
+        let valid_cred = marker_with_class(
+            "account-valid",
+            10,
+            None,
+            AccountEvidenceClass::ConfiguredCredentialMapping,
+            true,
+        );
+        assert_eq!(
+            valid_cred.effective_evidence_class(),
+            AccountEvidenceClass::ConfiguredCredentialMapping
+        );
+        assert_eq!(valid_cred.effective_evidence_class().rank(), 3);
+
+        let unvalidated_cred = marker_with_class(
+            "account-unvalidated",
+            10,
+            None,
+            AccountEvidenceClass::ConfiguredCredentialMapping,
+            false,
+        );
+        assert_eq!(
+            unvalidated_cred.effective_evidence_class(),
+            AccountEvidenceClass::ConservativeTemporalInference
+        );
+        assert_eq!(unvalidated_cred.effective_evidence_class().rank(), 4);
+
+        // When segmented alongside a validated mapping (Rank 3), the unvalidated mapping
+        // (effective Rank 4) loses to the validated one and is not used.
+        let inputs = AccountSegmentationInputs {
+            markers: vec![
+                marker_with_class(
+                    "account-unvalidated",
+                    10,
+                    None,
+                    AccountEvidenceClass::ConfiguredCredentialMapping,
+                    false,
+                ),
+                marker_with_class(
+                    "account-validated",
+                    20,
+                    None,
+                    AccountEvidenceClass::ConfiguredCredentialMapping,
+                    true,
+                ),
+            ],
+            usage: vec![event(25, 50)],
+        };
+        let result = segment(&inputs);
+        assert_eq!(result.account_usage("account-validated"), Some(tokens(50)));
+        assert_eq!(
+            result.account_evidence_class("account-validated"),
+            Some(AccountEvidenceClass::ConfiguredCredentialMapping)
+        );
+        assert_eq!(result.account_usage("account-unvalidated"), None);
+
+        // When only an unvalidated credential mapping is present, it falls through to
+        // ConservativeTemporalInference (Rank 4) and attributes as inferred.
+        let solo_unvalidated_inputs = AccountSegmentationInputs {
+            markers: vec![marker_with_class(
+                "account-unvalidated",
+                10,
+                None,
+                AccountEvidenceClass::ConfiguredCredentialMapping,
+                false,
+            )],
+            usage: vec![event(15, 30)],
+        };
+        let solo_result = segment(&solo_unvalidated_inputs);
+        assert_eq!(
+            solo_result.account_usage("account-unvalidated"),
+            Some(tokens(30))
+        );
+        assert_eq!(
+            solo_result.account_evidence_class("account-unvalidated"),
+            Some(AccountEvidenceClass::ConservativeTemporalInference)
+        );
+        assert!(
+            solo_result
+                .account_evidence_class("account-unvalidated")
+                .unwrap()
+                .is_inferred()
+        );
+    }
+
+    #[test]
+    fn explicit_marker_not_overwritten_by_later_inferred_marker() {
+        let inputs = AccountSegmentationInputs {
+            markers: vec![
+                marker_with_class(
+                    "account-explicit",
+                    10,
+                    None,
+                    AccountEvidenceClass::ExplicitLauncherOrHook,
+                    true,
+                ),
+                marker_with_class(
+                    "account-inferred",
+                    20,
+                    None,
+                    AccountEvidenceClass::ConservativeTemporalInference,
+                    true,
+                ),
+            ],
+            usage: vec![event(15, 100), event(25, 200)],
+        };
+        let result = segment(&inputs);
+        assert_eq!(result.account_usage("account-explicit"), Some(tokens(300)));
+        assert_eq!(
+            result.account_evidence_class("account-explicit"),
+            Some(AccountEvidenceClass::ExplicitLauncherOrHook)
+        );
+        assert_eq!(result.account_usage("account-inferred"), None);
+    }
+
+    #[test]
+    fn explicit_marker_not_overwritten_by_earlier_inferred_marker() {
+        let inputs = AccountSegmentationInputs {
+            markers: vec![
+                marker_with_class(
+                    "account-inferred",
+                    10,
+                    None,
+                    AccountEvidenceClass::ConservativeTemporalInference,
+                    true,
+                ),
+                marker_with_class(
+                    "account-explicit",
+                    20,
+                    None,
+                    AccountEvidenceClass::ExplicitLauncherOrHook,
+                    true,
+                ),
+            ],
+            usage: vec![event(25, 100)],
+        };
+        let result = segment(&inputs);
+        assert_eq!(result.account_usage("account-explicit"), Some(tokens(100)));
+        assert_eq!(
+            result.account_evidence_class("account-explicit"),
+            Some(AccountEvidenceClass::ExplicitLauncherOrHook)
+        );
+        assert_eq!(result.account_usage("account-inferred"), None);
+    }
+
+    #[test]
+    fn inferred_marker_cannot_overwrite_explicit_marker_regardless_of_arrival_order() {
+        // Arrival order 1: [explicit, inferred]
+        let inputs_order_1 = AccountSegmentationInputs {
+            markers: vec![
+                AccountMarkerBoundary::explicit("account-explicit", t(10), None),
+                AccountMarkerBoundary::inferred("account-inferred", t(20), None),
+            ],
+            usage: vec![event(15, 50), event(25, 50)],
+        };
+        let result_1 = segment(&inputs_order_1);
+        assert_eq!(
+            result_1.account_usage("account-explicit"),
+            Some(tokens(100))
+        );
+        assert_eq!(result_1.account_usage("account-inferred"), None);
+        assert_eq!(
+            result_1.account_evidence_class("account-explicit"),
+            Some(AccountEvidenceClass::ExplicitLauncherOrHook)
+        );
+
+        // Arrival order 2: [inferred, explicit]
+        let inputs_order_2 = AccountSegmentationInputs {
+            markers: vec![
+                AccountMarkerBoundary::inferred("account-inferred", t(20), None),
+                AccountMarkerBoundary::explicit("account-explicit", t(10), None),
+            ],
+            usage: vec![event(15, 50), event(25, 50)],
+        };
+        let result_2 = segment(&inputs_order_2);
+        assert_eq!(
+            result_2.account_usage("account-explicit"),
+            Some(tokens(100))
+        );
+        assert_eq!(result_2.account_usage("account-inferred"), None);
+        assert_eq!(
+            result_2.account_evidence_class("account-explicit"),
+            Some(AccountEvidenceClass::ExplicitLauncherOrHook)
         );
     }
 

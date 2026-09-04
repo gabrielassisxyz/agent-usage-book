@@ -70,6 +70,7 @@ impl MarkerSource {
 /// 1. Explicit session/account marker from launcher or hook
 /// 2. Explicit provider/account identity returned during that session
 /// 3. Configured credential-source identity with validated mapping
+/// 4. Conservative temporal inference
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum EvidenceDesignation {
     /// Explicit session/account marker from launcher or hook (Rank 1).
@@ -78,6 +79,8 @@ pub enum EvidenceDesignation {
     ExplicitProviderIdentity = 2,
     /// Configured credential-source identity with validated mapping (Rank 3).
     ConfiguredCredentialMapping = 3,
+    /// Conservative temporal inference (Rank 4).
+    ConservativeTemporalInference = 4,
 }
 
 impl EvidenceDesignation {
@@ -86,6 +89,7 @@ impl EvidenceDesignation {
             Self::ExplicitLauncherOrHook => "launcher_or_hook",
             Self::ExplicitProviderIdentity => "provider_identity",
             Self::ConfiguredCredentialMapping => "credential_mapping",
+            Self::ConservativeTemporalInference => "conservative_temporal_inference",
         }
     }
 }
@@ -101,12 +105,32 @@ impl FromStr for EvidenceDesignation {
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "launcher_or_hook" => Ok(Self::ExplicitLauncherOrHook),
-            "provider_identity" => Ok(Self::ExplicitProviderIdentity),
-            "credential_mapping" => Ok(Self::ConfiguredCredentialMapping),
+            "launcher_or_hook" | "explicit_launcher_or_hook" => Ok(Self::ExplicitLauncherOrHook),
+            "provider_identity" | "explicit_provider_identity" => {
+                Ok(Self::ExplicitProviderIdentity)
+            }
+            "credential_mapping" | "configured_credential_mapping" => {
+                Ok(Self::ConfiguredCredentialMapping)
+            }
+            "conservative_temporal_inference" | "temporal_inference" | "inferred" => {
+                Ok(Self::ConservativeTemporalInference)
+            }
             other => Err(Error::Store(format!(
                 "unknown evidence designation: '{other}'"
             ))),
+        }
+    }
+}
+
+impl From<EvidenceDesignation> for crate::attribution::AccountEvidenceClass {
+    fn from(designation: EvidenceDesignation) -> Self {
+        match designation {
+            EvidenceDesignation::ExplicitLauncherOrHook => Self::ExplicitLauncherOrHook,
+            EvidenceDesignation::ExplicitProviderIdentity => Self::ExplicitProviderIdentity,
+            EvidenceDesignation::ConfiguredCredentialMapping => Self::ConfiguredCredentialMapping,
+            EvidenceDesignation::ConservativeTemporalInference => {
+                Self::ConservativeTemporalInference
+            }
         }
     }
 }
