@@ -40,6 +40,7 @@ pub mod aliases;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::attribution::quality::AttributionQualityFloor;
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
 
@@ -212,6 +213,20 @@ pub struct CoverageConfig {
     pub measurement_floor: CoverageFloor,
 }
 
+/// The attribution-quality policy: the advisory floor for the attributed
+/// fraction and the recent window the metric is also computed over.
+#[derive(Debug, Clone)]
+pub struct AttributionConfig {
+    /// The advisory floor `doctor` flags a breach of. `None` until an operator
+    /// configures one (the value itself is decided by `aub-cab.7`): the metric
+    /// is still reported, just not judged.
+    pub quality_floor: Option<AttributionQualityFloor>,
+    /// The recent window the metric is computed over in addition to all
+    /// history, so a slow decline in attribution coverage is visible against a
+    /// lifetime average.
+    pub recent_window: MonotonicDuration,
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub review_after: MonotonicDuration,
@@ -257,6 +272,7 @@ pub struct Config {
     pub sampling: SamplingConfig,
     pub freshness: FreshnessConfig,
     pub coverage: CoverageConfig,
+    pub attribution: AttributionConfig,
     pub accounts: Vec<AccountConfig>,
     pub ingest: IngestConfig,
     pub transcripts: Vec<TranscriptConfig>,
@@ -279,6 +295,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "ingest",
     "freshness",
     "coverage",
+    "attribution",
     "accounts",
     "transcripts",
     "tracker",
@@ -299,6 +316,7 @@ const SAMPLING_KEYS: &[&str] = &[
 const INGEST_KEYS: &[&str] = &["max_batch_events"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
+const ATTRIBUTION_KEYS: &[&str] = &["quality_floor", "recent_window"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
@@ -363,6 +381,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("coverage").and_then(toml::Value::as_table) {
         check_keys(t, COVERAGE_KEYS, "coverage", file_display)?;
+    }
+    if let Some(t) = table.get("attribution").and_then(toml::Value::as_table) {
+        check_keys(t, ATTRIBUTION_KEYS, "attribution", file_display)?;
     }
     if let Some(t) = table.get("tracker").and_then(toml::Value::as_table) {
         check_keys(t, TRACKER_KEYS, "tracker", file_display)?;
@@ -552,6 +573,40 @@ fn resolve_floor(
         .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
 }
 
+/// An attribution-quality floor with no platform default: absent everywhere
+/// means `None`, and an operator opts in by setting it. Follows the same
+/// override, environment, file precedence as the other scalars, without the
+/// fourth (default) level.
+fn resolve_optional_floor(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    provenance: &mut Provenance,
+) -> Result<Option<AttributionQualityFloor>, Error> {
+    let raw = if let Some(v) = overrides.get(key) {
+        provenance.set(key, ConfigSource::Flag);
+        Some(v.to_string())
+    } else if let Some(v) = env.get(&env_var_name(key)) {
+        provenance.set(key, ConfigSource::Environment);
+        Some(v)
+    } else if let Some(v) = file_value {
+        provenance.set(key, ConfigSource::File);
+        Some(v)
+    } else {
+        None
+    };
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let value: f64 = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a number")))?;
+    AttributionQualityFloor::new(value)
+        .map(Some)
+        .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
+}
+
 /// A count a configuration file expresses as a bare positive integer. A value
 /// of zero would sample nothing while reporting a completed batch, so it is
 /// refused at resolution time rather than discovered at sampling time.
@@ -736,6 +791,25 @@ pub fn resolve(
         )?,
     };
 
+    let attribution = AttributionConfig {
+        quality_floor: resolve_optional_floor(
+            "attribution.quality_floor",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "attribution", "quality_floor"),
+            &mut provenance,
+        )?,
+        recent_window: resolve_duration(
+            "attribution.recent_window",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "attribution", "recent_window"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let backup = BackupConfig {
         review_after: resolve_duration(
             "backup.review_after",
@@ -878,6 +952,7 @@ pub fn resolve(
             ingest,
             freshness,
             coverage,
+            attribution,
             accounts,
             transcripts,
             tracker,
@@ -1226,5 +1301,50 @@ credential = { kind = "unknown-future-kind", anything = "goes" }
         let file = "[coverage]\nattempt_floor = 0.9\n";
         let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
         assert_eq!(config.coverage.attempt_floor.get(), 0.9);
+    }
+
+    #[test]
+    fn the_attribution_quality_floor_is_absent_by_default_and_set_from_the_file() {
+        let (default_config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(
+            default_config.attribution.quality_floor.is_none(),
+            "no floor until an operator configures one"
+        );
+        assert!(provenance.get("attribution.quality_floor").is_none());
+        // The window still has a default and is provenance-tracked.
+        assert_eq!(
+            provenance.get("attribution.recent_window"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "[attribution]\nquality_floor = 0.8\nrecent_window = \"14d\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.attribution.quality_floor.map(|f| f.ppm()),
+            Some(800_000)
+        );
+        assert_eq!(
+            provenance.get("attribution.quality_floor"),
+            Some(ConfigSource::File)
+        );
+        assert_eq!(
+            config.attribution.recent_window,
+            MonotonicDuration::from_seconds(14 * 86_400)
+        );
+    }
+
+    #[test]
+    fn an_attribution_quality_floor_out_of_range_is_a_usage_error() {
+        let file = "[attribution]\nquality_floor = 1.4\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn an_unknown_key_under_attribution_is_a_usage_error() {
+        let file = "[attribution]\nnope = 1\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("attribution.nope"), "{err}");
     }
 }

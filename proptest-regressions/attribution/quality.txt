@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc c1604bc2424a5b1d9a3c783d6e58f9b3a9a28594d9f30752ce0cc793c4307f66 # shrinks to marker_times = [], usage_specs = [(0, 1, 0)]
