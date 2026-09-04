@@ -745,6 +745,21 @@ impl SharePpm {
     }
 }
 
+/// What `aub task ingest` did to the durable event history, as the renderer
+/// sees it.
+///
+/// Separate from `store::task_event`'s own [`IngestSummary`](crate::store::task_event::IngestSummary)
+/// of the same name, and deliberately so: the store owns what happened against the
+/// tracker connection, this owns what is reported, and presentation may only see
+/// the second. [`IngestReport`] carries the same split for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskIngestReport {
+    pub events_inserted: u64,
+    pub events_already_present: u64,
+    pub quarantines_inserted: u64,
+    pub quarantines_already_present: u64,
+}
+
 /// One session's contribution to a task's total usage, for `aub task
 /// report`'s session listing. `run` is the session's own run identifier,
 /// retained where the session carries one so `aub` can emit it for the
@@ -1592,12 +1607,19 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 7] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 8] = [
         (
             "IngestSummary",
             "*",
             "operational counters describing what the ingestion run did, not \
              measurements it reports; they exist to say the report is incomplete",
+        ),
+        (
+            "TaskIngestReport",
+            "*",
+            "operational counters describing what the tracker-event ingestion run \
+             did, not measurements it reports; they exist to say the report is \
+             incomplete",
         ),
         (
             "SpendGroup",
@@ -1781,7 +1803,7 @@ mod tests {
     /// decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 7);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 8);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),

@@ -20,7 +20,8 @@ pub use models::{
     MeterReadingProvenance, NowReport, ProjectionReadState, ReportMetadata, SampleAttempt,
     SampleReport, SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
     SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport, StatusReport,
-    TaskIdentityRow, TaskOverheadBucket, TaskOverheadReport, TaskReport, TaskSessionUsage,
+    TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
+    TaskSessionUsage,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

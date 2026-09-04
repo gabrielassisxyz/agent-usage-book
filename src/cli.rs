@@ -3557,6 +3557,19 @@ fn task_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Re
     }
 }
 
+/// Carries the store's tracker-ingest summary across the presentation boundary as
+/// a report model, which is the only shape a renderer is allowed to see.
+fn task_ingest_report(
+    summary: &crate::store::task_event::IngestSummary,
+) -> crate::report::TaskIngestReport {
+    crate::report::TaskIngestReport {
+        events_inserted: summary.events_inserted,
+        events_already_present: summary.events_already_present,
+        quarantines_inserted: summary.quarantines_inserted,
+        quarantines_already_present: summary.quarantines_already_present,
+    }
+}
+
 /// `aub task ingest`: runs the Beads tracker adapter and reports events
 /// ingested, quarantined and unchanged. The tracker database is opened
 /// read-only and is never written to: `aub` reads task-claim history, it
@@ -3625,7 +3638,11 @@ fn task_ingest_command(
             );
             println!(
                 "{}",
-                crate::presentation::json::task_ingest_json(&summary, run, metadata)
+                crate::presentation::json::task_ingest_json(
+                    &task_ingest_report(&summary),
+                    run,
+                    metadata,
+                )
             );
         }
     }

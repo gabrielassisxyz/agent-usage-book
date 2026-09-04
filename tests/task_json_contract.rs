@@ -22,9 +22,8 @@ use agent_usage_book::presentation::render::ExplainMode;
 use agent_usage_book::report::provenance::{ProvenanceNode, ValueArithmetic};
 use agent_usage_book::report::{
     IngestionGeneration, LedgerGeneration, ReportMetadata, SharePpm, TaskIdentityRow,
-    TaskOverheadBucket, TaskOverheadReport, TaskReport, TaskSessionUsage,
+    TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport, TaskSessionUsage,
 };
-use agent_usage_book::store::task_event::IngestSummary;
 
 fn run() -> RunId {
     RunId::new(UtcTimestamp::from_unix_nanos(2_000))
@@ -254,7 +253,7 @@ fn an_unexpected_key_is_refused() {
 /// rendering does, and validates.
 #[test]
 fn task_ingest_document_validates() {
-    let summary = IngestSummary {
+    let summary = TaskIngestReport {
         events_inserted: 3,
         events_already_present: 1,
         quarantines_inserted: 1,

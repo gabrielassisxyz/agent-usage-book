@@ -12,8 +12,9 @@ use crate::attribution::{
     normalize_tracker_event,
 };
 use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
-use crate::domain::time::UtcTimestamp;
+use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::error::Error;
+use crate::store::connection::{self, AccessMode, PragmaPolicy};
 
 /// A Beads `events` table reader. It receives an already-open connection and only
 /// exposes the read-only [`TrackerEventReader`] interface to callers.
@@ -107,16 +108,22 @@ pub fn ingest<R: TrackerEventReader>(
 /// Opens the tracker's own SQLite database read-only, for wrapping in
 /// [`BeadsEventReader`].
 ///
-/// Unlike [`crate::store::connection::open`], this applies no pragma policy:
-/// that policy verifies journal mode, synchronous level and foreign-key
-/// enforcement this project's own ledger is built to hold, and the tracker
-/// database belongs to a different project entirely. Enforcing `aub`'s
-/// pragma policy against a schema and file it does not own would refuse a
-/// healthy tracker database for disagreeing with settings it was never asked
-/// to hold.
+/// Routed through [`connection::open`] with [`AccessMode::ForeignReadOnly`], which
+/// applies no pragma policy: that policy verifies journal mode, synchronous level
+/// and foreign-key enforcement this project's own ledger is built to hold, and the
+/// tracker database belongs to a different project entirely. Enforcing `aub`'s
+/// pragma policy against a schema and file it does not own would refuse a healthy
+/// tracker database for disagreeing with settings it was never asked to hold. The
+/// busy timeout below is unused for this mode; it exists only because `open`
+/// takes one policy value for every mode.
 pub fn open_tracker_database(path: &std::path::Path) -> Result<rusqlite::Connection, Error> {
-    rusqlite::Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
-        .map_err(|error| Error::Store(format!("cannot open tracker database {path:?}: {error}")))
+    connection::open(
+        path,
+        AccessMode::ForeignReadOnly,
+        &PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_seconds(0),
+        },
+    )
 }
 
 /// Reads every durably ingested claim/release boundary, tracker-wide and
@@ -412,10 +419,16 @@ mod tests {
     fn open_tracker_database_opens_read_only_and_refuses_a_missing_file() {
         let scratch = ScratchDir::new();
         let path = scratch.path().join("beads.db");
-        rusqlite::Connection::open(&path)
-            .unwrap()
-            .execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY);")
-            .unwrap();
+        open(
+            &path,
+            AccessMode::ReadWrite,
+            &PragmaPolicy {
+                busy_timeout: MonotonicDuration::from_millis(1_000),
+            },
+        )
+        .unwrap()
+        .execute_batch("CREATE TABLE probe (id INTEGER PRIMARY KEY);")
+        .unwrap();
 
         let conn = open_tracker_database(&path).unwrap();
         let count: i64 = conn

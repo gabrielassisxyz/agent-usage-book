@@ -25,9 +25,8 @@ use crate::presentation::render::{CREDIT_UNIT, ExplainMode, render_credits_amoun
 use crate::problem_code::ProblemCode;
 use crate::report::{
     CoverageReport, LedgerGeneration, NowReport, ProvenanceGraph, ReportMetadata, SpendReport,
-    StatusReport, TaskOverheadReport, TaskReport,
+    StatusReport, TaskIdentityRow, TaskIngestReport, TaskOverheadReport, TaskReport,
 };
-use crate::store::task_event::IngestSummary as TaskIngestSummary;
 use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
@@ -885,7 +884,7 @@ fn usage_vector_json(usage: &crate::domain::tokens::UsageVector) -> String {
 
 /// One task's resolved kind identity, or `null` when the tracker never
 /// supplied kind-asserting evidence for the task at all.
-fn task_kind_json(task_kind: &Option<crate::store::task_identity::TaskIdentityRow>) -> String {
+fn task_kind_json(task_kind: &Option<TaskIdentityRow>) -> String {
     match task_kind {
         None => "null".to_string(),
         Some(row) => {
@@ -1124,7 +1123,7 @@ pub fn validate_task_overhead_json(json_str: &str) -> Result<ParsedEnvelope, Jso
 /// The task ingest summary under the envelope: events ingested, quarantined
 /// and unchanged.
 pub fn task_ingest_json(
-    summary: &TaskIngestSummary,
+    summary: &TaskIngestReport,
     run: RunId,
     metadata: ReportMetadata,
 ) -> String {
