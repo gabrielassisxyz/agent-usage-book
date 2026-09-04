@@ -130,6 +130,20 @@ destination given on the command line, because a drill that damages the thing it
 to prove recoverable has proved the opposite. It also refuses `--account` and `--model`: a
 drill exercises the whole state directory, not one slice of it.
 
+## `aub compare`
+
+**Answers:** does the adapter's stored reading of one window agree with what the
+provider's own authoritative surface showed for it?
+
+**Refuses:** to accept a verdict from the caller. `compare record` always computes the
+verdict from the stored adapter reading, the surface value and the documented
+granularity given on the command line, through the same function the validation
+procedure (`docs/adapter-semantics-validation.md`) describes; there is no flag that
+sets agreement or mismatch directly. It also refuses to write a second comparison for
+a window that already carries one, naming the existing record instead of overwriting
+it, and refuses `--format`, `--explain`, `--account` and `--model`: a comparison is
+scoped by observation and window, not by any of those dimensions.
+
 ## `aub ingest`
 
 **Answers:** have the transcript-derived tables been refreshed from the

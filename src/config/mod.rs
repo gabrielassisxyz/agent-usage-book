@@ -23,9 +23,9 @@
 //! using exactly the four labels above: `flag`, `environment`, `file`, `default`.
 //!
 //! Scope, stated rather than left implicit: the four scalar sections (`state`,
-//! `sampling`, `freshness`, `coverage`) plus `backup.review_after` and `drill.max_age`
-//! go through the full four-level order and are individually provenance-tracked, since
-//! those are the keys
+//! `sampling`, `freshness`, `coverage`) plus `backup.review_after`, `drill.max_age`
+//! and `adapter_semantics.max_comparison_age` go through the full four-level order
+//! and are individually provenance-tracked, since those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
 //! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
@@ -252,6 +252,19 @@ pub struct DrillConfig {
     pub result: Option<PathBuf>,
 }
 
+/// The review policy for the adapter-semantics comparison log (`aub-eun.12`,
+/// docs/adapter-semantics-validation.md), the same shape as [`BackupConfig`]
+/// and [`DrillConfig`] and for the same reason: `doctor` needs a configured
+/// threshold to turn the age of the newest recorded comparison into a
+/// pass/fail verdict. Unlike backup and drill there is no destination path
+/// here: the comparison log lives in the ledger itself
+/// (`store::adapter_semantics_validation::latest_comparison_read_at`), so
+/// there is nowhere else it could be configured to.
+#[derive(Debug, Clone)]
+pub struct AdapterSemanticsConfig {
+    pub max_comparison_age: MonotonicDuration,
+}
+
 /// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
 /// of the file's `credential` table (`kind`, plus its `ref` or `path`): the typed,
 /// validated credential model belongs to `aub-eun.1`, which consumes this section.
@@ -317,6 +330,7 @@ pub struct Config {
     pub valuation: ValuationConfig,
     pub backup: BackupConfig,
     pub drill: DrillConfig,
+    pub adapter_semantics: AdapterSemanticsConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
@@ -341,6 +355,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "valuation",
     "backup",
     "drill",
+    "adapter_semantics",
     "projects",
     "repositories",
 ];
@@ -366,6 +381,7 @@ const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
+const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -441,6 +457,12 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("drill").and_then(toml::Value::as_table) {
         check_keys(t, DRILL_KEYS, "drill", file_display)?;
+    }
+    if let Some(t) = table
+        .get("adapter_semantics")
+        .and_then(toml::Value::as_table)
+    {
+        check_keys(t, ADAPTER_SEMANTICS_KEYS, "adapter_semantics", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -925,6 +947,18 @@ pub fn resolve(
         result: drill_result,
     };
 
+    let adapter_semantics = AdapterSemanticsConfig {
+        max_comparison_age: resolve_duration(
+            "adapter_semantics.max_comparison_age",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "adapter_semantics", "max_comparison_age"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let valuation = ValuationConfig {
         default_rate_book: file
             .as_ref()
@@ -1063,6 +1097,7 @@ pub fn resolve(
             valuation,
             backup,
             drill,
+            adapter_semantics,
             projects,
             repositories,
         },

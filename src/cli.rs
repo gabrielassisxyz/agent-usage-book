@@ -84,6 +84,7 @@ aub_command_enum! {
     ClearDiagnostics,
     Drill,
     Task,
+    Compare,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -112,7 +113,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 23] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -135,6 +136,7 @@ impl Command {
         Self::ClearDiagnostics,
         Self::Drill,
         Self::Task,
+        Self::Compare,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -505,6 +507,24 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Compare => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "compare prints one operational result",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "compare derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "a comparison is scoped by observation and window, not by account",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "a comparison is scoped by window, not by model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "compare prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -534,6 +554,7 @@ impl Command {
             Command::ClearDiagnostics => "clear-diagnostics",
             Command::Drill => "drill",
             Command::Task => "task",
+            Command::Compare => "compare",
         }
     }
 
@@ -585,6 +606,9 @@ impl Command {
             Command::Task => Some(
                 "ingest issue-tracker task-claim events and report per-task usage and overhead",
             ),
+            Command::Compare => Some(
+                "record and inspect adapter-semantics comparisons against the provider's authoritative surface",
+            ),
         }
     }
 
@@ -627,6 +651,9 @@ impl Command {
             ),
             Command::Task => Some(
                 "which task or named overhead bucket consumed this usage, by temporal segmentation of the issue tracker's claim history?",
+            ),
+            Command::Compare => Some(
+                "does the adapter's stored reading of one window agree with what the provider's own authoritative surface showed for it?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -694,6 +721,9 @@ impl Command {
             ),
             Command::Task => Some(
                 "ingest | report TASK-ID | overhead [--today (default) | --since YYYY-MM-DD | --days N]",
+            ),
+            Command::Compare => Some(
+                "record OBSERVATION_ID WINDOW --surface NAME --surface-used PPM --granularity PPM [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Status
             | Command::LoggingFixture
@@ -1014,6 +1044,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Command::Drill => drill_command(&RealClock::new(), &invocation),
         Command::Task => task_command(&RealClock::new(), level, &invocation),
+        Command::Compare => compare_command(&RealClock::new(), &invocation),
     }
 }
 
@@ -3844,6 +3875,326 @@ fn render_drill_report(report: &crate::drill::DrillReport) {
         println!("drill: projection_deterministic={deterministic}");
     }
     println!("drill: passed={}", report.passed());
+}
+
+/// One request to record a comparison through `aub compare record`: the
+/// observation and window it compares, the value read from the
+/// authoritative surface, that surface's name and documented granularity,
+/// when it was read, and an optional override for the detail recorded on a
+/// mismatch annotation.
+///
+/// `authoritative_surface` and `documented_granularity` are explicit inputs
+/// rather than looked up from a per-adapter table because no such table
+/// exists in code: `docs/adapter-semantics-validation.md`'s own table is the
+/// only place a surface's documented granularity is recorded, by design (the
+/// domain layer may not depend on provider semantics), so the operator reads
+/// it from that table the same way the procedure's own step 4 describes.
+#[derive(Debug, Clone)]
+pub struct AdapterSemanticsComparisonRequest {
+    pub observation_id: crate::store::meter_evidence::ObservationRowId,
+    pub semantic_key: crate::domain::window::WindowSemanticKey,
+    pub authoritative_surface: String,
+    pub surface_quota_used: crate::domain::quota::QuotaUsed,
+    pub documented_granularity: crate::domain::authoritative_comparison::DocumentedGranularity,
+    pub read_at: UtcTimestamp,
+    pub detail: Option<String>,
+}
+
+/// What recording one comparison produced: the verdict, the stored
+/// comparison's row id, the adapter's own stored reading the verdict was
+/// computed from, and the mismatch annotation's row id when the verdict
+/// opened one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdapterSemanticsComparisonOutcome {
+    pub comparison_id: crate::store::adapter_semantics_validation::ComparisonRowId,
+    pub verdict: crate::domain::authoritative_comparison::AuthoritativeComparisonVerdict,
+    pub adapter_quota_used: crate::domain::quota::QuotaUsed,
+    pub mismatch_annotation_id: Option<crate::store::adapter_semantics_validation::AnnotationRowId>,
+}
+
+/// Records one comparison for `request.observation_id`'s window named
+/// `request.semantic_key`, the mechanism `docs/adapter-semantics-validation.md`
+/// describes and `aub-eun.12` built: resolves the window and the adapter's
+/// own stored reading from
+/// [`crate::store::meter_evidence::windows_by_observation`], computes the
+/// verdict with
+/// [`crate::domain::authoritative_comparison::compare_against_authoritative_surface`]
+/// rather than accepting one from the caller, records it through
+/// [`crate::store::adapter_semantics_validation::insert_comparison`], and
+/// opens a mismatch annotation through
+/// [`crate::store::adapter_semantics_validation::insert_annotation`] when the
+/// verdict is
+/// [`crate::domain::authoritative_comparison::AuthoritativeComparisonVerdict::UnresolvedMismatch`].
+///
+/// Refuses a window that already carries a comparison for this observation,
+/// naming the existing one: a comparison is corrected by recording another
+/// one, never by writing a second record over the first.
+pub fn record_adapter_semantics_comparison(
+    conn: &rusqlite::Connection,
+    request: &AdapterSemanticsComparisonRequest,
+) -> Result<AdapterSemanticsComparisonOutcome, Error> {
+    use crate::domain::authoritative_comparison::{
+        AuthoritativeComparisonVerdict, compare_against_authoritative_surface,
+    };
+    use crate::store::adapter_semantics_validation::{
+        AnnotationKind, NewAdapterSemanticsAnnotation, NewAuthoritativeSurfaceComparison,
+        comparisons_for_observation, insert_annotation, insert_comparison,
+    };
+    use crate::store::meter_evidence::windows_by_observation;
+
+    let windows = windows_by_observation(conn, request.observation_id)?;
+    let window = windows
+        .iter()
+        .find(|w| w.semantic_key == request.semantic_key)
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "observation {} has no window named {:?}; see `aub compare uncompared {}`",
+                request.observation_id.value(),
+                request.semantic_key.as_str(),
+                request.observation_id.value(),
+            ))
+        })?;
+
+    let existing = comparisons_for_observation(conn, request.observation_id)?;
+    if let Some(prior) = existing.iter().find(|c| c.window_id == window.row_id) {
+        return Err(Error::Usage(format!(
+            "observation {} window {:?} already carries comparison #{} (verdict {}); a wrong \
+             comparison is corrected by recording another one, never by overwriting it",
+            request.observation_id.value(),
+            request.semantic_key.as_str(),
+            prior.row_id.value(),
+            prior.verdict.as_str(),
+        )));
+    }
+
+    let verdict = compare_against_authoritative_surface(
+        window.quota_used,
+        request.surface_quota_used,
+        request.documented_granularity,
+    );
+
+    let comparison_id = insert_comparison(
+        conn,
+        &NewAuthoritativeSurfaceComparison {
+            observation_id: request.observation_id,
+            window_id: window.row_id,
+            semantic_key: request.semantic_key.clone(),
+            authoritative_surface: request.authoritative_surface.clone(),
+            documented_granularity: request.documented_granularity,
+            adapter_quota_used: window.quota_used,
+            authoritative_quota_used: request.surface_quota_used,
+            read_at: request.read_at,
+            verdict,
+        },
+    )?;
+
+    let mismatch_annotation_id = if verdict == AuthoritativeComparisonVerdict::UnresolvedMismatch {
+        let detail = request.detail.clone().unwrap_or_else(|| {
+            format!(
+                "recorded through `aub compare`: adapter read {} ppm, {} read {} ppm for window \
+                 {:?} of observation {}",
+                window.quota_used.as_ppm().get(),
+                request.authoritative_surface,
+                request.surface_quota_used.as_ppm().get(),
+                request.semantic_key.as_str(),
+                request.observation_id.value(),
+            )
+        });
+        Some(insert_annotation(
+            conn,
+            &NewAdapterSemanticsAnnotation {
+                kind: AnnotationKind::Mismatch,
+                comparison_id,
+                observation_id: request.observation_id,
+                semantic_key: request.semantic_key.clone(),
+                adapter_quota_used: window.quota_used,
+                authoritative_quota_used: request.surface_quota_used,
+                corrects: None,
+                detail,
+                created_at: request.read_at,
+            },
+        )?)
+    } else {
+        None
+    };
+
+    Ok(AdapterSemanticsComparisonOutcome {
+        comparison_id,
+        verdict,
+        adapter_quota_used: window.quota_used,
+        mismatch_annotation_id,
+    })
+}
+
+/// `aub compare`: record an adapter-semantics comparison through the release
+/// binary, or list the windows of an observation that still need one.
+/// docs/adapter-semantics-validation.md is the procedure this command
+/// automates the bookkeeping half of.
+fn compare_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let subcommand = invocation.rest.first().map(String::as_str);
+    match subcommand {
+        Some("record") => compare_record_command(clock, invocation),
+        Some("uncompared") => compare_uncompared_command(clock, invocation),
+        other => Err(Error::Usage(format!(
+            "compare requires a subcommand (record | uncompared), got {other:?}"
+        ))),
+    }
+}
+
+fn compare_next_arg(args: &mut std::slice::Iter<String>, flag: &str) -> Result<String, Error> {
+    args.next()
+        .cloned()
+        .ok_or_else(|| Error::Usage(format!("{flag} requires a value")))
+}
+
+fn compare_parse_ppm_arg(
+    args: &mut std::slice::Iter<String>,
+    flag: &str,
+) -> Result<crate::domain::quota::QuotaFractionPpm, Error> {
+    let raw = compare_next_arg(args, flag)?;
+    let value: i32 = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{flag} must be an integer, got {raw:?}")))?;
+    crate::domain::quota::QuotaFractionPpm::new(value).ok_or_else(|| {
+        Error::Usage(format!(
+            "{flag} must be 0..=1000000 parts per million, got {value}"
+        ))
+    })
+}
+
+/// `aub compare record OBSERVATION_ID WINDOW --surface NAME --surface-used PPM
+/// --granularity PPM [--read-at RFC3339] [--detail TEXT]`.
+fn compare_record_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let rest = &invocation.rest;
+    let usage = "compare record requires OBSERVATION_ID WINDOW --surface NAME --surface-used \
+                 PPM --granularity PPM [--read-at RFC3339] [--detail TEXT]";
+    let observation_arg = rest.get(1).ok_or_else(|| Error::Usage(usage.into()))?;
+    let window_arg = rest.get(2).ok_or_else(|| Error::Usage(usage.into()))?;
+    let observation_id_value: i64 = observation_arg.parse().map_err(|_| {
+        Error::Usage(format!(
+            "compare record: OBSERVATION_ID must be an integer, got {observation_arg:?}"
+        ))
+    })?;
+    let observation_id = crate::store::meter_evidence::ObservationRowId::new(observation_id_value);
+    let semantic_key = crate::domain::window::WindowSemanticKey::new(window_arg.clone());
+
+    let mut surface: Option<String> = None;
+    let mut surface_used_ppm: Option<crate::domain::quota::QuotaFractionPpm> = None;
+    let mut granularity_ppm: Option<crate::domain::quota::QuotaFractionPpm> = None;
+    let mut read_at: Option<UtcTimestamp> = None;
+    let mut detail: Option<String> = None;
+
+    let mut args = rest[3..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--surface" => surface = Some(compare_next_arg(&mut args, "--surface")?),
+            "--surface-used" => {
+                surface_used_ppm = Some(compare_parse_ppm_arg(&mut args, "--surface-used")?)
+            }
+            "--granularity" => {
+                granularity_ppm = Some(compare_parse_ppm_arg(&mut args, "--granularity")?)
+            }
+            "--read-at" => {
+                let raw = compare_next_arg(&mut args, "--read-at")?;
+                read_at = Some(UtcTimestamp::parse_rfc3339(&raw).ok_or_else(|| {
+                    Error::Usage(format!("--read-at must be RFC3339, got {raw:?}"))
+                })?);
+            }
+            "--detail" => detail = Some(compare_next_arg(&mut args, "--detail")?),
+            other => {
+                return Err(Error::Usage(format!(
+                    "compare record: unknown argument {other}"
+                )));
+            }
+        }
+    }
+
+    let surface =
+        surface.ok_or_else(|| Error::Usage("compare record requires --surface NAME".into()))?;
+    let surface_used_ppm = surface_used_ppm
+        .ok_or_else(|| Error::Usage("compare record requires --surface-used PPM".into()))?;
+    let granularity_ppm = granularity_ppm
+        .ok_or_else(|| Error::Usage("compare record requires --granularity PPM".into()))?;
+    let read_at = read_at.unwrap_or_else(|| clock.now());
+
+    let request = AdapterSemanticsComparisonRequest {
+        observation_id,
+        semantic_key: semantic_key.clone(),
+        authoritative_surface: surface,
+        surface_quota_used: crate::domain::quota::QuotaUsed::new(surface_used_ppm),
+        documented_granularity: crate::domain::authoritative_comparison::DocumentedGranularity::new(
+            granularity_ppm,
+        ),
+        read_at,
+        detail,
+    };
+
+    let conn = open_ledger(clock)?;
+    let outcome = record_adapter_semantics_comparison(&conn, &request)?;
+
+    println!(
+        "compare: recorded observation={} window={} comparison=#{} adapter_used_ppm={} \
+         surface_used_ppm={} verdict={}",
+        observation_id.value(),
+        semantic_key.as_str(),
+        outcome.comparison_id.value(),
+        outcome.adapter_quota_used.as_ppm().get(),
+        surface_used_ppm.get(),
+        outcome.verdict.as_str(),
+    );
+    if let Some(annotation_id) = outcome.mismatch_annotation_id {
+        println!(
+            "compare: unresolved mismatch opened as finding annotation=#{}",
+            annotation_id.value()
+        );
+    }
+    Ok(())
+}
+
+/// `aub compare uncompared OBSERVATION_ID`: the windows of one observation
+/// `store::adapter_semantics_validation::uncompared_window_ids` says still
+/// lack a comparison, named by their semantic key rather than left as bare
+/// row ids the operator cannot act on.
+fn compare_uncompared_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let rest = &invocation.rest;
+    let observation_arg = rest
+        .get(1)
+        .ok_or_else(|| Error::Usage("compare uncompared requires OBSERVATION_ID".into()))?;
+    if let Some(extra) = rest.get(2) {
+        return Err(Error::Usage(format!("unknown argument: {extra}")));
+    }
+    let observation_id_value: i64 = observation_arg.parse().map_err(|_| {
+        Error::Usage(format!(
+            "compare uncompared: OBSERVATION_ID must be an integer, got {observation_arg:?}"
+        ))
+    })?;
+    let observation_id = crate::store::meter_evidence::ObservationRowId::new(observation_id_value);
+
+    let conn = open_ledger(clock)?;
+    let windows = crate::store::meter_evidence::windows_by_observation(&conn, observation_id)?;
+    let uncompared_ids: std::collections::HashSet<_> =
+        crate::store::adapter_semantics_validation::uncompared_window_ids(&conn, observation_id)?
+            .into_iter()
+            .collect();
+    let uncompared: Vec<_> = windows
+        .iter()
+        .filter(|w| uncompared_ids.contains(&w.row_id))
+        .collect();
+    if uncompared.is_empty() {
+        println!(
+            "compare: observation {} has no uncompared windows",
+            observation_id.value()
+        );
+    } else {
+        for window in uncompared {
+            println!(
+                "compare: observation={} uncompared window={}",
+                observation_id.value(),
+                window.semantic_key.as_str()
+            );
+        }
+    }
+    Ok(())
 }
 
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in

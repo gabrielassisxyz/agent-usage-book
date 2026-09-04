@@ -20,6 +20,7 @@ commands:
   clear-diagnostics clear retained diagnostic provider bodies
   drill    damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive
   task     ingest issue-tracker task-claim events and report per-task usage and overhead
+  compare  record and inspect adapter-semantics comparisons against the provider's authoritative surface
 
 status:
   answers: how much quota does each configured account have left?
@@ -113,5 +114,11 @@ task:
   refuses: --account (task attribution has no account dimension); --model (task attribution has no model dimension); --no-color (task prints no color)
   format: text | json
   options: ingest | report TASK-ID | overhead [--today (default) | --since YYYY-MM-DD | --days N]
+
+compare:
+  answers: does the adapter's stored reading of one window agree with what the provider's own authoritative surface showed for it?
+  refuses: --format (compare prints one operational result); --explain (compare derives no quantity); --account (a comparison is scoped by observation and window, not by account); --model (a comparison is scoped by window, not by model); --no-color (compare prints no color)
+  format: text only: compare prints one operational result
+  options: record OBSERVATION_ID WINDOW --surface NAME --surface-used PPM --granularity PPM [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID
 
 aub            prints the version; aub --help prints this

@@ -80,6 +80,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         clock_skew(ctx),
         local_filesystem_and_wal_suitability(ctx),
         accumulated_diagnostic_material(ctx),
+        adapter_semantics_comparison_age(ctx),
     ]
 }
 
@@ -133,6 +134,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::ClockSkew => "doctor",
         CheckName::LocalFilesystemAndWalSuitability => "store::startup",
         CheckName::AccumulatedDiagnosticMaterial => "store::retention",
+        CheckName::AdapterSemanticsComparisonAge => "store::adapter_semantics_validation",
     }
 }
 
@@ -177,6 +179,10 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::AccumulatedDiagnosticMaterial => {
             "retained diagnostic capture material does not accumulate unnoticed"
+        }
+        CheckName::AdapterSemanticsComparisonAge => {
+            "the newest adapter-semantics comparison against the provider's authoritative \
+             surface is within its configured review horizon"
         }
     }
 }
@@ -716,6 +722,61 @@ fn backup_age(ctx: &DoctorContext) -> CheckOutcome {
         }
     };
     outcome(CheckName::BackupAge, status)
+}
+
+/// The age of the newest recorded adapter-semantics comparison
+/// (`store::adapter_semantics_validation::latest_comparison_read_at`), the
+/// bookkeeping half of docs/adapter-semantics-validation.md. No comparison
+/// ever recorded is [`CheckStatus::NotApplicable`] rather than a failure: the
+/// procedure is manual and recurring, and a fresh ledger has not had a chance
+/// to run it yet. Once one exists, its age is judged against
+/// `adapter_semantics.max_comparison_age`, the same review-horizon shape
+/// [`backup_age`] uses for `backup.review_after` and `drill.max_age`.
+fn adapter_semantics_comparison_age(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => {
+                match crate::store::adapter_semantics_validation::latest_comparison_read_at(conn) {
+                    Err(error) => CheckStatus::Fail(format!(
+                        "cannot read the latest adapter-semantics comparison: {error}"
+                    )),
+                    Ok(None) => CheckStatus::NotApplicable(
+                        "no adapter-semantics comparison has been recorded yet; see \
+                         docs/adapter-semantics-validation.md"
+                            .to_string(),
+                    ),
+                    Ok(Some(read_at)) => {
+                        let age_nanos = ctx
+                            .timestamp
+                            .unix_nanos()
+                            .saturating_sub(read_at.unix_nanos())
+                            .max(0) as u64;
+                        let max_age_nanos =
+                            ctx.config.adapter_semantics.max_comparison_age.as_nanos();
+                        if age_nanos > max_age_nanos {
+                            CheckStatus::Fail(format!(
+                                "the last adapter-semantics comparison is {}s old, past its \
+                                 {}s review horizon",
+                                age_nanos / 1_000_000_000,
+                                max_age_nanos / 1_000_000_000,
+                            ))
+                        } else {
+                            CheckStatus::PassWithDetail(format!(
+                                "the last adapter-semantics comparison is {}s old",
+                                age_nanos / 1_000_000_000,
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    };
+    outcome(CheckName::AdapterSemanticsComparisonAge, status)
 }
 
 /// The most recent window a recent attempt's provider timestamp was checked
@@ -1303,5 +1364,260 @@ mod tests {
         ctx.db = Some(&conn);
         let outcome = projection_versus_database_generation(&ctx);
         assert!(matches!(outcome.status, CheckStatus::NotApplicable(_)));
+    }
+
+    fn test_config_with_max_comparison_age(state_dir: &std::path::Path, max_age: &str) -> Config {
+        let env = RealEnv;
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[adapter_semantics]\nmax_comparison_age = {:?}\n",
+            state_dir, max_age
+        );
+        let (config, _) =
+            resolve(&Overrides::new(), &env, Some(&toml), "aub.toml").expect("config must resolve");
+        config
+    }
+
+    /// A migrated ledger with one observation and one account-wide `five_hour`
+    /// window, ready for a comparison to be inserted directly against it.
+    /// Mirrors the fixture in `store::adapter_semantics_validation`'s own
+    /// tests; duplicated here rather than shared because each test module
+    /// keeps its own fixture in this codebase.
+    fn seeded_observation_with_window(
+        conn: &rusqlite::Connection,
+    ) -> (
+        crate::store::meter_evidence::ObservationRowId,
+        crate::store::meter_evidence::WindowRowId,
+    ) {
+        use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::time::{MeasurementBasis, MonotonicDuration};
+        use crate::domain::window::{
+            NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
+            WindowSemanticKey,
+        };
+        use crate::store::account::observe_account;
+        use crate::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
+        use crate::store::meter_evidence::{
+            NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
+            insert_response_evidence, insert_window,
+        };
+        use crate::store::sample_run::{Trigger, start_sample_run};
+        use crate::store::sampling_policy_snapshot::{
+            ResolvedSamplingPolicy, resolve_policy_snapshot,
+        };
+
+        const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_millis(300_000),
+            freshness_horizon: MonotonicDuration::from_millis(900_000),
+            reset_edge_policy: String::new(),
+            retry_backoff_policy: String::new(),
+            command_budget: MonotonicDuration::from_millis(60_000),
+            policy_algorithm_version: String::new(),
+        };
+
+        let account = observe_account(
+            conn,
+            "anthropic",
+            "primary",
+            UtcTimestamp::from_unix_nanos(10),
+        )
+        .expect("account must insert");
+        let run = start_sample_run(
+            conn,
+            Trigger::Manual,
+            UtcTimestamp::from_unix_nanos(10),
+            "seed",
+        )
+        .expect("sample run must insert");
+        let snapshot =
+            resolve_policy_snapshot(conn, account, UtcTimestamp::from_unix_nanos(10), &POLICY)
+                .expect("policy snapshot must insert");
+        let attempt = start_meter_attempt(
+            conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "anthropic".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(20),
+                credential_context_id: Some("ctx".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(19),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "account-5h-v2".into(),
+            },
+        )
+        .expect("attempt must insert");
+        let evidence_id = insert_response_evidence(
+            conn,
+            &NewMeterResponseEvidence {
+                attempt_id: attempt,
+                response_classification: "200".into(),
+                received_at: UtcTimestamp::from_unix_nanos(30),
+                provider_observed_at_original: None,
+                evidence_capsule: r#"{"windows":[]}"#.into(),
+                capsule_schema_version: "capsule-v1".into(),
+                sanitizer_version: "sanitizer-v1".into(),
+                capture_truncated: false,
+            },
+        )
+        .expect("evidence must insert");
+        let observation_id = insert_observation(
+            conn,
+            &NewMeterObservation {
+                attempt_id: attempt,
+                evidence_id,
+                account_id: account,
+                provider: "anthropic".into(),
+                provider_observed_at: None,
+                received_at: UtcTimestamp::from_unix_nanos(31),
+                measurement_basis: MeasurementBasis::LocallyReceived,
+                observed_plan: Some("max".into()),
+                observed_tier: None,
+                adapter_version: AdapterVersion::new("adapter-v1"),
+                provider_contract_id: ProviderContractId::new("endpoint-schema-v3"),
+                meter_semantics_id: MeterSemanticsId::new("account-5h-v2"),
+                normalized_fingerprint: "fp-1".into(),
+            },
+        )
+        .expect("observation must insert");
+        let window_id = insert_window(
+            conn,
+            &NewMeterWindow {
+                observation_id,
+                semantic_key: WindowSemanticKey::new("five_hour"),
+                scope: WindowScope::AccountWide,
+                quota_used: QuotaUsed::new(QuotaFractionPpm::new(250_000).unwrap()),
+                reported_resolution: ReportedResolution::new(
+                    QuotaFractionPpm::new(10_000).unwrap(),
+                )
+                .unwrap(),
+                quantization: QuantizationSemantics::RoundedToNearest,
+                resets_at: UtcTimestamp::from_unix_nanos(100_000),
+                nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            },
+        )
+        .expect("window must insert");
+        (observation_id, window_id)
+    }
+
+    fn record_test_comparison(
+        conn: &rusqlite::Connection,
+        observation_id: crate::store::meter_evidence::ObservationRowId,
+        window_id: crate::store::meter_evidence::WindowRowId,
+        read_at: UtcTimestamp,
+    ) {
+        use crate::domain::authoritative_comparison::{
+            AuthoritativeComparisonVerdict, DocumentedGranularity,
+        };
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::window::WindowSemanticKey;
+        use crate::store::adapter_semantics_validation::{
+            NewAuthoritativeSurfaceComparison, insert_comparison,
+        };
+
+        insert_comparison(
+            conn,
+            &NewAuthoritativeSurfaceComparison {
+                observation_id,
+                window_id,
+                semantic_key: WindowSemanticKey::new("five_hour"),
+                authoritative_surface: "test surface".into(),
+                documented_granularity: DocumentedGranularity::new(
+                    QuotaFractionPpm::new(10_000).unwrap(),
+                ),
+                adapter_quota_used: QuotaUsed::new(QuotaFractionPpm::new(250_000).unwrap()),
+                authoritative_quota_used: QuotaUsed::new(QuotaFractionPpm::new(250_000).unwrap()),
+                read_at,
+                verdict: AuthoritativeComparisonVerdict::AgreesWithinGranularity,
+            },
+        )
+        .expect("comparison must insert");
+    }
+
+    #[test]
+    fn no_adapter_semantics_comparison_is_not_applicable() {
+        let dir = scratch_dir("no-comparison");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = test_config(&dir);
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        let conn = crate::store::rate_card::open_ledger(
+            &ctx.db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate");
+        ctx.db = Some(&conn);
+        let outcome = adapter_semantics_comparison_age(&ctx);
+        assert!(matches!(outcome.status, CheckStatus::NotApplicable(_)));
+    }
+
+    /// A comparison recorded well within the configured horizon passes and
+    /// states its age.
+    #[test]
+    fn a_recent_comparison_passes_with_its_age() {
+        let dir = scratch_dir("recent-comparison");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = test_config_with_max_comparison_age(&dir, "30d");
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.timestamp = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let conn = crate::store::rate_card::open_ledger(
+            &ctx.db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate");
+        let (observation_id, window_id) = seeded_observation_with_window(&conn);
+        // One hour before "now": comfortably inside a 30-day horizon.
+        let read_at =
+            UtcTimestamp::from_unix_nanos(ctx.timestamp.unix_nanos() - 3600 * 1_000_000_000);
+        record_test_comparison(&conn, observation_id, window_id, read_at);
+        ctx.db = Some(&conn);
+        let outcome = adapter_semantics_comparison_age(&ctx);
+        match &outcome.status {
+            CheckStatus::PassWithDetail(detail) => {
+                assert!(detail.contains("3600s old"), "{detail}");
+            }
+            CheckStatus::Pass
+            | CheckStatus::Fail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!("expected PassWithDetail, got {:?}", outcome.status)
+            }
+        }
+    }
+
+    /// Mutation: the same comparison, judged against a thirty-minute horizon
+    /// instead of thirty days, must fail rather than keep passing. Proves the
+    /// threshold is read from configuration rather than hard-coded.
+    #[test]
+    fn a_stale_comparison_fails_past_the_configured_threshold() {
+        let dir = scratch_dir("stale-comparison");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = test_config_with_max_comparison_age(&dir, "30m");
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.timestamp = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let conn = crate::store::rate_card::open_ledger(
+            &ctx.db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate");
+        let (observation_id, window_id) = seeded_observation_with_window(&conn);
+        // One hour before "now": past a thirty-minute horizon.
+        let read_at =
+            UtcTimestamp::from_unix_nanos(ctx.timestamp.unix_nanos() - 3600 * 1_000_000_000);
+        record_test_comparison(&conn, observation_id, window_id, read_at);
+        ctx.db = Some(&conn);
+        let outcome = adapter_semantics_comparison_age(&ctx);
+        assert!(
+            matches!(outcome.status, CheckStatus::Fail(ref msg) if msg.contains("review horizon")),
+            "{:?}",
+            outcome.status
+        );
     }
 }

@@ -48,12 +48,16 @@ pub enum CheckName {
     ClockSkew,
     LocalFilesystemAndWalSuitability,
     AccumulatedDiagnosticMaterial,
+    AdapterSemanticsComparisonAge,
 }
 
 impl CheckName {
     /// The design's full check list (PLAN.md 27, 36, aub-smqu), encoded once so the
-    /// registry can be compared against it. Nineteen entries.
-    pub const EXPECTED: [CheckName; 19] = [
+    /// registry can be compared against it. Twenty entries: the design's original
+    /// nineteen plus [`Self::AdapterSemanticsComparisonAge`], added by `aub-x2bq`
+    /// once the adapter-semantics mechanism (`aub-eun.12`) existed for a check to
+    /// cover.
+    pub const EXPECTED: [CheckName; 20] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -73,6 +77,7 @@ impl CheckName {
         Self::ClockSkew,
         Self::LocalFilesystemAndWalSuitability,
         Self::AccumulatedDiagnosticMaterial,
+        Self::AdapterSemanticsComparisonAge,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -97,6 +102,7 @@ impl CheckName {
             Self::ClockSkew => "clock-skew",
             Self::LocalFilesystemAndWalSuitability => "local-filesystem-and-wal-suitability",
             Self::AccumulatedDiagnosticMaterial => "accumulated-diagnostic-material",
+            Self::AdapterSemanticsComparisonAge => "adapter-semantics-comparison-age",
         }
     }
 }

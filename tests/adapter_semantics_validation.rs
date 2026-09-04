@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::backup::create_archive;
+use agent_usage_book::cli::{
+    AdapterSemanticsComparisonRequest, record_adapter_semantics_comparison,
+};
 use agent_usage_book::domain::authoritative_comparison::{
     AuthoritativeComparisonVerdict, DocumentedGranularity, compare_against_authoritative_surface,
 };
@@ -347,4 +350,133 @@ fn comparison_and_correction_records_survive_a_verified_backup_and_restore() {
         assert!(class.is_forever());
         assert!(!class.is_prunable());
     }
+}
+
+/// Recording a comparison through `aub compare record`'s own mechanism
+/// (`agent_usage_book::cli::record_adapter_semantics_comparison`, `aub-x2bq`)
+/// with a surface value far outside the documented granularity opens a
+/// mismatch annotation reachable through
+/// `open_semantic_mismatch_findings`, the same path a hand-recorded mismatch
+/// reaches. The planted negative: an agreeing comparison, recorded the same
+/// way against the second window, must open no finding at all.
+#[test]
+fn recording_a_mismatch_through_the_command_mechanism_opens_a_reachable_finding() {
+    let scratch = ScratchDir::new();
+    let state_dir = scratch.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let (observation_id, windows) = seed_observation(&state_dir);
+    let conn = open(
+        &state_dir.join(LEDGER_DATABASE_FILE),
+        AccessMode::ReadWrite,
+        &PragmaPolicy {
+            busy_timeout: timeout(),
+        },
+    )
+    .expect("ledger must open");
+
+    let granularity = DocumentedGranularity::new(QuotaFractionPpm::new(10_000).unwrap());
+
+    // five_hour's adapter reading is 700_000 ppm; a surface reading of
+    // 410_000 ppm disagrees by far more than the granularity, so this must
+    // be an unresolved mismatch.
+    let mismatch_outcome = record_adapter_semantics_comparison(
+        &conn,
+        &AdapterSemanticsComparisonRequest {
+            observation_id,
+            semantic_key: WindowSemanticKey::new("five_hour"),
+            authoritative_surface: "console usage page".into(),
+            surface_quota_used: used(410_000),
+            documented_granularity: granularity,
+            read_at: UtcTimestamp::from_unix_nanos(200_000),
+            detail: None,
+        },
+    )
+    .expect("the mismatched comparison must record");
+    assert_eq!(
+        mismatch_outcome.verdict,
+        AuthoritativeComparisonVerdict::UnresolvedMismatch
+    );
+    let mismatch_annotation_id = mismatch_outcome
+        .mismatch_annotation_id
+        .expect("a mismatch verdict must open an annotation");
+
+    // seven_day's adapter reading is 910_000 ppm; a surface reading that
+    // agrees must open no finding.
+    let agreement_outcome = record_adapter_semantics_comparison(
+        &conn,
+        &AdapterSemanticsComparisonRequest {
+            observation_id,
+            semantic_key: WindowSemanticKey::new("seven_day"),
+            authoritative_surface: "console usage page".into(),
+            surface_quota_used: used(910_000),
+            documented_granularity: granularity,
+            read_at: UtcTimestamp::from_unix_nanos(200_000),
+            detail: None,
+        },
+    )
+    .expect("the agreeing comparison must record");
+    assert_eq!(
+        agreement_outcome.verdict,
+        AuthoritativeComparisonVerdict::AgreesWithinGranularity
+    );
+    assert_eq!(agreement_outcome.mismatch_annotation_id, None);
+
+    let findings = open_semantic_mismatch_findings(&conn).expect("findings must read");
+    assert_eq!(
+        findings.len(),
+        1,
+        "only the five_hour mismatch is an open finding"
+    );
+    assert_eq!(findings[0].annotation_id, mismatch_annotation_id);
+    assert_eq!(findings[0].observation_id, observation_id);
+    assert_eq!(findings[0].semantic_key.as_str(), "five_hour");
+    assert_eq!(findings[0].adapter_quota_used, used(700_000));
+    assert_eq!(findings[0].authoritative_quota_used, used(410_000));
+    let _ = windows;
+}
+
+/// A second comparison for a window that already carries one is refused,
+/// naming the existing comparison rather than writing a duplicate row.
+#[test]
+fn record_refuses_a_second_comparison_for_an_already_compared_window() {
+    let scratch = ScratchDir::new();
+    let state_dir = scratch.path().join("state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    let (observation_id, _windows) = seed_observation(&state_dir);
+    let conn = open(
+        &state_dir.join(LEDGER_DATABASE_FILE),
+        AccessMode::ReadWrite,
+        &PragmaPolicy {
+            busy_timeout: timeout(),
+        },
+    )
+    .expect("ledger must open");
+
+    let request = AdapterSemanticsComparisonRequest {
+        observation_id,
+        semantic_key: WindowSemanticKey::new("five_hour"),
+        authoritative_surface: "console usage page".into(),
+        surface_quota_used: used(700_000),
+        documented_granularity: DocumentedGranularity::new(QuotaFractionPpm::new(10_000).unwrap()),
+        read_at: UtcTimestamp::from_unix_nanos(200_000),
+        detail: None,
+    };
+    let first = record_adapter_semantics_comparison(&conn, &request)
+        .expect("the first comparison must record");
+
+    let second_attempt = record_adapter_semantics_comparison(&conn, &request);
+    let error = second_attempt.expect_err("a second comparison for the same window is refused");
+    let message = error.to_string();
+    assert!(
+        message.contains(&format!("comparison #{}", first.comparison_id.value())),
+        "the refusal must name the existing comparison: {message}"
+    );
+    assert!(
+        message.contains(&observation_id.value().to_string()),
+        "the refusal must name the observation: {message}"
+    );
+
+    // Exactly one comparison row exists for this window: the refusal never
+    // wrote a duplicate.
+    assert_eq!(comparison_row_count(&conn).unwrap().value(), 1);
 }
