@@ -239,6 +239,13 @@ pub fn render_spend_report(report: &SpendReport) -> String {
     render_spend_report_with_explain(report, ExplainMode::Off)
 }
 
+/// Renders an interval reconciliation outcome for human display (aub-dpn.1).
+///
+/// The output term is "unexplained residual" on every human surface.
+pub fn render_reconciliation(outcome: &crate::reconciliation::ReconciliationOutcome) -> String {
+    crate::reconciliation::render_reconciliation_human(outcome)
+}
+
 /// Renders a spend report, optionally including the explain block.
 pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMode) -> String {
     let grouping = report

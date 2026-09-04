@@ -665,6 +665,15 @@ pub fn spend_json(report: &SpendReport, run: RunId) -> String {
     spend_json_with_explain(report, run, ExplainMode::Off)
 }
 
+/// Serializes a reconciliation outcome to JSON (aub-dpn.1).
+///
+/// The output term is "unexplained_residual" on every JSON surface.
+pub fn reconciliation_json(
+    outcome: &crate::reconciliation::ReconciliationOutcome,
+) -> serde_json::Value {
+    crate::reconciliation::reconciliation_json(outcome)
+}
+
 /// The spend report under the envelope, optionally including explain provenance.
 pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: ExplainMode) -> String {
     let groups = report

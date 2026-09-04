@@ -33,6 +33,7 @@ pub mod presentation;
 pub mod problem_code;
 pub mod projection;
 pub mod rate_book;
+pub mod reconciliation;
 pub mod report;
 pub mod restore;
 pub mod seed_archive;

@@ -35,6 +35,7 @@ pub mod migrations;
 pub mod projection_crash_hook;
 pub mod projection_source;
 pub mod rate_card;
+pub mod reconciliation;
 pub mod repository;
 pub mod retention;
 pub mod sample_run;
