@@ -94,7 +94,9 @@ pub enum DrillSource {
 }
 
 impl DrillSource {
-    fn label(&self) -> String {
+    /// The machine-readable label this source prints and records: `seeded:`
+    /// or `archive:` followed by the case name or path.
+    pub fn label(&self) -> String {
         match self {
             Self::Seeded(case) => format!("seeded:{}", case.as_str()),
             Self::Archive(path) => format!("archive:{}", path.display()),
