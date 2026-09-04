@@ -79,7 +79,7 @@ impl DamageCase {
         }
     }
 
-    pub fn from_str(name: &str) -> Option<Self> {
+    pub fn from_name(name: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|case| case.as_str() == name)
     }
 }

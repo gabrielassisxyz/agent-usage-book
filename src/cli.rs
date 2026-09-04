@@ -3671,7 +3671,7 @@ enum DrillArgs {
 fn parse_drill_args(rest: &[String]) -> Result<DrillArgs, Error> {
     match rest {
         [flag, value, scratch] if flag == "--seed" => {
-            let case = crate::drill::DamageCase::from_str(value).ok_or_else(|| {
+            let case = crate::drill::DamageCase::from_name(value).ok_or_else(|| {
                 Error::Usage(format!(
                     "--seed {value} is not a known damage case; use truncated-database, \
                      corrupted-projection, malformed-spool-record or unsupported-schema-version"
