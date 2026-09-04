@@ -506,9 +506,9 @@ impl Command {
     pub fn summary(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
-            Command::Spend => {
-                Some("canonical token usage grouped by day, session, project or repository")
-            }
+            Command::Spend => Some(
+                "canonical token usage grouped by day, session, project, repository or account",
+            ),
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
             }
@@ -625,7 +625,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository (repeatable) | --credits | --refresh auto|never|force | --value api-list",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|account (repeatable) | --credits | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -2303,8 +2303,9 @@ fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
         "session" => Ok(SpendGrouping::Session),
         "project" => Ok(SpendGrouping::Project),
         "repository" | "repo" => Ok(SpendGrouping::Repository),
+        "account" => Ok(SpendGrouping::Account),
         _ => Err(Error::Usage(format!(
-            "--group-by must be day, session, project or repository, got {value}"
+            "--group-by must be day, session, project, repository or account, got {value}"
         ))),
     }
 }
@@ -4497,7 +4498,13 @@ mod tests {
         assert_eq!(explicit.refresh, RefreshPolicy::Never);
         assert!(spend_options(&["--since".into(), "25/08/2026".into()], now).is_err());
         assert!(spend_options(&["--days".into(), "0".into()], now).is_err());
-        assert!(spend_options(&["--group-by=account".into()], now).is_err());
+        assert_eq!(
+            spend_options(&["--group-by=account".into()], now)
+                .unwrap()
+                .grouping,
+            vec![SpendGrouping::Account]
+        );
+        assert!(spend_options(&["--group-by=task".into()], now).is_err());
         assert!(spend_options(&["--bogus".into()], now).is_err());
     }
 

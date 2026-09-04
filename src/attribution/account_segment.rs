@@ -427,10 +427,32 @@ fn locate(intervals: &[MarkerInterval], instant: UtcTimestamp) -> Option<&Marker
 /// test`.
 pub fn segment(inputs: &AccountSegmentationInputs) -> AccountSegmentationResult {
     let mut result = AccountSegmentationResult::default();
-    let intervals = build_intervals(&inputs.markers);
+    for (event, (target, evidence_class)) in inputs.usage.iter().zip(assign(inputs)) {
+        result.add(target, event.usage, evidence_class);
+    }
+    debug_assert_conserves(inputs, &result);
+    result
+}
 
-    for event in &inputs.usage {
-        let (target, evidence_class) = match locate(&intervals, event.occurred_at) {
+/// Places every usage event on its account, in the exact order of
+/// `inputs.usage`, without summing anything. This is the single decision point
+/// for "which account does this event belong to": [`segment`] folds its output,
+/// and the spend report groups by it, so neither reimplements the marker
+/// timeline (aub-mgv.4).
+///
+/// Each entry is the account the event's timestamp falls under and the effective
+/// evidence class of the marker interval that placed it; an event before every
+/// marker (or in a session with no marker) is
+/// [`AccountSegmentTarget::UnknownAccount`] with
+/// [`AccountEvidenceClass::Unattributed`].
+pub fn assign(
+    inputs: &AccountSegmentationInputs,
+) -> Vec<(AccountSegmentTarget, AccountEvidenceClass)> {
+    let intervals = build_intervals(&inputs.markers);
+    inputs
+        .usage
+        .iter()
+        .map(|event| match locate(&intervals, event.occurred_at) {
             Some(interval) => (
                 AccountSegmentTarget::Account(interval.logical_account.clone()),
                 interval.evidence_class,
@@ -439,12 +461,8 @@ pub fn segment(inputs: &AccountSegmentationInputs) -> AccountSegmentationResult 
                 AccountSegmentTarget::UnknownAccount,
                 AccountEvidenceClass::Unattributed,
             ),
-        };
-        result.add(target, event.usage, evidence_class);
-    }
-
-    debug_assert_conserves(inputs, &result);
-    result
+        })
+        .collect()
 }
 
 fn debug_assert_conserves(inputs: &AccountSegmentationInputs, result: &AccountSegmentationResult) {
@@ -610,6 +628,49 @@ mod tests {
         assert_eq!(result.account_usage("account-a"), Some(tokens(1)));
         assert_eq!(result.account_usage("account-b"), Some(tokens(2)));
         assert_eq!(result.account_usage("account-c"), Some(tokens(3)));
+    }
+
+    #[test]
+    fn assign_places_each_event_in_order_and_agrees_with_segment() {
+        let inputs = AccountSegmentationInputs {
+            markers: vec![marker("account-a", 0, None), marker("account-b", 40, None)],
+            usage: vec![event(10, 3), event(60, 11), event(39, 4)],
+        };
+        let assigned = assign(&inputs);
+        assert_eq!(
+            assigned
+                .iter()
+                .map(|(target, _)| target.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                AccountSegmentTarget::Account("account-a".to_owned()),
+                AccountSegmentTarget::Account("account-b".to_owned()),
+                AccountSegmentTarget::Account("account-a".to_owned()),
+            ],
+            "each event lands under the marker its own timestamp falls after"
+        );
+
+        // Folding assign() by hand must reproduce segment() exactly: the two
+        // share one decision point.
+        let mut folded = AccountSegmentationResult::default();
+        for (usage_event, (target, class)) in inputs.usage.iter().zip(assign(&inputs)) {
+            folded.add(target, usage_event.usage, class);
+        }
+        assert_eq!(folded, segment(&inputs));
+
+        // Planted negative: an event before every marker is unattributed, not
+        // silently folded into the first account.
+        let before = AccountSegmentationInputs {
+            markers: vec![marker("account-a", 100, None)],
+            usage: vec![event(10, 5)],
+        };
+        assert_eq!(
+            assign(&before),
+            vec![(
+                AccountSegmentTarget::UnknownAccount,
+                AccountEvidenceClass::Unattributed
+            )]
+        );
     }
 
     #[test]

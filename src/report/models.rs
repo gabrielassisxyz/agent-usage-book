@@ -7,6 +7,7 @@
 
 use std::collections::BTreeMap;
 
+use crate::attribution::account_segment::AccountEvidenceClass;
 use crate::config::CoverageFloor;
 use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
@@ -298,15 +299,20 @@ impl SpendGroup {
     }
 }
 
-/// A supported canonical-ledger grouping dimension. Future account, task,
-/// credits, calibrated-window and valuation work extends this enum in its own
-/// bead; Phase 5 deliberately exposes token-only dimensions only.
+/// A supported canonical-ledger grouping dimension. Future task, calibrated-window
+/// and valuation work extends this enum in its own bead.
+///
+/// `Account` is not a property of one canonical event the way the other
+/// dimensions are: it is decided by the session's account-marker timeline, so
+/// the report layer resolves it through [`crate::attribution::account_segment`]
+/// before grouping and never reasons about markers itself (aub-mgv.4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpendGrouping {
     Day,
     Session,
     Project,
     Repository,
+    Account,
 }
 
 impl SpendGrouping {
@@ -316,8 +322,42 @@ impl SpendGrouping {
             Self::Session => "session",
             Self::Project => "project",
             Self::Repository => "repository",
+            Self::Account => "account",
         }
     }
+}
+
+/// The label the report and the presentation layer use for usage that no account
+/// marker could justify. It is a group in its own right, never omitted and never
+/// merged into an attributed account (PLAN.md 19.2).
+pub const UNKNOWN_ACCOUNT_LABEL: &str = "unknown-account";
+
+/// One account group's attribution provenance, surfaced under `--explain`: the
+/// evidence class the marker interval carried and the exact markers that
+/// produced it. Carried on the report rather than folded into a group's usage,
+/// because attribution confidence and token-measurement confidence are distinct
+/// axes (correctness invariant 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountGroupExplain {
+    /// The account-dimension key, `account=<label>`, matching the group key
+    /// segment regardless of where the account dimension sits in the tree.
+    pub key: LogicalName,
+    /// The effective evidence class of the interval that attributed this account.
+    pub evidence_class: AccountEvidenceClass,
+    /// The markers that produced the attribution, in a deterministic order. Empty
+    /// for the unknown-account group: no marker justified that usage.
+    pub markers: Vec<AccountMarkerReference>,
+}
+
+/// A stable reference to one persisted account marker and the evidence it carried.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct AccountMarkerReference {
+    /// `session_account_marker:<id>`, the row's durable identity.
+    pub reference: String,
+    /// The account the marker named.
+    pub logical_account: String,
+    /// The marker's effective evidence class.
+    pub evidence_class: AccountEvidenceClass,
 }
 
 /// What ingestion did to produce a spend report, so the counts never stand alone:
@@ -428,6 +468,10 @@ pub struct SpendReport {
     /// group's provenance so that a window whose every group refused conversion
     /// still names the model the refusal was measured against.
     pub credit_model: Option<CostModelId>,
+    /// One entry per distinct account group when `--group-by account` was
+    /// requested, naming the marker evidence behind each attribution. Empty
+    /// otherwise.
+    pub account_explain: Vec<AccountGroupExplain>,
 }
 
 impl SpendReport {
@@ -454,7 +498,13 @@ impl SpendReport {
             ingest,
             stale_rate_card_note: None,
             credit_model: None,
+            account_explain: Vec::new(),
         }
+    }
+
+    pub fn with_account_explain(mut self, account_explain: Vec<AccountGroupExplain>) -> Self {
+        self.account_explain = account_explain;
+        self
     }
 
     pub fn with_stale_rate_card_note(mut self, note: Option<String>) -> Self {

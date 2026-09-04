@@ -17,9 +17,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
+use crate::attribution::account_segment::{
+    self, AccountEvidenceClass, AccountSegmentTarget, AccountSegmentationInputs, AccountUsageEvent,
+};
 use crate::config::Config;
 use crate::dedup::deduplicate;
 use crate::domain::credits::Credits;
+use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
 use crate::domain::money::Usd;
 use crate::domain::provenance::{DerivationId, EvidenceId, QuerySemantics, WitnessId};
 use crate::domain::time::{UtcDate, UtcTimestamp, unix_nanos};
@@ -34,9 +38,10 @@ use crate::evidence::{
 };
 use crate::logging::LogicalName;
 use crate::report::models::{
-    IngestSummary, IngestionGeneration, LedgerGeneration, ReportMetadata, SpendDiagnostic,
-    SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
-    SpendGrouping, SpendReport,
+    AccountGroupExplain, AccountMarkerReference, IngestSummary, IngestionGeneration,
+    LedgerGeneration, ReportMetadata, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
+    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport,
+    UNKNOWN_ACCOUNT_LABEL,
 };
 use crate::report::provenance::{ProvenanceNode, Unit, ValueArithmetic};
 use crate::store::cost_model::CostModel;
@@ -456,6 +461,14 @@ pub fn assemble_canonical(
     let partial = refresh_failure.is_some() || !diagnostics.quarantined_by_class.is_empty();
     let mut provenance = Vec::new();
     let mut credit_provenance = Vec::new();
+    let mut account_explain = Vec::new();
+    let account_of = if grouping.contains(&SpendGrouping::Account) {
+        let (map, explain) = account_attribution(conn, &events)?;
+        account_explain = explain;
+        map
+    } else {
+        BTreeMap::new()
+    };
     let groups = canonical_groups(
         &events,
         &grouping,
@@ -463,6 +476,7 @@ pub fn assemble_canonical(
         &mut Vec::new(),
         &window,
         partial,
+        &account_of,
         &mut provenance,
         rate_book,
         &mut credit_provenance,
@@ -541,6 +555,7 @@ pub fn assemble_canonical(
     )
     .with_stale_rate_card_note(stale_note)
     .with_grouping(grouping)
+    .with_account_explain(account_explain)
     .with_credit_model(match credit_reporting {
         CreditReporting::Active(model) => Some(model.id().clone()),
         CreditReporting::NotRequested | CreditReporting::NoActiveModel => None,
@@ -570,6 +585,7 @@ fn canonical_groups(
     path: &mut Vec<String>,
     window: &SpendWindow,
     partial: bool,
+    account_of: &BTreeMap<String, String>,
     provenance: &mut Vec<SpendGroupProvenance>,
     rate_book: Option<&RateBook>,
     credit_provenance: &mut Vec<SpendGroupCreditsProvenance>,
@@ -581,7 +597,7 @@ fn canonical_groups(
     let mut by_key: BTreeMap<String, Vec<&CanonicalSpendEvent>> = BTreeMap::new();
     for event in events {
         by_key
-            .entry(group_value(event, dimension))
+            .entry(group_value(event, dimension, account_of))
             .or_default()
             .push(event);
     }
@@ -652,6 +668,7 @@ fn canonical_groups(
                 path,
                 window,
                 partial,
+                account_of,
                 provenance,
                 rate_book,
                 credit_provenance,
@@ -661,12 +678,151 @@ fn canonical_groups(
             let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
                 .with_valuation(valuation)
                 .with_children(children);
-            match credits {
+            let group = match credits {
                 Some(credits) => group.with_credits(credits),
                 None => group,
+            };
+            // The unknown-account group is usage no marker could justify: its
+            // coverage says so on every subtotal it holds, rather than reading
+            // as a complete account (aub-mgv.4, PLAN.md 19.2).
+            if dimension == SpendGrouping::Account && value == UNKNOWN_ACCOUNT_LABEL {
+                qualify_tree_unattributed(group)
+            } else {
+                group
             }
         })
         .collect()
+}
+
+/// Marks a group and every descendant partial on the account dimension: the
+/// account attribution is a required input the unknown-account bucket does not
+/// have. This never touches the token quantities, only the coverage they
+/// carry.
+fn qualify_tree_unattributed(mut group: SpendGroup) -> SpendGroup {
+    let merged = group
+        .usage
+        .coverage()
+        .combine(&CoverageCompleteness::partial([ComponentKind::new(
+            "account",
+        )]));
+    group.usage = UsageVector::new(
+        group.usage.known(),
+        group.usage.unknown().clone(),
+        merged,
+        group.usage.quality().clone(),
+    );
+    group.children = group
+        .children
+        .into_iter()
+        .map(qualify_tree_unattributed)
+        .collect();
+    group
+}
+
+/// Resolves every in-window event to an account through the marker-interval
+/// segmentation, returning the per-event account label and, per distinct
+/// account, the marker evidence that placed it. The report never inspects a
+/// marker itself: [`account_segment::assign`] owns the decision (aub-mgv.4).
+fn account_attribution(
+    conn: &rusqlite::Connection,
+    events: &[CanonicalSpendEvent],
+) -> Result<(BTreeMap<String, String>, Vec<AccountGroupExplain>), Error> {
+    // Bucket event indices by the session that owns them, keeping the order
+    // canonical_events returned so assign()'s answer maps back by position. An
+    // event with no session identity has no marker timeline and goes straight
+    // to the unknown-account bucket.
+    let mut by_session: BTreeMap<(String, String), Vec<usize>> = BTreeMap::new();
+    let mut sessionless: Vec<usize> = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        match (&event.session_source, &event.session_native) {
+            (Some(source), Some(native)) => by_session
+                .entry((source.clone(), native.clone()))
+                .or_default()
+                .push(index),
+            _ => sessionless.push(index),
+        }
+    }
+
+    let mut account_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut per_account: BTreeMap<
+        String,
+        (AccountEvidenceClass, BTreeSet<AccountMarkerReference>),
+    > = BTreeMap::new();
+
+    for &index in &sessionless {
+        account_of.insert(
+            events[index].canonical_id.clone(),
+            UNKNOWN_ACCOUNT_LABEL.to_string(),
+        );
+        per_account
+            .entry(UNKNOWN_ACCOUNT_LABEL.to_string())
+            .or_insert_with(|| (AccountEvidenceClass::Unattributed, BTreeSet::new()));
+    }
+
+    for ((source, native), indices) in &by_session {
+        let session_id = SessionId::new(
+            SourceNamespace::new(source.clone()),
+            NativeSessionId::new(native.clone()),
+        );
+        let markers = crate::store::session_account_marker::markers_for_session(conn, &session_id)?;
+        let usage: Vec<AccountUsageEvent> = indices
+            .iter()
+            .map(|&i| AccountUsageEvent {
+                occurred_at: events[i].occurred_at,
+                usage: known_vector(&events[i].components),
+            })
+            .collect();
+        let assigned = account_segment::assign(&AccountSegmentationInputs {
+            markers: markers.iter().map(|marker| marker.boundary()).collect(),
+            usage,
+        });
+        for (&event_index, (target, class)) in indices.iter().zip(&assigned) {
+            let label = match target {
+                AccountSegmentTarget::Account(account) => account.clone(),
+                AccountSegmentTarget::UnknownAccount => UNKNOWN_ACCOUNT_LABEL.to_string(),
+            };
+            account_of.insert(events[event_index].canonical_id.clone(), label.clone());
+            let entry = per_account
+                .entry(label)
+                .or_insert_with(|| (*class, BTreeSet::new()));
+            if class.takes_precedence_over(entry.0) {
+                entry.0 = *class;
+            }
+            if let AccountSegmentTarget::Account(account) = target {
+                for marker in &markers {
+                    let boundary_class = marker.boundary().effective_evidence_class();
+                    if marker.logical_account() == account && boundary_class == *class {
+                        entry.1.insert(AccountMarkerReference {
+                            reference: format!("session_account_marker:{}", marker.id().value()),
+                            logical_account: account.clone(),
+                            evidence_class: boundary_class,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    let account_explain = per_account
+        .into_iter()
+        .map(|(label, (evidence_class, markers))| AccountGroupExplain {
+            key: LogicalName::new(format!("account={label}")),
+            evidence_class,
+            markers: markers.into_iter().collect(),
+        })
+        .collect();
+    Ok((account_of, account_explain))
+}
+
+/// The four known token kinds of a canonical event as a [`KnownTokenVector`],
+/// the shape [`account_segment`] segments over.
+fn known_vector(components: &BTreeMap<String, u64>) -> KnownTokenVector {
+    KnownTokenVector::new(
+        InputTokens::new(components.get("input").copied().unwrap_or(0)),
+        OutputTokens::new(components.get("output").copied().unwrap_or(0)),
+        CacheReadTokens::new(components.get("cache_read").copied().unwrap_or(0)),
+        CacheWriteTokens::new(components.get("cache_write").copied().unwrap_or(0)),
+    )
 }
 
 fn value_events(events: &[&CanonicalSpendEvent], book: &RateBook) -> ValuationOutcome<Usd> {
@@ -715,12 +871,22 @@ fn credit_derivation(
     }
 }
 
-fn group_value(event: &CanonicalSpendEvent, grouping: SpendGrouping) -> String {
+fn group_value(
+    event: &CanonicalSpendEvent,
+    grouping: SpendGrouping,
+    account_of: &BTreeMap<String, String>,
+) -> String {
     match grouping {
         SpendGrouping::Day => event.occurred_at.utc_date().iso(),
         SpendGrouping::Session => event.session.clone(),
         SpendGrouping::Project => event.project.clone(),
         SpendGrouping::Repository => event.repository.clone(),
+        // Resolved before grouping by account_attribution(); an event missing
+        // from the map never received an account and is unattributed.
+        SpendGrouping::Account => account_of
+            .get(&event.canonical_id)
+            .cloned()
+            .unwrap_or_else(|| UNKNOWN_ACCOUNT_LABEL.to_string()),
     }
 }
 
@@ -909,6 +1075,279 @@ mod tests {
             },
         )
         .unwrap();
+    }
+
+    fn seed_marker(
+        conn: &rusqlite::Connection,
+        native: &str,
+        account: &str,
+        observed_nanos: i64,
+        designation: crate::store::session_account_marker::EvidenceDesignation,
+    ) {
+        crate::store::session_account_marker::insert_marker(
+            conn,
+            &crate::store::session_account_marker::NewSessionAccountMarker {
+                session_id: SessionId::new(
+                    SourceNamespace::new("fixture"),
+                    crate::domain::ids::NativeSessionId::new(native),
+                ),
+                observed_at: UtcTimestamp::from_unix_nanos(observed_nanos),
+                source_ordering_key: None,
+                logical_account: account.to_owned(),
+                resolved_account_id: None,
+                marker_source: crate::store::session_account_marker::MarkerSource::new("hook"),
+                run_id: None,
+                evidence_designation: designation,
+            },
+        )
+        .unwrap();
+    }
+
+    /// `--group-by account` sums per account, keeps the unknown-account bucket
+    /// as its own group, carries the marker evidence class per group, and does
+    /// not decide attribution itself: its buckets equal a direct
+    /// `account_segment::segment` over the same markers and usage.
+    #[test]
+    fn account_grouping_delegates_to_segmentation_and_keeps_the_unknown_bucket() {
+        use crate::store::session_account_marker::EvidenceDesignation;
+
+        let (_root, conn) = canonical_conn("account-grouping");
+        seed_session(&conn, "s1");
+        seed_session(&conn, "s2");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        // s1: marker at day+50 names "work"; one event before it (unknown), one after (work).
+        seed_marker(
+            &conn,
+            "s1",
+            "work",
+            day + 50,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(&conn, "e1", day + 10, "s1", "reported", &[("input", 3)]);
+        seed_canonical(&conn, "e2", day + 90, "s1", "reported", &[("input", 7)]);
+        // s2: marker from the start names "research".
+        seed_marker(
+            &conn,
+            "s2",
+            "research",
+            day + 1,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(&conn, "e3", day + 20, "s2", "reported", &[("input", 5)]);
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+        )
+        .unwrap();
+
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(by_key["account=work"].usage.known().input().value(), 7);
+        assert_eq!(by_key["account=research"].usage.known().input().value(), 5);
+        assert_eq!(
+            by_key["account=unknown-account"]
+                .usage
+                .known()
+                .input()
+                .value(),
+            3,
+            "the pre-marker event is its own group, never merged into work"
+        );
+
+        // One group partial while others are complete: the unknown-account
+        // bucket is partial on the account dimension, the attributed ones are not.
+        assert!(
+            by_key["account=unknown-account"]
+                .usage
+                .coverage()
+                .missing()
+                .is_some()
+        );
+        assert!(by_key["account=work"].usage.coverage().missing().is_none());
+        assert!(
+            by_key["account=research"]
+                .usage
+                .coverage()
+                .missing()
+                .is_none()
+        );
+
+        // Evidence class travels per group.
+        let explain: BTreeMap<&str, &AccountGroupExplain> = report
+            .account_explain
+            .iter()
+            .map(|group| (group.key.as_str(), group))
+            .collect();
+        assert_eq!(
+            explain["account=work"].evidence_class,
+            AccountEvidenceClass::ExplicitLauncherOrHook
+        );
+        assert_eq!(
+            explain["account=unknown-account"].evidence_class,
+            AccountEvidenceClass::Unattributed
+        );
+        assert!(
+            explain["account=unknown-account"].markers.is_empty(),
+            "the unknown bucket names no marker"
+        );
+        assert!(
+            explain["account=work"].markers[0]
+                .reference
+                .starts_with("session_account_marker:"),
+            "an attributed account names the marker that placed it"
+        );
+
+        // No attribution logic of its own: the report's account buckets equal a
+        // direct segmentation over the same inputs.
+        let direct_s1 = account_segment::segment(&AccountSegmentationInputs {
+            markers: vec![account_segment::AccountMarkerBoundary::explicit(
+                "work",
+                UtcTimestamp::from_unix_nanos(day + 50),
+                None,
+            )],
+            usage: vec![
+                AccountUsageEvent {
+                    occurred_at: UtcTimestamp::from_unix_nanos(day + 10),
+                    usage: known_vector(&[("input".to_string(), 3)].into_iter().collect()),
+                },
+                AccountUsageEvent {
+                    occurred_at: UtcTimestamp::from_unix_nanos(day + 90),
+                    usage: known_vector(&[("input".to_string(), 7)].into_iter().collect()),
+                },
+            ],
+        });
+        assert_eq!(
+            direct_s1.account_usage("work").unwrap().input().value(),
+            by_key["account=work"].usage.known().input().value()
+        );
+        assert_eq!(
+            direct_s1.unknown_account_usage().unwrap().input().value(),
+            by_key["account=unknown-account"]
+                .usage
+                .known()
+                .input()
+                .value()
+        );
+
+        // Human and JSON explain carry identical marker references and classes.
+        let human = crate::presentation::render_spend_report_with_explain(
+            &report,
+            crate::presentation::ExplainMode::Summary,
+        );
+        let json = crate::presentation::spend_json_with_explain(
+            &report,
+            crate::logging::RunId::new(now()),
+            crate::presentation::ExplainMode::Summary,
+        );
+        for group in &report.account_explain {
+            assert!(human.contains(group.evidence_class.as_str()));
+            assert!(json.contains(group.evidence_class.as_str()));
+            for marker in &group.markers {
+                assert!(
+                    human.contains(&marker.reference),
+                    "human explain names {}",
+                    marker.reference
+                );
+                assert!(
+                    json.contains(&marker.reference),
+                    "json explain names {}",
+                    marker.reference
+                );
+            }
+        }
+        crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    /// `--group-by account --group-by day` reconciles: each account's day
+    /// children sum to its total, and the account totals sum to a plain
+    /// `--group-by day` report over the same corpus.
+    #[test]
+    fn account_grouping_composes_with_day_and_the_totals_reconcile() {
+        use crate::store::session_account_marker::EvidenceDesignation;
+
+        let (_root, conn) = canonical_conn("account-compose");
+        seed_session(&conn, "s1");
+        let day25 = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        let day26 = UtcDate::parse("2026-08-26").unwrap().start().unix_nanos();
+        seed_marker(
+            &conn,
+            "s1",
+            "work",
+            day25,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(
+            &conn,
+            "e1",
+            day25 + 10,
+            "s1",
+            "reported",
+            &[("input", 4), ("output", 1)],
+        );
+        seed_canonical(
+            &conn,
+            "e2",
+            day26 + 10,
+            "s1",
+            "reported",
+            &[("input", 6), ("output", 2)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let composed = assemble_canonical(
+            &conn,
+            window("2026-08-25", 2),
+            now(),
+            vec![SpendGrouping::Account, SpendGrouping::Day],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+        )
+        .unwrap();
+        let work = composed
+            .groups
+            .iter()
+            .find(|g| g.key.as_str() == "account=work")
+            .expect("work account group");
+        let child_input: u64 = work
+            .children
+            .iter()
+            .map(|child| child.usage.known().input().value())
+            .sum();
+        assert_eq!(child_input, work.usage.known().input().value());
+
+        let account_total: u64 = composed
+            .groups
+            .iter()
+            .map(|g| g.usage.known().input().value())
+            .sum();
+        let by_day = assemble_canonical(
+            &conn,
+            window("2026-08-25", 2),
+            now(),
+            vec![SpendGrouping::Day],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+        )
+        .unwrap();
+        let day_total: u64 = by_day
+            .groups
+            .iter()
+            .map(|g| g.usage.known().input().value())
+            .sum();
+        assert_eq!(account_total, day_total, "account grouping loses no tokens");
+        assert_eq!(day_total, 10);
     }
 
     #[test]
