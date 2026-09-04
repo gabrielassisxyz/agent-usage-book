@@ -126,7 +126,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::StrictAndConstraintIntegrity => "store::schema_audit",
         CheckName::PendingEvidence => "store::spool",
         CheckName::SamplingCadence => "doctor",
-        CheckName::UnresolvedAuthentication => "auth",
+        CheckName::UnresolvedAuthentication => "doctor",
         CheckName::TranscriptRoots => "doctor",
         CheckName::ParserFailures => "store::ingest_quarantine",
         CheckName::UnmappedAccounts => "attribution",

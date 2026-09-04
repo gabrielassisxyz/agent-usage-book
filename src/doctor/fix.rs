@@ -139,18 +139,35 @@ pub fn run_fix(
         conn,
         crate::store::retention::RebuildGroup::Transcripts,
     )?;
-    let recreate_detail = if config.transcripts.is_empty() {
-        format!(
-            "deleted {} derived row(s); no transcript sources are configured to re-parse",
-            swept.total().value(),
-        )
+    let reachable_transcripts: Vec<crate::config::TranscriptConfig> = config
+        .transcripts
+        .iter()
+        .filter(|t| t.root.is_dir())
+        .cloned()
+        .collect();
+    let recreate_detail = if reachable_transcripts.is_empty() {
+        if config.transcripts.is_empty() {
+            format!(
+                "deleted {} derived row(s); no transcript sources are configured to re-parse",
+                swept.total().value(),
+            )
+        } else {
+            format!(
+                "deleted {} derived row(s); no reachable transcript roots exist to re-parse",
+                swept.total().value(),
+            )
+        }
     } else {
+        let mut filtered_config = config.clone();
+        filtered_config.transcripts = reachable_transcripts;
         let ingest_options = crate::ingest::IngestOptions {
             source: None,
             changed_only: false,
         };
         let ingest_report =
-            crate::ingest::run(conn, config, &ingest_options, clock, &mut |_| Ok(()))?;
+            crate::ingest::run(conn, &filtered_config, &ingest_options, clock, &mut |_| {
+                Ok(())
+            })?;
         format!(
             "deleted {} derived row(s), re-parsed {} file(s) across {} source(s)",
             swept.total().value(),

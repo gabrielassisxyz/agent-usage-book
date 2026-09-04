@@ -1228,9 +1228,7 @@ fn instant_before(at: UtcTimestamp) -> UtcTimestamp {
 }
 
 /// Returns distinct calibration scopes that have ever had a result fitted.
-pub fn fitted_calibration_scopes(
-    conn: &Connection,
-) -> Result<Vec<CalibrationScope>, Error> {
+pub fn fitted_calibration_scopes(conn: &Connection) -> Result<Vec<CalibrationScope>, Error> {
     let mut statement = conn
         .prepare(
             "SELECT DISTINCT provider, plan_tier, window_semantic_key FROM window_calibration_result",
@@ -1250,7 +1248,9 @@ pub fn fitted_calibration_scopes(
         .map_err(|e| Error::Store(format!("cannot query calibration scopes: {e}")))?;
     let mut scopes = Vec::new();
     for row in rows {
-        scopes.push(row.map_err(|e| Error::Store(format!("cannot read calibration scope row: {e}")))?);
+        scopes.push(
+            row.map_err(|e| Error::Store(format!("cannot read calibration scope row: {e}")))?,
+        );
     }
     Ok(scopes)
 }

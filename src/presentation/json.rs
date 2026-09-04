@@ -1216,11 +1216,11 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
         .iter()
         .map(|outcome| {
             let mut fields = format!(
-                "\"name\":{},\"owner_module\":{},\"has_repair\":{},\"status\":{}",
+                "\"name\":{},\"status\":{},\"owner_module\":{},\"has_repair\":{}",
                 json_string(outcome.name.as_str()),
+                json_string(outcome.status.label()),
                 json_string(outcome.owner_module),
                 outcome.has_repair,
-                json_string(outcome.status.label()),
             );
             match &outcome.status {
                 crate::doctor::CheckStatus::Fail(reason)
