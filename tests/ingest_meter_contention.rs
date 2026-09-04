@@ -329,6 +329,38 @@ format = "claude-code"
     .0
 }
 
+/// Like [`config_for`], with the file-count batch bound also configured
+/// (`aub-va6s`), for the tests that exercise it independently of the event
+/// bound.
+fn config_for_file_bound(
+    corpus: &Path,
+    max_batch_events: u64,
+    max_batch_files: u64,
+) -> agent_usage_book::config::Config {
+    let toml = format!(
+        r#"
+[ingest]
+max_batch_events = {max_batch_events}
+max_batch_files = {max_batch_files}
+
+[[transcripts]]
+name = "claude-code"
+root = "{}"
+pattern = "**/*.jsonl"
+format = "claude-code"
+"#,
+        corpus.display()
+    );
+    resolve(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&toml),
+        "/virtual/aub.toml",
+    )
+    .expect("resolve test config")
+    .0
+}
+
 /// A second connection onto the fixture's ledger, for a writer or drainer that
 /// must not borrow the fixture's own connection.
 fn extra_conn(fixture: &Fixture, busy_ms: u64) -> rusqlite::Connection {
@@ -350,6 +382,7 @@ fn run_ingest_collecting(
             batches.push(batch.clone());
             Ok(())
         },
+        &mut |_| Ok(()),
     )
     .expect("the ingest pass must land");
     (report, batches)
@@ -530,6 +563,7 @@ fn meter_writes_land_between_ingest_batches_while_the_pass_is_in_flight() {
                 &IngestOptions::default(),
                 &RealClock::new(),
                 &mut sink,
+                &mut |_| Ok(()),
             )
             .expect("the pass must land under interleaved meter writes")
         });
@@ -692,6 +726,43 @@ fn every_batch_respects_the_stated_writer_slot_budget_and_the_pass_splits() {
     assert_eq!(fixture.usage_reconciliation(), (5, 5, 5));
 }
 
+/// The file-count batch bound commits at least once per N files even when the
+/// event bound alone would never trigger a split (`aub-va6s`): a corpus of
+/// 2N+1 files, one event each, under a file bound of N and an event bound
+/// wide enough that only the file bound can be the one that closes a batch.
+/// Three batches land (N, N, 1 files), each its own generation advance, so a
+/// sparse-event corpus (the operator's actual shape: many transcript files,
+/// few events each) still commits on a predictable file cadence instead of
+/// accumulating the whole corpus in one open pass.
+#[test]
+fn the_file_count_bound_commits_at_least_once_per_n_files() {
+    let fixture = fixture("file-bound", 5_000);
+    let corpus = fixture.state_dir().join("corpus");
+    const N: u64 = 3;
+    write_corpus(&corpus, 2 * N + 1, 2 * N + 1);
+    let config = config_for_file_bound(&corpus, 10_000, N);
+    let mut writer = ingest_conn(&fixture, 5_000);
+
+    let (report, batches) = run_ingest_collecting(&mut writer, &config);
+    assert_eq!(
+        batches.len(),
+        3,
+        "2N+1 files under a file bound of N must split into three batches"
+    );
+    assert_eq!(batches[0].events, N);
+    assert_eq!(batches[1].events, N);
+    assert_eq!(batches[2].events, 1);
+    assert_eq!(batches[0].generation.value(), 1);
+    assert_eq!(batches[1].generation.value(), 2);
+    assert_eq!(batches[2].generation.value(), 3);
+    assert_eq!(report.generation.value(), 3);
+    assert_eq!(report.outcome.events_written.value(), 2 * N + 1);
+    assert_eq!(
+        fixture.usage_reconciliation(),
+        (2 * N + 1, 2 * N + 1, 2 * N + 1)
+    );
+}
+
 /// A batch that fails mid-flight commits nothing. The injection is real store
 /// behaviour, not a seam: a batch carrying one valid event and one watermark
 /// naming an absolute path, which the store refuses. The refusal fires after
@@ -852,6 +923,7 @@ fn a_refused_batch_stops_the_pass_whole_and_a_rerun_converges() {
                 &IngestOptions::default(),
                 &RealClock::new(),
                 &mut sink,
+                &mut |_| Ok(()),
             )
         });
 

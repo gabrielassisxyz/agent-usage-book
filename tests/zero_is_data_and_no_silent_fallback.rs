@@ -598,6 +598,7 @@ fn transcript_file_that_cannot_be_read_is_named_not_silently_dropped() {
         &IngestOptions::default(),
         &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000_000_000)),
         &mut |_| Ok(()),
+        &mut |_| Ok(()),
     )
     .expect("ingest completes even with an unreadable file");
 

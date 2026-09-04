@@ -25,7 +25,14 @@ fn run_ingest(
     options: &IngestOptions,
     now: UtcTimestamp,
 ) -> Result<agent_usage_book::ingest::IngestReport, agent_usage_book::error::Error> {
-    run_ingest_with_sink(conn, config, options, &FakeClock::new(now), &mut |_| Ok(()))
+    run_ingest_with_sink(
+        conn,
+        config,
+        options,
+        &FakeClock::new(now),
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
 }
 use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
 use agent_usage_book::store::migrate::run_migrations;

@@ -164,10 +164,14 @@ pub fn run_fix(
             source: None,
             changed_only: false,
         };
-        let ingest_report =
-            crate::ingest::run(conn, &filtered_config, &ingest_options, clock, &mut |_| {
-                Ok(())
-            })?;
+        let ingest_report = crate::ingest::run(
+            conn,
+            &filtered_config,
+            &ingest_options,
+            clock,
+            &mut |_| Ok(()),
+            &mut |_| Ok(()),
+        )?;
         format!(
             "deleted {} derived row(s), re-parsed {} file(s) across {} source(s)",
             swept.total().value(),

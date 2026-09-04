@@ -14,13 +14,27 @@
 //! Batching is the concurrency obligation. One pass-sized transaction would
 //! hold the single SQLite writer slot for the whole corpus, starving meter
 //! writes behind it; so the pass splits into transactions of at most
-//! `config.ingest.max_batch_events` canonical events and yields the writer
-//! slot between batches. Each batch commits atomically or not at all; a crash
-//! mid-pass leaves only whole batches, and a re-run converges by replay:
-//! deduplication collapses what already landed. Watermarks are the exception
-//! that proves the rule: they land in the final batch, because a watermark
-//! claiming a file consumed while its events are still unlanded would let a
-//! later `--changed-only` pass skip exactly the rows a crash dropped.
+//! `config.ingest.max_batch_events` canonical events or
+//! `config.ingest.max_batch_files` source files, whichever comes first, and
+//! yields the writer slot between batches. The file bound exists beside the
+//! event bound (`aub-va6s`), not instead of it: a corpus whose files carry
+//! few events each could otherwise accumulate thousands of files before the
+//! event bound alone ever closed a batch, so a commit boundary expressed
+//! purely in events never actually bounds how long the corpus goes without
+//! one. Each batch commits atomically or not at all; a crash mid-pass leaves
+//! only whole batches, and a re-run converges by replay: deduplication
+//! collapses what already landed. Watermarks are the exception that proves
+//! the rule: they land in the final batch, because a watermark claiming a
+//! file consumed while its events are still unlanded would let a later
+//! `--changed-only` pass skip exactly the rows a crash dropped.
+//!
+//! The pass also reports its own progress to a caller-supplied sink, at
+//! least once every [`PROGRESS_FILE_INTERVAL`] files or
+//! [`PROGRESS_TIME_INTERVAL`], whichever comes first (`aub-va6s`): files done
+//! of the total discovered, sessions and usage events landed so far, and how
+//! long the pass has run. A first ingest over a large corpus can hold the
+//! writer lock, in bounded batches, for many minutes; without this, a
+//! process printing nothing for that long reads as hung rather than working.
 //!
 //! Two modes. The default pass parses every discovered file whole, and each
 //! file's fresh parse replaces its previous contribution, so a parser-version
@@ -53,7 +67,7 @@ use crate::dedup::{
     HeuristicKeyCollision, canonical_identity, canonical_payload_digest, deduplicate,
 };
 use crate::domain::ids::SourceNamespace;
-use crate::domain::time::{Clock, MonotonicDuration, UtcTimestamp};
+use crate::domain::time::{Clock, MonotonicDuration, MonotonicInstant, UtcTimestamp};
 use crate::error::Error;
 use crate::store::ingest::PersistEvent;
 use crate::store::ingest_quarantine::{DedupCollisionDescriptor, NewQuarantineItem};
@@ -128,13 +142,79 @@ pub struct LandedBatch {
 /// whole multi-thousand-batch pass pays seconds for it at most.
 const INTER_BATCH_YIELD: Duration = Duration::from_millis(1);
 
+/// The file-count interval a progress report resets on (`aub-va6s`): a line
+/// goes out at least once per this many files parsed.
+const PROGRESS_FILE_INTERVAL: u64 = 100;
+
+/// The elapsed-time interval a progress report resets on, so a line still
+/// goes out while the pass sits in the persist loop, where files done stops
+/// advancing but a long batch sequence is exactly what needs to keep moving
+/// visibly.
+const PROGRESS_TIME_INTERVAL: MonotonicDuration = MonotonicDuration::from_seconds(30);
+
+/// One progress snapshot the pass reports to `progress_sink`, so a long first
+/// ingest is distinguishable from a hung one (`aub-va6s`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngestProgress {
+    /// Files fully accounted for (parsed, skipped or found unreadable) so far.
+    pub files_done: u64,
+    /// Files discovered across the covered sources, the denominator.
+    pub files_total: u64,
+    /// Session rows landed by every batch committed so far.
+    pub sessions_written: u64,
+    /// Canonical usage events landed by every batch committed so far, newly
+    /// written plus already-ingested, the same convention [`LandedBatch::events`]
+    /// uses for one batch.
+    pub events_written: u64,
+    /// Time elapsed since the pass started, on the monotonic clock.
+    pub elapsed: MonotonicDuration,
+}
+
+/// Decides when the pass is due to report progress, and remembers where it
+/// last reported from. Files done only advances during the discovery-and-parse
+/// loop; the elapsed side keeps firing through the persist loop that follows.
+struct ProgressGate {
+    started_at: MonotonicInstant,
+    last_report_files: u64,
+    last_report_at: MonotonicInstant,
+}
+
+impl ProgressGate {
+    fn new(now: MonotonicInstant) -> Self {
+        Self {
+            started_at: now,
+            last_report_files: 0,
+            last_report_at: now,
+        }
+    }
+
+    /// Whether a report is due at `files_done` and `now`, resetting the gate's
+    /// own bookkeeping when it fires so the next report waits a full interval
+    /// again.
+    fn due(&mut self, files_done: u64, now: MonotonicInstant) -> bool {
+        let by_files = files_done.saturating_sub(self.last_report_files) >= PROGRESS_FILE_INTERVAL;
+        let by_time = now.duration_since(self.last_report_at) >= PROGRESS_TIME_INTERVAL;
+        if !by_files && !by_time {
+            return false;
+        }
+        self.last_report_files = files_done;
+        self.last_report_at = now;
+        true
+    }
+
+    fn elapsed(&self, now: MonotonicInstant) -> MonotonicDuration {
+        now.duration_since(self.started_at)
+    }
+}
+
 /// Reads every configured transcript source and lands the parsed batch.
 ///
 /// One pass, bounded batches: the canonical events split into transactions of
-/// at most `config.ingest.max_batch_events`, each transaction atomic, the
-/// writer slot yielded between consecutive batches. Every row the pass writes,
-/// and the generation it is reported under, commit together or not at all
-/// within one batch. A file that cannot be read is named in the report and the
+/// at most `config.ingest.max_batch_events` events or
+/// `config.ingest.max_batch_files` files, each transaction atomic, the writer
+/// slot yielded between consecutive batches. Every row the pass writes, and
+/// the generation it is reported under, commit together or not at all within
+/// one batch. A file that cannot be read is named in the report and the
 /// remaining files still land; the caller decides the exit class from
 /// `unreadable_files`.
 ///
@@ -142,20 +222,34 @@ const INTER_BATCH_YIELD: Duration = Duration::from_millis(1);
 /// so a caller can emit the structured diagnostics that correlate batches by
 /// stable identifiers while the pass is still running. A sink error is a run
 /// error: diagnostics that silently stop mid-pass would read as progress.
+///
+/// `progress_sink` observes progress at least once every
+/// [`PROGRESS_FILE_INTERVAL`] files or [`PROGRESS_TIME_INTERVAL`], whichever
+/// comes first, across both the discovery-and-parse phase and the persist
+/// phase that follows it (`aub-va6s`). Like `batch_sink`, a sink error is a
+/// run error.
 pub fn run(
     conn: &mut Connection,
     config: &Config,
     options: &IngestOptions,
     clock: &impl Clock,
     batch_sink: &mut dyn FnMut(&LandedBatch) -> Result<(), Error>,
+    progress_sink: &mut dyn FnMut(&IngestProgress) -> Result<(), Error>,
 ) -> Result<IngestReport, Error> {
     let now = clock.now();
+    let pass_started_at = clock.monotonic_now();
+    let mut progress = ProgressGate::new(pass_started_at);
     let sources = ingest_sources(config, options)?;
     let discovered = discover(&sources, &DiscoveryOptions::default()).map_err(discovery_error)?;
+    let files_total: u64 = discovered
+        .iter()
+        .map(|source| source.files.len() as u64)
+        .sum();
 
     let mut files_scanned = 0u64;
     let mut files_parsed = 0u64;
     let mut files_skipped = 0u64;
+    let mut files_done = 0u64;
     let mut unreadable_files = Vec::new();
     let mut quarantined_items: Vec<NewQuarantineItem> = Vec::new();
     let mut events: Vec<NormalizedUsageEvent> = Vec::new();
@@ -178,6 +272,21 @@ pub fn run(
         files_scanned += source.files.len() as u64;
 
         for file in &source.files {
+            // Counted as done here, before this file's own outcome is known,
+            // so every branch below (skipped, unreadable or parsed) is
+            // covered by one counter rather than three that could drift.
+            files_done += 1;
+            let file_check_at = clock.monotonic_now();
+            if progress.due(files_done, file_check_at) {
+                progress_sink(&IngestProgress {
+                    files_done,
+                    files_total,
+                    sessions_written: 0,
+                    events_written: 0,
+                    elapsed: progress.elapsed(file_check_at),
+                })?;
+            }
+
             let file_str = file.display().to_string();
             let relative_path = relative_to_root(file, &source_config.root);
             relative_by_source_file.insert(file_str.clone(), relative_path.clone());
@@ -283,10 +392,14 @@ pub fn run(
     }
 
     // Bounded batches (PLAN.md section 11.2): the pass lands its canonical
-    // events in transactions of at most the configured maximum, yielding the
-    // writer slot between consecutive batches. What rides with which batch is
-    // decided here, once, so each transaction stays atomic and the pass
-    // converges on a re-run after any interruption:
+    // events in transactions of at most the configured maximum events, or
+    // spanning at most the configured maximum files, whichever comes first
+    // (`aub-va6s`). The file bound exists because a corpus whose files carry
+    // few events each could otherwise accumulate thousands of files, holding
+    // the writer lock's worth of real wall-clock parsing and bookkeeping time
+    // for the whole pass, before the event bound alone ever closed a batch.
+    // What rides with which batch is decided here, once, so each transaction
+    // stays atomic and the pass converges on a re-run after any interruption:
     //
     //   events        the chunk they were split into;
     //   sessions      the bounds the chunk's own events imply;
@@ -300,20 +413,17 @@ pub fn run(
     //                 contribution in the final batch, the last opinion the
     //                 pass states about it.
     let max_batch_events = config.ingest.max_batch_events as usize;
+    let max_batch_files = config.ingest.max_batch_files as usize;
     let mut first_chunk_of_file: BTreeMap<String, usize> = BTreeMap::new();
-    for (index, chunk) in persist_events.chunks(max_batch_events).enumerate() {
-        for persist in chunk {
+    let chunks: Vec<&[PersistEvent]> =
+        split_into_batches(&persist_events, max_batch_events, max_batch_files);
+    for (index, chunk) in chunks.iter().enumerate() {
+        for persist in chunk.iter() {
             first_chunk_of_file
                 .entry(persist.event.source_file().to_string())
                 .or_insert(index);
         }
     }
-
-    let chunks: Vec<&[PersistEvent]> = if persist_events.is_empty() {
-        vec![&[]]
-    } else {
-        persist_events.chunks(max_batch_events).collect()
-    };
     let total_chunks = chunks.len();
 
     let mut batches: Vec<LandedBatch> = Vec::new();
@@ -402,6 +512,22 @@ pub fn run(
         };
         batch_sink(&landed)?;
         batches.push(landed);
+
+        // Files done stopped advancing once the persist loop began; the
+        // elapsed side of the gate is what keeps firing here, so a long
+        // sequence of batches still reports rather than going silent between
+        // the last file parsed and the pass's own return.
+        let batch_check_at = clock.monotonic_now();
+        if progress.due(files_done, batch_check_at) {
+            progress_sink(&IngestProgress {
+                files_done,
+                files_total,
+                sessions_written: totals.sessions_upserted.value(),
+                events_written: totals.events_written.value()
+                    + totals.events_already_ingested.value(),
+                elapsed: progress.elapsed(batch_check_at),
+            })?;
+        }
     }
 
     Ok(IngestReport {
@@ -426,6 +552,45 @@ fn sum_rows(
     right: crate::domain::rows::RowCount,
 ) -> crate::domain::rows::RowCount {
     crate::domain::rows::RowCount::new(left.value() + right.value())
+}
+
+/// Splits `persist_events` into batches bounded by `max_batch_events`
+/// canonical events or `max_batch_files` distinct source files, whichever
+/// comes first (`aub-va6s`). The file bound exists beside the event bound,
+/// not instead of it: a corpus whose files carry few events each could
+/// otherwise accumulate thousands of files, and the real cost of a pass over
+/// them, before the event bound alone ever closed a batch. A batch still
+/// closes exactly where the event bound alone would (a file's events can
+/// still land split across two batches, unchanged from before this bead):
+/// the file bound only ever closes a batch *earlier* than the event bound
+/// would, never keeps a file whole that the event bound would have split.
+fn split_into_batches(
+    persist_events: &[PersistEvent],
+    max_batch_events: usize,
+    max_batch_files: usize,
+) -> Vec<&[PersistEvent]> {
+    if persist_events.is_empty() {
+        return vec![&persist_events[..0]];
+    }
+
+    let mut batches: Vec<&[PersistEvent]> = Vec::new();
+    let mut batch_start = 0usize;
+    let mut batch_files: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    for (index, persist) in persist_events.iter().enumerate() {
+        let events_in_batch = index - batch_start;
+        let file = persist.event.source_file();
+        let is_new_file = !batch_files.contains(file);
+        let would_overflow_events = events_in_batch >= max_batch_events;
+        let would_overflow_files = is_new_file && batch_files.len() >= max_batch_files;
+        if events_in_batch > 0 && (would_overflow_events || would_overflow_files) {
+            batches.push(&persist_events[batch_start..index]);
+            batch_start = index;
+            batch_files.clear();
+        }
+        batch_files.insert(file);
+    }
+    batches.push(&persist_events[batch_start..]);
+    batches
 }
 
 /// The configured sources this pass covers, filtered by the options.
@@ -568,4 +733,171 @@ fn session_pass<'a>(events: impl IntoIterator<Item = &'a NormalizedUsageEvent>) 
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod progress_gate_tests {
+    use super::*;
+
+    fn instant(nanos: u64) -> MonotonicInstant {
+        // `MonotonicInstant` has no public constructor other than the clock
+        // it is read from; a `FakeClock` advanced by `nanos` from its own
+        // zero epoch gives one without pulling the real clock into a unit
+        // test.
+        let mut clock = crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(0));
+        clock.advance(MonotonicDuration::from_nanos(nanos));
+        clock.monotonic_now()
+    }
+
+    /// The file-count side fires at exactly [`PROGRESS_FILE_INTERVAL`] files
+    /// since the last report, not one file later or earlier (`aub-va6s`).
+    #[test]
+    fn the_file_interval_fires_at_exactly_the_boundary() {
+        let mut gate = ProgressGate::new(instant(0));
+        assert!(
+            !gate.due(PROGRESS_FILE_INTERVAL - 1, instant(0)),
+            "one file short of the interval must not report"
+        );
+        assert!(
+            gate.due(PROGRESS_FILE_INTERVAL, instant(0)),
+            "exactly at the interval must report"
+        );
+    }
+
+    /// The elapsed-time side fires at exactly [`PROGRESS_TIME_INTERVAL`]
+    /// since the last report, independent of the file count: this is what
+    /// keeps a report going out while files done has stopped advancing, in
+    /// the persist loop.
+    #[test]
+    fn the_time_interval_fires_at_exactly_the_boundary_regardless_of_file_count() {
+        let mut gate = ProgressGate::new(instant(0));
+        let just_under = PROGRESS_TIME_INTERVAL.as_nanos() - 1;
+        assert!(
+            !gate.due(0, instant(just_under)),
+            "one nanosecond short of the interval must not report"
+        );
+        assert!(
+            gate.due(0, instant(PROGRESS_TIME_INTERVAL.as_nanos())),
+            "exactly at the interval must report even with zero files done"
+        );
+    }
+
+    /// A fired report resets both sides of the gate, so the *next* report
+    /// waits a full interval from the point it fired, not from the pass's
+    /// start.
+    #[test]
+    fn firing_resets_the_gate_so_the_next_report_waits_a_full_interval_again() {
+        let mut gate = ProgressGate::new(instant(0));
+        assert!(gate.due(PROGRESS_FILE_INTERVAL, instant(0)));
+        assert!(
+            !gate.due(PROGRESS_FILE_INTERVAL + 1, instant(0)),
+            "one file past a just-fired report must not report again"
+        );
+        assert!(gate.due(2 * PROGRESS_FILE_INTERVAL, instant(0)));
+    }
+}
+
+#[cfg(test)]
+mod batch_split_tests {
+    use super::*;
+    use crate::dedup::canonical_identity;
+    use crate::domain::ids::NativeSessionId;
+    use crate::domain::tokens::{
+        CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, UsageVector,
+    };
+    use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
+    use crate::transcripts::parser::{
+        EvidenceClassification, ParserVersion, STRONG_IDENTITY_PREFIX,
+    };
+
+    /// A minimal strong-identity event naming one source file, enough for
+    /// `split_into_batches` to key on: the boundary logic reads only the
+    /// event's own `source_file()`. Mirrors `crate::store::ingest`'s own
+    /// `strong_event` test fixture, so a fixture already proven against the
+    /// identity framework is reused rather than a second one invented here.
+    fn strong_event(id: &str, file: &str) -> NormalizedUsageEvent {
+        let usage = UsageVector::new(
+            KnownTokenVector::new(
+                InputTokens::new(10),
+                OutputTokens::new(5),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            ),
+            BTreeMap::new(),
+            CoverageCompleteness::Complete,
+            EvidenceQuality::Measured,
+        );
+        NormalizedUsageEvent::new(
+            usage,
+            EvidenceClassification::Reported,
+            Provenance::new(vec![
+                file.to_string(),
+                format!("{STRONG_IDENTITY_PREFIX}{id}"),
+            ]),
+            ParserVersion::new("test-1"),
+        )
+        .with_session(crate::domain::ids::SessionId::new(
+            SourceNamespace::new("test"),
+            NativeSessionId::new("s1"),
+        ))
+    }
+
+    fn persist_events_for(files: &[&str]) -> Vec<PersistEvent> {
+        files
+            .iter()
+            .enumerate()
+            .map(|(index, file)| {
+                let event = strong_event(&format!("m{index}"), file);
+                let identity = canonical_identity(&event);
+                PersistEvent {
+                    event,
+                    namespace: SourceNamespace::new("test"),
+                    canonical_event_id: identity.canonical_event_id,
+                    native_event_id: identity.native_event_id,
+                    heuristic_key: identity.heuristic_key,
+                    heuristic_algorithm_version: None,
+                    canonical_payload_digest: "digest".to_string(),
+                    relative_path: Some(file.to_string()),
+                }
+            })
+            .collect()
+    }
+
+    /// The event bound alone still behaves exactly as a plain `.chunks()`
+    /// call would (`aub-lqe.18`'s own contract, unchanged by `aub-va6s`): a
+    /// generous file bound never closes a batch the event bound would not
+    /// already have closed.
+    #[test]
+    fn the_event_bound_alone_splits_exactly_like_a_fixed_size_chunk() {
+        let events = persist_events_for(&["a.jsonl"; 5]);
+        let batches = split_into_batches(&events, 2, 200);
+        let sizes: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    /// The file bound closes a batch earlier than a generous event bound
+    /// would, exactly at the file count configured (`aub-va6s`): the
+    /// mechanism a sparse-event corpus needs to commit on a predictable file
+    /// cadence rather than accumulating unboundedly in events.
+    #[test]
+    fn the_file_bound_closes_a_batch_before_the_event_bound_would() {
+        let events = persist_events_for(&["a.jsonl", "b.jsonl", "c.jsonl", "d.jsonl", "e.jsonl"]);
+        let batches = split_into_batches(&events, 10_000, 2);
+        let sizes: Vec<usize> = batches.iter().map(|b| b.len()).collect();
+        assert_eq!(
+            sizes,
+            vec![2, 2, 1],
+            "a file bound of 2 must close a batch every two files"
+        );
+    }
+
+    /// An empty pass still returns one (empty) batch, never zero: the caller
+    /// loop always runs at least once, which is what advances the
+    /// generation counter even for a pass with nothing new to land.
+    #[test]
+    fn an_empty_pass_returns_one_empty_batch() {
+        let batches = split_into_batches(&[], 10, 10);
+        assert_eq!(batches.len(), 1);
+        assert!(batches[0].is_empty());
+    }
 }
