@@ -256,7 +256,11 @@ mod tests {
         };
         match outcome.status {
             CheckStatus::NotYetAvailable { owning_bead } => assert_eq!(owning_bead, "aub-mgv.3"),
-            _ => panic!("expected not-yet-available"),
+            // Named rather than a wildcard: the crate denies a catch-all over an enum, so a
+            // status added later fails this assertion instead of being folded into the panic.
+            CheckStatus::Pass | CheckStatus::Fail(_) | CheckStatus::NotApplicable(_) => {
+                panic!("expected not-yet-available")
+            }
         }
     }
 
