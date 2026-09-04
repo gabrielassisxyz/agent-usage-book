@@ -4,6 +4,11 @@
 //! signed residual distinguishability (overprediction vs underexplanation), unexplained residual
 //! naming across human and JSON surfaces, full provenance manifest tracking, diagnostic patterns,
 //! and single-source calibration proof via the shared calibration repository.
+//!
+//! aub-dpn.2 extends this with residual-uncertainty propagation: quantization derived
+//! per observation, calibration uncertainty carried through interval arithmetic, explicit
+//! timing alignment, the residual as an interval in both renderers, a zero-containing
+//! interval reported as reconciling, and the non-narrowing law as a property test.
 
 use std::collections::BTreeSet;
 
@@ -26,7 +31,7 @@ use agent_usage_book::presentation::{reconciliation_json, render_reconciliation}
 use agent_usage_book::reconciliation::{
     CandidateInterval, CandidateObservation, CandidateUsageEvent, EligibilityCondition,
     IntervalCoverage, IntervalSettlement, IntervalUsage, ReconciliationOutcome, ResidualPattern,
-    classify_patterns, evaluate_eligibility, reconcile,
+    TimingAlignmentUncertainty, classify_patterns, evaluate_eligibility, reconcile,
 };
 use agent_usage_book::store::account::{AccountId, observe_account};
 use agent_usage_book::store::calibration::{WindowCalibration, activate, load_result};
@@ -118,6 +123,9 @@ fn base_eligible_candidate(cal: WindowCalibration) -> CandidateInterval {
         window_key: window_key.clone(),
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(100_000).unwrap()),
         resets_at,
+        reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(1_000).unwrap())
+            .unwrap(),
+        quantization: QuantizationSemantics::RoundedToNearest,
     };
 
     let end_obs = CandidateObservation {
@@ -127,6 +135,9 @@ fn base_eligible_candidate(cal: WindowCalibration) -> CandidateInterval {
         window_key: window_key.clone(),
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(200_000).unwrap()),
         resets_at,
+        reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(1_000).unwrap())
+            .unwrap(),
+        quantization: QuantizationSemantics::RoundedToNearest,
     };
 
     let usage_events = vec![CandidateUsageEvent {
@@ -148,6 +159,7 @@ fn base_eligible_candidate(cal: WindowCalibration) -> CandidateInterval {
         calibration_health: Some(CalibrationHealth::Current),
         settlement: IntervalSettlement::settled(),
         local_usage: IntervalUsage::new(usage_events, Credits::from_micros(5_000_000)),
+        timing_alignment: TimingAlignmentUncertainty::none(),
     }
 }
 
@@ -978,4 +990,378 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     let cal2_witness = WitnessId::WindowCalibration(WindowCalibrationId::new("wcr-proof-2"));
     assert!(res2.provenance().witnesses().contains(&cal2_witness));
     assert!(!res2.provenance().witnesses().contains(&cal1_witness));
+}
+
+// ---------------------------------------------------------------------------
+// aub-dpn.2: residual uncertainty propagated from its three sources
+// ---------------------------------------------------------------------------
+
+/// A calibration row with an explicitly chosen coefficient uncertainty band, so a
+/// test can widen calibration uncertainty in isolation.
+fn insert_calibration_with_band(
+    conn: &rusqlite::Connection,
+    cal_id: &str,
+    fitted_micros: i64,
+    uncertainty_low_micros: i64,
+    uncertainty_high_micros: i64,
+) {
+    conn.execute(
+        "INSERT INTO window_calibration_result (
+            calibration_id, provider, plan_tier, window_semantic_key, meter_semantics_id,
+            billing_semantics_id, cost_model_id, fitted_micros_per_point,
+            equivalent_full_window_capacity_micros, fit_residual_micros, uncertainty_low_micros,
+            uncertainty_high_micros, lag_estimate_nanos, lag_handling, sample_count,
+            fit_timestamp, inputs_digest, inputs_count, fitting_evidence_digest,
+            validation_evidence_digest, validation_method, validation_version,
+            out_of_sample_residual_micros, statistical_method, statistical_parameters,
+            condition_number_micros, observation_coverage_requirement, settling_policy,
+            excluded_samples, activation_policy_version, aub_version, source_revision,
+            valid_from, valid_until, knowledge_time
+        ) VALUES (
+            ?1, 'anthropic', 'max', 'five_hour', 'meter-v1', 'billing-v1', 'cm-1',
+            ?2, 12000000, 4200, ?3, ?4, 90000000000, 'shifted-by-estimate', 40,
+            1000, '0123456789abcdef', 3,
+            '0123456789abcdef',
+            '0123456789abcdef',
+            'holdout', 'v2', 7000, 'ols', '{\"ridge\":0}',
+            3500000, 'ninety-percent', 'plateau-3', '[]', 'ap-v1', '0.1.0', 'abc1234',
+            0, 1000000000000, 1000
+        )",
+        rusqlite::params![
+            cal_id,
+            fitted_micros,
+            uncertainty_low_micros,
+            uncertainty_high_micros
+        ],
+    )
+    .expect("insert window_calibration_result with band");
+}
+
+/// A base-eligible candidate with per-observation reported resolution and an
+/// explicit timing-alignment uncertainty. The interval carries movement of
+/// 100_000 ppm and 5_000_000 micro-credits of locally explained usage.
+fn eligible_with(
+    cal: WindowCalibration,
+    start_resolution_ppm: i32,
+    end_resolution_ppm: i32,
+    timing: TimingAlignmentUncertainty,
+) -> CandidateInterval {
+    let mut cand = base_eligible_candidate(cal);
+    cand.start_observation.reported_resolution =
+        ReportedResolution::new(QuotaFractionPpm::new(start_resolution_ppm).unwrap()).unwrap();
+    cand.end_observation.reported_resolution =
+        ReportedResolution::new(QuotaFractionPpm::new(end_resolution_ppm).unwrap()).unwrap();
+    cand.timing_alignment = timing;
+    cand
+}
+
+fn computed(
+    outcome: ReconciliationOutcome,
+) -> agent_usage_book::reconciliation::ReconciledResidual {
+    match outcome {
+        ReconciliationOutcome::Computed(res) => *res,
+        ReconciliationOutcome::NotComputed { failing_conditions } => {
+            panic!("expected Computed, got NotComputed: {failing_conditions:?}")
+        }
+    }
+}
+
+// Criterion: quantization uncertainty is derived per observation from its persisted
+// resolution, never from one global tolerance.
+#[test]
+fn unit_quantization_bounds_are_per_observation_not_a_global_tolerance() {
+    let conn = fixture_db();
+    insert_calibration(&conn, "cal-q", "anthropic", "max", "five_hour", 100_000);
+    let cal = load_fixture_calibration(&conn, "cal-q");
+
+    // start reported at 2_000 ppm, end reported at 10_000 ppm, both round-to-nearest.
+    let asymmetric = computed(reconcile(&eligible_with(
+        cal.clone(),
+        2_000,
+        10_000,
+        TimingAlignmentUncertainty::none(),
+    )));
+    // Interval subtraction of the two bands: width is the sum of the two resolutions.
+    assert_eq!(
+        asymmetric.observed_meter_delta_bounds().width_ppm(),
+        12_000,
+        "delta bounds must widen by each observation's own resolution"
+    );
+
+    // Both observations at 2_000 ppm: a single global tolerance could not produce
+    // both this width and the one above.
+    let symmetric = computed(reconcile(&eligible_with(
+        cal,
+        2_000,
+        2_000,
+        TimingAlignmentUncertainty::none(),
+    )));
+    assert_eq!(symmetric.observed_meter_delta_bounds().width_ppm(), 4_000);
+}
+
+// Criterion / Done when: the same scenario at a coarse vs a fine provider
+// resolution produces a wider interval for the coarse one.
+#[test]
+fn unit_coarser_provider_resolution_produces_a_wider_residual_interval() {
+    let conn = fixture_db();
+    insert_calibration(&conn, "cal-r", "anthropic", "max", "five_hour", 100_000);
+    let cal = load_fixture_calibration(&conn, "cal-r");
+
+    let coarse = computed(reconcile(&eligible_with(
+        cal.clone(),
+        50_000,
+        50_000,
+        TimingAlignmentUncertainty::none(),
+    )));
+    let fine = computed(reconcile(&eligible_with(
+        cal,
+        1_000,
+        1_000,
+        TimingAlignmentUncertainty::none(),
+    )));
+
+    let coarse_width = coarse.unexplained_residual_interval().upper().micros()
+        - coarse.unexplained_residual_interval().lower().micros();
+    let fine_width = fine.unexplained_residual_interval().upper().micros()
+        - fine.unexplained_residual_interval().lower().micros();
+    assert!(
+        coarse_width > fine_width,
+        "coarse interval width {coarse_width} must exceed fine width {fine_width}"
+    );
+}
+
+// Criterion: calibration uncertainty propagates through the credits conversion with
+// interval arithmetic. Quantization is held to Exact so the only width in the
+// residual interval comes from the coefficient's stated band.
+#[test]
+fn unit_calibration_uncertainty_propagates_through_the_credits_conversion() {
+    let conn = fixture_db();
+    insert_calibration_with_band(&conn, "cal-narrow", 100_000, 99_000, 101_000);
+    insert_calibration_with_band(&conn, "cal-wide", 100_000, 90_000, 110_000);
+
+    let exact = |cal| {
+        let mut cand = eligible_with(cal, 1_000, 1_000, TimingAlignmentUncertainty::none());
+        cand.start_observation.quantization = QuantizationSemantics::Exact;
+        cand.end_observation.quantization = QuantizationSemantics::Exact;
+        cand
+    };
+
+    let narrow = computed(reconcile(&exact(load_fixture_calibration(
+        &conn,
+        "cal-narrow",
+    ))));
+    let wide = computed(reconcile(&exact(load_fixture_calibration(
+        &conn, "cal-wide",
+    ))));
+
+    // Movement is a fixed 100_000 ppm point; the interval width is
+    // (coefficient_upper - coefficient_lower) * 100_000 micro-credits.
+    let width = |r: &agent_usage_book::reconciliation::ReconciledResidual| {
+        r.unexplained_residual_interval().upper().micros()
+            - r.unexplained_residual_interval().lower().micros()
+    };
+    assert_eq!(width(&narrow), 2_000 * 100_000);
+    assert_eq!(width(&wide), 20_000 * 100_000);
+}
+
+// Criterion: a residual interval containing zero reconciles within uncertainty and
+// is not reported as a finding.
+#[test]
+fn unit_residual_interval_containing_zero_reconciles_within_uncertainty() {
+    let conn = fixture_db();
+    insert_calibration(&conn, "cal-z", "anthropic", "max", "five_hour", 100_000);
+    let cal = load_fixture_calibration(&conn, "cal-z");
+
+    // Observed movement is 100_000 ppm at 100_000 micros/point => 10_000_000_000
+    // micro-credits. Locally explaining exactly that puts the point residual at zero
+    // and the interval straddling it.
+    let mut cand = eligible_with(
+        cal.clone(),
+        1_000,
+        1_000,
+        TimingAlignmentUncertainty::none(),
+    );
+    cand.local_usage = IntervalUsage::new(
+        cand.local_usage.events.clone(),
+        Credits::from_micros(10_000_000_000),
+    );
+    let res = computed(reconcile(&cand));
+
+    assert!(res.reconciles_within_uncertainty());
+    assert!(res.unexplained_residual_interval().lower().micros() < 0);
+    assert!(res.unexplained_residual_interval().upper().micros() > 0);
+
+    let human = render_reconciliation(&ReconciliationOutcome::Computed(Box::new(res.clone())));
+    assert!(human.contains("reconciles within uncertainty"));
+    assert!(!human.contains("residual interval excludes zero"));
+
+    let json = reconciliation_json(&ReconciliationOutcome::Computed(Box::new(res)));
+    assert_eq!(
+        json.get("reconciles_within_uncertainty").unwrap(),
+        &serde_json::json!(true)
+    );
+
+    // Mutation control: a residual interval that excludes zero is not called reconciling.
+    let mut finding = eligible_with(cal, 1_000, 1_000, TimingAlignmentUncertainty::none());
+    finding.local_usage = IntervalUsage::new(
+        finding.local_usage.events.clone(),
+        Credits::from_micros(5_000_000),
+    );
+    let finding_res = computed(reconcile(&finding));
+    assert!(!finding_res.reconciles_within_uncertainty());
+    assert!(
+        render_reconciliation(&ReconciliationOutcome::Computed(Box::new(finding_res)))
+            .contains("residual interval excludes zero")
+    );
+}
+
+// Contract: both endpoints of the residual interval survive into human and JSON output.
+#[test]
+fn contract_both_residual_interval_endpoints_reach_human_and_json() {
+    let conn = fixture_db();
+    insert_calibration(&conn, "cal-c", "anthropic", "max", "five_hour", 100_000);
+    let cal = load_fixture_calibration(&conn, "cal-c");
+
+    let outcome = reconcile(&eligible_with(
+        cal,
+        2_000,
+        4_000,
+        TimingAlignmentUncertainty::from_credit_half_width(Credits::from_micros(1_000_000)),
+    ));
+    let res = computed(outcome.clone());
+    let lower = res.unexplained_residual_interval().lower().micros();
+    let upper = res.unexplained_residual_interval().upper().micros();
+    assert!(lower < upper, "a non-degenerate interval is expected here");
+
+    let human = render_reconciliation(&outcome);
+    assert!(human.contains(&format!(
+        "unexplained residual interval: [{lower} .. {upper}] credits"
+    )));
+
+    let json = reconciliation_json(&outcome);
+    let interval = json
+        .get("unexplained_residual_interval")
+        .expect("interval key present");
+    assert_eq!(
+        interval.get("lower").unwrap(),
+        &serde_json::json!(lower.to_string())
+    );
+    assert_eq!(
+        interval.get("upper").unwrap(),
+        &serde_json::json!(upper.to_string())
+    );
+    assert_eq!(interval.get("unit").unwrap(), &serde_json::json!("credits"));
+    assert!(json.get("observed_meter_credits_interval").is_some());
+    assert!(json.get("observed_meter_delta_bounds_ppm").is_some());
+}
+
+// Isolated timing-alignment coverage (bead's dedicated section): hold meter
+// quantization and calibration uncertainty fixed, widen only timing alignment, and
+// assert the residual interval cannot narrow. Then assert timing-alignment
+// provenance reaches both renderers.
+#[test]
+fn unit_widening_only_timing_alignment_never_narrows_and_is_rendered() {
+    let conn = fixture_db();
+    insert_calibration(&conn, "cal-t", "anthropic", "max", "five_hour", 100_000);
+    let cal = load_fixture_calibration(&conn, "cal-t");
+
+    let narrow = computed(reconcile(&eligible_with(
+        cal.clone(),
+        1_000,
+        1_000,
+        TimingAlignmentUncertainty::none(),
+    )));
+    let wide_outcome = reconcile(&eligible_with(
+        cal,
+        1_000,
+        1_000,
+        TimingAlignmentUncertainty::from_credit_half_width(Credits::from_micros(7_000_000)),
+    ));
+    let wide = computed(wide_outcome.clone());
+
+    assert!(
+        wide.unexplained_residual_interval().lower().micros()
+            <= narrow.unexplained_residual_interval().lower().micros()
+    );
+    assert!(
+        wide.unexplained_residual_interval().upper().micros()
+            >= narrow.unexplained_residual_interval().upper().micros()
+    );
+    let narrow_width = narrow.unexplained_residual_interval().upper().micros()
+        - narrow.unexplained_residual_interval().lower().micros();
+    let wide_width = wide.unexplained_residual_interval().upper().micros()
+        - wide.unexplained_residual_interval().lower().micros();
+    assert_eq!(
+        wide_width - narrow_width,
+        14_000_000,
+        "a +/- band widens by twice its half width"
+    );
+
+    let human = render_reconciliation(&wide_outcome);
+    assert!(human.contains("timing alignment uncertainty: +/-7000000 credits"));
+    let json = reconciliation_json(&wide_outcome);
+    assert_eq!(
+        json.get("timing_alignment_uncertainty")
+            .and_then(|t| t.get("credits_micros_half_width"))
+            .unwrap(),
+        &serde_json::json!(7_000_000)
+    );
+}
+
+proptest! {
+    // The non-narrowing law across all three uncertainty sources: widening any one
+    // input can never narrow the residual interval.
+    #[test]
+    fn prop_widening_any_uncertainty_source_never_narrows_residual_interval(
+        base_resolution in 1_000i32..=90_000i32,
+        resolution_widen in 1i32..=90_000i32,
+        band in 0i64..=40_000i64,
+        band_widen in 1i64..=40_000i64,
+        base_timing in 0i64..=3_000_000i64,
+        timing_widen in 1i64..=5_000_000i64,
+        which in 0u8..3u8,
+    ) {
+        let conn = fixture_db();
+        insert_calibration_with_band(&conn, "cal-a", 100_000, 100_000 - band, 100_000 + band);
+        let cal_a = load_fixture_calibration(&conn, "cal-a");
+
+        let base_timing_unc =
+            TimingAlignmentUncertainty::from_credit_half_width(Credits::from_micros(base_timing));
+        let base = eligible_with(cal_a.clone(), base_resolution, base_resolution, base_timing_unc);
+
+        let widened = match which {
+            0 => eligible_with(
+                cal_a.clone(),
+                base_resolution + resolution_widen,
+                base_resolution + resolution_widen,
+                base_timing_unc,
+            ),
+            1 => {
+                insert_calibration_with_band(
+                    &conn,
+                    "cal-b",
+                    100_000,
+                    100_000 - band - band_widen,
+                    100_000 + band + band_widen,
+                );
+                let cal_b = load_fixture_calibration(&conn, "cal-b");
+                eligible_with(cal_b, base_resolution, base_resolution, base_timing_unc)
+            }
+            _ => eligible_with(
+                cal_a.clone(),
+                base_resolution,
+                base_resolution,
+                TimingAlignmentUncertainty::from_credit_half_width(Credits::from_micros(
+                    base_timing + timing_widen,
+                )),
+            ),
+        };
+
+        let base_res = computed(reconcile(&base));
+        let widened_res = computed(reconcile(&widened));
+        let base_interval = base_res.unexplained_residual_interval();
+        let widened_interval = widened_res.unexplained_residual_interval();
+        prop_assert!(widened_interval.lower().micros() <= base_interval.lower().micros());
+        prop_assert!(widened_interval.upper().micros() >= base_interval.upper().micros());
+    }
 }

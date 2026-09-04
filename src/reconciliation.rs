@@ -18,12 +18,13 @@ use std::fmt;
 use crate::attribution::account_segment::AccountEvidenceClass;
 use crate::calibration::health::CalibrationHealth;
 use crate::domain::credits::Credits;
+use crate::domain::interval::{DomainQuantity, Interval};
 use crate::domain::provenance::{
     EvidenceId, ProvenanceManifest, QuerySemantics, WindowCalibrationId, WitnessId,
 };
 use crate::domain::quota::{PercentagePoints, QuotaUsed};
 use crate::domain::time::UtcTimestamp;
-use crate::domain::window::WindowSemanticKey;
+use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowSemanticKey};
 use crate::store::account::AccountId;
 use crate::store::calibration::WindowCalibration;
 
@@ -224,6 +225,87 @@ pub struct CandidateObservation {
     pub window_key: WindowSemanticKey,
     pub quota_used: QuotaUsed,
     pub resets_at: UtcTimestamp,
+    /// Smallest increment this reading was reported at, persisted with the
+    /// observation (PLAN.md 12.5). Its quantization interval is derived here, not
+    /// from one globally guessed tolerance.
+    pub reported_resolution: ReportedResolution,
+    /// How the provider maps an underlying value onto that resolution (PLAN.md 12.5).
+    pub quantization: QuantizationSemantics,
+}
+
+impl CandidateObservation {
+    /// The admissible interval, in parts per million of quota used, that this
+    /// reading asserts once its resolution and quantization semantics are taken
+    /// into account (PLAN.md 12.5, 23.5). A reading under round-to-nearest is a
+    /// band centred on the reported value, not an infinitely precise scalar.
+    fn quantized_used_bounds_ppm(&self) -> (i64, i64) {
+        let reading = i64::from(self.quota_used.as_ppm().get());
+        let resolution = i64::from(self.reported_resolution.as_ppm().get());
+        match self.quantization {
+            QuantizationSemantics::Exact => (reading, reading),
+            QuantizationSemantics::RoundedToNearest => {
+                let below = resolution / 2;
+                (reading - below, reading + (resolution - below))
+            }
+            QuantizationSemantics::RoundedDown => (reading, reading + resolution),
+            QuantizationSemantics::RoundedUp => (reading - resolution, reading),
+            QuantizationSemantics::Unknown => (reading - resolution, reading + resolution),
+        }
+    }
+}
+
+/// The quantization-widened bounds of observed meter movement over the interval,
+/// in parts per million. The reported scalar delta always lies inside it; a coarser
+/// provider resolution widens it (PLAN.md 12.5, 23.5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeterDeltaBounds {
+    lower_ppm: i64,
+    upper_ppm: i64,
+}
+
+impl MeterDeltaBounds {
+    pub fn lower_ppm(&self) -> i64 {
+        self.lower_ppm
+    }
+
+    pub fn upper_ppm(&self) -> i64 {
+        self.upper_ppm
+    }
+
+    pub fn width_ppm(&self) -> i64 {
+        self.upper_ppm - self.lower_ppm
+    }
+}
+
+/// Timing-alignment uncertainty: the symmetric credit band by which provider
+/// accounting lag and imperfect timestamp alignment could shift the residual
+/// (PLAN.md 23.5, 35). Represented explicitly so it is never silently assumed to
+/// be zero; a caller with no lag model passes [`TimingAlignmentUncertainty::none`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimingAlignmentUncertainty {
+    half_width: Credits,
+}
+
+impl TimingAlignmentUncertainty {
+    /// A band of `+/- half_width` credits about the residual. The magnitude is
+    /// taken, so a negatively signed argument still widens rather than narrows.
+    pub fn from_credit_half_width(half_width: Credits) -> Self {
+        Self {
+            half_width: Credits::from_micros(half_width.micros().abs()),
+        }
+    }
+
+    /// No timing-alignment uncertainty. Still explicit: the residual interval
+    /// carries this value and the renderers report it.
+    pub fn none() -> Self {
+        Self {
+            half_width: Credits::from_micros(0),
+        }
+    }
+
+    pub fn half_width(&self) -> Credits {
+        self.half_width
+    }
 }
 
 /// One local usage event within the candidate interval.
@@ -338,6 +420,8 @@ pub struct CandidateInterval {
     pub calibration_health: Option<CalibrationHealth>,
     pub settlement: IntervalSettlement,
     pub local_usage: IntervalUsage,
+    /// Explicit timing-alignment uncertainty for this interval (PLAN.md 23.5, 35).
+    pub timing_alignment: TimingAlignmentUncertainty,
 }
 
 /// Evaluates all six eligibility conditions independently for a candidate interval.
@@ -426,6 +510,19 @@ pub struct ReconciledResidual {
     pub explained_interval_change: PercentagePoints,
     pub unexplained_residual: Credits,
     pub unexplained_residual_percentage_points: PercentagePoints,
+    /// Observed meter movement widened by each endpoint's quantization interval.
+    pub observed_meter_delta_bounds: MeterDeltaBounds,
+    /// Observed meter movement in credits, widened by both the quantization
+    /// bounds and the calibration coefficient's stated uncertainty, propagated
+    /// with interval arithmetic.
+    pub observed_meter_credits_interval: Interval<Credits>,
+    /// The timing-alignment uncertainty that was propagated into the residual.
+    pub timing_alignment: TimingAlignmentUncertainty,
+    /// The unexplained residual as an interval, carrying uncertainty from all
+    /// three sources: meter quantization, calibration uncertainty and timing
+    /// alignment (PLAN.md 35). A residual interval containing zero means the two
+    /// axes reconcile within measurement uncertainty and is not a finding.
+    pub unexplained_residual_interval: Interval<Credits>,
     pub calibration_id: WindowCalibrationId,
     pub provenance: ProvenanceManifest,
 }
@@ -471,6 +568,31 @@ impl ReconciledResidual {
         self.unexplained_residual_percentage_points
     }
 
+    pub fn observed_meter_delta_bounds(&self) -> MeterDeltaBounds {
+        self.observed_meter_delta_bounds
+    }
+
+    pub fn observed_meter_credits_interval(&self) -> Interval<Credits> {
+        self.observed_meter_credits_interval
+    }
+
+    pub fn timing_alignment(&self) -> TimingAlignmentUncertainty {
+        self.timing_alignment
+    }
+
+    pub fn unexplained_residual_interval(&self) -> Interval<Credits> {
+        self.unexplained_residual_interval
+    }
+
+    /// True when the residual interval contains zero: the observed and locally
+    /// explained movement reconcile within the uncertainty of the measurement,
+    /// so this interval is reported as reconciling, never as a finding
+    /// (PLAN.md 35).
+    pub fn reconciles_within_uncertainty(&self) -> bool {
+        self.unexplained_residual_interval.lower().micros() <= 0
+            && self.unexplained_residual_interval.upper().micros() >= 0
+    }
+
     pub fn calibration_id(&self) -> &WindowCalibrationId {
         &self.calibration_id
     }
@@ -484,7 +606,11 @@ impl ReconciledResidual {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReconciliationOutcome {
     /// All six eligibility conditions passed: unexplained residual computed.
-    Computed(ReconciledResidual),
+    ///
+    /// Boxed because the residual carries three uncertainty intervals and a
+    /// provenance manifest, and `NotComputed` is a short vector: the same
+    /// indirection `transcripts::native` uses for its lopsided event enum.
+    Computed(Box<ReconciledResidual>),
     /// One or more conditions failed: residual is not computed, naming failing conditions.
     NotComputed {
         failing_conditions: Vec<EligibilityCondition>,
@@ -498,7 +624,7 @@ impl ReconciliationOutcome {
 
     pub fn as_computed(&self) -> Option<&ReconciledResidual> {
         match self {
-            Self::Computed(res) => Some(res),
+            Self::Computed(res) => Some(res.as_ref()),
             Self::NotComputed { .. } => None,
         }
     }
@@ -560,6 +686,12 @@ pub fn reconcile(candidate: &CandidateInterval) -> ReconciliationOutcome {
     let unexplained_residual_percentage_points =
         PercentagePoints::new(res_points_i32).expect("clamped to valid percentage points");
 
+    let (
+        observed_meter_delta_bounds,
+        observed_meter_credits_interval,
+        unexplained_residual_interval,
+    ) = propagate_residual_uncertainty(candidate, calibration, locally_explained_credits);
+
     let mut inputs = vec![
         candidate.start_observation.observation_id.clone(),
         candidate.end_observation.observation_id.clone(),
@@ -583,7 +715,7 @@ pub fn reconcile(candidate: &CandidateInterval) -> ReconciliationOutcome {
     );
     let provenance = ProvenanceManifest::new(inputs, witnesses, query_semantics);
 
-    ReconciliationOutcome::Computed(ReconciledResidual {
+    ReconciliationOutcome::Computed(Box::new(ReconciledResidual {
         account_id: candidate.account_id,
         window_key: candidate.window_key.clone(),
         interval_start: candidate.start_observation.received_at,
@@ -594,9 +726,69 @@ pub fn reconcile(candidate: &CandidateInterval) -> ReconciliationOutcome {
         explained_interval_change,
         unexplained_residual,
         unexplained_residual_percentage_points,
+        observed_meter_delta_bounds,
+        observed_meter_credits_interval,
+        timing_alignment: candidate.timing_alignment,
+        unexplained_residual_interval,
         calibration_id: calibration.id().clone(),
         provenance,
-    })
+    }))
+}
+
+/// Propagates residual uncertainty from meter quantization, calibration
+/// uncertainty and timing alignment into an interval over the unexplained
+/// residual (PLAN.md 35). Widening any of the three inputs can only widen the
+/// result: each combination is monotone in the endpoint it is built from, which
+/// is the non-narrowing law the property test pins.
+fn propagate_residual_uncertainty(
+    candidate: &CandidateInterval,
+    calibration: &WindowCalibration,
+    locally_explained_credits: Credits,
+) -> (MeterDeltaBounds, Interval<Credits>, Interval<Credits>) {
+    let (start_lower, start_upper) = candidate.start_observation.quantized_used_bounds_ppm();
+    let (end_lower, end_upper) = candidate.end_observation.quantized_used_bounds_ppm();
+    // Interval subtraction of the two quantization bands: the widest and
+    // narrowest movement both readings admit.
+    let delta_lower = end_lower - start_upper;
+    let delta_upper = end_upper - start_lower;
+    let bounds = MeterDeltaBounds {
+        lower_ppm: delta_lower,
+        upper_ppm: delta_upper,
+    };
+
+    let coefficient = calibration.uncertainty();
+    let coefficient_lower = i128::from(coefficient.lower().micros_per_point());
+    let coefficient_upper = i128::from(coefficient.upper().micros_per_point());
+    let corners = [
+        coefficient_lower * i128::from(delta_lower),
+        coefficient_lower * i128::from(delta_upper),
+        coefficient_upper * i128::from(delta_lower),
+        coefficient_upper * i128::from(delta_upper),
+    ];
+    let credits_lower = *corners.iter().min().expect("four corners");
+    let credits_upper = *corners.iter().max().expect("four corners");
+
+    let explained = i128::from(locally_explained_credits.micros());
+    let timing = i128::from(candidate.timing_alignment.half_width().micros());
+    (
+        bounds,
+        credits_interval(credits_lower, credits_upper),
+        credits_interval(
+            credits_lower - explained - timing,
+            credits_upper - explained + timing,
+        ),
+    )
+}
+
+/// Builds an [`Interval<Credits>`] from an ordered pair of `i128` micro-credit
+/// bounds, saturating each endpoint into `i64` range.
+fn credits_interval(lower: i128, upper: i128) -> Interval<Credits> {
+    let saturate = |value: i128| value.clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64;
+    Interval::new(
+        Credits::from_micros(saturate(lower)),
+        Credits::from_micros(saturate(upper)),
+    )
+    .expect("bounds are passed in nondecreasing order")
 }
 
 /// Formats a reconciliation outcome for human display.
@@ -610,11 +802,21 @@ pub fn render_reconciliation_human(outcome: &ReconciliationOutcome) -> String {
             } else {
                 ""
             };
+            let verdict = if res.reconciles_within_uncertainty() {
+                "reconciles within uncertainty: the two axes agree within the uncertainty of the measurement (residual interval contains zero)"
+            } else {
+                "residual interval excludes zero"
+            };
             format!(
                 "reconciliation: account={} window={} interval=[{} .. {}]
   observed meter delta: {} ppm
   locally explained calibrated delta: {} ppm ({} credits)
-  unexplained residual: {}{} credits ({}{} ppm)",
+  unexplained residual: {}{} credits ({}{} ppm)
+  meter quantization delta bounds: [{} .. {}] ppm
+  observed meter credits interval: [{} .. {}] credits
+  timing alignment uncertainty: +/-{} credits
+  unexplained residual interval: [{} .. {}] credits
+  {}",
                 res.account_id.value(),
                 res.window_key.as_str(),
                 res.interval_start.unix_nanos(),
@@ -626,6 +828,14 @@ pub fn render_reconciliation_human(outcome: &ReconciliationOutcome) -> String {
                 res.unexplained_residual.micros(),
                 sign,
                 res.unexplained_residual_percentage_points.get(),
+                res.observed_meter_delta_bounds.lower_ppm(),
+                res.observed_meter_delta_bounds.upper_ppm(),
+                res.observed_meter_credits_interval.lower().micros(),
+                res.observed_meter_credits_interval.upper().micros(),
+                res.timing_alignment.half_width().micros(),
+                res.unexplained_residual_interval.lower().micros(),
+                res.unexplained_residual_interval.upper().micros(),
+                verdict,
             )
         }
         ReconciliationOutcome::NotComputed { failing_conditions } => {
@@ -657,6 +867,24 @@ pub fn reconciliation_json(outcome: &ReconciliationOutcome) -> serde_json::Value
                 "credits_micros": res.unexplained_residual.micros(),
                 "percentage_points_ppm": res.unexplained_residual_percentage_points.get()
             },
+            "observed_meter_delta_bounds_ppm": {
+                "lower": res.observed_meter_delta_bounds.lower_ppm(),
+                "upper": res.observed_meter_delta_bounds.upper_ppm()
+            },
+            "observed_meter_credits_interval": {
+                "lower": res.observed_meter_credits_interval.lower().to_exact_string(),
+                "upper": res.observed_meter_credits_interval.upper().to_exact_string(),
+                "unit": Credits::unit()
+            },
+            "timing_alignment_uncertainty": {
+                "credits_micros_half_width": res.timing_alignment.half_width().micros()
+            },
+            "unexplained_residual_interval": {
+                "lower": res.unexplained_residual_interval.lower().to_exact_string(),
+                "upper": res.unexplained_residual_interval.upper().to_exact_string(),
+                "unit": Credits::unit()
+            },
+            "reconciles_within_uncertainty": res.reconciles_within_uncertainty(),
             "calibration_id": res.calibration_id.as_str(),
             "provenance": {
                 "inputs_count": res.provenance.input_count(),

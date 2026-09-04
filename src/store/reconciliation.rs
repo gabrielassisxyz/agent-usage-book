@@ -24,10 +24,11 @@ use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, EvidenceQuality};
 use crate::reconciliation::{
     CandidateInterval, CandidateObservation, CandidateUsageEvent, IntervalCoverage,
-    IntervalSettlement, IntervalUsage, ReconciliationOutcome, reconcile,
+    IntervalSettlement, IntervalUsage, ReconciliationOutcome, TimingAlignmentUncertainty,
+    reconcile,
 };
 use crate::store::account::AccountId;
-use crate::store::calibration::{CalibrationScope, PlanTier};
+use crate::store::calibration::{CalibrationScope, PlanTier, WindowCalibration};
 use crate::store::cost_model::ProviderKey;
 use crate::store::meter_evidence::ObservationRowId;
 
@@ -86,6 +87,8 @@ pub fn reconcile_candidate_from_store(
         window_key: start_window.semantic_key.clone(),
         quota_used: start_window.quota_used,
         resets_at: start_window.resets_at,
+        reported_resolution: start_window.reported_resolution,
+        quantization: start_window.quantization,
     };
 
     let end_cand = CandidateObservation {
@@ -95,6 +98,8 @@ pub fn reconcile_candidate_from_store(
         window_key: end_window.semantic_key.clone(),
         quota_used: end_window.quota_used,
         resets_at: end_window.resets_at,
+        reported_resolution: end_window.reported_resolution,
+        quantization: end_window.quantization,
     };
 
     let resets = crate::store::meter_evidence::reset_windows_for_account_between(
@@ -241,6 +246,15 @@ pub fn reconcile_candidate_from_store(
 
     let is_settled = effective_time.unix_nanos() >= end_obs.received_at.unix_nanos();
 
+    let observed_delta_ppm = i64::from(end_window.quota_used.as_ppm().get())
+        - i64::from(start_window.quota_used.as_ppm().get());
+    let timing_alignment = timing_alignment_uncertainty(
+        active_calibration.as_ref(),
+        start_obs.received_at,
+        end_obs.received_at,
+        observed_delta_ppm,
+    );
+
     let candidate = CandidateInterval {
         account_id,
         window_key: window_key.clone(),
@@ -255,7 +269,39 @@ pub fn reconcile_candidate_from_store(
             lag_handling_satisfied: true,
         },
         local_usage: IntervalUsage::new(candidate_events, total_credits),
+        timing_alignment,
     };
 
     Ok(reconcile(&candidate))
+}
+
+/// Derives an explicit timing-alignment uncertainty from the active calibration's
+/// estimated accounting lag (PLAN.md 23.5). If provider accounting lags by `L` over
+/// an interval of length `W`, up to a `L/W` fraction of the observed movement (never
+/// more than the whole movement) could be misattributed across the interval
+/// boundary; converted to credits through the fitted coefficient, that is the
+/// residual's timing half width. No calibration or no lag estimate means an
+/// explicit zero, not a silent absence.
+fn timing_alignment_uncertainty(
+    calibration: Option<&WindowCalibration>,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+    observed_delta_ppm: i64,
+) -> TimingAlignmentUncertainty {
+    let Some(calibration) = calibration else {
+        return TimingAlignmentUncertainty::none();
+    };
+    let Some(lag) = calibration.lag_estimate() else {
+        return TimingAlignmentUncertainty::none();
+    };
+    let lag_nanos = i128::from(lag.as_nanos());
+    if lag_nanos == 0 {
+        return TimingAlignmentUncertainty::none();
+    }
+    let interval_nanos = i128::from(end.unix_nanos().saturating_sub(start.unix_nanos())).max(1);
+    let movement = i128::from(observed_delta_ppm.abs());
+    let misattributed_ppm = (movement * lag_nanos / interval_nanos).min(movement);
+    let coefficient = i128::from(calibration.fitted().micros_per_point().abs());
+    let half_width = (coefficient * misattributed_ppm).clamp(0, i128::from(i64::MAX)) as i64;
+    TimingAlignmentUncertainty::from_credit_half_width(Credits::from_micros(half_width))
 }
