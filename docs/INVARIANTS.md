@@ -43,7 +43,7 @@ same thing in both documents.
 | 12 | Calibrated values have immutable IDs and no consumer-side literals. | unenforced aub-c0b.13 | (single-source calibration proof) |
 | 13 | Calibration cannot cross incompatible plan tiers, reset boundaries, or provider semantics. | unenforced aub-c0b.11 | (calibration rejection test) |
 | 14 | Passive calibration is evidence and candidate generation, not automatic truth. | unenforced aub-c0b.7 | (passive candidate test) |
-| 15 | `status` never opens SQLite, performs network I/O, or writes. | unenforced aub-me5.7 | (status no-store / no-network test) |
+| 15 | `status` never opens SQLite, performs network I/O, or writes. | bin/checks/boundary-rules/{06,15,19}, tests/status_syscall_trace.rs | tests::the_status_function_performs_only_the_status_contract, status_opens_no_socket_and_writes_nothing_to_the_state_directory |
 | 16 | The projection is disposable and contains no stored freshness boolean. | src/projection.rs | tests::deleting_the_projection_and_republishing_reproduces_it_byte_for_byte |
 | 17 | Task ambiguity becomes explicit overhead. | src/attribution/segment.rs | tests::task_attributed_plus_overhead_equals_total_input_usage |
 | 18 | Dollar valuation and subscription credits are distinct dimensions. | tests/valuation.rs | tests::golden_hand_computed_exact_decimal_fixtures |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 23 are enforced by mechanical checks present at HEAD (file paths and tests), and 4 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 24 are enforced by mechanical checks present at HEAD (file paths and tests), and 3 are unenforced and tracked by open beads in the tracker.
