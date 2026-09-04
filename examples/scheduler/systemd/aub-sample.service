@@ -1,0 +1,16 @@
+# Runs one `aub sample --due` tick. Paired with aub-sample.timer, which
+# decides how often this fires; see docs/scheduling.md for the reasoning.
+#
+# ExecStart names an absolute path on purpose: systemd services do not run
+# inside an interactive shell and do not read its PATH, so a bare `aub` here
+# would fail with "command not found" the first time the unit runs. Replace
+# /usr/local/bin/aub below with wherever `aub` actually lives on this machine
+# (`which aub`, or the install prefix used for the release archive).
+[Unit]
+Description=aub sample --due (scheduler tick)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aub sample --due
