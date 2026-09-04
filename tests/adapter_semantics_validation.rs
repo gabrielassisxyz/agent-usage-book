@@ -192,7 +192,7 @@ fn seed_observation(state_dir: &Path) -> (ObservationRowId, Vec<WindowRowId>) {
                 )
                 .unwrap(),
                 quantization: QuantizationSemantics::RoundedToNearest,
-                resets_at: UtcTimestamp::from_unix_nanos(100_000),
+                resets_at: UtcTimestamp::from_unix_nanos(100_000).into(),
                 nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
             },
         )

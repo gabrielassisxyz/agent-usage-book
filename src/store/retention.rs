@@ -1598,7 +1598,7 @@ mod tests {
                 )
                 .unwrap(),
                 quantization: QuantizationSemantics::RoundedToNearest,
-                resets_at: now,
+                resets_at: now.into(),
                 nominal_duration: NominalWindowDuration::from_nanos(3_600_000_000_000),
             },
         )

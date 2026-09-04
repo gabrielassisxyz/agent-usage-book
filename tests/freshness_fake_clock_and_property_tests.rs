@@ -103,7 +103,7 @@ impl Snapshot {
             )
             .unwrap(),
             quantization: QuantizationSemantics::Exact,
-            resets_at: UtcTimestamp::from_unix_nanos(nanos(999_999)),
+            resets_at: UtcTimestamp::from_unix_nanos(nanos(999_999)).into(),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
         }
     }

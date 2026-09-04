@@ -21,7 +21,8 @@ All fixtures in this directory are vetted to ensure:
 - `error-403-ambiguous.json`: 403 Forbidden with generic permission error (classified as `HttpStatus(ClientError)`, not authentication).
 - `error-429.json`: 429 Too Many Requests response with retry information.
 - `malformed.json`: Invalid non-JSON payload.
-- `missing-field.json`: Valid JSON missing a required quota field (`utilization`).
+- `missing-field.json`: Valid response missing the required top-level `five_hour` window.
 - `unknown-fields.json`: Valid response containing forward-compatible unknown fields.
 - `stale-timestamp.json`: Valid response with a past reset timestamp.
 - `reset-changed-a.json` & `reset-changed-b.json`: Paired responses demonstrating a changed reset timestamp.
+- `idle-five-hour.json`: Idle 5-hour window with null reset instant and populated 7-day window.

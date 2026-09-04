@@ -440,7 +440,7 @@ fn pending_bundle_json(attempt_id: i64, bundle: &TerminalMeterBundle) -> String 
             quota_used_ppm: window.quota_used().as_ppm().get() as i64,
             reported_resolution_ppm: window.reported_resolution().as_ppm().get() as i64,
             quantization: "rounded_to_nearest".into(),
-            resets_at_nanos: window.resets_at().unix_nanos(),
+            resets_at_nanos: window.resets_at().map(|t| t.unix_nanos()),
             nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
         }],
     }

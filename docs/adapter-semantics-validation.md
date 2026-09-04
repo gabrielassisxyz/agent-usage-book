@@ -42,6 +42,7 @@ granularity, or it reports the mismatch as unresolved.
 | adapter | authoritative surface | documented granularity | windows the adapter reports |
 |---|---|---|---|
 | Anthropic (`src/meter/anthropic.rs`) | the usage view in the Anthropic Console for the configured account | whole percentage points, that is 10000 parts per million | `five_hour` (account wide), `seven_day` (account wide), and one `seven_day_<model>` per model the response carries (model specific) |
+| Anthropic idle / not-started (`src/meter/anthropic.rs`) | the usage view in the Anthropic Console for the configured account | whole percentage points (0% used, `resets_at: null` expected when idle, indicating no window in progress) | `five_hour` in typed `not_started` state (`resets_at: null`), `seven_day` (account wide), and model-specific windows |
 
 When the surface changes what it displays or the granularity it displays it at, update
 this row in the same change that adapts the adapter, and record a fresh comparison.

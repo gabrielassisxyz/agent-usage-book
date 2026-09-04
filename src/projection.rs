@@ -36,7 +36,7 @@ use serde_json::{Value, json};
 
 use crate::domain::attempt::{AttemptId, AttemptOutcome};
 use crate::domain::time::{MeasurementBasis, UtcTimestamp};
-use crate::domain::window::{QuantizationSemantics, WindowScope};
+use crate::domain::window::{QuantizationSemantics, WindowResetState, WindowScope};
 use crate::error::Error;
 use crate::store::ledger_generation::Generation;
 use crate::store::meter_attempt::failure_class_sql;
@@ -180,7 +180,7 @@ pub struct ProjectedWindow {
     pub quota_used_ppm: crate::domain::quota::QuotaUsed,
     pub reported_resolution_ppm: crate::domain::window::ReportedResolution,
     pub quantization: QuantizationSemantics,
-    pub resets_at: UtcTimestamp,
+    pub resets_at: WindowResetState,
     pub nominal_duration_nanos: crate::domain::window::NominalWindowDuration,
 }
 
@@ -261,7 +261,7 @@ impl ProjectedWindow {
             "quota_used_ppm": self.quota_used_ppm.as_ppm().get(),
             "reported_resolution_ppm": self.reported_resolution_ppm.as_ppm().get(),
             "quantization": quantization_sql::as_sql(self.quantization),
-            "resets_at_nanos": self.resets_at.unix_nanos(),
+            "resets_at_nanos": self.resets_at.instant().map(|ts| ts.unix_nanos()),
             "nominal_duration_nanos": self.nominal_duration_nanos.as_nanos(),
         })
     }
@@ -440,7 +440,7 @@ mod tests {
             quota_used_ppm: QuotaUsed::new(fraction(used_ppm)),
             reported_resolution_ppm: ReportedResolution::new(fraction(10_000)).unwrap(),
             quantization: QuantizationSemantics::RoundedToNearest,
-            resets_at: UtcTimestamp::from_unix_nanos(9_000),
+            resets_at: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
         }
     }

@@ -259,7 +259,7 @@ fn import_single_record(
                         quota_used: window.quota_used,
                         reported_resolution: resolution,
                         quantization: QuantizationSemantics::Unknown,
-                        resets_at: window.resets_at,
+                        resets_at: window.resets_at.into(),
                         nominal_duration: NominalWindowDuration::from_nanos(
                             window.nominal_duration_nanos,
                         ),

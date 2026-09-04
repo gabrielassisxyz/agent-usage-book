@@ -18,7 +18,9 @@ use agent_usage_book::report::{
 use agent_usage_book::domain::attempt::AttemptId;
 use agent_usage_book::domain::freshness::Freshness;
 use agent_usage_book::domain::quota::QuotaRemaining;
-use agent_usage_book::domain::window::{ModelId, NominalWindowDuration, WindowScope};
+use agent_usage_book::domain::window::{
+    ModelId, NominalWindowDuration, WindowResetState, WindowScope,
+};
 
 /// One minute and twelve seconds after the Unix epoch: the fixed now every
 /// rendering below is computed against.
@@ -47,7 +49,8 @@ fn window(
         reported_resolution_ppm: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
             .unwrap(),
         quantization: QuantizationSemantics::Exact,
-        resets_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(nanos(10_800)),
+        resets_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(nanos(10_800))
+            .into(),
         nominal_duration_nanos: NominalWindowDuration::from_nanos(nanos(duration_seconds) as u64),
     }
 }
@@ -121,7 +124,7 @@ fn reading_for(
     projected: Option<&ProjectedAccount>,
     freshness: Freshness<QuotaRemaining>,
     scopes: Vec<WindowScope>,
-    limit: Option<(WindowScope, NominalWindowDuration)>,
+    limit: Option<LimitingWindow>,
 ) -> MeterAccount {
     MeterAccount::from_projection(
         LogicalName::new(
@@ -130,10 +133,7 @@ fn reading_for(
                 .unwrap_or_else(|| "work-primary".to_string()),
         ),
         freshness,
-        limit.map(|(scope, nominal_duration)| LimitingWindow {
-            scope,
-            nominal_duration,
-        }),
+        limit,
         scopes,
         None,
     )
@@ -198,9 +198,11 @@ fn fresh_last_attempt() {
             Some(&seeded.accounts[0]),
             reading.freshness,
             reading.included_scopes,
-            reading
-                .limiting_window
-                .map(|limit| (limit.scope, limit.nominal_duration)),
+            reading.limiting_window.map(|limit| LimitingWindow {
+                scope: limit.scope,
+                nominal_duration: limit.nominal_duration,
+                reset_state: limit.reset_state,
+            }),
         )],
         ProjectionReadState::Read,
     );
@@ -246,9 +248,11 @@ fn stale_after_a_timeout() {
             Some(&seeded.accounts[0]),
             reading.freshness,
             reading.included_scopes,
-            reading
-                .limiting_window
-                .map(|limit| (limit.scope, limit.nominal_duration)),
+            reading.limiting_window.map(|limit| LimitingWindow {
+                scope: limit.scope,
+                nominal_duration: limit.nominal_duration,
+                reset_state: limit.reset_state,
+            }),
         )],
         ProjectionReadState::Read,
     );
@@ -295,9 +299,11 @@ fn auth_required() {
             Some(&seeded.accounts[0]),
             reading.freshness,
             reading.included_scopes,
-            reading
-                .limiting_window
-                .map(|limit| (limit.scope, limit.nominal_duration)),
+            reading.limiting_window.map(|limit| LimitingWindow {
+                scope: limit.scope,
+                nominal_duration: limit.nominal_duration,
+                reset_state: limit.reset_state,
+            }),
         )],
         ProjectionReadState::Read,
     );
@@ -333,9 +339,11 @@ fn collector_interrupted() {
             Some(&seeded.accounts[0]),
             reading.freshness,
             reading.included_scopes,
-            reading
-                .limiting_window
-                .map(|limit| (limit.scope, limit.nominal_duration)),
+            reading.limiting_window.map(|limit| LimitingWindow {
+                scope: limit.scope,
+                nominal_duration: limit.nominal_duration,
+                reset_state: limit.reset_state,
+            }),
         )],
         ProjectionReadState::Read,
     );
@@ -366,9 +374,11 @@ fn never_successfully_observed() {
             Some(&seeded.accounts[0]),
             reading.freshness,
             reading.included_scopes,
-            reading
-                .limiting_window
-                .map(|limit| (limit.scope, limit.nominal_duration)),
+            reading.limiting_window.map(|limit| LimitingWindow {
+                scope: limit.scope,
+                nominal_duration: limit.nominal_duration,
+                reset_state: limit.reset_state,
+            }),
         )],
         ProjectionReadState::Read,
     );
@@ -398,6 +408,76 @@ fn projection_missing() {
         ExplainMode::Summary,
     );
     assert_eq!(with_reason, "aub ? · projection not found");
+}
+
+/// Rendering: an account with a not-started window renders "no window in progress".
+#[test]
+fn not_started_window_renders_no_window_in_progress() {
+    let idle_window = agent_usage_book::projection::ProjectedWindow {
+        semantic_key: "five_hour".to_string(),
+        scope: WindowScope::AccountWide,
+        quota_used_ppm: agent_usage_book::domain::quota::QuotaUsed::new(
+            agent_usage_book::domain::quota::QuotaFractionPpm::new(0).unwrap(),
+        ),
+        reported_resolution_ppm: agent_usage_book::domain::window::ReportedResolution::new(
+            agent_usage_book::domain::quota::QuotaFractionPpm::new(10_000).unwrap(),
+        )
+        .unwrap(),
+        quantization: agent_usage_book::domain::window::QuantizationSemantics::Exact,
+        resets_at: WindowResetState::NotStarted,
+        nominal_duration_nanos: NominalWindowDuration::from_nanos(5 * 3_600 * 1_000_000_000),
+    };
+    let account = account(
+        "work-primary",
+        Some(agent_usage_book::projection::SuccessfulObservation {
+            observation_id: agent_usage_book::store::meter_evidence::ObservationRowId::new(1),
+            provider_observed_at: None,
+            received_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
+                NOW_NANOS - nanos(41),
+            ),
+            measurement_basis: agent_usage_book::domain::time::MeasurementBasis::LocallyReceived,
+            windows: vec![idle_window],
+        }),
+        Some(latest_attempt(
+            42,
+            Some(agent_usage_book::projection::TerminalOutcome {
+                completed_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
+                    NOW_NANOS - nanos(41),
+                ),
+                outcome: agent_usage_book::domain::attempt::AttemptOutcome::Success,
+            }),
+        )),
+    );
+    let seeded = projection(vec![account]);
+    let clock =
+        FakeClock::new(agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(NOW_NANOS));
+    let (fresh, command, skew) = horizon();
+    let reading = account_reading(
+        Some(&seeded.accounts[0]),
+        None,
+        fresh,
+        command,
+        skew,
+        &clock,
+    );
+
+    let report = report_with(
+        vec![reading_for(
+            Some(&seeded.accounts[0]),
+            reading.freshness,
+            reading.included_scopes,
+            reading.limiting_window.map(|limit| LimitingWindow {
+                scope: limit.scope,
+                nominal_duration: limit.nominal_duration,
+                reset_state: limit.reset_state,
+            }),
+        )],
+        ProjectionReadState::Read,
+    );
+    assert_eq!(
+        render(&report),
+        "aub work-primary 100% left · no window in progress"
+    );
 }
 
 /// The window duration labels the fresh line carries, at the ladder's every rung.

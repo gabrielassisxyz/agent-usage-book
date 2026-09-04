@@ -365,7 +365,7 @@ fn drill_bundle(attempt_id: i64, request_started_at_nanos: i64) -> PendingTermin
                 crate::domain::window::QuantizationSemantics::Exact,
             )
             .to_owned(),
-            resets_at_nanos: request_started_at_nanos + 5_000,
+            resets_at_nanos: Some(request_started_at_nanos + 5_000),
             nominal_duration_nanos: 18_000_000_000_000,
         }],
     }

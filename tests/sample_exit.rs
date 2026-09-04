@@ -416,3 +416,54 @@ fn store_failure_on_due_lookup_exits_store_class_5() {
     );
     assert!(stderr.contains("sampling due lookup failed"));
 }
+
+#[test]
+fn sample_and_status_idle_five_hour_window_stores_observation_and_renders_no_window_in_progress() {
+    let env = Environment::new("idle-five-hour-integration");
+    let fixture_bytes = include_bytes!("fixtures/meter/anthropic/idle-five-hour.json");
+    let server = SyntheticServer::start(vec![ScriptedOutcome::Success(
+        ScriptedResponseBody::json_ok(fixture_bytes.to_vec()),
+    )])
+    .unwrap();
+
+    let (sample_status, sample_stdout, sample_stderr) =
+        env.run(&server.url(), &["sample", "--account", "work-primary"]);
+    assert_eq!(
+        sample_status, 0,
+        "sample must succeed; stdout: {sample_stdout}, stderr: {sample_stderr}"
+    );
+
+    // Verify observation in DB has five_hour window with NULL resets_at and seven_day with timestamp
+    let conn = rusqlite::Connection::open(env.db_path()).expect("open db");
+    let mut stmt = conn
+        .prepare("SELECT semantic_key, resets_at, quota_used_ppm FROM meter_window ORDER BY semantic_key ASC")
+        .unwrap();
+    let rows: Vec<(String, Option<i64>, i32)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "five_hour");
+    assert_eq!(
+        rows[0].1, None,
+        "five_hour window resets_at must be NULL (not started)"
+    );
+    assert_eq!(rows[0].2, 0, "five_hour utilization must be 0");
+    assert_eq!(rows[1].0, "seven_day");
+    assert!(rows[1].1.is_some(), "seven_day resets_at must be populated");
+    assert_eq!(rows[1].2, 0, "seven_day utilization must be 0");
+    drop(stmt);
+    drop(conn);
+
+    // Run aub status
+    let (status_code, status_stdout, status_stderr) = env.run(&server.url(), &["status"]);
+    assert_eq!(
+        status_code, 0,
+        "status must succeed; stderr: {status_stderr}"
+    );
+    assert!(
+        status_stdout.contains("100% left · no window in progress"),
+        "status stdout must contain '100% left · no window in progress', got: {status_stdout}"
+    );
+}

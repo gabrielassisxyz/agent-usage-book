@@ -1,7 +1,4 @@
 {
-  "five_hour": {
-    "resets_at": "2026-08-30T19:00:00.000Z"
-  },
   "seven_day": {
     "utilization": 91.0,
     "resets_at": "2026-09-06T12:00:00.000Z"

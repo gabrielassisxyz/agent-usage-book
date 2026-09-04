@@ -30,7 +30,9 @@ use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining, QuotaUsed};
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, ProviderObservedAt, ReceivedAt, UtcTimestamp,
 };
-use crate::domain::window::{ModelId, NominalWindowDuration, ReportedResolution, WindowScope};
+use crate::domain::window::{
+    ModelId, NominalWindowDuration, ReportedResolution, WindowResetState, WindowScope,
+};
 use crate::store::account::AccountId;
 use crate::store::ledger_generation::Generation;
 use crate::store::meter_attempt::failure_class_sql;
@@ -235,7 +237,16 @@ fn window_from_document(value: &Value) -> Result<ProjectedWindow, String> {
         reported_resolution_ppm: reported_resolution(object, "reported_resolution_ppm")?,
         quantization: quantization_sql::from_sql(required_str(object, "quantization")?)
             .map_err(|error| error.to_string())?,
-        resets_at: UtcTimestamp::from_unix_nanos(required_i64(object, "resets_at_nanos")?),
+        resets_at: match object.get("resets_at_nanos") {
+            None | Some(Value::Null) => WindowResetState::NotStarted,
+            Some(Value::Number(n)) => {
+                let nanos = n
+                    .as_i64()
+                    .ok_or_else(|| "resets_at_nanos is not an integer".to_string())?;
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos))
+            }
+            Some(_) => return Err("resets_at_nanos is not an integer or null".to_string()),
+        },
         nominal_duration_nanos: NominalWindowDuration::from_nanos(required_u64(
             object,
             "nominal_duration_nanos",
@@ -391,12 +402,13 @@ pub struct ProjectedReading {
     pub included_scopes: Vec<WindowScope>,
 }
 
-/// The limiting window behind a reading: which scope it belongs to and the
-/// nominal length the design's status line shows beside a fresh value.
+/// The limiting window behind a reading: which scope it belongs to, the
+/// nominal length the design's status line shows beside a fresh value, and its reset state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LimitingWindowRef {
     pub scope: WindowScope,
     pub nominal_duration: NominalWindowDuration,
+    pub reset_state: WindowResetState,
 }
 
 /// Computes one account's status reading from its projected state.
@@ -428,11 +440,18 @@ pub fn account_reading(
                 included_scopes.push(window.scope.clone());
             }
         }
-        if let Some(limit) = applicable
-            .iter()
-            .max_by_key(|window| window.quota_used_ppm.as_ppm().get())
-        {
-            let remaining: QuotaRemaining = limit.quota_used_ppm.complement();
+        if let Some(limit) = applicable.iter().min_by_key(|window| {
+            if window.resets_at.is_not_started() {
+                1_000_000
+            } else {
+                window.quota_used_ppm.complement().as_ppm().get()
+            }
+        }) {
+            let remaining: QuotaRemaining = if limit.resets_at.is_not_started() {
+                QuotaRemaining::new(crate::domain::quota::QuotaFractionPpm::new(1_000_000).unwrap())
+            } else {
+                limit.quota_used_ppm.complement()
+            };
             last_good = Some(Observed::new(
                 remaining,
                 success.provider_observed_at.map(ProviderObservedAt::new),
@@ -442,6 +461,7 @@ pub fn account_reading(
             limiting_window = Some(LimitingWindowRef {
                 scope: limit.scope.clone(),
                 nominal_duration: limit.nominal_duration_nanos,
+                reset_state: limit.resets_at,
             });
         }
     }
@@ -511,7 +531,7 @@ mod tests {
             )
             .unwrap(),
             quantization: QuantizationSemantics::Exact,
-            resets_at: UtcTimestamp::from_unix_nanos(9_000),
+            resets_at: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
         }
     }
@@ -757,7 +777,7 @@ mod read_tests {
                         )
                         .unwrap(),
                         quantization: QuantizationSemantics::RoundedToNearest,
-                        resets_at: UtcTimestamp::from_unix_nanos(9_000),
+                        resets_at: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
                         nominal_duration_nanos: NominalWindowDuration::from_nanos(
                             18_000_000_000_000,
                         ),

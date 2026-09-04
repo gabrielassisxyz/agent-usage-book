@@ -290,7 +290,7 @@ fn make_fixture_bundles(
             quota_used_ppm: 250_000,
             reported_resolution_ppm: 10_000,
             quantization: "rounded_to_nearest".into(),
-            resets_at_nanos: completed_at.unix_nanos(),
+            resets_at_nanos: Some(completed_at.unix_nanos()),
             nominal_duration_nanos: 18_000_000_000_000,
         }],
     };
@@ -857,7 +857,7 @@ fn pending_bundle_for(
             quota_used_ppm: 250_000,
             reported_resolution_ppm: 10_000,
             quantization: "exact".into(),
-            resets_at_nanos: started_at.unix_nanos().saturating_add(5_000),
+            resets_at_nanos: Some(started_at.unix_nanos().saturating_add(5_000)),
             nominal_duration_nanos: 18_000_000_000_000,
         }],
     }
