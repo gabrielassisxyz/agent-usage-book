@@ -39,6 +39,17 @@ impl TokenKind {
         TokenKind::CacheRead,
         TokenKind::CacheWrite,
     ];
+
+    /// The stable snake-case identifier for this kind. Exhaustive with no
+    /// wildcard arm, so a fifth variant breaks compilation here.
+    pub const fn label(self) -> &'static str {
+        match self {
+            TokenKind::Input => "input",
+            TokenKind::Output => "output",
+            TokenKind::CacheRead => "cache_read",
+            TokenKind::CacheWrite => "cache_write",
+        }
+    }
 }
 
 /// Generates a token-count newtype: private `u64` storage, an infallible constructor, a

@@ -525,6 +525,88 @@ fn render_ingest_summary(report: &SpendReport) -> String {
     line
 }
 
+/// Renders the attribution-quality section of `aub doctor`: the metric over
+/// all history and over the recent window, and any configured-floor breach.
+///
+/// An empty metric is stated as "no account attribution segments recorded
+/// yet", never as `0%`: a fabricated zero would read as every token
+/// unattributed.
+pub fn render_attribution_quality(
+    assessment: &crate::attribution::quality::AttributionQualityAssessment,
+) -> String {
+    use crate::attribution::account_segment::AccountEvidenceClass;
+    use crate::attribution::quality::AttributionQuality;
+
+    fn percent(fraction: crate::attribution::quality::AttributionFraction) -> String {
+        match fraction.ppm() {
+            Some(ppm) => format!("{:.1}%", ppm as f64 / 10_000.0),
+            None => "no usage".to_string(),
+        }
+    }
+
+    fn render_metric(lines: &mut Vec<String>, quality: &AttributionQuality) {
+        if quality.is_empty() {
+            lines.push("  no account attribution segments recorded yet".to_string());
+            return;
+        }
+        for kind in TokenKind::ALL {
+            let breakdown = quality.breakdown(kind);
+            if breakdown.total() == 0 {
+                continue;
+            }
+            lines.push(format!(
+                "  {}: {} tokens, {} attributed",
+                token_kind_label(kind),
+                breakdown.total(),
+                percent(breakdown.attributed_fraction())
+            ));
+            for class in AccountEvidenceClass::ALL {
+                let tokens = breakdown.tokens(class);
+                if tokens == 0 {
+                    continue;
+                }
+                lines.push(format!(
+                    "    {}: {} ({})",
+                    class.as_str(),
+                    tokens,
+                    percent(breakdown.class_fraction(class))
+                ));
+            }
+        }
+    }
+
+    let mut lines = Vec::new();
+    lines.push("Doctor: Attribution Quality".to_string());
+    lines.push("All history:".to_string());
+    render_metric(&mut lines, &assessment.all_history);
+    lines.push(format!(
+        "Recent window (since {}):",
+        assessment.recent_window.since.unix_nanos()
+    ));
+    render_metric(&mut lines, &assessment.recent_window.quality);
+    if assessment.recent_window.undated_observations > 0 {
+        lines.push(format!(
+            "  ({} observations with unknown session start excluded from the window)",
+            assessment.recent_window.undated_observations
+        ));
+    }
+    for breach in &assessment.breaches {
+        let scope = match breach.scope {
+            crate::attribution::quality::MetricScope::AllHistory => "all-history".to_string(),
+            crate::attribution::quality::MetricScope::RecentWindow { since } => {
+                format!("recent-window (since {})", since.unix_nanos())
+            }
+        };
+        lines.push(format!(
+            "FLOOR BREACH: {scope} {} attribution {} is below the configured floor of {:.1}%",
+            token_kind_label(breach.kind),
+            percent(breach.fraction),
+            breach.floor.as_f64() * 100.0
+        ));
+    }
+    lines.join("\n")
+}
+
 /// Renders a [`TranscriptDriftReport`] for `aub doctor --transcript-format-drift`.
 pub fn render_doctor_drift_report(report: &TranscriptDriftReport) -> String {
     if !report.has_configured_roots {
@@ -1074,6 +1156,61 @@ mod tests {
 
     fn now() -> UtcTimestamp {
         UtcTimestamp::from_unix_nanos(1_000_000 * NANOS_PER_SECOND)
+    }
+
+    #[test]
+    fn render_attribution_quality_states_empty_rather_than_zero_and_names_a_breach() {
+        use crate::attribution::account_segment::AccountEvidenceClass;
+        use crate::attribution::quality::{
+            AttributionObservation, AttributionQualityAssessment, AttributionQualityFloor,
+        };
+        use crate::domain::tokens::{
+            CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
+        };
+
+        // No observations: the metric must say so, never print 0%.
+        let empty = AttributionQualityAssessment::assess(
+            Vec::new(),
+            UtcTimestamp::from_unix_nanos(0),
+            None,
+        );
+        let empty_text = render_attribution_quality(&empty);
+        assert!(empty_text.contains("no account attribution segments recorded yet"));
+        assert!(!empty_text.contains('%'));
+
+        // A breaching corpus: the metric and a FLOOR BREACH line.
+        let tokens = |input: u64| {
+            KnownTokenVector::new(
+                InputTokens::new(input),
+                OutputTokens::new(0),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            )
+        };
+        let observations = vec![
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::ExplicitLauncherOrHook,
+                usage: tokens(20),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+            AttributionObservation {
+                evidence_class: AccountEvidenceClass::Unattributed,
+                usage: tokens(80),
+                observed_at: Some(UtcTimestamp::from_unix_nanos(10)),
+            },
+        ];
+        let assessment = AttributionQualityAssessment::assess(
+            observations,
+            UtcTimestamp::from_unix_nanos(0),
+            AttributionQualityFloor::new(0.9),
+        );
+        let text = render_attribution_quality(&assessment);
+        assert!(
+            text.contains("input: 100 tokens, 20.0% attributed"),
+            "{text}"
+        );
+        assert!(text.contains("unattributed"));
+        assert!(text.contains("FLOOR BREACH"));
     }
 
     fn envelope() -> ClockSkewEnvelope {

@@ -12,6 +12,7 @@
 use rusqlite::{Connection, params};
 
 use crate::attribution::account_segment::{AccountEvidenceClass, AccountSegmentationResult};
+use crate::attribution::quality::AttributionObservation;
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
@@ -110,6 +111,74 @@ pub fn all_account_segments(
         })?);
     }
     Ok(segments)
+}
+
+/// Loads every attribution segment as an [`AttributionObservation`] for the
+/// attribution-quality metric, tagging each with the start of the session it
+/// belongs to.
+///
+/// The join assumes `account_attribution_segment.session_id` is
+/// `"{source}:{native_session_id}"`, the same session label
+/// [`crate::store::spend`] renders; the write path (`aub-mgv`) must keep that
+/// convention. A segment whose session cannot be located keeps a `None`
+/// timestamp: it still counts toward all-history totals and is named, not
+/// dropped, by the windowed metric.
+pub fn attribution_observations(conn: &Connection) -> Result<Vec<AttributionObservation>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT seg.evidence_class, \
+                    seg.input_tokens, seg.output_tokens, seg.cache_read_tokens, seg.cache_write_tokens, \
+                    sess.start \
+             FROM account_attribution_segment seg \
+             LEFT JOIN session sess \
+                    ON (sess.source || ':' || sess.native_session_id) = seg.session_id \
+             ORDER BY seg.id ASC",
+        )
+        .map_err(|error| {
+            Error::Store(format!(
+                "cannot prepare the attribution-observation query: {error}"
+            ))
+        })?;
+
+    let rows = stmt
+        .query_map([], |row| {
+            let evidence_class_str: String = row.get(0)?;
+            let input: i64 = row.get(1)?;
+            let output: i64 = row.get(2)?;
+            let cache_read: i64 = row.get(3)?;
+            let cache_write: i64 = row.get(4)?;
+            let start_nanos: Option<i64> = row.get(5)?;
+            let evidence_class =
+                AccountEvidenceClass::parse(&evidence_class_str).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Text,
+                        Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            format!("unknown account evidence class: '{evidence_class_str}'"),
+                        )),
+                    )
+                })?;
+            Ok(AttributionObservation {
+                evidence_class,
+                usage: KnownTokenVector::new(
+                    InputTokens::new(input as u64),
+                    OutputTokens::new(output as u64),
+                    CacheReadTokens::new(cache_read as u64),
+                    CacheWriteTokens::new(cache_write as u64),
+                ),
+                observed_at: start_nanos.map(UtcTimestamp::from_unix_nanos),
+            })
+        })
+        .map_err(|error| Error::Store(format!("cannot query attribution observations: {error}")))?;
+
+    let mut observations = Vec::new();
+    for row in rows {
+        observations.push(row.map_err(|error| {
+            Error::Store(format!("cannot read an attribution observation: {error}"))
+        })?);
+    }
+    Ok(observations)
 }
 
 fn map_segment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAccountAttributionSegment> {
@@ -537,6 +606,109 @@ mod tests {
         );
         assert_eq!(segments[0].usage.input().value(), 250);
         assert!(!segments[0].is_inferred());
+    }
+
+    #[test]
+    fn attribution_observations_join_the_session_start_and_keep_unmatched_segments() {
+        use crate::attribution::quality::AttributionQuality;
+        use crate::domain::ids::{NativeSessionId, SourceNamespace};
+        use crate::domain::tokens::TokenKind;
+        use crate::sessions::{ProjectKey, RepositoryKey};
+        use crate::store::session::{NewSession, insert_session};
+
+        let scratch = ScratchDir::new();
+        let mut conn = migrated_conn(&scratch);
+
+        insert_session(
+            &conn,
+            &NewSession {
+                source: SourceNamespace::new("fixture"),
+                native_session_id: NativeSessionId::new("s1"),
+                start: UtcTimestamp::from_unix_nanos(5_000),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                run_id: None,
+            },
+        )
+        .unwrap();
+
+        // A session with a marker: usage before it is unattributed, usage after
+        // it is explicit. `session_id` follows the "{source}:{native}" label.
+        let joined = segment(&AccountSegmentationInputs {
+            markers: vec![AccountMarkerBoundary::explicit(
+                "account-a",
+                UtcTimestamp::from_unix_nanos(10),
+                None,
+            )],
+            usage: vec![
+                AccountUsageEvent {
+                    occurred_at: UtcTimestamp::from_unix_nanos(5),
+                    usage: usage(40),
+                },
+                AccountUsageEvent {
+                    occurred_at: UtcTimestamp::from_unix_nanos(15),
+                    usage: usage(60),
+                },
+            ],
+        });
+        replace_account_segments_for_session(
+            &mut conn,
+            "fixture:s1",
+            &joined,
+            UtcTimestamp::from_unix_nanos(9_000),
+        )
+        .unwrap();
+
+        // A segment for a session with no row in `session`: it must survive the
+        // LEFT JOIN with a None timestamp.
+        let orphan = segment(&AccountSegmentationInputs {
+            markers: vec![],
+            usage: vec![AccountUsageEvent {
+                occurred_at: UtcTimestamp::from_unix_nanos(1),
+                usage: usage(7),
+            }],
+        });
+        replace_account_segments_for_session(
+            &mut conn,
+            "fixture:absent",
+            &orphan,
+            UtcTimestamp::from_unix_nanos(9_000),
+        )
+        .unwrap();
+
+        let observations = attribution_observations(&conn).unwrap();
+        assert_eq!(observations.len(), 3);
+
+        let dated: Vec<_> = observations
+            .iter()
+            .filter(|o| o.observed_at == Some(UtcTimestamp::from_unix_nanos(5_000)))
+            .collect();
+        assert_eq!(
+            dated.len(),
+            2,
+            "both segments of fixture:s1 carry its start"
+        );
+        let undated: Vec<_> = observations
+            .iter()
+            .filter(|o| o.observed_at.is_none())
+            .collect();
+        assert_eq!(
+            undated.len(),
+            1,
+            "the orphan segment keeps a None timestamp"
+        );
+
+        // All-history metric sees every segment; the window drops the orphan and
+        // names it.
+        let all = AttributionQuality::over(observations.iter().cloned());
+        assert_eq!(all.breakdown(TokenKind::Input).total(), 107);
+        let window = AttributionQuality::windowed(
+            observations.iter().cloned(),
+            UtcTimestamp::from_unix_nanos(0),
+        );
+        assert_eq!(window.quality.breakdown(TokenKind::Input).total(), 100);
+        assert_eq!(window.undated_observations, 1);
     }
 
     #[test]
