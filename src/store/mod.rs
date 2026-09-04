@@ -39,6 +39,7 @@ pub mod sample_run;
 pub mod sampling_lease;
 pub mod sampling_policy_snapshot;
 pub mod schema_audit;
+pub mod seed_archive_import;
 pub mod session;
 pub mod session_account_marker;
 pub mod spend;
