@@ -95,7 +95,7 @@ impl Repository {
                     Some(observation) => {
                         meter_evidence::windows_by_observation(conn, observation.row_id)?
                             .into_iter()
-                            .map(|window| window.resets_at)
+                            .filter_map(|window| window.resets_at.instant())
                             .collect::<BTreeSet<_>>()
                             .into_iter()
                             .collect()
@@ -511,7 +511,7 @@ pub(crate) fn commit_terminal_bundle_on_connection(
                 quota_used: window.quota_used(),
                 reported_resolution: window.reported_resolution(),
                 quantization: window.quantization(),
-                resets_at: window.resets_at(),
+                resets_at: window.reset_state(),
                 nominal_duration: window.nominal_duration(),
             },
         )?;

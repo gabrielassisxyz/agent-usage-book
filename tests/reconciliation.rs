@@ -857,7 +857,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
             reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
                 .unwrap(),
             quantization: QuantizationSemantics::RoundedToNearest,
-            resets_at: UtcTimestamp::from_unix_nanos(100_000_000),
+            resets_at: UtcTimestamp::from_unix_nanos(100_000_000).into(),
             nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
         },
     )
@@ -908,7 +908,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
             reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
                 .unwrap(),
             quantization: QuantizationSemantics::RoundedToNearest,
-            resets_at: UtcTimestamp::from_unix_nanos(100_000_000),
+            resets_at: UtcTimestamp::from_unix_nanos(100_000_000).into(),
             nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
         },
     )

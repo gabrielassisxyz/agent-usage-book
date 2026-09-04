@@ -26,11 +26,11 @@ pub use json::{
 };
 pub use precision::{CREDITS, MONEY, PERCENT, TOKENS};
 pub use render::{
-    ExplainMode, format_number, render_age, render_attribution_quality, render_clear_diagnostics,
-    render_coverage_report, render_doctor_drift_report, render_doctor_report, render_explain,
-    render_failure_class, render_fix_report, render_meter_reading, render_now_report,
-    render_now_report_with_explain, render_percentage, render_quantity, render_reconciliation,
-    render_spend_report, render_spend_report_with_explain, render_stale_reason,
-    render_status_report, render_status_report_with_explain, render_total,
+    ExplainMode, LimitingWindowDisplay, format_number, render_age, render_attribution_quality,
+    render_clear_diagnostics, render_coverage_report, render_doctor_drift_report,
+    render_doctor_report, render_explain, render_failure_class, render_fix_report,
+    render_meter_reading, render_now_report, render_now_report_with_explain, render_percentage,
+    render_quantity, render_reconciliation, render_spend_report, render_spend_report_with_explain,
+    render_stale_reason, render_status_report, render_status_report_with_explain, render_total,
 };
 pub use vocabulary::{Qualification, coverage_term, quality_term};

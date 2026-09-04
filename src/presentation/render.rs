@@ -204,7 +204,7 @@ fn meter_account_lines(
                 account
                     .limiting_window
                     .as_ref()
-                    .map(|limit| limit.nominal_duration),
+                    .map(LimitingWindowDisplay::from),
             );
             format!("aub {} {}", account.account.as_str(), reading)
         })
@@ -980,6 +980,30 @@ pub fn render_total(
     }
 }
 
+/// The presentation shape of a limiting window: its duration when known, or the
+/// fact that no window is in progress.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitingWindowDisplay {
+    Duration(NominalWindowDuration),
+    NotStarted,
+}
+
+impl From<NominalWindowDuration> for LimitingWindowDisplay {
+    fn from(duration: NominalWindowDuration) -> Self {
+        LimitingWindowDisplay::Duration(duration)
+    }
+}
+
+impl From<&crate::report::LimitingWindow> for LimitingWindowDisplay {
+    fn from(limit: &crate::report::LimitingWindow) -> Self {
+        if limit.reset_state.is_not_started() {
+            LimitingWindowDisplay::NotStarted
+        } else {
+            LimitingWindowDisplay::Duration(limit.nominal_duration)
+        }
+    }
+}
+
 /// Renders a meter reading with its freshness, age and reason. Freshness is conveyed
 /// in text, never by colour alone: the state is readable from the words themselves.
 pub fn render_meter_reading(
@@ -988,18 +1012,22 @@ pub fn render_meter_reading(
     precision: Precision,
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
-    limiting_window: Option<NominalWindowDuration>,
+    limiting_window: Option<LimitingWindowDisplay>,
 ) -> String {
     match reading {
         Freshness::Fresh { observed, .. } => {
             let value = render_percentage(observed.value().as_ppm().get(), precision);
             // The fresh line names the limiting window's nominal length, the
-            // suffix the design's example shows: "38% left · 5h". The window
+            // suffix the design's example shows: "38% left · 5h", or " · no window in progress"
+            // for a window that has not yet started. The window
             // is part of the value's meaning, not of its freshness.
-            let window = limiting_window
-                .map(render_window_duration)
-                .map(|label| format!(" · {label}"))
-                .unwrap_or_default();
+            let window = match limiting_window {
+                Some(LimitingWindowDisplay::NotStarted) => " · no window in progress".to_string(),
+                Some(LimitingWindowDisplay::Duration(duration)) => {
+                    format!(" · {}", render_window_duration(duration))
+                }
+                None => String::new(),
+            };
             format!("{value}{unit} left{window}")
         }
         Freshness::Stale {
@@ -1484,11 +1512,20 @@ mod tests {
                 precision,
                 now,
                 envelope,
-                Some(NominalWindowDuration::from_nanos(
-                    5 * 3_600 * NANOS_PER_SECOND as u64
-                )),
+                Some(NominalWindowDuration::from_nanos(5 * 3_600 * NANOS_PER_SECOND as u64).into(),),
             ),
             "38% left · 5h"
+        );
+        assert_eq!(
+            render_meter_reading(
+                &fresh,
+                "%",
+                precision,
+                now,
+                envelope,
+                Some(LimitingWindowDisplay::NotStarted),
+            ),
+            "38% left · no window in progress"
         );
         // Without a window to name, the value is shown bare.
         assert_eq!(
@@ -1680,6 +1717,11 @@ mod tests {
                         nominal_duration: NominalWindowDuration::from_nanos(
                             5 * 3_600 * NANOS_PER_SECOND as u64,
                         ),
+                        reset_state: crate::domain::window::WindowResetState::Known(
+                            UtcTimestamp::from_unix_nanos(
+                                now.unix_nanos() + 5 * 3_600 * NANOS_PER_SECOND,
+                            ),
+                        ),
                     }),
                     vec![],
                     None,
@@ -1761,6 +1803,11 @@ mod tests {
                     scope: crate::domain::window::WindowScope::AccountWide,
                     nominal_duration: NominalWindowDuration::from_nanos(
                         5 * 3_600 * NANOS_PER_SECOND as u64,
+                    ),
+                    reset_state: crate::domain::window::WindowResetState::Known(
+                        UtcTimestamp::from_unix_nanos(
+                            now.unix_nanos() + 5 * 3_600 * NANOS_PER_SECOND,
+                        ),
                     ),
                 }),
                 vec![],

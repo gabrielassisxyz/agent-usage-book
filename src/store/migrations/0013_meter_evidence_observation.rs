@@ -67,7 +67,7 @@ CREATE TABLE meter_window (
     quantization TEXT NOT NULL CHECK (
         quantization IN ('exact', 'rounded_to_nearest', 'rounded_down', 'rounded_up', 'unknown')
     ),
-    resets_at INTEGER NOT NULL,
+    resets_at INTEGER,
     nominal_duration_nanos INTEGER NOT NULL CHECK (nominal_duration_nanos >= 0),
     CHECK (
         (scope_kind = 'account_wide' AND scoped_model IS NULL)

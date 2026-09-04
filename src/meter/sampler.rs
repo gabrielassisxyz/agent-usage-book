@@ -874,7 +874,10 @@ fn normalized_fingerprint(meter_semantics_id: &str, windows: &[MeterWindow]) -> 
             window.quota_used().as_ppm().get(),
             window.reported_resolution().as_ppm().get(),
             quantization_token(window.quantization()),
-            window.resets_at().unix_nanos(),
+            match window.reset_state() {
+                crate::domain::window::WindowResetState::Known(ts) => ts.unix_nanos().to_string(),
+                crate::domain::window::WindowResetState::NotStarted => "not_started".to_string(),
+            },
             window.nominal_duration().as_nanos(),
         );
         hasher.update(line.as_bytes());

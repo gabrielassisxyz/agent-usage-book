@@ -80,24 +80,32 @@ pub fn reconcile_candidate_from_store(
             ))
         })?;
 
+    let start_resets_at = start_window
+        .resets_at
+        .instant()
+        .ok_or_else(|| Error::Store("start observation window has no reset instant".to_string()))?;
     let start_cand = CandidateObservation {
         observation_id: EvidenceId::new(format!("observation:{}", start_obs.row_id.value())),
         account_id: start_obs.account_id,
         received_at: start_obs.received_at,
         window_key: start_window.semantic_key.clone(),
         quota_used: start_window.quota_used,
-        resets_at: start_window.resets_at,
+        resets_at: start_resets_at,
         reported_resolution: start_window.reported_resolution,
         quantization: start_window.quantization,
     };
 
+    let end_resets_at = end_window
+        .resets_at
+        .instant()
+        .ok_or_else(|| Error::Store("end observation window has no reset instant".to_string()))?;
     let end_cand = CandidateObservation {
         observation_id: EvidenceId::new(format!("observation:{}", end_obs.row_id.value())),
         account_id: end_obs.account_id,
         received_at: end_obs.received_at,
         window_key: end_window.semantic_key.clone(),
         quota_used: end_window.quota_used,
-        resets_at: end_window.resets_at,
+        resets_at: end_resets_at,
         reported_resolution: end_window.reported_resolution,
         quantization: end_window.quantization,
     };

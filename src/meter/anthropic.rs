@@ -29,7 +29,7 @@ use crate::domain::time::{
 };
 use crate::domain::window::{
     MeterWindow, ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
-    WindowScope, WindowSemanticKey,
+    WindowResetState, WindowScope, WindowSemanticKey,
 };
 use crate::meter::adapter::{
     AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
@@ -50,12 +50,22 @@ pub struct AnthropicExtraUsage {
     pub utilization: Option<QuotaFractionPpm>,
 }
 
+/// A window dropped from an observation because of an invalid or missing field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DroppedWindow {
+    pub semantic_key: WindowSemanticKey,
+    pub reason: FailureClass,
+    pub field: String,
+    pub payload_fragment: String,
+}
+
 /// The typed observation reading produced by [`AnthropicAdapter`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicReading {
     pub windows: Vec<MeterWindow>,
     pub provider_observed_at: Option<ProviderObservedAt>,
     pub extra_usage: Option<AnthropicExtraUsage>,
+    pub dropped_windows: Vec<DroppedWindow>,
 }
 
 impl AnthropicReading {
@@ -64,6 +74,7 @@ impl AnthropicReading {
             windows,
             provider_observed_at: None,
             extra_usage: None,
+            dropped_windows: Vec::new(),
         }
     }
 }
@@ -199,21 +210,38 @@ pub fn replay_anthropic_capsule(
         .and_then(|v| v.as_object())
         .ok_or(FailureClass::MissingRequiredField)?;
 
-    let five_hour_window = parse_window(
+    let mut windows = Vec::new();
+    let mut dropped_windows = Vec::new();
+
+    match parse_window(
         "five_hour",
         WindowScope::AccountWide,
         five_hour_obj,
         NominalWindowDuration::from_nanos(5 * 3600 * 1_000_000_000),
-    )?;
+    ) {
+        Ok(window) => windows.push(window),
+        Err(err) => dropped_windows.push(DroppedWindow {
+            semantic_key: WindowSemanticKey::new("five_hour"),
+            reason: err.failure_class,
+            field: err.field.to_string(),
+            payload_fragment: err.payload_fragment,
+        }),
+    }
 
-    let seven_day_window = parse_window(
+    match parse_window(
         "seven_day",
         WindowScope::AccountWide,
         seven_day_obj,
         NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
-    )?;
-
-    let mut windows = vec![five_hour_window, seven_day_window];
+    ) {
+        Ok(window) => windows.push(window),
+        Err(err) => dropped_windows.push(DroppedWindow {
+            semantic_key: WindowSemanticKey::new("seven_day"),
+            reason: err.failure_class,
+            field: err.field.to_string(),
+            payload_fragment: err.payload_fragment,
+        }),
+    }
 
     for (key, v) in root {
         if key.starts_with("seven_day_")
@@ -221,15 +249,26 @@ pub fn replay_anthropic_capsule(
         {
             let model_name = key.trim_start_matches("seven_day_");
             if !model_name.is_empty() {
-                let model_window = parse_window(
+                match parse_window(
                     key,
                     WindowScope::ModelSpecific(ModelId::new(model_name)),
                     obj,
                     NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
-                )?;
-                windows.push(model_window);
+                ) {
+                    Ok(window) => windows.push(window),
+                    Err(err) => dropped_windows.push(DroppedWindow {
+                        semantic_key: WindowSemanticKey::new(key),
+                        reason: err.failure_class,
+                        field: err.field.to_string(),
+                        payload_fragment: err.payload_fragment,
+                    }),
+                }
             }
         }
+    }
+
+    if windows.is_empty() {
+        return Err(FailureClass::MissingRequiredField);
     }
 
     let extra_usage = root.get("extra_usage").and_then(parse_extra_usage);
@@ -238,7 +277,15 @@ pub fn replay_anthropic_capsule(
         windows,
         provider_observed_at: None,
         extra_usage,
+        dropped_windows,
     })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct WindowParseError {
+    field: &'static str,
+    payload_fragment: String,
+    failure_class: FailureClass,
 }
 
 fn parse_window(
@@ -246,29 +293,58 @@ fn parse_window(
     scope: WindowScope,
     obj: &serde_json::Map<String, serde_json::Value>,
     nominal_duration: NominalWindowDuration,
-) -> Result<MeterWindow, FailureClass> {
-    let util_val = obj
-        .get("utilization")
-        .ok_or(FailureClass::MissingRequiredField)?;
-    let util_num = util_val
-        .as_f64()
-        .ok_or(FailureClass::MissingRequiredField)?;
+) -> Result<MeterWindow, WindowParseError> {
+    let fragment = serde_json::to_string(obj).unwrap_or_default();
+
+    let util_val = obj.get("utilization").ok_or_else(|| WindowParseError {
+        field: "utilization",
+        payload_fragment: fragment.clone(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
+    let util_num = util_val.as_f64().ok_or_else(|| WindowParseError {
+        field: "utilization",
+        payload_fragment: fragment.clone(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
 
     if !(0.0..=100.0).contains(&util_num) || !util_num.is_finite() {
-        return Err(FailureClass::MissingRequiredField);
+        return Err(WindowParseError {
+            field: "utilization",
+            payload_fragment: fragment.clone(),
+            failure_class: FailureClass::MissingRequiredField,
+        });
     }
 
     let ppm_raw = (util_num * 10_000.0).round() as i32;
-    let ppm = QuotaFractionPpm::new(ppm_raw).ok_or(FailureClass::MissingRequiredField)?;
+    let ppm = QuotaFractionPpm::new(ppm_raw).ok_or_else(|| WindowParseError {
+        field: "utilization",
+        payload_fragment: fragment.clone(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
     let quota_used = QuotaUsed::new(ppm);
 
-    let resets_str = obj
-        .get("resets_at")
-        .and_then(|v| v.as_str())
-        .ok_or(FailureClass::MissingRequiredField)?;
+    let resets_val = obj.get("resets_at").ok_or_else(|| WindowParseError {
+        field: "resets_at",
+        payload_fragment: fragment.clone(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
 
-    let resets_at =
-        UtcTimestamp::parse_rfc3339(resets_str).ok_or(FailureClass::MissingRequiredField)?;
+    let reset_state = if resets_val.is_null() {
+        WindowResetState::NotStarted
+    } else if let Some(resets_str) = resets_val.as_str() {
+        let ts = UtcTimestamp::parse_rfc3339(resets_str).ok_or_else(|| WindowParseError {
+            field: "resets_at",
+            payload_fragment: fragment.clone(),
+            failure_class: FailureClass::MissingRequiredField,
+        })?;
+        WindowResetState::Known(ts)
+    } else {
+        return Err(WindowParseError {
+            field: "resets_at",
+            payload_fragment: fragment.clone(),
+            failure_class: FailureClass::MissingRequiredField,
+        });
+    };
 
     let resolution_ppm = QuotaFractionPpm::new(100).expect("100 ppm is valid non-zero");
     let reported_resolution =
@@ -280,7 +356,7 @@ fn parse_window(
         quota_used,
         reported_resolution,
         QuantizationSemantics::Exact,
-        resets_at,
+        reset_state,
         nominal_duration,
     ))
 }
@@ -525,6 +601,8 @@ mod tests {
         include_bytes!("../../tests/fixtures/meter/anthropic/reset-changed-a.json");
     const FIXTURE_RESET_CHANGED_B: &[u8] =
         include_bytes!("../../tests/fixtures/meter/anthropic/reset-changed-b.json");
+    const FIXTURE_IDLE_FIVE_HOUR: &[u8] =
+        include_bytes!("../../tests/fixtures/meter/anthropic/idle-five-hour.json");
 
     fn test_adapter() -> AnthropicAdapter {
         AnthropicAdapter::new()
@@ -835,7 +913,7 @@ mod tests {
         assert_eq!(reading.windows.len(), 2);
         let expected_ts = UtcTimestamp::parse_rfc3339("2020-01-01T00:00:00.000Z")
             .expect("valid RFC3339 timestamp");
-        assert_eq!(reading.windows[0].resets_at(), expected_ts);
+        assert_eq!(reading.windows[0].resets_at(), Some(expected_ts));
     }
 
     #[test]
@@ -865,6 +943,93 @@ mod tests {
         assert_ne!(
             reading_a.windows[0].resets_at(),
             reading_b.windows[0].resets_at()
+        );
+    }
+
+    #[test]
+    fn case_15_idle_five_hour_window() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(200, FIXTURE_IDLE_FIVE_HOUR);
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 2);
+        assert_eq!(reading.windows[0].semantic_key().as_str(), "five_hour");
+        assert!(reading.windows[0].reset_state().is_not_started());
+        assert_eq!(reading.windows[0].resets_at(), None);
+        assert_eq!(reading.windows[0].quota_used().as_ppm().get(), 0);
+
+        assert_eq!(reading.windows[1].semantic_key().as_str(), "seven_day");
+        assert_eq!(
+            reading.windows[1].resets_at(),
+            Some(UtcTimestamp::parse_rfc3339("2026-09-06T12:00:00.000Z").unwrap())
+        );
+        assert!(reading.dropped_windows.is_empty());
+    }
+
+    #[test]
+    fn window_with_missing_field_dropped_and_other_window_stored() {
+        let adapter = test_adapter();
+        let body = br#"{
+            "five_hour": {
+                "utilization": 10.0,
+                "resets_at": "2026-08-30T19:00:00.000Z"
+            },
+            "seven_day": {
+                "resets_at": "2026-09-06T12:00:00.000Z"
+            }
+        }"#;
+        let transport = MockTransport::ok(200, body);
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 1);
+        assert_eq!(reading.windows[0].semantic_key().as_str(), "five_hour");
+        assert_eq!(reading.dropped_windows.len(), 1);
+        assert_eq!(
+            reading.dropped_windows[0].semantic_key.as_str(),
+            "seven_day"
+        );
+        assert_eq!(
+            reading.dropped_windows[0].reason,
+            FailureClass::MissingRequiredField
+        );
+        assert_eq!(reading.dropped_windows[0].field, "utilization");
+    }
+
+    #[test]
+    fn missing_top_level_five_hour_fails_entire_parse() {
+        let adapter = test_adapter();
+        let body = br#"{
+            "seven_day": {
+                "utilization": 91.0,
+                "resets_at": "2026-09-06T12:00:00.000Z"
+            }
+        }"#;
+        let transport = MockTransport::ok(200, body);
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+
+        assert_eq!(
+            obs,
+            ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
         );
     }
 

@@ -356,7 +356,7 @@ fn seed_worked_examples(conn: &Connection) {
             )
             .unwrap(),
             quantization: agent_usage_book::domain::window::QuantizationSemantics::Exact,
-            resets_at: ts(T0 / SECOND + 35_000),
+            resets_at: ts(T0 / SECOND + 35_000).into(),
             nominal_duration: agent_usage_book::domain::window::NominalWindowDuration::from_nanos(
                 18_000 * SECOND as u64,
             ),

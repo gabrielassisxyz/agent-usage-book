@@ -703,7 +703,7 @@ mod tests {
                 quota_used_ppm: 250_000,
                 reported_resolution_ppm: 10_000,
                 quantization: quantization_sql::as_sql(QuantizationSemantics::Exact).to_owned(),
-                resets_at_nanos: 5_000,
+                resets_at_nanos: Some(5_000),
                 nominal_duration_nanos: 18_000_000_000_000,
             }],
         }

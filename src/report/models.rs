@@ -19,7 +19,7 @@ use crate::domain::provenance::{CostModelId, DerivationId, RateCardId};
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
-use crate::domain::window::{ModelId, NominalWindowDuration, WindowScope};
+use crate::domain::window::{ModelId, NominalWindowDuration, WindowResetState, WindowScope};
 use crate::evidence::{Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
@@ -154,6 +154,7 @@ impl MeterAccount {
 pub struct LimitingWindow {
     pub scope: WindowScope,
     pub nominal_duration: NominalWindowDuration,
+    pub reset_state: WindowResetState,
 }
 
 /// Whether the status command could read the projection, and why not when it

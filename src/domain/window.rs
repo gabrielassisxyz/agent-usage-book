@@ -122,6 +122,38 @@ impl NominalWindowDuration {
     }
 }
 
+/// The provider-reported reset state of a quota window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum WindowResetState {
+    /// A known reset instant reported by the provider.
+    Known(UtcTimestamp),
+    /// The window has not started yet (idle window with no activity since last reset).
+    NotStarted,
+}
+
+impl WindowResetState {
+    pub fn instant(self) -> Option<UtcTimestamp> {
+        match self {
+            Self::Known(ts) => Some(ts),
+            Self::NotStarted => None,
+        }
+    }
+
+    pub fn is_not_started(self) -> bool {
+        matches!(self, Self::NotStarted)
+    }
+
+    pub fn is_known(self) -> bool {
+        matches!(self, Self::Known(_))
+    }
+}
+
+impl From<UtcTimestamp> for WindowResetState {
+    fn from(ts: UtcTimestamp) -> Self {
+        Self::Known(ts)
+    }
+}
+
 /// A normalized provider quota constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeterWindow {
@@ -130,7 +162,7 @@ pub struct MeterWindow {
     quota_used: QuotaUsed,
     reported_resolution: ReportedResolution,
     quantization: QuantizationSemantics,
-    resets_at: UtcTimestamp,
+    resets_at: WindowResetState,
     nominal_duration: NominalWindowDuration,
 }
 
@@ -142,7 +174,7 @@ impl MeterWindow {
         quota_used: QuotaUsed,
         reported_resolution: ReportedResolution,
         quantization: QuantizationSemantics,
-        resets_at: UtcTimestamp,
+        resets_at: impl Into<WindowResetState>,
         nominal_duration: NominalWindowDuration,
     ) -> Self {
         Self {
@@ -151,7 +183,7 @@ impl MeterWindow {
             quota_used,
             reported_resolution,
             quantization,
-            resets_at,
+            resets_at: resets_at.into(),
             nominal_duration,
         }
     }
@@ -176,8 +208,12 @@ impl MeterWindow {
         self.quantization
     }
 
-    pub fn resets_at(&self) -> UtcTimestamp {
+    pub fn reset_state(&self) -> WindowResetState {
         self.resets_at
+    }
+
+    pub fn resets_at(&self) -> Option<UtcTimestamp> {
+        self.resets_at.instant()
     }
 
     pub fn nominal_duration(&self) -> NominalWindowDuration {
@@ -186,8 +222,12 @@ impl MeterWindow {
 
     /// True before the provider's stated reset instant. At that instant this reading
     /// belongs to the completed window and must not be treated as current.
+    /// Returns false for not-started windows where no active window is in progress.
     pub fn is_active_at(&self, now: UtcTimestamp) -> bool {
-        now < self.resets_at
+        match self.resets_at {
+            WindowResetState::Known(reset) => now < reset,
+            WindowResetState::NotStarted => false,
+        }
     }
 
     pub fn remaining_fraction(&self) -> QuotaRemaining {
@@ -214,7 +254,13 @@ pub fn lowest_remaining_fraction_window<'a>(
     windows
         .iter()
         .filter(|window| window.constrains(model))
-        .min_by_key(|window| window.remaining_fraction().as_ppm().get())
+        .min_by_key(|window| {
+            if window.reset_state().is_not_started() {
+                1_000_000
+            } else {
+                window.remaining_fraction().as_ppm().get()
+            }
+        })
 }
 
 /// Result of selecting the workload constraint.
@@ -477,5 +523,55 @@ mod tests {
             };
             assert!(after.micros() <= before.micros());
         }
+    }
+
+    #[test]
+    fn lowest_remaining_fraction_window_treats_not_started_as_zero_used() {
+        let model = ModelId::new("claude-sonnet");
+        let idle_five_hour = MeterWindow::new(
+            WindowSemanticKey::new("five_hour"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(0).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Exact,
+            WindowResetState::NotStarted,
+            NominalWindowDuration::from_nanos(5 * 3600 * 1_000_000_000),
+        );
+        let weekly_used = MeterWindow::new(
+            WindowSemanticKey::new("seven_day"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(210_000).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Exact,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(100_000)),
+            NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
+        );
+
+        let windows = [idle_five_hour.clone(), weekly_used.clone()];
+        let selected = lowest_remaining_fraction_window(&windows, &model).unwrap();
+        assert_eq!(selected.semantic_key().as_str(), "seven_day");
+
+        // When only the not-started window is present, it is selected with 100% remaining.
+        let only_idle = [idle_five_hour];
+        let selected_idle = lowest_remaining_fraction_window(&only_idle, &model).unwrap();
+        assert_eq!(selected_idle.semantic_key().as_str(), "five_hour");
+    }
+
+    #[test]
+    fn not_started_window_is_never_active() {
+        let idle_window = MeterWindow::new(
+            WindowSemanticKey::new("five_hour"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(0).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Exact,
+            WindowResetState::NotStarted,
+            NominalWindowDuration::from_nanos(5 * 3600 * 1_000_000_000),
+        );
+
+        assert!(!idle_window.is_active_at(UtcTimestamp::from_unix_nanos(0)));
+        assert!(!idle_window.is_active_at(UtcTimestamp::from_unix_nanos(100_000)));
+        assert_eq!(idle_window.resets_at(), None);
+        assert_eq!(idle_window.reset_state(), WindowResetState::NotStarted);
     }
 }

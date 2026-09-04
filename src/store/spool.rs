@@ -37,7 +37,8 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use crate::domain::time::UtcTimestamp;
 use crate::domain::window::{
-    MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, WindowScope, WindowSemanticKey,
+    MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, WindowResetState, WindowScope,
+    WindowSemanticKey,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -113,7 +114,7 @@ pub struct PendingWindow {
     pub quota_used_ppm: i64,
     pub reported_resolution_ppm: i64,
     pub quantization: String,
-    pub resets_at_nanos: i64,
+    pub resets_at_nanos: Option<i64>,
     pub nominal_duration_nanos: i64,
 }
 
@@ -179,7 +180,7 @@ impl PendingWindow {
             quota_used_ppm: required_i64(value, "quota_used_ppm")?,
             reported_resolution_ppm: required_i64(value, "reported_resolution_ppm")?,
             quantization: required_str(value, "quantization")?,
-            resets_at_nanos: required_i64(value, "resets_at_nanos")?,
+            resets_at_nanos: optional_i64(value, "resets_at_nanos")?,
             nominal_duration_nanos: required_i64(value, "nominal_duration_nanos")?,
         })
     }
@@ -350,7 +351,7 @@ fn pending_window_from_window(window: &MeterWindow) -> PendingWindow {
         quota_used_ppm: i64::from(window.quota_used().as_ppm().get()),
         reported_resolution_ppm: i64::from(window.reported_resolution().as_ppm().get()),
         quantization: quantization_sql::as_sql(window.quantization()).to_owned(),
-        resets_at_nanos: window.resets_at().unix_nanos(),
+        resets_at_nanos: window.reset_state().instant().map(|ts| ts.unix_nanos()),
         nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
     }
 }
@@ -960,7 +961,10 @@ fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
         quota_used,
         reported_resolution,
         quantization,
-        UtcTimestamp::from_unix_nanos(window.resets_at_nanos),
+        match window.resets_at_nanos {
+            Some(nanos) => WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos)),
+            None => WindowResetState::NotStarted,
+        },
         NominalWindowDuration::from_nanos(window.nominal_duration_nanos as u64),
     ))
 }
@@ -1089,7 +1093,7 @@ mod tests {
                     crate::domain::window::QuantizationSemantics::Exact,
                 )
                 .to_owned(),
-                resets_at_nanos: 5_000,
+                resets_at_nanos: Some(5_000),
                 nominal_duration_nanos: 18_000_000_000_000,
             }],
         }
@@ -1176,7 +1180,7 @@ mod tests {
             quota_used_ppm: 400_000,
             reported_resolution_ppm: 10_000,
             quantization: "rounded_to_nearest".to_owned(),
-            resets_at_nanos: 6_000,
+            resets_at_nanos: Some(6_000),
             nominal_duration_nanos: 604_800_000_000_000,
         });
 

@@ -6,7 +6,9 @@ use agent_usage_book::domain::attempt::AttemptId;
 use agent_usage_book::domain::freshness::{Freshness, Observed};
 use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaRemaining};
 use agent_usage_book::domain::time::{MeasurementBasis, ReceivedAt, UtcTimestamp};
-use agent_usage_book::domain::window::{ModelId, NominalWindowDuration, WindowScope};
+use agent_usage_book::domain::window::{
+    ModelId, NominalWindowDuration, WindowResetState, WindowScope,
+};
 use agent_usage_book::logging::{LogicalName, RunId};
 use agent_usage_book::presentation::json::{status_json_with_explain, validate_status_report_json};
 use agent_usage_book::presentation::render::ExplainMode;
@@ -47,6 +49,7 @@ fn fresh_account(name: &str) -> MeterAccount {
         Some(LimitingWindow {
             scope: WindowScope::AccountWide,
             nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000)),
         }),
         vec![WindowScope::AccountWide],
         None,
@@ -163,6 +166,7 @@ fn the_selector_document_identifies_model_scopes_and_the_limit() {
             Some(LimitingWindow {
                 scope: WindowScope::ModelSpecific(ModelId::new("claude-model-x".to_string())),
                 nominal_duration: NominalWindowDuration::from_nanos(7 * 86_400_000_000_000),
+                reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000)),
             }),
             vec![
                 WindowScope::AccountWide,

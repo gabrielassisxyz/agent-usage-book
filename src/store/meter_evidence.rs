@@ -161,7 +161,7 @@ pub struct NewMeterWindow {
     pub quota_used: crate::domain::quota::QuotaUsed,
     pub reported_resolution: ReportedResolution,
     pub quantization: QuantizationSemantics,
-    pub resets_at: UtcTimestamp,
+    pub resets_at: crate::domain::window::WindowResetState,
     pub nominal_duration: NominalWindowDuration,
 }
 
@@ -175,7 +175,7 @@ pub struct StoredMeterWindow {
     pub quota_used: crate::domain::quota::QuotaUsed,
     pub reported_resolution: ReportedResolution,
     pub quantization: QuantizationSemantics,
-    pub resets_at: UtcTimestamp,
+    pub resets_at: crate::domain::window::WindowResetState,
     pub nominal_duration: NominalWindowDuration,
 }
 
@@ -450,7 +450,7 @@ pub fn insert_window(
             window.quota_used.as_ppm().get() as i64,
             window.reported_resolution.as_ppm().get() as i64,
             quantization_sql::as_sql(window.quantization),
-            window.resets_at.unix_nanos(),
+            window.resets_at.instant().map(|ts| ts.unix_nanos()),
             window.nominal_duration.as_nanos() as i64,
         ],
         |row| row.get(0),
@@ -536,7 +536,12 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
         )
         .expect("the table CHECK keeps reported_resolution_ppm non-zero"),
         quantization,
-        resets_at: UtcTimestamp::from_unix_nanos(row.get("resets_at")?),
+        resets_at: match row.get::<_, Option<i64>>("resets_at")? {
+            Some(nanos) => {
+                crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos))
+            }
+            None => crate::domain::window::WindowResetState::NotStarted,
+        },
         nominal_duration: NominalWindowDuration::from_nanos(
             row.get::<_, i64>("nominal_duration_nanos")? as u64,
         ),
@@ -899,7 +904,9 @@ mod tests {
             reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
                 .unwrap(),
             quantization: QuantizationSemantics::RoundedToNearest,
-            resets_at: UtcTimestamp::from_unix_nanos(100_000),
+            resets_at: crate::domain::window::WindowResetState::Known(
+                UtcTimestamp::from_unix_nanos(100_000),
+            ),
             nominal_duration: NominalWindowDuration::from_nanos(3_600_000_000_000),
         }
     }
@@ -1259,7 +1266,9 @@ mod tests {
             insert_window(
                 &conn,
                 &NewMeterWindow {
-                    resets_at: UtcTimestamp::from_unix_nanos(resets_at),
+                    resets_at: crate::domain::window::WindowResetState::Known(
+                        UtcTimestamp::from_unix_nanos(resets_at),
+                    ),
                     nominal_duration: NominalWindowDuration::from_nanos(nominal as u64),
                     ..window(observation_row, 410_000)
                 },
@@ -1282,5 +1291,74 @@ mod tests {
             }],
             "one reset event at 40_000, deduplicated, keeping the longest window"
         );
+    }
+
+    #[test]
+    fn storage_round_trip_persists_not_started_window_and_recovers_identically() {
+        let (_scratch, conn, _run, account, _snapshot, attempt) = fixture();
+        let evidence_row = insert_response_evidence(&conn, &evidence(attempt))
+            .expect("fixture evidence must insert");
+        let observation_row = insert_observation(
+            &conn,
+            &observation(attempt, evidence_row, account, "semantics-v1", "fp-1"),
+        )
+        .expect("the observation must insert");
+
+        let not_started_window = NewMeterWindow {
+            observation_id: observation_row,
+            semantic_key: WindowSemanticKey::new("five_hour"),
+            scope: WindowScope::AccountWide,
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(0).unwrap()),
+            reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+                .unwrap(),
+            quantization: QuantizationSemantics::Exact,
+            resets_at: crate::domain::window::WindowResetState::NotStarted,
+            nominal_duration: NominalWindowDuration::from_nanos(5 * 3600 * 1_000_000_000),
+        };
+
+        let known_window = NewMeterWindow {
+            observation_id: observation_row,
+            semantic_key: WindowSemanticKey::new("seven_day"),
+            scope: WindowScope::AccountWide,
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(210_000).unwrap()),
+            reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+                .unwrap(),
+            quantization: QuantizationSemantics::Exact,
+            resets_at: crate::domain::window::WindowResetState::Known(
+                UtcTimestamp::from_unix_nanos(500_000_000),
+            ),
+            nominal_duration: NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
+        };
+
+        insert_window(&conn, &not_started_window).expect("not-started window must insert");
+        insert_window(&conn, &known_window).expect("known window must insert");
+
+        let read_windows = windows_by_observation(&conn, observation_row)
+            .expect("must read windows by observation");
+        assert_eq!(read_windows.len(), 2);
+
+        let read_not_started = read_windows
+            .iter()
+            .find(|w| w.semantic_key.as_str() == "five_hour")
+            .expect("five_hour window must be present");
+        assert_eq!(
+            read_not_started.resets_at,
+            crate::domain::window::WindowResetState::NotStarted
+        );
+        assert_eq!(read_not_started.quota_used, not_started_window.quota_used);
+        assert_eq!(read_not_started.scope, not_started_window.scope);
+
+        let read_known = read_windows
+            .iter()
+            .find(|w| w.semantic_key.as_str() == "seven_day")
+            .expect("seven_day window must be present");
+        assert_eq!(
+            read_known.resets_at,
+            crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                500_000_000
+            ))
+        );
+        assert_eq!(read_known.quota_used, known_window.quota_used);
+        assert_eq!(read_known.scope, known_window.scope);
     }
 }

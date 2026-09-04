@@ -99,7 +99,7 @@ quantity, documented here with its reason for exclusion:
 ### Provenance and window descriptors (`provenance.rs`, `window.rs`)
 - `Digest`, `EvidenceId`, `CostModelId`, `WindowCalibrationId`, `RateCardId`, `WitnessId`, `DerivationId`: provenance identifiers.
 - `QuerySemantics`, `ProvenanceManifest`, `Derived`: compound provenance aggregates and wrappers.
-- `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
+- `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `WindowResetState`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
 
 ### Authoritative surface comparison (`authoritative_comparison.rs`)
 - `AuthoritativeComparisonVerdict`: tag enum with exactly two outcomes (agrees within granularity, unresolved mismatch), not a measured quantity. It has no `Default` and no free-standing formatting trait; `as_str` is an inherent method for the stable database spelling.

@@ -2783,6 +2783,7 @@ fn projection_accounts(
                     .map(|limit| crate::report::LimitingWindow {
                         scope: limit.scope,
                         nominal_duration: limit.nominal_duration,
+                        reset_state: limit.reset_state,
                     }),
                 reading.included_scopes,
                 model_selector.map(crate::domain::window::ModelId::new),

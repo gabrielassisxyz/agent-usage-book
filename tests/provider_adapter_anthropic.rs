@@ -276,7 +276,7 @@ fn contract_all_fourteen_cases() {
         ProviderObservation::Measured(r) => {
             assert_eq!(
                 r.windows[0].resets_at(),
-                UtcTimestamp::parse_rfc3339("2020-01-01T00:00:00.000Z").unwrap()
+                Some(UtcTimestamp::parse_rfc3339("2020-01-01T00:00:00.000Z").unwrap())
             );
         }
         other => panic!("case 13 expected Measured, got {other:?}"),
@@ -292,6 +292,24 @@ fn contract_all_fourteen_cases() {
             assert_ne!(a.windows[0].resets_at(), b.windows[0].resets_at());
         }
         other => panic!("case 14 expected Measured pair, got {other:?}"),
+    }
+
+    // 15. idle 5-hour window with null reset
+    let body = read_fixture("idle-five-hour.json");
+    let obs = adapter.observe(&cred, &req, &MockTransport::ok(200, body), &clock);
+    match obs {
+        ProviderObservation::Measured(r) => {
+            assert_eq!(r.windows.len(), 2);
+            assert_eq!(r.windows[0].semantic_key().as_str(), "five_hour");
+            assert!(r.windows[0].reset_state().is_not_started());
+            assert_eq!(r.windows[0].resets_at(), None);
+            assert_eq!(r.windows[1].semantic_key().as_str(), "seven_day");
+            assert_eq!(
+                r.windows[1].resets_at(),
+                Some(UtcTimestamp::parse_rfc3339("2026-09-06T12:00:00.000Z").unwrap())
+            );
+        }
+        other => panic!("case 15 expected Measured, got {other:?}"),
     }
 }
 

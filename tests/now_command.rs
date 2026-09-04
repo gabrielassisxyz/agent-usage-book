@@ -30,7 +30,7 @@ use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaRemaining};
 use agent_usage_book::domain::time::{
     ClockSkewEnvelope, MeasurementBasis, MonotonicDuration, ReceivedAt, UtcTimestamp,
 };
-use agent_usage_book::domain::window::{NominalWindowDuration, WindowScope};
+use agent_usage_book::domain::window::{NominalWindowDuration, WindowResetState, WindowScope};
 use agent_usage_book::logging::{LogicalName, RunId};
 use agent_usage_book::presentation::json::{
     now_json, now_json_with_explain, validate_now_report_json,
@@ -453,6 +453,7 @@ fn the_now_renderers_carry_one_freshness_variant_per_account_in_both_formats() {
         Some(LimitingWindow {
             scope: WindowScope::AccountWide,
             nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            reset_state: WindowResetState::Known(now),
         }),
         vec![WindowScope::AccountWide],
         None,
