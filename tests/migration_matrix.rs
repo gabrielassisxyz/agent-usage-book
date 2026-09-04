@@ -257,6 +257,14 @@ const POPULATION: &[(&str, Populate)] = &[
         "legacy_meter_import_record",
         populate_legacy_meter_import_record,
     ),
+    (
+        "authoritative_surface_comparison",
+        populate_authoritative_surface_comparison,
+    ),
+    (
+        "adapter_semantics_annotation",
+        populate_adapter_semantics_annotation,
+    ),
 ];
 
 fn populate_account(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -666,6 +674,31 @@ fn populate_legacy_meter_import_record(conn: &rusqlite::Connection) -> Result<()
         "INSERT INTO legacy_meter_import_record (source_digest, source_line, observation_id, marker_id) VALUES
             ('1111111111111111111111111111111111111111111111111111111111111111', 1, 1, 1),
             ('1111111111111111111111111111111111111111111111111111111111111111', 2, 2, 2)",
+    )
+}
+
+fn populate_authoritative_surface_comparison(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Row 1 sits on every quota-fraction floor: granularity and both readings
+    // exactly zero. Row 2 sits on every ceiling, and carries the other verdict.
+    exec(
+        conn,
+        "authoritative_surface_comparison",
+        "INSERT INTO authoritative_surface_comparison (id, observation_id, window_id, semantic_key, authoritative_surface, documented_granularity_ppm, adapter_quota_used_ppm, authoritative_quota_used_ppm, read_at, verdict) VALUES
+            (1, 1, 1, 'matrix-key-1', 'matrix-surface', 0, 0, 0, 100, 'agrees_within_granularity'),
+            (2, 2, 2, 'matrix-key-1', 'matrix-surface', 1000000, 1000000, 1000000, 200, 'unresolved_mismatch')",
+    )
+}
+
+fn populate_adapter_semantics_annotation(conn: &rusqlite::Connection) -> Result<(), String> {
+    // All three kinds, and both arms of the correction-link CHECK: a mismatch
+    // and an exclusion with no link, a correction that names the mismatch.
+    exec(
+        conn,
+        "adapter_semantics_annotation",
+        "INSERT INTO adapter_semantics_annotation (id, kind, comparison_id, observation_id, semantic_key, adapter_quota_used_ppm, authoritative_quota_used_ppm, corrects_annotation_id, detail, created_at) VALUES
+            (1, 'mismatch', 2, 2, 'matrix-key-1', 1000000, 0, NULL, 'matrix-mismatch', 300),
+            (2, 'correction', 2, 2, 'matrix-key-1', 1000000, 0, 1, 'matrix-correction', 310),
+            (3, 'exclusion', 1, 1, 'matrix-key-1', 0, 0, NULL, 'matrix-exclusion', 320)",
     )
 }
 
