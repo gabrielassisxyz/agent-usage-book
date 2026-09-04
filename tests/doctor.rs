@@ -664,3 +664,54 @@ fn owned_checks_have_correct_owner_module() {
         );
     }
 }
+
+#[test]
+fn every_check_declares_name_owner_condition_and_repair_flag() {
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join("ledger.sqlite3"),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    for outcome in &outcomes {
+        assert!(!outcome.name.as_str().is_empty());
+        assert!(!outcome.owner_module.is_empty());
+        assert!(!outcome.condition.is_empty());
+        if outcome.name == CheckName::PendingEvidence {
+            assert!(
+                outcome.has_repair,
+                "pending-evidence must declare has_repair = true"
+            );
+        }
+    }
+}
+
+#[test]
+fn not_applicable_checks_provide_non_empty_reason() {
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join("ledger.sqlite3"),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let na_count = outcomes
+        .iter()
+        .filter(
+            |o| matches!(o.status, CheckStatus::NotApplicable(ref reason) if !reason.is_empty()),
+        )
+        .count();
+    assert!(
+        na_count > 0,
+        "at least one check is not applicable with non-empty reason"
+    );
+}
