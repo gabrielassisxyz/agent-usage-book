@@ -264,19 +264,13 @@ mod tests {
         )
         .expect("a fresh ledger must open and migrate");
 
-        let calibrations_before: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_lifecycle", [], |row| {
-                row.get(0)
-            })
+        let calibrations_before = crate::store::calibration::lifecycle_event_count(&conn)
             .expect("calibration_lifecycle must be queryable");
         let rate_cards_before = crate::store::rate_card::count(&conn).expect("rate card count");
 
         run_fix(&mut conn, &config, &clock).expect("fix must succeed on a clean ledger");
 
-        let calibrations_after: i64 = conn
-            .query_row("SELECT COUNT(*) FROM calibration_lifecycle", [], |row| {
-                row.get(0)
-            })
+        let calibrations_after = crate::store::calibration::lifecycle_event_count(&conn)
             .expect("calibration_lifecycle must be queryable");
         let rate_cards_after = crate::store::rate_card::count(&conn).expect("rate card count");
 

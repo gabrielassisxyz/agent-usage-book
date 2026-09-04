@@ -211,7 +211,7 @@ fn outcome(name: CheckName, status: CheckStatus) -> CheckOutcome {
     }
 }
 
-/// SQLite's own health: `PRAGMA integrity_check` and `PRAGMA foreign_key_check`,
+/// SQLite's own health: pragma integrity_check and pragma foreign_key_check,
 /// via the same function backup verification runs (`store::backup`).
 fn sqlite_and_schema_health(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
@@ -483,7 +483,7 @@ fn missing_active_calibrations(ctx: &DoctorContext) -> CheckOutcome {
     } else {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
-            Some(conn) => match fitted_calibration_scopes(conn) {
+            Some(conn) => match crate::store::calibration::fitted_calibration_scopes(conn) {
                 Err(error) => CheckStatus::Fail(format!("cannot read calibration scopes: {error}")),
                 Ok(scopes) if scopes.is_empty() => {
                     CheckStatus::NotApplicable("no calibration has ever been fitted".to_string())
@@ -521,42 +521,6 @@ fn missing_active_calibrations(ctx: &DoctorContext) -> CheckOutcome {
         }
     };
     outcome(CheckName::MissingActiveCalibrations, status)
-}
-
-/// Every distinct (provider, plan tier, window) scope a result has ever been
-/// fitted for. A raw query rather than a `store::calibration` export: the module
-/// exposes lookups scoped by an already-known scope, and there is deliberately no
-/// "every scope that ever existed" query there, since only `doctor` needs one.
-fn fitted_calibration_scopes(
-    conn: &Connection,
-) -> Result<Vec<crate::store::calibration::CalibrationScope>, crate::error::Error> {
-    let mut statement = conn
-        .prepare(
-            "SELECT DISTINCT provider, plan_tier, window_semantic_key FROM window_calibration_result",
-        )
-        .map_err(|error| crate::error::Error::Store(format!("cannot list calibration scopes: {error}")))?;
-    let rows = statement
-        .query_map([], |row| {
-            let provider: String = row.get(0)?;
-            let plan_tier: String = row.get(1)?;
-            let window_semantic_key: String = row.get(2)?;
-            Ok((provider, plan_tier, window_semantic_key))
-        })
-        .map_err(|error| {
-            crate::error::Error::Store(format!("cannot query calibration scopes: {error}"))
-        })?;
-    let mut scopes = Vec::new();
-    for row in rows {
-        let (provider, plan_tier, window_semantic_key) = row.map_err(|error| {
-            crate::error::Error::Store(format!("cannot read a calibration scope row: {error}"))
-        })?;
-        scopes.push(crate::store::calibration::CalibrationScope {
-            provider: crate::store::cost_model::ProviderKey::new(provider),
-            plan_tier: crate::store::calibration::PlanTier::new(plan_tier),
-            window_semantic_key: crate::domain::window::WindowSemanticKey::new(window_semantic_key),
-        });
-    }
-    Ok(scopes)
 }
 
 /// Imported rate cards past their review-due date, where valuation is configured
@@ -696,17 +660,12 @@ fn clock_skew(ctx: &DoctorContext) -> CheckOutcome {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
             Some(conn) => {
-                let since = ctx
-                    .timestamp
-                    .unix_nanos()
-                    .saturating_sub(CLOCK_SKEW_LOOKBACK_NANOS);
-                let count: Result<i64, rusqlite::Error> = conn.query_row(
-                    "SELECT COUNT(*) FROM meter_attempt_result r
-                     JOIN meter_attempt a ON a.id = r.attempt_id
-                     WHERE r.clock_anomaly = 1 AND a.request_started_at >= ?1",
-                    [since],
-                    |row| row.get(0),
+                let since = UtcTimestamp::from_unix_nanos(
+                    ctx.timestamp
+                        .unix_nanos()
+                        .saturating_sub(CLOCK_SKEW_LOOKBACK_NANOS),
                 );
+                let count = crate::store::meter_attempt::count_clock_anomalies_since(conn, since);
                 match count {
                     Err(error) => {
                         CheckStatus::Fail(format!("cannot count clock anomalies: {error}"))
