@@ -22,10 +22,13 @@ forensic copy until the recovery has been reviewed.
    surviving pending records are replayed idempotently, so a record found in
    both sources is counted once. Every `unrecovered:` line names evidence that
    was preserved but could not be applied, with its source and reason.
-7. Projection recovery is not applicable in Phase 1 because the projection
-   subsystem has no published file yet. The restore result states this
-   explicitly. Projection rebuilding is owned by `aub-n27.2` once publication
-   exists.
+7. The projection is rebuilt, never restored: the archive carries no
+   projection file, and the damaged directory's own copy may be exactly what
+   the recovery was called in to fix. `aub` rebuilds it deterministically
+   from the restored database's own state and reports `projection: rebuilt`.
+   A rebuild that could not run yet (the projection publish deferred) reports
+   `projection: deferred`; the restored database is unaffected either way,
+   and the next publish heals it.
 8. Transcript-derived tables have no writer in Phase 1, so there is nothing to
    rebuild. If a later phase adds one, rebuild those tables only from their
    durable inputs after the database and spool recovery succeeds.
