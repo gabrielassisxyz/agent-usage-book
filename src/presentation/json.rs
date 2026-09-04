@@ -1285,13 +1285,50 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
         .collect::<Vec<_>>()
         .join(",");
 
-    let body = format!(
+    let mut body = format!(
         "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"not_applicable\":{},\"not_yet_available\":{}",
         report.passed(),
         report.failed(),
         report.not_applicable(),
         report.not_yet_available(),
     );
+
+    if let Some(res) = &report.residual {
+        let fraction_json = match res.rolling_residual_fraction {
+            Some(f) => format!("{f:.6}"),
+            None => "null".to_string(),
+        };
+        let patterns_json = res
+            .patterns
+            .iter()
+            .map(|p| {
+                let mut p_fields = format!(
+                    "\"label\":{},\"explanation\":{}",
+                    json_string(p.label()),
+                    json_string(p.explanation())
+                );
+                if let Some(ptr) = p.calibration_pointer() {
+                    p_fields.push_str(&format!(",\"pointer\":{}", json_string(ptr)));
+                }
+                format!("{{{p_fields}}}")
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        let pointer_json = match res.pointer {
+            Some(ptr) => json_string(ptr),
+            None => "null".to_string(),
+        };
+        body.push_str(&format!(
+            ",\"residual\":{{\"window_seconds\":{},\"eligible_count\":{},\"min_eligible\":{},\"residual_interval\":{{\"lower\":{},\"upper\":{},\"unit\":\"credits\"}},\"fraction\":{},\"verdict\":{},\"patterns\":[{patterns_json}],\"pointer\":{pointer_json}}}",
+            res.window.as_nanos() / 1_000_000_000,
+            res.eligible_count,
+            res.min_eligible,
+            res.rolling_residual_interval.lower().micros(),
+            res.rolling_residual_interval.upper().micros(),
+            fraction_json,
+            json_string(res.verdict.as_str()),
+        ));
+    }
 
     JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
 }

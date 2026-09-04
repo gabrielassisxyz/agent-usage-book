@@ -23,7 +23,7 @@ use crate::domain::provenance::{
     EvidenceId, ProvenanceManifest, QuerySemantics, WindowCalibrationId, WitnessId,
 };
 use crate::domain::quota::{PercentagePoints, QuotaUsed};
-use crate::domain::time::UtcTimestamp;
+use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowSemanticKey};
 use crate::store::account::AccountId;
 use crate::store::calibration::WindowCalibration;
@@ -158,6 +158,27 @@ impl ResidualPattern {
             }
         }
     }
+
+    pub const fn explanation(&self) -> &'static str {
+        self.diagnostic_pattern()
+    }
+
+    pub const fn label(&self) -> &'static str {
+        self.name()
+    }
+
+    /// Operational pointer for pattern, specifically for StepChange which indicates
+    /// potential calibration inapplicability rather than asserting a conclusion.
+    pub const fn calibration_pointer(&self) -> Option<&'static str> {
+        match self {
+            Self::StepChange => Some(
+                "pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable",
+            ),
+            Self::PersistentlyPositive | Self::PersistentlyNegative | Self::AlternatingNetZero => {
+                None
+            }
+        }
+    }
 }
 
 /// Classifies diagnostic patterns across a sequence of residuals (PLAN.md 35).
@@ -216,6 +237,153 @@ pub fn classify_patterns(residuals: &[Credits]) -> Vec<ResidualPattern> {
     patterns
 }
 
+/// The rolling-residual verdict for `doctor` (PLAN.md 35, aub-dpn.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RollingResidualVerdict {
+    /// Eligible intervals are fewer than the configured minimum: verdict is suppressed.
+    Suppressed {
+        eligible_count: usize,
+        min_eligible: usize,
+    },
+    /// Residual interval contains zero: observed meter movement and locally explained usage
+    /// agree within measurement uncertainty.
+    ReconcilesWithinUncertainty,
+    /// Residual interval excludes zero: discrepancy detected with diagnostic patterns.
+    Discrepancy { patterns: Vec<ResidualPattern> },
+}
+
+impl RollingResidualVerdict {
+    pub fn is_suppressed(&self) -> bool {
+        matches!(self, Self::Suppressed { .. })
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Suppressed { .. } => "suppressed",
+            Self::ReconcilesWithinUncertainty => "reconciles_within_uncertainty",
+            Self::Discrepancy { .. } => "discrepancy",
+        }
+    }
+}
+
+/// The rolling-residual health summary computed by `doctor` over recent eligible intervals
+/// (PLAN.md 35, aub-dpn.3).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RollingResidualHealth {
+    pub window: MonotonicDuration,
+    pub min_eligible: usize,
+    pub eligible_count: usize,
+    pub total_observed_meter_credits: Credits,
+    pub total_locally_explained_credits: Credits,
+    pub rolling_residual: Credits,
+    pub rolling_residual_interval: Interval<Credits>,
+    pub rolling_residual_fraction: Option<f64>,
+    pub verdict: RollingResidualVerdict,
+    pub patterns: Vec<ResidualPattern>,
+    pub pointer: Option<&'static str>,
+}
+
+impl RollingResidualHealth {
+    pub fn reconciles_within_uncertainty(&self) -> bool {
+        self.rolling_residual_interval.lower().micros() <= 0
+            && self.rolling_residual_interval.upper().micros() >= 0
+    }
+}
+
+/// Computes the rolling residual health from a sequence of reconciled eligible intervals.
+/// Returns None when there are no eligible intervals in the window.
+pub fn compute_rolling_residual_health(
+    reconciled_intervals: &[ReconciledResidual],
+    window: MonotonicDuration,
+    min_eligible: usize,
+) -> Option<RollingResidualHealth> {
+    if reconciled_intervals.is_empty() {
+        return None;
+    }
+
+    let eligible_count = reconciled_intervals.len();
+
+    let mut total_observed = Credits::from_micros(0);
+    let mut total_locally_explained = Credits::from_micros(0);
+    let mut total_residual = Credits::from_micros(0);
+
+    let first = &reconciled_intervals[0];
+    let mut rolling_residual_interval = first.unexplained_residual_interval;
+    total_observed = total_observed + first.observed_meter_credits;
+    total_locally_explained = total_locally_explained + first.locally_explained_credits;
+    total_residual = total_residual + first.unexplained_residual;
+
+    for interval in &reconciled_intervals[1..] {
+        rolling_residual_interval =
+            rolling_residual_interval + interval.unexplained_residual_interval;
+        total_observed = total_observed + interval.observed_meter_credits;
+        total_locally_explained = total_locally_explained + interval.locally_explained_credits;
+        total_residual = total_residual + interval.unexplained_residual;
+    }
+
+    let rolling_residual_fraction = if total_observed.micros() != 0 {
+        Some(total_residual.micros() as f64 / total_observed.micros() as f64)
+    } else {
+        None
+    };
+
+    let reconciles_within_uncertainty = rolling_residual_interval.lower().micros() <= 0
+        && rolling_residual_interval.upper().micros() >= 0;
+
+    if eligible_count < min_eligible {
+        Some(RollingResidualHealth {
+            window,
+            min_eligible,
+            eligible_count,
+            total_observed_meter_credits: total_observed,
+            total_locally_explained_credits: total_locally_explained,
+            rolling_residual: total_residual,
+            rolling_residual_interval,
+            rolling_residual_fraction,
+            verdict: RollingResidualVerdict::Suppressed {
+                eligible_count,
+                min_eligible,
+            },
+            patterns: Vec::new(),
+            pointer: None,
+        })
+    } else {
+        let residuals: Vec<Credits> = reconciled_intervals
+            .iter()
+            .map(|r| r.unexplained_residual)
+            .collect();
+        let patterns = classify_patterns(&residuals);
+
+        let pointer = if patterns.contains(&ResidualPattern::StepChange) {
+            ResidualPattern::StepChange.calibration_pointer()
+        } else {
+            None
+        };
+
+        let verdict = if reconciles_within_uncertainty {
+            RollingResidualVerdict::ReconcilesWithinUncertainty
+        } else {
+            RollingResidualVerdict::Discrepancy {
+                patterns: patterns.clone(),
+            }
+        };
+
+        Some(RollingResidualHealth {
+            window,
+            min_eligible,
+            eligible_count,
+            total_observed_meter_credits: total_observed,
+            total_locally_explained_credits: total_locally_explained,
+            rolling_residual: total_residual,
+            rolling_residual_interval,
+            rolling_residual_fraction,
+            verdict,
+            patterns,
+            pointer,
+        })
+    }
+}
+
 /// One observation boundary for candidate reconciliation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CandidateObservation {
@@ -264,6 +432,13 @@ pub struct MeterDeltaBounds {
 }
 
 impl MeterDeltaBounds {
+    pub fn new(lower_ppm: i64, upper_ppm: i64) -> Self {
+        Self {
+            lower_ppm,
+            upper_ppm,
+        }
+    }
+
     pub fn lower_ppm(&self) -> i64 {
         self.lower_ppm
     }

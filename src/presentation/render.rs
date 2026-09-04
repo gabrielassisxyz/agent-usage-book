@@ -772,6 +772,48 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
         report.not_applicable(),
         report.not_yet_available(),
     ));
+    if let Some(residual) = &report.residual {
+        lines.push(String::new());
+        lines.push("Doctor: Rolling Residual Health".to_string());
+        lines.push(format!(
+            "  window: {} ({} eligible intervals, minimum: {})",
+            render_coverage_duration(residual.window),
+            residual.eligible_count,
+            residual.min_eligible
+        ));
+        lines.push(format!(
+            "  residual interval: [{} .. {}] credits",
+            residual.rolling_residual_interval.lower().micros(),
+            residual.rolling_residual_interval.upper().micros()
+        ));
+        if let Some(fraction) = residual.rolling_residual_fraction {
+            lines.push(format!("  residual fraction: {:+.2}%", fraction * 100.0));
+        } else {
+            lines.push("  residual fraction: n/a".to_string());
+        }
+        match &residual.verdict {
+            crate::reconciliation::RollingResidualVerdict::Suppressed {
+                eligible_count,
+                min_eligible,
+            } => {
+                lines.push(format!(
+                    "  verdict: suppressed ({eligible_count} eligible intervals below minimum {min_eligible})"
+                ));
+            }
+            crate::reconciliation::RollingResidualVerdict::ReconcilesWithinUncertainty => {
+                lines.push("  verdict: reconciles within uncertainty".to_string());
+            }
+            crate::reconciliation::RollingResidualVerdict::Discrepancy { .. } => {
+                lines.push("  verdict: discrepancy".to_string());
+            }
+        }
+        for pattern in &residual.patterns {
+            lines.push(format!("  {}", pattern.explanation()));
+        }
+        if let Some(pointer) = residual.pointer {
+            lines.push(format!("  {pointer}"));
+        }
+    }
     lines.join("\n")
 }
 

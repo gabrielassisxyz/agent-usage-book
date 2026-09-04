@@ -1756,9 +1756,12 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         return Ok(());
     }
 
-    let outcomes = match &config_result {
-        Ok((config, _provenance)) => doctor_registry_outcomes(config, timestamp),
-        Err(error) => crate::doctor::configuration_failed_registry(&error.to_string()),
+    let (outcomes, residual) = match &config_result {
+        Ok((config, _provenance)) => doctor_registry_and_residual(config, timestamp),
+        Err(error) => (
+            crate::doctor::configuration_failed_registry(&error.to_string()),
+            None,
+        ),
     };
     let ledger_generation = match &config_result {
         Ok((config, _provenance)) => current_ledger_generation_or_zero(config),
@@ -1767,6 +1770,7 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     let report = crate::doctor::DoctorReport {
         metadata: ReportMetadata::new(timestamp, timestamp, ledger_generation, None),
         outcomes,
+        residual,
     };
     match invocation.format {
         OutputFormat::Text => println!("{}", crate::presentation::render_doctor_report(&report)),
@@ -1896,13 +1900,16 @@ fn attribution_quality_breach_error(
     )))
 }
 
-/// Builds the registry-report outcomes for one resolved configuration: opens the
+/// Runs the doctor check registry against a configured ledger context, opening the
 /// ledger read-only when it exists, tolerating both its absence (a fresh install)
 /// and a failure to open it (a finding, not an absence).
-fn doctor_registry_outcomes(
+fn doctor_registry_and_residual(
     config: &crate::config::Config,
     timestamp: UtcTimestamp,
-) -> Vec<crate::doctor::CheckOutcome> {
+) -> (
+    Vec<crate::doctor::CheckOutcome>,
+    Option<crate::reconciliation::RollingResidualHealth>,
+) {
     let db_path = config
         .state
         .dir
@@ -1930,7 +1937,9 @@ fn doctor_registry_outcomes(
         db_missing,
         db_open_error,
     };
-    crate::doctor::build_registry(&ctx)
+    let outcomes = crate::doctor::build_registry(&ctx);
+    let residual = crate::doctor::checks::rolling_residual_health(&ctx);
+    (outcomes, residual)
 }
 
 /// The current ledger generation for the doctor report's metadata, or zero when

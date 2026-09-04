@@ -141,11 +141,13 @@ pub struct CheckOutcome {
 }
 
 /// The full report: every registered outcome, in registration order, plus the
-/// shared report metadata every command's JSON envelope carries.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// shared report metadata every command's JSON envelope carries, and the optional
+/// rolling residual health section when justified (PLAN.md 35, 36, aub-dpn.3).
+#[derive(Debug, Clone, PartialEq)]
 pub struct DoctorReport {
     pub metadata: crate::report::ReportMetadata,
     pub outcomes: Vec<CheckOutcome>,
+    pub residual: Option<crate::reconciliation::RollingResidualHealth>,
 }
 
 impl DoctorReport {
@@ -311,6 +313,7 @@ mod tests {
                     },
                 },
             ],
+            residual: None,
         };
         assert_eq!(report.passed(), 1);
         assert_eq!(report.failed(), 1);

@@ -491,27 +491,47 @@ fn check_reports_not_yet_available_meter_anomalies() {
 }
 
 #[test]
-fn check_reports_not_yet_available_unexplained_residual() {
+fn check_unexplained_residual_reports_not_applicable_when_no_db_or_no_intervals() {
     let state = StateDir::new();
     let config = test_config(state.path());
-    let ctx = DoctorContext {
+    let now = ts(1_700_000_000);
+    let ctx_no_db = DoctorContext {
         config: &config,
-        timestamp: ts(1_700_000_000),
+        timestamp: now,
         db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
         db: None,
         db_missing: true,
         db_open_error: None,
     };
-    let outcomes = build_registry(&ctx);
-    let outcome = outcomes
+    let outcomes_no_db = build_registry(&ctx_no_db);
+    let outcome_no_db = outcomes_no_db
         .iter()
         .find(|o| o.name == CheckName::UnexplainedResidual)
         .expect("UnexplainedResidual present");
     assert_eq!(
-        outcome.status,
-        CheckStatus::NotYetAvailable {
-            owning_bead: "aub-dpn.3"
-        }
+        outcome_no_db.status,
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    );
+
+    let conn = open_ledger(state.path());
+    let ctx_empty_db = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes_empty_db = build_registry(&ctx_empty_db);
+    let outcome_empty_db = outcomes_empty_db
+        .iter()
+        .find(|o| o.name == CheckName::UnexplainedResidual)
+        .expect("UnexplainedResidual present");
+    assert_eq!(
+        outcome_empty_db.status,
+        CheckStatus::NotApplicable(
+            "no eligible reconciliation intervals in recent window".to_string()
+        )
     );
 }
 
@@ -1077,4 +1097,447 @@ fn clearing_retained_bodies_leaves_status_and_coverage_byte_identical() {
         doc_cov_before, doc_cov_after,
         "coverage figures must be identical before and after clearing"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Tests for aub-dpn.3: Report rolling residual health in doctor
+// ---------------------------------------------------------------------------
+
+fn test_reconciled_interval(
+    start_secs: i64,
+    end_secs: i64,
+    observed_micros: i64,
+    locally_explained_micros: i64,
+    residual_micros: i64,
+    lower_micros: i64,
+    upper_micros: i64,
+) -> agent_usage_book::reconciliation::ReconciledResidual {
+    use agent_usage_book::domain::credits::Credits;
+    use agent_usage_book::domain::interval::Interval;
+    use agent_usage_book::domain::provenance::{
+        ProvenanceManifest, QuerySemantics, WindowCalibrationId,
+    };
+    use agent_usage_book::domain::quota::PercentagePoints;
+    use agent_usage_book::domain::window::WindowSemanticKey;
+    use agent_usage_book::reconciliation::{
+        MeterDeltaBounds, ReconciledResidual, TimingAlignmentUncertainty,
+    };
+    use agent_usage_book::store::account::AccountId;
+
+    ReconciledResidual {
+        account_id: AccountId::new(1),
+        window_key: WindowSemanticKey::new("five_hour"),
+        interval_start: ts(start_secs),
+        interval_end: ts(end_secs),
+        observed_meter_delta: PercentagePoints::new(0).unwrap(),
+        observed_meter_credits: Credits::from_micros(observed_micros),
+        locally_explained_credits: Credits::from_micros(locally_explained_micros),
+        explained_interval_change: PercentagePoints::new(0).unwrap(),
+        unexplained_residual: Credits::from_micros(residual_micros),
+        unexplained_residual_percentage_points: PercentagePoints::new(0).unwrap(),
+        observed_meter_delta_bounds: MeterDeltaBounds::new(0, 0),
+        observed_meter_credits_interval: Interval::new(
+            Credits::from_micros(observed_micros),
+            Credits::from_micros(observed_micros),
+        )
+        .unwrap(),
+        timing_alignment: TimingAlignmentUncertainty::none(),
+        unexplained_residual_interval: Interval::new(
+            Credits::from_micros(lower_micros),
+            Credits::from_micros(upper_micros),
+        )
+        .unwrap(),
+        calibration_id: WindowCalibrationId::new("cal-test"),
+        provenance: ProvenanceManifest::new(
+            vec![],
+            vec![],
+            QuerySemantics::new("reconciliation", ""),
+        ),
+    }
+}
+
+#[test]
+fn unit_rolling_residual_pattern_detection_and_candidate_explanations() {
+    use agent_usage_book::domain::credits::Credits;
+    use agent_usage_book::reconciliation::{ResidualPattern, classify_patterns};
+
+    // Pattern 1: Persistently positive
+    let pos_residuals = vec![
+        Credits::from_micros(10_000),
+        Credits::from_micros(20_000),
+        Credits::from_micros(30_000),
+    ];
+    let pos_patterns = classify_patterns(&pos_residuals);
+    assert_eq!(pos_patterns, vec![ResidualPattern::PersistentlyPositive]);
+    let pos_exp = ResidualPattern::PersistentlyPositive.explanation();
+    assert!(pos_exp.contains("persistently positive residual"));
+    assert!(pos_exp.contains(
+        "possible web, headless-unlogged, cross-machine or missed transcript consumption"
+    ));
+
+    // Pattern 2: Persistently negative
+    let neg_residuals = vec![
+        Credits::from_micros(-10_000),
+        Credits::from_micros(-20_000),
+        Credits::from_micros(-30_000),
+    ];
+    let neg_patterns = classify_patterns(&neg_residuals);
+    assert_eq!(neg_patterns, vec![ResidualPattern::PersistentlyNegative]);
+    let neg_exp = ResidualPattern::PersistentlyNegative.explanation();
+    assert!(neg_exp.contains("persistently negative residual"));
+    assert!(neg_exp.contains("possible calibration overprediction or provider semantics change"));
+
+    // Pattern 3: Step change
+    let step_residuals = vec![
+        Credits::from_micros(-10_000),
+        Credits::from_micros(-10_000),
+        Credits::from_micros(100_000),
+        Credits::from_micros(100_000),
+    ];
+    let step_patterns = classify_patterns(&step_residuals);
+    assert_eq!(step_patterns, vec![ResidualPattern::StepChange]);
+    let step_exp = ResidualPattern::StepChange.explanation();
+    assert!(step_exp.contains("step change in residual"));
+    assert!(step_exp.contains("possible plan or provider accounting transition"));
+
+    // Pattern 4: Alternating short-interval residuals netting to zero
+    let alt_residuals = vec![
+        Credits::from_micros(10_000),
+        Credits::from_micros(-10_000),
+        Credits::from_micros(10_000),
+        Credits::from_micros(-10_000),
+    ];
+    let alt_patterns = classify_patterns(&alt_residuals);
+    assert_eq!(alt_patterns, vec![ResidualPattern::AlternatingNetZero]);
+    let alt_exp = ResidualPattern::AlternatingNetZero.explanation();
+    assert!(alt_exp.contains("alternating short-interval residuals that net to zero"));
+    assert!(alt_exp.contains("likely accounting lag"));
+
+    // Check absence of causal claims across all explanations
+    for pat in [
+        ResidualPattern::PersistentlyPositive,
+        ResidualPattern::PersistentlyNegative,
+        ResidualPattern::StepChange,
+        ResidualPattern::AlternatingNetZero,
+    ] {
+        let text = pat.explanation();
+        assert!(
+            !text.contains("caused by"),
+            "must not claim causation: {text}"
+        );
+        assert!(
+            !text.contains("the cause is"),
+            "must not claim causation: {text}"
+        );
+    }
+}
+
+#[test]
+fn unit_rolling_residual_step_change_pointer_to_calibration_health_check_without_conclusion() {
+    use agent_usage_book::reconciliation::ResidualPattern;
+
+    let pointer = ResidualPattern::StepChange.calibration_pointer();
+    assert_eq!(
+        pointer,
+        Some(
+            "pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable"
+        )
+    );
+    assert!(!pointer.unwrap().contains("caused by"));
+    assert!(!pointer.unwrap().contains("inapplicable because"));
+
+    assert_eq!(
+        ResidualPattern::PersistentlyPositive.calibration_pointer(),
+        None
+    );
+    assert_eq!(
+        ResidualPattern::PersistentlyNegative.calibration_pointer(),
+        None
+    );
+    assert_eq!(
+        ResidualPattern::AlternatingNetZero.calibration_pointer(),
+        None
+    );
+}
+
+#[test]
+fn integration_rolling_residual_below_minimum_eligible_suppresses_verdict() {
+    use agent_usage_book::reconciliation::{
+        RollingResidualVerdict, compute_rolling_residual_health,
+    };
+
+    let intervals = vec![
+        test_reconciled_interval(100, 200, 10_000, 8_000, 2_000, 1_000, 3_000),
+        test_reconciled_interval(200, 300, 10_000, 8_000, 2_000, 1_000, 3_000),
+        test_reconciled_interval(300, 400, 10_000, 8_000, 2_000, 1_000, 3_000),
+    ];
+    let window = MonotonicDuration::from_seconds(86400 * 30);
+    let health = compute_rolling_residual_health(&intervals, window, 5)
+        .expect("health exists when intervals exist");
+
+    assert_eq!(health.eligible_count, 3);
+    assert_eq!(health.min_eligible, 5);
+    assert_eq!(
+        health.verdict,
+        RollingResidualVerdict::Suppressed {
+            eligible_count: 3,
+            min_eligible: 5,
+        }
+    );
+    assert!(health.verdict.is_suppressed());
+}
+
+#[test]
+fn unit_rolling_residual_section_omitted_when_no_eligible_interval_exists() {
+    use agent_usage_book::logging::RunId;
+    use agent_usage_book::presentation::{doctor_report_json, render_doctor_report};
+    use agent_usage_book::reconciliation::compute_rolling_residual_health;
+    use agent_usage_book::report::{LedgerGeneration, ReportMetadata};
+
+    let window = MonotonicDuration::from_seconds(86400 * 30);
+    let health = compute_rolling_residual_health(&[], window, 5);
+    assert!(
+        health.is_none(),
+        "health must be None when no intervals exist"
+    );
+
+    let now = ts(1_700_000_000);
+    let report = agent_usage_book::doctor::DoctorReport {
+        metadata: ReportMetadata::new(now, now, LedgerGeneration::new(1), None),
+        outcomes: vec![],
+        residual: None,
+    };
+
+    let text = render_doctor_report(&report);
+    assert!(
+        !text.contains("Doctor: Rolling Residual Health"),
+        "section must be omitted in text"
+    );
+    assert!(
+        !text.contains("residual interval"),
+        "residual interval must be omitted in text"
+    );
+
+    let json = doctor_report_json(&report, RunId::new(now));
+    let val: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    assert!(
+        val.get("residual").is_none(),
+        "residual key must be omitted in json"
+    );
+}
+
+#[test]
+fn unit_rolling_residual_check_performs_no_network_operation_and_no_fitting() {
+    let _tripwire = DoctorMustNotTouchNetwork;
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let config = test_config(state.path());
+    let now = ts(1_700_000_000);
+
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+
+    let outcomes = build_registry(&ctx);
+    let residual_check = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::UnexplainedResidual)
+        .expect("UnexplainedResidual check present");
+    assert_eq!(
+        residual_check.status,
+        CheckStatus::NotApplicable(
+            "no eligible reconciliation intervals in recent window".to_string()
+        )
+    );
+
+    let res = agent_usage_book::doctor::checks::rolling_residual_health(&ctx);
+    assert!(res.is_none());
+}
+
+#[test]
+fn e2e_doctor_json_includes_residual_fields_when_justified_and_omits_when_no_eligible_intervals() {
+    use agent_usage_book::domain::credits::Credits;
+    use agent_usage_book::domain::interval::Interval;
+    use agent_usage_book::logging::RunId;
+    use agent_usage_book::presentation::doctor_report_json;
+    use agent_usage_book::reconciliation::{
+        ResidualPattern, RollingResidualHealth, RollingResidualVerdict,
+    };
+    use agent_usage_book::report::{LedgerGeneration, ReportMetadata};
+
+    let now = ts(1_700_000_000);
+
+    // 1. Omitted case: residual is None
+    let report_omitted = agent_usage_book::doctor::DoctorReport {
+        metadata: ReportMetadata::new(now, now, LedgerGeneration::new(1), None),
+        outcomes: vec![],
+        residual: None,
+    };
+    let json_omitted = doctor_report_json(&report_omitted, RunId::new(now));
+    let val_omitted: serde_json::Value = serde_json::from_str(&json_omitted).unwrap();
+    assert!(val_omitted.get("residual").is_none());
+
+    // 2. Justified case: residual is Some
+    let health = RollingResidualHealth {
+        window: MonotonicDuration::from_seconds(86400 * 30),
+        min_eligible: 5,
+        eligible_count: 6,
+        total_observed_meter_credits: Credits::from_micros(10_000_000),
+        total_locally_explained_credits: Credits::from_micros(8_000_000),
+        rolling_residual: Credits::from_micros(2_000_000),
+        rolling_residual_interval: Interval::new(
+            Credits::from_micros(1_000_000),
+            Credits::from_micros(3_000_000),
+        )
+        .unwrap(),
+        rolling_residual_fraction: Some(0.20),
+        verdict: RollingResidualVerdict::Discrepancy {
+            patterns: vec![ResidualPattern::StepChange],
+        },
+        patterns: vec![ResidualPattern::StepChange],
+        pointer: ResidualPattern::StepChange.calibration_pointer(),
+    };
+
+    let report_justified = agent_usage_book::doctor::DoctorReport {
+        metadata: ReportMetadata::new(now, now, LedgerGeneration::new(1), None),
+        outcomes: vec![],
+        residual: Some(health),
+    };
+    let json_justified = doctor_report_json(&report_justified, RunId::new(now));
+    let val_justified: serde_json::Value = serde_json::from_str(&json_justified).unwrap();
+    let res = val_justified
+        .get("residual")
+        .expect("residual field present in json");
+    assert_eq!(res["eligible_count"], 6);
+    assert_eq!(res["min_eligible"], 5);
+    assert_eq!(res["residual_interval"]["lower"], 1_000_000);
+    assert_eq!(res["residual_interval"]["upper"], 3_000_000);
+    assert_eq!(res["residual_interval"]["unit"], "credits");
+    assert_eq!(res["verdict"], "discrepancy");
+    assert!(res["fraction"].is_number());
+    assert_eq!(res["patterns"][0]["label"], "step change");
+    assert!(res["pointer"].is_string());
+}
+
+#[test]
+fn golden_doctor_human_output_justified_state_and_omission_state() {
+    use agent_usage_book::doctor::{CheckOutcome, DoctorReport};
+    use agent_usage_book::domain::credits::Credits;
+    use agent_usage_book::domain::interval::Interval;
+    use agent_usage_book::presentation::render_doctor_report;
+    use agent_usage_book::reconciliation::{
+        ResidualPattern, RollingResidualHealth, RollingResidualVerdict,
+    };
+    use agent_usage_book::report::{LedgerGeneration, ReportMetadata};
+
+    let now = ts(1_700_000_000);
+
+    // Omission case: no eligible interval exists
+    let report_omitted = DoctorReport {
+        metadata: ReportMetadata::new(now, now, LedgerGeneration::new(1), None),
+        outcomes: vec![CheckOutcome {
+            name: CheckName::UnexplainedResidual,
+            owner_module: "reconciliation",
+            condition: "rolling residual stays within its explained bound",
+            has_repair: false,
+            status: CheckStatus::NotApplicable(
+                "no eligible reconciliation intervals in recent window".to_string(),
+            ),
+        }],
+        residual: None,
+    };
+    let output_omitted = render_doctor_report(&report_omitted);
+    let expected_omitted = "Doctor: 1 checks\n  [N/A ] unexplained-residual: no eligible reconciliation intervals in recent window\nSummary: 0 passed, 0 failed, 1 not applicable, 0 not yet available";
+    assert_eq!(output_omitted, expected_omitted);
+
+    // Justified case: eligible intervals exist and show discrepancy
+    let health = RollingResidualHealth {
+        window: MonotonicDuration::from_seconds(86400 * 30),
+        min_eligible: 5,
+        eligible_count: 6,
+        total_observed_meter_credits: Credits::from_micros(10_000_000),
+        total_locally_explained_credits: Credits::from_micros(8_000_000),
+        rolling_residual: Credits::from_micros(2_000_000),
+        rolling_residual_interval: Interval::new(
+            Credits::from_micros(1_000_000),
+            Credits::from_micros(3_000_000),
+        )
+        .unwrap(),
+        rolling_residual_fraction: Some(0.20),
+        verdict: RollingResidualVerdict::Discrepancy {
+            patterns: vec![ResidualPattern::StepChange],
+        },
+        patterns: vec![ResidualPattern::StepChange],
+        pointer: ResidualPattern::StepChange.calibration_pointer(),
+    };
+
+    let report_justified = DoctorReport {
+        metadata: ReportMetadata::new(now, now, LedgerGeneration::new(1), None),
+        outcomes: vec![CheckOutcome {
+            name: CheckName::UnexplainedResidual,
+            owner_module: "reconciliation",
+            condition: "rolling residual stays within its explained bound",
+            has_repair: false,
+            status: CheckStatus::Fail("rolling residual discrepancy: interval [1000000 .. 3000000] credits; pattern: step change in residual: possible plan or provider accounting transition; pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable".to_string()),
+        }],
+        residual: Some(health),
+    };
+    let output_justified = render_doctor_report(&report_justified);
+    let expected_justified = "Doctor: 1 checks\n  [FAIL] unexplained-residual: rolling residual discrepancy: interval [1000000 .. 3000000] credits; pattern: step change in residual: possible plan or provider accounting transition; pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable\nSummary: 0 passed, 1 failed, 0 not applicable, 0 not yet available\n\nDoctor: Rolling Residual Health\n  window: 30d (6 eligible intervals, minimum: 5)\n  residual interval: [1000000 .. 3000000] credits\n  residual fraction: +20.00%\n  verdict: discrepancy\n  pattern: step change in residual: possible plan or provider accounting transition\n  pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable";
+    assert_eq!(output_justified, expected_justified);
+}
+
+#[test]
+fn integration_synthetic_step_change_produces_step_change_pattern_and_no_causal_claim() {
+    use agent_usage_book::domain::credits::Credits;
+    use agent_usage_book::reconciliation::{
+        ResidualPattern, classify_patterns, compute_rolling_residual_health,
+    };
+
+    let intervals = vec![
+        test_reconciled_interval(100, 200, 10_000, 20_000, -10_000, -15_000, -5_000),
+        test_reconciled_interval(200, 300, 10_000, 20_000, -10_000, -15_000, -5_000),
+        test_reconciled_interval(300, 400, 10_000, 20_000, -10_000, -15_000, -5_000),
+        test_reconciled_interval(400, 500, 120_000, 20_000, 100_000, 95_000, 105_000),
+        test_reconciled_interval(500, 600, 120_000, 20_000, 100_000, 95_000, 105_000),
+        test_reconciled_interval(600, 700, 120_000, 20_000, 100_000, 95_000, 105_000),
+    ];
+
+    let residuals: Vec<Credits> = intervals.iter().map(|i| i.unexplained_residual).collect();
+    let patterns = classify_patterns(&residuals);
+    assert!(patterns.contains(&ResidualPattern::StepChange));
+
+    let window = MonotonicDuration::from_seconds(86400 * 30);
+    let health = compute_rolling_residual_health(&intervals, window, 5)
+        .expect("rolling residual health computed");
+
+    assert_eq!(health.window, window);
+    assert_eq!(health.eligible_count, 6);
+    assert_eq!(health.rolling_residual_interval.lower().micros(), 240_000);
+    assert_eq!(health.rolling_residual_interval.upper().micros(), 300_000);
+    assert!(health.rolling_residual_fraction.is_some());
+    let fraction = health.rolling_residual_fraction.unwrap();
+    assert!((fraction - (270_000.0 / 390_000.0)).abs() < 1e-6);
+
+    assert!(health.patterns.contains(&ResidualPattern::StepChange));
+    for pat in &health.patterns {
+        assert!(
+            !pat.explanation().contains("caused by"),
+            "must not claim cause"
+        );
+        assert!(
+            !pat.explanation().contains("the cause is"),
+            "must not claim cause"
+        );
+    }
+    assert!(health.pointer.is_some());
+    let pointer = health.pointer.unwrap();
+    assert!(pointer.contains("aub doctor missing-active-calibrations"));
+    assert!(!pointer.contains("caused by"), "must not claim cause");
+    assert!(!pointer.contains("the cause is"), "must not claim cause");
 }

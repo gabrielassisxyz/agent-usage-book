@@ -75,15 +75,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
                 owning_bead: "aub-eun.14",
             },
         },
-        CheckOutcome {
-            name: CheckName::UnexplainedResidual,
-            owner_module: "valuation",
-            condition: "rolling residual stays within its explained bound",
-            has_repair: false,
-            status: CheckStatus::NotYetAvailable {
-                owning_bead: "aub-dpn.3",
-            },
-        },
+        unexplained_residual(ctx),
         heuristic_dedup_counts(ctx),
         clock_skew(ctx),
         local_filesystem_and_wal_suitability(ctx),
@@ -136,7 +128,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::ProjectionVersusDatabaseGeneration => "doctor",
         CheckName::BackupAge => "doctor",
         CheckName::MeterAnomalies => "meter",
-        CheckName::UnexplainedResidual => "valuation",
+        CheckName::UnexplainedResidual => "reconciliation",
         CheckName::HeuristicDedupCounts => "store::ingest_quarantine",
         CheckName::ClockSkew => "doctor",
         CheckName::LocalFilesystemAndWalSuitability => "store::startup",
@@ -760,6 +752,76 @@ fn clock_skew(ctx: &DoctorContext) -> CheckOutcome {
         }
     };
     outcome(CheckName::ClockSkew, status)
+}
+
+/// The rolling residual health over recent eligible intervals (PLAN.md 35, 36, aub-dpn.3).
+///
+/// Computes rolling residual interval and fraction over the configured window.
+/// Suppresses the verdict when eligible intervals are below the minimum threshold.
+/// Reports patterns with candidate explanations and a calibration pointer for step changes.
+fn unexplained_residual(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(_) => match rolling_residual_health(ctx) {
+                None => CheckStatus::NotApplicable(
+                    "no eligible reconciliation intervals in recent window".to_string(),
+                ),
+                Some(health) => match &health.verdict {
+                    crate::reconciliation::RollingResidualVerdict::Suppressed {
+                        eligible_count,
+                        min_eligible,
+                    } => CheckStatus::PassWithDetail(format!(
+                        "{eligible_count} eligible interval(s) in window (below minimum {min_eligible}); verdict suppressed"
+                    )),
+                    crate::reconciliation::RollingResidualVerdict::ReconcilesWithinUncertainty => {
+                        CheckStatus::PassWithDetail(
+                            "rolling residual reconciles within uncertainty".to_string(),
+                        )
+                    }
+                    crate::reconciliation::RollingResidualVerdict::Discrepancy { patterns } => {
+                        if patterns.is_empty() {
+                            CheckStatus::Fail(format!(
+                                "rolling residual discrepancy: interval [{} .. {}] credits",
+                                health.rolling_residual_interval.lower().micros(),
+                                health.rolling_residual_interval.upper().micros(),
+                            ))
+                        } else {
+                            let explanations: Vec<&'static str> =
+                                patterns.iter().map(|p| p.explanation()).collect();
+                            let mut msg = format!(
+                                "rolling residual discrepancy: interval [{} .. {}] credits; {}",
+                                health.rolling_residual_interval.lower().micros(),
+                                health.rolling_residual_interval.upper().micros(),
+                                explanations.join("; "),
+                            );
+                            if let Some(ptr) = health.pointer {
+                                msg.push_str(&format!("; {ptr}"));
+                            }
+                            CheckStatus::Fail(msg)
+                        }
+                    }
+                },
+            },
+        }
+    };
+    outcome(CheckName::UnexplainedResidual, status)
+}
+
+/// Loads the rolling residual health from the store using the doctor context.
+pub fn rolling_residual_health(
+    ctx: &DoctorContext,
+) -> Option<crate::reconciliation::RollingResidualHealth> {
+    if ctx.db_missing || ctx.db_open_error.is_some() {
+        return None;
+    }
+    let conn = ctx.db?;
+    crate::store::reconciliation::load_rolling_residual_from_store(conn, ctx.config, ctx.timestamp)
+        .unwrap_or(None)
 }
 
 /// The state directory is local, present, mode 0700 and writable

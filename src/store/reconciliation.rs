@@ -305,3 +305,122 @@ fn timing_alignment_uncertainty(
     let half_width = (coefficient * misattributed_ppm).clamp(0, i128::from(i64::MAX)) as i64;
     TimingAlignmentUncertainty::from_credit_half_width(Credits::from_micros(half_width))
 }
+
+/// Loads all eligible intervals within the configured rolling residual window and
+/// computes rolling residual health for `doctor` (PLAN.md 35, 36, aub-dpn.3).
+///
+/// Performs no network operation and no fitting. Returns `None` when no eligible
+/// intervals exist in the recent window.
+pub fn load_rolling_residual_from_store(
+    conn: &Connection,
+    config: &crate::config::Config,
+    timestamp: UtcTimestamp,
+) -> Result<Option<crate::reconciliation::RollingResidualHealth>, Error> {
+    if config.accounts.is_empty() {
+        return Ok(None);
+    }
+
+    let window_nanos =
+        i64::try_from(config.reconciliation.residual_window.as_nanos()).unwrap_or(i64::MAX);
+    let since = UtcTimestamp::from_unix_nanos(timestamp.unix_nanos().saturating_sub(window_nanos));
+    let until = timestamp;
+
+    let mut eligible_intervals = Vec::new();
+
+    for account in &config.accounts {
+        let account_id = match crate::store::account::account_id_by_identity(
+            conn,
+            &account.provider,
+            &account.name,
+        )? {
+            Some(id) => id,
+            None => continue,
+        };
+
+        let mut key_stmt = conn
+            .prepare(
+                "SELECT DISTINCT mw.semantic_key
+                 FROM meter_window mw
+                 JOIN meter_observation mo ON mo.id = mw.observation_id
+                 WHERE mo.account_id = ?1 AND mo.received_at >= ?2 AND mo.received_at <= ?3
+                 ORDER BY mw.semantic_key",
+            )
+            .map_err(|e| Error::Store(format!("cannot prepare window keys query: {e}")))?;
+
+        let keys = key_stmt
+            .query_map(
+                params![account_id.value(), since.unix_nanos(), until.unix_nanos()],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| Error::Store(format!("cannot query window keys: {e}")))?;
+
+        let window_keys: Vec<String> = keys
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| Error::Store(format!("cannot read window keys: {e}")))?;
+
+        for key_str in window_keys {
+            let window_key = WindowSemanticKey::new(&key_str);
+
+            let mut obs_stmt = conn
+                .prepare(
+                    "SELECT mo.id
+                     FROM meter_observation mo
+                     JOIN meter_window mw ON mw.observation_id = mo.id
+                     WHERE mo.account_id = ?1 AND mw.semantic_key = ?2
+                       AND mo.received_at >= ?3 AND mo.received_at <= ?4
+                       AND NOT EXISTS (
+                           SELECT 1 FROM legacy_meter_import_record lir
+                           WHERE lir.observation_id = mo.id
+                       )
+                     ORDER BY mo.received_at ASC, mo.id ASC",
+                )
+                .map_err(|e| Error::Store(format!("cannot prepare obs query: {e}")))?;
+
+            let obs_rows = obs_stmt
+                .query_map(
+                    params![
+                        account_id.value(),
+                        window_key.as_str(),
+                        since.unix_nanos(),
+                        until.unix_nanos()
+                    ],
+                    |row| row.get::<_, i64>(0).map(ObservationRowId::new),
+                )
+                .map_err(|e| Error::Store(format!("cannot query observations: {e}")))?;
+
+            let obs_ids: Vec<ObservationRowId> = obs_rows
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| Error::Store(format!("cannot read observation IDs: {e}")))?;
+
+            if obs_ids.len() < 2 {
+                continue;
+            }
+
+            for i in 0..(obs_ids.len() - 1) {
+                let start_obs_id = obs_ids[i];
+                let end_obs_id = obs_ids[i + 1];
+                let outcome = reconcile_candidate_from_store(
+                    conn,
+                    account_id,
+                    start_obs_id,
+                    end_obs_id,
+                    &window_key,
+                    &CostModelId::new("default"),
+                    timestamp,
+                    timestamp,
+                )?;
+                if let ReconciliationOutcome::Computed(res) = outcome {
+                    eligible_intervals.push(*res);
+                }
+            }
+        }
+    }
+
+    eligible_intervals.sort_by_key(|i| i.interval_start.unix_nanos());
+
+    Ok(crate::reconciliation::compute_rolling_residual_health(
+        &eligible_intervals,
+        config.reconciliation.residual_window,
+        config.reconciliation.residual_min_eligible,
+    ))
+}
