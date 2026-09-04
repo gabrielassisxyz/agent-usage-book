@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Boundary: the status workflow must not reference the store or open SQLite directly.
+# Design: PLAN.md section 16.2 (the status contract's must-not list: "SQLite open",
+#   "database writes"), section 34.31 ("status depends only on config-location
+#   resolution, the projection parser, the clock and the renderer"), and bead
+#   aub-me5.7.
+# Detection: function-scoped, not module-scoped. `status` lives in src/cli.rs
+#   alongside every other command, and most of them use the store legitimately (124
+#   references at HEAD), so a module-wide grep over the whole file would fail on
+#   unrelated commands rather than on status. This rule instead extracts the body of
+#   `fn status`, `fn projection_accounts` and `fn status_clock_skew_envelope` (the
+#   status path and the two helpers it alone uses), each from its declaration line to
+#   the next top-level `fn`, and greps only that extracted text for a direct SQLite
+#   reference, a bare `Connection`, or a reference to `crate::store`. HTTP transport is
+#   covered separately by boundary rule 06, and the migration path specifically by
+#   rule 15; this rule is the general store edge those two do not close.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../../.." && pwd)"
+cd "$repo_root"
+
+file="src/cli.rs"
+if [ ! -f "$file" ]; then
+    echo "status must not reference the store: $file not found" >&2
+    exit 2
+fi
+
+extract_body() {
+    local declaration="$1"
+    awk -v decl="$declaration" '
+        index($0, decl) == 1 { in_body = 1 }
+        in_body && /^fn / && index($0, decl) != 1 { exit }
+        in_body { print }
+    ' "$file"
+}
+
+declarations=("fn status(" "fn projection_accounts(" "fn status_clock_skew_envelope(")
+body=""
+found_any=0
+for declaration in "${declarations[@]}"; do
+    if ! grep -qF "$declaration" "$file"; then
+        continue
+    fi
+    found_any=1
+    body="$body
+$(extract_body "$declaration")"
+done
+
+if [ "$found_any" -eq 0 ]; then
+    echo "status must not reference the store: none of ${declarations[*]} found in $file" >&2
+    exit 2
+fi
+
+matches="$(printf '%s\n' "$body" | grep -nE '(rusqlite::|crate::store::|\bConnection\b)' || true)"
+if [ -n "$matches" ]; then
+    echo "the status workflow references the store, in $file:" >&2
+    printf '%s\n' "$matches" >&2
+    exit 1
+fi
+exit 0
