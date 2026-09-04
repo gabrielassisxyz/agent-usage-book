@@ -14,6 +14,7 @@
 //! - A write transaction stays short: no network I/O and no unrelated work happens inside it.
 
 pub mod account;
+pub mod adapter_semantics_validation;
 pub mod attempt_crash_hook;
 pub mod attribution_segment;
 pub mod backup;
