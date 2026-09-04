@@ -5,6 +5,7 @@
 //! user-visible surface because no helper here accepts one, and a bare total where
 //! known missing evidence affects the aggregate is refused by construction.
 
+use crate::doctor::{CheckStatus, DoctorReport};
 use crate::domain::credits::Credits;
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
@@ -689,6 +690,53 @@ pub fn render_doctor_drift_report(report: &TranscriptDriftReport) -> String {
         } else {
             lines.push("  Status: All record shapes covered by committed fixtures.".to_string());
         }
+    }
+    lines.join("\n")
+}
+
+/// Renders the full check registry for `aub doctor` (`aub-n27.7`): every registered
+/// check, its status and, where it has one, its reason. Distinct from
+/// [`render_doctor_drift_report`], which is the deeper `--transcript-format-drift`
+/// view of one check's own evidence.
+pub fn render_doctor_report(report: &DoctorReport) -> String {
+    let mut lines = vec![format!("Doctor: {} checks", report.outcomes.len())];
+    for outcome in &report.outcomes {
+        let marker = match &outcome.status {
+            CheckStatus::Pass => "PASS".to_string(),
+            CheckStatus::Fail(_) => "FAIL".to_string(),
+            CheckStatus::NotApplicable(_) => "N/A ".to_string(),
+            CheckStatus::NotYetAvailable { .. } => "TODO".to_string(),
+        };
+        let mut line = format!("  [{marker}] {}", outcome.name.as_str());
+        match &outcome.status {
+            CheckStatus::Fail(reason) | CheckStatus::NotApplicable(reason) => {
+                line.push_str(&format!(": {reason}"));
+            }
+            CheckStatus::NotYetAvailable { owning_bead } => {
+                line.push_str(&format!(": not yet available ({owning_bead})"));
+            }
+            CheckStatus::Pass => {}
+        }
+        if outcome.has_repair {
+            line.push_str(" [repairable with --fix]");
+        }
+        lines.push(line);
+    }
+    lines.push(format!(
+        "Summary: {} passed, {} failed, {} not applicable, {} not yet available",
+        report.passed(),
+        report.failed(),
+        report.not_applicable(),
+        report.not_yet_available(),
+    ));
+    lines.join("\n")
+}
+
+/// Renders a `doctor --fix` result: one line per action performed, in order.
+pub fn render_fix_report(report: &crate::doctor::FixReport) -> String {
+    let mut lines = vec![format!("Fix: {} action(s) performed", report.actions.len())];
+    for outcome in &report.actions {
+        lines.push(format!("  {}: {}", outcome.action.as_str(), outcome.detail));
     }
     lines.join("\n")
 }

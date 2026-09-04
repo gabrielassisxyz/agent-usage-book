@@ -1207,6 +1207,74 @@ pub fn doctor_drift_json(report: &TranscriptDriftReport, run: RunId) -> String {
     JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
 }
 
+/// Serializes the full check registry (`aub doctor`, `aub-n27.7`) under the shared
+/// envelope. Distinct from [`doctor_drift_json`], which is the deeper
+/// `--transcript-format-drift` view of one check's own evidence.
+pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> String {
+    let checks_json = report
+        .outcomes
+        .iter()
+        .map(|outcome| {
+            let mut fields = format!(
+                "\"name\":{},\"status\":{},\"owner_module\":{},\"has_repair\":{}",
+                json_string(outcome.name.as_str()),
+                json_string(outcome.status.label()),
+                json_string(outcome.owner_module),
+                outcome.has_repair,
+            );
+            match &outcome.status {
+                crate::doctor::CheckStatus::Fail(reason)
+                | crate::doctor::CheckStatus::NotApplicable(reason) => {
+                    fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
+                }
+                crate::doctor::CheckStatus::NotYetAvailable { owning_bead } => {
+                    fields.push_str(&format!(",\"owning_bead\":{}", json_string(owning_bead)));
+                }
+                crate::doctor::CheckStatus::Pass => {}
+            }
+            format!("{{{fields}}}")
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+
+    let body = format!(
+        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"not_applicable\":{},\"not_yet_available\":{}",
+        report.passed(),
+        report.failed(),
+        report.not_applicable(),
+        report.not_yet_available(),
+    );
+
+    JsonEnvelope::new("doctor", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `doctor --fix` result under the shared envelope. `--fix` is an
+/// action log, not a ledger reading, so its own generation is always reported as
+/// zero rather than a number the action list does not actually justify; the
+/// caller's own run timestamp is both the generated and the knowledge instant.
+pub fn fix_report_json(
+    report: &crate::doctor::FixReport,
+    run: RunId,
+    at: crate::domain::time::UtcTimestamp,
+) -> String {
+    let actions_json = report
+        .actions
+        .iter()
+        .map(|outcome| {
+            format!(
+                "{{\"action\":{},\"detail\":{}}}",
+                json_string(outcome.action.as_str()),
+                json_string(&outcome.detail),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!("\"check\":\"fix\",\"actions\":[{actions_json}]");
+    let metadata =
+        crate::report::ReportMetadata::new(at, at, crate::report::LedgerGeneration::new(0), None);
+    JsonEnvelope::new("doctor", run, metadata).to_json_with(&body)
+}
+
 /// Serializes a provenance graph into its JSON explain representation.
 pub fn explain_json(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
     let mode_str = match mode {

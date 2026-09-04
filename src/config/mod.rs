@@ -230,6 +230,11 @@ pub struct AttributionConfig {
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub review_after: MonotonicDuration,
+    /// Where `doctor` looks for the last verified backup. `aub backup` takes its
+    /// destination as an explicit argument and remembers nothing durably, so
+    /// without this the backup-age check would have nowhere to look. `None`
+    /// means backup age is not applicable rather than an assumed default path.
+    pub destination: Option<PathBuf>,
 }
 
 /// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
@@ -323,7 +328,7 @@ const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
-const BACKUP_KEYS: &[&str] = &["review_after"];
+const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -810,6 +815,16 @@ pub fn resolve(
         )?,
     };
 
+    let backup_destination = file
+        .as_ref()
+        .and_then(|t| t.get("backup"))
+        .and_then(toml::Value::as_table)
+        .and_then(|t| t.get("destination"))
+        .and_then(toml::Value::as_str)
+        .map(PathBuf::from);
+    if backup_destination.is_some() {
+        provenance.set("backup.destination", ConfigSource::File);
+    }
     let backup = BackupConfig {
         review_after: resolve_duration(
             "backup.review_after",
@@ -820,6 +835,7 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        destination: backup_destination,
     };
 
     let valuation = ValuationConfig {

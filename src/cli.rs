@@ -607,7 +607,7 @@ impl Command {
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
-            Command::Doctor => Some("--transcript-format-drift"),
+            Command::Doctor => Some("--fix | --transcript-format-drift"),
             Command::Coverage => {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
             }
@@ -1637,8 +1637,9 @@ fn emit_now_report(
     }
 }
 
-/// `aub doctor`: operational health, drift and integrity diagnostics.
-/// Supports `--transcript-format-drift` (aub-lqe.17).
+/// `aub doctor`: the check registry (`aub-n27.7`) by default, the deeper
+/// `--transcript-format-drift` view of one check's own evidence, or `--fix` for
+/// the four permitted repairs.
 fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
@@ -1652,23 +1653,78 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
+    let mut legacy_drift_view = false;
+    let mut fix = false;
     for arg in &invocation.rest {
         match arg.as_str() {
-            "--transcript-format-drift" | "--rate-card-staleness" => {}
+            "--transcript-format-drift" | "--rate-card-staleness" => legacy_drift_view = true,
+            "--fix" => fix = true,
             other => return Err(Error::Usage(format!("unknown argument: {other}"))),
         }
+    }
+    if legacy_drift_view && fix {
+        return Err(Error::Usage(
+            "--fix cannot be combined with --transcript-format-drift or --rate-card-staleness"
+                .to_string(),
+        ));
     }
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
-    let (config, _provenance) = crate::config::resolve(
+    let config_result = crate::config::resolve(
         &crate::config::Overrides::new(),
         &env,
         file_contents.as_deref(),
         &file_path,
-    )?;
+    );
 
+    if legacy_drift_view {
+        let (config, _provenance) = config_result?;
+        return doctor_transcript_drift_view(&config, timestamp, run, invocation);
+    }
+    if fix {
+        let (config, _provenance) = config_result?;
+        let mut conn = open_ledger(clock)?;
+        let report = crate::doctor::run_fix(&mut conn, &config, clock)?;
+        match invocation.format {
+            OutputFormat::Text => println!("{}", crate::presentation::render_fix_report(&report)),
+            OutputFormat::Json => println!(
+                "{}",
+                crate::presentation::fix_report_json(&report, run, timestamp)
+            ),
+        }
+        return Ok(());
+    }
+
+    let outcomes = match &config_result {
+        Ok((config, _provenance)) => doctor_registry_outcomes(config, timestamp),
+        Err(error) => crate::doctor::configuration_failed_registry(&error.to_string()),
+    };
+    let ledger_generation = match &config_result {
+        Ok((config, _provenance)) => current_ledger_generation_or_zero(config),
+        Err(_) => LedgerGeneration::new(0),
+    };
+    let report = crate::doctor::DoctorReport {
+        metadata: ReportMetadata::new(timestamp, timestamp, ledger_generation, None),
+        outcomes,
+    };
+    match invocation.format {
+        OutputFormat::Text => println!("{}", crate::presentation::render_doctor_report(&report)),
+        OutputFormat::Json => println!("{}", crate::presentation::doctor_report_json(&report, run)),
+    }
+    Ok(())
+}
+
+/// The `aub doctor --transcript-format-drift` / `--rate-card-staleness` view: the
+/// pre-registry report, kept verbatim so its own e2e case and unit tests keep
+/// passing unchanged.
+fn doctor_transcript_drift_view(
+    config: &crate::config::Config,
+    timestamp: UtcTimestamp,
+    run: RunId,
+    invocation: &Invocation,
+) -> Result<(), Error> {
     let mut db_quarantine = None;
     let mut stale_cards = Vec::new();
     let mut attribution_assessment = None;
@@ -1711,7 +1767,7 @@ fn doctor_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     }
 
     let report =
-        crate::transcripts::detect_drift(&config, None, timestamp, db_quarantine.as_deref())?;
+        crate::transcripts::detect_drift(config, None, timestamp, db_quarantine.as_deref())?;
 
     match invocation.format {
         OutputFormat::Text => {
@@ -1779,6 +1835,68 @@ fn attribution_quality_breach_error(
         "attribution quality is below the configured floor for: {}",
         kinds.join(", ")
     )))
+}
+
+/// Builds the registry-report outcomes for one resolved configuration: opens the
+/// ledger read-only when it exists, tolerating both its absence (a fresh install)
+/// and a failure to open it (a finding, not an absence).
+fn doctor_registry_outcomes(
+    config: &crate::config::Config,
+    timestamp: UtcTimestamp,
+) -> Vec<crate::doctor::CheckOutcome> {
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    let (db, db_missing, db_open_error) = if !db_path.is_file() {
+        (None, true, None)
+    } else {
+        match crate::store::connection::open(
+            &db_path,
+            crate::store::connection::AccessMode::ReadOnly,
+            &policy,
+        ) {
+            Ok(conn) => (Some(conn), false, None),
+            Err(error) => (None, false, Some(error.to_string())),
+        }
+    };
+    let ctx = crate::doctor::DoctorContext {
+        config,
+        timestamp,
+        db_path,
+        db: db.as_ref(),
+        db_missing,
+        db_open_error,
+    };
+    crate::doctor::build_registry(&ctx)
+}
+
+/// The current ledger generation for the doctor report's metadata, or zero when
+/// no ledger exists yet: the same "nothing recorded yet" reading
+/// `TranscriptDriftReport`'s empty case uses, never a fabricated positive number.
+fn current_ledger_generation_or_zero(config: &crate::config::Config) -> LedgerGeneration {
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    if !db_path.is_file() {
+        return LedgerGeneration::new(0);
+    }
+    let policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    crate::store::connection::open(
+        &db_path,
+        crate::store::connection::AccessMode::ReadOnly,
+        &policy,
+    )
+    .ok()
+    .and_then(|conn| crate::store::ledger_generation::current(&conn).ok())
+    .map(|generation| LedgerGeneration::new(generation.value()))
+    .unwrap_or_else(|| LedgerGeneration::new(0))
 }
 
 /// The default window `aub coverage` reports when the command line names none:
@@ -4077,6 +4195,60 @@ mod tests {
             assert!(
                 help.contains(&command.format_help()),
                 "{command:?} help must state its format support"
+            );
+        }
+    }
+
+    /// `docs/commands.md` names every shipping command in a `## \`aub NAME\``
+    /// heading, each with a `**Refuses:**` line stating the behavioural
+    /// boundary `--help` does not carry (aub-n27.6). The documented set is
+    /// compared against [`Command::ALL`] filtered to the shipping subset
+    /// (`summary().is_some()`) rather than a hand-maintained list, so a
+    /// command added without a section fails here instead of only being
+    /// noticed by a human reading the file. The planted negative: a
+    /// documented command with no `**Refuses:**` line would still pass a
+    /// weaker check that only compared the name set.
+    #[test]
+    fn documented_command_list_matches_the_parser_and_states_a_refusal() {
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/commands.md"))
+                .expect("docs/commands.md must be readable");
+
+        let shipping: std::collections::BTreeSet<&str> = Command::ALL
+            .into_iter()
+            .filter(|command| command.summary().is_some())
+            .map(Command::name)
+            .collect();
+
+        let mut documented: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in docs.lines() {
+            let Some(rest) = line.strip_prefix("## `aub ") else {
+                continue;
+            };
+            let name = rest
+                .strip_suffix('`')
+                .unwrap_or_else(|| panic!("malformed command heading: {line:?}"));
+            documented.insert(name);
+        }
+
+        assert_eq!(
+            documented, shipping,
+            "docs/commands.md must document exactly the shipping commands"
+        );
+
+        for name in &documented {
+            let heading = format!("## `aub {name}`");
+            let start = docs
+                .find(&heading)
+                .unwrap_or_else(|| panic!("lost {heading:?} on the second pass"));
+            let section_end = docs[start..]
+                .find("\n## ")
+                .map(|offset| start + offset)
+                .unwrap_or(docs.len());
+            let section = &docs[start..section_end];
+            assert!(
+                section.contains("**Refuses:**"),
+                "docs/commands.md section for {name:?} has no **Refuses:** line"
             );
         }
     }
