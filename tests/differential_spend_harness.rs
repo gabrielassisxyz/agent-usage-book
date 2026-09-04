@@ -8,7 +8,7 @@
 //!    - parser correction
 //!    - cache-write visibility
 //!    - legacy bug
-//!    or flagged as unclassified.
+//!      or flagged as unclassified.
 //! 3. Assertion that unclassified count must be zero before any legacy tool is retired.
 //! 4. Per-category reporting stating exact share (tokens and ppm/percentage) of total difference.
 //! 5. Content-identified, reproducible corpus digest comparing identical results across runs.
@@ -20,7 +20,7 @@
 //!    - child nonzero exit
 //!    - timeout
 //!    - malformed output
-//!    preserving exact argv, digests, stdout/stderr artifacts, exits, and unclassified count.
+//!      preserving exact argv, digests, stdout/stderr artifacts, exits, and unclassified count.
 //! 8. Operational run over representative multi-week corpus recording content identity and classification.
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -417,7 +417,7 @@ pub fn compute_corpus_content_digest(corpus_root: &Path) -> Result<String, io::E
         let file_hash = Sha256::digest(&content);
 
         overall.update(rel.as_bytes());
-        overall.update(&file_hash);
+        overall.update(file_hash);
     }
     Ok(format!("{:x}", overall.finalize()))
 }
@@ -721,6 +721,12 @@ pub fn generate_differential_report(
 // --- End-to-End Execution Runner -------------------------------------------
 
 /// Runs both aub spend and legacy tool, recording the exact run log and differential report.
+///
+/// The long argument list and the large `Err` variant are both deliberate: each process
+/// contributes its binary, its argv and its environment separately so the run log can record
+/// exactly what was invoked, and a failed run returns that same log because the log is the
+/// evidence the failure produces. Bundling either one hides what this harness exists to show.
+#[allow(clippy::too_many_arguments, clippy::result_large_err)]
 pub fn run_differential_executables(
     aub_bin: &Path,
     aub_args: &[String],
