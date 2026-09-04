@@ -1,0 +1,24 @@
+# Ticks aub-sample.service once a minute.
+#
+# The tick is deliberately shorter than any account's configured sampling
+# interval (docs/PLAN.md section 14.1, "Two kinds of trigger"): `aub sample
+# --due` decides for itself which configured accounts are actually owed a
+# request, so this timer only has to fire often enough to catch a due account
+# close to when it becomes due, including a quota reset edge. A five-minute
+# sampling interval with a one-minute tick, the values this example ships
+# with, bounds the staleness of "how far past due" a reading can be to under
+# a minute without rewriting the timer whenever a reset time moves.
+#
+# Enable with: systemctl --user enable --now aub-sample.timer
+# (drop --user, and install under /etc/systemd/system/, for a system-wide
+# account instead of a per-user one.)
+[Unit]
+Description=Tick aub sample --due every minute
+
+[Timer]
+OnCalendar=minutely
+AccuracySec=1s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
