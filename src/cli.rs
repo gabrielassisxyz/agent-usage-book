@@ -723,7 +723,7 @@ impl Command {
                 "ingest | report TASK-ID | overhead [--today (default) | --since YYYY-MM-DD | --days N]",
             ),
             Command::Compare => Some(
-                "record OBSERVATION_ID WINDOW --surface NAME --surface-used PPM --granularity PPM [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
+                "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Status
             | Command::LoggingFixture
@@ -4047,27 +4047,44 @@ fn compare_next_arg(args: &mut std::slice::Iter<String>, flag: &str) -> Result<S
         .ok_or_else(|| Error::Usage(format!("{flag} requires a value")))
 }
 
-fn compare_parse_ppm_arg(
+/// A percentage typed by the operator, as the surface displays it (`21`, `21.0`, `0.5`),
+/// converted to the parts-per-million the domain stores. The record this feeds is immutable
+/// and read by a human off a web page in whole points, so the command takes the number the
+/// page shows rather than a six-digit ppm figure one misplaced zero away from a wrong
+/// comparison that looks computed.
+fn compare_parse_percent_arg(
     args: &mut std::slice::Iter<String>,
     flag: &str,
 ) -> Result<crate::domain::quota::QuotaFractionPpm, Error> {
     let raw = compare_next_arg(args, flag)?;
-    let value: i32 = raw
+    let percent: f64 = raw
+        .trim_end_matches('%')
         .parse()
-        .map_err(|_| Error::Usage(format!("{flag} must be an integer, got {raw:?}")))?;
-    crate::domain::quota::QuotaFractionPpm::new(value).ok_or_else(|| {
+        .map_err(|_| Error::Usage(format!("{flag} must be a percentage, got {raw:?}")))?;
+    if !percent.is_finite() || !(0.0..=100.0).contains(&percent) {
+        return Err(Error::Usage(format!(
+            "{flag} must be a percentage between 0 and 100, got {raw:?}"
+        )));
+    }
+    let ppm = (percent * 10_000.0).round() as i32;
+    crate::domain::quota::QuotaFractionPpm::new(ppm).ok_or_else(|| {
         Error::Usage(format!(
-            "{flag} must be 0..=1000000 parts per million, got {value}"
+            "{flag} must be a percentage between 0 and 100, got {raw:?}"
         ))
     })
 }
 
-/// `aub compare record OBSERVATION_ID WINDOW --surface NAME --surface-used PPM
-/// --granularity PPM [--read-at RFC3339] [--detail TEXT]`.
+/// One whole percentage point: what the Anthropic Console displays, and therefore the
+/// granularity `docs/adapter-semantics-validation.md` records for it. The default rather
+/// than a required flag because the table has one row and the procedure names the number.
+const DEFAULT_GRANULARITY_PPM: i32 = 10_000;
+
+/// `aub compare record OBSERVATION_ID WINDOW --surface NAME --surface-percent N
+/// [--granularity-percent N] [--read-at RFC3339] [--detail TEXT]`.
 fn compare_record_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let rest = &invocation.rest;
-    let usage = "compare record requires OBSERVATION_ID WINDOW --surface NAME --surface-used \
-                 PPM --granularity PPM [--read-at RFC3339] [--detail TEXT]";
+    let usage = "compare record requires OBSERVATION_ID WINDOW --surface NAME --surface-percent \
+                 N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT]";
     let observation_arg = rest.get(1).ok_or_else(|| Error::Usage(usage.into()))?;
     let window_arg = rest.get(2).ok_or_else(|| Error::Usage(usage.into()))?;
     let observation_id_value: i64 = observation_arg.parse().map_err(|_| {
@@ -4088,11 +4105,14 @@ fn compare_record_command(clock: &impl Clock, invocation: &Invocation) -> Result
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--surface" => surface = Some(compare_next_arg(&mut args, "--surface")?),
-            "--surface-used" => {
-                surface_used_ppm = Some(compare_parse_ppm_arg(&mut args, "--surface-used")?)
+            "--surface-percent" => {
+                surface_used_ppm = Some(compare_parse_percent_arg(&mut args, "--surface-percent")?)
             }
-            "--granularity" => {
-                granularity_ppm = Some(compare_parse_ppm_arg(&mut args, "--granularity")?)
+            "--granularity-percent" => {
+                granularity_ppm = Some(compare_parse_percent_arg(
+                    &mut args,
+                    "--granularity-percent",
+                )?)
             }
             "--read-at" => {
                 let raw = compare_next_arg(&mut args, "--read-at")?;
@@ -4112,9 +4132,11 @@ fn compare_record_command(clock: &impl Clock, invocation: &Invocation) -> Result
     let surface =
         surface.ok_or_else(|| Error::Usage("compare record requires --surface NAME".into()))?;
     let surface_used_ppm = surface_used_ppm
-        .ok_or_else(|| Error::Usage("compare record requires --surface-used PPM".into()))?;
-    let granularity_ppm = granularity_ppm
-        .ok_or_else(|| Error::Usage("compare record requires --granularity PPM".into()))?;
+        .ok_or_else(|| Error::Usage("compare record requires --surface-percent N".into()))?;
+    let granularity_ppm = granularity_ppm.unwrap_or_else(|| {
+        crate::domain::quota::QuotaFractionPpm::new(DEFAULT_GRANULARITY_PPM)
+            .expect("one whole percentage point is a valid non-zero granularity")
+    });
     let read_at = read_at.unwrap_or_else(|| clock.now());
 
     let request = AdapterSemanticsComparisonRequest {
@@ -4708,6 +4730,32 @@ fn task_overhead_window(rest: &[String], now: UtcTimestamp) -> Result<SpendWindo
 mod tests {
     use super::*;
     use crate::config::FakeEnv;
+
+    fn parse_percent(raw: &str) -> Result<u32, Error> {
+        let args = [raw.to_string()];
+        let mut iter = args.iter();
+        compare_parse_percent_arg(&mut iter, "--surface-percent").map(|ppm| ppm.get())
+    }
+
+    // The record this feeds is immutable, so the parser is checked in both directions:
+    // the shapes an operator copies off the Console page land on the exact ppm, and
+    // anything outside a percentage is refused rather than rounded into a plausible row.
+    #[test]
+    fn compare_percent_flag_takes_what_the_surface_displays_and_refuses_the_rest() {
+        assert_eq!(parse_percent("21").unwrap(), 210_000);
+        assert_eq!(parse_percent("21.0").unwrap(), 210_000);
+        assert_eq!(parse_percent("21%").unwrap(), 210_000);
+        assert_eq!(parse_percent("0.5").unwrap(), 5_000);
+        assert_eq!(parse_percent("0").unwrap(), 0);
+        assert_eq!(parse_percent("100").unwrap(), 1_000_000);
+        for bad in ["101", "-1", "abc", "250000", "nan", "inf"] {
+            let err = parse_percent(bad).expect_err(bad);
+            assert!(
+                matches!(err, Error::Usage(ref m) if m.contains("--surface-percent")),
+                "{bad}: {err:?}"
+            );
+        }
+    }
 
     #[test]
     fn doctor_maps_an_attribution_floor_breach_to_threshold_not_met() {

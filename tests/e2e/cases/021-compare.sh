@@ -34,8 +34,8 @@ case_steps() {
         "AUB_STATE_DIR=$STATE_DIR" \
         "$AUB_BIN" compare record "$OBS_ID" five_hour \
         --surface "anthropic console" \
-        --surface-used 250000 \
-        --granularity 10000 \
+        --surface-percent 25 \
+        --granularity-percent 1 \
         --read-at "2026-09-04T12:00:00Z"
 
     step "uncompared after recording is empty" env \
@@ -48,8 +48,8 @@ case_steps() {
         "AUB_STATE_DIR=$STATE_DIR" \
         "$AUB_BIN" compare record "$OBS_ID" five_hour \
         --surface "anthropic console" \
-        --surface-used 250000 \
-        --granularity 10000 \
+        --surface-percent 25 \
+        --granularity-percent 1 \
         --read-at "2026-09-04T12:00:00Z"
 
     step "doctor names the comparison age instead of reporting none exists" env \
