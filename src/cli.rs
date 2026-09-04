@@ -155,7 +155,7 @@ impl Command {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Rejected {
-                    reason: "spend has no account dimension until account attribution lands",
+                    reason: "spend groups by account with --group-by account; it has no single-account filter",
                 },
                 model: FlagSupport::Rejected {
                     reason: "spend has no model dimension until a model selector is needed",

@@ -41,7 +41,17 @@ the last published projection instead of sampling.
 ## `aub spend`
 
 **Answers:** how many canonical tokens were used, grouped by the requested
-dimensions?
+dimensions? `--group-by` takes `day`, `session`, `project`, `repository` or
+`account` and is repeatable, so `--group-by account --group-by day` nests days
+under each account.
+
+Account grouping is the session-identifier join: the session id already appears
+in every transcript and in every account marker, and `--group-by account` reads
+both. Attribution is decided by the marker-interval segmentation, never by this
+command; usage no marker can justify lands in the `unknown-account` group, which
+is reported as its own partial group rather than merged or dropped. `--explain`
+on an account group names the exact markers behind the attribution and their
+evidence class.
 
 **Refuses:** to guess at an unreadable transcript. A source that cannot be
 normalized leaves the report `IngestIncomplete` rather than silently omitted
