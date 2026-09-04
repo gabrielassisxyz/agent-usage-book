@@ -35,14 +35,43 @@ forensic copy until the recovery has been reviewed.
 
 ## Periodic restore drill
 
-Run the scripted drill from the repository root:
+`aub drill` runs this procedure end to end and proves it still works, rather than
+leaving that as something an operator finds out mid-incident. It never targets the
+configured state directory, in either mode below.
+
+Against a real archive, the way a scheduled drill runs (see
+[`docs/scheduling.md`](scheduling.md#scheduling-the-periodic-restore-drill)):
+
+```sh
+aub drill --archive ARCHIVE SCRATCH_DEST
+```
+
+Against one of four seeded damage cases, for exercising the procedure without a real
+archive at hand:
+
+```sh
+aub drill --seed truncated-database SCRATCH_DEST
+aub drill --seed corrupted-projection SCRATCH_DEST
+aub drill --seed malformed-spool-record SCRATCH_DEST
+aub drill --seed unsupported-schema-version SCRATCH_DEST
+```
+
+Each seeded case damages a scratch copy of a small ledger in a different way, then
+restores a clean archive of it with the damaged copy as the surviving directory,
+exactly as the numbered steps above describe. `truncated-database` and
+`unsupported-schema-version` prove something stronger than "recovery works": that the
+procedure never opens the damaged directory's own database at all, only its pending
+spool. `corrupted-projection` proves step 7 rebuilds rather than restores. Every run
+prints `drill: passed=true` or `false`, and, when `drill.result` is configured, appends
+a durable record `doctor` reads for the age of the last successful one.
+
+The repository's own end-to-end suite additionally runs this procedure against the
+release binary as part of its regression coverage:
 
 ```sh
 tests/e2e/run.sh
 ```
 
-The drill creates a real archive, restores it into a new scratch directory,
-replays archive and surviving pending evidence, and checks exact observation
-and unrecovered-evidence counts. The end-to-end runner records every command,
-its exit status, and the state-directory digest before and after each step in
-its run log. It never targets an operator state directory.
+That runner records every command, its exit status, and the state-directory digest
+before and after each step in its run log; it is repository test infrastructure, not
+something an operator schedules.
