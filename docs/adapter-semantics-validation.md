@@ -51,24 +51,34 @@ this row in the same change that adapts the adapter, and record a fresh comparis
 1. Pick a recent successful observation for the account. Note its `aub` observation
    identifier (the `meter_observation` rowid).
 2. List **every** semantic window that observation recorded, not only the one a status
-   line displays. `store::adapter_semantics_validation::uncompared_window_ids` returns
-   the windows of an observation that still lack a comparison; the comparison of an
-   observation is complete only when that list is empty. A window nobody looks at is
-   where a misreading survives longest.
+   line displays: `aub compare uncompared OBSERVATION_ID` names the windows that still
+   lack a comparison, and the comparison of an observation is complete only when it
+   answers that none remain. A window nobody looks at is where a misreading survives
+   longest.
 3. For each window, read the corresponding value from the authoritative surface as
-   close in time to the observation as possible, and record the local timestamp of the
-   reading.
-4. Compute the verdict with
-   `domain::authoritative_comparison::compare_against_authoritative_surface`, passing the
-   adapter's stored `quota_used`, the value read from the surface, and the documented
-   granularity from the table above.
-5. Record the comparison with
-   `store::adapter_semantics_validation::insert_comparison`. It stores the observation
-   identifier, the window, the surface name, the granularity, both values, the reading
-   timestamp, and the verdict.
-6. If the verdict is an unresolved mismatch, record a `mismatch` annotation with
-   `insert_annotation`. It becomes an open finding, surfaced by
-   `open_semantic_mismatch_findings`.
+   close in time to the observation as possible, and note the local time of the reading.
+4. Record each window through the binary, giving the percentage exactly as the surface
+   displays it and the time it was read:
+
+   ```sh
+   aub compare record OBSERVATION_ID WINDOW --surface "anthropic console" \
+       --surface-percent 21 --read-at 2026-09-04T11:20:00-03:00
+   ```
+
+   The verdict is computed by
+   `domain::authoritative_comparison::compare_against_authoritative_surface` from the
+   adapter's stored reading, the surface value and the documented granularity, which
+   defaults to one whole point (the table above) and is overridden with
+   `--granularity-percent` only when that table changes. There is no flag that sets the
+   verdict, and a window that already carries a comparison is refused by name rather
+   than overwritten.
+5. An unresolved mismatch is recorded as a `mismatch` annotation by the same command,
+   so it becomes an open finding surfaced by `open_semantic_mismatch_findings` without
+   a second step to forget.
+6. `aub doctor` then reports the age of the newest comparison under
+   `adapter-semantics-comparison-age`, and fails it once it is older than
+   `adapter_semantics.max_comparison_age` (default 30 days), which is how the recurrence
+   this procedure depends on stops being something a person has to remember.
 
 ## Correcting a comparison
 
@@ -91,16 +101,16 @@ proved by `tests/adapter_semantics_validation.rs`. They are never pruned.
 ## Comparison log
 
 One comparison per adapter has to be performed and recorded against the real surface,
-and any mismatch has to be explained or carried as an open finding. The first real comparison was performed on 2026-09-04 against the `max`
-subscription and both windows agreed.
+and any mismatch has to be explained or carried as an open finding. The rows below are
+the human-readable index of the immutable `authoritative_surface_comparison` records;
+the record itself, with the verdict the code computed, is the one `aub doctor` ages.
 
-Two things it needed and did not have, so the row below is the human half of the record
-only. `store::adapter_semantics_validation::insert_comparison` has no caller outside its
-own tests, so a comparison cannot be recorded through the mechanism that computes the
-verdict, and there is no doctor check reporting the age of the last comparison. Until
-both exist, the age of a comparison is something someone has to remember, which is the
-condition this procedure's own bookkeeping was meant to remove.
+| date (local) | adapter | observation id | window | comparison id | adapter | surface | verdict |
+|---|---|---|---|---|---|---|---|
+| 2026-09-04 11:20 | Anthropic | 2 (account `max`) | `five_hour` | #1 | 1% | 1% | agrees within granularity |
+| 2026-09-04 11:20 | Anthropic | 2 (account `max`) | `seven_day` | #2 | 21% | 21% | agrees within granularity |
 
-| date (local) | adapter | observation id | windows compared | result |
-|---|---|---|---|---|
-| 2026-09-04 | Anthropic | 2 (account `max`) | `five_hour`, `seven_day` | agrees within granularity on both: adapter 1% and 21%, surface 1% and 21% |
+The first comparison was read by the operator from the Console usage view on 2026-09-04
+at about 11:20 local and recorded through `aub compare record` the same day, once that
+command existed (`aub-x2bq`); observation 2 carried no model-specific window, so the two
+rows are its whole set.
