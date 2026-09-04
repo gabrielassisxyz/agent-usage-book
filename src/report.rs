@@ -11,6 +11,7 @@ pub mod provenance;
 pub mod coverage;
 pub mod export;
 pub mod spend;
+pub mod task;
 
 pub use models::{
     AccountGroupExplain, AccountMarkerReference, BackupReport, CalibrateReport,
@@ -18,9 +19,10 @@ pub use models::{
     CoverageReport, CoverageReset, CoverageThreshold, DoctorReport, ExportReport, IngestReport,
     IngestSummary, IngestionGeneration, LedgerGeneration, LimitingWindow, MeterAccount,
     MeterReadingProvenance, NowReport, ProjectionReadState, ReportMetadata, SampleAttempt,
-    SampleReport, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
+    SampleReport, SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
     SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport, StatusReport,
-    TaskReport, UNKNOWN_ACCOUNT_LABEL,
+    TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
+    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 
