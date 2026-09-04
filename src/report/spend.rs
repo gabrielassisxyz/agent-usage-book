@@ -20,6 +20,8 @@ use std::path::Path;
 use crate::attribution::account_segment::{
     self, AccountEvidenceClass, AccountSegmentTarget, AccountSegmentationInputs, AccountUsageEvent,
 };
+use crate::attribution::report::{AttributableEvent, attribute_events};
+use crate::attribution::segment::SegmentTarget;
 use crate::config::Config;
 use crate::dedup::deduplicate;
 use crate::domain::credits::Credits;
@@ -459,6 +461,11 @@ pub fn assemble_canonical(
     let replayed_occurrences = diagnostics.replayed_occurrences;
     let heuristic_identities = diagnostics.heuristic_identities;
     let partial = refresh_failure.is_some() || !diagnostics.quarantined_by_class.is_empty();
+    let task_labels = if grouping.contains(&SpendGrouping::Task) {
+        task_label_map(conn, &events)?
+    } else {
+        BTreeMap::new()
+    };
     let mut provenance = Vec::new();
     let mut credit_provenance = Vec::new();
     let mut account_explain = Vec::new();
@@ -481,6 +488,7 @@ pub fn assemble_canonical(
         rate_book,
         &mut credit_provenance,
         credit_reporting,
+        &task_labels,
     );
     let mut metadata = ReportMetadata::new(
         generated_at,
@@ -590,6 +598,7 @@ fn canonical_groups(
     rate_book: Option<&RateBook>,
     credit_provenance: &mut Vec<SpendGroupCreditsProvenance>,
     credit_reporting: CreditReporting<'_>,
+    task_labels: &BTreeMap<String, String>,
 ) -> Vec<SpendGroup> {
     let Some(dimension) = grouping.get(depth).copied() else {
         return Vec::new();
@@ -597,7 +606,7 @@ fn canonical_groups(
     let mut by_key: BTreeMap<String, Vec<&CanonicalSpendEvent>> = BTreeMap::new();
     for event in events {
         by_key
-            .entry(group_value(event, dimension, account_of))
+            .entry(group_value(event, dimension, task_labels, account_of))
             .or_default()
             .push(event);
     }
@@ -673,6 +682,7 @@ fn canonical_groups(
                 rate_book,
                 credit_provenance,
                 credit_reporting,
+                task_labels,
             );
             path.pop();
             let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
@@ -874,6 +884,7 @@ fn credit_derivation(
 fn group_value(
     event: &CanonicalSpendEvent,
     grouping: SpendGrouping,
+    task_labels: &BTreeMap<String, String>,
     account_of: &BTreeMap<String, String>,
 ) -> String {
     match grouping {
@@ -881,6 +892,10 @@ fn group_value(
         SpendGrouping::Session => event.session.clone(),
         SpendGrouping::Project => event.project.clone(),
         SpendGrouping::Repository => event.repository.clone(),
+        SpendGrouping::Task => task_labels
+            .get(&event.canonical_id)
+            .cloned()
+            .unwrap_or_else(|| "overhead:missing_timestamp".to_string()),
         // Resolved before grouping by account_attribution(); an event missing
         // from the map never received an account and is unattributed.
         SpendGrouping::Account => account_of
@@ -890,7 +905,55 @@ fn group_value(
     }
 }
 
-fn canonical_usage(events: &[&CanonicalSpendEvent], partial: bool) -> UsageVector {
+/// The task-or-overhead label for every event, keyed by its own
+/// `canonical_id`, computed by the shared segmentation engine
+/// ([`crate::attribution::segment`]) rather than by any grouping logic of
+/// this command's own: `--group-by task` reuses exactly the attribution
+/// `aub task report` and `aub task overhead` read back (`aub-eu7.4`).
+fn task_label_map(
+    conn: &rusqlite::Connection,
+    events: &[CanonicalSpendEvent],
+) -> Result<BTreeMap<String, String>, Error> {
+    let boundaries = crate::store::task_event::read_boundaries(conn)?;
+    let attributable: Vec<AttributableEvent> = events
+        .iter()
+        .map(|event| AttributableEvent {
+            canonical_id: event.canonical_id.clone(),
+            occurred_at: event.occurred_at,
+            session_is_mapped: event.session != crate::store::spend::UNKNOWN_SESSION,
+            usage: known_vector(&event.components),
+        })
+        .collect();
+    let attributed = attribute_events(boundaries, true, &attributable);
+    Ok(attributed
+        .into_iter()
+        .map(|attribution| {
+            (
+                attribution.canonical_id,
+                task_target_label(&attribution.target),
+            )
+        })
+        .collect())
+}
+
+fn task_target_label(target: &SegmentTarget) -> String {
+    match target {
+        SegmentTarget::Task(task_id) => {
+            format!(
+                "{}:{}",
+                task_id.source().as_str(),
+                task_id.native().as_str()
+            )
+        }
+        SegmentTarget::Overhead(reason) => format!("overhead:{}", reason.as_str()),
+    }
+}
+
+/// Aggregates known and unknown token components, coverage and evidence
+/// quality across a set of canonical events. `pub(crate)` so `report::task`
+/// reuses the exact same aggregation `aub spend` reports, rather than a
+/// second copy that could silently drift from it.
+pub(crate) fn canonical_usage(events: &[&CanonicalSpendEvent], partial: bool) -> UsageVector {
     let mut components = BTreeMap::<String, u64>::new();
     let mut quality = EvidenceQuality::Measured;
     for event in events {
@@ -1474,6 +1537,114 @@ mod tests {
         assert!(explain.contains("spend_canonical_records"));
         assert!(explain.contains("spend_replayed_occurrences"));
         assert!(explain.contains("spend_heuristic_identities"));
+    }
+
+    /// `--group-by task` reads the tracker's claim/release timeline and
+    /// attributes each canonical event to the task claimed at its own
+    /// timestamp, or to a named overhead bucket, without any grouping logic
+    /// of this test's own: the assertion is that the two group totals
+    /// reconcile exactly to the ungrouped canonical total, which is the
+    /// conservation invariant `aub-eu7.2` owns, exercised here through the
+    /// spend command's own grouping path.
+    #[test]
+    fn group_by_task_reconciles_to_canonical_totals_and_labels_by_task_and_overhead() {
+        use crate::attribution::{TrackerEventReader, TrackerEventRecord};
+
+        let (_root, conn) = canonical_conn("group-by-task");
+        seed_session(&conn, "s1");
+        let day_start = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        // Before any claim: lands in the before_first_claim overhead bucket.
+        seed_canonical(
+            &conn,
+            "e1",
+            day_start + 1,
+            "s1",
+            "reported",
+            &[("input", 2)],
+        );
+        // After the claim to T1: lands in task T1.
+        let one_hour = 3_600_000_000_000;
+        seed_canonical(
+            &conn,
+            "e2",
+            day_start + 2 * one_hour,
+            "s1",
+            "reported",
+            &[("input", 5)],
+        );
+
+        struct FixtureReader(Vec<TrackerEventRecord>);
+        impl TrackerEventReader for FixtureReader {
+            fn read_events(&self) -> Result<Vec<TrackerEventRecord>, Error> {
+                Ok(self.0.clone())
+            }
+        }
+        let reader = FixtureReader(vec![TrackerEventRecord {
+            upstream_id: 1,
+            task_native: "T1".to_string(),
+            event_type: "status_changed".to_string(),
+            old_value: Some("open".to_string()),
+            new_value: Some("in_progress".to_string()),
+            occurred_at: "2026-08-25T01:00:00Z".to_string(),
+            actor: None,
+        }]);
+        crate::store::task_event::ingest(&conn, SourceNamespace::new("beads-a"), &reader).unwrap();
+
+        let ungrouped = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Day],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+        )
+        .unwrap();
+        let canonical_total = ungrouped.groups[0].usage.known().input().value();
+        assert_eq!(canonical_total, 7);
+
+        let by_task = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Task],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+        )
+        .unwrap();
+        let grouped_total: u64 = by_task
+            .groups
+            .iter()
+            .map(|group| group.usage.known().input().value())
+            .sum();
+        assert_eq!(
+            grouped_total, canonical_total,
+            "task-grouped usage must reconcile to the canonical total"
+        );
+        let labels: BTreeSet<&str> = by_task
+            .groups
+            .iter()
+            .map(|group| group.key.as_str())
+            .collect();
+        assert_eq!(
+            labels,
+            BTreeSet::from(["task=overhead:before_first_claim", "task=beads-a:T1",])
+        );
+        let overhead_group = by_task
+            .groups
+            .iter()
+            .find(|group| group.key.as_str() == "task=overhead:before_first_claim")
+            .unwrap();
+        assert_eq!(overhead_group.usage.known().input().value(), 2);
+        let task_group = by_task
+            .groups
+            .iter()
+            .find(|group| group.key.as_str() == "task=beads-a:T1")
+            .unwrap();
+        assert_eq!(task_group.usage.known().input().value(), 5);
     }
 
     #[test]
