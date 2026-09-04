@@ -153,6 +153,7 @@ pub fn persist_ingest_batch(
     conn: &mut rusqlite::Connection,
     pass: &IngestPass,
     clock: &impl Clock,
+    max_batch_seconds: MonotonicDuration,
 ) -> Result<PersistOutcome, Error> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -182,22 +183,42 @@ pub fn persist_ingest_batch(
                 Error::Store(format!("cannot replace {source_file}'s occurrences: {e}"))
             })?;
     }
-    rows_replaced += tx
-        .execute(
-            "DELETE FROM usage_event WHERE NOT EXISTS (
-                 SELECT 1 FROM usage_occurrence o WHERE o.event_id = usage_event.id
-             )",
-            [],
-        )
-        .map_err(|e| Error::Store(format!("cannot drop orphaned canonical events: {e}")))?;
+    // An event can only be orphaned by the whole-file delete just above: no
+    // other path in this function removes an occurrence. So when that delete
+    // had nothing to do, no batch since the last cleanup could have created a
+    // new orphan, and this scan (indexed since `aub-mh1c`, but still a scan)
+    // is provably a no-op that a first ingest would otherwise pay on every
+    // single batch.
+    if !pass.whole_file_sources.is_empty() {
+        rows_replaced += tx
+            .execute(
+                "DELETE FROM usage_event WHERE NOT EXISTS (
+                     SELECT 1 FROM usage_occurrence o WHERE o.event_id = usage_event.id
+                 )",
+                [],
+            )
+            .map_err(|e| Error::Store(format!("cannot drop orphaned canonical events: {e}")))?;
+    }
 
     let mut events_written: u64 = 0;
     let mut events_already_ingested: u64 = 0;
     let mut occurrences_written: u64 = 0;
     let mut occurrences_already_ingested: u64 = 0;
     let mut components_written: u64 = 0;
+    // How many of `pass.events`, in order, this call actually landed. Bounded
+    // by `max_batch_seconds` below (`aub-mh1c`) as well as by the caller's own
+    // count and file bounds, so no single transaction can hold the writer
+    // slot past this budget however slow the per-event cost turns out to be.
+    // A cutoff always leaves at least one event landed, so the caller's retry
+    // with the remainder is guaranteed to make progress.
+    let mut events_processed: usize = 0;
 
     for persist in &pass.events {
+        if events_processed > 0
+            && clock.monotonic_now().duration_since(slot_start) >= max_batch_seconds
+        {
+            break;
+        }
         let event = &persist.event;
         let occurred_at_nanos = event.occurred_at().map(|t| t.unix_nanos());
 
@@ -296,50 +317,67 @@ pub fn persist_ingest_batch(
             Some(_) => occurrences_written += 1,
             None => occurrences_already_ingested += 1,
         }
+        events_processed += 1;
     }
+
+    // Sessions, watermarks, quarantine and collisions all describe the pass's
+    // events as a whole (a session's bounds, a file's consumed offset, what
+    // was excluded from the canonical set); landing them early, against a
+    // partial `pass.events`, would state a fact about events this call never
+    // reached. So they land only once this call actually drained every event
+    // it was given (`aub-mh1c`): a wall-clock cutoff above leaves them for the
+    // caller's retry, which carries the same pass-level fields forward on the
+    // remaining events until one call finishes the set.
+    let drained = events_processed == pass.events.len();
 
     // Session bounds merge rather than replace: a pass that sees only part of
     // a session's events narrows nothing, and the stored row keeps the widest
     // bounds any pass has seen. Attribution columns stay as first recorded.
     let mut sessions_upserted: u64 = 0;
-    for session in &pass.sessions {
-        tx.execute(
-            "INSERT INTO session (
-                source, native_session_id, start, end, project_key, repository_key, run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-            ON CONFLICT (source, native_session_id) DO UPDATE SET
-                start = MIN(start, excluded.start),
-                end = CASE
-                    WHEN end IS NULL THEN excluded.end
-                    WHEN excluded.end IS NULL THEN end
-                    ELSE MAX(end, excluded.end)
-                END",
-            params![
-                session.source.as_str(),
-                session.native_session_id.as_str(),
-                session.start.unix_nanos(),
-                session.end.map(|t| t.unix_nanos()),
-                session.project_key.as_str(),
-                session.repository_key.as_str(),
-                session.run_id.as_ref().map(|id| id.as_str()),
-            ],
-        )
-        .map_err(|e| Error::Store(format!("cannot land the session row: {e}")))?;
-        sessions_upserted += 1;
+    if drained {
+        for session in &pass.sessions {
+            tx.execute(
+                "INSERT INTO session (
+                    source, native_session_id, start, end, project_key, repository_key, run_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                ON CONFLICT (source, native_session_id) DO UPDATE SET
+                    start = MIN(start, excluded.start),
+                    end = CASE
+                        WHEN end IS NULL THEN excluded.end
+                        WHEN excluded.end IS NULL THEN end
+                        ELSE MAX(end, excluded.end)
+                    END",
+                params![
+                    session.source.as_str(),
+                    session.native_session_id.as_str(),
+                    session.start.unix_nanos(),
+                    session.end.map(|t| t.unix_nanos()),
+                    session.project_key.as_str(),
+                    session.repository_key.as_str(),
+                    session.run_id.as_ref().map(|id| id.as_str()),
+                ],
+            )
+            .map_err(|e| Error::Store(format!("cannot land the session row: {e}")))?;
+            sessions_upserted += 1;
+        }
     }
 
-    for watermark in &pass.watermarks {
-        crate::store::transcript_file::upsert(&tx, watermark)?;
+    if drained {
+        for watermark in &pass.watermarks {
+            crate::store::transcript_file::upsert(&tx, watermark)?;
+        }
     }
 
     let mut quarantined_recorded: u64 = 0;
-    for item in &pass.quarantined {
-        record_quarantine(&tx, item)?;
-        quarantined_recorded += 1;
-    }
-    for collision in &pass.collisions {
-        record_dedup_collision(&tx, collision)?;
-        quarantined_recorded += 1;
+    if drained {
+        for item in &pass.quarantined {
+            record_quarantine(&tx, item)?;
+            quarantined_recorded += 1;
+        }
+        for collision in &pass.collisions {
+            record_dedup_collision(&tx, collision)?;
+            quarantined_recorded += 1;
+        }
     }
 
     let generation = ingestion_generation::advance(&tx)?;
@@ -581,12 +619,17 @@ mod tests {
     }
 
     /// Lands one batch through the store primitive under a fixture clock, so
-    /// every call site names the behaviour instead of the clock plumbing.
+    /// every call site names the behaviour instead of the clock plumbing. The
+    /// wall-clock bound is the documented default: a clock that never
+    /// advances (as this fixture's does not, absent an explicit `advance`)
+    /// never trips it, so every existing caller of `land` keeps landing its
+    /// whole pass in one call exactly as before `aub-mh1c`.
     fn land(conn: &mut rusqlite::Connection, pass: &IngestPass) -> Result<PersistOutcome, Error> {
         persist_ingest_batch(
             conn,
             pass,
             &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+            MonotonicDuration::from_seconds(2),
         )
     }
 
@@ -914,5 +957,145 @@ mod tests {
         // Silence the unused-variable lint SourceLocation would otherwise carry:
         // the import exists for the parse-shaped record construction above.
         let _ = SourceLocation::new("x", 1);
+    }
+
+    /// A clock that advances by a fixed step every time it is read, so a test
+    /// can make wall-clock time actually pass between the persist loop's own
+    /// per-event checks without a real sleep.
+    struct TickingClock {
+        state: std::cell::Cell<FakeClock>,
+        step: MonotonicDuration,
+    }
+
+    impl TickingClock {
+        fn new(start: UtcTimestamp, step: MonotonicDuration) -> Self {
+            Self {
+                state: std::cell::Cell::new(FakeClock::new(start)),
+                step,
+            }
+        }
+    }
+
+    impl crate::domain::time::Clock for TickingClock {
+        fn now(&self) -> UtcTimestamp {
+            self.state.get().now()
+        }
+
+        fn monotonic_now(&self) -> crate::domain::time::MonotonicInstant {
+            let mut clock = self.state.get();
+            let instant = clock.monotonic_now();
+            clock.advance(self.step);
+            self.state.set(clock);
+            instant
+        }
+    }
+
+    /// `ingest.max_batch_seconds` closes a batch by wall clock independently
+    /// of the counts bounds (`aub-mh1c`): a clock advanced past the limit
+    /// mid-pass cuts the transaction short of every event it was given, and a
+    /// caller's retry with the remaining events lands the rest, resuming
+    /// exactly at the next one. The counts bounds themselves are untouched by
+    /// this mechanism and stay covered by `ingest.rs`'s own
+    /// `batch_split_tests`, unchanged since before this bead.
+    #[test]
+    fn the_wall_clock_bound_closes_a_batch_mid_pass_and_a_retry_lands_the_rest() {
+        let (_scratch, mut conn) = fixture_conn();
+        let now = UtcTimestamp::from_unix_nanos(1_000_000);
+        let pass = pass_of(
+            vec![
+                strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5),
+                strong_event("m2", "corpus/a.jsonl", 2_000, 10, 5),
+                strong_event("m3", "corpus/b.jsonl", 3_000, 10, 5),
+            ],
+            now,
+        );
+
+        // The clock advances a full second on every read. The loop never
+        // checks before the first event, so it always lands; the check
+        // before the second already reads past the budget and cuts there.
+        let clock = TickingClock::new(
+            UtcTimestamp::from_unix_nanos(0),
+            MonotonicDuration::from_millis(1_000),
+        );
+        let first = persist_ingest_batch(
+            &mut conn,
+            &pass,
+            &clock,
+            MonotonicDuration::from_millis(500),
+        )
+        .unwrap();
+        let landed_first =
+            (first.events_written.value() + first.events_already_ingested.value()) as usize;
+        assert_eq!(
+            landed_first, 1,
+            "the wall-clock bound must cut the batch after the first event"
+        );
+        assert_eq!(count(&conn, "usage_event"), 1);
+
+        // The caller's retry carries only the events the first call never
+        // reached; a fresh clock and a generous budget let it all land.
+        let remaining = IngestPass {
+            events: pass.events[landed_first..].to_vec(),
+            sessions: Vec::new(),
+            watermarks: Vec::new(),
+            quarantined: Vec::new(),
+            collisions: Vec::new(),
+            whole_file_sources: Vec::new(),
+            created_at: now,
+        };
+        let second = land(&mut conn, &remaining).unwrap();
+        assert_eq!(
+            second.events_written.value(),
+            2,
+            "the retry must land exactly the events the first call did not reach"
+        );
+        assert_eq!(
+            count(&conn, "usage_event"),
+            3,
+            "every event lands exactly once across the cut-short call and its retry"
+        );
+        let ids: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT canonical_event_id FROM usage_event ORDER BY canonical_event_id")
+                .unwrap();
+            stmt.query_map([], |row| row.get(0))
+                .unwrap()
+                .map(|row| row.unwrap())
+                .collect()
+        };
+        assert_eq!(
+            ids,
+            vec!["event-id:m1", "event-id:m2", "event-id:m3"],
+            "the retry resumes at the next event, neither skipping nor repeating one"
+        );
+    }
+
+    /// A budget the very first event already exceeds still lands that one
+    /// event: the check only ever runs after at least one has landed, so a
+    /// call is always guaranteed to make progress and the caller's retry loop
+    /// can never spin without landing anything.
+    #[test]
+    fn an_impossibly_small_budget_still_lands_at_least_one_event() {
+        let (_scratch, mut conn) = fixture_conn();
+        let now = UtcTimestamp::from_unix_nanos(1_000_000);
+        let pass = pass_of(
+            vec![
+                strong_event("m1", "corpus/a.jsonl", 1_000, 10, 5),
+                strong_event("m2", "corpus/a.jsonl", 2_000, 10, 5),
+            ],
+            now,
+        );
+        let clock = TickingClock::new(
+            UtcTimestamp::from_unix_nanos(0),
+            MonotonicDuration::from_seconds(1),
+        );
+        let outcome =
+            persist_ingest_batch(&mut conn, &pass, &clock, MonotonicDuration::from_nanos(0))
+                .unwrap();
+        assert_eq!(
+            outcome.events_written.value() + outcome.events_already_ingested.value(),
+            1,
+            "a zero budget still lands the first event rather than landing nothing"
+        );
     }
 }

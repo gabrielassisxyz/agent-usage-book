@@ -214,6 +214,14 @@ pub struct IngestConfig {
     /// would let a batch of many small files grow unbounded in file count and
     /// wall time before it ever landed. The value must be at least 1.
     pub max_batch_files: u64,
+    /// The longest one ingest transaction may hold the SQLite writer slot,
+    /// independently of `max_batch_events` and `max_batch_files` (`aub-mh1c`).
+    /// Those two bound a batch by what it counts, not by what landing it
+    /// actually costs; a batch that hits this bound instead commits whatever
+    /// it already landed and the remainder continues as a further
+    /// transaction, so a sampler waiting on the writer lock is served within
+    /// this bound however slow the per-event cost turns out to be.
+    pub max_batch_seconds: MonotonicDuration,
 }
 
 #[derive(Debug, Clone)]
@@ -382,7 +390,7 @@ const SAMPLING_KEYS: &[&str] = &[
     "command_budget",
     "max_concurrent_requests",
 ];
-const INGEST_KEYS: &[&str] = &["max_batch_events", "max_batch_files"];
+const INGEST_KEYS: &[&str] = &["max_batch_events", "max_batch_files", "max_batch_seconds"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
 const ATTRIBUTION_KEYS: &[&str] = &["quality_floor", "recent_window"];
@@ -789,6 +797,15 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "ingest", "max_batch_files"),
             Some("200"),
+            &file_display,
+            &mut provenance,
+        )?,
+        max_batch_seconds: resolve_duration(
+            "ingest.max_batch_seconds",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "ingest", "max_batch_seconds"),
+            Some("2s"),
             &file_display,
             &mut provenance,
         )?,
@@ -1473,6 +1490,44 @@ pattern = "**/*.jsonl"
         let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
         assert!(
             error.to_string().contains("ingest.max_batch_files"),
+            "{error}"
+        );
+    }
+
+    /// `ingest.max_batch_seconds` (`aub-mh1c`) resolves to a 2-second default,
+    /// takes a file override, and refuses garbage naming the key: the same
+    /// contract `max_batch_events` and `max_batch_files` already carry. The
+    /// planted negative is a resolver that silently ignores the file value
+    /// and always reports the default, which the file-override assertion
+    /// below would still catch even though the default-only assertion would
+    /// not.
+    #[test]
+    fn ingest_batch_seconds_bound_resolves_default_and_from_file() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            config.ingest.max_batch_seconds,
+            MonotonicDuration::from_seconds(2)
+        );
+        assert_eq!(
+            provenance.get("ingest.max_batch_seconds"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "\n[ingest]\nmax_batch_seconds = \"5s\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.ingest.max_batch_seconds,
+            MonotonicDuration::from_seconds(5)
+        );
+        assert_eq!(
+            provenance.get("ingest.max_batch_seconds"),
+            Some(ConfigSource::File)
+        );
+
+        let garbage = "\n[ingest]\nmax_batch_seconds = \"lots\"\n";
+        let error = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
+        assert!(
+            error.to_string().contains("ingest.max_batch_seconds"),
             "{error}"
         );
     }

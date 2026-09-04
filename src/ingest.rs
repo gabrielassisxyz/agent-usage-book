@@ -154,7 +154,7 @@ const PROGRESS_TIME_INTERVAL: MonotonicDuration = MonotonicDuration::from_second
 
 /// One progress snapshot the pass reports to `progress_sink`, so a long first
 /// ingest is distinguishable from a hung one (`aub-va6s`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct IngestProgress {
     /// Files fully accounted for (parsed, skipped or found unreadable) so far.
     pub files_done: u64,
@@ -168,6 +168,12 @@ pub struct IngestProgress {
     pub events_written: u64,
     /// Time elapsed since the pass started, on the monotonic clock.
     pub elapsed: MonotonicDuration,
+    /// Events landed per second over the interval since the previous report
+    /// (`aub-mh1c`), not since the pass started: a rate averaged over the
+    /// whole pass would hide a fresh regression behind however fast the pass
+    /// ran before it. Zero while the discovery-and-parse loop is still
+    /// running, since nothing has landed yet at that point.
+    pub rate_events_per_sec: f64,
 }
 
 /// Decides when the pass is due to report progress, and remembers where it
@@ -176,6 +182,7 @@ pub struct IngestProgress {
 struct ProgressGate {
     started_at: MonotonicInstant,
     last_report_files: u64,
+    last_report_events: u64,
     last_report_at: MonotonicInstant,
 }
 
@@ -184,22 +191,34 @@ impl ProgressGate {
         Self {
             started_at: now,
             last_report_files: 0,
+            last_report_events: 0,
             last_report_at: now,
         }
     }
 
-    /// Whether a report is due at `files_done` and `now`, resetting the gate's
-    /// own bookkeeping when it fires so the next report waits a full interval
-    /// again.
-    fn due(&mut self, files_done: u64, now: MonotonicInstant) -> bool {
+    /// Whether a report is due at `files_done`, `events_written` and `now`.
+    /// When due, resets the gate's own bookkeeping so the next report waits a
+    /// full interval again, and returns the rate: events landed since the
+    /// last report divided by the wall time since the last report
+    /// (`aub-mh1c`), the interval the progress line's `rate` field names.
+    fn due(&mut self, files_done: u64, events_written: u64, now: MonotonicInstant) -> Option<f64> {
         let by_files = files_done.saturating_sub(self.last_report_files) >= PROGRESS_FILE_INTERVAL;
-        let by_time = now.duration_since(self.last_report_at) >= PROGRESS_TIME_INTERVAL;
+        let interval = now.duration_since(self.last_report_at);
+        let by_time = interval >= PROGRESS_TIME_INTERVAL;
         if !by_files && !by_time {
-            return false;
+            return None;
         }
+        let events_delta = events_written.saturating_sub(self.last_report_events);
+        let seconds = interval.as_nanos() as f64 / 1_000_000_000.0;
+        let rate = if seconds > 0.0 {
+            events_delta as f64 / seconds
+        } else {
+            0.0
+        };
         self.last_report_files = files_done;
+        self.last_report_events = events_written;
         self.last_report_at = now;
-        true
+        Some(rate)
     }
 
     fn elapsed(&self, now: MonotonicInstant) -> MonotonicDuration {
@@ -277,13 +296,14 @@ pub fn run(
             // covered by one counter rather than three that could drift.
             files_done += 1;
             let file_check_at = clock.monotonic_now();
-            if progress.due(files_done, file_check_at) {
+            if let Some(rate) = progress.due(files_done, 0, file_check_at) {
                 progress_sink(&IngestProgress {
                     files_done,
                     files_total,
                     sessions_written: 0,
                     events_written: 0,
                     elapsed: progress.elapsed(file_check_at),
+                    rate_events_per_sec: rate,
                 })?;
             }
 
@@ -440,13 +460,17 @@ pub fn run(
         writer_slot: MonotonicDuration::from_nanos(0),
     };
 
+    // `batch_number` counts actual committed transactions, which can now
+    // outnumber `chunks`: `config.ingest.max_batch_seconds` (`aub-mh1c`) may
+    // cut a chunk's own transaction short of the counts bounds above, and the
+    // remainder lands as one or more further transactions before this chunk
+    // is considered done. Sessions, watermarks, quarantine and collisions
+    // stay attached to the chunk they were computed for on every retry;
+    // `persist_ingest_batch` itself only applies them once a call actually
+    // drains the events it was given, so they land exactly once regardless of
+    // how many transactions the chunk took.
+    let mut batch_number: u64 = 0;
     for (index, chunk) in chunks.into_iter().enumerate() {
-        if index > 0 {
-            // Yield the writer slot between consecutive batches so a meter
-            // write waiting for the slot is served after one batch's hold,
-            // never behind the whole pass.
-            std::thread::sleep(INTER_BATCH_YIELD);
-        }
         let last = index + 1 == total_chunks;
 
         let whole_file_chunk: Vec<String> = whole_file_sources
@@ -459,74 +483,112 @@ pub fn run(
             })
             .cloned()
             .collect();
-
-        let pass = crate::store::ingest::IngestPass {
-            events: chunk.to_vec(),
-            sessions: session_pass(chunk.iter().map(|persist| &persist.event)),
-            watermarks: if last {
-                std::mem::take(&mut watermarks)
-            } else {
-                Vec::new()
-            },
-            quarantined: if index == 0 {
-                std::mem::take(&mut quarantined_items)
-            } else {
-                Vec::new()
-            },
-            collisions: if index == 0 {
-                std::mem::take(&mut collisions)
-            } else {
-                Vec::new()
-            },
-            whole_file_sources: whole_file_chunk,
-            created_at: now,
+        let chunk_sessions = session_pass(chunk.iter().map(|persist| &persist.event));
+        let chunk_watermarks = if last {
+            std::mem::take(&mut watermarks)
+        } else {
+            Vec::new()
         };
-        let outcome = crate::store::ingest::persist_ingest_batch(conn, &pass, clock)?;
-
-        totals.events_written = sum_rows(totals.events_written, outcome.events_written);
-        totals.events_already_ingested = sum_rows(
-            totals.events_already_ingested,
-            outcome.events_already_ingested,
-        );
-        totals.occurrences_written =
-            sum_rows(totals.occurrences_written, outcome.occurrences_written);
-        totals.occurrences_already_ingested = sum_rows(
-            totals.occurrences_already_ingested,
-            outcome.occurrences_already_ingested,
-        );
-        totals.components_written = sum_rows(totals.components_written, outcome.components_written);
-        totals.sessions_upserted = sum_rows(totals.sessions_upserted, outcome.sessions_upserted);
-        totals.rows_replaced = sum_rows(totals.rows_replaced, outcome.rows_replaced);
-        totals.quarantined_recorded =
-            sum_rows(totals.quarantined_recorded, outcome.quarantined_recorded);
-        totals.generation = outcome.generation;
-        totals.writer_slot = MonotonicDuration::from_nanos(
-            totals.writer_slot.as_nanos() + outcome.writer_slot.as_nanos(),
-        );
-
-        let landed = LandedBatch {
-            index: index as u64 + 1,
-            events: outcome.events_written.value() + outcome.events_already_ingested.value(),
-            writer_slot: outcome.writer_slot,
-            generation: outcome.generation,
+        let chunk_quarantined = if index == 0 {
+            std::mem::take(&mut quarantined_items)
+        } else {
+            Vec::new()
         };
-        batch_sink(&landed)?;
-        batches.push(landed);
+        let chunk_collisions = if index == 0 {
+            std::mem::take(&mut collisions)
+        } else {
+            Vec::new()
+        };
 
-        // Files done stopped advancing once the persist loop began; the
-        // elapsed side of the gate is what keeps firing here, so a long
-        // sequence of batches still reports rather than going silent between
-        // the last file parsed and the pass's own return.
-        let batch_check_at = clock.monotonic_now();
-        if progress.due(files_done, batch_check_at) {
-            progress_sink(&IngestProgress {
+        let mut cursor = 0usize;
+        loop {
+            if batch_number > 0 {
+                // Yield the writer slot between consecutive transactions so a
+                // meter write waiting for the slot is served after one
+                // transaction's hold, never behind the whole pass.
+                std::thread::sleep(INTER_BATCH_YIELD);
+            }
+
+            let pass = crate::store::ingest::IngestPass {
+                events: chunk[cursor..].to_vec(),
+                sessions: chunk_sessions.clone(),
+                watermarks: chunk_watermarks.clone(),
+                quarantined: chunk_quarantined.clone(),
+                collisions: chunk_collisions.clone(),
+                whole_file_sources: if cursor == 0 {
+                    whole_file_chunk.clone()
+                } else {
+                    Vec::new()
+                },
+                created_at: now,
+            };
+            let outcome = crate::store::ingest::persist_ingest_batch(
+                conn,
+                &pass,
+                clock,
+                config.ingest.max_batch_seconds,
+            )?;
+
+            totals.events_written = sum_rows(totals.events_written, outcome.events_written);
+            totals.events_already_ingested = sum_rows(
+                totals.events_already_ingested,
+                outcome.events_already_ingested,
+            );
+            totals.occurrences_written =
+                sum_rows(totals.occurrences_written, outcome.occurrences_written);
+            totals.occurrences_already_ingested = sum_rows(
+                totals.occurrences_already_ingested,
+                outcome.occurrences_already_ingested,
+            );
+            totals.components_written =
+                sum_rows(totals.components_written, outcome.components_written);
+            totals.sessions_upserted =
+                sum_rows(totals.sessions_upserted, outcome.sessions_upserted);
+            totals.rows_replaced = sum_rows(totals.rows_replaced, outcome.rows_replaced);
+            totals.quarantined_recorded =
+                sum_rows(totals.quarantined_recorded, outcome.quarantined_recorded);
+            totals.generation = outcome.generation;
+            totals.writer_slot = MonotonicDuration::from_nanos(
+                totals.writer_slot.as_nanos() + outcome.writer_slot.as_nanos(),
+            );
+
+            let consumed =
+                (outcome.events_written.value() + outcome.events_already_ingested.value()) as usize;
+            batch_number += 1;
+            let landed = LandedBatch {
+                index: batch_number,
+                events: consumed as u64,
+                writer_slot: outcome.writer_slot,
+                generation: outcome.generation,
+            };
+            batch_sink(&landed)?;
+            batches.push(landed);
+
+            // Files done stopped advancing once the persist loop began; the
+            // elapsed side of the gate is what keeps firing here, so a long
+            // sequence of batches still reports rather than going silent
+            // between the last file parsed and the pass's own return.
+            let batch_check_at = clock.monotonic_now();
+            if let Some(rate) = progress.due(
                 files_done,
-                files_total,
-                sessions_written: totals.sessions_upserted.value(),
-                events_written: totals.events_written.value()
-                    + totals.events_already_ingested.value(),
-                elapsed: progress.elapsed(batch_check_at),
-            })?;
+                totals.events_written.value() + totals.events_already_ingested.value(),
+                batch_check_at,
+            ) {
+                progress_sink(&IngestProgress {
+                    files_done,
+                    files_total,
+                    sessions_written: totals.sessions_upserted.value(),
+                    events_written: totals.events_written.value()
+                        + totals.events_already_ingested.value(),
+                    elapsed: progress.elapsed(batch_check_at),
+                    rate_events_per_sec: rate,
+                })?;
+            }
+
+            cursor += consumed;
+            if cursor >= chunk.len() {
+                break;
+            }
         }
     }
 
@@ -766,11 +828,12 @@ mod progress_gate_tests {
     fn the_file_interval_fires_at_exactly_the_boundary() {
         let mut gate = ProgressGate::new(instant(0));
         assert!(
-            !gate.due(PROGRESS_FILE_INTERVAL - 1, instant(0)),
+            gate.due(PROGRESS_FILE_INTERVAL - 1, 0, instant(0))
+                .is_none(),
             "one file short of the interval must not report"
         );
         assert!(
-            gate.due(PROGRESS_FILE_INTERVAL, instant(0)),
+            gate.due(PROGRESS_FILE_INTERVAL, 0, instant(0)).is_some(),
             "exactly at the interval must report"
         );
     }
@@ -784,11 +847,12 @@ mod progress_gate_tests {
         let mut gate = ProgressGate::new(instant(0));
         let just_under = PROGRESS_TIME_INTERVAL.as_nanos() - 1;
         assert!(
-            !gate.due(0, instant(just_under)),
+            gate.due(0, 0, instant(just_under)).is_none(),
             "one nanosecond short of the interval must not report"
         );
         assert!(
-            gate.due(0, instant(PROGRESS_TIME_INTERVAL.as_nanos())),
+            gate.due(0, 0, instant(PROGRESS_TIME_INTERVAL.as_nanos()))
+                .is_some(),
             "exactly at the interval must report even with zero files done"
         );
     }
@@ -799,12 +863,42 @@ mod progress_gate_tests {
     #[test]
     fn firing_resets_the_gate_so_the_next_report_waits_a_full_interval_again() {
         let mut gate = ProgressGate::new(instant(0));
-        assert!(gate.due(PROGRESS_FILE_INTERVAL, instant(0)));
+        assert!(gate.due(PROGRESS_FILE_INTERVAL, 0, instant(0)).is_some());
         assert!(
-            !gate.due(PROGRESS_FILE_INTERVAL + 1, instant(0)),
+            gate.due(PROGRESS_FILE_INTERVAL + 1, 0, instant(0))
+                .is_none(),
             "one file past a just-fired report must not report again"
         );
-        assert!(gate.due(2 * PROGRESS_FILE_INTERVAL, instant(0)));
+        assert!(
+            gate.due(2 * PROGRESS_FILE_INTERVAL, 0, instant(0))
+                .is_some()
+        );
+    }
+
+    /// The rate is events landed since the previous report divided by the
+    /// wall time since the previous report, not an average over the whole
+    /// pass (`aub-mh1c`): a fast start followed by a slow patch must show the
+    /// slow patch's own rate, not one blended with the fast start.
+    #[test]
+    fn the_rate_is_the_delta_since_the_previous_report_not_a_running_average() {
+        let mut gate = ProgressGate::new(instant(0));
+        // First report: 100 files and 1000 events land in the first second.
+        let rate = gate
+            .due(PROGRESS_FILE_INTERVAL, 1_000, instant(1_000_000_000))
+            .expect("due at the file boundary");
+        assert_eq!(rate, 1_000.0, "1000 events over 1 second is 1000/s");
+
+        // Second report: only 100 more events land, but it takes 10 seconds.
+        // A running average over the whole pass (1100 events / 11s ~= 100/s)
+        // would still read close to the first rate; the per-interval rate
+        // must show the regression instead.
+        let rate = gate
+            .due(2 * PROGRESS_FILE_INTERVAL, 1_100, instant(11_000_000_000))
+            .expect("due at the second file boundary");
+        assert_eq!(
+            rate, 10.0,
+            "100 events over the 10s since the last report is 10/s, not the pass-wide average"
+        );
     }
 }
 

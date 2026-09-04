@@ -4283,12 +4283,13 @@ fn compare_uncompared_command(clock: &impl Clock, invocation: &Invocation) -> Re
 /// actually running a pass long enough to trigger one.
 fn format_ingest_progress_line(progress: &crate::ingest::IngestProgress) -> String {
     format!(
-        "ingest transcripts: progress files={}/{} sessions={} events={} elapsed={}s",
+        "ingest transcripts: progress files={}/{} sessions={} events={} elapsed={}s rate={:.1}/s",
         progress.files_done,
         progress.files_total,
         progress.sessions_written,
         progress.events_written,
         progress.elapsed.as_nanos() / 1_000_000_000,
+        progress.rate_events_per_sec,
     )
 }
 
@@ -4870,8 +4871,9 @@ mod tests {
         assert_eq!(unchanged_class.to_string(), other_class_text);
     }
 
-    /// The progress line's exact wording is the golden target (`aub-va6s`):
-    /// files done of total, sessions and events landed so far, elapsed.
+    /// The progress line's exact wording is the golden target (`aub-va6s`,
+    /// `aub-mh1c`): files done of total, sessions and events landed so far,
+    /// elapsed, and the rate over the interval since the previous line.
     #[test]
     fn golden_ingest_progress_line_format() {
         let progress = crate::ingest::IngestProgress {
@@ -4880,10 +4882,11 @@ mod tests {
             sessions_written: 12,
             events_written: 4_567,
             elapsed: crate::domain::time::MonotonicDuration::from_seconds(37),
+            rate_events_per_sec: 123.456,
         };
         assert_eq!(
             format_ingest_progress_line(&progress),
-            "ingest transcripts: progress files=100/3830 sessions=12 events=4567 elapsed=37s"
+            "ingest transcripts: progress files=100/3830 sessions=12 events=4567 elapsed=37s rate=123.5/s"
         );
     }
 
