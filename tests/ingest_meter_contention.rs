@@ -20,7 +20,8 @@ use agent_usage_book::domain::attempt::AttemptOutcome;
 use agent_usage_book::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use agent_usage_book::domain::time::{
-    FakeClock, MeasurementBasis, MonotonicDuration, RealClock, UtcTimestamp,
+    Clock, FakeClock, MeasurementBasis, MonotonicDuration, MonotonicInstant, RealClock,
+    UtcTimestamp,
 };
 use agent_usage_book::domain::window::{
     MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
@@ -803,6 +804,7 @@ fn a_batch_whose_watermark_refuses_mid_transaction_rolls_back_its_event_rows() {
         &mut writer,
         &pass_with("/absolute/path/session.jsonl".into()),
         &RealClock::new(),
+        MonotonicDuration::from_seconds(2),
     )
     .unwrap_err();
     assert!(
@@ -825,6 +827,7 @@ fn a_batch_whose_watermark_refuses_mid_transaction_rolls_back_its_event_rows() {
         &mut writer,
         &pass_with("corpus/a.jsonl".into()),
         &RealClock::new(),
+        MonotonicDuration::from_seconds(2),
     )
     .unwrap();
     assert_eq!(outcome.events_written.value(), 1);
@@ -1012,4 +1015,111 @@ fn an_interruption_after_spooling_drains_exactly_once_beside_ingest_batches() {
     assert_eq!((again.applied, again.already_applied), (0, 0));
     assert_eq!(fixture.observation_count(), 1);
     assert_eq!(fixture.usage_reconciliation(), (4, 4, 4));
+}
+
+/// A clock that advances by a fixed step every time it is read, standing in
+/// for real elapsed time inside `persist_ingest_batch`'s per-event check
+/// (`aub-mh1c`) without a real sleep. Proves the orchestrator (`crate::ingest::run`)
+/// actually reads `config.ingest.max_batch_seconds` and passes it all the way
+/// through to the store primitive, which the store's own unit tests
+/// (`src/store/ingest.rs`) cannot: they call `persist_ingest_batch` directly
+/// and never touch `Config` or `run` at all.
+struct TickingClock {
+    state: std::cell::Cell<FakeClock>,
+    step: MonotonicDuration,
+}
+
+impl TickingClock {
+    fn new(step: MonotonicDuration) -> Self {
+        Self {
+            state: std::cell::Cell::new(FakeClock::new(UtcTimestamp::from_unix_nanos(0))),
+            step,
+        }
+    }
+}
+
+impl Clock for TickingClock {
+    fn now(&self) -> UtcTimestamp {
+        self.state.get().now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        let mut clock = self.state.get();
+        let instant = clock.monotonic_now();
+        clock.advance(self.step);
+        self.state.set(clock);
+        instant
+    }
+}
+
+/// `config.ingest.max_batch_seconds` reaches the store's own transaction
+/// bound through the real orchestrator, not only through a direct call to
+/// `persist_ingest_batch` (`aub-mh1c`). A ticking clock advancing a full
+/// second on every read stands in for real elapsed time: a corpus of 5 events
+/// under a generous event bound (10) but a 1-second wall-clock bound splits
+/// into more than one landed batch, which a count bound alone would never do
+/// here. The planted negative is an orchestrator that reads the bound but
+/// never passes it to the store (or silently substitutes a constant): both
+/// would land all 5 events in the single batch the event bound alone
+/// produces.
+#[test]
+fn the_orchestrator_wires_max_batch_seconds_through_to_the_store() {
+    let scratch = ScratchDir::new("wall-clock-wiring");
+    let corpus = scratch.path().join("corpus");
+    write_corpus(&corpus, 5, 1);
+    let toml = format!(
+        r#"
+[ingest]
+max_batch_events = 10
+max_batch_seconds = "1s"
+
+[[transcripts]]
+name = "claude-code"
+root = "{}"
+pattern = "**/*.jsonl"
+format = "claude-code"
+"#,
+        corpus.display()
+    );
+    let (config, _) = resolve(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&toml),
+        "/virtual/aub.toml",
+    )
+    .expect("resolve test config");
+
+    let db_path = scratch.path().join("ledger.db");
+    let mut conn = open(&db_path, AccessMode::ReadWrite, &policy(5_000)).unwrap();
+    run_migrations(
+        &mut conn,
+        &agent_usage_book::store::migrations::registry(),
+        None,
+        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+    )
+    .unwrap();
+
+    let clock = TickingClock::new(MonotonicDuration::from_millis(1_100));
+    let mut batches = Vec::new();
+    let report = run_ingest_with_sink(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |batch: &LandedBatch| {
+            batches.push(batch.clone());
+            Ok(())
+        },
+        &mut |_| Ok(()),
+    )
+    .expect("the ingest pass must land");
+
+    assert_eq!(report.outcome.events_written.value(), 5);
+    assert!(
+        batches.len() > 1,
+        "a 1-second wall-clock bound against a clock advancing 1.1s per read must split \
+         a 5-event pass into more than the one batch the 10-event count bound alone would \
+         produce; the orchestrator is not passing max_batch_seconds through: batches={}",
+        batches.len()
+    );
 }
