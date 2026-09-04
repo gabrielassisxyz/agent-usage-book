@@ -1074,6 +1074,16 @@ mod tests {
         let result_path = scratch.path().join("drill-result.jsonl");
         record_run(&result_path, &DrillRunRecord::from_report(&report)).unwrap();
 
+        // The durable record names the source it used, not just that a run
+        // happened: read the raw appended line back rather than trusting
+        // drill_health, which does not surface this field.
+        let raw = fs::read_to_string(&result_path).unwrap();
+        assert!(
+            raw.contains(&format!("archive:{}", archive_dir.display())),
+            "{raw}"
+        );
+        assert!(raw.contains("\"passed\":true"), "{raw}");
+
         let later =
             UtcTimestamp::from_unix_nanos(clock_at(10_000).now().unix_nanos() + 60_000_000_000);
         let health =
