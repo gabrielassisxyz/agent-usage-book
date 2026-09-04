@@ -1348,6 +1348,44 @@ mod tests {
             .sum();
         assert_eq!(account_total, day_total, "account grouping loses no tokens");
         assert_eq!(day_total, 10);
+
+        // Composed the other way, day then account: a mid-session switch to a
+        // second account on day 26 must land under day 26's node, not day 25's.
+        // This is sensitive to the recursion carrying the account resolution
+        // into the inner dimension.
+        seed_marker(
+            &conn,
+            "s1",
+            "research",
+            day26,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        let day_then_account = assemble_canonical(
+            &conn,
+            window("2026-08-25", 2),
+            now(),
+            vec![SpendGrouping::Day, SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+        )
+        .unwrap();
+        let cell = |day: &str, account: &str| -> u64 {
+            day_then_account
+                .groups
+                .iter()
+                .find(|g| g.key.as_str() == format!("day={day}"))
+                .and_then(|g| {
+                    g.children
+                        .iter()
+                        .find(|c| c.key.as_str() == format!("day={day} / account={account}"))
+                })
+                .map_or(0, |c| c.usage.known().input().value())
+        };
+        assert_eq!(cell("2026-08-25", "work"), 4);
+        assert_eq!(cell("2026-08-26", "research"), 6);
+        assert_eq!(cell("2026-08-26", "work"), 0, "day 26 switched to research");
     }
 
     #[test]
