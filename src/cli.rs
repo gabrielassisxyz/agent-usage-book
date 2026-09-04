@@ -4085,6 +4085,60 @@ mod tests {
         }
     }
 
+    /// `docs/commands.md` names every shipping command in a `## \`aub NAME\``
+    /// heading, each with a `**Refuses:**` line stating the behavioural
+    /// boundary `--help` does not carry (aub-n27.6). The documented set is
+    /// compared against [`Command::ALL`] filtered to the shipping subset
+    /// (`summary().is_some()`) rather than a hand-maintained list, so a
+    /// command added without a section fails here instead of only being
+    /// noticed by a human reading the file. The planted negative: a
+    /// documented command with no `**Refuses:**` line would still pass a
+    /// weaker check that only compared the name set.
+    #[test]
+    fn documented_command_list_matches_the_parser_and_states_a_refusal() {
+        let docs =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/docs/commands.md"))
+                .expect("docs/commands.md must be readable");
+
+        let shipping: std::collections::BTreeSet<&str> = Command::ALL
+            .into_iter()
+            .filter(|command| command.summary().is_some())
+            .map(Command::name)
+            .collect();
+
+        let mut documented: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        for line in docs.lines() {
+            let Some(rest) = line.strip_prefix("## `aub ") else {
+                continue;
+            };
+            let name = rest
+                .strip_suffix('`')
+                .unwrap_or_else(|| panic!("malformed command heading: {line:?}"));
+            documented.insert(name);
+        }
+
+        assert_eq!(
+            documented, shipping,
+            "docs/commands.md must document exactly the shipping commands"
+        );
+
+        for name in &documented {
+            let heading = format!("## `aub {name}`");
+            let start = docs
+                .find(&heading)
+                .unwrap_or_else(|| panic!("lost {heading:?} on the second pass"));
+            let section_end = docs[start..]
+                .find("\n## ")
+                .map(|offset| start + offset)
+                .unwrap_or(docs.len());
+            let section = &docs[start..section_end];
+            assert!(
+                section.contains("**Refuses:**"),
+                "docs/commands.md section for {name:?} has no **Refuses:** line"
+            );
+        }
+    }
+
     fn args(items: &[&str]) -> Vec<OsString> {
         std::iter::once("aub")
             .chain(items.iter().copied())
