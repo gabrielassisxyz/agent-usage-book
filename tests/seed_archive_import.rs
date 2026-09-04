@@ -486,7 +486,7 @@ fn operational_reconcile_real_seed_archive_counts() {
 
     let parsed = read_source(archive_dir).expect("real seed archive must parse");
     assert!(
-        parsed.records.len() > 0,
+        !parsed.records.is_empty(),
         "seed archive must contain records"
     );
 

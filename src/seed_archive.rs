@@ -373,6 +373,7 @@ fn parse_record_line(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_success_record(
     file_name: &str,
     source_line: u64,
@@ -395,7 +396,10 @@ fn parse_success_record(
                 (map, s.clone())
             }
             serde_json::Value::Object(map) => (map.clone(), reading_val.to_string()),
-            _ => return Err("malformed_reading".to_string()),
+            serde_json::Value::Null
+            | serde_json::Value::Bool(_)
+            | serde_json::Value::Number(_)
+            | serde_json::Value::Array(_) => return Err("malformed_reading".to_string()),
         };
 
     let generated_at_str = reading_obj
@@ -468,14 +472,15 @@ fn parse_success_record(
         let quota_used =
             percentage_to_used(percent_val).ok_or_else(|| "invalid_percent_used".to_string())?;
 
+        let default_window_seconds = match id {
+            "five_hour" => 18_000,
+            "seven_day" => 604_800,
+            _ => 18_000,
+        };
         let window_seconds = w_obj
             .get("windowSeconds")
             .and_then(|v| v.as_u64())
-            .unwrap_or_else(|| match id {
-                "five_hour" => 18000,
-                "seven_day" => 604800,
-                _ => 18000,
-            });
+            .unwrap_or(default_window_seconds);
 
         let nominal_duration_nanos = window_seconds.saturating_mul(1_000_000_000);
         let resets_at = match w_obj.get("resetsAt") {
