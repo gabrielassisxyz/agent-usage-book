@@ -68,7 +68,7 @@ doctor:
   answers: is the recorded evidence healthy, and does the transcript corpus still match its parsers?
   refuses: --explain (doctor derives no quantity); --account (doctor is a system-wide diagnostic); --model (doctor is a system-wide diagnostic); --no-color (doctor prints plain text or json)
   format: text | json
-  options: --transcript-format-drift
+  options: --fix | --transcript-format-drift
 
 coverage:
   answers: did the sampler attempt what the policy owed, and did those attempts observe?

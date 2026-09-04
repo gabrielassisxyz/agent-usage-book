@@ -19,6 +19,7 @@ pub mod config;
 pub mod cost_model;
 pub mod coverage;
 pub mod dedup;
+pub mod doctor;
 pub mod domain;
 pub mod error;
 pub mod error_output;
