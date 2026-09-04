@@ -64,6 +64,15 @@ pub enum ReportField {
     ExportRows,
     /// The derived token count of a calibration report.
     CalibrationTokens,
+    /// The total usage of one task in `aub task report`.
+    TaskUsage { task_id: LogicalName },
+    /// The subscription-credit derivation of one task in `aub task report`.
+    TaskCredits { task_id: LogicalName },
+    /// One overhead bucket's usage in `aub task overhead`.
+    TaskOverheadBucket { reason: LogicalName },
+    /// The total task-attributed usage over an `aub task overhead` window,
+    /// shown alongside the overhead buckets for comparison.
+    TaskOverheadTaskUsage,
 }
 
 impl ReportField {
@@ -85,6 +94,12 @@ impl ReportField {
             ReportField::Coverage { account } => format!("coverage[{}]", account.as_str()),
             ReportField::ExportRows => "export_rows".to_string(),
             ReportField::CalibrationTokens => "calibration_tokens".to_string(),
+            ReportField::TaskUsage { task_id } => format!("task_usage[{}]", task_id.as_str()),
+            ReportField::TaskCredits { task_id } => format!("task_credits[{}]", task_id.as_str()),
+            ReportField::TaskOverheadBucket { reason } => {
+                format!("task_overhead_bucket[{}]", reason.as_str())
+            }
+            ReportField::TaskOverheadTaskUsage => "task_overhead_task_usage".to_string(),
         }
     }
 
@@ -100,6 +115,11 @@ impl ReportField {
             ReportField::Coverage { account } => account.as_str(),
             ReportField::ExportRows => "export",
             ReportField::CalibrationTokens => "calibration",
+            ReportField::TaskUsage { task_id } | ReportField::TaskCredits { task_id } => {
+                task_id.as_str()
+            }
+            ReportField::TaskOverheadBucket { reason } => reason.as_str(),
+            ReportField::TaskOverheadTaskUsage => "task-overhead",
         }
     }
 }

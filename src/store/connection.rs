@@ -63,6 +63,13 @@ pub enum AccessMode {
     /// A read-write connection. The only path that may set `journal_mode`,
     /// transitioning a DELETE-journal database to WAL.
     ReadWrite,
+    /// A read-only connection to a database this project reads but does not own,
+    /// such as an issue tracker's own SQLite file. No pragma policy is applied or
+    /// verified: the required journal mode, durability level and foreign-key
+    /// setting encode assumptions about a schema this project controls, and
+    /// enforcing them against a foreign schema would refuse a healthy foreign
+    /// database for disagreeing with settings it was never asked to hold.
+    ForeignReadOnly,
 }
 
 /// The pragma policy every connection must establish and verify.
@@ -191,7 +198,9 @@ pub fn open(
     policy: &PragmaPolicy,
 ) -> Result<rusqlite::Connection, Error> {
     let flags = match mode {
-        AccessMode::ReadOnly => rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        AccessMode::ReadOnly | AccessMode::ForeignReadOnly => {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+        }
         AccessMode::ReadWrite => {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
         }
@@ -201,7 +210,9 @@ pub fn open(
     }
     let conn = rusqlite::Connection::open_with_flags(path, flags)
         .map_err(|e| Error::Store(format!("cannot open database {path:?}: {e}")))?;
-    apply_policy(&conn, mode, policy)?;
+    if mode != AccessMode::ForeignReadOnly {
+        apply_policy(&conn, mode, policy)?;
+    }
     if mode == AccessMode::ReadWrite {
         force_file_mode_0600(&wal_sidecar_path(path))?;
         force_file_mode_0600(&shm_sidecar_path(path))?;

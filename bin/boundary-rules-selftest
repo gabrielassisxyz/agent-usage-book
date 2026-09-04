@@ -96,6 +96,44 @@ violation "rule15-flat" "15-status-no-migration" "src/projection.rs" "use crate:
 violation "rule15-cli" "15-status-no-migration" "src/cli.rs" "use crate::store::migrate;"
 violation "rule18-flat" "18-no-system-clock-outside-time" "src/advice.rs" "pub fn bad() { let _ = std::time::SystemTime::now(); }"
 
+# --- rule 19: function-scoped, not flat-file/nested like the rules above, because
+# status shares src/cli.rs with every other command. A store reference planted inside
+# `fn status` itself must be caught ...
+dir="$(make_scenario rule19-status)"
+python3 - "$dir/src/cli.rs" <<'PYEOF'
+import sys
+path = sys.argv[1]
+with open(path) as f:
+    content = f.read()
+needle = "fn status(\n"
+count = content.count(needle)
+if count != 1:
+    raise SystemExit(f"expected exactly one 'fn status(' declaration, found {count}")
+marker = ") -> Result<(), Error> {\n"
+idx = content.index(needle)
+brace_idx = content.index(marker, idx) + len(marker)
+content = (
+    content[:brace_idx]
+    + "    let _planted_store_edge = crate::store::connection::open;\n"
+    + content[brace_idx:]
+)
+with open(path, "w") as f:
+    f.write(content)
+PYEOF
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "rule19-status exits 1" 1 "$rc"
+assert_contains "rule19-status names rule" "19-status-no-store-connection" "$out"
+assert_contains "rule19-status names file" "src/cli.rs" "$out"
+
+# ... and the identical reference in an unrelated cli.rs function, outside the status
+# path, must pass: the rule scans the status functions, never the whole file.
+dir="$(make_scenario rule19-elsewhere)"
+printf '\nfn unrelated_uses_the_store() { let _ = crate::store::connection::open; }\n' >> "$dir/src/cli.rs"
+out="$("$(runner_for "$dir")" 2>&1)"
+rc=$?
+assert_exit "rule19-elsewhere exits 0" 0 "$rc"
+
 # Nested-file violations under module directories
 violation "rule01-nested" "01-presentation-no-provider-adapters" "src/presentation/render.rs" "use crate::meter;"
 violation "rule02-nested" "02-transcripts-no-calibration" "src/transcripts/native.rs" "use crate::calibration;"
@@ -197,7 +235,7 @@ for rule in "$repo_root"/bin/checks/boundary-rules/*; do
     [ -f "$rule" ] && [ -x "$rule" ] || continue
     rule_base="$(basename "$rule")"
     case "$rule_base" in
-        08-*|10-*|11-*|12-*|13-*) continue ;;
+        08-*|10-*|11-*|12-*|13-*|19-*) continue ;;
     esac
     if ! grep -q 'module_files' "$rule"; then
         echo "FAIL: $rule_base does not call module_files helper" >&2

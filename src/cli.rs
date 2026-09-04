@@ -83,6 +83,7 @@ aub_command_enum! {
     Now,
     ClearDiagnostics,
     Drill,
+    Task,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -111,7 +112,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 21] = [
+    pub const ALL: [Self; 22] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -133,6 +134,7 @@ impl Command {
         Self::Now,
         Self::ClearDiagnostics,
         Self::Drill,
+        Self::Task,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -489,6 +491,20 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Task => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Accepted,
+                account: FlagSupport::Rejected {
+                    reason: "task attribution has no account dimension",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "task attribution has no model dimension",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "task prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -517,6 +533,7 @@ impl Command {
             Command::Now => "now",
             Command::ClearDiagnostics => "clear-diagnostics",
             Command::Drill => "drill",
+            Command::Task => "task",
         }
     }
 
@@ -526,7 +543,7 @@ impl Command {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
             Command::Spend => Some(
-                "canonical token usage grouped by day, session, project, repository or account",
+                "canonical token usage grouped by day, session, project, repository, task or account",
             ),
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
@@ -564,6 +581,9 @@ impl Command {
             Command::ClearDiagnostics => Some("clear retained diagnostic provider bodies"),
             Command::Drill => Some(
                 "damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive",
+            ),
+            Command::Task => Some(
+                "ingest issue-tracker task-claim events and report per-task usage and overhead",
             ),
         }
     }
@@ -604,6 +624,9 @@ impl Command {
             Command::ClearDiagnostics => Some("how many retained diagnostic bodies were cleared?"),
             Command::Drill => Some(
                 "does the documented recovery procedure actually recover a damaged state directory, and is that still true today?",
+            ),
+            Command::Task => Some(
+                "which task or named overhead bucket consumed this usage, by temporal segmentation of the issue tracker's claim history?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -646,7 +669,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|account (repeatable) | --credits | --refresh auto|never|force | --value api-list",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -668,6 +691,9 @@ impl Command {
             Command::ClearDiagnostics => Some("[--provider NAME | --all]"),
             Command::Drill => Some(
                 "--seed truncated-database|corrupted-projection|malformed-spool-record|unsupported-schema-version SCRATCH_DEST | --archive ARCHIVE SCRATCH_DEST",
+            ),
+            Command::Task => Some(
+                "ingest | report TASK-ID | overhead [--today (default) | --since YYYY-MM-DD | --days N]",
             ),
             Command::Status
             | Command::LoggingFixture
@@ -987,6 +1013,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
             clear_diagnostics_command(&RealClock::new(), level, &invocation)
         }
         Command::Drill => drill_command(&RealClock::new(), &invocation),
+        Command::Task => task_command(&RealClock::new(), level, &invocation),
     }
 }
 
@@ -2341,8 +2368,9 @@ fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
         "project" => Ok(SpendGrouping::Project),
         "repository" | "repo" => Ok(SpendGrouping::Repository),
         "account" => Ok(SpendGrouping::Account),
+        "task" => Ok(SpendGrouping::Task),
         _ => Err(Error::Usage(format!(
-            "--group-by must be day, session, project, repository or account, got {value}"
+            "--group-by must be day, session, project, repository, task or account, got {value}"
         ))),
     }
 }
@@ -4093,6 +4121,238 @@ fn clear_diagnostics_command(
     Ok(())
 }
 
+/// `aub task`: `ingest`, `report TASK-ID`, and `overhead`. Owns task-claim
+/// ingestion and segmentation, never issue management (`aub-eu7.4`,
+/// PLAN.md 27); none of the three subcommands segments usage itself, they
+/// only call [`crate::report::task`], which is the shared assembly
+/// `aub spend --group-by task` also reads.
+fn task_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let subcommand = invocation.rest.first().map(String::as_str);
+    match subcommand {
+        Some("ingest") => task_ingest_command(clock, level, invocation),
+        Some("report") => task_report_command(clock, invocation),
+        Some("overhead") => task_overhead_command(clock, invocation),
+        other => Err(Error::Usage(format!(
+            "task requires a subcommand (ingest | report | overhead), got {other:?}"
+        ))),
+    }
+}
+
+/// Carries the store's tracker-ingest summary across the presentation boundary as
+/// a report model, which is the only shape a renderer is allowed to see.
+fn task_ingest_report(
+    summary: &crate::store::task_event::IngestSummary,
+) -> crate::report::TaskIngestReport {
+    crate::report::TaskIngestReport {
+        events_inserted: summary.events_inserted,
+        events_already_present: summary.events_already_present,
+        quarantines_inserted: summary.quarantines_inserted,
+        quarantines_already_present: summary.quarantines_already_present,
+    }
+}
+
+/// `aub task ingest`: runs the Beads tracker adapter and reports events
+/// ingested, quarantined and unchanged. The tracker database is opened
+/// read-only and is never written to: `aub` reads task-claim history, it
+/// never manages issues.
+fn task_ingest_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    if invocation.rest.len() > 1 {
+        return Err(Error::Usage(format!(
+            "unknown argument: {}",
+            invocation.rest[1]
+        )));
+    }
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("task");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let tracker = config.tracker.as_ref().ok_or_else(|| {
+        Error::Usage("no [tracker] source is configured; task ingest has nothing to read".into())
+    })?;
+    let tracker_conn =
+        crate::store::task_event::open_tracker_database(&tracker.path.join("beads.db"))?;
+    let reader = crate::store::task_event::BeadsEventReader::new(&tracker_conn);
+    let ledger_conn = open_ledger(clock)?;
+    let summary = crate::store::task_event::ingest(
+        &ledger_conn,
+        crate::domain::ids::SourceNamespace::new("beads"),
+        &reader,
+    )?;
+
+    match invocation.format {
+        OutputFormat::Text => println!(
+            "task ingest: events_inserted={} events_already_present={} quarantines_inserted={} quarantines_already_present={}",
+            summary.events_inserted,
+            summary.events_already_present,
+            summary.quarantines_inserted,
+            summary.quarantines_already_present,
+        ),
+        OutputFormat::Json => {
+            let metadata = ReportMetadata::new(
+                timestamp,
+                timestamp,
+                LedgerGeneration::new(
+                    crate::store::ledger_generation::current(&ledger_conn)?.value(),
+                ),
+                None,
+            );
+            println!(
+                "{}",
+                crate::presentation::json::task_ingest_json(
+                    &task_ingest_report(&summary),
+                    run,
+                    metadata,
+                )
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `aub task report TASK-ID`: the task's total usage, resolved task-kind
+/// identity, subscription credits where a complete cost model exists, and
+/// the sessions that contributed to it.
+fn task_report_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let task_id_arg = invocation
+        .rest
+        .get(1)
+        .ok_or_else(|| Error::Usage("task report requires a TASK-ID".into()))?;
+    if invocation.rest.len() > 2 {
+        return Err(Error::Usage(format!(
+            "unknown argument: {}",
+            invocation.rest[2]
+        )));
+    }
+    let task_id = parse_task_id(task_id_arg)?;
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let conn = open_ledger(clock)?;
+    let report = crate::report::task::assemble_task_report(&conn, &task_id, timestamp)?;
+    match invocation.format {
+        OutputFormat::Text => println!(
+            "{}",
+            crate::presentation::render::render_task_report_with_explain(
+                &report,
+                invocation.explain
+            )
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::presentation::json::task_report_json_with_explain(
+                &report,
+                run,
+                invocation.explain
+            )
+        ),
+    }
+    Ok(())
+}
+
+/// Parses a `TASK-ID` positional argument in `SOURCE:NATIVE` form, matching
+/// the namespaced identifier every task-attribution table keys on.
+fn parse_task_id(value: &str) -> Result<crate::domain::ids::TaskId, Error> {
+    let (source, native) = value
+        .split_once(':')
+        .ok_or_else(|| Error::Usage(format!("TASK-ID must be SOURCE:NATIVE, got {value}")))?;
+    if source.is_empty() || native.is_empty() {
+        return Err(Error::Usage(format!(
+            "TASK-ID must be SOURCE:NATIVE, got {value}"
+        )));
+    }
+    Ok(crate::domain::ids::TaskId::new(
+        crate::domain::ids::SourceNamespace::new(source),
+        crate::domain::ids::NativeTaskId::new(native),
+    ))
+}
+
+/// `aub task overhead --since`: every overhead bucket usage landed in over
+/// the window, alongside the total task-attributed usage in the same window.
+fn task_overhead_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let window = task_overhead_window(&invocation.rest[1..], timestamp)?;
+    let conn = open_ledger(clock)?;
+    let report = crate::report::task::assemble_task_overhead(&conn, window, timestamp)?;
+    match invocation.format {
+        OutputFormat::Text => println!(
+            "{}",
+            crate::presentation::render::render_task_overhead_report_with_explain(
+                &report,
+                invocation.explain
+            )
+        ),
+        OutputFormat::Json => println!(
+            "{}",
+            crate::presentation::json::task_overhead_json_with_explain(
+                &report,
+                run,
+                invocation.explain
+            )
+        ),
+    }
+    Ok(())
+}
+
+/// The window from `--today`, `--since YYYY-MM-DD` and `--days N`, the same
+/// convention `aub spend` uses (see [`spend_options`]).
+fn task_overhead_window(rest: &[String], now: UtcTimestamp) -> Result<SpendWindow, Error> {
+    let mut since: Option<UtcDate> = None;
+    let mut days: i64 = 1;
+    let mut args = rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--today" => since = Some(now.utc_date()),
+            "--since" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--since requires YYYY-MM-DD".into()))?;
+                since = Some(parse_date(val)?);
+            }
+            "--days" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--days requires a number".into()))?;
+                days = val
+                    .parse()
+                    .map_err(|_| Error::Usage(format!("--days must be a number, got {val}")))?;
+            }
+            other => match other.strip_prefix("--since=") {
+                Some(val) => since = Some(parse_date(val)?),
+                None => match other.strip_prefix("--days=") {
+                    Some(val) => {
+                        days = val.parse().map_err(|_| {
+                            Error::Usage(format!("--days must be a number, got {val}"))
+                        })?
+                    }
+                    None => return Err(Error::Usage(format!("unknown argument: {other}"))),
+                },
+            },
+        }
+    }
+    SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4648,7 +4908,13 @@ mod tests {
                 .grouping,
             vec![SpendGrouping::Account]
         );
-        assert!(spend_options(&["--group-by=task".into()], now).is_err());
+        assert_eq!(
+            spend_options(&["--group-by=task".into()], now)
+                .unwrap()
+                .grouping,
+            vec![SpendGrouping::Task]
+        );
+        assert!(spend_options(&["--group-by=model".into()], now).is_err());
         assert!(spend_options(&["--bogus".into()], now).is_err());
     }
 

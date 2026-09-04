@@ -6,6 +6,7 @@
 
 pub mod account_segment;
 pub mod quality;
+pub mod report;
 pub mod segment;
 
 pub use account_segment::AccountEvidenceClass;

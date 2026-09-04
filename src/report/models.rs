@@ -13,6 +13,7 @@ use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
 use crate::domain::credits::Credits;
 use crate::domain::freshness::Freshness;
+use crate::domain::ids::NativeRunId;
 use crate::domain::money::Usd;
 use crate::domain::provenance::{CostModelId, DerivationId, RateCardId};
 use crate::domain::quota::QuotaRemaining;
@@ -23,6 +24,7 @@ use crate::evidence::{Derivation, Provenance};
 use crate::logging::LogicalName;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
+pub use crate::store::task_identity::TaskIdentityRow;
 use crate::valuation::ValuationOutcome;
 
 /// A monotonically increasing ledger generation.
@@ -299,8 +301,11 @@ impl SpendGroup {
     }
 }
 
-/// A supported canonical-ledger grouping dimension. Future task, calibrated-window
-/// and valuation work extends this enum in its own bead.
+/// A supported canonical-ledger grouping dimension. `Task` groups by the
+/// same temporal-segmentation attribution `aub task report` and
+/// `aub task overhead` read back (`aub-eu7.4`), never by grouping logic of
+/// its own. Future credits, calibrated-window and valuation work extends
+/// this enum in its own bead.
 ///
 /// `Account` is not a property of one canonical event the way the other
 /// dimensions are: it is decided by the session's account-marker timeline, so
@@ -312,6 +317,7 @@ pub enum SpendGrouping {
     Session,
     Project,
     Repository,
+    Task,
     Account,
 }
 
@@ -322,6 +328,7 @@ impl SpendGrouping {
             Self::Session => "session",
             Self::Project => "project",
             Self::Repository => "repository",
+            Self::Task => "task",
             Self::Account => "account",
         }
     }
@@ -772,22 +779,174 @@ impl DoctorReport {
     }
 }
 
-/// The task report for the `aub task` command family.
+/// A share of an overhead total, in parts per million. Not a domain quantity
+/// requiring calibration semantics (`aub-eu7.4`'s "magnitude and share"
+/// criterion is about a report-rendering ratio, not a billed or measured
+/// value), so it lives here rather than in `domain`, following the same
+/// parts-per-million idiom `QuotaFractionPpm` established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SharePpm(u32);
+
+impl SharePpm {
+    pub const MAX: u32 = 1_000_000;
+
+    /// Computes `part`'s share of `total`, in parts per million. A zero total
+    /// has no defined share and reports zero rather than dividing by zero:
+    /// the caller (an overhead report with no usage at all) has nothing to
+    /// apportion in the first place.
+    pub fn of(part: u64, total: u64) -> Self {
+        if total == 0 {
+            return Self(0);
+        }
+        let ppm = (u128::from(part) * u128::from(Self::MAX)) / u128::from(total);
+        Self(ppm.min(u128::from(Self::MAX)) as u32)
+    }
+
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+/// What `aub task ingest` did to the durable event history, as the renderer
+/// sees it.
 ///
-/// Task names are not quantities, so the provenance graph is empty.
+/// Separate from `store::task_event`'s own [`IngestSummary`](crate::store::task_event::IngestSummary)
+/// of the same name, and deliberately so: the store owns what happened against the
+/// tracker connection, this owns what is reported, and presentation may only see
+/// the second. [`IngestReport`] carries the same split for the same reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskIngestReport {
+    pub events_inserted: u64,
+    pub events_already_present: u64,
+    pub quarantines_inserted: u64,
+    pub quarantines_already_present: u64,
+}
+
+/// One session's contribution to a task's total usage, for `aub task
+/// report`'s session listing. `run` is the session's own run identifier,
+/// retained where the session carries one so `aub` can emit it for the
+/// external friction-ledger join (`aub-eu7.4`; `aub-xus.7` owns emitting it
+/// through `aub export`). `aub` never interprets what the run identifier
+/// means beyond carrying it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSessionUsage {
+    pub session: LogicalName,
+    pub run: Option<NativeRunId>,
+    pub usage: UsageVector,
+}
+
+/// The task report for `aub task report TASK-ID`: the task's total usage
+/// across every session that contributed to it, its resolved task-kind
+/// identity, subscription credits where a complete cost model exists, and
+/// the sessions the total is made of.
+///
+/// `task_kind` is `None` when the tracker supplied no kind-asserting
+/// evidence for this task at all, distinct from
+/// [`crate::attribution::TaskIdentityState::Unknown`] (evidence existed and
+/// asserted no kind under the current mapping): the two are different facts
+/// and a renderer that collapsed them would misreport "the tracker never
+/// mentioned this task's kind" as "the tracker's evidence was ambiguous".
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskReport {
     pub metadata: ReportMetadata,
-    pub tasks: Vec<LogicalName>,
+    pub task_id: LogicalName,
+    pub task_kind: Option<TaskIdentityRow>,
+    pub usage: UsageVector,
+    pub credits: Derivation<Credits>,
+    pub sessions: Vec<TaskSessionUsage>,
     pub provenance: ProvenanceGraph,
 }
 
 impl TaskReport {
-    pub fn new(metadata: ReportMetadata, tasks: Vec<LogicalName>) -> Self {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        metadata: ReportMetadata,
+        task_id: LogicalName,
+        task_kind: Option<TaskIdentityRow>,
+        usage: UsageVector,
+        credits: Derivation<Credits>,
+        sessions: Vec<TaskSessionUsage>,
+        usage_node: ProvenanceNode,
+        credits_node: ProvenanceNode,
+    ) -> Self {
+        let provenance = ProvenanceGraph::new([
+            (
+                ReportField::TaskUsage {
+                    task_id: task_id.clone(),
+                },
+                usage_node,
+            ),
+            (
+                ReportField::TaskCredits {
+                    task_id: task_id.clone(),
+                },
+                credits_node,
+            ),
+        ]);
         Self {
             metadata,
-            tasks,
-            provenance: ProvenanceGraph::default(),
+            task_id,
+            task_kind,
+            usage,
+            credits,
+            sessions,
+            provenance,
+        }
+    }
+}
+
+/// One overhead bucket's magnitude and its share of the total overhead usage
+/// in the report's window (`aub-eu7.4`'s "every overhead bucket with its
+/// magnitude and its share" criterion). `share` is computed over the input
+/// token count, the dimension every overhead reason's usage is compared on
+/// consistently across buckets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOverheadBucket {
+    pub reason: LogicalName,
+    pub usage: UsageVector,
+    pub share: SharePpm,
+}
+
+/// The task overhead report for `aub task overhead --since`: every overhead
+/// bucket usage landed in over the report's window, alongside task-attributed
+/// consumption (`aub-eu7.3`'s restored criterion: overhead renders alongside
+/// task consumption, not behind a flag), so the total task-attributed and
+/// total overhead usage in the window are both visible on one report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskOverheadReport {
+    pub metadata: ReportMetadata,
+    pub since: UtcDate,
+    pub until: UtcDate,
+    pub task_usage: UsageVector,
+    pub buckets: Vec<TaskOverheadBucket>,
+    pub provenance: ProvenanceGraph,
+}
+
+impl TaskOverheadReport {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        metadata: ReportMetadata,
+        since: UtcDate,
+        until: UtcDate,
+        task_usage: UsageVector,
+        task_usage_node: ProvenanceNode,
+        buckets: Vec<TaskOverheadBucket>,
+        bucket_nodes: Vec<(LogicalName, ProvenanceNode)>,
+    ) -> Self {
+        let mut nodes = vec![(ReportField::TaskOverheadTaskUsage, task_usage_node)];
+        nodes.extend(
+            bucket_nodes
+                .into_iter()
+                .map(|(reason, node)| (ReportField::TaskOverheadBucket { reason }, node)),
+        );
+        let provenance = ProvenanceGraph::new(nodes);
+        Self {
+            metadata,
+            since,
+            until,
+            task_usage,
+            buckets,
+            provenance,
         }
     }
 }
@@ -993,6 +1152,7 @@ mod tests {
         BackupReport,
         DoctorReport,
         TaskReport,
+        TaskOverheadReport,
         CalibrateReport,
         ExportReport,
     );
@@ -1050,7 +1210,36 @@ mod tests {
             ),
             ("backup", Box::new(BackupReport::new(m.clone(), true))),
             ("doctor", Box::new(DoctorReport::new(m.clone(), vec![]))),
-            ("task", Box::new(TaskReport::new(m.clone(), vec![]))),
+            (
+                "task",
+                Box::new(TaskReport::new(
+                    m.clone(),
+                    LogicalName::new("beads-a:aub-1"),
+                    None,
+                    usage_vector(),
+                    Derivation::Unavailable {
+                        missing: [crate::evidence::RequiredFact::new("active cost model")]
+                            .into_iter()
+                            .collect(),
+                        provenance: crate::evidence::Provenance::new([]),
+                    },
+                    vec![],
+                    node(),
+                    node(),
+                )),
+            ),
+            (
+                "task-overhead",
+                Box::new(TaskOverheadReport::new(
+                    m.clone(),
+                    day(),
+                    day(),
+                    usage_vector(),
+                    node(),
+                    vec![],
+                    vec![],
+                )),
+            ),
             (
                 "calibrate",
                 Box::new(CalibrateReport::new(
@@ -1088,7 +1277,7 @@ mod tests {
     #[test]
     fn every_report_model_carries_the_metadata() {
         let models = every_model(metadata());
-        assert_eq!(models.len(), 11, "every command must have a report model");
+        assert_eq!(models.len(), 12, "every command must have a report model");
 
         for (command, model) in &models {
             let carried = model.metadata();
@@ -1302,6 +1491,30 @@ mod tests {
             },
             node(),
         );
+        let task = TaskReport::new(
+            m.clone(),
+            LogicalName::new("beads-a:aub-1"),
+            None,
+            usage_vector(),
+            Derivation::Unavailable {
+                missing: [crate::evidence::RequiredFact::new("active cost model")]
+                    .into_iter()
+                    .collect(),
+                provenance: crate::evidence::Provenance::new([]),
+            },
+            vec![],
+            node(),
+            node(),
+        );
+        let task_overhead = TaskOverheadReport::new(
+            m.clone(),
+            day(),
+            day(),
+            usage_vector(),
+            node(),
+            vec![],
+            vec![(LogicalName::new("contended"), node())],
+        );
 
         // The exhaustive match: adding a variant to the enum fails to compile
         // until this match is extended, which is the compile half of the guard.
@@ -1323,6 +1536,16 @@ mod tests {
             },
             ReportField::ExportRows,
             ReportField::CalibrationTokens,
+            ReportField::TaskUsage {
+                task_id: LogicalName::new("beads-a:aub-1"),
+            },
+            ReportField::TaskCredits {
+                task_id: LogicalName::new("beads-a:aub-1"),
+            },
+            ReportField::TaskOverheadTaskUsage,
+            ReportField::TaskOverheadBucket {
+                reason: LogicalName::new("contended"),
+            },
         ];
         for field in &field_kinds {
             match field {
@@ -1347,6 +1570,18 @@ mod tests {
                 ReportField::CalibrationTokens => {
                     assert!(calibrate.provenance.resolve(field).is_some());
                 }
+                ReportField::TaskUsage { task_id } | ReportField::TaskCredits { task_id } => {
+                    assert!(task.provenance.resolve(field).is_some(), "{task_id:?}");
+                }
+                ReportField::TaskOverheadTaskUsage => {
+                    assert!(task_overhead.provenance.resolve(field).is_some());
+                }
+                ReportField::TaskOverheadBucket { reason } => {
+                    assert!(
+                        task_overhead.provenance.resolve(field).is_some(),
+                        "{reason:?}"
+                    );
+                }
             }
         }
 
@@ -1360,7 +1595,6 @@ mod tests {
         );
         assert!(BackupReport::new(m.clone(), true).provenance.is_empty());
         assert!(DoctorReport::new(m.clone(), vec![]).provenance.is_empty());
-        assert!(TaskReport::new(m.clone(), vec![]).provenance.is_empty());
     }
 
     /// The detection half of the rejection mechanism: a field the constructor
@@ -1435,7 +1669,7 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 4] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 9] = [
         (
             "IngestSummary",
             "*",
@@ -1443,10 +1677,41 @@ mod tests {
              measurements it reports; they exist to say the report is incomplete",
         ),
         (
+            "TaskIngestReport",
+            "*",
+            "operational counters describing what the tracker-event ingestion run \
+             did, not measurements it reports; they exist to say the report is \
+             incomplete",
+        ),
+        (
             "SpendGroup",
             "usage",
             "a UsageVector carries its own coverage and evidence quality, with the \
              provenance and derivation identifier as sibling fields on the group",
+        ),
+        (
+            "TaskReport",
+            "usage",
+            "a UsageVector carries its own coverage and evidence quality; the report's \
+             own provenance graph carries the field's node, keyed by task id",
+        ),
+        (
+            "TaskSessionUsage",
+            "usage",
+            "a UsageVector carries its own coverage and evidence quality; it is one \
+             session's share of the parent TaskReport's already-qualified usage field",
+        ),
+        (
+            "TaskOverheadBucket",
+            "usage",
+            "a UsageVector carries its own coverage and evidence quality; the parent \
+             TaskOverheadReport's own provenance graph carries the field's node",
+        ),
+        (
+            "TaskOverheadReport",
+            "task_usage",
+            "a UsageVector carries its own coverage and evidence quality; the report's \
+             own provenance graph carries the field's node",
         ),
         (
             "ClearDiagnosticsReport",
@@ -1601,13 +1866,13 @@ mod tests {
         );
     }
 
-    /// The structurally qualified exceptions are exactly the four documented here,
-    /// each naming the reason it is not an unqualified number. A fifth one cannot
+    /// The structurally qualified exceptions are exactly the nine documented here,
+    /// each naming the reason it is not an unqualified number. A tenth one cannot
     /// be added without this test being edited, which is the point: the list is a
     /// decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 4);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 9);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),

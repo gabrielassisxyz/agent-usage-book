@@ -41,9 +41,9 @@ the last published projection instead of sampling.
 ## `aub spend`
 
 **Answers:** how many canonical tokens were used, grouped by the requested
-dimensions? `--group-by` takes `day`, `session`, `project`, `repository` or
-`account` and is repeatable, so `--group-by account --group-by day` nests days
-under each account.
+dimensions? `--group-by` takes `day`, `session`, `project`, `repository`,
+`task` or `account` and is repeatable, so `--group-by account --group-by day`
+nests days under each account.
 
 Account grouping is the session-identifier join: the session id already appears
 in every transcript and in every account marker, and `--group-by account` reads
@@ -58,6 +58,22 @@ normalized leaves the report `IngestIncomplete` rather than silently omitted
 or extrapolated from what did parse. `spend` also refuses to answer a quota
 question; `status`, `now` and `sample` own that, and refuses to forecast a
 cost that has not happened yet.
+
+## `aub task`
+
+**Answers:** which task or named overhead bucket consumed this usage, by
+temporal segmentation of the issue tracker's claim history? `ingest` lands the
+tracker's claim and release events, `report TASK-ID` totals one task across
+every session that contributed to it, and `overhead` reports the usage that
+belonged to no claim, bucketed by the reason it belonged to none.
+
+**Refuses:** to manage issues. The tracker database is opened read-only and is
+never written to; `aub` reads a claim history it did not produce and has no way
+to change a task's state. It also refuses to classify usage itself: all three
+subcommands, and `aub spend --group-by task`, read one segmentation engine, so
+a task total and a task-grouped spend row can never disagree. Usage outside
+every claim window is not dropped and not folded into a neighbouring task: it
+is reported under a named overhead bucket that says why it was unattributable.
 
 ## `aub config`
 
