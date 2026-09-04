@@ -84,6 +84,12 @@ pub(crate) mod migration_0019;
 #[path = "0020_adapter_semantics_validation.rs"]
 pub(crate) mod migration_0020;
 
+#[path = "0021_account_attribution_segment.rs"]
+pub(crate) mod migration_0021;
+
+#[path = "0022_account_attribution_segment_evidence_class.rs"]
+pub(crate) mod migration_0022;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -110,5 +116,7 @@ pub fn registry() -> Vec<Migration> {
         migration_0018::migration(),
         migration_0019::migration(),
         migration_0020::migration(),
+        migration_0021::migration(),
+        migration_0022::migration(),
     ]
 }

@@ -4,7 +4,10 @@
 //! - presentation
 //! - provider adapters
 
+pub mod account_segment;
 pub mod segment;
+
+pub use account_segment::AccountEvidenceClass;
 
 use std::collections::BTreeMap;
 

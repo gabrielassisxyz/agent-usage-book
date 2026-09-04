@@ -99,6 +99,7 @@ pub enum DurableClass {
     UsageComponent,
     Session,
     AttributionSegment,
+    AccountAttributionSegment,
     IngestQuarantine,
 
     // Core SQLite tables: Reference data
@@ -158,6 +159,7 @@ impl DurableClass {
             | Self::UsageComponent
             | Self::Session
             | Self::AttributionSegment
+            | Self::AccountAttributionSegment
             | Self::IngestQuarantine => DurableClassCategory::Rebuildable,
 
             Self::Account
@@ -212,7 +214,8 @@ impl DurableClass {
             | Self::UsageEvent
             | Self::UsageComponent
             | Self::Session
-            | Self::AttributionSegment => RetentionRule::RebuildableConfigurable {
+            | Self::AttributionSegment
+            | Self::AccountAttributionSegment => RetentionRule::RebuildableConfigurable {
                 default_retained: false,
             },
 
@@ -262,6 +265,7 @@ impl DurableClass {
             Self::WindowCalibrationSourceExperiment => Some("window_calibration_source_experiment"),
             Self::CalibrationLifecycle => Some("calibration_lifecycle"),
             Self::AttributionSegment => Some("attribution_segment"),
+            Self::AccountAttributionSegment => Some("account_attribution_segment"),
             Self::IngestQuarantine => Some("ingest_quarantine"),
             Self::LegacyMeterImport => Some("legacy_meter_import"),
             Self::LegacyMeterImportRecord => Some("legacy_meter_import_record"),
@@ -323,7 +327,8 @@ impl DurableClass {
             | Self::TaskEventQuarantine
             | Self::TaskKindCandidate
             | Self::TaskIdentity
-            | Self::AttributionSegment => Some(RebuildGroup::Attribution),
+            | Self::AttributionSegment
+            | Self::AccountAttributionSegment => Some(RebuildGroup::Attribution),
             Self::Account
             | Self::SampleRun
             | Self::SamplingPolicySnapshot
@@ -391,6 +396,7 @@ impl DurableClass {
             Self::WindowCalibrationSourceExperiment,
             Self::CalibrationLifecycle,
             Self::AttributionSegment,
+            Self::AccountAttributionSegment,
             Self::IngestQuarantine,
             Self::LegacyMeterImport,
             Self::LegacyMeterImportRecord,
@@ -437,6 +443,7 @@ impl DurableClass {
             Self::WindowCalibrationSourceExperiment,
             Self::CalibrationLifecycle,
             Self::AttributionSegment,
+            Self::AccountAttributionSegment,
             Self::IngestQuarantine,
             Self::LegacyMeterImport,
             Self::LegacyMeterImportRecord,
@@ -462,6 +469,7 @@ pub enum PruneTarget {
     UsageComponent,
     Session,
     AttributionSegment,
+    AccountAttributionSegment,
     IngestQuarantine,
     SamplingLease,
 }
@@ -480,6 +488,7 @@ impl PruneTarget {
             Self::UsageComponent => DurableClass::UsageComponent,
             Self::Session => DurableClass::Session,
             Self::AttributionSegment => DurableClass::AttributionSegment,
+            Self::AccountAttributionSegment => DurableClass::AccountAttributionSegment,
             Self::IngestQuarantine => DurableClass::IngestQuarantine,
             Self::SamplingLease => DurableClass::SamplingLease,
         }
@@ -506,6 +515,7 @@ impl PruneTarget {
             Self::UsageComponent,
             Self::Session,
             Self::AttributionSegment,
+            Self::AccountAttributionSegment,
             Self::IngestQuarantine,
             Self::SamplingLease,
         ]
@@ -660,6 +670,7 @@ pub fn prune_rebuildable_transcript_usage(conn: &Connection) -> Result<usize, Er
         PruneTarget::UsageOccurrence,
         PruneTarget::Session,
         PruneTarget::AttributionSegment,
+        PruneTarget::AccountAttributionSegment,
         PruneTarget::TaskIdentity,
         PruneTarget::TaskKindCandidate,
         PruneTarget::TaskEventQuarantine,
@@ -1409,6 +1420,12 @@ mod tests {
             [now.unix_nanos()],
         )
         .expect("fixture attribution segment must insert");
+        conn.execute(
+            "INSERT INTO account_attribution_segment (session_id, target_kind, logical_account, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, computed_at)
+             VALUES ('fixture-session', 'account', 'fixture-account', 1, 2, 0, 0, ?1)",
+            [now.unix_nanos()],
+        )
+        .expect("fixture account attribution segment must insert");
         // The disposable lease table: a rebuild sweep must leave it alone even
         // though a prune target addresses it.
         crate::store::sampling_lease::acquire(
