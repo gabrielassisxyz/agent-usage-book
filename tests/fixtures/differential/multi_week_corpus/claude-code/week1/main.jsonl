@@ -1,0 +1,1 @@
+{"type":"assistant","timestamp":"2026-08-03T10:00:00.000Z","sessionId":"s-w1-main","message":{"id":"msg_w1_1","usage":{"input_tokens":2000,"output_tokens":800,"cache_creation_input_tokens":5000,"cache_read_input_tokens":4000}}}

@@ -1,0 +1,283 @@
+{
+  "category_breakdown": {
+    "cache-write visibility": {
+      "absolute_tokens": 9000,
+      "net_delta": 9000,
+      "share_percentage": "86.66%",
+      "share_ppm": 866634
+    },
+    "legacy bug": {
+      "absolute_tokens": 15,
+      "net_delta": 15,
+      "share_percentage": "0.14%",
+      "share_ppm": 1444
+    },
+    "newly discovered subagents": {
+      "absolute_tokens": 900,
+      "net_delta": 900,
+      "share_percentage": "8.67%",
+      "share_ppm": 86663
+    },
+    "parser correction": {
+      "absolute_tokens": 70,
+      "net_delta": 70,
+      "share_percentage": "0.67%",
+      "share_ppm": 6740
+    },
+    "replay removal": {
+      "absolute_tokens": 400,
+      "net_delta": -400,
+      "share_percentage": "3.85%",
+      "share_ppm": 38517
+    }
+  },
+  "corpus_content_digest": "eec17c918ba47e8cf77c8b2eda4a03bdff2e6e0d850743312e32f641892d9e6c",
+  "periods": [
+    {
+      "aub": {
+        "cache_read": 4000,
+        "cache_write": 5000,
+        "input": 2000,
+        "output": 800,
+        "total": 11800
+      },
+      "classified_explanations": [
+        {
+          "category": "cache-write visibility",
+          "delta": {
+            "cache_read": 0,
+            "cache_write": 5000,
+            "input": 0,
+            "output": 0,
+            "total": 5000
+          },
+          "reason": "legacy spend tool omitted cache_write billing; aub measured 5000 tokens"
+        }
+      ],
+      "is_agreement": false,
+      "legacy": {
+        "cache_read": 4000,
+        "cache_write": 0,
+        "input": 2000,
+        "output": 800,
+        "total": 6800
+      },
+      "period": "2026-08-03",
+      "total_delta": {
+        "cache_read": 0,
+        "cache_write": 5000,
+        "input": 0,
+        "output": 0,
+        "total": 5000
+      },
+      "unclassified_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    },
+    {
+      "aub": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 600,
+        "output": 300,
+        "total": 900
+      },
+      "classified_explanations": [
+        {
+          "category": "newly discovered subagents",
+          "delta": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 600,
+            "output": 300,
+            "total": 900
+          },
+          "reason": "discovered nested subagent transcript"
+        }
+      ],
+      "is_agreement": false,
+      "legacy": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      },
+      "period": "2026-08-05",
+      "total_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 600,
+        "output": 300,
+        "total": 900
+      },
+      "unclassified_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    },
+    {
+      "aub": {
+        "cache_read": 1000,
+        "cache_write": 0,
+        "input": 1500,
+        "output": 700,
+        "total": 3200
+      },
+      "classified_explanations": [
+        {
+          "category": "replay removal",
+          "delta": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 0,
+            "output": -400,
+            "total": -400
+          },
+          "reason": "legacy double counted replayed stream; aub deduplicated"
+        }
+      ],
+      "is_agreement": false,
+      "legacy": {
+        "cache_read": 1000,
+        "cache_write": 0,
+        "input": 1500,
+        "output": 1100,
+        "total": 3600
+      },
+      "period": "2026-08-10",
+      "total_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": -400,
+        "total": -400
+      },
+      "unclassified_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    },
+    {
+      "aub": {
+        "cache_read": 2500,
+        "cache_write": 4000,
+        "input": 1200,
+        "output": 600,
+        "total": 8300
+      },
+      "classified_explanations": [
+        {
+          "category": "cache-write visibility",
+          "delta": {
+            "cache_read": 0,
+            "cache_write": 4000,
+            "input": 0,
+            "output": 0,
+            "total": 4000
+          },
+          "reason": "legacy spend tool omitted cache_write billing; aub measured 4000 tokens"
+        },
+        {
+          "category": "parser correction",
+          "delta": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 50,
+            "output": 20,
+            "total": 70
+          },
+          "reason": "parser correction on format drift record"
+        }
+      ],
+      "is_agreement": false,
+      "legacy": {
+        "cache_read": 2500,
+        "cache_write": 0,
+        "input": 1150,
+        "output": 580,
+        "total": 4230
+      },
+      "period": "2026-08-17",
+      "total_delta": {
+        "cache_read": 0,
+        "cache_write": 4000,
+        "input": 50,
+        "output": 20,
+        "total": 4070
+      },
+      "unclassified_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    },
+    {
+      "aub": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 1000,
+        "output": 500,
+        "total": 1500
+      },
+      "classified_explanations": [
+        {
+          "category": "legacy bug",
+          "delta": {
+            "cache_read": 0,
+            "cache_write": 0,
+            "input": 10,
+            "output": 5,
+            "total": 15
+          },
+          "reason": "legacy cumulative differencing inversion bug"
+        }
+      ],
+      "is_agreement": false,
+      "legacy": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 990,
+        "output": 495,
+        "total": 1485
+      },
+      "period": "2026-08-24",
+      "total_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 10,
+        "output": 5,
+        "total": 15
+      },
+      "unclassified_delta": {
+        "cache_read": 0,
+        "cache_write": 0,
+        "input": 0,
+        "output": 0,
+        "total": 0
+      }
+    }
+  ],
+  "retirement_ready": true,
+  "total_absolute_difference": 10385,
+  "total_classified_difference": 10385,
+  "unclassified": {
+    "absolute_tokens": 0,
+    "count": 0,
+    "net_delta": 0,
+    "share_percentage": "0.00%",
+    "share_ppm": 0
+  }
+}
