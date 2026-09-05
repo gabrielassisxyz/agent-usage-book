@@ -558,6 +558,9 @@ impl Command {
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "can-run prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::Calibrate => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Rejected {
@@ -662,6 +665,7 @@ impl Command {
             Command::CalibrationFixture => None,
             Command::CanRun => Some(
                 "compare calibrated credit headroom against historical task cost, refusing rather than guessing when evidence is missing",
+            ),
             Command::Calibrate => Some(
                 "record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence",
             ),
@@ -713,6 +717,7 @@ impl Command {
             ),
             Command::CanRun => Some(
                 "given a fresh or cached calibrated credit headroom and the historical cost of this task kind, can the proposed task run now?",
+            ),
             Command::Calibrate => Some(
                 "what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?",
             ),
@@ -4471,188 +4476,6 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let model_raw =
         model_raw.ok_or_else(|| Error::Usage("can-run requires --task-model MODEL".into()))?;
     let model = crate::domain::window::ModelId::new(&model_raw);
-/// `aub calibrate begin|status|end`: the controlled-experiment record without a
-/// resident process (`aub-c0b.2`, PLAN.md 23.3, 23.4).
-///
-/// `begin` writes the premise, the process exits, the ordinary scheduler keeps
-/// sampling, and `end` later records the end of controlled local work.
-/// Sampling cadence during an experiment is tightened by invoking
-/// `sample --due` more often through the external scheduler, never by a
-/// resident loop: nothing here spawns a thread, sleeps, or holds the database
-/// open past the command.
-fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let subcommand = invocation.rest.first().map(String::as_str);
-    match subcommand {
-        Some("begin") => calibrate_begin_command(clock, invocation),
-        Some("status") => calibrate_status_command(clock, invocation),
-        Some("end") => calibrate_end_command(clock, invocation),
-        Some("fit") => calibrate_fit(clock, invocation),
-        other => Err(Error::Usage(format!(
-            "calibrate requires a subcommand (begin | status | end | fit), got {other:?}"
-        ))),
-    }
-}
-
-fn calibrate_next_arg(args: &mut std::slice::Iter<String>, flag: &str) -> Result<String, Error> {
-    args.next()
-        .cloned()
-        .ok_or_else(|| Error::Usage(format!("{flag} requires a value")))
-}
-
-/// Reads one `--flag value` or `--flag=value` pair out of the subcommand args.
-/// Returns `None` when the next arg names a different flag or a positional.
-fn calibrate_take_value(
-    args: &mut std::slice::Iter<String>,
-    flag: &str,
-) -> Result<Option<String>, Error> {
-    let Some(peek) = args.clone().next() else {
-        return Ok(None);
-    };
-    if let Some(value) = peek.strip_prefix(&format!("{flag}=")) {
-        args.next();
-        if value.is_empty() {
-            return Err(Error::Usage(format!("{flag} requires a value")));
-        }
-        return Ok(Some(value.to_string()));
-    }
-    if peek == flag {
-        args.next();
-        return Ok(Some(calibrate_next_arg(args, flag)?));
-    }
-    Ok(None)
-}
-
-#[derive(Debug)]
-struct CalibrateBeginArgs {
-    plan_tier: String,
-    window: String,
-    cost_model: String,
-    expect_kinds: Option<String>,
-    experiment: Option<String>,
-    assert_exclusive: bool,
-}
-
-fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
-    let usage = "calibrate begin requires --account NAME --plan-tier TIER --window KEY \
-                 --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
-    let mut args = CalibrateBeginArgs {
-        plan_tier: String::new(),
-        window: String::new(),
-        cost_model: String::new(),
-        expect_kinds: None,
-        experiment: None,
-        assert_exclusive: false,
-    };
-    let mut rest = rest.iter();
-    while let Some(arg) = rest.next() {
-        if arg == "--assert-exclusive" {
-            args.assert_exclusive = true;
-        } else if arg == "--plan-tier" {
-            args.plan_tier = calibrate_next_arg(&mut rest, "--plan-tier")?;
-        } else if let Some(value) = arg.strip_prefix("--plan-tier=") {
-            args.plan_tier = value.to_string();
-        } else if arg == "--window" {
-            args.window = calibrate_next_arg(&mut rest, "--window")?;
-        } else if let Some(value) = arg.strip_prefix("--window=") {
-            args.window = value.to_string();
-        } else if arg == "--cost-model" {
-            args.cost_model = calibrate_next_arg(&mut rest, "--cost-model")?;
-        } else if let Some(value) = arg.strip_prefix("--cost-model=") {
-            args.cost_model = value.to_string();
-        } else if arg == "--expect-kinds" {
-            args.expect_kinds = Some(calibrate_next_arg(&mut rest, "--expect-kinds")?);
-        } else if let Some(value) = arg.strip_prefix("--expect-kinds=") {
-            args.expect_kinds = Some(value.to_string());
-        } else if arg == "--experiment" {
-            args.experiment = Some(calibrate_next_arg(&mut rest, "--experiment")?);
-        } else if let Some(value) = arg.strip_prefix("--experiment=") {
-            args.experiment = Some(value.to_string());
-        } else {
-            return Err(Error::Usage(format!(
-                "calibrate begin: unknown argument {arg:?}; {usage}"
-            )));
-        }
-    }
-    if args.plan_tier.trim().is_empty()
-        || args.window.trim().is_empty()
-        || args.cost_model.trim().is_empty()
-    {
-        return Err(Error::Usage(usage.into()));
-    }
-    if !args.assert_exclusive {
-        return Err(Error::Usage(
-            "calibrate begin records that the account is reserved for the experiment; pass --assert-exclusive to state the premise explicitly".into(),
-        ));
-    }
-    Ok(args)
-}
-
-/// Resolves the experiment `status` and `end` operate on: the `--experiment`
-/// value (or lone positional) when given, else the most recently begun run.
-fn calibrate_resolve_experiment(
-    conn: &rusqlite::Connection,
-    rest: &[String],
-    subcommand: &str,
-) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
-    use crate::store::calibration_controlled::{
-        ControlledExperimentId, load_by_experiment_id, load_latest,
-    };
-    let usage = format!("{subcommand} takes [--experiment ID] or [ID]");
-    let mut experiment: Option<String> = None;
-    let mut positionals: Vec<&String> = Vec::new();
-    let mut args = rest.iter();
-    loop {
-        if let Some(taken) = calibrate_take_value(&mut args, "--experiment")? {
-            if experiment.is_some() {
-                return Err(Error::Usage(format!(
-                    "{subcommand}: --experiment given twice"
-                )));
-            }
-            experiment = Some(taken);
-        } else if let Some(arg) = args.next() {
-            if arg.starts_with("--") {
-                return Err(Error::Usage(format!(
-                    "calibrate {subcommand}: unknown argument {arg:?}; {usage}"
-                )));
-            }
-            positionals.push(arg);
-        } else {
-            break;
-        }
-    }
-    if experiment.is_none() && positionals.len() == 1 {
-        experiment = Some(positionals[0].clone());
-    } else if !positionals.is_empty() {
-        return Err(Error::Usage(format!(
-            "calibrate {subcommand}: unexpected positional arguments {positionals:?}; {usage}"
-        )));
-    }
-    match experiment {
-        Some(id) => {
-            let id = ControlledExperimentId::new(id);
-            load_by_experiment_id(conn, &id)?.ok_or_else(|| {
-                Error::Usage(format!(
-                    "no controlled experiment '{}'; begin one with `aub calibrate begin`",
-                    id.as_str()
-                ))
-            })
-        }
-        None => load_latest(conn)?.ok_or_else(|| {
-            Error::Usage(
-                "no controlled experiment recorded; begin one with `aub calibrate begin`".into(),
-            )
-        }),
-    }
-}
-
-fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let Some(account) = invocation.account.as_deref() else {
-        return Err(Error::Usage(
-            "calibrate begin requires --account NAME: the account reserved for the experiment"
-                .into(),
-        ));
-    };
-    let args = calibrate_parse_begin(&invocation.rest[1..])?;
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
@@ -5102,6 +4925,200 @@ fn gather_meter_readiness(
             crate::report::can_run::CanRunMeterReadiness::AuthRequired
         }
     }
+}
+
+/// `aub calibrate begin|status|end`: the controlled-experiment record without a
+/// resident process (`aub-c0b.2`, PLAN.md 23.3, 23.4).
+///
+/// `begin` writes the premise, the process exits, the ordinary scheduler keeps
+/// sampling, and `end` later records the end of controlled local work.
+/// Sampling cadence during an experiment is tightened by invoking
+/// `sample --due` more often through the external scheduler, never by a
+/// resident loop: nothing here spawns a thread, sleeps, or holds the database
+/// open past the command.
+fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let subcommand = invocation.rest.first().map(String::as_str);
+    match subcommand {
+        Some("begin") => calibrate_begin_command(clock, invocation),
+        Some("status") => calibrate_status_command(clock, invocation),
+        Some("end") => calibrate_end_command(clock, invocation),
+        Some("fit") => calibrate_fit(clock, invocation),
+        other => Err(Error::Usage(format!(
+            "calibrate requires a subcommand (begin | status | end | fit), got {other:?}"
+        ))),
+    }
+}
+
+fn calibrate_next_arg(args: &mut std::slice::Iter<String>, flag: &str) -> Result<String, Error> {
+    args.next()
+        .cloned()
+        .ok_or_else(|| Error::Usage(format!("{flag} requires a value")))
+}
+
+/// Reads one `--flag value` or `--flag=value` pair out of the subcommand args.
+/// Returns `None` when the next arg names a different flag or a positional.
+fn calibrate_take_value(
+    args: &mut std::slice::Iter<String>,
+    flag: &str,
+) -> Result<Option<String>, Error> {
+    let Some(peek) = args.clone().next() else {
+        return Ok(None);
+    };
+    if let Some(value) = peek.strip_prefix(&format!("{flag}=")) {
+        args.next();
+        if value.is_empty() {
+            return Err(Error::Usage(format!("{flag} requires a value")));
+        }
+        return Ok(Some(value.to_string()));
+    }
+    if peek == flag {
+        args.next();
+        return Ok(Some(calibrate_next_arg(args, flag)?));
+    }
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct CalibrateBeginArgs {
+    plan_tier: String,
+    window: String,
+    cost_model: String,
+    expect_kinds: Option<String>,
+    experiment: Option<String>,
+    assert_exclusive: bool,
+}
+
+fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
+    let usage = "calibrate begin requires --account NAME --plan-tier TIER --window KEY \
+                 --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
+    let mut args = CalibrateBeginArgs {
+        plan_tier: String::new(),
+        window: String::new(),
+        cost_model: String::new(),
+        expect_kinds: None,
+        experiment: None,
+        assert_exclusive: false,
+    };
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--assert-exclusive" {
+            args.assert_exclusive = true;
+        } else if arg == "--plan-tier" {
+            args.plan_tier = calibrate_next_arg(&mut rest, "--plan-tier")?;
+        } else if let Some(value) = arg.strip_prefix("--plan-tier=") {
+            args.plan_tier = value.to_string();
+        } else if arg == "--window" {
+            args.window = calibrate_next_arg(&mut rest, "--window")?;
+        } else if let Some(value) = arg.strip_prefix("--window=") {
+            args.window = value.to_string();
+        } else if arg == "--cost-model" {
+            args.cost_model = calibrate_next_arg(&mut rest, "--cost-model")?;
+        } else if let Some(value) = arg.strip_prefix("--cost-model=") {
+            args.cost_model = value.to_string();
+        } else if arg == "--expect-kinds" {
+            args.expect_kinds = Some(calibrate_next_arg(&mut rest, "--expect-kinds")?);
+        } else if let Some(value) = arg.strip_prefix("--expect-kinds=") {
+            args.expect_kinds = Some(value.to_string());
+        } else if arg == "--experiment" {
+            args.experiment = Some(calibrate_next_arg(&mut rest, "--experiment")?);
+        } else if let Some(value) = arg.strip_prefix("--experiment=") {
+            args.experiment = Some(value.to_string());
+        } else {
+            return Err(Error::Usage(format!(
+                "calibrate begin: unknown argument {arg:?}; {usage}"
+            )));
+        }
+    }
+    if args.plan_tier.trim().is_empty()
+        || args.window.trim().is_empty()
+        || args.cost_model.trim().is_empty()
+    {
+        return Err(Error::Usage(usage.into()));
+    }
+    if !args.assert_exclusive {
+        return Err(Error::Usage(
+            "calibrate begin records that the account is reserved for the experiment; pass --assert-exclusive to state the premise explicitly".into(),
+        ));
+    }
+    Ok(args)
+}
+
+/// Resolves the experiment `status` and `end` operate on: the `--experiment`
+/// value (or lone positional) when given, else the most recently begun run.
+fn calibrate_resolve_experiment(
+    conn: &rusqlite::Connection,
+    rest: &[String],
+    subcommand: &str,
+) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
+    use crate::store::calibration_controlled::{
+        ControlledExperimentId, load_by_experiment_id, load_latest,
+    };
+    let usage = format!("{subcommand} takes [--experiment ID] or [ID]");
+    let mut experiment: Option<String> = None;
+    let mut positionals: Vec<&String> = Vec::new();
+    let mut args = rest.iter();
+    loop {
+        if let Some(taken) = calibrate_take_value(&mut args, "--experiment")? {
+            if experiment.is_some() {
+                return Err(Error::Usage(format!(
+                    "{subcommand}: --experiment given twice"
+                )));
+            }
+            experiment = Some(taken);
+        } else if let Some(arg) = args.next() {
+            if arg.starts_with("--") {
+                return Err(Error::Usage(format!(
+                    "calibrate {subcommand}: unknown argument {arg:?}; {usage}"
+                )));
+            }
+            positionals.push(arg);
+        } else {
+            break;
+        }
+    }
+    if experiment.is_none() && positionals.len() == 1 {
+        experiment = Some(positionals[0].clone());
+    } else if !positionals.is_empty() {
+        return Err(Error::Usage(format!(
+            "calibrate {subcommand}: unexpected positional arguments {positionals:?}; {usage}"
+        )));
+    }
+    match experiment {
+        Some(id) => {
+            let id = ControlledExperimentId::new(id);
+            load_by_experiment_id(conn, &id)?.ok_or_else(|| {
+                Error::Usage(format!(
+                    "no controlled experiment '{}'; begin one with `aub calibrate begin`",
+                    id.as_str()
+                ))
+            })
+        }
+        None => load_latest(conn)?.ok_or_else(|| {
+            Error::Usage(
+                "no controlled experiment recorded; begin one with `aub calibrate begin`".into(),
+            )
+        }),
+    }
+}
+
+fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let Some(account) = invocation.account.as_deref() else {
+        return Err(Error::Usage(
+            "calibrate begin requires --account NAME: the account reserved for the experiment"
+                .into(),
+        ));
+    };
+    let args = calibrate_parse_begin(&invocation.rest[1..])?;
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
     let provider = config
         .accounts
         .iter()

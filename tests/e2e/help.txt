@@ -22,6 +22,7 @@ commands:
   task     ingest issue-tracker task-claim events and report per-task usage and overhead
   compare  record and inspect adapter-semantics comparisons against the provider's authoritative surface
   can-run  compare calibrated credit headroom against historical task cost, refusing rather than guessing when evidence is missing
+  calibrate record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence
 
 status:
   answers: how much quota does each configured account have left?
@@ -128,5 +129,11 @@ can-run:
   refuses: --model (can-run names the proposed model with --task-model; --model is status's own reporting-scope selector); --no-color (can-run prints no color)
   format: text | json
   options: --task-kind TYPE --account NAME --task-model MODEL [--cached]
+
+calibrate:
+  answers: what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?
+  refuses: --explain (calibrate records an experiment premise or derives candidates from recorded evidence, never a live explanation); --model (calibrate operates on whole experiments and windows, not individual models); --no-color (calibrate prints plain text or json, never color)
+  format: text | json
+  options: begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID]
 
 aub            prints the version; aub --help prints this
