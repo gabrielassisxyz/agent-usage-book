@@ -32,6 +32,7 @@ pub mod meter_attempt;
 pub mod meter_evidence;
 pub mod migrate;
 pub mod migrations;
+pub mod opencode;
 pub mod projection_crash_hook;
 pub mod projection_source;
 pub mod rate_card;

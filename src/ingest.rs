@@ -330,6 +330,34 @@ pub fn run(
                 continue;
             }
 
+            // A database source is parsed whole from its file, never sliced
+            // by line offsets: byte offsets into a SQLite file mean nothing
+            // to the next pass, so every parse replaces the file's previous
+            // contribution and the watermark consumes the whole file.
+            if parser.is_database_source() {
+                let output =
+                    parser.parse_database_file(file, &SourceLocation::new(file_str.clone(), 1));
+                quarantined_items.extend(
+                    output
+                        .quarantined()
+                        .iter()
+                        .map(|record| NewQuarantineItem::from_record(record, now)),
+                );
+                events.extend(output.events().iter().cloned());
+                files_parsed += 1;
+                whole_file_sources.push(file_str.clone());
+                watermarks.push(crate::transcripts::watermark::Watermark {
+                    source_key: source.source.clone(),
+                    relative_path,
+                    size: current.size,
+                    mtime_nanos: current.mtime_nanos,
+                    identity: current.identity,
+                    parser_version: parser_version.clone(),
+                    consumed_offset: current.size,
+                });
+                continue;
+            }
+
             let contents = match std::fs::read_to_string(file) {
                 Ok(text) => text,
                 Err(_) => {
@@ -707,8 +735,9 @@ fn source_config<'a>(config: &'a Config, name: &str) -> Result<&'a TranscriptCon
 
 fn unknown_format(source: &str, format: Option<&str>) -> Error {
     Error::Usage(format!(
-        "transcript source {source} declares unknown format {}; known formats are claude-code, codex, pi",
-        format.unwrap_or("(none)")
+        "transcript source {source} declares unknown format {}; known formats are {}",
+        format.unwrap_or("(none)"),
+        crate::transcripts::KNOWN_FORMATS.join(", ")
     ))
 }
 

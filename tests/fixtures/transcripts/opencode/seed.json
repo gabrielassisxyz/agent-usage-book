@@ -1,0 +1,113 @@
+{
+  "schema": "opencode-sqlite-v1",
+  "note": "Invented rows mirroring the opencode message-table shape. Every value is a small placeholder written for this fixture, never copied from a real database. Tests build a scratch opencode.db from this file at runtime and parse that; no real database file is ever committed or read by a test.",
+  "sessions": [
+    {
+      "id": "ses_fixture_parent",
+      "project_id": "proj_fixture",
+      "parent_id": null,
+      "directory": "work/fixture-project",
+      "title": "Fixture parent session",
+      "time_created_ms": 1788220800000,
+      "time_updated_ms": 1788220860000,
+      "model": {"id": "fixture-model-a", "providerID": "fixture-provider", "variant": "standard"},
+      "tokens_input": 160,
+      "tokens_output": 46,
+      "tokens_reasoning": 7,
+      "tokens_cache_read": 12,
+      "tokens_cache_write": 5,
+      "cost": 0.001
+    },
+    {
+      "id": "ses_fixture_child",
+      "project_id": "proj_fixture",
+      "parent_id": "ses_fixture_parent",
+      "directory": "work/fixture-project",
+      "title": "Fixture child session",
+      "time_created_ms": 1788220830000,
+      "time_updated_ms": 1788220845000,
+      "model": {"id": "fixture-model-a", "providerID": "fixture-provider", "variant": "standard"},
+      "tokens_input": 10,
+      "tokens_output": 4,
+      "tokens_reasoning": 2,
+      "tokens_cache_read": 0,
+      "tokens_cache_write": 0,
+      "cost": 0.0
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg_fixture_0001",
+      "session_id": "ses_fixture_parent",
+      "time_created_ms": 1788220800000,
+      "time_updated_ms": 1788220815000,
+      "data": {
+        "role": "assistant",
+        "modelID": "fixture-model-a",
+        "providerID": "fixture-provider",
+        "mode": "build",
+        "cost": 0.001,
+        "finish": "stop",
+        "time": {"created": 1788220800000, "completed": 1788220815000},
+        "tokens": {"input": 120, "output": 34, "reasoning": 7, "cache": {"write": 5, "read": 9}, "total": 166}
+      }
+    },
+    {
+      "id": "msg_fixture_0002",
+      "session_id": "ses_fixture_parent",
+      "time_created_ms": 1788220820000,
+      "time_updated_ms": 1788220820000,
+      "data": {
+        "role": "user",
+        "time": {"created": 1788220820000}
+      }
+    },
+    {
+      "id": "msg_fixture_0003",
+      "session_id": "ses_fixture_parent",
+      "time_created_ms": 1788220830000,
+      "time_updated_ms": 1788220840000,
+      "data": {
+        "role": "assistant",
+        "modelID": "fixture-model-b",
+        "providerID": "fixture-provider",
+        "mode": "build",
+        "cost": 0.0,
+        "finish": "stop",
+        "time": {"created": 1788220830000, "completed": 1788220840000},
+        "tokens": {"input": 40, "output": 12, "cache": {"write": 0, "read": 3}, "total": 55}
+      }
+    },
+    {
+      "id": "msg_fixture_0004",
+      "session_id": "ses_fixture_child",
+      "time_created_ms": 1788220835000,
+      "time_updated_ms": 1788220845000,
+      "data": {
+        "role": "assistant",
+        "modelID": "fixture-model-a",
+        "providerID": "fixture-provider",
+        "mode": "plan",
+        "cost": 0.0,
+        "finish": "stop",
+        "time": {"created": 1788220835000, "completed": 1788220845000},
+        "tokens": {"input": 10, "output": 4, "reasoning": 2, "cache": {"write": 0, "read": 0}, "total": 16}
+      }
+    },
+    {
+      "id": "msg_fixture_0005",
+      "session_id": "ses_fixture_parent",
+      "time_created_ms": 1788220850000,
+      "time_updated_ms": 1788220850000,
+      "data": {
+        "role": "assistant",
+        "modelID": "fixture-model-a",
+        "providerID": "fixture-provider",
+        "mode": "build",
+        "cost": 0.0,
+        "finish": "stop",
+        "time": {"created": 1788220850000, "completed": 1788220850000}
+      }
+    }
+  ]
+}

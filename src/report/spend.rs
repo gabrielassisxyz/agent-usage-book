@@ -124,15 +124,23 @@ pub fn assemble(
                 summary.files_skipped_before_window += 1;
                 continue;
             }
-            let Ok(contents) = std::fs::read_to_string(file) else {
-                summary.unreadable_files.push(file.display().to_string());
-                continue;
+            // A database source is parsed whole from its file, the same seam
+            // the ingest pass reads through, so the report never parses a
+            // SQLite file as text.
+            let output = if parser.is_database_source() {
+                parser
+                    .parse_database_file(file, &SourceLocation::new(file.display().to_string(), 1))
+            } else {
+                let Ok(contents) = std::fs::read_to_string(file) else {
+                    summary.unreadable_files.push(file.display().to_string());
+                    continue;
+                };
+                parser.parse(
+                    &contents,
+                    &SourceLocation::new(file.display().to_string(), 1),
+                )
             };
             summary.files_read += 1;
-            let output = parser.parse(
-                &contents,
-                &SourceLocation::new(file.display().to_string(), 1),
-            );
             for record in output.quarantined() {
                 *summary
                     .quarantined_by_class
@@ -168,14 +176,16 @@ fn parsers_for(config: &Config) -> Result<BTreeMap<&str, Box<dyn ParserAdapter>>
     for source in &config.transcripts {
         let format = source.format.as_deref().ok_or_else(|| {
             Error::Usage(format!(
-                "transcript source {} declares no format; set format to one of claude-code, codex, pi",
-                source.name
+                "transcript source {} declares no format; set format to one of {}",
+                source.name,
+                crate::transcripts::KNOWN_FORMATS.join(", ")
             ))
         })?;
         let parser = parser_for_format(format).ok_or_else(|| {
             Error::Usage(format!(
-                "transcript source {} declares unknown format {format}; known formats are claude-code, codex, pi",
-                source.name
+                "transcript source {} declares unknown format {format}; known formats are {}",
+                source.name,
+                crate::transcripts::KNOWN_FORMATS.join(", ")
             ))
         })?;
         parsers.insert(source.name.as_str(), parser);

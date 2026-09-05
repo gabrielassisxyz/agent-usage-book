@@ -1,6 +1,6 @@
-//! Native-usage transcript parsers: Claude Code, Codex, and pi.
+//! Native-usage transcript parsers: Claude Code, Codex, opencode, and pi.
 //!
-//! These three sources all report provider- or CLI-measured token counts, so
+//! These four sources all report provider- or CLI-measured token counts, so
 //! everything this module emits is classified [`EvidenceClassification::Reported`].
 //! The estimated-source parser (`aub-lqe.5`) owns reconstruction; this module never
 //! estimates.
@@ -35,6 +35,7 @@
 //! - calibration, cost models, rate cards, task history, or meter observations
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 
 use serde_json::Value;
 
@@ -51,10 +52,11 @@ use crate::transcripts::parser::{
     QuarantineRecord, STRONG_IDENTITY_PREFIX, SourceLocation,
 };
 
-/// The source namespaces the three parsers attribute sessions under. One
+/// The source namespaces the four parsers attribute sessions under. One
 /// definition each, so a session join never sees two spellings of one source.
 pub const CLAUDE_CODE_NAMESPACE: &str = "claude-code";
 pub const CODEX_NAMESPACE: &str = "codex";
+pub const OPENCODE_NAMESPACE: &str = "opencode";
 pub const PI_NAMESPACE: &str = "pi";
 
 /// The source namespace a declared format's events and sessions are attributed
@@ -65,6 +67,7 @@ pub fn namespace_for_format(format: &str) -> Option<&'static str> {
     match format {
         "claude-code" => Some(CLAUDE_CODE_NAMESPACE),
         "codex" => Some(CODEX_NAMESPACE),
+        "opencode" => Some(OPENCODE_NAMESPACE),
         "pi" => Some(PI_NAMESPACE),
         _ => None,
     }
@@ -577,6 +580,179 @@ fn parse_pi_line(
     ))))
 }
 
+/// The opencode transcript parser.
+///
+/// Reads the `message` table of the opencode session database (`opencode.db`)
+/// through `crate::store::opencode`, one row per message. An assistant row's
+/// `data` carries `tokens: {input, output, reasoning, cache: {write, read}}`
+/// beside `role`, `modelID`, `providerID` and `time: {created, completed}`.
+/// The nested cache pair is flattened into the vocabulary the shared
+/// `extract_usage` helper reads, `total` is a derived sum and is ignored the
+/// way the other sources' totals are, and `reasoning` has no canonical kind
+/// so it survives in the unknown map, never folded into output. `message.id`
+/// is the stable event identifier, the strong identity dedup collapses
+/// replays on. A user row carries no tokens and is skipped silently, the way
+/// a record without a usage object is; an assistant row without one
+/// quarantines, because a count the source should have written is missing,
+/// not absent by shape.
+pub struct OpencodeParser;
+
+const OPENCODE_KNOWN: [(&str, TokenKind); 4] = [
+    ("input", TokenKind::Input),
+    ("output", TokenKind::Output),
+    ("cache_read", TokenKind::CacheRead),
+    ("cache_write", TokenKind::CacheWrite),
+];
+const OPENCODE_IGNORED: [&str; 1] = ["total"];
+
+impl ParserAdapter for OpencodeParser {
+    fn parser_version(&self) -> ParserVersion {
+        ParserVersion::new("opencode-1")
+    }
+
+    fn input_format_version(&self) -> InputFormatVersion {
+        InputFormatVersion::new("opencode-sqlite-v1")
+    }
+
+    /// A database source has no text form: empty input parses to nothing, and
+    /// anything else quarantines as unsupported rather than silently
+    /// producing zero events.
+    fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
+        if input.trim().is_empty() {
+            return ParseOutput::new(Vec::new(), Vec::new());
+        }
+        ParseOutput::new(
+            Vec::new(),
+            vec![QuarantineRecord::new(
+                location.clone(),
+                self.parser_version(),
+                QuarantineClass::UnsupportedInputFormat,
+            )],
+        )
+    }
+
+    fn is_database_source(&self) -> bool {
+        true
+    }
+
+    fn parse_database_file(&self, path: &Path, location: &SourceLocation) -> ParseOutput {
+        let rows = match crate::store::opencode::open_opencode_database(path)
+            .and_then(|connection| crate::store::opencode::read_message_rows(&connection))
+        {
+            Ok(rows) => rows,
+            // A file that is not an opencode database is an input this parser
+            // does not understand, counted once at the file rather than
+            // dropped silently or aborting the pass.
+            Err(_) => {
+                return ParseOutput::new(
+                    Vec::new(),
+                    vec![QuarantineRecord::new(
+                        location.clone(),
+                        self.parser_version(),
+                        QuarantineClass::UnsupportedInputFormat,
+                    )],
+                );
+            }
+        };
+        let mut events = Vec::new();
+        let mut quarantined = Vec::new();
+        for (index, row) in rows.iter().enumerate() {
+            let record_location =
+                SourceLocation::new(location.file().to_string(), location.line() + index as u64);
+            match parse_opencode_row(row, &record_location, self.parser_version()) {
+                Ok(Some(event)) => events.push(event),
+                Ok(None) => {}
+                Err(class) => quarantined.push(QuarantineRecord::new(
+                    record_location,
+                    self.parser_version(),
+                    class,
+                )),
+            }
+        }
+        ParseOutput::new(events, quarantined)
+    }
+}
+
+/// Turns one opencode message row into a normalized event: `None` for a user
+/// row, which carries no tokens by shape, or the quarantine class for a row
+/// that should carry usage but cannot be normalized.
+fn parse_opencode_row(
+    row: &crate::store::opencode::OpencodeMessageRow,
+    location: &SourceLocation,
+    parser_version: ParserVersion,
+) -> Result<Option<NormalizedUsageEvent>, QuarantineClass> {
+    let data: Value =
+        serde_json::from_str(&row.data).map_err(|_| QuarantineClass::TruncatedStructure)?;
+    let message = data
+        .as_object()
+        .ok_or(QuarantineClass::TruncatedStructure)?;
+    if message.get("role").and_then(Value::as_str) == Some("user") {
+        return Ok(None);
+    }
+    let tokens = message
+        .get("tokens")
+        .ok_or(QuarantineClass::MissingRequiredField)?;
+    let tokens = tokens.as_object().ok_or(QuarantineClass::WrongFieldType)?;
+    let mut flat = tokens.clone();
+    flat.remove("cache");
+    if let Some(cache) = tokens.get("cache") {
+        let cache = cache.as_object().ok_or(QuarantineClass::WrongFieldType)?;
+        if let Some(read) = cache.get("read") {
+            flat.insert("cache_read".to_string(), read.clone());
+        }
+        if let Some(write) = cache.get("write") {
+            flat.insert("cache_write".to_string(), write.clone());
+        }
+    }
+    let counts = extract_usage(&flat, &OPENCODE_KNOWN, &OPENCODE_IGNORED, &["input"])?;
+    let occurred_at = message
+        .get("time")
+        .and_then(Value::as_object)
+        .and_then(|time| {
+            time.get("completed")
+                .and_then(opencode_millis)
+                .or_else(|| time.get("created").and_then(opencode_millis))
+        })
+        .or_else(|| opencode_millis_value(row.time_created_ms));
+    let provider = message.get("providerID").and_then(Value::as_str);
+    let model_id = message.get("modelID").and_then(Value::as_str);
+    let model = match (provider, model_id) {
+        (Some(provider), Some(model_id)) => Some(format!("{provider}/{model_id}")),
+        (Some(provider), None) => Some(provider.to_string()),
+        (None, Some(model_id)) => Some(model_id.to_string()),
+        (None, None) => None,
+    };
+    let context = RecordContext {
+        event_id: Some(row.message_id.as_str()),
+        occurred_at,
+        session: Some(session_id(OPENCODE_NAMESPACE, row.session_id.as_str())),
+        model: model.as_deref(),
+    };
+    Ok(Some(event(
+        measured_usage(counts),
+        location.file(),
+        context,
+        parser_version,
+    )))
+}
+
+/// A millisecond timestamp as opencode writes it, or `None` for a value that
+/// is not one. A float, a string or a negative count is not a timestamp this
+/// parser understands; the event then keeps no time rather than an invented
+/// one.
+fn opencode_millis(value: &Value) -> Option<UtcTimestamp> {
+    let millis = value.as_i64().filter(|millis| *millis >= 0)?;
+    opencode_millis_value(millis)
+}
+
+/// The row timestamp in whole-epoch units, or `None` when the multiplication
+/// into nanoseconds would overflow.
+fn opencode_millis_value(millis: i64) -> Option<UtcTimestamp> {
+    millis
+        .checked_mul(1_000_000)
+        .map(UtcTimestamp::from_unix_nanos)
+}
+
 /// The declared fixture coverage: one entry per catalog shape, so a shape added
 /// to the contract fails the golden test until a fixture (or a rationale)
 /// exists here.
@@ -764,6 +940,43 @@ mod tests {
             MutationExpectation::PreservesUnknownComponent {
                 key: "futureTokens".to_string(),
             },
+        );
+    }
+
+    /// opencode carries its own namespace, so its sessions never join another
+    /// source's under a shared spelling.
+    #[test]
+    fn opencode_has_its_own_source_namespace() {
+        assert_eq!(namespace_for_format("opencode"), Some(OPENCODE_NAMESPACE));
+        assert_eq!(OPENCODE_NAMESPACE, "opencode");
+    }
+
+    /// opencode declares its parser and input-format versions, the pair the
+    /// watermark and the fixture manifest pin a parse to.
+    #[test]
+    fn opencode_declares_its_parser_and_input_format_versions() {
+        let parser = OpencodeParser;
+        assert_eq!(parser.parser_version().as_str(), "opencode-1");
+        assert_eq!(parser.input_format_version().as_str(), "opencode-sqlite-v1");
+        assert!(parser.is_database_source());
+    }
+
+    /// A database source has no text form: empty input parses to nothing, and
+    /// anything else quarantines as unsupported rather than silently
+    /// producing zero events.
+    #[test]
+    fn opencode_text_input_quarantines_instead_of_silently_parsing_nothing() {
+        let parser = OpencodeParser;
+        let loc = location();
+        let empty = parser.parse("", &loc);
+        assert!(empty.events().is_empty());
+        assert!(empty.quarantined().is_empty());
+        let text = parser.parse(r#"{"message":{"id":"m1","usage":{"input":10}}}"#, &loc);
+        assert!(text.events().is_empty());
+        assert_eq!(text.quarantined().len(), 1);
+        assert_eq!(
+            text.quarantined()[0].class(),
+            QuarantineClass::UnsupportedInputFormat
         );
     }
 

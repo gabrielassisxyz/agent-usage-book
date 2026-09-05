@@ -9,6 +9,7 @@
 //! - calibration, cost models, rate cards, task history, or meter observations
 
 use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::domain::ids::SessionId;
 use crate::domain::time::UtcTimestamp;
@@ -447,6 +448,31 @@ pub trait ParserAdapter {
     /// the pipeline reads the declaration instead of a per-caller list.
     fn reports_cumulative(&self) -> bool {
         false
+    }
+
+    /// Whether this source is one whole-file database rather than
+    /// line-delimited text. The opencode source keeps every session in a
+    /// single SQLite file, so discovery still finds it by root plus pattern
+    /// but no caller may read it as text or slice it by line offsets. The
+    /// ingest and report paths branch on this declaration instead of guessing
+    /// from the file name, so a text source is never misread as a database.
+    fn is_database_source(&self) -> bool {
+        false
+    }
+
+    /// Parses one database file on disk into normalized events and quarantine
+    /// records. Called only when [`Self::is_database_source`] is true. The
+    /// default refuses as unsupported rather than returning zero events,
+    /// because a silent zero is an undercount wearing an empty result.
+    fn parse_database_file(&self, _path: &Path, location: &SourceLocation) -> ParseOutput {
+        ParseOutput::new(
+            Vec::new(),
+            vec![QuarantineRecord::new(
+                location.clone(),
+                self.parser_version(),
+                QuarantineClass::UnsupportedInputFormat,
+            )],
+        )
     }
 }
 
