@@ -124,10 +124,15 @@ pub enum DiagnosticEvent {
     /// A pre-implementation seed archive was imported. Its source is identified by
     /// digest, never by path or raw record content.
     SeedArchiveImported,
+    /// A commit's consecutive-window comparison classified a typed anomaly
+    /// against the account's immediately preceding observation (`aub-eun.14`).
+    /// `anomaly` is the persisted row's own id, so a reader can look up its
+    /// full evidence references without the raw values ever entering the log.
+    MeterWindowAnomalyDetected,
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
@@ -138,6 +143,7 @@ impl DiagnosticEvent {
         Self::ProjectionRead,
         Self::LegacyMeterImported,
         Self::SeedArchiveImported,
+        Self::MeterWindowAnomalyDetected,
     ];
 
     pub fn name(self) -> &'static str {
@@ -152,6 +158,7 @@ impl DiagnosticEvent {
             Self::ProjectionRead => "projection_read",
             Self::LegacyMeterImported => "legacy_meter_imported",
             Self::SeedArchiveImported => "seed_archive_imported",
+            Self::MeterWindowAnomalyDetected => "meter_window_anomaly_detected",
         }
     }
 
@@ -166,6 +173,7 @@ impl DiagnosticEvent {
             | Self::MeterSpoolDrained => Level::Info,
             Self::ProjectionRead => Level::Debug,
             Self::LegacyMeterImported | Self::SeedArchiveImported => Level::Info,
+            Self::MeterWindowAnomalyDetected => Level::Warn,
         }
     }
 
@@ -185,6 +193,7 @@ impl DiagnosticEvent {
             Self::SeedArchiveImported => {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome"
             }
+            Self::MeterWindowAnomalyDetected => "anomaly, kind, account",
         }
     }
 }

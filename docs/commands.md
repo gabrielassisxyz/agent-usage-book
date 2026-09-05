@@ -38,6 +38,17 @@ fresh sampling attempt first and renders the result that attempt produced;
 there is no flag that fetches and discards, and there is no mode that reads
 the last published projection instead of sampling.
 
+`--session-id SESSION` additionally asks whether that session is actively
+spending right now. The answer is one of four typed states: an explicit
+launcher-or-hook marker with a fresh heartbeat both covering this instant
+(`explicit_marker_evidence`, the only state that names an account and prints
+a `spending` line), nothing named or found (`no_evidence`), two explicit
+markers naming different accounts for the exact same instant with no way to
+order them (`conflicting_evidence`), or a marker whose session the heartbeat
+policy no longer finds live (`inactive`). Neither a moving meter nor an
+ambient credential ever substitutes for either half of that claim, and
+without `--session-id` the state is always `no_evidence`.
+
 ## `aub spend`
 
 **Answers:** how many canonical tokens were used, grouped by the requested
