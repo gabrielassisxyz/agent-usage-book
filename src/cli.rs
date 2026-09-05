@@ -1511,6 +1511,24 @@ pub(crate) fn sample_command(
                             reason,
                         );
                     }
+                    crate::meter::sampler::AccountDisposition::Spooled {
+                        attempt_id,
+                        outcome,
+                        reason,
+                    } => {
+                        let outcome_str = match outcome {
+                            crate::domain::attempt::AttemptOutcome::Success => "success",
+                            crate::domain::attempt::AttemptOutcome::AuthRequired => "auth_required",
+                            crate::domain::attempt::AttemptOutcome::Unreachable(_) => "unreachable",
+                        };
+                        println!(
+                            "sample: account={} spooled attempt={} outcome={} reason={}",
+                            report.name.as_str(),
+                            attempt_id.value(),
+                            outcome_str,
+                            reason,
+                        );
+                    }
                 }
             }
         }
@@ -1576,6 +1594,17 @@ pub(crate) fn sample_command(
                             ..
                         } => (
                             "persist_failed",
+                            serde_json::json!({
+                                "attempt_id": attempt_id.value(),
+                                "reason": reason,
+                            }),
+                        ),
+                        crate::meter::sampler::AccountDisposition::Spooled {
+                            attempt_id,
+                            reason,
+                            ..
+                        } => (
+                            "spooled",
                             serde_json::json!({
                                 "attempt_id": attempt_id.value(),
                                 "reason": reason,
@@ -1933,6 +1962,13 @@ fn now_activity_state(
 /// Returns the store-class error for the first disposition that failed to record
 /// its attempt or terminal fact. Shared by `sample` and `now`: both treat a
 /// persistence failure as fatal and neither renders a reading after one.
+///
+/// A spooled-but-uncommitted result is deliberately a different class from a
+/// lost one (aub-1r3m): `PersistFailed` means the reading is gone, and stays
+/// `Error::Store`; `Spooled` means the reading survived durably on disk
+/// pending the next drain, which is `Error::IngestIncomplete` rather than a
+/// store failure, so a caller scripting on the exit class can tell "lost"
+/// from "preserved but not yet in the ledger" without parsing prose.
 fn sampling_disposition_error(
     accounts: &[crate::meter::sampler::AccountReport],
 ) -> Result<(), Error> {
@@ -1941,6 +1977,11 @@ fn sampling_disposition_error(
             crate::meter::sampler::AccountDisposition::PersistFailed { reason, .. } => {
                 return Err(Error::Store(format!(
                     "evidence could not be durably preserved: {reason}"
+                )));
+            }
+            crate::meter::sampler::AccountDisposition::Spooled { reason, .. } => {
+                return Err(Error::IngestIncomplete(format!(
+                    "evidence durably spooled pending commit: {reason}"
                 )));
             }
             crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } => {
@@ -7844,6 +7885,40 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
                 assert!(message.contains("disk full"), "{message:?}");
             }
             other => panic!("PersistFailed must map to Error::Store, got {other:?}"),
+        }
+    }
+
+    /// The planted negative for the row above: a `Spooled` disposition means
+    /// the reading survived durably on disk, which is not the same event as
+    /// `PersistFailed` losing it, and today both exited 5 before this bead
+    /// (`aub-1r3m`). An implementation that collapsed the two onto one exit
+    /// class would still pass every other assertion in this file and fails
+    /// only here.
+    #[test]
+    fn a_spooled_disposition_becomes_an_ingest_incomplete_error_not_a_store_error() {
+        use crate::domain::attempt::{AttemptId, AttemptOutcome};
+        use crate::meter::sampler::{AccountDisposition, AccountReport};
+        use crate::store::sampling_lease::AccountName;
+
+        let spooled = AccountReport {
+            name: AccountName::new("work-a"),
+            disposition: AccountDisposition::Spooled {
+                attempt_id: AttemptId::new(9),
+                outcome: AttemptOutcome::Success,
+                reason: "database is locked".to_string(),
+            },
+        };
+        match sampling_disposition_error(std::slice::from_ref(&spooled)) {
+            Err(Error::IngestIncomplete(message)) => {
+                assert!(message.contains("spooled"), "{message:?}");
+                assert!(message.contains("database is locked"), "{message:?}");
+                assert_eq!(
+                    Error::IngestIncomplete(message).exit_class(),
+                    crate::error::ExitClass::IngestIncomplete,
+                    "a spooled result's exit class must not coincide with Store's"
+                );
+            }
+            other => panic!("Spooled must map to Error::IngestIncomplete, got {other:?}"),
         }
     }
 
