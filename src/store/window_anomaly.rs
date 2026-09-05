@@ -1031,7 +1031,7 @@ mod tests {
             &fx,
             40_000,
             50_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(100_035_000)),
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(3_000_035_000)),
         );
         let outcome = detect_and_persist(
             &fx.conn,
