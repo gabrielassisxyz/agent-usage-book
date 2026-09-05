@@ -46,6 +46,15 @@ fn migrated_db_path(state_dir: &Path) -> PathBuf {
 /// Mirrors `crate::ingest::run`'s own pattern (`IngestPass` commits, then
 /// `INTER_BATCH_YIELD`) at the level that actually contends for the writer
 /// slot.
+///
+/// The stub's own lock wait is not a property under test, so it waits as
+/// long as it takes: a 30 s busy timeout (the store's bound, the most a
+/// connection may configure) plus a retry loop over busy errors. Only a
+/// non-busy failure ends the test. Without this, a sampler commit's fsync
+/// stalling behind saturated IO holds the writer slot past a short timeout
+/// and the stub's own expect fires, failing a test no change under review
+/// touched (measured 2026-09-05: a 1 s timeout expired under load average
+/// 12 to 20 with IO pressure at 75 to 90 percent).
 fn run_stub_batched_ingest(
     db_path: &Path,
     hold: StdDuration,
@@ -54,7 +63,7 @@ fn run_stub_batched_ingest(
     stop: &AtomicBool,
 ) {
     let policy = PragmaPolicy {
-        busy_timeout: MonotonicDuration::from_millis(1_000),
+        busy_timeout: MonotonicDuration::from_millis(30_000),
     };
     for _ in 0..iterations {
         if stop.load(Ordering::Relaxed) {
@@ -62,9 +71,22 @@ fn run_stub_batched_ingest(
         }
         let mut conn = open(db_path, AccessMode::ReadWrite, &policy)
             .expect("stub ingest connection must open");
-        let tx = conn
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .expect("stub ingest batch must acquire the writer slot");
+        let tx = loop {
+            match conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate) {
+                Ok(tx) => break tx,
+                Err(error) => {
+                    let message = error.to_string();
+                    let busy = message.contains("database is locked") || message.contains("busy");
+                    if !busy {
+                        panic!("stub ingest batch must acquire the writer slot: {error:?}");
+                    }
+                    if stop.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    thread::sleep(StdDuration::from_millis(10));
+                }
+            }
+        };
         thread::sleep(hold);
         tx.commit().expect("stub ingest batch must commit");
         thread::sleep(yield_for);
@@ -96,12 +118,18 @@ fn every_sample_tick_gets_through_a_batched_ingest_within_the_busy_timeout() {
         );
     });
 
-    // The sampler's own busy timeout: what `sample_command` now opens the
-    // store with (`config.sampling.busy_timeout`), generous enough to
-    // outlast one batch's hold, unlike the hardcoded 500ms this bead fixed
-    // to be exactly this instead of a hardcoded value below any batch hold.
+    // The sampler's busy timeout, derived from the stub's hold rather than
+    // from the machine being idle: the stub holds the writer slot 80 ms per
+    // batch, and either side's commit fsync can stall for seconds behind
+    // saturated IO (2026-09-05: past 1 s under load average 12 to 20 with IO
+    // pressure at 75 to 90 percent). 10 s is the production default
+    // `config.sampling.busy_timeout`, 125 times the 80 ms hold, so the
+    // roughly 9.9 s margin absorbs those stalls while still proving what
+    // `aub-va6s` proved: short holds never refuse. A lock held past the
+    // whole timeout still refuses; that half is covered by the second test
+    // below, which holds the lock for the full wait on purpose.
     let sampler_policy = PragmaPolicy {
-        busy_timeout: MonotonicDuration::from_millis(500),
+        busy_timeout: MonotonicDuration::from_millis(10_000),
     };
     let mut refusals: Vec<String> = Vec::new();
     for tick in 0..20u32 {
