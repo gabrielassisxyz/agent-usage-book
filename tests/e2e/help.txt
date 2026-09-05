@@ -90,7 +90,7 @@ sample:
   answers: are configured accounts due for meter sampling, and what did the endpoints observe?
   refuses: --explain (sample derives no quantity); --model (sample operates on configured accounts, not models); --no-color (sample prints plain status or json)
   format: text | json
-  options: --due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success
+  options: --due | --account NAME | --if-due | --session-id SESSION | --run-id RUN | --require-success
 
 now:
   answers: how much quota does each configured account have right now?

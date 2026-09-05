@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::store::migrate::Migration;
 
 /// The schema version this step produces.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 27;
 
 const ADD_PROVIDER_WINDOW_FACTS: &str = "\
 ALTER TABLE meter_window ADD COLUMN is_active INTEGER NOT NULL DEFAULT 1 CHECK (

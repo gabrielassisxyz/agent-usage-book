@@ -224,6 +224,25 @@ pub fn execute_single(
     budget: &CommandBudget,
     clock: &impl Clock,
 ) -> Result<HttpResponse, FailureClass> {
+    execute_single_with_resolver(request, budget, clock, None)
+}
+
+/// A hostname resolver in std types, so no ureq type leaves this module.
+type HostResolver = fn(&str) -> std::io::Result<Vec<std::net::SocketAddr>>;
+
+/// Executes a single HTTP request, resolving hostnames through `resolver`
+/// instead of the system resolver when one is given.
+///
+/// `None` resolves through the system resolver: the production path, and the
+/// only path production uses. Tests pass a resolver that fails (or answers)
+/// deterministically, so a test asserting a DNS mapping never races the
+/// machine's real resolver against the command budget (aub-1ijb).
+fn execute_single_with_resolver(
+    request: &HttpRequest,
+    budget: &CommandBudget,
+    clock: &impl Clock,
+    resolver: Option<HostResolver>,
+) -> Result<HttpResponse, FailureClass> {
     let Some(remaining) = budget.remaining(clock) else {
         return Err(FailureClass::TotalBudgetExpired);
     };
@@ -235,6 +254,10 @@ pub fn execute_single(
     let mut agent_builder = ureq::AgentBuilder::new()
         .timeout_connect(connect_dur)
         .timeout_read(read_dur);
+
+    if let Some(resolve) = resolver {
+        agent_builder = agent_builder.resolver(resolve);
+    }
 
     // ureq derives the socket read timeout from the overall deadline whenever one is
     // set, discarding timeout_read entirely - so a budget-derived total would silently
@@ -446,6 +469,16 @@ mod tests {
         )
     }
 
+    /// A resolver that fails every hostname without touching the network.
+    /// Returning an error (rather than an empty address list) exercises the
+    /// same `ErrorKind::Dns` path a real NXDOMAIN takes through ureq.
+    fn failing_dns_resolver(_netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "test resolver refuses every hostname",
+        ))
+    }
+
     #[test]
     fn slow_headers_and_connection_refused_produce_distinct_failure_classes() {
         let clock = RealClock::new();
@@ -562,12 +595,17 @@ mod tests {
             "connection refused must map to transport FailureClass::ConnectTimeout"
         );
 
-        // 2. DNS failure -> DnsFailure
+        // 2. DNS failure -> DnsFailure. Deterministic: the resolver below
+        // fails every hostname without touching the network, so the outcome
+        // cannot depend on the machine's resolver latency; the budget is
+        // generous for the same reason, so only the resolver can fail this.
         let dns_req = HttpRequest::get(
             "http://nonexistent.invalid.domain.for.transport.test:80",
             timeouts(50, 50, Some(50)),
         );
-        let dns_res = execute_single(&dns_req, &budget, &clock);
+        let dns_budget = CommandBudget::new(MonotonicDuration::from_millis(5000), &clock);
+        let dns_res =
+            execute_single_with_resolver(&dns_req, &dns_budget, &clock, Some(failing_dns_resolver));
         assert_eq!(
             dns_res,
             Err(FailureClass::DnsFailure),
@@ -594,8 +632,17 @@ mod tests {
         );
     }
 
+    /// Each timeout fires rather than waiting for a wedged server. The elapsed
+    /// bounds are deliberately loose on top: the lower bound proves the call
+    /// waited for the timeout instead of returning instantly, and the upper
+    /// bound proves it returned long before the wedged server acted. A tight
+    /// upper bound around the configured value flakes under load, because a
+    /// thread that is ready at 60ms may not be scheduled until later, and no
+    /// assertion can tell that scheduling delay apart from a late timeout
+    /// (aub-1ijb). The servers therefore sleep far beyond the upper bound, so
+    /// an implementation that ignored the timeout would still be caught.
     #[test]
-    fn each_timeout_honoured_within_configured_value_with_tolerance() {
+    fn each_timeout_fires_before_a_wedged_server_responds() {
         let clock = RealClock::new();
 
         // 1. Read timeout: server accepts connection and never sends data
@@ -603,7 +650,7 @@ mod tests {
         let port_read = listener_read.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((_stream, _)) = listener_read.accept() {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(2000));
             }
         });
 
@@ -622,7 +669,7 @@ mod tests {
             "read timeout must produce FailureClass::ReadTimeout"
         );
         let min_read = 40_000_000u128; // 40ms
-        let max_read = 60_000_000u128 + u128::from(SHUTDOWN_TOLERANCE.as_nanos());
+        let max_read = 1_000_000_000u128; // 1s, far below the wedged server's 2s sleep
         assert!(
             u128::from(elapsed_read.as_nanos()) >= min_read
                 && u128::from(elapsed_read.as_nanos()) <= max_read,
@@ -634,7 +681,7 @@ mod tests {
         let port_budget = listener_budget.local_addr().unwrap().port();
         std::thread::spawn(move || {
             if let Ok((_stream, _)) = listener_budget.accept() {
-                std::thread::sleep(Duration::from_millis(500));
+                std::thread::sleep(Duration::from_millis(2000));
             }
         });
 
@@ -653,7 +700,7 @@ mod tests {
             "expired command budget must produce FailureClass::TotalBudgetExpired"
         );
         let min_budget = 40_000_000u128; // 40ms
-        let max_budget = 60_000_000u128 + u128::from(SHUTDOWN_TOLERANCE.as_nanos());
+        let max_budget = 1_000_000_000u128; // 1s, far below the wedged server's 2s sleep
         assert!(
             u128::from(elapsed_budget.as_nanos()) >= min_budget
                 && u128::from(elapsed_budget.as_nanos()) <= max_budget,

@@ -27,13 +27,15 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::calibration::settlement::{SettlementCriterion, SettlementPolicy};
 use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
 use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
 use crate::domain::provenance::{
     CostModelId, EvidenceId, WindowCalibrationId, canonical_inputs_hash,
 };
+use crate::domain::quota::QuotaFractionPpm;
 use crate::domain::time::{MonotonicDuration, UtcTimestamp};
-use crate::domain::window::WindowSemanticKey;
+use crate::domain::window::{ReportedResolution, WindowSemanticKey};
 use crate::error::Error;
 use crate::store::cost_model::{ProviderKey, ValidityInterval};
 
@@ -325,6 +327,7 @@ pub struct CalibrationExperiment {
     pub window_semantic_key: WindowSemanticKey,
     pub meter_semantics_id: MeterSemanticsId,
     pub billing_semantics_id: BillingSemanticsId,
+    pub settlement_policy: SettlementPolicy,
     pub validity: ValidityInterval,
     pub knowledge_time: UtcTimestamp,
 }
@@ -583,7 +586,13 @@ impl CalibrationEventKind {
 // --- column lists -----------------------------------------------------------
 
 const EXPERIMENT_COLUMNS: &str = "experiment_id, provider, plan_tier, window_semantic_key, \
-     meter_semantics_id, billing_semantics_id, valid_from, valid_until, knowledge_time";
+     meter_semantics_id, billing_semantics_id, valid_from, valid_until, knowledge_time, \
+     settlement_policy_version, baseline_sampling_interval_nanos, baseline_observation_count, \
+     baseline_minimum_span_nanos, baseline_max_change_resolution_units, \
+     baseline_maximum_settlement_window_nanos, baseline_reported_resolution_ppm, \
+     terminal_sampling_interval_nanos, terminal_observation_count, terminal_minimum_span_nanos, \
+     terminal_max_change_resolution_units, terminal_maximum_settlement_window_nanos, \
+     terminal_reported_resolution_ppm, settlement_shared_criteria_reason";
 
 const CANDIDATE_COLUMNS: &str = "candidate_id, provider, plan_tier, window_semantic_key, \
      fitted_micros_per_point, equivalent_full_window_capacity_micros, fit_residual_micros, \
@@ -637,6 +646,75 @@ fn uncertainty_from_row(low: i64, high: i64) -> Result<CoefficientUncertainty, E
     CoefficientUncertainty::new(ppp(low), ppp(high))
 }
 
+fn duration_from_row(
+    row: &Row<'_>,
+    index: usize,
+    role: &str,
+    field: &str,
+) -> Result<MonotonicDuration, Error> {
+    let nanos = get::<i64>(row, index)?;
+    u64::try_from(nanos)
+        .map(MonotonicDuration::from_nanos)
+        .map_err(|_| Error::Store(format!("stored {role} settlement {field} is negative")))
+}
+
+fn u32_from_row(row: &Row<'_>, index: usize, role: &str, field: &str) -> Result<u32, Error> {
+    let value = get::<i64>(row, index)?;
+    u32::try_from(value).map_err(|_| {
+        Error::Store(format!(
+            "stored {role} settlement {field} is outside the u32 range"
+        ))
+    })
+}
+
+fn resolution_from_row(
+    row: &Row<'_>,
+    index: usize,
+    role: &str,
+) -> Result<ReportedResolution, Error> {
+    let value = get::<i64>(row, index)?;
+    let value = i32::try_from(value).map_err(|_| {
+        Error::Store(format!(
+            "stored {role} settlement reported resolution is outside the i32 range"
+        ))
+    })?;
+    let ppm = QuotaFractionPpm::new(value).ok_or_else(|| {
+        Error::Store(format!(
+            "stored {role} settlement reported resolution is invalid"
+        ))
+    })?;
+    ReportedResolution::new(ppm).ok_or_else(|| {
+        Error::Store(format!(
+            "stored {role} settlement reported resolution cannot be zero"
+        ))
+    })
+}
+
+fn settlement_criterion_from_row(
+    row: &Row<'_>,
+    first_index: usize,
+    role: &str,
+) -> Result<SettlementCriterion, Error> {
+    SettlementCriterion::new(
+        duration_from_row(row, first_index, role, "sampling interval")?,
+        u32_from_row(row, first_index + 1, role, "observation count")?,
+        duration_from_row(row, first_index + 2, role, "minimum span")?,
+        u32_from_row(row, first_index + 3, role, "maximum change")?,
+        duration_from_row(row, first_index + 4, role, "maximum window")?,
+        resolution_from_row(row, first_index + 5, role)?,
+    )
+    .map_err(|error| Error::Store(format!("invalid {role} settlement criterion: {error}")))
+}
+
+fn settlement_policy_from_row(row: &Row<'_>) -> Result<SettlementPolicy, Error> {
+    let baseline = settlement_criterion_from_row(row, 10, "baseline")?;
+    let terminal = settlement_criterion_from_row(row, 16, "terminal")?;
+    let shared_reason = get::<String>(row, 22)?;
+    let shared_reason = (!shared_reason.is_empty()).then_some(shared_reason);
+    SettlementPolicy::new(get::<String>(row, 9)?, baseline, terminal, shared_reason)
+        .map_err(|error| Error::Store(format!("invalid settlement policy: {error}")))
+}
+
 fn experiment_from_row(row: &Row<'_>) -> Result<CalibrationExperiment, Error> {
     Ok(CalibrationExperiment {
         id: ExperimentId::new(get::<String>(row, 0)?),
@@ -650,6 +728,7 @@ fn experiment_from_row(row: &Row<'_>) -> Result<CalibrationExperiment, Error> {
             UtcTimestamp::from_unix_nanos(get::<i64>(row, 7)?),
         )?,
         knowledge_time: UtcTimestamp::from_unix_nanos(get::<i64>(row, 8)?),
+        settlement_policy: settlement_policy_from_row(row)?,
     })
 }
 
@@ -739,12 +818,29 @@ pub fn insert_experiment(
     conn: &Connection,
     experiment: &CalibrationExperiment,
 ) -> Result<ExperimentDbId, Error> {
+    let policy = &experiment.settlement_policy;
+    let baseline = policy.baseline();
+    let terminal = policy.terminal();
+    let sqlite_duration = |duration: MonotonicDuration, field: &str| {
+        i64::try_from(duration.as_nanos())
+            .map_err(|_| Error::Store(format!("settlement {field} does not fit in SQLite INTEGER")))
+    };
     let id = conn
         .query_row(
             "INSERT INTO calibration_experiment (
                 experiment_id, provider, plan_tier, window_semantic_key,
-                meter_semantics_id, billing_semantics_id, valid_from, valid_until, knowledge_time
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id",
+                meter_semantics_id, billing_semantics_id, valid_from, valid_until, knowledge_time,
+                settlement_policy_version, baseline_sampling_interval_nanos,
+                baseline_observation_count, baseline_minimum_span_nanos,
+                baseline_max_change_resolution_units, baseline_maximum_settlement_window_nanos,
+                baseline_reported_resolution_ppm, terminal_sampling_interval_nanos,
+                terminal_observation_count, terminal_minimum_span_nanos,
+                terminal_max_change_resolution_units, terminal_maximum_settlement_window_nanos,
+                terminal_reported_resolution_ppm, settlement_shared_criteria_reason
+            ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+                ?17, ?18, ?19, ?20, ?21, ?22, ?23
+            ) RETURNING id",
             params![
                 experiment.id.as_str(),
                 experiment.provider.as_str(),
@@ -755,6 +851,26 @@ pub fn insert_experiment(
                 experiment.validity.valid_from().unix_nanos(),
                 experiment.validity.valid_until().unix_nanos(),
                 experiment.knowledge_time.unix_nanos(),
+                policy.version(),
+                sqlite_duration(baseline.sampling_interval(), "baseline sampling interval")?,
+                i64::from(baseline.required_observations()),
+                sqlite_duration(baseline.minimum_span(), "baseline minimum span")?,
+                i64::from(baseline.maximum_change_resolution_units()),
+                sqlite_duration(
+                    baseline.maximum_settlement_window(),
+                    "baseline maximum settlement window",
+                )?,
+                i64::from(baseline.reported_resolution().as_ppm().get()),
+                sqlite_duration(terminal.sampling_interval(), "terminal sampling interval")?,
+                i64::from(terminal.required_observations()),
+                sqlite_duration(terminal.minimum_span(), "terminal minimum span")?,
+                i64::from(terminal.maximum_change_resolution_units()),
+                sqlite_duration(
+                    terminal.maximum_settlement_window(),
+                    "terminal maximum settlement window",
+                )?,
+                i64::from(terminal.reported_resolution().as_ppm().get()),
+                policy.shared_criteria_reason().unwrap_or_default(),
             ],
             |row| row.get::<_, i64>(0),
         )
@@ -1326,6 +1442,12 @@ mod tests {
         ValidityInterval::new(ts(from), ts(until)).unwrap()
     }
 
+    fn settlement_policy() -> SettlementPolicy {
+        SettlementPolicy::conservative_default(
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+        )
+    }
+
     fn scope() -> CalibrationScope {
         CalibrationScope {
             provider: ProviderKey::new("anthropic"),
@@ -1346,6 +1468,7 @@ mod tests {
             window_semantic_key: WindowSemanticKey::new("account"),
             meter_semantics_id: MeterSemanticsId::new("meter-v1"),
             billing_semantics_id: BillingSemanticsId::new("billing-v1"),
+            settlement_policy: settlement_policy(),
             validity,
             knowledge_time: ts(knowledge),
         }
@@ -1407,6 +1530,42 @@ mod tests {
         insert_experiment(&conn, &exp).unwrap();
         let loaded = load_experiment(&conn, &exp.id).unwrap().unwrap();
         assert_eq!(loaded, exp);
+    }
+
+    #[test]
+    fn experiment_keeps_the_recorded_policy_when_a_later_policy_is_created() {
+        let (_scratch, conn) = fixture_conn();
+        let mut exp = experiment("exp-policy-snapshot", interval(100, 200), 300);
+        let recorded_policy = SettlementPolicy::new(
+            "policy-before-change",
+            SettlementCriterion::new(
+                MonotonicDuration::from_seconds(60),
+                2,
+                MonotonicDuration::from_seconds(60),
+                0,
+                MonotonicDuration::from_seconds(600),
+                ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            )
+            .unwrap(),
+            SettlementCriterion::new(
+                MonotonicDuration::from_seconds(120),
+                3,
+                MonotonicDuration::from_seconds(240),
+                1,
+                MonotonicDuration::from_seconds(1_200),
+                ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        exp.settlement_policy = recorded_policy.clone();
+        insert_experiment(&conn, &exp).unwrap();
+
+        let later_policy = settlement_policy();
+        assert_ne!(later_policy, recorded_policy);
+        let loaded = load_experiment(&conn, &exp.id).unwrap().unwrap();
+        assert_eq!(loaded.settlement_policy, recorded_policy);
     }
 
     #[test]
