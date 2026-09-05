@@ -264,6 +264,7 @@ mod tests {
             provider: "test-provider".to_string(),
             credential_kind: kind.to_string(),
             credential_detail: detail.to_string(),
+            exclusivity_policy: None,
         }
     }
 

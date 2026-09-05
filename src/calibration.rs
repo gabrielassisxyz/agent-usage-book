@@ -10,4 +10,5 @@
 pub mod contamination;
 pub mod fitter;
 pub mod health;
+pub mod passive;
 pub mod settlement;

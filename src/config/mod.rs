@@ -299,6 +299,26 @@ pub struct AccountConfig {
     pub provider: String,
     pub credential_kind: String,
     pub credential_detail: String,
+    pub exclusivity_policy: Option<String>,
+}
+
+impl AccountConfig {
+    /// True when this account's exclusivity policy permits passive calibration fitting (`aub-c0b.7`).
+    pub fn permits_passive_fitting(&self) -> bool {
+        match self.exclusivity_policy.as_deref() {
+            Some(
+                "forbid_passive"
+                | "forbid"
+                | "forbidden"
+                | "shared"
+                | "multi_consumer"
+                | "false"
+                | "dedicated_calibration_only"
+                | "dedicated",
+            ) => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -417,7 +437,13 @@ const TASK_DISTRIBUTION_KEYS: &[&str] = &[
 ];
 const CAN_RUN_KEYS: &[&str] = &["labels", "ample_margin_multiple", "headroom_bound"];
 const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible"];
-const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
+const ACCOUNT_KEYS: &[&str] = &[
+    "name",
+    "provider",
+    "credential",
+    "exclusivity",
+    "exclusivity_policy",
+];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
@@ -1322,6 +1348,11 @@ pub fn resolve(
                             .and_then(toml::Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
+                        exclusivity_policy: entry
+                            .get("exclusivity_policy")
+                            .or_else(|| entry.get("exclusivity"))
+                            .and_then(toml::Value::as_str)
+                            .map(|s| s.to_string()),
                     }
                 })
                 .collect()

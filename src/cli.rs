@@ -749,7 +749,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID]",
+                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status
@@ -4261,8 +4261,9 @@ fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
         Some("status") => calibrate_status_command(clock, invocation),
         Some("end") => calibrate_end_command(clock, invocation),
         Some("fit") => calibrate_fit(clock, invocation),
+        Some("passive") => calibrate_passive_command(clock, invocation),
         other => Err(Error::Usage(format!(
-            "calibrate requires a subcommand (begin | status | end | fit), got {other:?}"
+            "calibrate requires a subcommand (begin | status | end | fit | passive), got {other:?}"
         ))),
     }
 }
@@ -4924,6 +4925,105 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
                         }),
                     }
                 }).collect::<Vec<_>>(),
+            });
+            println!("{json}");
+        }
+    }
+    Ok(())
+}
+
+fn calibrate_passive_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let mut window: Option<String> = None;
+    let mut account: Option<String> = invocation.account.clone();
+    let mut iter = invocation.rest.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--window" {
+            let val = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--window requires a value".into()))?;
+            window = Some(val.clone());
+        } else if let Some(val) = arg.strip_prefix("--window=") {
+            if val.is_empty() {
+                return Err(Error::Usage("--window requires a value".into()));
+            }
+            window = Some(val.to_string());
+        } else if arg == "--account" {
+            let val = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--account requires a value".into()))?;
+            account = Some(val.clone());
+        } else if let Some(val) = arg.strip_prefix("--account=") {
+            if val.is_empty() {
+                return Err(Error::Usage("--account requires a value".into()));
+            }
+            account = Some(val.to_string());
+        } else {
+            return Err(Error::Usage(format!(
+                "unknown argument to calibrate passive: {arg}"
+            )));
+        }
+    }
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let conn = open_ledger(clock)?;
+    let report = crate::calibration::passive::run_passive_calibration_from_ledger(
+        &conn,
+        &config,
+        account.as_deref(),
+        window.as_deref(),
+        clock,
+    )?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!("calibrate passive report:");
+            println!("  intervals considered: {}", report.intervals_considered);
+            println!("  eligible intervals:   {}", report.eligible_intervals);
+            println!("  excluded intervals:   {}", report.excluded_intervals);
+            if !report.failing_condition_counts.is_empty() {
+                println!("failing condition counts:");
+                for (condition, count) in &report.failing_condition_counts {
+                    println!("  {condition}: {count}");
+                }
+            }
+            if let Some(candidate) = &report.candidate {
+                println!("candidate id:         {}", candidate.id.as_str());
+                println!(
+                    "fitted:               {} micros/point",
+                    candidate.fitted.micros_per_point()
+                );
+                println!(
+                    "capacity:             {} credits",
+                    candidate.equivalent_full_window_capacity.micros() as f64 / 1_000_000.0
+                );
+            } else {
+                println!("candidate:            none (no eligible intervals)");
+            }
+        }
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "intervals_considered": report.intervals_considered,
+                "eligible_intervals": report.eligible_intervals,
+                "excluded_intervals": report.excluded_intervals,
+                "failing_condition_counts": report.failing_condition_counts,
+                "candidate": report.candidate.as_ref().map(|c| serde_json::json!({
+                    "candidate_id": c.id.as_str(),
+                    "experiment_id": c.experiment.as_str(),
+                    "provider": c.provider.as_str(),
+                    "plan_tier": c.plan_tier.as_str(),
+                    "window_semantic_key": c.window_semantic_key.as_str(),
+                    "fitted_micros_per_point": c.fitted.micros_per_point(),
+                    "equivalent_full_window_capacity_micros": c.equivalent_full_window_capacity.micros(),
+                })),
             });
             println!("{json}");
         }
