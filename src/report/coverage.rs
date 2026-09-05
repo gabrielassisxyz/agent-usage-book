@@ -31,6 +31,8 @@ use crate::store::{
     sampling_policy_snapshot,
 };
 
+pub use crate::store::account::AccountIdentity;
+
 /// The four classes PLAN.md section 15 distinguishes in measurement coverage:
 /// authentication outage, rate limiting, provider outage, and parser or
 /// API-schema breakage. One group per detail line, so the report names what
@@ -172,6 +174,7 @@ pub fn assemble(
     selector: &CoverageSelector,
     floors: CoverageFloors,
     now: UtcTimestamp,
+    configured_accounts: &[AccountIdentity],
 ) -> Result<CoverageReport, Error> {
     let recorded = account::all_accounts(conn)?;
     let selected: Vec<_> = match &selector.account {
@@ -295,12 +298,17 @@ pub fn assemble(
             ValueArithmetic::Count,
         );
 
+        let is_configured = configured_accounts
+            .iter()
+            .any(|configured| configured == &recorded.identity());
+
         accounts.push(CoverageAccount {
             name: LogicalName::new(recorded.logical_name().to_string()),
             engine,
             failures,
             resets_in_gaps,
             legacy_evidence_present: legacy_observations > 0,
+            configured: is_configured,
             provenance: node,
         });
     }
@@ -330,9 +338,16 @@ pub fn assemble(
 /// force, a zero denominator, no terminal attempt) is never judged against a
 /// floor: a missing number is reported as missing, and inventing a breach or
 /// a pass for it would both be guesses.
+///
+/// Accounts absent from the resolved configuration are excluded from the
+/// threshold verdict: only accounts the sampler was told to observe can
+/// breach coverage.
 fn verdict(accounts: &[CoverageAccount], floors: CoverageFloors) -> CoverageThreshold {
     let mut breaches = Vec::<CoverageBreach>::new();
     for account in accounts {
+        if !account.configured {
+            continue;
+        }
         if let Some(coverage) = account.engine.attempt_coverage
             && coverage.as_f64() < floors.attempt.get()
         {
@@ -433,6 +448,333 @@ mod tests {
                 (CoverageFailureGroup::ResponseUnusable, 1),
             ],
             "non-zero groups are ordered by count, largest first"
+        );
+    }
+
+    use crate::config::CoverageFloor;
+    use crate::coverage::CoverageFraction;
+    use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+    use crate::domain::time::{FakeClock, MeasurementBasis, MonotonicDuration};
+    use crate::store::connection::{self, AccessMode, PragmaPolicy};
+    use crate::store::meter_attempt::{self, DueReason, NewMeterAttempt, NewMeterAttemptResult};
+    use crate::store::meter_evidence::{self, NewMeterObservation, NewMeterResponseEvidence};
+    use crate::store::migrate;
+    use crate::store::migrations;
+    use crate::store::sample_run::{self, Trigger};
+    use crate::store::sampling_policy_snapshot::{self, ResolvedSamplingPolicy};
+    use test_support::StateDir;
+
+    fn open_test_ledger(state: &StateDir) -> rusqlite::Connection {
+        let path = state.path().join(connection::LEDGER_DATABASE_FILE);
+        let policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = connection::open(&path, AccessMode::ReadWrite, &policy)
+            .expect("scratch ledger must open");
+        migrate::run_migrations(
+            &mut conn,
+            &migrations::registry(),
+            None,
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+        )
+        .expect("scratch ledger must migrate");
+        conn
+    }
+
+    fn test_policy(cadence_secs: u64) -> ResolvedSamplingPolicy {
+        ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(cadence_secs),
+            freshness_horizon: MonotonicDuration::from_seconds(cadence_secs * 3),
+            reset_edge_policy: "lead-0s".to_string(),
+            retry_backoff_policy: "none".to_string(),
+            command_budget: MonotonicDuration::from_seconds(30),
+            policy_algorithm_version: "v1".to_string(),
+        }
+    }
+
+    fn test_floors() -> CoverageFloors {
+        CoverageFloors {
+            attempt: CoverageFloor::new(0.95).unwrap(),
+            measurement: CoverageFloor::new(0.90).unwrap(),
+        }
+    }
+
+    fn seed_test_attempt_with_observation(
+        conn: &rusqlite::Connection,
+        run: sample_run::SampleRunId,
+        account: account::AccountId,
+        snapshot: sampling_policy_snapshot::SamplingPolicySnapshotId,
+        started: UtcTimestamp,
+    ) {
+        let row = meter_attempt::start_meter_attempt(
+            conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "anthropic".into(),
+                request_started_at: started,
+                credential_context_id: None,
+                policy_snapshot_id: snapshot,
+                due_at: started,
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "test-contract".into(),
+                meter_semantics_id: "test-semantics".into(),
+            },
+        )
+        .expect("attempt must insert");
+        let finished = UtcTimestamp::from_unix_nanos(started.unix_nanos() + 1_000_000_000);
+        meter_attempt::record_meter_attempt_result(
+            conn,
+            &NewMeterAttemptResult {
+                attempt_id: row,
+                completed_at: finished,
+                elapsed: MonotonicDuration::from_millis(100),
+                outcome: AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .expect("attempt result must insert");
+        let evidence = meter_evidence::insert_response_evidence(
+            conn,
+            &NewMeterResponseEvidence {
+                attempt_id: row,
+                response_classification: "200".into(),
+                received_at: finished,
+                provider_observed_at_original: None,
+                evidence_capsule: "{}".into(),
+                capsule_schema_version: "capsule-v1".into(),
+                sanitizer_version: "san-v1".into(),
+                capture_truncated: false,
+            },
+        )
+        .expect("evidence must insert");
+        meter_evidence::insert_observation(
+            conn,
+            &NewMeterObservation {
+                attempt_id: row,
+                evidence_id: evidence,
+                account_id: account,
+                provider: "anthropic".into(),
+                provider_observed_at: Some(finished),
+                received_at: finished,
+                measurement_basis: MeasurementBasis::ProviderObserved,
+                observed_plan: None,
+                observed_tier: None,
+                adapter_version: AdapterVersion::new("adapter-v1"),
+                provider_contract_id: ProviderContractId::new("test-contract"),
+                meter_semantics_id: MeterSemanticsId::new("test-semantics"),
+                normalized_fingerprint: format!("fp-{}", started.unix_nanos()),
+            },
+        )
+        .expect("observation must insert");
+    }
+
+    #[test]
+    fn unconfigured_account_with_observations_and_snapshot_produces_no_breach() {
+        let state = StateDir::new();
+        let conn = open_test_ledger(&state);
+        let since = UtcTimestamp::from_unix_nanos(100_000_000_000);
+        let until = UtcTimestamp::from_unix_nanos(200_000_000_000);
+        let run = sample_run::start_sample_run(&conn, Trigger::Timer, since, "test-run")
+            .expect("sample run must insert");
+        let account = account::observe_account(&conn, "anthropic", "retired", since)
+            .expect("account must insert");
+        let snapshot = sampling_policy_snapshot::resolve_policy_snapshot(
+            &conn,
+            account,
+            since,
+            &test_policy(10),
+        )
+        .expect("policy snapshot must insert");
+        seed_test_attempt_with_observation(
+            &conn,
+            run,
+            account,
+            snapshot,
+            UtcTimestamp::from_unix_nanos(110_000_000_000),
+        );
+
+        let selector = CoverageSelector::default();
+        let configured = [AccountIdentity::new("anthropic", "active")];
+        let report = assemble(
+            &conn,
+            since,
+            until,
+            &selector,
+            test_floors(),
+            until,
+            &configured,
+        )
+        .expect("report must assemble");
+
+        assert_eq!(report.accounts.len(), 1);
+        let acct = &report.accounts[0];
+        assert_eq!(acct.name.as_str(), "retired");
+        assert!(
+            !acct.configured,
+            "account absent from config must have configured=false"
+        );
+        assert!(
+            report.threshold.met,
+            "an unconfigured account must not breach coverage threshold"
+        );
+        assert!(
+            report.threshold.breaches.is_empty(),
+            "an unconfigured account must produce no breach"
+        );
+    }
+
+    #[test]
+    fn configured_account_below_floor_still_produces_breach() {
+        let state = StateDir::new();
+        let conn = open_test_ledger(&state);
+        let since = UtcTimestamp::from_unix_nanos(100_000_000_000);
+        let until = UtcTimestamp::from_unix_nanos(200_000_000_000);
+        let run = sample_run::start_sample_run(&conn, Trigger::Timer, since, "test-run")
+            .expect("sample run must insert");
+        let account = account::observe_account(&conn, "anthropic", "failing", since)
+            .expect("account must insert");
+        let snapshot = sampling_policy_snapshot::resolve_policy_snapshot(
+            &conn,
+            account,
+            since,
+            &test_policy(10),
+        )
+        .expect("policy snapshot must insert");
+        seed_test_attempt_with_observation(
+            &conn,
+            run,
+            account,
+            snapshot,
+            UtcTimestamp::from_unix_nanos(110_000_000_000),
+        );
+
+        let selector = CoverageSelector::default();
+        let configured = [AccountIdentity::new("anthropic", "failing")];
+        let report = assemble(
+            &conn,
+            since,
+            until,
+            &selector,
+            test_floors(),
+            until,
+            &configured,
+        )
+        .expect("report must assemble");
+
+        assert_eq!(report.accounts.len(), 1);
+        let acct = &report.accounts[0];
+        assert_eq!(acct.name.as_str(), "failing");
+        assert!(
+            acct.configured,
+            "account in config must have configured=true"
+        );
+        assert!(
+            !report.threshold.met,
+            "a configured account below floor must breach coverage threshold"
+        );
+        assert_eq!(report.threshold.breaches.len(), 1);
+        assert_eq!(report.threshold.breaches[0].account.as_str(), "failing");
+        assert_eq!(
+            report.threshold.breaches[0].dimension,
+            CoverageBreachDimension::Attempt
+        );
+    }
+
+    #[test]
+    fn configured_account_with_zero_attempts_and_covering_snapshot_produces_breach() {
+        let state = StateDir::new();
+        let conn = open_test_ledger(&state);
+        let since = UtcTimestamp::from_unix_nanos(100_000_000_000);
+        let until = UtcTimestamp::from_unix_nanos(200_000_000_000);
+        let account = account::observe_account(&conn, "anthropic", "zero-attempts", since)
+            .expect("account must insert");
+        let _snapshot = sampling_policy_snapshot::resolve_policy_snapshot(
+            &conn,
+            account,
+            since,
+            &test_policy(10),
+        )
+        .expect("policy snapshot must insert");
+
+        let selector = CoverageSelector::default();
+        let configured = [AccountIdentity::new("anthropic", "zero-attempts")];
+        let report = assemble(
+            &conn,
+            since,
+            until,
+            &selector,
+            test_floors(),
+            until,
+            &configured,
+        )
+        .expect("report must assemble");
+
+        assert_eq!(report.accounts.len(), 1);
+        let acct = &report.accounts[0];
+        assert_eq!(acct.name.as_str(), "zero-attempts");
+        assert!(
+            acct.configured,
+            "account in config must have configured=true"
+        );
+        assert_eq!(acct.engine.attempted_opportunities, 0);
+        assert_eq!(acct.engine.attempt_coverage, CoverageFraction::new(0, 10));
+        assert!(
+            !report.threshold.met,
+            "a configured account with zero attempts must breach coverage threshold"
+        );
+        assert_eq!(report.threshold.breaches.len(), 1);
+        assert_eq!(
+            report.threshold.breaches[0].account.as_str(),
+            "zero-attempts"
+        );
+        assert_eq!(
+            report.threshold.breaches[0].dimension,
+            CoverageBreachDimension::Attempt
+        );
+    }
+
+    #[test]
+    fn identity_match_requires_matching_provider_and_logical_name() {
+        let state = StateDir::new();
+        let conn = open_test_ledger(&state);
+        let since = UtcTimestamp::from_unix_nanos(100_000_000_000);
+        let until = UtcTimestamp::from_unix_nanos(200_000_000_000);
+        let account = account::observe_account(&conn, "other-provider", "same-name", since)
+            .expect("account must insert");
+        let _snapshot = sampling_policy_snapshot::resolve_policy_snapshot(
+            &conn,
+            account,
+            since,
+            &test_policy(10),
+        )
+        .expect("policy snapshot must insert");
+
+        let configured = [AccountIdentity::new("anthropic", "same-name")];
+        let report = assemble(
+            &conn,
+            since,
+            until,
+            &CoverageSelector::default(),
+            test_floors(),
+            until,
+            &configured,
+        )
+        .expect("report must assemble");
+
+        assert_eq!(report.accounts.len(), 1);
+        let acct = &report.accounts[0];
+        assert_eq!(acct.name.as_str(), "same-name");
+        assert!(
+            !acct.configured,
+            "account with mismatched provider must not match configured identity"
+        );
+        assert!(
+            report.threshold.met,
+            "unconfigured account must not trigger breach"
         );
     }
 }

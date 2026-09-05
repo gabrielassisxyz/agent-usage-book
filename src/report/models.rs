@@ -675,6 +675,9 @@ pub struct CoverageAccount {
     /// Historical observations imported from the legacy series. They are
     /// visible here, but excluded from the scheduler's attempt denominator.
     pub legacy_evidence_present: bool,
+    /// True when the account matches an account in the active configuration.
+    /// An unconfigured account is excluded from the coverage threshold verdict.
+    pub configured: bool,
     /// The provenance node for this account's coverage quantities.
     pub provenance: ProvenanceNode,
 }
@@ -1161,6 +1164,7 @@ mod tests {
                 failures: crate::report::coverage::CoverageFailureTally::default(),
                 resets_in_gaps: Vec::new(),
                 legacy_evidence_present: false,
+                configured: true,
                 provenance: node,
             }],
         )

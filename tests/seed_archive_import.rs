@@ -7,7 +7,7 @@ use agent_usage_book::domain::time::{
     FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
 };
 use agent_usage_book::report::coverage::{
-    CoverageFloors, CoverageSelector, assemble as assemble_coverage,
+    AccountIdentity, CoverageFloors, CoverageSelector, assemble as assemble_coverage,
 };
 use agent_usage_book::seed_archive::{SeedArchiveRecord, read_source};
 use agent_usage_book::store::connection::{AccessMode, LEDGER_DATABASE_FILE, PragmaPolicy, open};
@@ -307,6 +307,7 @@ fn unit_seed_failure_records_import_as_attempted_and_failed_distinguishable_from
         },
         floors,
         until,
+        &[AccountIdentity::new("anthropic", "primary")],
     )
     .unwrap();
 
@@ -455,6 +456,7 @@ fn integration_coverage_over_seed_interval_uses_seed_cadence_as_denominator() {
         },
         floors,
         until,
+        &[AccountIdentity::new("anthropic", "primary")],
     )
     .unwrap();
 
