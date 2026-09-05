@@ -149,7 +149,7 @@ impl ContaminationThresholds {
             post_settlement_max_movement_ppm,
             post_settlement_grace,
             flat_credits_min_meter_movement_ppm,
-            flat_credits_max_local: flat_credits_max_local,
+            flat_credits_max_local,
         })
     }
 
