@@ -114,6 +114,7 @@ pub enum DurableClass {
 
     // Core SQLite tables: Disposable
     SamplingLease,
+    SessionHeartbeat,
 
     // Non-table persisted artifacts
     StatusProjection,
@@ -173,6 +174,7 @@ impl DurableClass {
             | Self::RateCard => DurableClassCategory::ReferenceData,
 
             Self::SamplingLease
+            | Self::SessionHeartbeat
             | Self::StatusProjection
             | Self::PendingObservationSpool
             | Self::RetainedProviderBody => DurableClassCategory::Disposable,
@@ -228,7 +230,7 @@ impl DurableClass {
             },
 
             Self::StatusProjection => RetentionRule::SingleCurrentFile,
-            Self::SamplingLease => RetentionRule::TransientLease,
+            Self::SamplingLease | Self::SessionHeartbeat => RetentionRule::TransientLease,
             Self::PendingObservationSpool => RetentionRule::EphemeralStaging,
             Self::RetainedProviderBody => RetentionRule::CountBounded { max_entries: 100 },
         }
@@ -244,6 +246,7 @@ impl DurableClass {
             Self::LedgerGeneration => Some("ledger_generation"),
             Self::IngestionGeneration => Some("ingestion_generation"),
             Self::SessionAccountMarker => Some("session_account_marker"),
+            Self::SessionHeartbeat => Some("session_heartbeat"),
             Self::UsageOccurrence => Some("usage_occurrence"),
             Self::TranscriptFile => Some("transcript_file"),
             Self::TaskEvent => Some("task_event"),
@@ -361,7 +364,8 @@ impl DurableClass {
             | Self::RateCard
             | Self::StatusProjection
             | Self::PendingObservationSpool
-            | Self::RetainedProviderBody => None,
+            | Self::RetainedProviderBody
+            | Self::SessionHeartbeat => None,
         }
     }
 
@@ -375,6 +379,7 @@ impl DurableClass {
             Self::LedgerGeneration,
             Self::IngestionGeneration,
             Self::SessionAccountMarker,
+            Self::SessionHeartbeat,
             Self::UsageOccurrence,
             Self::TranscriptFile,
             Self::TaskEvent,
@@ -422,6 +427,7 @@ impl DurableClass {
             Self::LedgerGeneration,
             Self::IngestionGeneration,
             Self::SessionAccountMarker,
+            Self::SessionHeartbeat,
             Self::UsageOccurrence,
             Self::TranscriptFile,
             Self::TaskEvent,
