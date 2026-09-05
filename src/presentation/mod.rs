@@ -15,11 +15,12 @@ pub mod render;
 pub mod vocabulary;
 
 pub use json::{
-    JsonContractError, JsonEnvelope, ParsedEnvelope, Quantity, SCHEMA_VERSION, can_run_json,
-    can_run_json_with_explain, clear_diagnostics_json, coverage_and_quality_json, coverage_json,
-    doctor_drift_json, doctor_report_json, error_envelope_json, explain_json, fix_report_json,
-    freshness_json, interval_from_json, interval_json, now_json, now_json_with_explain,
-    provenance_from_json, provenance_json, reconciliation_json, spend_json,
+    JsonContractError, JsonEnvelope, ParsedEnvelope, Quantity, SCHEMA_VERSION,
+    calibrate_activate_json, calibrate_compare_json, calibrate_history_json, calibrate_show_json,
+    can_run_json, can_run_json_with_explain, clear_diagnostics_json, coverage_and_quality_json,
+    coverage_json, doctor_drift_json, doctor_report_json, error_envelope_json, explain_json,
+    fix_report_json, freshness_json, interval_from_json, interval_json, now_json,
+    now_json_with_explain, provenance_from_json, provenance_json, reconciliation_json, spend_json,
     spend_json_with_explain, status_json, status_json_with_explain, validate_can_run_report_json,
     validate_coverage_report_json, validate_doctor_drift_report_json, validate_envelope_strict,
     validate_now_report_json, validate_spend_report_json, validate_status_report_json,
@@ -27,6 +28,8 @@ pub use json::{
 pub use precision::{CREDITS, MONEY, PERCENT, TOKENS};
 pub use render::{
     ExplainMode, LimitingWindowDisplay, format_number, render_age, render_attribution_quality,
+    render_calibrate_activate_report, render_calibrate_compare_report,
+    render_calibrate_history_report, render_calibrate_show_entry, render_calibrate_show_report,
     render_can_run_report, render_clear_diagnostics, render_coverage_report,
     render_doctor_drift_report, render_doctor_report, render_explain, render_failure_class,
     render_fix_report, render_meter_reading, render_now_report, render_now_report_with_explain,

@@ -1659,6 +1659,241 @@ pub fn render_can_run_report(report: &crate::report::CanRunReport) -> String {
     }
 }
 
+/// Renders one `calibrate show` entry: the active coefficient together with
+/// its residual, its uncertainty, the cost-model version and its token-kind
+/// coverage, the plan tier, the fit date, the method, the evidence experiment,
+/// the input hash, the fitter version and the health state. The fitted value
+/// never appears without its residual and uncertainty on the same rendering.
+pub fn render_calibrate_show_entry(entry: &crate::report::CalibrateShowEntry) -> String {
+    let mut out = String::new();
+    if entry.is_active {
+        out.push_str(&format!(
+            "active window calibration {}\n",
+            entry.calibration_id
+        ));
+    } else {
+        out.push_str(&format!(
+            "window calibration {} ({})\n",
+            entry.calibration_id, entry.health_label
+        ));
+    }
+    out.push('\n');
+    out.push_str(&format!(
+        "provider/window: {} / {}\n",
+        entry.provider, entry.window_semantic_key
+    ));
+    out.push_str(&format!("plan:            {}\n", entry.plan_tier));
+    out.push_str(&format!(
+        "cost model:      {}\n",
+        entry.cost_model.cost_model_id
+    ));
+    out.push_str(&format!("method:          {}\n", entry.statistical_method));
+    if entry.evidence_experiment_ids.is_empty() {
+        out.push_str("evidence:        none recorded\n");
+    } else {
+        out.push_str(&format!(
+            "evidence:        experiment {}\n",
+            entry.evidence_experiment_ids.join(", experiment ")
+        ));
+    }
+    out.push_str(&format!(
+        "fitted:          {} micros/point\n",
+        entry.fitted_micros_per_point
+    ));
+    out.push_str(&format!(
+        "window capacity: {} micros\n",
+        entry.equivalent_full_window_capacity_micros
+    ));
+    out.push_str(&format!(
+        "uncertainty:     [{}..={}] micros/point\n",
+        entry.uncertainty_low_micros_per_point, entry.uncertainty_high_micros_per_point
+    ));
+    out.push_str(&format!(
+        "residual:        {} micros\n",
+        entry.fit_residual_micros
+    ));
+    match entry.out_of_sample_residual_micros {
+        Some(held_out) => out.push_str(&format!("held-out:        {held_out} micros\n")),
+        None => out.push_str("held-out:        none recorded\n"),
+    }
+    out.push_str(&format!(
+        "input hash:      {} (count {})\n",
+        entry.inputs_digest_hex, entry.inputs_count
+    ));
+    out.push_str(&format!(
+        "fitter:          {} / revision {}\n",
+        entry.aub_version, entry.source_revision
+    ));
+    out.push_str(&format!(
+        "fit date:        {} nanos\n",
+        entry.fit_timestamp_nanos
+    ));
+    out.push_str(&format!("health:          {}\n", entry.health_label));
+    out.push('\n');
+    if entry.cost_model.cost_model_found {
+        out.push_str(&format!("cost model {}:\n", entry.cost_model.cost_model_id));
+    } else {
+        out.push_str(&format!(
+            "cost model {} (not in ledger):\n",
+            entry.cost_model.cost_model_id
+        ));
+    }
+    for kind in &entry.cost_model.kinds {
+        let state = if kind.modeled { "modeled" } else { "missing" };
+        out.push_str(&format!("  - {:<14} {state}\n", kind.kind_label));
+    }
+    if entry.cost_model.unknown_kinds.is_empty() {
+        out.push_str("  - unknown kinds  none\n");
+    } else {
+        out.push_str(&format!(
+            "  - unknown kinds  {}\n",
+            entry.cost_model.unknown_kinds.join(", ")
+        ));
+    }
+    out
+}
+
+/// Renders the `calibrate show` report: one block per active scope.
+pub fn render_calibrate_show_report(report: &crate::report::CalibrateShowReport) -> String {
+    if report.entries.is_empty() {
+        return "no active calibration; fit and activate one with `aub calibrate fit` and `aub calibrate activate`"
+            .to_string();
+    }
+    report
+        .entries
+        .iter()
+        .map(render_calibrate_show_entry)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Renders the `calibrate history` report: every calibration with its health
+/// state and its activation and supersession events. Each entry carries its
+/// fitted value with its residual and uncertainty, never a bare coefficient.
+pub fn render_calibrate_history_report(report: &crate::report::CalibrateHistoryReport) -> String {
+    if report.entries.is_empty() {
+        return "no calibrations recorded".to_string();
+    }
+    let mut out = String::new();
+    for entry in &report.entries {
+        out.push_str(&format!(
+            "calibration {} ({})\n",
+            entry.calibration_id, entry.health_label
+        ));
+        out.push_str(&format!(
+            "  provider/window: {} / {}\n",
+            entry.provider, entry.window_semantic_key
+        ));
+        out.push_str(&format!("  plan: {}\n", entry.plan_tier));
+        out.push_str(&format!(
+            "  fitted: {} micros/point\n",
+            entry.fitted_micros_per_point
+        ));
+        out.push_str(&format!(
+            "  residual: {} micros\n",
+            entry.fit_residual_micros
+        ));
+        out.push_str(&format!(
+            "  uncertainty: [{}..={}] micros/point\n",
+            entry.uncertainty_low_micros_per_point, entry.uncertainty_high_micros_per_point
+        ));
+        out.push_str(&format!(
+            "  fit date: {} nanos\n",
+            entry.fit_timestamp_nanos
+        ));
+        if entry.events.is_empty() {
+            out.push_str("  events: none (provisional)\n");
+        } else {
+            out.push_str("  events:\n");
+            for event in &entry.events {
+                match &event.supersedes {
+                    Some(predecessor) => out.push_str(&format!(
+                        "    - {} at {} by {} (policy {}) supersedes {}\n",
+                        event.kind_label,
+                        event.event_at_nanos,
+                        event.actor,
+                        event.activation_policy_version,
+                        predecessor
+                    )),
+                    None => out.push_str(&format!(
+                        "    - {} at {} by {} (policy {})\n",
+                        event.kind_label,
+                        event.event_at_nanos,
+                        event.actor,
+                        event.activation_policy_version
+                    )),
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Renders the `calibrate compare` report: the percentage difference between
+/// a candidate and the active record, the candidate's activation status stated
+/// plainly, and both coefficients with their residuals and uncertainties.
+pub fn render_calibrate_compare_report(report: &crate::report::CalibrateCompareReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "candidate {} differs from active {} by {}\n",
+        report.candidate_id,
+        report.active_id,
+        crate::report::format_calibrate_difference_percent(report.difference_bps)
+    ));
+    if report.candidate_is_active {
+        out.push_str("candidate is active\n");
+    } else {
+        out.push_str("candidate evidence is sufficient for comparison but is not active\n");
+    }
+    out.push_str(&format!(
+        "candidate fitted: {} micros/point; residual: {} micros; uncertainty: [{}..={}] micros/point\n",
+        report.candidate_fitted_micros_per_point,
+        report.candidate_fit_residual_micros,
+        report.candidate_uncertainty_low_micros_per_point,
+        report.candidate_uncertainty_high_micros_per_point
+    ));
+    out.push_str(&format!(
+        "active fitted: {} micros/point; residual: {} micros; uncertainty: [{}..={}] micros/point\n",
+        report.active_fitted_micros_per_point,
+        report.active_fit_residual_micros,
+        report.active_uncertainty_low_micros_per_point,
+        report.active_uncertainty_high_micros_per_point
+    ));
+    out
+}
+
+/// Renders the `calibrate activate` report: the explicit activation just
+/// recorded, with the activated coefficient, its residual and its
+/// uncertainty.
+pub fn render_calibrate_activate_report(report: &crate::report::CalibrateActivateReport) -> String {
+    let mut out = String::new();
+    match &report.supersedes {
+        Some(predecessor) => out.push_str(&format!(
+            "calibration {} active (supersedes {}) by {} under policy {} at {}\n",
+            report.calibration_id,
+            predecessor,
+            report.actor,
+            report.activation_policy_version,
+            report.event_at_nanos
+        )),
+        None => out.push_str(&format!(
+            "calibration {} active by {} under policy {} at {}\n",
+            report.calibration_id,
+            report.actor,
+            report.activation_policy_version,
+            report.event_at_nanos
+        )),
+    }
+    out.push_str(&format!(
+        "fitted: {} micros/point; residual: {} micros; uncertainty: [{}..={}] micros/point\n",
+        report.fitted_micros_per_point,
+        report.fit_residual_micros,
+        report.uncertainty_low_micros_per_point,
+        report.uncertainty_high_micros_per_point
+    ));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

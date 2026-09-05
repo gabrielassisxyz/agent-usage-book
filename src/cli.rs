@@ -18,10 +18,13 @@ use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, Quantity, RunId};
 pub use crate::presentation::ExplainMode;
 use crate::presentation::json::{
+    calibrate_activate_json, calibrate_compare_json, calibrate_history_json, calibrate_show_json,
     coverage_json, now_json_with_explain, spend_json_with_explain, status_json_with_explain,
 };
 use crate::presentation::render::{
-    render_coverage_report, render_coverage_threshold_message, render_now_report_with_explain,
+    render_calibrate_activate_report, render_calibrate_compare_report,
+    render_calibrate_history_report, render_calibrate_show_report, render_coverage_report,
+    render_coverage_threshold_message, render_now_report_with_explain,
     render_spend_report_with_explain, render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
@@ -29,7 +32,10 @@ use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as asse
 use crate::report::export::assemble as assemble_export;
 use crate::report::spend::{CreditReporting, SpendWindow, assemble_canonical as assemble_spend};
 use crate::report::{
-    LedgerGeneration, MeterAccount, NowReport, ReportMetadata, SpendGrouping, StatusReport,
+    CalibrateActivateReport, CalibrateCompareReport, CalibrateCostModelCoverage,
+    CalibrateCostModelKindCoverage, CalibrateHistoryEntry, CalibrateHistoryReport,
+    CalibrateLifecycleEventView, CalibrateShowEntry, CalibrateShowReport, LedgerGeneration,
+    MeterAccount, NowReport, ReportMetadata, SpendGrouping, StatusReport,
 };
 use crate::store::export::ExportKey;
 
@@ -793,7 +799,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY]",
+                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::CanRun => {
@@ -4981,8 +4987,12 @@ fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
         Some("end") => calibrate_end_command(clock, invocation),
         Some("fit") => calibrate_fit(clock, invocation),
         Some("passive") => calibrate_passive_command(clock, invocation),
+        Some("show") => calibrate_show_command(clock, invocation),
+        Some("history") => calibrate_history_command(clock, invocation),
+        Some("compare") => calibrate_compare_command(clock, invocation),
+        Some("activate") => calibrate_activate_command(clock, invocation),
         other => Err(Error::Usage(format!(
-            "calibrate requires a subcommand (begin | status | end | fit | passive), got {other:?}"
+            "calibrate requires a subcommand (begin | status | end | fit | passive | show | history | compare | activate), got {other:?}"
         ))),
     }
 }
@@ -5750,6 +5760,545 @@ fn calibrate_passive_command(clock: &impl Clock, invocation: &Invocation) -> Res
     Ok(())
 }
 
+/// The ledger generation a calibrate display report was built against: the
+/// current generation when the ledger answers, zero when it does not, so the
+/// envelope never claims a generation it did not read.
+fn calibrate_ledger_generation(conn: &rusqlite::Connection) -> LedgerGeneration {
+    crate::store::ledger_generation::current(conn)
+        .ok()
+        .map(|generation| LedgerGeneration::new(generation.value()))
+        .unwrap_or_else(|| LedgerGeneration::new(0))
+}
+
+/// The activation lifecycle state of one calibration result: never activated
+/// when no lifecycle event names it, superseded when a later event records it
+/// as the predecessor, active otherwise. A calibration whose own event is a
+/// supersession is still active when nothing supersedes it in turn: the event
+/// kind says it replaced someone, not that it was replaced.
+fn calibrate_lifecycle_state(
+    conn: &rusqlite::Connection,
+    id: &crate::domain::provenance::WindowCalibrationId,
+) -> Result<crate::calibration::health::LifecycleState, Error> {
+    use crate::calibration::health::LifecycleState;
+    if crate::store::calibration::activation_events_for(conn, id)?.is_empty() {
+        return Ok(LifecycleState::NeverActivated);
+    }
+    if crate::store::calibration::is_superseded(conn, id)? {
+        return Ok(LifecycleState::Superseded);
+    }
+    Ok(LifecycleState::Active)
+}
+
+/// The health label of one calibration, for `show` and `history`. The
+/// applicability context mirrors the calibration's own scope, drift has no
+/// recorded finding to consult yet and no review horizon is configured, which
+/// is the same simplification `can-run` documents where it builds the same
+/// inputs: a genuine plan-tier or semantics mismatch still surfaces through
+/// the scope lookup returning nothing for an unfitted tier.
+fn calibrate_health_label(
+    conn: &rusqlite::Connection,
+    calibration: &crate::store::calibration::WindowCalibration,
+    now: UtcTimestamp,
+) -> Result<String, Error> {
+    use crate::calibration::health::{
+        ApplicabilityContext, CalibrationFacts, HealthInputs, compute_health,
+    };
+    let facts = CalibrationFacts {
+        plan_tier: calibration.plan_tier().clone(),
+        meter_semantics_id: calibration.meter_semantics_id().clone(),
+        billing_semantics_id: calibration.billing_semantics_id().clone(),
+    };
+    let context = ApplicabilityContext {
+        plan_tier: calibration.plan_tier().clone(),
+        meter_semantics_id: calibration.meter_semantics_id().clone(),
+        billing_semantics_id: calibration.billing_semantics_id().clone(),
+    };
+    let inputs = HealthInputs {
+        calibration: &facts,
+        context: &context,
+        lifecycle: calibrate_lifecycle_state(conn, calibration.id())?,
+        cost_model_superseded: crate::store::cost_model::is_superseded(
+            conn,
+            calibration.cost_model_id(),
+        )?,
+        drift: None,
+        review_due_at: None,
+    };
+    Ok(compute_health(&inputs, now).label().to_string())
+}
+
+/// The per-kind coverage of the cost model a calibration references: one row
+/// per known token kind saying whether the model carries a term for it, plus
+/// the unknown-kind statement (empty when the calibration workload carried no
+/// unknown token components, which the ledger does not yet track per
+/// calibration, so a shown calibration always reports none).
+fn calibrate_cost_model_coverage(
+    conn: &rusqlite::Connection,
+    calibration: &crate::store::calibration::WindowCalibration,
+) -> Result<CalibrateCostModelCoverage, Error> {
+    let model = crate::store::cost_model::load_by_semantic_id(conn, calibration.cost_model_id())?;
+    let kinds = crate::domain::tokens::TokenKind::ALL
+        .into_iter()
+        .map(|kind| CalibrateCostModelKindCoverage {
+            kind_label: kind.label().to_string(),
+            modeled: model
+                .as_ref()
+                .is_some_and(|loaded| loaded.term(kind).is_some()),
+        })
+        .collect();
+    Ok(CalibrateCostModelCoverage {
+        cost_model_id: calibration.cost_model_id().as_str().to_string(),
+        cost_model_found: model.is_some(),
+        kinds,
+        unknown_kinds: Vec::new(),
+    })
+}
+
+/// One `show` entry for a stored calibration: every field the design's
+/// example names, so the renderer can print the coefficient only alongside
+/// its residual and uncertainty.
+fn calibrate_show_entry_for(
+    conn: &rusqlite::Connection,
+    calibration: &crate::store::calibration::WindowCalibration,
+    now: UtcTimestamp,
+    is_active: bool,
+) -> Result<CalibrateShowEntry, Error> {
+    let experiments = crate::store::calibration::source_experiments(conn, calibration.id())?;
+    Ok(CalibrateShowEntry {
+        calibration_id: calibration.id().as_str().to_string(),
+        provider: calibration.provider().as_str().to_string(),
+        window_semantic_key: calibration.window_semantic_key().as_str().to_string(),
+        plan_tier: calibration.plan_tier().as_str().to_string(),
+        cost_model: calibrate_cost_model_coverage(conn, calibration)?,
+        fitted_micros_per_point: calibration.fitted().micros_per_point(),
+        equivalent_full_window_capacity_micros: calibration
+            .equivalent_full_window_capacity()
+            .micros(),
+        fit_residual_micros: calibration.fit_residual().micros(),
+        out_of_sample_residual_micros: calibration.out_of_sample_residual().map(|r| r.micros()),
+        uncertainty_low_micros_per_point: calibration.uncertainty().lower().micros_per_point(),
+        uncertainty_high_micros_per_point: calibration.uncertainty().upper().micros_per_point(),
+        statistical_method: calibration.statistical_method().to_string(),
+        statistical_parameters: calibration.statistical_parameters().to_string(),
+        validation_method: calibration.validation_method().to_string(),
+        validation_version: calibration.validation_version().to_string(),
+        evidence_experiment_ids: experiments
+            .iter()
+            .map(|id| id.as_str().to_string())
+            .collect(),
+        inputs_digest_hex: format!("{:016x}", calibration.inputs().digest()),
+        inputs_count: calibration.inputs().count(),
+        fitting_evidence_digest_hex: format!("{:016x}", calibration.fitting_evidence().as_u64()),
+        validation_evidence_digest_hex: format!(
+            "{:016x}",
+            calibration.validation_evidence().as_u64()
+        ),
+        fit_timestamp_nanos: calibration.fit_timestamp().unix_nanos(),
+        activation_policy_version: calibration.activation_policy_version().to_string(),
+        aub_version: calibration.aub_version().to_string(),
+        source_revision: calibration.source_revision().to_string(),
+        health_label: calibrate_health_label(conn, calibration, now)?,
+        is_active,
+    })
+}
+
+/// Assembles the `calibrate show` report: every currently active calibration,
+/// one entry per scope, ordered by calibration id.
+pub(crate) fn assemble_calibrate_show(
+    conn: &rusqlite::Connection,
+    now: UtcTimestamp,
+) -> Result<CalibrateShowReport, Error> {
+    let mut entries = Vec::new();
+    for scope in crate::store::calibration::fitted_calibration_scopes(conn)? {
+        if let Some(calibration) = crate::store::calibration::load_active_at(conn, &scope, now)? {
+            entries.push(calibrate_show_entry_for(conn, &calibration, now, true)?);
+        }
+    }
+    entries.sort_by(|left, right| left.calibration_id.cmp(&right.calibration_id));
+    Ok(CalibrateShowReport {
+        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+        entries,
+    })
+}
+
+fn calibrate_show_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    if let Some(extra) = invocation.rest.get(1) {
+        return Err(Error::Usage(format!(
+            "unknown argument: {extra}; run aub calibrate show with no arguments"
+        )));
+    }
+    let conn = open_ledger(clock)?;
+    let now = clock.now();
+    let report = assemble_calibrate_show(&conn, now)?;
+    match invocation.format {
+        OutputFormat::Text => println!("{}", render_calibrate_show_report(&report)),
+        OutputFormat::Json => println!("{}", calibrate_show_json(&report, RunId::new(now))),
+    }
+    Ok(())
+}
+
+/// Assembles the `calibrate history` report: every calibration result with
+/// its health state and its activation and supersession events in event
+/// order.
+pub(crate) fn assemble_calibrate_history(
+    conn: &rusqlite::Connection,
+    now: UtcTimestamp,
+) -> Result<CalibrateHistoryReport, Error> {
+    let mut entries = Vec::new();
+    for calibration in crate::store::calibration::list_all_results(conn)? {
+        let mut events = Vec::new();
+        for event in crate::store::calibration::activation_events_for(conn, calibration.id())? {
+            let kind_label = match event.kind {
+                crate::store::calibration::CalibrationEventKind::Activation => "activation",
+                crate::store::calibration::CalibrationEventKind::Supersession => "supersession",
+            };
+            events.push(CalibrateLifecycleEventView {
+                kind_label: kind_label.to_string(),
+                event_at_nanos: event.event_at.unix_nanos(),
+                actor: event.actor.as_str().to_string(),
+                activation_policy_version: event.activation_policy_version.clone(),
+                supersedes: event.supersedes.map(|id| id.as_str().to_string()),
+            });
+        }
+        entries.push(CalibrateHistoryEntry {
+            calibration_id: calibration.id().as_str().to_string(),
+            provider: calibration.provider().as_str().to_string(),
+            window_semantic_key: calibration.window_semantic_key().as_str().to_string(),
+            plan_tier: calibration.plan_tier().as_str().to_string(),
+            fitted_micros_per_point: calibration.fitted().micros_per_point(),
+            fit_residual_micros: calibration.fit_residual().micros(),
+            uncertainty_low_micros_per_point: calibration.uncertainty().lower().micros_per_point(),
+            uncertainty_high_micros_per_point: calibration.uncertainty().upper().micros_per_point(),
+            fit_timestamp_nanos: calibration.fit_timestamp().unix_nanos(),
+            health_label: calibrate_health_label(conn, &calibration, now)?,
+            events,
+        });
+    }
+    Ok(CalibrateHistoryReport {
+        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+        entries,
+    })
+}
+
+fn calibrate_history_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    if let Some(extra) = invocation.rest.get(1) {
+        return Err(Error::Usage(format!(
+            "unknown argument: {extra}; run aub calibrate history with no arguments"
+        )));
+    }
+    let conn = open_ledger(clock)?;
+    let now = clock.now();
+    let report = assemble_calibrate_history(&conn, now)?;
+    match invocation.format {
+        OutputFormat::Text => println!("{}", render_calibrate_history_report(&report)),
+        OutputFormat::Json => println!("{}", calibrate_history_json(&report, RunId::new(now))),
+    }
+    Ok(())
+}
+
+/// Loads one calibration result by its semantic id, or explains which id is
+/// missing.
+fn calibrate_load_result(
+    conn: &rusqlite::Connection,
+    id: &str,
+) -> Result<crate::store::calibration::WindowCalibration, Error> {
+    crate::store::calibration::load_result(
+        conn,
+        &crate::domain::provenance::WindowCalibrationId::new(id),
+    )?
+    .ok_or_else(|| {
+        Error::Usage(format!(
+            "no calibration '{id}'; list them with `aub calibrate history`"
+        ))
+    })
+}
+
+/// Assembles the `calibrate compare` report: the percentage difference
+/// between a candidate and the active record, and whether the candidate is
+/// the active calibration for its scope.
+pub(crate) fn assemble_calibrate_compare(
+    conn: &rusqlite::Connection,
+    candidate_id: &str,
+    active_id: &str,
+    now: UtcTimestamp,
+) -> Result<CalibrateCompareReport, Error> {
+    let candidate = calibrate_load_result(conn, candidate_id)?;
+    let active = calibrate_load_result(conn, active_id)?;
+    let difference_bps = crate::report::calibrate_difference_bps(
+        candidate.fitted().micros_per_point(),
+        active.fitted().micros_per_point(),
+    );
+    let candidate_is_active =
+        crate::store::calibration::load_active_at(conn, &candidate.scope(), now)?
+            .is_some_and(|current| current.id().as_str() == candidate_id);
+    Ok(CalibrateCompareReport {
+        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+        candidate_id: candidate_id.to_string(),
+        active_id: active_id.to_string(),
+        candidate_fitted_micros_per_point: candidate.fitted().micros_per_point(),
+        active_fitted_micros_per_point: active.fitted().micros_per_point(),
+        difference_bps,
+        candidate_fit_residual_micros: candidate.fit_residual().micros(),
+        candidate_uncertainty_low_micros_per_point: candidate
+            .uncertainty()
+            .lower()
+            .micros_per_point(),
+        candidate_uncertainty_high_micros_per_point: candidate
+            .uncertainty()
+            .upper()
+            .micros_per_point(),
+        active_fit_residual_micros: active.fit_residual().micros(),
+        active_uncertainty_low_micros_per_point: active.uncertainty().lower().micros_per_point(),
+        active_uncertainty_high_micros_per_point: active.uncertainty().upper().micros_per_point(),
+        candidate_health_label: calibrate_health_label(conn, &candidate, now)?,
+        candidate_is_active,
+    })
+}
+
+fn calibrate_compare_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let usage = "calibrate compare requires CANDIDATE ACTIVE: two calibration ids, listed by `aub calibrate history`";
+    let candidate = invocation
+        .rest
+        .get(1)
+        .ok_or_else(|| Error::Usage(usage.into()))?;
+    let active = invocation
+        .rest
+        .get(2)
+        .ok_or_else(|| Error::Usage(usage.into()))?;
+    if let Some(extra) = invocation.rest.get(3) {
+        return Err(Error::Usage(format!("unknown argument: {extra}; {usage}")));
+    }
+    let conn = open_ledger(clock)?;
+    let now = clock.now();
+    let report = assemble_calibrate_compare(&conn, candidate, active, now)?;
+    match invocation.format {
+        OutputFormat::Text => println!("{}", render_calibrate_compare_report(&report)),
+        OutputFormat::Json => println!("{}", calibrate_compare_json(&report, RunId::new(now))),
+    }
+    Ok(())
+}
+
+/// The `calibrate activate` activation policy bounds, as the operator stated
+/// them on the command line. The defaults are this command's own documented
+/// starting point, not the activation module's: that module holds no policy
+/// of its own by design, so every caller names the bounds it judges under.
+const CALIBRATE_ACTIVATE_DEFAULT_MAX_RESIDUAL_MICROS: i64 = 100_000;
+const CALIBRATE_ACTIVATE_DEFAULT_MAX_CONDITION_MICROS: i64 = 30_000_000;
+
+#[derive(Debug)]
+pub(crate) struct CalibrateActivateArgs {
+    pub(crate) calibration_id: String,
+    pub(crate) actor: String,
+    pub(crate) policy_version: Option<String>,
+    pub(crate) training: Vec<String>,
+    pub(crate) validation: Vec<String>,
+    pub(crate) max_residual_micros: i64,
+    pub(crate) max_condition_micros: i64,
+}
+
+fn calibrate_parse_activate(rest: &[String]) -> Result<CalibrateActivateArgs, Error> {
+    let usage = "calibrate activate requires ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]";
+    let mut args = CalibrateActivateArgs {
+        calibration_id: String::new(),
+        actor: "operator".to_string(),
+        policy_version: None,
+        training: Vec::new(),
+        validation: Vec::new(),
+        max_residual_micros: CALIBRATE_ACTIVATE_DEFAULT_MAX_RESIDUAL_MICROS,
+        max_condition_micros: CALIBRATE_ACTIVATE_DEFAULT_MAX_CONDITION_MICROS,
+    };
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--actor" {
+            args.actor = calibrate_next_arg(&mut rest, "--actor")?;
+        } else if let Some(value) = arg.strip_prefix("--actor=") {
+            if value.is_empty() {
+                return Err(Error::Usage("--actor requires a value".into()));
+            }
+            args.actor = value.to_string();
+        } else if arg == "--policy-version" {
+            args.policy_version = Some(calibrate_next_arg(&mut rest, "--policy-version")?);
+        } else if let Some(value) = arg.strip_prefix("--policy-version=") {
+            if value.is_empty() {
+                return Err(Error::Usage("--policy-version requires a value".into()));
+            }
+            args.policy_version = Some(value.to_string());
+        } else if arg == "--training" {
+            let raw = calibrate_next_arg(&mut rest, "--training")?;
+            args.training = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+        } else if let Some(value) = arg.strip_prefix("--training=") {
+            args.training = value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+        } else if arg == "--validation" {
+            let raw = calibrate_next_arg(&mut rest, "--validation")?;
+            args.validation = raw
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+        } else if let Some(value) = arg.strip_prefix("--validation=") {
+            args.validation = value
+                .split(',')
+                .map(str::trim)
+                .filter(|part| !part.is_empty())
+                .map(str::to_string)
+                .collect();
+        } else if arg == "--max-residual-micros" {
+            let raw = calibrate_next_arg(&mut rest, "--max-residual-micros")?;
+            args.max_residual_micros = raw.parse().map_err(|_| {
+                Error::Usage(format!(
+                    "--max-residual-micros must be an integer number of micro-credits, got {raw:?}"
+                ))
+            })?;
+        } else if let Some(value) = arg.strip_prefix("--max-residual-micros=") {
+            args.max_residual_micros = value.parse().map_err(|_| {
+                Error::Usage(format!(
+                    "--max-residual-micros must be an integer number of micro-credits, got {value:?}"
+                ))
+            })?;
+        } else if arg == "--max-condition-micros" {
+            let raw = calibrate_next_arg(&mut rest, "--max-condition-micros")?;
+            args.max_condition_micros = raw.parse().map_err(|_| {
+                Error::Usage(format!(
+                    "--max-condition-micros must be an integer, got {raw:?}"
+                ))
+            })?;
+        } else if let Some(value) = arg.strip_prefix("--max-condition-micros=") {
+            args.max_condition_micros = value.parse().map_err(|_| {
+                Error::Usage(format!(
+                    "--max-condition-micros must be an integer, got {value:?}"
+                ))
+            })?;
+        } else if arg.starts_with("--") {
+            return Err(Error::Usage(format!(
+                "calibrate activate: unknown argument {arg:?}; {usage}"
+            )));
+        } else if args.calibration_id.is_empty() {
+            args.calibration_id = arg.clone();
+        } else {
+            return Err(Error::Usage(format!(
+                "calibrate activate takes one ID, got a second positional {arg:?}; {usage}"
+            )));
+        }
+    }
+    if args.calibration_id.trim().is_empty() {
+        return Err(Error::Usage(usage.into()));
+    }
+    if args.training.is_empty() {
+        return Err(Error::Usage(
+            "calibrate activate requires --training E,...: the training evidence ids the result was validated against, so the activation judges the recorded evidence rather than a substitute set"
+                .into(),
+        ));
+    }
+    if args.validation.is_empty() {
+        return Err(Error::Usage(
+            "calibrate activate requires --validation E,...: the held-out validation evidence ids the result was validated against"
+                .into(),
+        ));
+    }
+    Ok(args)
+}
+
+/// Performs the explicit activation `calibrate activate` names: the request
+/// judges exactly the evidence the result recorded (same digests), over
+/// disjoint training and validation sets, with the recorded held-out
+/// residual and condition number inside the stated policy bounds. Any failure
+/// refuses before anything is written, through the store's typed refusal.
+///
+/// Contamination is presented as clean because the fitter already rejects
+/// contaminated series at fit time; re-evaluating contamination from the
+/// ledger at activation time is later work, recorded on the bead.
+pub(crate) fn calibrate_activate_validated(
+    conn: &mut rusqlite::Connection,
+    args: &CalibrateActivateArgs,
+    now: UtcTimestamp,
+) -> Result<CalibrateActivateReport, Error> {
+    use crate::domain::credits::Credits;
+    let id = crate::domain::provenance::WindowCalibrationId::new(&args.calibration_id);
+    let calibration = crate::store::calibration::load_result(conn, &id)?.ok_or_else(|| {
+        Error::Usage(format!(
+            "no calibration '{}'; list them with `aub calibrate history`",
+            args.calibration_id
+        ))
+    })?;
+    let training: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
+        .training
+        .iter()
+        .map(crate::domain::provenance::EvidenceId::new)
+        .collect();
+    let validation: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
+        .validation
+        .iter()
+        .map(crate::domain::provenance::EvidenceId::new)
+        .collect();
+    let actor = crate::calibration::activation::ActivationActor::new(&args.actor)
+        .map_err(|refusal| Error::Usage(format!("invalid --actor: {refusal}")))?;
+    let policy_version = args
+        .policy_version
+        .clone()
+        .unwrap_or_else(|| calibration.activation_policy_version().to_string());
+    let policy = crate::calibration::activation::ActivationPolicy::new(
+        policy_version.clone(),
+        Credits::from_micros(args.max_residual_micros),
+        crate::store::calibration::ConditionNumber::from_micros(args.max_condition_micros),
+    )
+    .map_err(|refusal| Error::Usage(format!("invalid activation policy: {refusal}")))?;
+    let verdict = crate::calibration::contamination::ContaminationVerdict::clean();
+    let request = crate::calibration::activation::ActivationRequest {
+        actor: &actor,
+        policy: &policy,
+        training: &training,
+        validation: &validation,
+        contamination: &verdict,
+    };
+    let scope = calibration.scope();
+    let supersedes = match crate::store::calibration::load_active_at(conn, &scope, now)? {
+        None => None,
+        Some(current) if current.id().as_str() == args.calibration_id => None,
+        Some(current) => Some(current.id().clone()),
+    };
+    crate::store::calibration::activate(conn, &id, now, supersedes.as_ref(), &request)?;
+    Ok(CalibrateActivateReport {
+        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+        calibration_id: args.calibration_id.clone(),
+        supersedes: supersedes.map(|id| id.as_str().to_string()),
+        actor: args.actor.clone(),
+        activation_policy_version: policy_version,
+        event_at_nanos: now.unix_nanos(),
+        fitting_evidence_digest_hex: format!("{:016x}", calibration.fitting_evidence().as_u64()),
+        validation_evidence_digest_hex: format!(
+            "{:016x}",
+            calibration.validation_evidence().as_u64()
+        ),
+        fitted_micros_per_point: calibration.fitted().micros_per_point(),
+        fit_residual_micros: calibration.fit_residual().micros(),
+        uncertainty_low_micros_per_point: calibration.uncertainty().lower().micros_per_point(),
+        uncertainty_high_micros_per_point: calibration.uncertainty().upper().micros_per_point(),
+    })
+}
+
+fn calibrate_activate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let args = calibrate_parse_activate(&invocation.rest[1..])?;
+    let mut conn = open_ledger(clock)?;
+    let now = clock.now();
+    let report = calibrate_activate_validated(&mut conn, &args, now)?;
+    match invocation.format {
+        OutputFormat::Text => println!("{}", render_calibrate_activate_report(&report)),
+        OutputFormat::Json => println!("{}", calibrate_activate_json(&report, RunId::new(now))),
+    }
+    Ok(())
+}
+
 /// The `aub ingest transcripts` progress line's exact wording (`aub-va6s`),
 /// factored out so its format is a golden test target independent of
 /// actually running a pass long enough to trigger one.
@@ -6291,6 +6840,7 @@ fn task_overhead_window(rest: &[String], now: UtcTimestamp) -> Result<SpendWindo
 mod tests {
     use super::*;
     use crate::config::FakeEnv;
+    use crate::presentation::render::render_calibrate_show_entry;
 
     /// `aub sample` opens its ledger with the configured `sampling.request_timeout`,
     /// not a hardcoded value (`aub-va6s`): a config naming a busy timeout
@@ -7579,5 +8129,725 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             !status.is_settled(),
             "one observation cannot satisfy the settlement criterion: end declares no settlement"
         );
+    }
+
+    /// Fixture helpers for the `calibrate show|history|compare|activate`
+    /// tests (`aub-c0b.9`): a stored experiment plus stored results with
+    /// known evidence, built only through the store's own insert functions.
+    mod calibrate_display {
+        use std::collections::BTreeSet;
+
+        use super::*;
+        use crate::calibration::settlement::SettlementPolicy;
+        use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
+        use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
+        use crate::domain::provenance::{CostModelId, EvidenceId, WindowCalibrationId};
+        use crate::domain::quota::QuotaFractionPpm;
+        use crate::domain::time::UtcTimestamp;
+        use crate::domain::window::{ReportedResolution, WindowSemanticKey};
+        use crate::store::calibration::{
+            CalibrationExperiment, ConditionNumber, EvidenceDigest, EvidenceFingerprint,
+            ExperimentId, LagHandling, PlanTier, WindowCalibration, WindowCalibrationFields,
+        };
+        use crate::store::cost_model::{ProviderKey, ValidityInterval};
+
+        pub(super) fn ts(nanos: i64) -> UtcTimestamp {
+            UtcTimestamp::from_unix_nanos(nanos)
+        }
+
+        pub(super) fn evidence(ids: &[&str]) -> BTreeSet<EvidenceId> {
+            ids.iter().map(|s| EvidenceId::new(*s)).collect()
+        }
+
+        pub(super) fn interval(from: i64, until: i64) -> ValidityInterval {
+            ValidityInterval::new(ts(from), ts(until)).unwrap()
+        }
+
+        pub(super) fn experiment(id: &str) -> CalibrationExperiment {
+            CalibrationExperiment {
+                id: ExperimentId::new(id),
+                provider: ProviderKey::new("anthropic"),
+                plan_tier: PlanTier::new("pro-5h"),
+                window_semantic_key: WindowSemanticKey::new("five_hour"),
+                meter_semantics_id: MeterSemanticsId::new("meter-v1"),
+                billing_semantics_id: BillingSemanticsId::new("billing-v1"),
+                settlement_policy: SettlementPolicy::conservative_default(
+                    ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+                ),
+                validity: interval(100, 300),
+                knowledge_time: ts(90),
+            }
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn result(
+            id: &str,
+            fitted_micros: i64,
+            residual_micros: i64,
+            policy_version: &str,
+            fit_at: i64,
+        ) -> WindowCalibration {
+            result_with_evidence(
+                id,
+                fitted_micros,
+                residual_micros,
+                policy_version,
+                fit_at,
+                "anthropic-claude-messages-v1",
+                &["s-1", "s-2"],
+                &["s-3"],
+            )
+        }
+
+        pub(super) fn result_with_cost_model(
+            id: &str,
+            fitted_micros: i64,
+            residual_micros: i64,
+            policy_version: &str,
+            fit_at: i64,
+            cost_model_id: &str,
+        ) -> WindowCalibration {
+            result_with_evidence(
+                id,
+                fitted_micros,
+                residual_micros,
+                policy_version,
+                fit_at,
+                cost_model_id,
+                &["s-1", "s-2"],
+                &["s-3"],
+            )
+        }
+
+        /// A result whose recorded fitting and validation evidence overlap on
+        /// `s-3`: presenting those same sets reaches the disjointness refusal
+        /// rather than an evidence-mismatch refusal.
+        pub(super) fn result_overlapping_evidence(id: &str) -> WindowCalibration {
+            result_with_evidence(
+                id,
+                1_000_000,
+                4_200,
+                "ap-v1",
+                500,
+                "anthropic-claude-messages-v1",
+                &["s-1", "s-3"],
+                &["s-3"],
+            )
+        }
+
+        #[allow(clippy::too_many_arguments)]
+        pub(super) fn result_with_evidence(
+            id: &str,
+            fitted_micros: i64,
+            residual_micros: i64,
+            policy_version: &str,
+            fit_at: i64,
+            cost_model_id: &str,
+            training_ids: &[&str],
+            validation_ids: &[&str],
+        ) -> WindowCalibration {
+            let training = evidence(training_ids);
+            let validation = evidence(validation_ids);
+            let union: BTreeSet<EvidenceId> = training.union(&validation).cloned().collect();
+            WindowCalibration::from_fields(WindowCalibrationFields {
+                id: WindowCalibrationId::new(id),
+                provider: ProviderKey::new("anthropic"),
+                plan_tier: PlanTier::new("pro-5h"),
+                window_semantic_key: WindowSemanticKey::new("five_hour"),
+                meter_semantics_id: MeterSemanticsId::new("meter-v1"),
+                billing_semantics_id: BillingSemanticsId::new("billing-v1"),
+                cost_model_id: CostModelId::new(cost_model_id),
+                fitted: CreditsPerPercentagePoint::from_micros_per_point(fitted_micros),
+                equivalent_full_window_capacity: Credits::from_micros(12_000_000),
+                fit_residual: Credits::from_micros(residual_micros),
+                uncertainty: crate::store::calibration::CoefficientUncertainty::new(
+                    CreditsPerPercentagePoint::from_micros_per_point(fitted_micros - 10_000),
+                    CreditsPerPercentagePoint::from_micros_per_point(fitted_micros + 10_000),
+                )
+                .unwrap(),
+                lag_estimate: None,
+                lag_handling: LagHandling::new("shifted-by-estimate"),
+                sample_count: 40,
+                fit_timestamp: ts(fit_at),
+                inputs: EvidenceDigest::from_inputs(&union),
+                fitting_evidence: EvidenceFingerprint::from_inputs(&training),
+                validation_evidence: EvidenceFingerprint::from_inputs(&validation),
+                validation_method: "held-out-disjoint".to_string(),
+                validation_version: "v2".to_string(),
+                out_of_sample_residual: Some(Credits::from_micros(7_000)),
+                statistical_method: "controlled-settled-boundaries/v1".to_string(),
+                statistical_parameters: "{\"ridge\":0}".to_string(),
+                condition_number: Some(ConditionNumber::from_micros(3_500_000)),
+                observation_coverage_requirement: "ninety-percent".to_string(),
+                settling_policy: "plateau-3".to_string(),
+                excluded_samples: Vec::new(),
+                activation_policy_version: policy_version.to_string(),
+                aub_version: "0.1.0".to_string(),
+                source_revision: "abc1234".to_string(),
+                validity: interval(100, 300),
+                knowledge_time: ts(fit_at),
+            })
+            .unwrap()
+        }
+
+        pub(super) fn activate_args(id: &str) -> CalibrateActivateArgs {
+            CalibrateActivateArgs {
+                calibration_id: id.to_string(),
+                actor: "operator".to_string(),
+                policy_version: None,
+                training: vec!["s-1".to_string(), "s-2".to_string()],
+                validation: vec!["s-3".to_string()],
+                max_residual_micros: 100_000,
+                max_condition_micros: 30_000_000,
+            }
+        }
+
+        /// Seeds one experiment, one complete cost model and one active
+        /// calibration, returning the knowledge instant the assembly reads at.
+        pub(super) fn seed_active(conn: &mut rusqlite::Connection) -> UtcTimestamp {
+            use crate::store::calibration::{
+                activate, insert_experiment, insert_result, load_active_at,
+            };
+            insert_experiment(conn, &experiment("exp-31")).unwrap();
+            let now = ts(1_000);
+            let cal = result("wc-17", 1_000_000, 4_200, "ap-v1", 500);
+            insert_result(conn, &cal, &[ExperimentId::new("exp-31")]).unwrap();
+            let training = evidence(&["s-1", "s-2"]);
+            let validation = evidence(&["s-3"]);
+            let actor = crate::calibration::activation::ActivationActor::new("operator").unwrap();
+            let policy = crate::calibration::activation::ActivationPolicy::new(
+                "ap-v1",
+                Credits::from_micros(100_000),
+                ConditionNumber::from_micros(30_000_000),
+            )
+            .unwrap();
+            let verdict = crate::calibration::contamination::ContaminationVerdict::clean();
+            let request = crate::calibration::activation::ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &training,
+                validation: &validation,
+                contamination: &verdict,
+            };
+            activate(conn, cal.id(), ts(600), None, &request).unwrap();
+            assert!(
+                load_active_at(
+                    conn,
+                    &crate::store::calibration::CalibrationScope {
+                        provider: ProviderKey::new("anthropic"),
+                        plan_tier: PlanTier::new("pro-5h"),
+                        window_semantic_key: WindowSemanticKey::new("five_hour"),
+                    },
+                    now
+                )
+                .unwrap()
+                .is_some()
+            );
+            now
+        }
+
+        /// Rejects a rendering that prints a bare coefficient: a fitted value
+        /// (`micros/point`) with no residual and no uncertainty anywhere in
+        /// the same output is the defect this bead exists to remove.
+        pub(super) fn assert_no_bare_coefficient(output: &str) {
+            if output.contains("micros/point") {
+                assert!(
+                    output.contains("residual"),
+                    "a coefficient without its residual:\n{output}"
+                );
+                assert!(
+                    output.contains("uncertainty"),
+                    "a coefficient without its uncertainty:\n{output}"
+                );
+            }
+        }
+    }
+
+    /// Golden: the design's active-calibration rendering (PLAN.md section
+    /// 50), reproduced with concrete values through the real assembly.
+    #[test]
+    fn calibrate_show_renders_the_design_example() {
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        let report = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        assert_eq!(report.entries.len(), 1);
+        let text = render_calibrate_show_report(&report);
+        for expected in [
+            "active window calibration wc-17",
+            "provider/window: anthropic / five_hour",
+            "plan:            pro-5h",
+            "cost model:      anthropic-claude-messages-v1",
+            "method:          controlled-settled-boundaries/v1",
+            "evidence:        experiment exp-31",
+            "fitted:          1000000 micros/point",
+            "window capacity: 12000000 micros",
+            "uncertainty:     [990000..=1010000] micros/point",
+            "residual:        4200 micros",
+            "held-out:        7000 micros",
+            "input hash:",
+            "fitter:          0.1.0 / revision abc1234",
+            "health:          current",
+            "cost model anthropic-claude-messages-v1:",
+            "input",
+            "output",
+            "cache_read",
+            "cache_write",
+            "modeled",
+            "unknown kinds  none",
+        ] {
+            assert!(
+                text.contains(expected),
+                "show must render {expected:?}:\n{text}"
+            );
+        }
+        fx::assert_no_bare_coefficient(&text);
+    }
+
+    /// Golden: the design's candidate-comparison rendering (PLAN.md section
+    /// 50): the percentage difference and the plain statement that the
+    /// candidate is sufficient for comparison and not active.
+    #[test]
+    fn calibrate_compare_renders_the_design_example() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        insert_experiment(&conn, &fx::experiment("exp-32")).unwrap();
+        let candidate = fx::result("wc-19", 1_038_000, 4_500, "ap-v1", 700);
+        insert_result(&mut conn, &candidate, &[ExperimentId::new("exp-32")]).unwrap();
+        let report = assemble_calibrate_compare(&conn, "wc-19", "wc-17", now)
+            .expect("compare must assemble");
+        assert_eq!(report.difference_bps, 380);
+        assert!(!report.candidate_is_active);
+        let text = render_calibrate_compare_report(&report);
+        for expected in [
+            "candidate wc-19 differs from active wc-17 by 3.8%",
+            "candidate evidence is sufficient for comparison but is not active",
+        ] {
+            assert!(
+                text.contains(expected),
+                "compare must render {expected:?}:\n{text}"
+            );
+        }
+        fx::assert_no_bare_coefficient(&text);
+    }
+
+    /// Every field in the design's example is present in `show`, including
+    /// the cost model's per-kind coverage.
+    #[test]
+    fn calibrate_show_carries_every_designed_field() {
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        let report = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let entry = &report.entries[0];
+        assert_eq!(entry.calibration_id, "wc-17");
+        assert_eq!(entry.provider, "anthropic");
+        assert_eq!(entry.window_semantic_key, "five_hour");
+        assert_eq!(entry.plan_tier, "pro-5h");
+        assert_eq!(
+            entry.cost_model.cost_model_id,
+            "anthropic-claude-messages-v1"
+        );
+        assert!(entry.cost_model.cost_model_found);
+        assert_eq!(entry.cost_model.kinds.len(), 4);
+        assert!(
+            entry.cost_model.kinds.iter().all(|kind| kind.modeled),
+            "the complete cost model covers every kind"
+        );
+        assert!(entry.cost_model.unknown_kinds.is_empty());
+        assert_eq!(entry.fitted_micros_per_point, 1_000_000);
+        assert_eq!(entry.fit_residual_micros, 4_200);
+        assert_eq!(entry.uncertainty_low_micros_per_point, 990_000);
+        assert_eq!(entry.uncertainty_high_micros_per_point, 1_010_000);
+        assert_eq!(entry.statistical_method, "controlled-settled-boundaries/v1");
+        assert_eq!(entry.evidence_experiment_ids, vec!["exp-31".to_string()]);
+        assert_eq!(entry.inputs_count, 3);
+        assert_eq!(entry.inputs_digest_hex.len(), 16);
+        assert_eq!(entry.aub_version, "0.1.0");
+        assert_eq!(entry.source_revision, "abc1234");
+        assert_eq!(entry.health_label, "current");
+        assert!(entry.is_active);
+    }
+
+    /// An incomplete cost model shows which kinds are missing rather than
+    /// silently presenting full coverage.
+    #[test]
+    fn calibrate_show_marks_the_missing_cost_model_kind() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, false);
+        insert_experiment(&conn, &fx::experiment("exp-40")).unwrap();
+        let cal = fx::result_with_cost_model(
+            "wc-40",
+            1_000_000,
+            4_200,
+            "ap-v1",
+            500,
+            "anthropic-claude-messages-incomplete-v1",
+        );
+        insert_result(&mut conn, &cal, &[ExperimentId::new("exp-40")]).unwrap();
+        let entry =
+            calibrate_show_entry_for(&conn, &cal, fx::ts(1_000), false).expect("entry must build");
+        assert!(entry.cost_model.cost_model_found);
+        let missing: Vec<&str> = entry
+            .cost_model
+            .kinds
+            .iter()
+            .filter(|kind| !kind.modeled)
+            .map(|kind| kind.kind_label.as_str())
+            .collect();
+        assert_eq!(missing, vec!["cache_write"]);
+        let text = render_calibrate_show_entry(&entry);
+        assert!(
+            text.contains("missing"),
+            "the missing kind must read missing:\n{text}"
+        );
+        fx::assert_no_bare_coefficient(&text);
+    }
+
+    /// The renderer states unknown kinds in both cases: `none` when absent
+    /// and the names when present.
+    #[test]
+    fn calibrate_show_states_unknown_kinds_present_and_absent() {
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        let report = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let absent = render_calibrate_show_entry(&report.entries[0]);
+        assert!(absent.contains("unknown kinds  none"), "{absent}");
+        let mut present = report.entries[0].clone();
+        present.cost_model.unknown_kinds = vec!["reasoning_tokens".to_string()];
+        let text = render_calibrate_show_entry(&present);
+        assert!(text.contains("reasoning_tokens"), "{text}");
+        assert!(!text.contains("unknown kinds  none"), "{text}");
+    }
+
+    /// `history` lists calibrations with their activation and supersession
+    /// events and their health states.
+    #[test]
+    fn calibrate_history_lists_events_and_health_states() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        insert_experiment(&conn, &fx::experiment("exp-33")).unwrap();
+        let second = fx::result("wc-18", 1_010_000, 4_100, "ap-v1", 800);
+        insert_result(&mut conn, &second, &[ExperimentId::new("exp-33")]).unwrap();
+        let mut args = fx::activate_args("wc-18");
+        args.actor = "operator".to_string();
+        calibrate_activate_validated(&mut conn, &args, fx::ts(900))
+            .expect("second activation must work");
+        let report = assemble_calibrate_history(&conn, now).expect("history must assemble");
+        assert_eq!(report.entries.len(), 2);
+        let first = &report.entries[0];
+        assert_eq!(first.calibration_id, "wc-17");
+        assert_eq!(first.health_label, "superseded");
+        assert_eq!(first.events.len(), 1);
+        assert_eq!(first.events[0].kind_label, "activation");
+        let next = &report.entries[1];
+        assert_eq!(next.calibration_id, "wc-18");
+        assert_eq!(next.health_label, "current");
+        assert_eq!(next.events.len(), 1);
+        assert_eq!(next.events[0].kind_label, "supersession");
+        assert_eq!(next.events[0].supersedes.as_deref(), Some("wc-17"));
+        let text = render_calibrate_history_report(&report);
+        for expected in [
+            "wc-17",
+            "wc-18",
+            "activation",
+            "supersession",
+            "superseded",
+            "current",
+        ] {
+            assert!(
+                text.contains(expected),
+                "history must render {expected:?}:\n{text}"
+            );
+        }
+        fx::assert_no_bare_coefficient(&text);
+    }
+
+    /// A provisional calibration with no lifecycle event reads provisional in
+    /// history and is listed with no events.
+    #[test]
+    fn calibrate_history_lists_a_provisional_result_with_no_events() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        insert_experiment(&conn, &fx::experiment("exp-34")).unwrap();
+        let provisional = fx::result("wc-provisional", 1_000_000, 4_200, "ap-v1", 500);
+        insert_result(&mut conn, &provisional, &[ExperimentId::new("exp-34")]).unwrap();
+        let report =
+            assemble_calibrate_history(&conn, fx::ts(1_000)).expect("history must assemble");
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].health_label, "provisional");
+        assert!(report.entries[0].events.is_empty());
+        let text = render_calibrate_history_report(&report);
+        assert!(text.contains("provisional"), "{text}");
+        fx::assert_no_bare_coefficient(&text);
+    }
+
+    /// `activate` refuses with a reason when the held-out residual exceeds
+    /// the activation policy.
+    #[test]
+    fn calibrate_activate_refuses_a_residual_above_policy() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        insert_experiment(&conn, &fx::experiment("exp-35")).unwrap();
+        let cal = fx::result("wc-35", 1_000_000, 4_200, "ap-v1", 500);
+        insert_result(&mut conn, &cal, &[ExperimentId::new("exp-35")]).unwrap();
+        let mut args = fx::activate_args("wc-35");
+        args.max_residual_micros = 1_000;
+        match calibrate_activate_validated(&mut conn, &args, fx::ts(600)) {
+            Err(Error::ThresholdNotMet(message)) => {
+                assert!(
+                    message.contains("7000"),
+                    "the refusal must name the residual: {message}"
+                );
+                assert!(
+                    message.contains("1000"),
+                    "the refusal must name the bound: {message}"
+                );
+            }
+            other => panic!("expected Error::ThresholdNotMet, got {other:?}"),
+        }
+    }
+
+    /// `activate` refuses when the presented evidence overlaps or names the
+    /// wrong policy version, and each refusal says why.
+    #[test]
+    fn calibrate_activate_refuses_overlap_and_policy_mismatch() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        insert_experiment(&conn, &fx::experiment("exp-36")).unwrap();
+        let overlapping_cal = fx::result_overlapping_evidence("wc-36");
+        insert_result(&mut conn, &overlapping_cal, &[ExperimentId::new("exp-36")]).unwrap();
+        let mut overlapping = fx::activate_args("wc-36");
+        overlapping.training = vec!["s-1".to_string(), "s-3".to_string()];
+        overlapping.validation = vec!["s-3".to_string()];
+        match calibrate_activate_validated(&mut conn, &overlapping, fx::ts(600)) {
+            Err(Error::ThresholdNotMet(message)) => assert!(
+                message.contains("s-3"),
+                "the refusal must name the overlap: {message}"
+            ),
+            other => panic!("expected Error::ThresholdNotMet, got {other:?}"),
+        }
+        insert_experiment(&conn, &fx::experiment("exp-36b")).unwrap();
+        let cal = fx::result("wc-36b", 1_000_000, 4_200, "ap-v1", 500);
+        insert_result(&mut conn, &cal, &[ExperimentId::new("exp-36b")]).unwrap();
+        let mut mismatched = fx::activate_args("wc-36b");
+        mismatched.policy_version = Some("ap-v2".to_string());
+        match calibrate_activate_validated(&mut conn, &mismatched, fx::ts(600)) {
+            Err(Error::ThresholdNotMet(message)) => assert!(
+                message.contains("ap-v2") && message.contains("ap-v1"),
+                "the refusal must name both policy versions: {message}"
+            ),
+            other => panic!("expected Error::ThresholdNotMet, got {other:?}"),
+        }
+    }
+
+    /// `activate` records the explicit activation: the report names the actor
+    /// and policy, and the calibration becomes the active one.
+    #[test]
+    fn calibrate_activate_records_the_explicit_activation() {
+        use crate::store::calibration::{ExperimentId, insert_experiment, insert_result};
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        insert_experiment(&conn, &fx::experiment("exp-37")).unwrap();
+        let cal = fx::result("wc-37", 1_000_000, 4_200, "ap-v1", 500);
+        insert_result(&mut conn, &cal, &[ExperimentId::new("exp-37")]).unwrap();
+        let args = fx::activate_args("wc-37");
+        let report = calibrate_activate_validated(&mut conn, &args, fx::ts(600))
+            .expect("activation must work");
+        assert_eq!(report.calibration_id, "wc-37");
+        assert_eq!(report.supersedes, None);
+        assert_eq!(report.actor, "operator");
+        assert_eq!(report.activation_policy_version, "ap-v1");
+        assert_eq!(report.fitted_micros_per_point, 1_000_000);
+        let text = render_calibrate_activate_report(&report);
+        assert!(
+            text.contains("calibration wc-37 active by operator under policy ap-v1"),
+            "{text}"
+        );
+        fx::assert_no_bare_coefficient(&text);
+    }
+
+    /// No subcommand prints a bare coefficient: asserted over the rendered
+    /// output of each of the four, including the empty and self-compare
+    /// shapes.
+    #[test]
+    fn no_calibrate_subcommand_prints_a_bare_coefficient() {
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        let show = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        fx::assert_no_bare_coefficient(&render_calibrate_show_report(&show));
+        let history = assemble_calibrate_history(&conn, now).expect("history must assemble");
+        fx::assert_no_bare_coefficient(&render_calibrate_history_report(&history));
+        let compare = assemble_calibrate_compare(&conn, "wc-17", "wc-17", now)
+            .expect("self-compare must assemble");
+        assert_eq!(compare.difference_bps, 0);
+        assert!(compare.candidate_is_active);
+        let compare_text = render_calibrate_compare_report(&compare);
+        assert!(compare_text.contains("by 0.0%"), "{compare_text}");
+        assert!(
+            compare_text.contains("candidate is active"),
+            "{compare_text}"
+        );
+        fx::assert_no_bare_coefficient(&compare_text);
+        let empty = CalibrateShowReport {
+            metadata: show.metadata.clone(),
+            entries: Vec::new(),
+        };
+        let empty_text = render_calibrate_show_report(&empty);
+        assert!(empty_text.contains("no active calibration"), "{empty_text}");
+        fx::assert_no_bare_coefficient(&empty_text);
+        let empty_history = CalibrateHistoryReport {
+            metadata: show.metadata.clone(),
+            entries: Vec::new(),
+        };
+        fx::assert_no_bare_coefficient(&render_calibrate_history_report(&empty_history));
+    }
+
+    /// JSON output for all four carries units and provenance identifiers.
+    #[test]
+    fn calibrate_json_carries_units_and_provenance_identifiers() {
+        use crate::logging::RunId;
+        use calibrate_display as fx;
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let now = fx::seed_active(&mut conn);
+        let run = RunId::new(now);
+        let show = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let show_json = calibrate_show_json(&show, run.clone());
+        let show_value: serde_json::Value =
+            serde_json::from_str(&show_json).expect("show json must parse");
+        assert_eq!(show_value["command"], "calibrate-show");
+        let entry = &show_value["entries"][0];
+        assert_eq!(entry["fitted"]["unit"], "micros_per_point");
+        assert_eq!(entry["fit_residual"]["unit"], "credits");
+        assert_eq!(entry["uncertainty"]["unit"], "micros_per_point");
+        assert_eq!(entry["calibration_id"], "wc-17");
+        assert_eq!(entry["cost_model"]["id"], "anthropic-claude-messages-v1");
+        assert!(
+            entry["evidence_experiments"]
+                .as_array()
+                .unwrap()
+                .contains(&serde_json::Value::String("exp-31".to_string()))
+        );
+        assert_eq!(entry["health"], "current");
+        let history = assemble_calibrate_history(&conn, now).expect("history must assemble");
+        let history_json = calibrate_history_json(&history, run.clone());
+        let history_value: serde_json::Value =
+            serde_json::from_str(&history_json).expect("history json must parse");
+        assert_eq!(history_value["command"], "calibrate-history");
+        assert_eq!(
+            history_value["entries"][0]["fitted"]["unit"],
+            "micros_per_point"
+        );
+        assert_eq!(
+            history_value["entries"][0]["events"][0]["actor"],
+            "operator"
+        );
+        let compare = assemble_calibrate_compare(&conn, "wc-17", "wc-17", now)
+            .expect("compare must assemble");
+        let compare_json = calibrate_compare_json(&compare, run.clone());
+        let compare_value: serde_json::Value =
+            serde_json::from_str(&compare_json).expect("compare json must parse");
+        assert_eq!(compare_value["command"], "calibrate-compare");
+        assert_eq!(
+            compare_value["candidate_fitted"]["unit"],
+            "micros_per_point"
+        );
+        assert_eq!(compare_value["candidate_id"], "wc-17");
+        assert_eq!(compare_value["active_id"], "wc-17");
+        let args = fx::activate_args("wc-17");
+        match calibrate_activate_validated(&mut conn, &args, fx::ts(1_100)) {
+            Err(Error::Store(message)) => assert!(
+                message.contains("must supersede"),
+                "re-activating the active calibration meets the chain guard: {message}"
+            ),
+            other => panic!("expected the scoped-chain refusal, got {other:?}"),
+        }
+        let activate_report = CalibrateActivateReport {
+            metadata: show.metadata.clone(),
+            calibration_id: "wc-17".to_string(),
+            supersedes: None,
+            actor: "operator".to_string(),
+            activation_policy_version: "ap-v1".to_string(),
+            event_at_nanos: 600,
+            fitting_evidence_digest_hex: "0000000000000000".to_string(),
+            validation_evidence_digest_hex: "0000000000000001".to_string(),
+            fitted_micros_per_point: 1_000_000,
+            fit_residual_micros: 4_200,
+            uncertainty_low_micros_per_point: 990_000,
+            uncertainty_high_micros_per_point: 1_010_000,
+        };
+        let activate_json = calibrate_activate_json(&activate_report, run);
+        let activate_value: serde_json::Value =
+            serde_json::from_str(&activate_json).expect("activate json must parse");
+        assert_eq!(activate_value["command"], "calibrate-activate");
+        assert_eq!(activate_value["fitted"]["unit"], "micros_per_point");
+        assert_eq!(activate_value["calibration_id"], "wc-17");
+        assert_eq!(activate_value["actor"], "operator");
+        assert_eq!(activate_value["activation_policy_version"], "ap-v1");
+    }
+
+    /// `calibrate activate` parses its flags and refuses an unknown one by
+    /// name.
+    #[test]
+    fn calibrate_activate_parses_its_flags() {
+        let rest: Vec<String> = [
+            "wc-17",
+            "--actor",
+            "ada",
+            "--training",
+            "s-1,s-2",
+            "--validation=s-3",
+            "--policy-version",
+            "ap-v9",
+            "--max-residual-micros=500",
+            "--max-condition-micros",
+            "700",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_activate(&rest).expect("activate args must parse");
+        assert_eq!(args.calibration_id, "wc-17");
+        assert_eq!(args.actor, "ada");
+        assert_eq!(args.training, vec!["s-1".to_string(), "s-2".to_string()]);
+        assert_eq!(args.validation, vec!["s-3".to_string()]);
+        assert_eq!(args.policy_version.as_deref(), Some("ap-v9"));
+        assert_eq!(args.max_residual_micros, 500);
+        assert_eq!(args.max_condition_micros, 700);
+        let missing: Vec<String> = ["wc-17".to_string()].to_vec();
+        match calibrate_parse_activate(&missing) {
+            Err(Error::Usage(message)) => assert!(message.contains("--training"), "{message}"),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+        let unknown: Vec<String> = ["wc-17", "--resident"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        match calibrate_parse_activate(&unknown) {
+            Err(Error::Usage(message)) => assert!(message.contains("--resident"), "{message}"),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
     }
 }

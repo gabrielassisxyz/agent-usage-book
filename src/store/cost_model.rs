@@ -714,6 +714,24 @@ pub fn load_active_at(conn: &Connection, at: UtcTimestamp) -> Result<Option<Cost
     )
 }
 
+/// Whether a later lifecycle event names this cost model as superseded: a
+/// model is retired exactly when another model's activation records it as
+/// the predecessor. A model absent from the ledger is not superseded, it is
+/// simply unknown there.
+pub fn is_superseded(conn: &Connection, id: &CostModelId) -> Result<bool, Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM cost_model_lifecycle
+            WHERE supersedes_model_id = (
+                SELECT id FROM cost_model WHERE cost_model_id = ?1
+            )
+        )",
+        params![id.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("cannot query cost model supersession: {e}")))
+}
+
 fn load_model(
     conn: &Connection,
     where_clause: &str,
