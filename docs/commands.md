@@ -207,3 +207,10 @@ recording that outcome is success; the command exits non-zero only when it
 could not persist or operate at all. A caller that wants the ordinary
 live-source exit classes instead asks for them explicitly with
 `--require-success`, which still records the same evidence first.
+
+## `aub calibrate`
+
+**Answers:** what quota window capacity is fitted from recorded meter observations?
+
+**Refuses:** to activate candidate calibrations automatically. Candidates are written immutably and never promoted to active status by the fitter.
+
