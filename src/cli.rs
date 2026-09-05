@@ -87,6 +87,7 @@ aub_command_enum! {
     Compare,
     CalibrationFixture,
     CanRun,
+    Calibrate,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -115,7 +116,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 25] = [
+    pub const ALL: [Self; 26] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -141,6 +142,7 @@ impl Command {
         Self::Compare,
         Self::CalibrationFixture,
         Self::CanRun,
+        Self::Calibrate,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -556,6 +558,17 @@ impl Command {
                 },
                 no_color: FlagSupport::Rejected {
                     reason: "can-run prints no color",
+            Command::Calibrate => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Rejected {
+                    reason: "calibrate records an experiment premise or derives candidates from recorded evidence, never a live explanation",
+                },
+                account: FlagSupport::Accepted,
+                model: FlagSupport::Rejected {
+                    reason: "calibrate operates on whole experiments and windows, not individual models",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "calibrate prints plain text or json, never color",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -591,6 +604,7 @@ impl Command {
             Command::Compare => "compare",
             Command::CalibrationFixture => "__calibration-fixture",
             Command::CanRun => "can-run",
+            Command::Calibrate => "calibrate",
         }
     }
 
@@ -648,6 +662,8 @@ impl Command {
             Command::CalibrationFixture => None,
             Command::CanRun => Some(
                 "compare calibrated credit headroom against historical task cost, refusing rather than guessing when evidence is missing",
+            Command::Calibrate => Some(
+                "record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence",
             ),
         }
     }
@@ -697,6 +713,8 @@ impl Command {
             ),
             Command::CanRun => Some(
                 "given a fresh or cached calibrated credit headroom and the historical cost of this task kind, can the proposed task run now?",
+            Command::Calibrate => Some(
+                "what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -768,6 +786,9 @@ impl Command {
             ),
             Command::Compare => Some(
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
+            ),
+            Command::Calibrate => Some(
+                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::CanRun => {
@@ -1092,6 +1113,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Compare => compare_command(&RealClock::new(), &invocation),
         Command::CalibrationFixture => calibration_fixture_command(&RealClock::new(), &invocation),
         Command::CanRun => can_run_command(&RealClock::new(), level, &invocation),
+        Command::Calibrate => calibrate_command(&RealClock::new(), &invocation),
     }
 }
 
@@ -4449,6 +4471,188 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let model_raw =
         model_raw.ok_or_else(|| Error::Usage("can-run requires --task-model MODEL".into()))?;
     let model = crate::domain::window::ModelId::new(&model_raw);
+/// `aub calibrate begin|status|end`: the controlled-experiment record without a
+/// resident process (`aub-c0b.2`, PLAN.md 23.3, 23.4).
+///
+/// `begin` writes the premise, the process exits, the ordinary scheduler keeps
+/// sampling, and `end` later records the end of controlled local work.
+/// Sampling cadence during an experiment is tightened by invoking
+/// `sample --due` more often through the external scheduler, never by a
+/// resident loop: nothing here spawns a thread, sleeps, or holds the database
+/// open past the command.
+fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let subcommand = invocation.rest.first().map(String::as_str);
+    match subcommand {
+        Some("begin") => calibrate_begin_command(clock, invocation),
+        Some("status") => calibrate_status_command(clock, invocation),
+        Some("end") => calibrate_end_command(clock, invocation),
+        Some("fit") => calibrate_fit(clock, invocation),
+        other => Err(Error::Usage(format!(
+            "calibrate requires a subcommand (begin | status | end | fit), got {other:?}"
+        ))),
+    }
+}
+
+fn calibrate_next_arg(args: &mut std::slice::Iter<String>, flag: &str) -> Result<String, Error> {
+    args.next()
+        .cloned()
+        .ok_or_else(|| Error::Usage(format!("{flag} requires a value")))
+}
+
+/// Reads one `--flag value` or `--flag=value` pair out of the subcommand args.
+/// Returns `None` when the next arg names a different flag or a positional.
+fn calibrate_take_value(
+    args: &mut std::slice::Iter<String>,
+    flag: &str,
+) -> Result<Option<String>, Error> {
+    let Some(peek) = args.clone().next() else {
+        return Ok(None);
+    };
+    if let Some(value) = peek.strip_prefix(&format!("{flag}=")) {
+        args.next();
+        if value.is_empty() {
+            return Err(Error::Usage(format!("{flag} requires a value")));
+        }
+        return Ok(Some(value.to_string()));
+    }
+    if peek == flag {
+        args.next();
+        return Ok(Some(calibrate_next_arg(args, flag)?));
+    }
+    Ok(None)
+}
+
+#[derive(Debug)]
+struct CalibrateBeginArgs {
+    plan_tier: String,
+    window: String,
+    cost_model: String,
+    expect_kinds: Option<String>,
+    experiment: Option<String>,
+    assert_exclusive: bool,
+}
+
+fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
+    let usage = "calibrate begin requires --account NAME --plan-tier TIER --window KEY \
+                 --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
+    let mut args = CalibrateBeginArgs {
+        plan_tier: String::new(),
+        window: String::new(),
+        cost_model: String::new(),
+        expect_kinds: None,
+        experiment: None,
+        assert_exclusive: false,
+    };
+    let mut rest = rest.iter();
+    while let Some(arg) = rest.next() {
+        if arg == "--assert-exclusive" {
+            args.assert_exclusive = true;
+        } else if arg == "--plan-tier" {
+            args.plan_tier = calibrate_next_arg(&mut rest, "--plan-tier")?;
+        } else if let Some(value) = arg.strip_prefix("--plan-tier=") {
+            args.plan_tier = value.to_string();
+        } else if arg == "--window" {
+            args.window = calibrate_next_arg(&mut rest, "--window")?;
+        } else if let Some(value) = arg.strip_prefix("--window=") {
+            args.window = value.to_string();
+        } else if arg == "--cost-model" {
+            args.cost_model = calibrate_next_arg(&mut rest, "--cost-model")?;
+        } else if let Some(value) = arg.strip_prefix("--cost-model=") {
+            args.cost_model = value.to_string();
+        } else if arg == "--expect-kinds" {
+            args.expect_kinds = Some(calibrate_next_arg(&mut rest, "--expect-kinds")?);
+        } else if let Some(value) = arg.strip_prefix("--expect-kinds=") {
+            args.expect_kinds = Some(value.to_string());
+        } else if arg == "--experiment" {
+            args.experiment = Some(calibrate_next_arg(&mut rest, "--experiment")?);
+        } else if let Some(value) = arg.strip_prefix("--experiment=") {
+            args.experiment = Some(value.to_string());
+        } else {
+            return Err(Error::Usage(format!(
+                "calibrate begin: unknown argument {arg:?}; {usage}"
+            )));
+        }
+    }
+    if args.plan_tier.trim().is_empty()
+        || args.window.trim().is_empty()
+        || args.cost_model.trim().is_empty()
+    {
+        return Err(Error::Usage(usage.into()));
+    }
+    if !args.assert_exclusive {
+        return Err(Error::Usage(
+            "calibrate begin records that the account is reserved for the experiment; pass --assert-exclusive to state the premise explicitly".into(),
+        ));
+    }
+    Ok(args)
+}
+
+/// Resolves the experiment `status` and `end` operate on: the `--experiment`
+/// value (or lone positional) when given, else the most recently begun run.
+fn calibrate_resolve_experiment(
+    conn: &rusqlite::Connection,
+    rest: &[String],
+    subcommand: &str,
+) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
+    use crate::store::calibration_controlled::{
+        ControlledExperimentId, load_by_experiment_id, load_latest,
+    };
+    let usage = format!("{subcommand} takes [--experiment ID] or [ID]");
+    let mut experiment: Option<String> = None;
+    let mut positionals: Vec<&String> = Vec::new();
+    let mut args = rest.iter();
+    loop {
+        if let Some(taken) = calibrate_take_value(&mut args, "--experiment")? {
+            if experiment.is_some() {
+                return Err(Error::Usage(format!(
+                    "{subcommand}: --experiment given twice"
+                )));
+            }
+            experiment = Some(taken);
+        } else if let Some(arg) = args.next() {
+            if arg.starts_with("--") {
+                return Err(Error::Usage(format!(
+                    "calibrate {subcommand}: unknown argument {arg:?}; {usage}"
+                )));
+            }
+            positionals.push(arg);
+        } else {
+            break;
+        }
+    }
+    if experiment.is_none() && positionals.len() == 1 {
+        experiment = Some(positionals[0].clone());
+    } else if !positionals.is_empty() {
+        return Err(Error::Usage(format!(
+            "calibrate {subcommand}: unexpected positional arguments {positionals:?}; {usage}"
+        )));
+    }
+    match experiment {
+        Some(id) => {
+            let id = ControlledExperimentId::new(id);
+            load_by_experiment_id(conn, &id)?.ok_or_else(|| {
+                Error::Usage(format!(
+                    "no controlled experiment '{}'; begin one with `aub calibrate begin`",
+                    id.as_str()
+                ))
+            })
+        }
+        None => load_latest(conn)?.ok_or_else(|| {
+            Error::Usage(
+                "no controlled experiment recorded; begin one with `aub calibrate begin`".into(),
+            )
+        }),
+    }
+}
+
+fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let Some(account) = invocation.account.as_deref() else {
+        return Err(Error::Usage(
+            "calibrate begin requires --account NAME: the account reserved for the experiment"
+                .into(),
+        ));
+    };
+    let args = calibrate_parse_begin(&invocation.rest[1..])?;
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
@@ -4898,6 +5102,206 @@ fn gather_meter_readiness(
             crate::report::can_run::CanRunMeterReadiness::AuthRequired
         }
     }
+    let provider = config
+        .accounts
+        .iter()
+        .find(|entry| entry.name == account)
+        .map(|entry| entry.provider.clone())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "unknown account '{account}': calibrate begin --account names a configured account"
+            ))
+        })?;
+
+    let conn = open_ledger(clock)?;
+    let run = calibrate_begin_validated(&conn, &provider, account, &args, clock)?;
+    println!(
+        "calibrate begin: experiment={} account={} plan_tier={} window={} cost_model={} baseline_observation={} started_at={}",
+        run.id.as_str(),
+        run.account,
+        run.plan_tier.as_str(),
+        run.window_semantic_key.as_str(),
+        run.cost_model_id.as_str(),
+        run.baseline_observation_id.value(),
+        run.started_at.unix_nanos(),
+    );
+    println!(
+        "tighten sampling by invoking `aub sample --due` more often; no resident process was started"
+    );
+    Ok(())
+}
+
+/// The testable core of `calibrate begin`: everything after configuration and
+/// connection setup, so unit tests can drive the refusal branches against a
+/// fixture database with no environment involved.
+fn calibrate_begin_validated(
+    conn: &rusqlite::Connection,
+    provider: &str,
+    account: &str,
+    args: &CalibrateBeginArgs,
+    clock: &impl Clock,
+) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
+    use crate::store::calibration_controlled::{
+        ControlledExperimentId, ControlledExperimentRun, default_expected_token_kinds,
+        insert_begin, load_by_experiment_id, missing_expected_terms, parse_expected_token_kinds,
+        running_for_account,
+    };
+    let started_at = clock.now();
+    let experiment_id = args
+        .experiment
+        .clone()
+        .map(ControlledExperimentId::new)
+        .unwrap_or_else(|| ControlledExperimentId::new(format!("cal-{}", started_at.unix_nanos())));
+
+    let cost_model_id = crate::domain::provenance::CostModelId::new(args.cost_model.clone());
+    let model =
+        crate::store::cost_model::load_by_semantic_id(conn, &cost_model_id)?.ok_or_else(|| {
+            Error::Usage(format!(
+                "unknown cost model '{}': calibrate begin --cost-model names a stored cost model",
+                args.cost_model
+            ))
+        })?;
+    let expected = match args.expect_kinds.as_deref() {
+        Some(kinds) => parse_expected_token_kinds(kinds)?,
+        None => default_expected_token_kinds(),
+    };
+    let missing = missing_expected_terms(&model, &expected);
+    if !missing.is_empty() {
+        let names = missing
+            .iter()
+            .copied()
+            .map(crate::domain::tokens::TokenKind::label)
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(Error::Usage(format!(
+            "cost model '{}' carries no term for expected token kind(s) {}; fit the cost model first",
+            args.cost_model, names
+        )));
+    }
+
+    let account_id = crate::store::account::account_id_by_identity(conn, provider, account)?
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "no meter observation for account '{account}': sample first with `aub sample --account {account}`"
+            ))
+        })?;
+    let baseline =
+        crate::store::meter_evidence::newest_observation_for_account(conn, account_id)?
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "no meter observation for account '{account}': sample first with `aub sample --account {account}`"
+                ))
+            })?;
+    let windows = crate::store::meter_evidence::windows_by_observation(conn, baseline.row_id)?;
+    let window = windows
+        .iter()
+        .find(|entry| entry.semantic_key.as_str() == args.window)
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "no meter window '{}' on the baseline observation for account '{account}': sample first with `aub sample --account {account}`",
+                args.window
+            ))
+        })?;
+
+    if load_by_experiment_id(conn, &experiment_id)?.is_some() {
+        return Err(Error::Usage(format!(
+            "controlled experiment '{}' already exists; name this one with --experiment",
+            experiment_id.as_str()
+        )));
+    }
+    if let Some(holder) = running_for_account(conn, account)? {
+        return Err(Error::Usage(format!(
+            "account '{account}' already runs controlled experiment '{}'; end it with `aub calibrate end` before beginning another",
+            holder.id.as_str()
+        )));
+    }
+
+    let run = ControlledExperimentRun {
+        account: account.to_string(),
+        provider: crate::store::cost_model::ProviderKey::new(provider),
+        plan_tier: crate::store::calibration::PlanTier::new(args.plan_tier.clone()),
+        window_semantic_key: crate::domain::window::WindowSemanticKey::new(args.window.clone()),
+        cost_model_id,
+        expected_token_kinds: expected,
+        baseline_observation_id: baseline.row_id,
+        baseline_quota_used: window.quota_used,
+        baseline_resolution: window.reported_resolution,
+        baseline_observed_at: baseline.received_at,
+        baseline_plateau_started_at: {
+            use crate::store::calibration_controlled::baseline_plateau_start_for;
+            let thresholds =
+                crate::calibration::contamination::ContaminationThresholds::conservative_default();
+            baseline_plateau_start_for(
+                conn,
+                provider,
+                account,
+                &crate::domain::window::WindowSemanticKey::new(args.window.clone()),
+                window.quota_used,
+                baseline.received_at,
+                thresholds.pre_burn_max_movement_ppm(),
+            )?
+        },
+        contamination_thresholds:
+            crate::calibration::contamination::ContaminationThresholds::conservative_default(),
+        started_at,
+        ended_at: None,
+        exclusivity_assertion: format!(
+            "account {account} reserved for controlled experiment {}",
+            experiment_id.as_str()
+        ),
+        id: experiment_id,
+    };
+    insert_begin(conn, &run)?;
+    Ok(run)
+}
+
+fn calibrate_status_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    use crate::store::calibration_controlled::status_for_run;
+    let conn = open_ledger(clock)?;
+    let now = clock.now();
+    let run = calibrate_resolve_experiment(&conn, &invocation.rest[1..], "calibrate status")?;
+    let status = status_for_run(&conn, &run, now)?;
+    println!(
+        "calibrate status: experiment={} phase={} elapsed_nanos={} samples_since_baseline={} settlement={}",
+        run.id.as_str(),
+        status.phase.label(),
+        status.elapsed.as_nanos(),
+        status.samples_since_baseline,
+        if status.is_settled() {
+            "settled"
+        } else {
+            "unsettled"
+        },
+    );
+    println!(
+        "account={} window={} cost_model={} started_at={} ended_at={}",
+        run.account,
+        run.window_semantic_key.as_str(),
+        run.cost_model_id.as_str(),
+        run.started_at.unix_nanos(),
+        run.ended_at
+            .map(|at| at.unix_nanos().to_string())
+            .as_deref()
+            .unwrap_or("none"),
+    );
+    Ok(())
+}
+
+fn calibrate_end_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    use crate::store::calibration_controlled::record_end;
+    let conn = open_ledger(clock)?;
+    let now = clock.now();
+    let run = calibrate_resolve_experiment(&conn, &invocation.rest[1..], "calibrate end")?;
+    record_end(&conn, &run.id, now)?;
+    println!(
+        "calibrate end: experiment={} ended_at={}",
+        run.id.as_str(),
+        now.unix_nanos(),
+    );
+    println!(
+        "controlled work ended; the meter is not declared settled here. Keep invoking `aub sample --due` and watch `aub calibrate status` until settlement is reported."
+    );
+    Ok(())
 }
 
 fn compare_next_arg(args: &mut std::slice::Iter<String>, flag: &str) -> Result<String, Error> {
@@ -5073,6 +5477,120 @@ fn compare_uncompared_command(clock: &impl Clock, invocation: &Invocation) -> Re
                 observation_id.value(),
                 window.semantic_key.as_str()
             );
+        }
+    }
+    Ok(())
+}
+
+fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let mut experiment_id: Option<crate::store::calibration::ExperimentId> = None;
+    let mut iter = invocation.rest.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--experiment" {
+            let id = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--experiment requires an argument".into()))?;
+            experiment_id = Some(crate::store::calibration::ExperimentId::new(id));
+        } else {
+            return Err(Error::Usage(format!(
+                "unknown argument to calibrate fit: {arg}"
+            )));
+        }
+    }
+
+    let conn = open_ledger(clock)?;
+    let fit_result =
+        crate::calibration::fitter::fit_and_record_candidate(&conn, experiment_id.as_ref(), clock)?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!("Candidate ID: {}", fit_result.candidate.id.as_str());
+            println!("Experiment:   {}", fit_result.candidate.experiment.as_str());
+            println!("Provider:     {}", fit_result.candidate.provider.as_str());
+            println!("Plan Tier:    {}", fit_result.candidate.plan_tier.as_str());
+            println!(
+                "Window:       {}",
+                fit_result.candidate.window_semantic_key.as_str()
+            );
+            println!(
+                "Fitted:       {} micros/point",
+                fit_result.candidate.fitted.micros_per_point()
+            );
+            println!(
+                "Capacity:     {} credits",
+                fit_result
+                    .candidate
+                    .equivalent_full_window_capacity
+                    .micros() as f64
+                    / 1_000_000.0
+            );
+            println!(
+                "Uncertainty:  [{}..={}] micros/point",
+                fit_result.candidate.uncertainty.lower().micros_per_point(),
+                fit_result.candidate.uncertainty.upper().micros_per_point()
+            );
+            println!(
+                "Residual:     {:.4} pp",
+                fit_result.residual_percentage_points
+            );
+            println!("Lag Handling: {}", fit_result.lag_handling.as_str());
+            println!("Method:       {}", fit_result.statistical_method);
+            println!("Parameters:   {}", fit_result.statistical_parameters);
+            println!("Usable Obs:   {}", fit_result.usable_observations);
+            println!("Excluded:     {}", fit_result.excluded_samples.len());
+            for ex in &fit_result.excluded_samples {
+                println!("  - {}: {}", ex.sample_ref(), ex.reason());
+            }
+            if !fit_result.diagnostic_findings.is_empty() {
+                println!("Diagnostics:");
+                for diag in &fit_result.diagnostic_findings {
+                    println!("  - {}", diag.message());
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "candidate_id": fit_result.candidate.id.as_str(),
+                "experiment_id": fit_result.candidate.experiment.as_str(),
+                "provider": fit_result.candidate.provider.as_str(),
+                "plan_tier": fit_result.candidate.plan_tier.as_str(),
+                "window_semantic_key": fit_result.candidate.window_semantic_key.as_str(),
+                "fitted_micros_per_point": fit_result.candidate.fitted.micros_per_point(),
+                "equivalent_full_window_capacity_micros": fit_result.candidate.equivalent_full_window_capacity.micros(),
+                "fit_residual_micros": fit_result.candidate.fit_residual.micros(),
+                "residual_percentage_points": fit_result.residual_percentage_points,
+                "uncertainty_low_micros": fit_result.candidate.uncertainty.lower().micros_per_point(),
+                "uncertainty_high_micros": fit_result.candidate.uncertainty.upper().micros_per_point(),
+                "lag_handling": fit_result.lag_handling.as_str(),
+                "statistical_method": fit_result.statistical_method,
+                "statistical_parameters": fit_result.statistical_parameters,
+                "usable_observations": fit_result.usable_observations,
+                "sample_count": fit_result.candidate.sample_count,
+                "inputs_digest": format!("{:016x}", fit_result.candidate.inputs.digest()),
+                "inputs_count": fit_result.candidate.inputs.count(),
+                "excluded_samples": fit_result.excluded_samples.iter().map(|ex| {
+                    serde_json::json!({
+                        "sample_ref": ex.sample_ref(),
+                        "reason": ex.reason(),
+                    })
+                }).collect::<Vec<_>>(),
+                "diagnostic_findings": fit_result.diagnostic_findings.iter().map(|diag| {
+                    match diag {
+                        crate::calibration::fitter::DiagnosticFinding::LargeIntercept {
+                            intercept_ppm,
+                            threshold_ppm,
+                            possible_causes,
+                        } => serde_json::json!({
+                            "type": "large_intercept",
+                            "intercept_ppm": intercept_ppm,
+                            "threshold_ppm": threshold_ppm,
+                            "possible_causes": possible_causes,
+                            "message": diag.message(),
+                        }),
+                    }
+                }).collect::<Vec<_>>(),
+            });
+            println!("{json}");
         }
     }
     Ok(())
@@ -6623,5 +7141,289 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             .map(|offset| offset + declaration.len() + 1)
             .unwrap_or(rest.len());
         rest[..end].to_string()
+    }
+
+    /// A scratch ledger for the `calibrate` unit tests: a migrated database in
+    /// a temp directory that removes itself. The tests drive
+    /// [`calibrate_begin_validated`] and [`calibrate_resolve_experiment`]
+    /// against it with no environment involved. The ledger lives in the store
+    /// so this file carries no SQL and no migration import (boundary rules 15
+    /// and 16); the wrappers below only delegate.
+    fn calibrate_fixture_db() -> (
+        crate::store::calibrate_cli_test_ledger::CalibrateCliTestLedgerDir,
+        rusqlite::Connection,
+    ) {
+        crate::store::calibrate_cli_test_ledger::open_calibrate_cli_test_ledger()
+    }
+
+    fn calibrate_insert_meter_chain(
+        conn: &rusqlite::Connection,
+        account: &str,
+        semantic_key: &str,
+        received_at: crate::domain::time::UtcTimestamp,
+        quota_ppm: i64,
+    ) {
+        crate::store::calibrate_cli_test_ledger::insert_calibrate_cli_meter_chain(
+            conn,
+            account,
+            semantic_key,
+            received_at,
+            quota_ppm,
+        );
+    }
+
+    fn calibrate_activate_cost_model(conn: &mut rusqlite::Connection, complete: bool) {
+        use crate::domain::time::UtcTimestamp;
+        use crate::store::cost_model::{
+            anthropic_claude_messages_incomplete_v1, anthropic_claude_messages_v1,
+        };
+        let at = UtcTimestamp::from_unix_nanos(1_000_000);
+        let model = if complete {
+            anthropic_claude_messages_v1(at)
+        } else {
+            anthropic_claude_messages_incomplete_v1(at)
+        };
+        crate::store::cost_model::activate(conn, &model, at, None)
+            .expect("cost model activation must work");
+    }
+
+    fn calibrate_begin_rest(
+        plan_tier: &str,
+        window: &str,
+        cost_model: &str,
+        experiment: &str,
+    ) -> Vec<String> {
+        [
+            "--plan-tier",
+            plan_tier,
+            "--window",
+            window,
+            "--cost-model",
+            cost_model,
+            "--experiment",
+            experiment,
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect()
+    }
+
+    #[test]
+    fn calibrate_begin_parses_its_flags() {
+        let rest = calibrate_begin_rest("pro-5h", "five_hour", "cm-1", "exp-1");
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        assert_eq!(args.plan_tier, "pro-5h");
+        assert_eq!(args.window, "five_hour");
+        assert_eq!(args.cost_model, "cm-1");
+        assert_eq!(args.experiment.as_deref(), Some("exp-1"));
+        assert!(args.assert_exclusive);
+    }
+
+    #[test]
+    fn calibrate_begin_requires_the_explicit_assertion() {
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "cm-1",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        match calibrate_parse_begin(&rest) {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("--assert-exclusive"),
+                "the refusal must name the missing assertion: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_begin_refuses_an_unknown_argument() {
+        let mut rest = calibrate_begin_rest("pro-5h", "five_hour", "cm-1", "exp-1");
+        rest.push("--resident".to_string());
+        match calibrate_parse_begin(&rest) {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("--resident"),
+                "the refusal must name the unknown argument: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_begin_refuses_an_incomplete_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, false);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest = calibrate_begin_rest(
+            "pro-5h",
+            "five_hour",
+            "anthropic-claude-messages-incomplete-v1",
+            "exp-incomplete",
+        );
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        let clock = FakeClock::new(at);
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock) {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("cache_write"),
+                "the refusal must name the missing term: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_begin_refuses_without_a_sampled_baseline() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        let rest = calibrate_begin_rest(
+            "pro-5h",
+            "five_hour",
+            "anthropic-claude-messages-v1",
+            "exp-no-baseline",
+        );
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        let clock = FakeClock::new(at);
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock) {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("sample first"),
+                "the refusal must point at sampling: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_begin_records_the_premise_and_refuses_a_second_running_experiment() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let clock = FakeClock::new(at);
+        let first = calibrate_begin_rest(
+            "pro-5h",
+            "five_hour",
+            "anthropic-claude-messages-v1",
+            "exp-1",
+        );
+        let args = calibrate_parse_begin(&first).expect("begin args must parse");
+        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock)
+            .expect("first begin must work");
+        assert_eq!(run.account, "work-a");
+        assert_eq!(run.plan_tier.as_str(), "pro-5h");
+        assert_eq!(run.window_semantic_key.as_str(), "five_hour");
+        assert_eq!(run.cost_model_id.as_str(), "anthropic-claude-messages-v1");
+        assert!(
+            run.exclusivity_assertion.contains("work-a"),
+            "the assertion must name the reserved account"
+        );
+
+        let second = calibrate_begin_rest(
+            "pro-5h",
+            "five_hour",
+            "anthropic-claude-messages-v1",
+            "exp-2",
+        );
+        let args = calibrate_parse_begin(&second).expect("begin args must parse");
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock) {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("exp-1"),
+                "the overlap refusal must name the running holder: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_resolve_experiment_reads_flag_equals_and_positional_forms() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let clock = FakeClock::new(at);
+        let rest = calibrate_begin_rest(
+            "pro-5h",
+            "five_hour",
+            "anthropic-claude-messages-v1",
+            "exp-resolve",
+        );
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock)
+            .expect("begin must work");
+
+        for rest in [
+            vec!["--experiment".to_string(), "exp-resolve".to_string()],
+            vec!["--experiment=exp-resolve".to_string()],
+            vec!["exp-resolve".to_string()],
+            vec![],
+        ] {
+            let run = calibrate_resolve_experiment(&conn, &rest, "calibrate status")
+                .expect("resolve must work");
+            assert_eq!(run.id.as_str(), "exp-resolve");
+        }
+    }
+
+    #[test]
+    fn calibrate_resolve_experiment_refuses_an_unknown_flag() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, conn) = calibrate_fixture_db();
+        let _ = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000));
+        let rest = vec!["--resident".to_string()];
+        match calibrate_resolve_experiment(&conn, &rest, "calibrate status") {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("--resident"),
+                "the refusal must name the unknown flag: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_end_records_the_boundary_and_status_reports_the_phase() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::store::calibration_controlled::{
+            ControlledExperimentId, load_by_experiment_id, record_end, status_for_run,
+        };
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let clock = FakeClock::new(at);
+        let rest = calibrate_begin_rest(
+            "pro-5h",
+            "five_hour",
+            "anthropic-claude-messages-v1",
+            "exp-end",
+        );
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock)
+            .expect("begin must work");
+
+        let ended_at = UtcTimestamp::from_unix_nanos(2_000_000_000);
+        let id = ControlledExperimentId::new("exp-end");
+        record_end(&conn, &id, ended_at).expect("end must work");
+        let run = load_by_experiment_id(&conn, &id)
+            .expect("load must work")
+            .expect("run must exist");
+        let status = status_for_run(&conn, &run, ended_at).expect("status must work");
+        assert_eq!(
+            status.phase,
+            crate::store::calibration_controlled::ControlledRunPhase::Ended
+        );
+        assert!(
+            !status.is_settled(),
+            "one observation cannot satisfy the settlement criterion: end declares no settlement"
+        );
     }
 }

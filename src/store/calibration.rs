@@ -35,7 +35,7 @@ use crate::domain::provenance::{
 };
 use crate::domain::quota::QuotaFractionPpm;
 use crate::domain::time::{MonotonicDuration, UtcTimestamp};
-use crate::domain::window::{ReportedResolution, WindowSemanticKey};
+use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowSemanticKey};
 use crate::error::Error;
 use crate::store::cost_model::{ProviderKey, ValidityInterval};
 
@@ -894,6 +894,158 @@ pub fn load_experiment(
     .map_err(|e| Error::Store(format!("cannot load the calibration_experiment row: {e}")))
 }
 
+/// Loads the most recently recorded experiment, ordered by knowledge_time DESC, id DESC.
+pub fn load_latest_experiment(conn: &Connection) -> Result<Option<CalibrationExperiment>, Error> {
+    conn.query_row(
+        &format!(
+            "SELECT {EXPERIMENT_COLUMNS} FROM calibration_experiment ORDER BY knowledge_time DESC, id DESC LIMIT 1"
+        ),
+        [],
+        |row| experiment_from_row(row).map_err(store_error_to_sql),
+    )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot load latest calibration_experiment row: {e}")))
+}
+
+/// An observation loaded from durable store for calibration fitting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredFitObservation {
+    pub evidence_id: EvidenceId,
+    pub at: UtcTimestamp,
+    pub quota_used_ppm: i64,
+    pub reported_resolution_ppm: i64,
+    pub quantization: QuantizationSemantics,
+    pub resets_at: UtcTimestamp,
+}
+
+/// Loads all meter observations within an experiment's scope and validity window.
+pub fn load_experiment_observations(
+    conn: &Connection,
+    experiment: &CalibrationExperiment,
+) -> Result<Vec<StoredFitObservation>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                re.content_hash,
+                mo.received_at,
+                mw.quota_used_ppm,
+                mw.reported_resolution_ppm,
+                mw.quantization,
+                mw.resets_at
+             FROM meter_observation mo
+             JOIN meter_window mw ON mw.observation_id = mo.id
+             JOIN meter_response_evidence re ON re.id = mo.evidence_id
+             WHERE mo.provider = ?1
+               AND mw.semantic_key = ?2
+               AND mo.received_at >= ?3
+               AND mo.received_at <= ?4
+             ORDER BY mo.received_at ASC, mo.id ASC",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare experiment observations query: {e}")))?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                experiment.provider.as_str(),
+                experiment.window_semantic_key.as_str(),
+                experiment.validity.valid_from().unix_nanos(),
+                experiment.validity.valid_until().unix_nanos(),
+            ],
+            |row| {
+                let hash: String = row.get(0)?;
+                let received_at_nanos: i64 = row.get(1)?;
+                let quota_used_ppm: i64 = row.get(2)?;
+                let reported_resolution_ppm: i64 = row.get(3)?;
+                let quantization_str: String = row.get(4)?;
+                let resets_at_nanos: i64 = row.get(5)?;
+                Ok((
+                    hash,
+                    received_at_nanos,
+                    quota_used_ppm,
+                    reported_resolution_ppm,
+                    quantization_str,
+                    resets_at_nanos,
+                ))
+            },
+        )
+        .map_err(|e| Error::Store(format!("cannot query experiment observations: {e}")))?;
+
+    let mut observations = Vec::new();
+    for row_res in rows {
+        let (hash, rec_nanos, used_ppm, res_ppm, quant_str, resets_nanos) =
+            row_res.map_err(|e| Error::Store(format!("cannot read observation row: {e}")))?;
+        let quantization = crate::store::meter_evidence::quantization_sql::from_sql(&quant_str)?;
+        observations.push(StoredFitObservation {
+            evidence_id: EvidenceId::new(hash),
+            at: UtcTimestamp::from_unix_nanos(rec_nanos),
+            quota_used_ppm: used_ppm,
+            reported_resolution_ppm: res_ppm,
+            quantization,
+            resets_at: UtcTimestamp::from_unix_nanos(resets_nanos),
+        });
+    }
+    Ok(observations)
+}
+
+/// A usage event loaded from durable store for calibration fitting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredUsageEvent {
+    pub canonical_event_id: String,
+    pub timestamp: UtcTimestamp,
+    pub model_id: Option<String>,
+    pub token_class: String,
+    pub count: u64,
+}
+
+/// Loads all usage events within a time interval for calculating cumulative credits.
+pub fn load_experiment_usage(
+    conn: &Connection,
+    from: UtcTimestamp,
+    until: UtcTimestamp,
+) -> Result<Vec<StoredUsageEvent>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                ue.canonical_event_id,
+                ue.event_timestamp,
+                ue.model_id,
+                uc.token_class,
+                uc.count
+             FROM usage_event ue
+             JOIN usage_component uc ON uc.event_id = ue.id
+             WHERE ue.event_timestamp >= ?1 AND ue.event_timestamp <= ?2
+             ORDER BY ue.event_timestamp ASC, ue.id ASC",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare experiment usage query: {e}")))?;
+
+    let rows = stmt
+        .query_map(params![from.unix_nanos(), until.unix_nanos()], |row| {
+            let id: String = row.get(0)?;
+            let ts: Option<i64> = row.get(1)?;
+            let model: Option<String> = row.get(2)?;
+            let token_class: String = row.get(3)?;
+            let count: i64 = row.get(4)?;
+            Ok((id, ts, model, token_class, count))
+        })
+        .map_err(|e| Error::Store(format!("cannot query experiment usage: {e}")))?;
+
+    let mut events = Vec::new();
+    for row_res in rows {
+        let (id, ts, model, token_class, count) =
+            row_res.map_err(|e| Error::Store(format!("cannot read usage row: {e}")))?;
+        let count_u64 = u64::try_from(count)
+            .map_err(|_| Error::Store("stored token count is negative".into()))?;
+        events.push(StoredUsageEvent {
+            canonical_event_id: id,
+            timestamp: UtcTimestamp::from_unix_nanos(ts.unwrap_or(0)),
+            model_id: model,
+            token_class,
+            count: count_u64,
+        });
+    }
+    Ok(events)
+}
+
 fn resolve_experiment_db_id(conn: &Connection, id: &ExperimentId) -> Result<i64, Error> {
     conn.query_row(
         "SELECT id FROM calibration_experiment WHERE experiment_id = ?1",
@@ -970,6 +1122,34 @@ pub fn load_candidate(
             "cannot load the window_calibration_candidate row: {e}"
         ))
     })
+}
+
+/// Attempts an update on a candidate row. Always fails because `window_calibration_candidate` is immutable.
+pub fn try_update_candidate(conn: &Connection, id: &CandidateId) -> Result<(), Error> {
+    conn.execute(
+        "UPDATE window_calibration_candidate SET provider = 'tampered' WHERE candidate_id = ?1",
+        params![id.as_str()],
+    )
+    .map_err(|e| Error::Store(format!("update refused: {e}")))?;
+    Ok(())
+}
+
+/// Attempts a delete on a candidate row. Always fails because `window_calibration_candidate` is immutable.
+pub fn try_delete_candidate(conn: &Connection, id: &CandidateId) -> Result<(), Error> {
+    conn.execute(
+        "DELETE FROM window_calibration_candidate WHERE candidate_id = ?1",
+        params![id.as_str()],
+    )
+    .map_err(|e| Error::Store(format!("delete refused: {e}")))?;
+    Ok(())
+}
+
+/// Returns the total count of lifecycle rows.
+pub fn count_calibration_lifecycles(conn: &Connection) -> Result<i64, Error> {
+    conn.query_row("SELECT COUNT(*) FROM calibration_lifecycle", [], |row| {
+        row.get(0)
+    })
+    .map_err(|e| Error::Store(format!("cannot count calibration_lifecycle rows: {e}")))
 }
 
 // --- results ----------------------------------------------------------
