@@ -1236,16 +1236,19 @@ fn render_coverage_detail(
     account: &crate::report::CoverageAccount,
 ) -> Option<Vec<String>> {
     let engine = &account.engine;
-    let attempt_below_floor = engine
-        .attempt_coverage
-        .is_some_and(|coverage| coverage.as_f64() < report.threshold.attempt_floor.get());
-    let measurement_below_floor = engine
-        .measurement_coverage
-        .is_some_and(|coverage| coverage.as_f64() < report.threshold.measurement_floor.get());
+    let attempt_below_floor = account.configured
+        && engine
+            .attempt_coverage
+            .is_some_and(|coverage| coverage.as_f64() < report.threshold.attempt_floor.get());
+    let measurement_below_floor = account.configured
+        && engine
+            .measurement_coverage
+            .is_some_and(|coverage| coverage.as_f64() < report.threshold.measurement_floor.get());
     let interrupted = engine.started_without_terminal_result > 0;
     let policy_unknown = engine.expected_opportunities.is_none();
     let severe = !engine.reset_spanning_gaps.is_empty();
-    if !policy_unknown
+    if account.configured
+        && !policy_unknown
         && !attempt_below_floor
         && !measurement_below_floor
         && !interrupted
@@ -1255,7 +1258,9 @@ fn render_coverage_detail(
     }
 
     let mut lines = Vec::new();
-    if policy_unknown {
+    if !account.configured {
+        lines.push("account is not configured".to_string());
+    } else if policy_unknown {
         lines.push("no sampling policy snapshot covers the whole interval".to_string());
     } else {
         match engine.attempt_coverage {

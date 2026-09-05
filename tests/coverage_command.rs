@@ -21,7 +21,7 @@ use agent_usage_book::presentation::{
     coverage_json, render_coverage_report, validate_coverage_report_json,
 };
 use agent_usage_book::report::coverage::{
-    CoverageFloors, CoverageSelector, assemble as assemble_coverage,
+    AccountIdentity, CoverageFloors, CoverageSelector, assemble as assemble_coverage,
 };
 use agent_usage_book::store::{
     account as account_store, connection, meter_attempt as attempt_store,
@@ -48,6 +48,13 @@ fn floors() -> CoverageFloors {
         attempt: CoverageFloor::new(0.98).unwrap(),
         measurement: CoverageFloor::new(0.95).unwrap(),
     }
+}
+
+fn worked_example_accounts() -> [AccountIdentity; 2] {
+    [
+        AccountIdentity::new("provider-a", "work-primary"),
+        AccountIdentity::new("provider-a", "research"),
+    ]
 }
 
 /// Opens a scratch ledger through the store's own path and migrates it.
@@ -384,6 +391,7 @@ fn the_two_worked_examples_render() {
         &selector,
         floors(),
         ts(T1 / SECOND),
+        &worked_example_accounts(),
     )
     .expect("the worked examples must assemble");
 
@@ -424,6 +432,7 @@ fn the_json_contract_carries_units_and_both_coverages() {
         &CoverageSelector::default(),
         floors(),
         ts(T1 / SECOND),
+        &worked_example_accounts(),
     )
     .expect("the worked examples must assemble");
     let json = coverage_json(
@@ -539,6 +548,7 @@ fn a_policy_unknown_interval_is_visible_in_both_modes() {
         &CoverageSelector::default(),
         floors(),
         ts(T1 / SECOND),
+        &[AccountIdentity::new("provider-a", "ghost")],
     )
     .expect("the report must assemble");
     let rendered = render_coverage_report(&report, "24h");
@@ -580,6 +590,7 @@ fn account_and_severe_selectors_compose_before_the_threshold_verdict() {
         },
         floors(),
         ts(T1 / SECOND),
+        &worked_example_accounts(),
     )
     .expect("the selected severe account must assemble");
     assert_eq!(research.accounts.len(), 1);
@@ -599,6 +610,7 @@ fn account_and_severe_selectors_compose_before_the_threshold_verdict() {
         },
         floors(),
         ts(T1 / SECOND),
+        &worked_example_accounts(),
     )
     .expect("an account selector may have no severe interval");
     assert!(work.accounts.is_empty());
@@ -658,6 +670,7 @@ fn the_coverage_pipeline_performs_no_network_operation() {
         &CoverageSelector::default(),
         floors(),
         ts(T1 / SECOND),
+        &worked_example_accounts(),
     )
     .expect("the report must assemble");
     let _rendered = render_coverage_report(&report, "24h");
@@ -846,7 +859,7 @@ impl ExitFixture {
         std::fs::write(
             &config_file,
             format!(
-                "[coverage]\nattempt_floor = {attempt_floor}\nmeasurement_floor = {measurement_floor}\n"
+                "[[accounts]]\nname = \"work\"\nprovider = \"provider-a\"\ncredential = {{ kind = \"file\", path = \"/nonexistent\" }}\n\n[coverage]\nattempt_floor = {attempt_floor}\nmeasurement_floor = {measurement_floor}\n"
             ),
         )
         .expect("the coverage config must write");
@@ -907,4 +920,100 @@ fn threshold_exit_does_not_fire_when_both_floors_are_met() {
     assert_eq!(status, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(stdout.contains("coverage - last 24h"), "{stdout}");
     assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn unconfigured_account_in_ledger_produces_no_breach_and_renders_unconfigured_detail() {
+    let fixture = ExitFixture::new(26, AttemptOutcome::Success, 0.90, 0.90);
+    let conn = open_ledger(&fixture.state);
+    let now = UtcTimestamp::from_unix_nanos(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .try_into()
+            .unwrap(),
+    );
+    let interval_start = UtcTimestamp::from_unix_nanos(now.unix_nanos() - 24 * 60 * 60 * SECOND);
+    let retired = account_store::observe_account(&conn, "provider-a", "retired", interval_start)
+        .expect("the retired account must insert");
+    let _snapshot = snapshot_store::resolve_policy_snapshot(
+        &conn,
+        retired,
+        UtcTimestamp::from_unix_nanos(interval_start.unix_nanos() - SECOND),
+        &snapshot_store::ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(3_600),
+            freshness_horizon: MonotonicDuration::from_seconds(900),
+            reset_edge_policy: String::new(),
+            retry_backoff_policy: String::new(),
+            command_budget: MonotonicDuration::from_seconds(30),
+            policy_algorithm_version: "v1".into(),
+        },
+    )
+    .expect("the snapshot must insert");
+
+    let (status, stdout, stderr) = run_coverage(&fixture, &[]);
+
+    assert_eq!(status, 0, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(
+        stdout.contains("retired"),
+        "retired account must be listed in stdout table: {stdout}"
+    );
+    assert!(
+        stdout.contains("account is not configured"),
+        "retired account must be explained as not configured: {stdout}"
+    );
+    assert!(
+        !stderr.contains("retired"),
+        "retired account must produce no breach in stderr: {stderr}"
+    );
+    assert!(stderr.is_empty(), "{stderr}");
+}
+
+#[test]
+fn configured_account_with_no_observations_still_produces_threshold_breach() {
+    let state = StateDir::new();
+    let conn = open_ledger(&state);
+    let now = UtcTimestamp::from_unix_nanos(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+            .try_into()
+            .unwrap(),
+    );
+    let interval_start = UtcTimestamp::from_unix_nanos(now.unix_nanos() - 24 * 60 * 60 * SECOND);
+    let account = account_store::observe_account(&conn, "provider-a", "unreached", interval_start)
+        .expect("the account must insert");
+    let _snapshot = snapshot_store::resolve_policy_snapshot(
+        &conn,
+        account,
+        UtcTimestamp::from_unix_nanos(interval_start.unix_nanos() - SECOND),
+        &snapshot_store::ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(3_600),
+            freshness_horizon: MonotonicDuration::from_seconds(900),
+            reset_edge_policy: String::new(),
+            retry_backoff_policy: String::new(),
+            command_budget: MonotonicDuration::from_seconds(30),
+            policy_algorithm_version: "v1".into(),
+        },
+    )
+    .expect("the snapshot must insert");
+
+    let config_file = state.path().join("aub.toml");
+    std::fs::write(
+        &config_file,
+        "[[accounts]]\nname = \"unreached\"\nprovider = \"provider-a\"\ncredential = { kind = \"file\", path = \"/nonexistent\" }\n\n[coverage]\nattempt_floor = 0.90\nmeasurement_floor = 0.90\n",
+    )
+    .expect("the coverage config must write");
+
+    let fixture = ExitFixture { state, config_file };
+    let (status, stdout, stderr) = run_coverage(&fixture, &[]);
+
+    assert_eq!(status, 7, "stdout: {stdout}\nstderr: {stderr}");
+    assert!(stdout.contains("coverage - last 24h"), "{stdout}");
+    assert!(
+        stderr.contains("unreached attempt coverage 0% is below the 90% floor"),
+        "{stderr}"
+    );
 }

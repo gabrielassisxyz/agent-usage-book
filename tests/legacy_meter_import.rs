@@ -7,7 +7,7 @@ use agent_usage_book::domain::time::{
 use agent_usage_book::legacy_meter::read_source;
 use agent_usage_book::presentation::render_coverage_report;
 use agent_usage_book::report::coverage::{
-    CoverageFloors, CoverageSelector, assemble as assemble_coverage,
+    AccountIdentity, CoverageFloors, CoverageSelector, assemble as assemble_coverage,
 };
 use agent_usage_book::store::connection::{AccessMode, LEDGER_DATABASE_FILE, PragmaPolicy, open};
 use agent_usage_book::store::legacy_meter_import::import;
@@ -206,6 +206,7 @@ fn integration_coverage_distinguishes_legacy_evidence_from_live_sampling() {
         },
         floors,
         until,
+        &[AccountIdentity::new("anthropic", "primary")],
     )
     .expect("coverage report must assemble");
 

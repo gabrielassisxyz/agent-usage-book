@@ -2414,7 +2414,20 @@ fn coverage_command(
         attempt: config.coverage.attempt_floor,
         measurement: config.coverage.measurement_floor,
     };
-    let report = assemble_coverage(&conn, since, timestamp, &selector, floors, timestamp)?;
+    let configured_accounts: Vec<crate::store::account::AccountIdentity> = config
+        .accounts
+        .iter()
+        .map(crate::store::account::AccountIdentity::from)
+        .collect();
+    let report = assemble_coverage(
+        &conn,
+        since,
+        timestamp,
+        &selector,
+        floors,
+        timestamp,
+        &configured_accounts,
+    )?;
 
     match invocation.format {
         OutputFormat::Text => println!("{}", render_coverage_report(&report, &window.description)),
