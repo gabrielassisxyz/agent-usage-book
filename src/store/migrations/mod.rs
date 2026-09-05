@@ -120,6 +120,9 @@ pub(crate) mod migration_0031;
 #[path = "0032_calibration_activation.rs"]
 pub(crate) mod migration_0032;
 
+#[path = "0033_legacy_calibration_import.rs"]
+pub(crate) mod migration_0033;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -158,5 +161,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0030::migration(),
         migration_0031::migration(),
         migration_0032::migration(),
+        migration_0033::migration(),
     ]
 }

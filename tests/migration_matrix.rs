@@ -277,6 +277,10 @@ const POPULATION: &[(&str, Populate)] = &[
         populate_legacy_meter_import_record,
     ),
     (
+        "legacy_calibration_import",
+        populate_legacy_calibration_import,
+    ),
+    (
         "authoritative_surface_comparison",
         populate_authoritative_surface_comparison,
     ),
@@ -748,6 +752,16 @@ fn populate_legacy_meter_import_record(conn: &rusqlite::Connection) -> Result<()
         "INSERT INTO legacy_meter_import_record (source_digest, source_line, observation_id, marker_id) VALUES
             ('1111111111111111111111111111111111111111111111111111111111111111', 1, 1, 1),
             ('1111111111111111111111111111111111111111111111111111111111111111', 2, 2, 2)",
+    )
+}
+
+fn populate_legacy_calibration_import(conn: &rusqlite::Connection) -> Result<(), String> {
+    exec(
+        conn,
+        "legacy_calibration_import",
+        "INSERT INTO legacy_calibration_import (source_digest, verified_backup_id, imported_at, calibration_id, records_read, records_quarantined) VALUES
+            ('3333333333333333333333333333333333333333333333333333333333333333', 'matrix-backup-1', 1000, 'matrix-legacy-fit-1', 1, 0),
+            ('4444444444444444444444444444444444444444444444444444444444444444', 'matrix-backup-2', 2000, 'matrix-legacy-fit-2', 1, 0)",
     )
 }
 

@@ -80,6 +80,7 @@ pub enum DurableClass {
     CalibrationExperiment,
     LegacyMeterImport,
     LegacyMeterImportRecord,
+    LegacyCalibrationImport,
     AuthoritativeSurfaceComparison,
     AdapterSemanticsAnnotation,
     MeterWindowAnomaly,
@@ -146,6 +147,7 @@ impl DurableClass {
             | Self::CalibrationExperiment
             | Self::LegacyMeterImport
             | Self::LegacyMeterImportRecord
+            | Self::LegacyCalibrationImport
             | Self::AuthoritativeSurfaceComparison
             | Self::AdapterSemanticsAnnotation
             | Self::MeterWindowAnomaly
@@ -214,6 +216,7 @@ impl DurableClass {
             | Self::RateCard
             | Self::LegacyMeterImport
             | Self::LegacyMeterImportRecord
+            | Self::LegacyCalibrationImport
             | Self::AuthoritativeSurfaceComparison
             | Self::AdapterSemanticsAnnotation
             | Self::MeterWindowAnomaly
@@ -290,6 +293,7 @@ impl DurableClass {
             Self::IngestQuarantine => Some("ingest_quarantine"),
             Self::LegacyMeterImport => Some("legacy_meter_import"),
             Self::LegacyMeterImportRecord => Some("legacy_meter_import_record"),
+            Self::LegacyCalibrationImport => Some("legacy_calibration_import"),
             Self::AuthoritativeSurfaceComparison => Some("authoritative_surface_comparison"),
             Self::AdapterSemanticsAnnotation => Some("adapter_semantics_annotation"),
             Self::MeterWindowAnomaly => Some("meter_window_anomaly"),
@@ -366,6 +370,7 @@ impl DurableClass {
             | Self::CalibrationExperiment
             | Self::LegacyMeterImport
             | Self::LegacyMeterImportRecord
+            | Self::LegacyCalibrationImport
             | Self::AuthoritativeSurfaceComparison
             | Self::AdapterSemanticsAnnotation
             | Self::MeterWindowAnomaly
@@ -431,6 +436,7 @@ impl DurableClass {
             Self::IngestQuarantine,
             Self::LegacyMeterImport,
             Self::LegacyMeterImportRecord,
+            Self::LegacyCalibrationImport,
             Self::AuthoritativeSurfaceComparison,
             Self::AdapterSemanticsAnnotation,
             Self::MeterWindowAnomaly,
@@ -483,6 +489,7 @@ impl DurableClass {
             Self::IngestQuarantine,
             Self::LegacyMeterImport,
             Self::LegacyMeterImportRecord,
+            Self::LegacyCalibrationImport,
             Self::AuthoritativeSurfaceComparison,
             Self::AdapterSemanticsAnnotation,
             Self::MeterWindowAnomaly,

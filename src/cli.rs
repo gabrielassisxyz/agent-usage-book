@@ -783,7 +783,7 @@ impl Command {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
             }
             Command::Import => Some(
-                "legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE",
+                "legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE | legacy-calibration --source PATH --backup VERIFIED_ARCHIVE",
             ),
             Command::Sample => Some(
                 "--due | --account NAME | --if-due | --session-id SESSION | --run-id RUN | --require-success",
@@ -3819,8 +3819,9 @@ fn import_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
     match invocation.rest.first().map(String::as_str) {
         Some("legacy-meter") => import_legacy_meter(clock, level, &invocation.rest),
         Some("seed-archive") => import_seed_archive(clock, level, &invocation.rest),
+        Some("legacy-calibration") => import_legacy_calibration(clock, level, &invocation.rest),
         _ => Err(Error::Usage(
-            "import requires either the `legacy-meter` or `seed-archive` subcommand".into(),
+            "import requires either the `legacy-meter`, `seed-archive` or `legacy-calibration` subcommand".into(),
         )),
     }
 }
@@ -4005,6 +4006,106 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
     Ok(())
 }
 
+/// `aub import legacy-calibration` is administrative: it accepts the legacy
+/// regression-fit format, verifies a recovery archive before it writes, and
+/// names the source only by digest. The fit imports as immutable calibration
+/// history resting on an incomplete cost model, never as an activatable
+/// record.
+fn import_legacy_calibration(
+    clock: &impl Clock,
+    level: Level,
+    rest: &[String],
+) -> Result<(), Error> {
+    let (source_path, backup_path) = legacy_calibration_import_flags(rest)?;
+    let source = crate::legacy_calibration::read_source(std::path::Path::new(&source_path))?;
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let backup = crate::backup::verify_archive(
+        std::path::Path::new(&backup_path),
+        config.sampling.request_timeout,
+        clock,
+    )?;
+    if !backup.verified {
+        return Err(Error::Store(
+            "legacy calibration import requires a verified backup archive".into(),
+        ));
+    }
+    let backup_id = format!(
+        "archive-v{}-g{}",
+        backup.schema_version, backup.ledger_generation
+    );
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &LogicalName::new("import"))],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    let mut conn = open_ledger(clock)?;
+    let summary =
+        crate::store::legacy_calibration_import::import(&mut conn, &source, &backup_id, timestamp)?;
+    if summary.imported > 0 {
+        crate::projection::publish(
+            &conn,
+            &crate::projection::projection_path_in(&config.state.dir),
+        );
+    }
+    let terminal_outcome = if summary.quarantined > 0 && summary.imported == 0 {
+        "quarantined"
+    } else if summary.imported > 0 {
+        "imported"
+    } else if summary.unchanged > 0 {
+        "unchanged"
+    } else {
+        "empty"
+    };
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::LegacyCalibrationImported,
+            &[
+                (
+                    "source_digest",
+                    &LogicalName::new(source.content_digest.clone()),
+                ),
+                ("verified_backup_id", &LogicalName::new(backup_id.clone())),
+                (
+                    "records_read",
+                    &Quantity::new(source.records_read, "records"),
+                ),
+                ("imported", &Quantity::new(summary.imported, "records")),
+                ("unchanged", &Quantity::new(summary.unchanged, "records")),
+                (
+                    "quarantined",
+                    &Quantity::new(summary.quarantined, "records"),
+                ),
+                ("terminal_outcome", &LogicalName::new(terminal_outcome)),
+            ],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    println!(
+        "legacy-calibration import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} quarantined={} terminal_outcome={}",
+        source.content_digest,
+        backup_id,
+        source.records_read,
+        summary.imported,
+        summary.unchanged,
+        summary.quarantined,
+        terminal_outcome,
+    );
+    Ok(())
+}
+
 fn verify_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
     let config = resolve_backup_config()?;
     let destination = std::path::Path::new(destination);
@@ -4066,6 +4167,30 @@ fn seed_archive_import_flags(rest: &[String]) -> Result<(String, String), Error>
         (Some(source), Some(backup)) => Ok((source, backup)),
         _ => Err(Error::Usage(
             "import seed-archive requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
+        )),
+    }
+}
+
+fn legacy_calibration_import_flags(rest: &[String]) -> Result<(String, String), Error> {
+    if rest.first().map(String::as_str) != Some("legacy-calibration") {
+        return Err(Error::Usage(
+            "import requires the `legacy-calibration` subcommand".into(),
+        ));
+    }
+    let mut source = None;
+    let mut backup = None;
+    let mut args = rest[1..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--source" => source = args.next().cloned(),
+            "--backup" => backup = args.next().cloned(),
+            other => return Err(Error::Usage(format!("unknown import argument: {other}"))),
+        }
+    }
+    match (source, backup) {
+        (Some(source), Some(backup)) => Ok((source, backup)),
+        _ => Err(Error::Usage(
+            "import legacy-calibration requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
         )),
     }
 }

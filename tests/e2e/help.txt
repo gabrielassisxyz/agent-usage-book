@@ -86,7 +86,7 @@ import:
   answers: which legacy evidence is safe to import into the ledger?
   refuses: --format (import prints one operational result); --explain (import derives no report); --account (import carries account identity in its source); --model (import carries no model selector); --no-color (import prints no color)
   format: text only: import prints one operational result
-  options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE
+  options: legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE | legacy-calibration --source PATH --backup VERIFIED_ARCHIVE
 
 sample:
   answers: are configured accounts due for meter sampling, and what did the endpoints observe?

@@ -19,4 +19,5 @@ render as `[REDACTED]`. Quantities are JSON objects with `value` and `unit`.
 | projection_read | debug | state |
 | legacy_meter_imported | info | source_digest, verified_backup_id, records_read, imported, unchanged, quarantined |
 | seed_archive_imported | info | source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome |
+| legacy_calibration_imported | info | source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome |
 | meter_window_anomaly_detected | warn | anomaly, kind, account |
