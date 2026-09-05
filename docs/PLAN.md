@@ -4876,6 +4876,36 @@ Target behavior:
 
 History size and SQLite lock state are irrelevant to this path.
 
+### Accepted latency budget (aub-n27.3)
+
+The qualitative target above says nothing about how fast is fast enough; a
+number chosen before implementation would have been a guess. `aub-n27.3`
+measured the release binary directly (`tests/status_benchmark.rs`,
+`emit_status_benchmark_json`) -- 1000 real subprocess invocations per case,
+four cases -- before recording the budget below.
+
+| case | samples | p50 | p95 | p99 | accepted p99 budget |
+|---|---:|---:|---:|---:|---:|
+| uncontended | 1000 | ~1.07ms | ~1.25ms | ~1.34ms | 15ms |
+| large seeded database (256 accounts) | 1000 | ~1.13ms | ~1.72ms | ~2.0ms | 15ms |
+| active writer holding the ledger | 1000 | ~1.02ms | ~1.18ms | ~1.26ms | 15ms |
+| migration in flight on the ledger | 1000 | ~1.03ms | ~1.21ms | ~1.35ms | 15ms |
+
+Measured on linux/x86_64 (see the benchmark artifact for the exact revision
+and numbers of a given run; individual runs vary within normal scheduling
+jitter, which is why the accepted budget sits roughly ten times above any
+observed p99 rather than tracking it closely). The one budget applies to
+every case identically: the point of measuring the contended cases is that
+none of them should cost more than the uncontended one, since `status`
+never opens SQLite (invariant 15) and therefore has nothing to contend
+over. A future measurement that shows the budget too tight or too loose
+replaces this table's numbers along with its rationale; it does not delete
+the enforcing assertion (AGENTS.md "Recovery path").
+
+Enforced by `bin/checks/85-status-latency-budget`, which fails the build
+the moment any case's own p99 exceeds `STATUS_P99_BUDGET_NS` in
+`tests/status_benchmark.rs` -- the one place the number is defined.
+
 ## Sampling
 
 Network latency dominates.
