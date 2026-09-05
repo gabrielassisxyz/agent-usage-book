@@ -9,7 +9,7 @@
 
 use std::ffi::OsString;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
@@ -1416,6 +1416,15 @@ pub(crate) fn sample_command(
     );
     let batch_report = run_result?;
 
+    // A malformed-database recurrence (`aub-lz0k`) surfaces as a `PersistFailed`
+    // or `DueLookupFailed` disposition, not as an `Err` from `run_result` above,
+    // so it is invisible to `sample_tick`'s single latest-tick record. Counted
+    // here, durably and by reason, so a second occurrence of the same reason is
+    // a number that grew rather than a line that scrolled past in the journal.
+    // A count-write failure is a diagnostic-aid failure, same as the tick
+    // marker above, so it never masks or replaces the tick's own result.
+    let _ = record_sampling_failure_counts(&config.state.dir, &batch_report.accounts);
+
     // Emitted once regardless of output format, so a JSON-format invocation's
     // anomalies reach the diagnostic log exactly like a text-format one's do;
     // only the human-readable stdout line and the JSON detail differ below.
@@ -2000,6 +2009,42 @@ fn sampling_disposition_error(
             crate::meter::sampler::AccountDisposition::NotYet { .. }
             | crate::meter::sampler::AccountDisposition::LeaseHeld { .. }
             | crate::meter::sampler::AccountDisposition::Sampled(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Counts every `PersistFailed` and `DueLookupFailed` disposition in `accounts`
+/// by its own reason, durably (`aub-b0w6`). Called once per `sample` tick with
+/// that tick's accounts; a tick with none of the two dispositions increments
+/// nothing, which is what keeps a later success from resetting an earlier
+/// failure's count, unlike `crate::store::sample_tick`'s single latest-tick
+/// record.
+fn record_sampling_failure_counts(
+    state_dir: &Path,
+    accounts: &[crate::meter::sampler::AccountReport],
+) -> Result<(), Error> {
+    for report in accounts {
+        match &report.disposition {
+            crate::meter::sampler::AccountDisposition::PersistFailed { reason, .. } => {
+                crate::store::sampling_failure_counts::record_sampling_failure(
+                    state_dir,
+                    "persist_failed",
+                    reason,
+                )?;
+            }
+            crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } => {
+                crate::store::sampling_failure_counts::record_sampling_failure(
+                    state_dir,
+                    "due_lookup_failed",
+                    reason,
+                )?;
+            }
+            crate::meter::sampler::AccountDisposition::NotYet { .. }
+            | crate::meter::sampler::AccountDisposition::LeaseHeld { .. }
+            | crate::meter::sampler::AccountDisposition::EligibilityFailed { .. }
+            | crate::meter::sampler::AccountDisposition::Sampled(_)
+            | crate::meter::sampler::AccountDisposition::Spooled { .. } => {}
         }
     }
     Ok(())
@@ -8103,6 +8148,96 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             }
             other => panic!("Spooled must map to Error::IngestIncomplete, got {other:?}"),
         }
+    }
+
+    /// `record_sampling_failure_counts` is the glue between the disposition a
+    /// tick produced and the durable per-reason counter (`aub-b0w6`): a
+    /// `PersistFailed` and a `DueLookupFailed` each add one to their own
+    /// category's count, and every other disposition, including a successful
+    /// `Sampled` one, adds nothing. The planted negative is the second call
+    /// below: a tick with no failing disposition must leave the first tick's
+    /// count exactly as it was, never resetting it the way `sample_tick`'s
+    /// single latest-tick record would.
+    #[test]
+    fn record_sampling_failure_counts_counts_failures_by_reason_and_ignores_success() {
+        use crate::domain::attempt::{AttemptId, AttemptOutcome};
+        use crate::meter::sampler::{AccountDisposition, AccountReport, SampledAttempt};
+        use crate::store::sampling_lease::AccountName;
+
+        let state_dir = std::env::temp_dir().join(format!(
+            "aub-cli-sampling-failure-counts-test-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&state_dir).unwrap();
+
+        let persist_failed = AccountReport {
+            name: AccountName::new("work-a"),
+            disposition: AccountDisposition::PersistFailed {
+                attempt_id: AttemptId::new(1),
+                outcome: AttemptOutcome::Success,
+                reason: "database disk image is malformed".to_string(),
+            },
+        };
+        let due_lookup_failed = AccountReport {
+            name: AccountName::new("work-b"),
+            disposition: AccountDisposition::DueLookupFailed {
+                reason: "database disk image is malformed".to_string(),
+            },
+        };
+        let not_yet = AccountReport {
+            name: AccountName::new("work-c"),
+            disposition: AccountDisposition::NotYet {
+                next_due_at: crate::domain::time::UtcTimestamp::from_unix_nanos(1),
+            },
+        };
+        record_sampling_failure_counts(&state_dir, &[persist_failed, due_lookup_failed, not_yet])
+            .unwrap();
+
+        let mut counts =
+            crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
+                .unwrap();
+        counts.sort_by(|a, b| a.category.cmp(&b.category));
+        assert_eq!(
+            counts,
+            vec![
+                crate::store::sampling_failure_counts::SamplingFailureCount {
+                    category: "due_lookup_failed".to_string(),
+                    reason: "database disk image is malformed".to_string(),
+                    count: 1,
+                },
+                crate::store::sampling_failure_counts::SamplingFailureCount {
+                    category: "persist_failed".to_string(),
+                    reason: "database disk image is malformed".to_string(),
+                    count: 1,
+                },
+            ]
+        );
+
+        let sampled = AccountReport {
+            name: AccountName::new("work-a"),
+            disposition: AccountDisposition::Sampled(SampledAttempt {
+                attempt_id: AttemptId::new(2),
+                outcome: AttemptOutcome::Success,
+                observation_committed: true,
+                publication: crate::projection::Publication::Deferred {
+                    reason: "test".to_string(),
+                },
+                window_anomalies: Vec::new(),
+            }),
+        };
+        record_sampling_failure_counts(&state_dir, &[sampled]).unwrap();
+
+        let counts_after_success =
+            crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
+                .unwrap();
+        let mut counts_after_success = counts_after_success;
+        counts_after_success.sort_by(|a, b| a.category.cmp(&b.category));
+        assert_eq!(
+            counts_after_success, counts,
+            "a successful tick must not reset the earlier failures' count"
+        );
+
+        std::fs::remove_dir_all(&state_dir).unwrap();
     }
 
     #[test]

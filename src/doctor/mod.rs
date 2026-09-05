@@ -50,16 +50,20 @@ pub enum CheckName {
     AccumulatedDiagnosticMaterial,
     AdapterSemanticsComparisonAge,
     LastSampleTick,
+    SamplingFailureCounts,
 }
 
 impl CheckName {
     /// The design's full check list (PLAN.md 27, 36, aub-smqu), encoded once so the
-    /// registry can be compared against it. Twenty-one entries: the design's
+    /// registry can be compared against it. Twenty-two entries: the design's
     /// original nineteen, [`Self::AdapterSemanticsComparisonAge`] added by
     /// `aub-x2bq` once the adapter-semantics mechanism (`aub-eun.12`) existed for
-    /// a check to cover, and [`Self::LastSampleTick`] added by `aub-va6s` once the
-    /// last-tick marker (`crate::store::sample_tick`) existed for a check to read.
-    pub const EXPECTED: [CheckName; 21] = [
+    /// a check to cover, [`Self::LastSampleTick`] added by `aub-va6s` once the
+    /// last-tick marker (`crate::store::sample_tick`) existed for a check to read,
+    /// and [`Self::SamplingFailureCounts`] added by `aub-b0w6` once the durable
+    /// per-reason failure counter (`crate::store::sampling_failure_counts`)
+    /// existed for a check to read.
+    pub const EXPECTED: [CheckName; 22] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -81,6 +85,7 @@ impl CheckName {
         Self::AccumulatedDiagnosticMaterial,
         Self::AdapterSemanticsComparisonAge,
         Self::LastSampleTick,
+        Self::SamplingFailureCounts,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -107,6 +112,7 @@ impl CheckName {
             Self::AccumulatedDiagnosticMaterial => "accumulated-diagnostic-material",
             Self::AdapterSemanticsComparisonAge => "adapter-semantics-comparison-age",
             Self::LastSampleTick => "last-sample-tick",
+            Self::SamplingFailureCounts => "sampling-failure-counts",
         }
     }
 }

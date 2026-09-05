@@ -750,6 +750,76 @@ fn check_fails_last_sample_tick_when_the_last_recorded_tick_was_refused() {
     );
 }
 
+// --- aub-b0w6: persist-failed and due-lookup-failed sampler dispositions,
+// counted durably by reason ---------------------------------------------------
+
+#[test]
+fn sampling_failure_counts_passes_when_no_failure_has_ever_been_recorded() {
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::SamplingFailureCounts)
+        .expect("SamplingFailureCounts present");
+    assert_eq!(outcome.status, CheckStatus::Pass);
+}
+
+/// The acceptance criterion's exact case (`aub-lz0k`): a recurrence of
+/// `database disk image is malformed` is noticeable in `doctor` output,
+/// without reading the scheduler's journal by hand.
+#[test]
+fn check_fails_sampling_failure_counts_and_names_the_recurring_reason() {
+    use agent_usage_book::store::sampling_failure_counts::record_sampling_failure;
+
+    let state = StateDir::new();
+    record_sampling_failure(
+        state.path(),
+        "due_lookup_failed",
+        "database disk image is malformed",
+    )
+    .unwrap();
+    record_sampling_failure(
+        state.path(),
+        "due_lookup_failed",
+        "database disk image is malformed",
+    )
+    .unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::SamplingFailureCounts)
+        .expect("SamplingFailureCounts present");
+    assert!(
+        matches!(
+            outcome.status,
+            CheckStatus::Fail(ref detail)
+                if detail.contains("database disk image is malformed")
+                    && detail.contains("count=2")
+        ),
+        "{:?}",
+        outcome.status
+    );
+}
+
 #[test]
 fn owned_checks_have_correct_owner_module() {
     let state = StateDir::new();
