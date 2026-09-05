@@ -157,7 +157,8 @@ scoped by observation and window, not by any of those dimensions.
 
 ## `aub calibrate`
 
-**Answers:** what is the state of the controlled calibration experiment?
+**Answers:** what is the state of the controlled calibration experiment, and
+what quota window capacity is fitted from recorded meter observations?
 
 **Refuses:** to run a resident process. `begin`, `status` and `end` each open
 the ledger, do their read or write, and exit; the experiment survives in the
@@ -165,11 +166,13 @@ database between them, including across a reboot. Sampling cadence during an
 experiment is tightened by invoking `sample --due` more often through the
 external scheduler, never by a loop inside `aub`. `begin` refuses when the
 named cost model covers none of the expected token kinds, when the account has
-no sampled baseline yet, and when the account already runs an experiment; `end`
-records the end of controlled work and never declares the meter settled. It
-also refuses `--format`, `--explain`, `--model` and `--no-color`: a
-calibration experiment is scoped by account and window, not by any of those
-dimensions.
+no sampled baseline yet, and when the account already runs an experiment;
+`end` records the end of controlled work and never declares the meter
+settled. `fit` refuses to activate candidate calibrations automatically:
+candidates are written immutably and never promoted to active status by the
+fitter. The command also refuses `--explain`, `--model` and `--no-color`: a
+calibration experiment or fit is scoped by account, window or evidence set,
+never by those dimensions.
 
 ## `aub ingest`
 
@@ -234,3 +237,4 @@ recording that outcome is success; the command exits non-zero only when it
 could not persist or operate at all. A caller that wants the ordinary
 live-source exit classes instead asks for them explicitly with
 `--require-success`, which still records the same evidence first.
+

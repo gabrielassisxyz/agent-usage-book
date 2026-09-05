@@ -528,18 +528,16 @@ impl Command {
                 verbosity: FlagSupport::Accepted,
             },
             Command::Calibrate => FlagPolicy {
-                format: FlagSupport::Rejected {
-                    reason: "calibrate prints plain operational lines, not a report",
-                },
+                format: FlagSupport::Accepted,
                 explain: FlagSupport::Rejected {
-                    reason: "calibrate records an experiment premise, not a derived quantity",
+                    reason: "calibrate records an experiment premise or derives candidates from recorded evidence, never a live explanation",
                 },
                 account: FlagSupport::Accepted,
                 model: FlagSupport::Rejected {
-                    reason: "a calibration experiment is scoped by window, not by model",
+                    reason: "calibrate operates on whole experiments and windows, not individual models",
                 },
                 no_color: FlagSupport::Rejected {
-                    reason: "calibrate prints no color",
+                    reason: "calibrate prints plain text or json, never color",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -628,9 +626,9 @@ impl Command {
             Command::Compare => Some(
                 "record and inspect adapter-semantics comparisons against the provider's authoritative surface",
             ),
-            Command::Calibrate => {
-                Some("record a controlled calibration experiment without a resident process")
-            }
+            Command::Calibrate => Some(
+                "record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence",
+            ),
         }
     }
 
@@ -677,9 +675,9 @@ impl Command {
             Command::Compare => Some(
                 "does the adapter's stored reading of one window agree with what the provider's own authoritative surface showed for it?",
             ),
-            Command::Calibrate => {
-                Some("what is the state of the controlled calibration experiment?")
-            }
+            Command::Calibrate => Some(
+                "what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?",
+            ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
@@ -751,7 +749,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID]",
+                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status
@@ -4262,8 +4260,9 @@ fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
         Some("begin") => calibrate_begin_command(clock, invocation),
         Some("status") => calibrate_status_command(clock, invocation),
         Some("end") => calibrate_end_command(clock, invocation),
+        Some("fit") => calibrate_fit(clock, invocation),
         other => Err(Error::Usage(format!(
-            "calibrate requires a subcommand (begin | status | end), got {other:?}"
+            "calibrate requires a subcommand (begin | status | end | fit), got {other:?}"
         ))),
     }
 }
@@ -4797,6 +4796,120 @@ fn compare_uncompared_command(clock: &impl Clock, invocation: &Invocation) -> Re
                 observation_id.value(),
                 window.semantic_key.as_str()
             );
+        }
+    }
+    Ok(())
+}
+
+fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let mut experiment_id: Option<crate::store::calibration::ExperimentId> = None;
+    let mut iter = invocation.rest.iter().skip(1);
+    while let Some(arg) = iter.next() {
+        if arg == "--experiment" {
+            let id = iter
+                .next()
+                .ok_or_else(|| Error::Usage("--experiment requires an argument".into()))?;
+            experiment_id = Some(crate::store::calibration::ExperimentId::new(id));
+        } else {
+            return Err(Error::Usage(format!(
+                "unknown argument to calibrate fit: {arg}"
+            )));
+        }
+    }
+
+    let conn = open_ledger(clock)?;
+    let fit_result =
+        crate::calibration::fitter::fit_and_record_candidate(&conn, experiment_id.as_ref(), clock)?;
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!("Candidate ID: {}", fit_result.candidate.id.as_str());
+            println!("Experiment:   {}", fit_result.candidate.experiment.as_str());
+            println!("Provider:     {}", fit_result.candidate.provider.as_str());
+            println!("Plan Tier:    {}", fit_result.candidate.plan_tier.as_str());
+            println!(
+                "Window:       {}",
+                fit_result.candidate.window_semantic_key.as_str()
+            );
+            println!(
+                "Fitted:       {} micros/point",
+                fit_result.candidate.fitted.micros_per_point()
+            );
+            println!(
+                "Capacity:     {} credits",
+                fit_result
+                    .candidate
+                    .equivalent_full_window_capacity
+                    .micros() as f64
+                    / 1_000_000.0
+            );
+            println!(
+                "Uncertainty:  [{}..={}] micros/point",
+                fit_result.candidate.uncertainty.lower().micros_per_point(),
+                fit_result.candidate.uncertainty.upper().micros_per_point()
+            );
+            println!(
+                "Residual:     {:.4} pp",
+                fit_result.residual_percentage_points
+            );
+            println!("Lag Handling: {}", fit_result.lag_handling.as_str());
+            println!("Method:       {}", fit_result.statistical_method);
+            println!("Parameters:   {}", fit_result.statistical_parameters);
+            println!("Usable Obs:   {}", fit_result.usable_observations);
+            println!("Excluded:     {}", fit_result.excluded_samples.len());
+            for ex in &fit_result.excluded_samples {
+                println!("  - {}: {}", ex.sample_ref(), ex.reason());
+            }
+            if !fit_result.diagnostic_findings.is_empty() {
+                println!("Diagnostics:");
+                for diag in &fit_result.diagnostic_findings {
+                    println!("  - {}", diag.message());
+                }
+            }
+        }
+        OutputFormat::Json => {
+            let json = serde_json::json!({
+                "candidate_id": fit_result.candidate.id.as_str(),
+                "experiment_id": fit_result.candidate.experiment.as_str(),
+                "provider": fit_result.candidate.provider.as_str(),
+                "plan_tier": fit_result.candidate.plan_tier.as_str(),
+                "window_semantic_key": fit_result.candidate.window_semantic_key.as_str(),
+                "fitted_micros_per_point": fit_result.candidate.fitted.micros_per_point(),
+                "equivalent_full_window_capacity_micros": fit_result.candidate.equivalent_full_window_capacity.micros(),
+                "fit_residual_micros": fit_result.candidate.fit_residual.micros(),
+                "residual_percentage_points": fit_result.residual_percentage_points,
+                "uncertainty_low_micros": fit_result.candidate.uncertainty.lower().micros_per_point(),
+                "uncertainty_high_micros": fit_result.candidate.uncertainty.upper().micros_per_point(),
+                "lag_handling": fit_result.lag_handling.as_str(),
+                "statistical_method": fit_result.statistical_method,
+                "statistical_parameters": fit_result.statistical_parameters,
+                "usable_observations": fit_result.usable_observations,
+                "sample_count": fit_result.candidate.sample_count,
+                "inputs_digest": format!("{:016x}", fit_result.candidate.inputs.digest()),
+                "inputs_count": fit_result.candidate.inputs.count(),
+                "excluded_samples": fit_result.excluded_samples.iter().map(|ex| {
+                    serde_json::json!({
+                        "sample_ref": ex.sample_ref(),
+                        "reason": ex.reason(),
+                    })
+                }).collect::<Vec<_>>(),
+                "diagnostic_findings": fit_result.diagnostic_findings.iter().map(|diag| {
+                    match diag {
+                        crate::calibration::fitter::DiagnosticFinding::LargeIntercept {
+                            intercept_ppm,
+                            threshold_ppm,
+                            possible_causes,
+                        } => serde_json::json!({
+                            "type": "large_intercept",
+                            "intercept_ppm": intercept_ppm,
+                            "threshold_ppm": threshold_ppm,
+                            "possible_causes": possible_causes,
+                            "message": diag.message(),
+                        }),
+                    }
+                }).collect::<Vec<_>>(),
+            });
+            println!("{json}");
         }
     }
     Ok(())
