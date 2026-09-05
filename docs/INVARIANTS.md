@@ -40,7 +40,7 @@ same thing in both documents.
 | 9 | All replay deduplication passes through one semantic event-identity framework and database uniqueness constraint. | src/store/usage_occurrence.rs | tests::a_duplicate_strong_identity_fails_the_direct_insert |
 | 10 | Unknown token components block complete conversions. | tests/cost_model.rs | tests::conversion_fails_closed_on_unknown_components |
 | 11 | Cost-model coefficients and window calibrations are distinct versioned witnesses. | src/domain/provenance.rs | tests::witness_identifier_types_are_distinct |
-| 12 | Calibrated values have immutable IDs and no consumer-side literals. | unenforced aub-c0b.13 | (single-source calibration proof) |
+| 12 | Calibrated values have immutable IDs and no consumer-side literals. | tests/calibration_single_source.rs | calibration_supersession_moves_calibrate_show_and_spend_window_equivalent_together |
 | 13 | Calibration cannot cross incompatible plan tiers, reset boundaries, or provider semantics. | tests/calibration_recovery_and_rejection.rs | test_eleven_rejection_conditions_table_driven |
 | 14 | Passive calibration is evidence and candidate generation, not automatic truth. | src/calibration/passive.rs | tests::passive_calibration_produces_candidate_and_never_activates |
 | 15 | `status` never opens SQLite, performs network I/O, or writes. | src/cli.rs | tests::the_status_function_performs_only_the_status_contract |
@@ -59,7 +59,7 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 26 are enforced by mechanical checks present at HEAD (file paths and tests), and 1 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 27 are enforced by mechanical checks present at HEAD (file paths and tests), and 0 are unenforced and tracked by open beads in the tracker.
 
 ## Maintaining this document
 
