@@ -134,6 +134,6 @@ calibrate:
   answers: what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?
   refuses: --explain (calibrate records an experiment premise or derives candidates from recorded evidence, never a live explanation); --model (calibrate operates on whole experiments and windows, not individual models); --no-color (calibrate prints plain text or json, never color)
   format: text | json
-  options: begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY]
+  options: begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]
 
 aub            prints the version; aub --help prints this
