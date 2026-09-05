@@ -1101,4 +1101,25 @@ mod compose_tests {
         assert_eq!(refused.missing[0].subject, "constraining_windows");
         assert!(refused.missing[0].reason.contains("model-x"));
     }
+
+    /// A reset timestamp may be displayed, but no output ever reasons about
+    /// whether the proposed task finishes before or after it (PLAN.md 26.8):
+    /// run duration belongs to a separate friction ledger this report never
+    /// touches.
+    #[test]
+    fn a_reset_timestamp_never_carries_a_before_or_after_claim() {
+        let report = compose_can_run_report(worked_example_inputs());
+        let text = crate::presentation::render::render_can_run_report(&report).to_lowercase();
+        assert!(text.contains("resets"), "{text}");
+        for forbidden in [
+            "before",
+            "after",
+            "finish",
+            "in time",
+            "will cross",
+            "won't cross",
+        ] {
+            assert!(!text.contains(forbidden), "found {forbidden:?} in: {text}");
+        }
+    }
 }
