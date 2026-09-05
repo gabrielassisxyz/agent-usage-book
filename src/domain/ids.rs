@@ -8,7 +8,7 @@
 //! calibration applicability is decided against physical and billing semantics
 //! rather than against release numbers.
 
-/// The source a native identifier came from (e.g., "claude-code", "codex", "pi").
+/// The source a native identifier came from (e.g., "claude-code", "codex", "opencode", "pi").
 ///
 /// Opaque: the inner value is private, so a namespace can only be built through
 /// [`SourceNamespace::new`] and read through [`SourceNamespace::as_str`].

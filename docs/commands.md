@@ -149,6 +149,11 @@ scoped by observation and window, not by any of those dimensions.
 **Answers:** have the transcript-derived tables been refreshed from the
 transcripts on disk, under one generation?
 
+**Reads:** the configured `[[transcripts]]` sources, each with a `format` of
+`claude-code`, `codex`, `opencode` or `pi`. An `opencode` source names the
+directory holding its session database with the pattern `opencode.db`; the
+database is opened read-only and parsed whole, never sliced by lines.
+
 **Refuses:** to touch anything but rebuildable, transcript-derived rows. It
 never writes or deletes a meter attempt, a response, an observation, a
 calibration, or any other irreplaceable evidence.

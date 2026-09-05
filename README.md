@@ -10,7 +10,7 @@ from one source instead of from several tools that quietly disagree.
 
 Early. The harness, the licence obligations and the correctness rules are in place, and
 the first half of the measurement exists: `aub spend` refreshes and reads the canonical
-ledger built from Claude Code, Codex and pi transcripts. It groups token vectors by day,
+ledger built from Claude Code, Codex, opencode and pi transcripts. It groups token vectors by day,
 session, project and repository, preserving evidence qualification and provenance at
 every subtotal. Quota is not measured yet: `aub status` renders every configured account
 as never observed until the sampler lands. There is no release yet.
@@ -68,7 +68,18 @@ format the parser reads:
 name = "claude-code"
 root = "/path/to/.claude/projects"
 pattern = "**/*.jsonl"
-format = "claude-code"   # or "codex", "pi"
+format = "claude-code"   # or "codex", "pi", "opencode"
+```
+
+An opencode source names the directory holding its session database; the
+database itself is the one file the pattern matches:
+
+```toml
+[[transcripts]]
+name = "opencode"
+root = "/path/to/.local/share/opencode"
+pattern = "opencode.db"
+format = "opencode"
 ```
 
 `aub spend` reports today by default; `--since YYYY-MM-DD` and `--days N` widen the

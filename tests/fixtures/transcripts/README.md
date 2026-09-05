@@ -14,11 +14,16 @@ sanitization scan. The audit fails when any of those stops holding.
 
 ## Layout
 
-- `native/` holds the parser fixtures for the three native-usage formats
+- `native/` holds the parser fixtures for the three line-delimited
+  native-usage formats
   (claude-code, codex, pi). `native/MANIFEST.json` declares, per format, the
   input-format version and which fixture (or rationale) covers each catalog
   shape. `native/expected/` holds one golden expected-output file per applicable
   fixture.
+- `opencode/` holds the seed for the fourth native-usage format. opencode
+  keeps every session in one SQLite database, so there is no transcript file
+  to pin: `opencode/seed.json` holds invented session and message rows in the
+  real table shape, and tests build a scratch database from it at runtime.
 - `nested-only/` holds the recursive-discovery regression fixture: every
   transcript file lives in a subdirectory, so a flat glob finds zero. It is part
   of the audited corpus; moving it out fails the audit.

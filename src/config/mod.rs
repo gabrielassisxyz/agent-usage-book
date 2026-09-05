@@ -302,7 +302,7 @@ pub struct TranscriptConfig {
     pub name: String,
     pub root: PathBuf,
     pub pattern: String,
-    /// Which parser reads this source: `claude-code`, `codex` or `pi`. The name is
+    /// Which parser reads this source: `claude-code`, `codex`, `opencode` or `pi`. The name is
     /// the operator's label and says nothing about the record shape, so the format
     /// is declared rather than guessed from a path.
     pub format: Option<String>,
