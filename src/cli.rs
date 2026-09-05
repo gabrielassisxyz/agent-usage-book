@@ -1330,6 +1330,34 @@ pub(crate) fn sample_command(
     );
     let batch_report = run_result?;
 
+    // Emitted once regardless of output format, so a JSON-format invocation's
+    // anomalies reach the diagnostic log exactly like a text-format one's do;
+    // only the human-readable stdout line and the JSON detail differ below.
+    for report in &batch_report.accounts {
+        if let crate::meter::sampler::AccountDisposition::Sampled(sampled) = &report.disposition {
+            for anomaly in &sampled.window_anomalies {
+                let kind_name = LogicalName::new(anomaly.kind.as_str());
+                logger
+                    .emit(
+                        timestamp,
+                        DiagnosticEvent::MeterWindowAnomalyDetected,
+                        &[
+                            (
+                                "anomaly",
+                                &Quantity::new(anomaly.row_id.value() as u64, "id"),
+                            ),
+                            ("kind", &kind_name),
+                            (
+                                "account",
+                                &Quantity::new(anomaly.account_id.value() as u64, "id"),
+                            ),
+                        ],
+                    )
+                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+            }
+        }
+    }
+
     match invocation.format {
         OutputFormat::Text => {
             for report in &batch_report.accounts {
@@ -1346,6 +1374,13 @@ pub(crate) fn sample_command(
                             outcome_str,
                             sampled.attempt_id.value(),
                         );
+                        for anomaly in &sampled.window_anomalies {
+                            println!(
+                                "  window anomaly: kind={} id={}",
+                                anomaly.kind.as_str(),
+                                anomaly.row_id.value(),
+                            );
+                        }
                     }
                     crate::meter::sampler::AccountDisposition::NotYet { next_due_at } => {
                         println!(
@@ -1412,11 +1447,22 @@ pub(crate) fn sample_command(
                                     "unreachable"
                                 }
                             };
+                            let window_anomalies: Vec<serde_json::Value> = sampled
+                                .window_anomalies
+                                .iter()
+                                .map(|anomaly| {
+                                    serde_json::json!({
+                                        "anomaly_id": anomaly.row_id.value(),
+                                        "kind": anomaly.kind.as_str(),
+                                    })
+                                })
+                                .collect();
                             (
                                 "sampled",
                                 serde_json::json!({
                                     "attempt_id": sampled.attempt_id.value(),
                                     "outcome": outcome_str,
+                                    "window_anomalies": window_anomalies,
                                 }),
                             )
                         }

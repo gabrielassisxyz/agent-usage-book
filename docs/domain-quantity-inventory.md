@@ -101,6 +101,12 @@ quantity, documented here with its reason for exclusion:
 - `QuerySemantics`, `ProvenanceManifest`, `Derived`: compound provenance aggregates and wrappers.
 - `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `WindowResetState`, `WindowSeverity`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
 
+### Window anomaly classification (`window_anomaly.rs`)
+- `WindowAnomalyKind`: tag enum naming which of the two evidence-problem classes a consecutive-window comparison found (a percentage decrease without a legitimate reset, or an unexpected reset-timestamp change), not a measured quantity; `as_str`/`from_code` are the stable database spelling, not a formatting trait.
+- `WindowSetChangeKind`: tag enum naming which of the two window-set-evolution directions this system classifies (a new account-wide window, a missing model-specific window), not a measured quantity.
+- `WindowPresenceChange`: tag enum recording whether a window identity appeared in or disappeared from the current observation relative to the previous one, an input to `classify_window_set_change`, not a measured quantity.
+- `WindowReading`: a composite input to `classify_window_transition` grouping one window's already-typed used fraction, reset state and measurement instant for one observation; a grouping of other quantities' outputs, not itself a validated quantity with a smart constructor of its own.
+
 ### Authoritative surface comparison (`authoritative_comparison.rs`)
 - `AuthoritativeComparisonVerdict`: tag enum with exactly two outcomes (agrees within granularity, unresolved mismatch), not a measured quantity. It has no `Default` and no free-standing formatting trait; `as_str` is an inherent method for the stable database spelling.
 - `DocumentedGranularity`: a thin newtype over `QuotaFractionPpm` carrying the smallest difference the provider's authoritative surface is able to express. Private representation, a public smart constructor, no `Default`, no `Display`. It delegates its numeric bound to `QuotaFractionPpm`, so it has no dedicated compile-fail fixture of its own.

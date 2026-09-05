@@ -57,3 +57,4 @@ pub mod transcript_file;
 pub mod usage_component;
 pub mod usage_event;
 pub mod usage_occurrence;
+pub mod window_anomaly;
