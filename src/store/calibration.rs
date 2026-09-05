@@ -1379,6 +1379,94 @@ pub fn lifecycle_event_count(conn: &Connection) -> Result<i64, Error> {
     .map_err(|e| Error::Store(format!("cannot count calibration lifecycle events: {e}")))
 }
 
+/// A minimal but fully valid experiment for one scope, real in every field the
+/// schema requires. Shared by this module's own fixtures and by `aub-cab.4`'s
+/// `__calibration-fixture` CLI test hook, which needs the exact same
+/// experiment/result/activation chain an end-to-end case can seed without
+/// hand-writing SQL against a schema it does not own.
+pub(crate) fn minimal_experiment(
+    id: &str,
+    scope: &CalibrationScope,
+    meter_semantics_id: &MeterSemanticsId,
+    billing_semantics_id: &BillingSemanticsId,
+    validity: ValidityInterval,
+    knowledge_time: UtcTimestamp,
+) -> CalibrationExperiment {
+    CalibrationExperiment {
+        id: ExperimentId::new(id),
+        provider: scope.provider.clone(),
+        plan_tier: scope.plan_tier.clone(),
+        window_semantic_key: scope.window_semantic_key.clone(),
+        meter_semantics_id: meter_semantics_id.clone(),
+        billing_semantics_id: billing_semantics_id.clone(),
+        settlement_policy: SettlementPolicy::conservative_default(
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+        ),
+        validity,
+        knowledge_time,
+    }
+}
+
+/// A minimal but fully valid current calibration for one scope: real values in
+/// every field the schema requires, using placeholder identifiers and
+/// evidence references where the exact value does not change what a
+/// consumer's health decision or headroom arithmetic is testing. Point
+/// uncertainty (`fitted` repeated as both bounds) so a fixture caller gets an
+/// exact, reproducible headroom rather than an interval it did not choose.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn minimal_fixture(
+    id: &str,
+    scope: &CalibrationScope,
+    meter_semantics_id: &MeterSemanticsId,
+    billing_semantics_id: &BillingSemanticsId,
+    cost_model_id: &CostModelId,
+    fitted: CreditsPerPercentagePoint,
+    validity: ValidityInterval,
+    knowledge_time: UtcTimestamp,
+) -> WindowCalibration {
+    let evidence = |tag: &str| -> BTreeSet<EvidenceId> {
+        [EvidenceId::new(format!("fixture:{tag}"))]
+            .into_iter()
+            .collect()
+    };
+    WindowCalibration::from_fields(WindowCalibrationFields {
+        id: WindowCalibrationId::new(id),
+        provider: scope.provider.clone(),
+        plan_tier: scope.plan_tier.clone(),
+        window_semantic_key: scope.window_semantic_key.clone(),
+        meter_semantics_id: meter_semantics_id.clone(),
+        billing_semantics_id: billing_semantics_id.clone(),
+        cost_model_id: cost_model_id.clone(),
+        fitted,
+        equivalent_full_window_capacity: Credits::from_micros(1_000_000),
+        fit_residual: Credits::from_micros(0),
+        uncertainty: CoefficientUncertainty::new(fitted, fitted)
+            .expect("identical lower and upper bounds are a valid point uncertainty"),
+        lag_estimate: None,
+        lag_handling: LagHandling::new("none"),
+        sample_count: 1,
+        fit_timestamp: knowledge_time,
+        inputs: EvidenceDigest::from_inputs(&evidence("inputs")),
+        fitting_evidence: EvidenceFingerprint::from_inputs(&evidence("fitting")),
+        validation_evidence: EvidenceFingerprint::from_inputs(&evidence("validation")),
+        validation_method: "fixture".to_string(),
+        validation_version: "v1".to_string(),
+        out_of_sample_residual: None,
+        statistical_method: "fixture".to_string(),
+        statistical_parameters: "{}".to_string(),
+        condition_number: None,
+        observation_coverage_requirement: "fixture".to_string(),
+        settling_policy: "fixture".to_string(),
+        excluded_samples: Vec::new(),
+        activation_policy_version: "fixture".to_string(),
+        aub_version: crate::build_info::crate_version().to_string(),
+        source_revision: crate::build_info::source_revision().to_string(),
+        validity,
+        knowledge_time,
+    })
+    .expect("the fixture's own fields satisfy the constructor's invariants")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

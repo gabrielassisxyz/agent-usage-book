@@ -1488,13 +1488,11 @@ fn format_int_with_commas(n: i64) -> String {
     let sign = if n < 0 { "-" } else { "" };
     let s = n.abs().to_string();
     let mut out = String::new();
-    let mut count = 0;
-    for c in s.chars().rev() {
+    for (count, c) in s.chars().rev().enumerate() {
         if count > 0 && count % 3 == 0 {
             out.push(',');
         }
         out.push(c);
-        count += 1;
     }
     format!("{}{}", sign, out.chars().rev().collect::<String>())
 }

@@ -1981,7 +1981,7 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
     let status = outcome_obj
         .get("status")
         .and_then(serde_json::Value::as_str)
-        .ok_or_else(|| JsonContractError::MissingField("outcome.status"))?;
+        .ok_or(JsonContractError::MissingField("outcome.status"))?;
 
     match status {
         "ready" => {
@@ -2010,9 +2010,9 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
             let central_range = task_evidence
                 .get("central_range")
                 .and_then(serde_json::Value::as_object)
-                .ok_or_else(|| {
-                    JsonContractError::MissingField("outcome.task_evidence.central_range")
-                })?;
+                .ok_or(JsonContractError::MissingField(
+                    "outcome.task_evidence.central_range",
+                ))?;
             if !central_range.contains_key("lower") || !central_range.contains_key("upper") {
                 return Err(JsonContractError::MissingField("central_range endpoints"));
             }
@@ -2557,7 +2557,6 @@ mod tests {
         use crate::report::can_run::{
             CanRunJoinInputs, CanRunMeterReadiness, WindowCalibrationLookup, compose_can_run_report,
         };
-        use crate::store::calibration::CoefficientUncertainty;
         use std::collections::BTreeMap;
 
         fn credits_of(whole: i64) -> Credits {
@@ -2573,17 +2572,18 @@ mod tests {
             UtcTimestamp::from_unix_nanos(2_000_000_000),
             NominalWindowDuration::from_nanos(1_000_000_000),
         );
-        let unc = CoefficientUncertainty::new(
-            CreditsPerPercentagePoint::from_micros_per_point(8_000),
-            CreditsPerPercentagePoint::from_micros_per_point(9_000),
-        )
-        .unwrap();
+        // A point calibration (no `store::calibration::CoefficientUncertainty`
+        // import): presentation may not depend on the store or calibration
+        // modules (boundary rule 09), and this contract test only needs the
+        // interval endpoints to be present, not a specific width.
         let mut calibrations = BTreeMap::new();
         calibrations.insert(
             WindowSemanticKey::new("account:5h"),
             WindowCalibrationLookup {
                 calibration_id: "17".to_string(),
-                constraint: CalibratedWindowConstraint::current(unc),
+                constraint: CalibratedWindowConstraint::current_point(
+                    CreditsPerPercentagePoint::from_micros_per_point(8_500),
+                ),
             },
         );
 

@@ -21,6 +21,7 @@ commands:
   drill    damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive
   task     ingest issue-tracker task-claim events and report per-task usage and overhead
   compare  record and inspect adapter-semantics comparisons against the provider's authoritative surface
+  can-run  compare calibrated credit headroom against historical task cost, refusing rather than guessing when evidence is missing
 
 status:
   answers: how much quota does each configured account have left?
@@ -121,5 +122,11 @@ compare:
   refuses: --format (compare prints one operational result); --explain (compare derives no quantity); --account (a comparison is scoped by observation and window, not by account); --model (a comparison is scoped by window, not by model); --no-color (compare prints no color)
   format: text only: compare prints one operational result
   options: record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID
+
+can-run:
+  answers: given a fresh or cached calibrated credit headroom and the historical cost of this task kind, can the proposed task run now?
+  refuses: --model (can-run names the proposed model with --task-model; --model is status's own reporting-scope selector); --no-color (can-run prints no color)
+  format: text | json
+  options: --task-kind TYPE --account NAME --task-model MODEL [--cached]
 
 aub            prints the version; aub --help prints this

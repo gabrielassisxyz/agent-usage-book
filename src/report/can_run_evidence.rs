@@ -411,14 +411,16 @@ mod tests {
     }
 
     fn seed_resolved_kind(conn: &rusqlite::Connection, task_native: &str, kind: &str) {
-        conn.execute(
-            "INSERT INTO task_identity (
-                task_source, task_native, state, kind, winner_origin, evidence,
-                normalization_version, size_state, size, size_evidence,
-                difficulty_state, difficulty, difficulty_evidence
-            ) VALUES (?1, ?2, 'resolved', ?3, 'tracker_field:kind', '{}', 1,
-                      'unknown', NULL, '{}', 'unknown', NULL, '{}')",
-            rusqlite::params!["beads-a", task_native, kind],
+        crate::store::task_identity::insert_identity(
+            conn,
+            "beads-a",
+            task_native,
+            crate::attribution::ResolvedTaskKind::Resolved {
+                kind: TaskKind::parse(kind).expect("test-fixture kind is a valid TaskKind"),
+                winner: crate::attribution::TaskKindOrigin::TrackerField("kind".to_string()),
+                evidence: "{}".to_string(),
+            },
+            1,
         )
         .unwrap();
     }
