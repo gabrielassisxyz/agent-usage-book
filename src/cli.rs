@@ -3544,11 +3544,48 @@ fn calibration_fixture_command(clock: &impl Clock, invocation: &Invocation) -> R
         &calibration,
         &[crate::store::calibration::ExperimentId::new(&experiment_id)],
     )?;
+    // The fixture asserts its own scaffolding evidence through the real
+    // activation gate: the training and validation sets repeat the
+    // identifiers `minimal_fixture` records (a drift between the two fails
+    // closed with an evidence mismatch), the verdict is clean because
+    // scaffolding performs no experiment to contaminate, and the policy
+    // admits only the asserted-perfect held-out diagnostic the fixture
+    // records. The event names actor `fixture`, so no audit mistakes this
+    // activation for a measured one.
+    let training: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> =
+        [crate::domain::provenance::EvidenceId::new(
+            "fixture:fitting",
+        )]
+        .into_iter()
+        .collect();
+    let validation: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> =
+        [crate::domain::provenance::EvidenceId::new(
+            "fixture:validation",
+        )]
+        .into_iter()
+        .collect();
+    let actor = crate::calibration::activation::ActivationActor::new("fixture")
+        .map_err(|e| Error::Internal(format!("fixture actor is invalid: {e}")))?;
+    let policy = crate::calibration::activation::ActivationPolicy::new(
+        "fixture",
+        crate::domain::credits::Credits::from_micros(0),
+        crate::store::calibration::ConditionNumber::from_micros(30_000_000),
+    )
+    .map_err(|e| Error::Internal(format!("fixture policy is invalid: {e}")))?;
+    let verdict = crate::calibration::contamination::ContaminationVerdict::clean();
+    let request = crate::calibration::activation::ActivationRequest {
+        actor: &actor,
+        policy: &policy,
+        training: &training,
+        validation: &validation,
+        contamination: &verdict,
+    };
     crate::store::calibration::activate(
         &mut conn,
         &crate::domain::provenance::WindowCalibrationId::new(&calibration_id),
         timestamp,
         None,
+        &request,
     )?;
     println!("calibration {calibration_id} active for window {window_key}");
     Ok(())

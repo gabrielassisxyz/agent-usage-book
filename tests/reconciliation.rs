@@ -13,6 +13,10 @@
 use std::collections::BTreeSet;
 
 use agent_usage_book::attribution::account_segment::AccountEvidenceClass;
+use agent_usage_book::calibration::activation::{
+    ActivationActor, ActivationPolicy, ActivationRequest,
+};
+use agent_usage_book::calibration::contamination::ContaminationVerdict;
 use agent_usage_book::calibration::health::CalibrationHealth;
 use agent_usage_book::domain::credits::Credits;
 use agent_usage_book::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
@@ -34,7 +38,9 @@ use agent_usage_book::reconciliation::{
     TimingAlignmentUncertainty, classify_patterns, evaluate_eligibility, reconcile,
 };
 use agent_usage_book::store::account::{AccountId, observe_account};
-use agent_usage_book::store::calibration::{WindowCalibration, activate, load_result};
+use agent_usage_book::store::calibration::{
+    ConditionNumber, EvidenceDigest, WindowCalibration, activate, load_result,
+};
 use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
 use agent_usage_book::store::meter_evidence::{
     NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
@@ -70,6 +76,39 @@ fn fixture_db() -> rusqlite::Connection {
     conn
 }
 
+/// Disjoint fitting and validation evidence sets for one test calibration,
+/// derived from its id so every row `insert_calibration` writes carries
+/// digests the activation gate binds back to these same sets.
+fn calibration_evidence(cal_id: &str) -> (BTreeSet<EvidenceId>, BTreeSet<EvidenceId>) {
+    let training: BTreeSet<EvidenceId> = (1..=3)
+        .map(|n| EvidenceId::new(format!("{cal_id}-fitting-{n}")))
+        .collect();
+    let validation: BTreeSet<EvidenceId> = (1..=2)
+        .map(|n| EvidenceId::new(format!("{cal_id}-validation-{n}")))
+        .collect();
+    (training, validation)
+}
+
+fn evidence_hex(set: &BTreeSet<EvidenceId>) -> String {
+    format!("{:016x}", EvidenceDigest::from_inputs(set).digest())
+}
+
+/// An activation policy the gate accepts for rows written by
+/// `insert_calibration`: version `ap-v1` with bounds above the recorded
+/// residual (7,000 micros) and condition number (3.5).
+fn activation_parts() -> (ActivationActor, ActivationPolicy, ContaminationVerdict) {
+    (
+        ActivationActor::new("reconciliation-test").expect("actor is non-empty"),
+        ActivationPolicy::new(
+            "ap-v1",
+            Credits::from_micros(1_000_000),
+            ConditionNumber::from_micros(30_000_000),
+        )
+        .expect("policy version is non-empty"),
+        ContaminationVerdict::clean(),
+    )
+}
+
 fn insert_calibration(
     conn: &rusqlite::Connection,
     cal_id: &str,
@@ -78,6 +117,7 @@ fn insert_calibration(
     window: &str,
     fitted_micros: i64,
 ) {
+    let (training, validation) = calibration_evidence(cal_id);
     conn.execute(
         "INSERT INTO window_calibration_result (
             calibration_id, provider, plan_tier, window_semantic_key, meter_semantics_id,
@@ -94,13 +134,21 @@ fn insert_calibration(
             ?1, ?2, ?3, ?4, 'meter-v1', 'billing-v1', 'cm-1',
             ?5, 12000000, 4200, ?5 - 1000, ?5 + 1000, 90000000000, 'shifted-by-estimate', 40,
             1000, '0123456789abcdef', 3,
-            '0123456789abcdef',
-            '0123456789abcdef',
+            ?6,
+            ?7,
             'holdout', 'v2', 7000, 'ols', '{\"ridge\":0}',
             3500000, 'ninety-percent', 'plateau-3', '[]', 'ap-v1', '0.1.0', 'abc1234',
             0, 1000000000000, 1000
         )",
-        rusqlite::params![cal_id, provider, plan, window, fitted_micros],
+        rusqlite::params![
+            cal_id,
+            provider,
+            plan,
+            window,
+            fitted_micros,
+            evidence_hex(&training),
+            evidence_hex(&validation)
+        ],
     )
     .expect("insert window_calibration_result");
 }
@@ -923,11 +971,21 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
         "five_hour",
         100_000,
     );
+    let (actor, policy, verdict) = activation_parts();
+    let (training_1, validation_1) = calibration_evidence("wcr-proof-1");
+    let request_1 = ActivationRequest {
+        actor: &actor,
+        policy: &policy,
+        training: &training_1,
+        validation: &validation_1,
+        contamination: &verdict,
+    };
     activate(
         &mut conn,
         &WindowCalibrationId::new("wcr-proof-1"),
         UtcTimestamp::from_unix_nanos(500),
         None,
+        &request_1,
     )
     .expect("activate cal 1");
 
@@ -961,11 +1019,20 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
         "five_hour",
         200_000,
     );
+    let (training_2, validation_2) = calibration_evidence("wcr-proof-2");
+    let request_2 = ActivationRequest {
+        actor: &actor,
+        policy: &policy,
+        training: &training_2,
+        validation: &validation_2,
+        contamination: &verdict,
+    };
     activate(
         &mut conn,
         &WindowCalibrationId::new("wcr-proof-2"),
         UtcTimestamp::from_unix_nanos(3_000),
         Some(&WindowCalibrationId::new("wcr-proof-1")),
+        &request_2,
     )
     .expect("activate cal 2 superseding cal 1");
 

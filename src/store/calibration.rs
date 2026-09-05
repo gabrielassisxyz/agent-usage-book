@@ -27,6 +27,7 @@ use std::collections::BTreeSet;
 
 use rusqlite::{Connection, OptionalExtension, Row, params};
 
+use crate::calibration::activation::{ActivationActor, ActivationRequest, RecordedValidation};
 use crate::calibration::settlement::{SettlementCriterion, SettlementPolicy};
 use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
 use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
@@ -579,6 +580,16 @@ impl CalibrationEventKind {
         match self {
             Self::Activation => "activation",
             Self::Supersession => "supersession",
+        }
+    }
+
+    fn from_kind_label(label: &str) -> Result<Self, Error> {
+        match label {
+            "activation" => Ok(Self::Activation),
+            "supersession" => Ok(Self::Supersession),
+            other => Err(Error::Store(format!(
+                "unknown calibration event kind '{other}'"
+            ))),
         }
     }
 }
@@ -1306,19 +1317,118 @@ pub fn source_experiments(
 
 // --- lifecycle: point-in-time by knowledge time --------------------------
 
+/// Publishes a single controlled fit deliberately as provisional: the result
+/// row is recorded and no lifecycle event is written, so health reads it as
+/// provisional and only an explicit activation passing the disjoint-validation
+/// gate can ever make it current.
+pub fn publish_provisional(
+    conn: &mut Connection,
+    calibration: &WindowCalibration,
+    source_experiments: &[ExperimentId],
+) -> Result<CalibrationResultDbId, Error> {
+    insert_result(conn, calibration, source_experiments)
+}
+
+/// One recorded activation or supersession event: which kind, when, who
+/// activated, under which activation policy version, and over which fitting
+/// and validation evidence. Read back from the append-only lifecycle table in
+/// event order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationEvent {
+    pub kind: CalibrationEventKind,
+    pub event_at: UtcTimestamp,
+    pub actor: ActivationActor,
+    pub activation_policy_version: String,
+    pub fitting_evidence: EvidenceFingerprint,
+    pub validation_evidence: EvidenceFingerprint,
+    pub supersedes: Option<WindowCalibrationId>,
+}
+
+/// Every lifecycle event for one calibration, in event order. The chain that
+/// decides what is active is derived from these rows; reading them back is
+/// how an auditor checks who activated what, when, under which policy, and
+/// over which evidence.
+pub fn activation_events_for(
+    conn: &Connection,
+    id: &WindowCalibrationId,
+) -> Result<Vec<ActivationEvent>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT l.event_kind, l.event_at, l.actor, l.activation_policy_version,
+                l.fitting_evidence_digest, l.validation_evidence_digest, s.calibration_id
+             FROM calibration_lifecycle l
+             JOIN window_calibration_result r ON r.id = l.calibration_result_id
+             LEFT JOIN window_calibration_result s ON s.id = l.supersedes_result_id
+             WHERE r.calibration_id = ?1
+             ORDER BY l.event_at, l.id",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the lifecycle query: {e}")))?;
+    let rows = stmt
+        .query_map(params![id.as_str()], |row| {
+            let kind: String = row.get(0)?;
+            let event_at: i64 = row.get(1)?;
+            let actor: String = row.get(2)?;
+            let policy_version: String = row.get(3)?;
+            let fitting_digest: String = row.get(4)?;
+            let validation_digest: String = row.get(5)?;
+            let supersedes: Option<String> = row.get(6)?;
+            Ok((
+                kind,
+                event_at,
+                actor,
+                policy_version,
+                fitting_digest,
+                validation_digest,
+                supersedes,
+            ))
+        })
+        .map_err(|e| Error::Store(format!("cannot query lifecycle events: {e}")))?;
+    let mut events = Vec::new();
+    for row in rows {
+        let (kind, event_at, actor, policy_version, fitting_digest, validation_digest, supersedes) =
+            row.map_err(|e| Error::Store(format!("cannot read a lifecycle row: {e}")))?;
+        events.push(ActivationEvent {
+            kind: CalibrationEventKind::from_kind_label(&kind)?,
+            event_at: UtcTimestamp::from_unix_nanos(event_at),
+            actor: ActivationActor::new(actor)
+                .map_err(|e| Error::Store(format!("stored activation actor is invalid: {e}")))?,
+            activation_policy_version: policy_version,
+            fitting_evidence: EvidenceFingerprint::from_raw(digest_from_hex(&fitting_digest)?),
+            validation_evidence: EvidenceFingerprint::from_raw(digest_from_hex(
+                &validation_digest,
+            )?),
+            supersedes: supersedes.map(WindowCalibrationId::new),
+        });
+    }
+    Ok(events)
+}
+
 /// Records `id` becoming the active calibration for its scope at `event_at`.
+///
+/// Activation requires independent validation (`aub-c0b.8`): the `request`
+/// must judge exactly the evidence the result was validated against
+/// (same policy version, same evidence digests), the training and validation
+/// sets must be disjoint, no contamination finding may stand, the recorded
+/// condition number must be within the activation bound, and the recorded
+/// held-out residual must be within the activation bound. Any failure refuses
+/// the activation before anything is written.
 ///
 /// The chain is enforced, not merely described, and it is scoped: the first
 /// activation in a scope has no predecessor, and every later activation must name, as
 /// its superseded calibration, the one active in that scope just before `event_at`. A
 /// call that breaks either rule is refused before anything is written, so
 /// `load_active_at` can never fork.
+///
+/// The event is append-only and carries the actor, the timestamp, the
+/// activation policy version and the evidence it relied on.
 pub fn activate(
     conn: &mut Connection,
     id: &WindowCalibrationId,
     event_at: UtcTimestamp,
     supersedes: Option<&WindowCalibrationId>,
+    request: &ActivationRequest<'_>,
 ) -> Result<CalibrationLifecycleEventId, Error> {
+    use crate::calibration::activation::check_activation;
     let tx = conn
         .transaction()
         .map_err(|e| Error::Store(format!("cannot open the activation transaction: {e}")))?;
@@ -1329,6 +1439,16 @@ pub fn activate(
             id.as_str()
         ))
     })?;
+
+    let recorded = RecordedValidation {
+        policy_version: calibration.activation_policy_version().to_string(),
+        held_out_residual: calibration.out_of_sample_residual(),
+        condition_number: calibration.condition_number(),
+        fitting_evidence: calibration.fitting_evidence(),
+        validation_evidence: calibration.validation_evidence(),
+    };
+    check_activation(request, &recorded).map_err(|refusal| refusal.into_error())?;
+
     let scope = calibration.scope();
     let active_before = load_active_at_in(&tx, &scope, instant_before(event_at))?;
 
@@ -1379,13 +1499,19 @@ pub fn activate(
     let event_id = tx
         .query_row(
             "INSERT INTO calibration_lifecycle (
-                calibration_result_id, event_kind, event_at, supersedes_result_id
-            ) VALUES (?1, ?2, ?3, ?4) RETURNING id",
+                calibration_result_id, event_kind, event_at, supersedes_result_id,
+                actor, activation_policy_version,
+                fitting_evidence_digest, validation_evidence_digest
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) RETURNING id",
             params![
                 result_db_id,
                 kind.as_str(),
                 event_at.unix_nanos(),
-                supersedes_db_id
+                supersedes_db_id,
+                request.actor.as_str(),
+                request.policy.version(),
+                digest_to_hex(calibration.fitting_evidence().as_u64()),
+                digest_to_hex(calibration.validation_evidence().as_u64())
             ],
             |row| row.get::<_, i64>(0),
         )
@@ -1593,6 +1719,10 @@ pub(crate) fn minimal_experiment(
 /// consumer's health decision or headroom arithmetic is testing. Point
 /// uncertainty (`fitted` repeated as both bounds) so a fixture caller gets an
 /// exact, reproducible headroom rather than an interval it did not choose.
+/// The held-out diagnostic is an asserted perfect zero: scaffolding invents
+/// all of its evidence, so there is nothing to validate against, and the
+/// activation it feeds records actor `fixture` so no audit mistakes the zero
+/// for a measurement.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn minimal_fixture(
     id: &str,
@@ -1631,7 +1761,7 @@ pub(crate) fn minimal_fixture(
         validation_evidence: EvidenceFingerprint::from_inputs(&evidence("validation")),
         validation_method: "fixture".to_string(),
         validation_version: "v1".to_string(),
-        out_of_sample_residual: None,
+        out_of_sample_residual: Some(Credits::from_micros(0)),
         statistical_method: "fixture".to_string(),
         statistical_parameters: "{}".to_string(),
         condition_number: None,
@@ -1650,6 +1780,9 @@ pub(crate) fn minimal_fixture(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::calibration::activation::{ActivationActor, ActivationPolicy, ActivationRequest};
+    use crate::calibration::contamination::ContaminationVerdict;
+    use crate::domain::credits::Credits;
     use crate::domain::time::{FakeClock, MonotonicDuration};
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use std::path::{Path, PathBuf};
@@ -1726,6 +1859,48 @@ mod tests {
 
     fn evidence(ids: &[&str]) -> BTreeSet<EvidenceId> {
         ids.iter().map(|s| EvidenceId::new(*s)).collect()
+    }
+
+    /// An activation request matching the `calibration` helper's recorded
+    /// validation: disjoint fitting (`s-1`, `s-2`) and validation (`s-3`)
+    /// sets, a clean verdict, and a policy bound above the recorded residual
+    /// (7,000 micros) and condition number (3.5). Returned owned, so each
+    /// call site binds the parts and assembles the borrowing request.
+    fn activation_parts() -> (
+        ActivationActor,
+        ActivationPolicy,
+        BTreeSet<EvidenceId>,
+        BTreeSet<EvidenceId>,
+        ContaminationVerdict,
+    ) {
+        (
+            ActivationActor::new("test").unwrap(),
+            ActivationPolicy::new(
+                "ap-v1",
+                Credits::from_micros(100_000),
+                ConditionNumber::from_micros(30_000_000),
+            )
+            .unwrap(),
+            evidence(&["s-1", "s-2"]),
+            evidence(&["s-3"]),
+            ContaminationVerdict::clean(),
+        )
+    }
+
+    fn activation_request<'a>(
+        actor: &'a ActivationActor,
+        policy: &'a ActivationPolicy,
+        training: &'a BTreeSet<EvidenceId>,
+        validation: &'a BTreeSet<EvidenceId>,
+        verdict: &'a ContaminationVerdict,
+    ) -> ActivationRequest<'a> {
+        ActivationRequest {
+            actor,
+            policy,
+            training,
+            validation,
+            contamination: verdict,
+        }
     }
 
     fn experiment(id: &str, validity: ValidityInterval, knowledge: i64) -> CalibrationExperiment {
@@ -2007,8 +2182,10 @@ mod tests {
         insert_result(&mut conn, &r_old, &[ExperimentId::new("exp-old")]).unwrap();
         insert_result(&mut conn, &r_new, &[ExperimentId::new("exp-new")]).unwrap();
 
-        activate(&mut conn, r_old.id(), ts(1_000), None).unwrap();
-        activate(&mut conn, r_new.id(), ts(2_000), Some(r_old.id())).unwrap();
+        let (actor, policy, training, validation, verdict) = activation_parts();
+        let request = activation_request(&actor, &policy, &training, &validation, &verdict);
+        activate(&mut conn, r_old.id(), ts(1_000), None, &request).unwrap();
+        activate(&mut conn, r_new.id(), ts(2_000), Some(r_old.id()), &request).unwrap();
 
         // Knowledge time: what was active as of an instant.
         assert!(load_active_at(&conn, &scope(), ts(999)).unwrap().is_none());
@@ -2064,11 +2241,13 @@ mod tests {
         insert_result(&mut conn, &a, &[ExperimentId::new("exp-c")]).unwrap();
         insert_result(&mut conn, &b, &[ExperimentId::new("exp-c")]).unwrap();
 
-        assert!(activate(&mut conn, a.id(), ts(1_000), Some(b.id())).is_err());
-        activate(&mut conn, a.id(), ts(1_000), None).unwrap();
-        assert!(activate(&mut conn, b.id(), ts(2_000), None).is_err());
-        assert!(activate(&mut conn, a.id(), ts(2_000), Some(a.id())).is_err());
-        activate(&mut conn, b.id(), ts(2_000), Some(a.id())).unwrap();
+        let (actor, policy, training, validation, verdict) = activation_parts();
+        let request = activation_request(&actor, &policy, &training, &validation, &verdict);
+        assert!(activate(&mut conn, a.id(), ts(1_000), Some(b.id()), &request).is_err());
+        activate(&mut conn, a.id(), ts(1_000), None, &request).unwrap();
+        assert!(activate(&mut conn, b.id(), ts(2_000), None, &request).is_err());
+        assert!(activate(&mut conn, a.id(), ts(2_000), Some(a.id()), &request).is_err());
+        activate(&mut conn, b.id(), ts(2_000), Some(a.id()), &request).unwrap();
         assert_eq!(
             load_active_at(&conn, &scope(), ts(2_000))
                 .unwrap()
@@ -2093,10 +2272,14 @@ mod tests {
         insert_result(&mut conn, &account, &[ExperimentId::new("exp-s")]).unwrap();
         insert_result(&mut conn, &model, &[ExperimentId::new("exp-s")]).unwrap();
 
-        activate(&mut conn, account.id(), ts(1_000), None).unwrap();
+        // The `model` result shares the helper's recorded validation sets, so
+        // one request activates both scopes.
+        let (actor, policy, training, validation, verdict) = activation_parts();
+        let request = activation_request(&actor, &policy, &training, &validation, &verdict);
+        activate(&mut conn, account.id(), ts(1_000), None, &request).unwrap();
         // First activation in the `model` scope: also has no predecessor, despite the
         // `account` scope already being active.
-        activate(&mut conn, model.id(), ts(1_500), None).unwrap();
+        activate(&mut conn, model.id(), ts(1_500), None, &request).unwrap();
 
         let model_scope = CalibrationScope {
             window_semantic_key: WindowSemanticKey::new("model"),
