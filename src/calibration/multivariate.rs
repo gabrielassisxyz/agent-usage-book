@@ -19,6 +19,11 @@
 //! the kind-level collinearity the gate must see. Intercept diagnostics stay
 //! with the univariate fitter, which answers a different question.
 
+// Index-based loops over symmetric matrices and augmented systems read as the
+// algebra they implement (Jacobi sweeps, Gauss-Jordan pivots); iterator forms of
+// the same nested index arithmetic obscure which element is being rotated.
+#![allow(clippy::needless_range_loop)]
+
 use super::fitter::{EntangledCoefficientPair, FitRejection};
 use crate::domain::provenance::EvidenceId;
 use crate::domain::tokens::{KnownTokenVector, TokenKind};
@@ -601,12 +606,11 @@ fn symmetric_eigenvalues(mut matrix: Vec<Vec<f64>>) -> Vec<f64> {
         return Vec::new();
     }
     for _ in 0..50 {
-        let mut off_diagonal = 0.0;
-        for i in 0..size {
-            for j in (i + 1)..size {
-                off_diagonal += matrix[i][j] * matrix[i][j];
-            }
-        }
+        let off_diagonal: f64 = matrix
+            .iter()
+            .enumerate()
+            .map(|(i, row)| row[i + 1..].iter().map(|v| v * v).sum::<f64>())
+            .sum();
         if off_diagonal <= 1e-24 {
             break;
         }
@@ -815,7 +819,17 @@ mod tests {
                     pair.correlation()
                 );
             }
-            other => panic!("expected ill-conditioned rejection, got {other}"),
+            other @ (FitRejection::InsufficientObservations { .. }
+            | FitRejection::Underidentified { .. }
+            | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::ZeroCreditSpan
+            | FitRejection::BaselinePlateauNotSettled
+            | FitRejection::TerminalPlateauNotSettled
+            | FitRejection::MissingCostModelTerm { .. }
+            | FitRejection::ContaminatedSeries { .. }) => {
+                panic!("expected ill-conditioned rejection, got {other}")
+            }
         }
 
         assert!(message.contains("input"), "message names input: {message}");
@@ -962,7 +976,17 @@ mod tests {
                 assert_eq!(found, 3);
                 assert_eq!(required, 5);
             }
-            other => panic!("expected insufficient-observations rejection, got {other}"),
+            other @ (FitRejection::Underidentified { .. }
+            | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::IllConditioned { .. }
+            | FitRejection::ZeroCreditSpan
+            | FitRejection::BaselinePlateauNotSettled
+            | FitRejection::TerminalPlateauNotSettled
+            | FitRejection::MissingCostModelTerm { .. }
+            | FitRejection::ContaminatedSeries { .. }) => {
+                panic!("expected insufficient-observations rejection, got {other}")
+            }
         }
         let message = rejection.to_string();
         assert!(
@@ -1005,7 +1029,17 @@ mod tests {
                     "estimate must be negative, got {estimate_ppm_per_token}"
                 );
             }
-            other => panic!("expected non-positive-coefficient rejection, got {other}"),
+            other @ (FitRejection::InsufficientObservations { .. }
+            | FitRejection::Underidentified { .. }
+            | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::IllConditioned { .. }
+            | FitRejection::ZeroCreditSpan
+            | FitRejection::BaselinePlateauNotSettled
+            | FitRejection::TerminalPlateauNotSettled
+            | FitRejection::MissingCostModelTerm { .. }
+            | FitRejection::ContaminatedSeries { .. }) => {
+                panic!("expected non-positive-coefficient rejection, got {other}")
+            }
         }
         let message = rejection.to_string();
         assert!(
@@ -1126,7 +1160,17 @@ mod tests {
             FitRejection::IllConditioned { threshold, .. } => {
                 assert_eq!(threshold, 1.0 + 1e-9);
             }
-            other => panic!("expected ill-conditioned rejection, got {other}"),
+            other @ (FitRejection::InsufficientObservations { .. }
+            | FitRejection::Underidentified { .. }
+            | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::ZeroCreditSpan
+            | FitRejection::BaselinePlateauNotSettled
+            | FitRejection::TerminalPlateauNotSettled
+            | FitRejection::MissingCostModelTerm { .. }
+            | FitRejection::ContaminatedSeries { .. }) => {
+                panic!("expected ill-conditioned rejection, got {other}")
+            }
         }
     }
 
@@ -1176,7 +1220,17 @@ mod tests {
                     "no pair varies, so no correlation exists to report"
                 );
             }
-            other => panic!("expected ill-conditioned rejection, got {other}"),
+            other @ (FitRejection::InsufficientObservations { .. }
+            | FitRejection::Underidentified { .. }
+            | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::ZeroCreditSpan
+            | FitRejection::BaselinePlateauNotSettled
+            | FitRejection::TerminalPlateauNotSettled
+            | FitRejection::MissingCostModelTerm { .. }
+            | FitRejection::ContaminatedSeries { .. }) => {
+                panic!("expected ill-conditioned rejection, got {other}")
+            }
         }
         assert!(
             rejection.to_string().contains("no token-kind pair"),
