@@ -187,17 +187,71 @@ impl DiagnosticFinding {
     }
 }
 
+/// One pair of token-kind coefficients a multivariate fit could not separate.
+///
+/// Lives beside [`FitRejection`] rather than in the multivariate module so the
+/// rejection type stays whole: splitting it across two modules would force a
+/// dependency cycle between siblings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EntangledCoefficientPair {
+    first: TokenKind,
+    second: TokenKind,
+    correlation: f64,
+}
+
+impl EntangledCoefficientPair {
+    pub fn new(first: TokenKind, second: TokenKind, correlation: f64) -> Self {
+        Self {
+            first,
+            second,
+            correlation,
+        }
+    }
+
+    pub fn first(&self) -> TokenKind {
+        self.first
+    }
+
+    pub fn second(&self) -> TokenKind {
+        self.second
+    }
+
+    pub fn correlation(&self) -> f64 {
+        self.correlation
+    }
+}
+
 /// Typed rejection reasons for calibration fitting.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FitRejection {
-    InsufficientObservations { found: usize, required: usize },
-    Underidentified { usable: usize },
-    NonPositiveSlope { slope_ppm_per_credit: f64 },
+    InsufficientObservations {
+        found: usize,
+        required: usize,
+    },
+    Underidentified {
+        usable: usize,
+    },
+    NonPositiveSlope {
+        slope_ppm_per_credit: f64,
+    },
+    NonPositiveCoefficient {
+        kind: TokenKind,
+        estimate_ppm_per_token: f64,
+    },
+    IllConditioned {
+        condition_number: f64,
+        threshold: f64,
+        entangled: Vec<EntangledCoefficientPair>,
+    },
     ZeroCreditSpan,
     BaselinePlateauNotSettled,
     TerminalPlateauNotSettled,
-    MissingCostModelTerm { details: String },
-    ContaminatedSeries { details: String },
+    MissingCostModelTerm {
+        details: String,
+    },
+    ContaminatedSeries {
+        details: String,
+    },
 }
 
 impl fmt::Display for FitRejection {
@@ -222,6 +276,40 @@ impl fmt::Display for FitRejection {
                     f,
                     "non-positive slope fitted: {slope_ppm_per_credit} ppm/credit"
                 )
+            }
+            Self::NonPositiveCoefficient {
+                kind,
+                estimate_ppm_per_token,
+            } => {
+                write!(
+                    f,
+                    "non-positive coefficient fitted for {}: {estimate_ppm_per_token} ppm/token; token usage cannot reduce the used fraction",
+                    kind.label()
+                )
+            }
+            Self::IllConditioned {
+                condition_number,
+                threshold,
+                entangled,
+            } => {
+                let condition = if condition_number.is_finite() {
+                    format!("{condition_number:.2}")
+                } else {
+                    "infinite".to_string()
+                };
+                match entangled.first() {
+                    Some(pair) => write!(
+                        f,
+                        "ill-conditioned fit (condition number {condition} exceeds threshold {threshold:.2}); cannot separate {} from {} (correlation r={:.4})",
+                        pair.first.label(),
+                        pair.second.label(),
+                        pair.correlation,
+                    ),
+                    None => write!(
+                        f,
+                        "ill-conditioned fit (condition number {condition} exceeds threshold {threshold:.2}); no token-kind pair varied independently enough to separate",
+                    ),
+                }
             }
             Self::ZeroCreditSpan => {
                 write!(f, "zero credit movement across observations")
