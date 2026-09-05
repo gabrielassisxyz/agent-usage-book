@@ -82,7 +82,7 @@ case_assertions() {
     # Step 2: Pre-fix JSON reports the fail statuses.
     assert_exit 0 2
     assert_json_field 2 "command" "doctor"
-    assert_json_field 2 "schema" "1"
+    assert_json_field 2 "schema" "2"
     assert_stdout_contains 2 '"name":"pending-evidence","status":"fail"'
     assert_stdout_contains 2 '"name":"projection-versus-database-generation","status":"fail"'
     assert_stdout_contains 2 '"name":"transcript-roots","status":"fail"'

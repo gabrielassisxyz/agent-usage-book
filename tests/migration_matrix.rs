@@ -232,6 +232,7 @@ const POPULATION: &[(&str, Populate)] = &[
     ("transcript_file", populate_transcript_file),
     ("session", populate_session),
     ("session_account_marker", populate_session_account_marker),
+    ("session_heartbeat", populate_session_heartbeat),
     ("task_event", populate_task_event),
     ("task_event_quarantine", populate_task_event_quarantine),
     ("meter_attempt", populate_meter_attempt),
@@ -287,6 +288,12 @@ const POPULATION: &[(&str, Populate)] = &[
         "account_attribution_segment",
         populate_account_attribution_segment,
     ),
+    ("meter_window_anomaly", populate_meter_window_anomaly),
+    (
+        "meter_calibration_exclusion",
+        populate_meter_calibration_exclusion,
+    ),
+    ("meter_window_set_change", populate_meter_window_set_change),
 ];
 
 fn populate_account_attribution_segment(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -443,6 +450,17 @@ fn populate_session_account_marker(conn: &rusqlite::Connection) -> Result<(), St
         "INSERT INTO session_account_marker (id, session_source, session_native, observed_at, logical_account, resolved_account_id, marker_source, evidence_designation) VALUES
             (1, 'claude-code', 'matrix-native-1', 150, 'alpha', 1, 'transcript', 'direct'),
             (2, 'claude-code', 'matrix-native-2', 250, 'unlinked', NULL, 'inference', 'heuristic')",
+    )
+}
+
+fn populate_session_heartbeat(conn: &rusqlite::Connection) -> Result<(), String> {
+    // One row per session, keyed by (session_source, session_native): the
+    // UNIQUE constraint the table's own upsert relies on.
+    exec(
+        conn,
+        "session_heartbeat",
+        "INSERT INTO session_heartbeat (session_source, session_native, last_heartbeat_at, heartbeat_source) VALUES
+            ('claude-code', 'matrix-native-1', 150, 'turn_end')",
     )
 }
 
@@ -755,6 +773,44 @@ fn populate_adapter_semantics_annotation(conn: &rusqlite::Connection) -> Result<
             (1, 'mismatch', 2, 2, 'matrix-key-1', 1000000, 0, NULL, 'matrix-mismatch', 300),
             (2, 'correction', 2, 2, 'matrix-key-1', 1000000, 0, 1, 'matrix-correction', 310),
             (3, 'exclusion', 1, 1, 'matrix-key-1', 0, 0, NULL, 'matrix-exclusion', 320)",
+    )
+}
+
+fn populate_meter_window_anomaly(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Both anomaly kinds, and both arms of the scope-pairing CHECK: an
+    // account-wide pair and a model-scoped pair, over the two window rows
+    // `populate_meter_window` already inserted.
+    exec(
+        conn,
+        "meter_window_anomaly",
+        "INSERT INTO meter_window_anomaly (id, kind, account_id, semantic_key, scope_kind, scoped_model, prior_observation_id, prior_window_id, current_observation_id, current_window_id, detected_at, detail) VALUES
+            (1, 'percentage_decrease_without_reset', 1, 'matrix-key-1', 'account_wide', NULL, 1, 1, 2, 2, 400, 'matrix-anomaly-1'),
+            (2, 'unexpected_reset_change', 1, 'matrix-key-1', 'model_specific', 'model-x', 1, 2, 2, 1, 410, 'matrix-anomaly-2')",
+    )
+}
+
+fn populate_meter_calibration_exclusion(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Row 1 is a normal interval; row 2 sits on the interval CHECK boundary,
+    // start equal to end.
+    exec(
+        conn,
+        "meter_calibration_exclusion",
+        "INSERT INTO meter_calibration_exclusion (id, anomaly_id, account_id, semantic_key, scope_kind, scoped_model, interval_start_at, interval_end_at, created_at) VALUES
+            (1, 1, 1, 'matrix-key-1', 'account_wide', NULL, 100, 200, 400),
+            (2, 2, 1, 'matrix-key-1', 'model_specific', 'model-x', 300, 300, 410)",
+    )
+}
+
+fn populate_meter_window_set_change(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Both kinds, and both arms of the kind-pairing CHECK: an appeared
+    // account-wide window (no prior row) and a disappeared model-specific one
+    // (no current row).
+    exec(
+        conn,
+        "meter_window_set_change",
+        "INSERT INTO meter_window_set_change (id, kind, account_id, semantic_key, scope_kind, scoped_model, previous_observation_id, previous_window_id, current_observation_id, current_window_id, detected_at) VALUES
+            (1, 'new_account_wide_window', 1, 'matrix-key-1', 'account_wide', NULL, 1, NULL, 2, 1, 420),
+            (2, 'missing_model_specific_window', 1, 'matrix-key-1', 'model_specific', 'model-x', 1, 2, 2, NULL, 430)",
     )
 }
 

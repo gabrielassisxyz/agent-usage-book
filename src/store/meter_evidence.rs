@@ -657,6 +657,46 @@ pub fn newest_observation_for_account(
     })
 }
 
+/// Reads the newest observation recorded for `account_id` strictly older than
+/// `before`: the immediately preceding observation a consecutive-window
+/// comparison (`aub-eun.14`) compares the current one against. `None` means
+/// `before` is the account's first observation, so there is nothing to
+/// compare it to yet.
+pub fn observation_immediately_before(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    before: ObservationRowId,
+) -> Result<Option<StoredMeterObservation>, Error> {
+    conn.query_row(
+        "SELECT meter_observation.id AS id,
+                    meter_observation.attempt_id AS attempt_id,
+                    meter_observation.evidence_id AS evidence_id,
+                    meter_observation.account_id AS account_id,
+                    meter_observation.provider AS provider,
+                    meter_observation.provider_observed_at AS provider_observed_at,
+                    meter_observation.received_at AS received_at,
+                    meter_observation.measurement_basis AS measurement_basis,
+                    meter_observation.observed_plan AS observed_plan,
+                    meter_observation.observed_tier AS observed_tier,
+                    meter_observation.adapter_version AS adapter_version,
+                    meter_observation.provider_contract_id AS provider_contract_id,
+                    meter_observation.meter_semantics_id AS meter_semantics_id,
+                    meter_observation.normalized_fingerprint AS normalized_fingerprint
+             FROM meter_observation
+             JOIN meter_attempt ON meter_attempt.id = meter_observation.attempt_id
+             WHERE meter_attempt.account_id = ?1 AND meter_observation.id < ?2
+             ORDER BY meter_observation.id DESC LIMIT 1",
+        params![account_id.value(), before.value()],
+        row_to_observation,
+    )
+    .optional()
+    .map_err(|e| {
+        Error::Store(format!(
+            "cannot read the observation preceding {before:?}: {e}"
+        ))
+    })
+}
+
 /// One known quota reset instant, with the nominal length of the window that
 /// reported it. The coverage command's detail rendering names this length when
 /// an account lost the peak of a window to a blind gap.

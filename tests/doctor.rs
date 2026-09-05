@@ -465,8 +465,15 @@ fn check_fails_backup_age() {
     );
 }
 
+/// `aub-eun.14`: with no ledger database yet, `MeterAnomalies` reports
+/// `NotApplicable`, the same shape every other database-backed check in this
+/// registry reports before a ledger exists (`BackupAge`,
+/// `AdapterSemanticsComparisonAge`). The persisted-count read itself, and its
+/// `Fail`/`PassWithDetail` split, is covered against a real database in
+/// `src/doctor/checks.rs`'s own test module, next to `store::window_anomaly`'s
+/// fixtures.
 #[test]
-fn check_reports_not_yet_available_meter_anomalies() {
+fn check_reports_not_applicable_meter_anomalies_before_a_ledger_exists() {
     let state = StateDir::new();
     let config = test_config(state.path());
     let ctx = DoctorContext {
@@ -482,12 +489,7 @@ fn check_reports_not_yet_available_meter_anomalies() {
         .iter()
         .find(|o| o.name == CheckName::MeterAnomalies)
         .expect("MeterAnomalies present");
-    assert_eq!(
-        outcome.status,
-        CheckStatus::NotYetAvailable {
-            owning_bead: "aub-eun.14"
-        }
-    );
+    assert!(matches!(outcome.status, CheckStatus::NotApplicable(_)));
 }
 
 #[test]
@@ -1635,4 +1637,167 @@ fn integration_synthetic_step_change_produces_step_change_pattern_and_no_causal_
     assert!(pointer.contains("aub doctor missing-active-calibrations"));
     assert!(!pointer.contains("caused by"), "must not claim cause");
     assert!(!pointer.contains("the cause is"), "must not claim cause");
+}
+
+// --- MeterAnomalies: doctor consumes persisted evidence, never re-detects ---
+
+/// `aub-eun.14`: `MeterAnomalies` reads what `store::window_anomaly` already
+/// persisted - a count and evidence references - without calling any
+/// detection function itself. A percentage decrease with no reset produces a
+/// `Fail` naming the anomaly's evidence references; a ledger with none is a
+/// `PassWithDetail` naming zero, never a silent pass with no detail at all.
+#[test]
+fn meter_anomalies_reports_persisted_evidence_without_reimplementing_detection() {
+    use agent_usage_book::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+    use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
+    use agent_usage_book::domain::time::MeasurementBasis;
+    use agent_usage_book::domain::window::{
+        NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowResetState,
+        WindowScope, WindowSemanticKey,
+    };
+    use agent_usage_book::store::account::observe_account;
+    use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
+    use agent_usage_book::store::meter_evidence::{
+        NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
+        insert_response_evidence, insert_window, observation_by_row_id, windows_by_observation,
+    };
+    use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
+    use agent_usage_book::store::sampling_policy_snapshot::{
+        ResolvedSamplingPolicy, resolve_policy_snapshot,
+    };
+    use agent_usage_book::store::window_anomaly::detect_and_persist;
+
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let conn = open_ledger(state.path());
+
+    let account = observe_account(&conn, "anthropic", "work-primary", ts(10)).unwrap();
+    let run = start_sample_run(&conn, Trigger::Manual, ts(10), "test").unwrap();
+    let policy = ResolvedSamplingPolicy {
+        ordinary_cadence: MonotonicDuration::from_millis(300_000),
+        freshness_horizon: MonotonicDuration::from_millis(900_000),
+        reset_edge_policy: String::new(),
+        retry_backoff_policy: String::new(),
+        command_budget: MonotonicDuration::from_millis(60_000),
+        policy_algorithm_version: String::new(),
+    };
+    let snapshot = resolve_policy_snapshot(&conn, account, ts(10), &policy).unwrap();
+
+    let record = |received_at: i64, used_ppm: i32, resets_at: WindowResetState| {
+        let attempt = start_meter_attempt(
+            &conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "anthropic".into(),
+                request_started_at: ts(received_at - 1),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: ts(received_at - 2),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "account-5h-v2".into(),
+            },
+        )
+        .unwrap();
+        let evidence_id = insert_response_evidence(
+            &conn,
+            &NewMeterResponseEvidence {
+                attempt_id: attempt,
+                response_classification: "200".into(),
+                received_at: ts(received_at),
+                provider_observed_at_original: None,
+                evidence_capsule: r#"{"windows":[{"key":"5h"}]}"#.into(),
+                capsule_schema_version: "capsule-v1".into(),
+                sanitizer_version: "sanitizer-v1".into(),
+                capture_truncated: false,
+            },
+        )
+        .unwrap();
+        let observation_id = insert_observation(
+            &conn,
+            &NewMeterObservation {
+                attempt_id: attempt,
+                evidence_id,
+                account_id: account,
+                provider: "anthropic".into(),
+                provider_observed_at: None,
+                received_at: ts(received_at),
+                measurement_basis: MeasurementBasis::LocallyReceived,
+                observed_plan: Some("max".into()),
+                observed_tier: Some("pro".into()),
+                adapter_version: AdapterVersion::new("adapter-v1"),
+                provider_contract_id: ProviderContractId::new("endpoint-schema-v3"),
+                meter_semantics_id: MeterSemanticsId::new("semantics-v1"),
+                normalized_fingerprint: format!("fp-{received_at}"),
+            },
+        )
+        .unwrap();
+        insert_window(
+            &conn,
+            &NewMeterWindow {
+                observation_id,
+                semantic_key: WindowSemanticKey::new("5h"),
+                scope: WindowScope::AccountWide,
+                quota_used: QuotaUsed::new(QuotaFractionPpm::new(used_ppm).unwrap()),
+                reported_resolution: ReportedResolution::new(
+                    QuotaFractionPpm::new(10_000).unwrap(),
+                )
+                .unwrap(),
+                quantization: QuantizationSemantics::RoundedToNearest,
+                resets_at,
+                nominal_duration: NominalWindowDuration::from_nanos(3_600_000_000_000),
+            },
+        )
+        .unwrap();
+        let observation = observation_by_row_id(&conn, observation_id)
+            .unwrap()
+            .unwrap();
+        let windows = windows_by_observation(&conn, observation_id).unwrap();
+        (observation, windows)
+    };
+
+    let ctx_before = DoctorContext {
+        config: &config,
+        timestamp: ts(1_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let before = build_registry(&ctx_before)
+        .into_iter()
+        .find(|o| o.name == CheckName::MeterAnomalies)
+        .expect("MeterAnomalies present");
+    assert_eq!(
+        before.status,
+        CheckStatus::PassWithDetail("0 window anomalies recorded".to_string())
+    );
+
+    let (first_obs, first_windows) = record(30, 600_000, WindowResetState::Known(ts(100)));
+    detect_and_persist(&conn, account, &first_obs, &first_windows, ts(30)).unwrap();
+    let (second_obs, second_windows) = record(40, 400_000, WindowResetState::Known(ts(100)));
+    detect_and_persist(&conn, account, &second_obs, &second_windows, ts(40)).unwrap();
+
+    let ctx_after = DoctorContext {
+        config: &config,
+        timestamp: ts(1_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let after = build_registry(&ctx_after)
+        .into_iter()
+        .find(|o| o.name == CheckName::MeterAnomalies)
+        .expect("MeterAnomalies present");
+    match after.status {
+        CheckStatus::Fail(ref detail) => {
+            assert!(detail.contains("1 window anomaly"));
+            assert!(detail.contains("percentage_decrease_without_reset"));
+            assert!(detail.contains(&format!("account={}", account.value())));
+        }
+        other => panic!("expected Fail naming the anomaly's evidence references, got {other:?}"),
+    }
 }

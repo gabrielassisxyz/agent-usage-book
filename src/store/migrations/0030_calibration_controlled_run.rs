@@ -19,7 +19,7 @@ use crate::error::Error;
 use crate::store::migrate::Migration;
 
 /// The schema version this step produces.
-pub const VERSION: u32 = 28;
+pub const VERSION: u32 = 30;
 
 const CREATE_CALIBRATION_CONTROLLED_RUN: &str = "\
 CREATE TABLE calibration_controlled_run (

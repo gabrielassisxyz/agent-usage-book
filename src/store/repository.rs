@@ -29,6 +29,7 @@ use super::meter_evidence::{
 use super::sample_run::{self, SampleRunId, Trigger};
 use super::sampling_lease::{self, AccountName, LeaseHolder, LeaseOutcome};
 use super::sampling_policy_snapshot::{ResolvedSamplingPolicy, SamplingPolicySnapshotId};
+use super::window_anomaly::{self, StoredWindowAnomaly};
 
 /// Opens repository operations against one ledger database under one pragma policy.
 #[derive(Debug, Clone)]
@@ -432,11 +433,14 @@ impl TerminalMeterBundle {
     }
 }
 
-/// The generated identities of one committed terminal bundle.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The generated identities of one committed terminal bundle, plus any window
+/// anomaly this commit's windows were found to carry against the account's
+/// immediately preceding observation (`aub-eun.14`).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TerminalBundleIds {
     pub evidence_id: EvidenceRowId,
     pub observation_id: ObservationRowId,
+    pub window_anomalies: Vec<StoredWindowAnomaly>,
 }
 
 /// One committed terminal bundle together with the publication that followed
@@ -519,6 +523,27 @@ pub(crate) fn commit_terminal_bundle_on_connection(
         )?;
     }
 
+    // Consecutive-window comparison against the account's immediately
+    // preceding observation (`aub-eun.14`). This reads back the rows just
+    // inserted above rather than reusing `bundle.windows()` directly, so the
+    // comparison sees exactly what was persisted, with its real row ids and
+    // observation id, not the pre-commit domain values.
+    let current_observation = meter_evidence::observation_by_row_id(&tx, observation_id)?
+        .ok_or_else(|| {
+            Error::Internal(format!(
+                "observation {} committed but cannot be read back",
+                observation_id.value()
+            ))
+        })?;
+    let current_windows = meter_evidence::windows_by_observation(&tx, observation_id)?;
+    let detection = window_anomaly::detect_and_persist(
+        &tx,
+        interpretation.account_id,
+        &current_observation,
+        &current_windows,
+        interpretation.received_at,
+    )?;
+
     // The terminal fact is projection-relevant durable meter state, so its
     // generation advance belongs to this same transaction (PLAN.md section
     // 11.6): a rollback of the bundle rolls the generation back, and a commit
@@ -534,6 +559,7 @@ pub(crate) fn commit_terminal_bundle_on_connection(
     })?;
     Ok(TerminalBundleIds {
         evidence_id,
+        window_anomalies: detection.anomalies,
         observation_id,
     })
 }

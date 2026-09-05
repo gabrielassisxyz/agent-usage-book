@@ -90,15 +90,15 @@ fn contract_status_json_matches_golden_fixture() {
         serde_json::from_str(&generated_json).expect("generated status JSON must parse");
 
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v1.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v2.json");
     let fixture_content =
-        std::fs::read_to_string(&fixture_path).expect("fixture status_v1.json must exist");
+        std::fs::read_to_string(&fixture_path).expect("fixture status_v2.json must exist");
     let parsed_fixture: serde_json::Value =
         serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
 
     assert_eq!(
         parsed_generated, parsed_fixture,
-        "generated status JSON must match golden status_v1.json fixture"
+        "generated status JSON must match golden status_v2.json fixture"
     );
 
     let parsed_env = validate_status_report_json(&generated_json)
@@ -157,15 +157,15 @@ fn contract_spend_json_matches_golden_fixture() {
         serde_json::from_str(&generated_json).expect("generated spend JSON must parse");
 
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v1.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v2.json");
     let fixture_content =
-        std::fs::read_to_string(&fixture_path).expect("fixture spend_v1.json must exist");
+        std::fs::read_to_string(&fixture_path).expect("fixture spend_v2.json must exist");
     let parsed_fixture: serde_json::Value =
         serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
 
     assert_eq!(
         parsed_generated, parsed_fixture,
-        "generated spend JSON must match golden spend_v1.json fixture"
+        "generated spend JSON must match golden spend_v2.json fixture"
     );
 
     let parsed_env = validate_spend_report_json(&generated_json)
@@ -202,7 +202,7 @@ fn contract_bumping_version_without_schema_update_fails() {
     parsed
         .as_object_mut()
         .unwrap()
-        .insert("schema".to_string(), serde_json::json!(2));
+        .insert("schema".to_string(), serde_json::json!(SCHEMA_VERSION + 1));
 
     let modified_json = serde_json::to_string(&parsed).unwrap();
     let err = validate_envelope_strict(&modified_json)
@@ -210,8 +210,8 @@ fn contract_bumping_version_without_schema_update_fails() {
     assert_eq!(
         err,
         JsonContractError::SchemaVersionMismatch {
-            expected: 1,
-            actual: 2
+            expected: SCHEMA_VERSION,
+            actual: SCHEMA_VERSION + 1
         }
     );
 }

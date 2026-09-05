@@ -24,6 +24,7 @@ use crate::domain::window::{
 };
 use crate::evidence::{Derivation, Provenance};
 use crate::logging::LogicalName;
+use crate::report::activity::ActiveActivityState;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
 pub use crate::store::task_identity::TaskIdentityRow;
@@ -251,6 +252,9 @@ pub struct NowReport {
     pub metadata: ReportMetadata,
     pub accounts: Vec<MeterAccount>,
     pub provenance: ProvenanceGraph,
+    /// Explicit marker-backed live account activity (`aub-mgv.5`), separate from
+    /// the meter readings above: a moving meter never substitutes for it.
+    pub activity: ActiveActivityState,
 }
 
 impl NowReport {
@@ -271,7 +275,17 @@ impl NowReport {
             metadata,
             accounts,
             provenance,
+            activity: ActiveActivityState::NoEvidence,
         }
+    }
+
+    /// Attaches the composed activity state. A report built without evaluating
+    /// any session (no `--session-id` given) keeps the [`NowReport::new`]
+    /// default of [`ActiveActivityState::NoEvidence`], which is the correct
+    /// disposition rather than an omission: nothing was named to claim.
+    pub fn with_activity(mut self, activity: ActiveActivityState) -> Self {
+        self.activity = activity;
+        self
     }
 }
 

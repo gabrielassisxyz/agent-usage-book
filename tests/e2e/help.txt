@@ -97,6 +97,7 @@ now:
   answers: how much quota does each configured account have right now?
   refuses: --model (now reports every window; only status takes a --model selector); --no-color (now prints no color)
   format: text | json
+  options: [--session-id SESSION]
 
 clear-diagnostics:
   answers: how many retained diagnostic bodies were cleared?
