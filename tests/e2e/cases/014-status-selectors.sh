@@ -39,7 +39,7 @@ EOT
     printf '%s\n' "$now" > "$CASE_LOG_DIR/seeded-at-nanos.txt"
 
     {
-        printf '{"schema_version":1,"ledger_generation":12,"accounts":['
+        printf '{"schema_version":2,"ledger_generation":12,"accounts":['
         account_record 1 "work-primary" "$received"
         printf ','
         account_record 2 "research" "$received"
@@ -64,11 +64,11 @@ EOT
 
 account_record() {
     local id="$1" name="$2" received="$3"
-    printf '{"account_id":%s,"logical_name":"%s","provider":"provider-a","last_successful_observation":{"observation_id":7,"provider_observed_at_nanos":%s,"received_at_nanos":%s,"measurement_basis":"provider_observed","windows":[%s,%s,%s]},"latest_attempt":{"attempt_id":9,"request_started_at_nanos":%s,"credential_context_id":"ctx","result":{"completed_at_nanos":%s,"outcome":"success","failure_class":null}}}' \
+    printf '{"account_id":%s,"logical_name":"%s","provider":"provider-a","last_successful_observation":{"observation_id":7,"provider_observed_at_nanos":%s,"received_at_nanos":%s,"measurement_basis":"provider_observed","provider_contract_id":"contract-v1","windows":[%s,%s,%s]},"latest_attempt":{"attempt_id":9,"request_started_at_nanos":%s,"credential_context_id":"ctx","result":{"completed_at_nanos":%s,"outcome":"success","failure_class":null}}}' \
         "$id" "$name" "$received" "$received" \
-        '{"semantic_key":"five_hour","scope_kind":"account_wide","scoped_model":null,"quota_used_ppm":500000,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":0,"nominal_duration_nanos":18000000000000}' \
-        "{\"semantic_key\":\"weekly\",\"scope_kind\":\"model_specific\",\"scoped_model\":\"claude-model-x\",\"quota_used_ppm\":700000,\"reported_resolution_ppm\":10000,\"quantization\":\"exact\",\"resets_at_nanos\":0,\"nominal_duration_nanos\":604800000000000}" \
-        "{\"semantic_key\":\"weekly\",\"scope_kind\":\"model_specific\",\"scoped_model\":\"claude-model-y\",\"quota_used_ppm\":950000,\"reported_resolution_ppm\":10000,\"quantization\":\"exact\",\"resets_at_nanos\":0,\"nominal_duration_nanos\":604800000000000}" \
+        '{"semantic_key":"five_hour","scope_kind":"account_wide","scoped_model":null,"quota_used_ppm":500000,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":0,"nominal_duration_nanos":18000000000000,"is_active":true,"severity":"unknown"}' \
+        "{\"semantic_key\":\"weekly\",\"scope_kind\":\"model_specific\",\"scoped_model\":\"claude-model-x\",\"quota_used_ppm\":700000,\"reported_resolution_ppm\":10000,\"quantization\":\"exact\",\"resets_at_nanos\":0,\"nominal_duration_nanos\":604800000000000,\"is_active\":true,\"severity\":\"unknown\"}" \
+        "{\"semantic_key\":\"weekly\",\"scope_kind\":\"model_specific\",\"scoped_model\":\"claude-model-y\",\"quota_used_ppm\":950000,\"reported_resolution_ppm\":10000,\"quantization\":\"exact\",\"resets_at_nanos\":0,\"nominal_duration_nanos\":604800000000000,\"is_active\":true,\"severity\":\"unknown\"}" \
         "$received" "$received"
 }
 

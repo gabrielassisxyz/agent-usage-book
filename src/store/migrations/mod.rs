@@ -102,6 +102,9 @@ pub(crate) mod migration_0025;
 #[path = "0026_settlement_policy.rs"]
 pub(crate) mod migration_0026;
 
+#[path = "0027_meter_window_provider_facts.rs"]
+pub(crate) mod migration_0027;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -134,5 +137,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0024::migration(),
         migration_0025::migration(),
         migration_0026::migration(),
+        migration_0027::migration(),
     ]
 }

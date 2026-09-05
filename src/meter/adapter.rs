@@ -98,6 +98,49 @@ pub struct MeterRequest {
     pub model: Option<ModelId>,
 }
 
+/// One provider-defined constraint kind an adapter requires in a successful
+/// response. Keeping the kind typed prevents a parser from silently treating
+/// a generic field name as a window identity.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct RequiredWindowKind(String);
+
+impl RequiredWindowKind {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The required provider constraint kinds declared by one adapter.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RequiredWindowKinds(Vec<RequiredWindowKind>);
+
+impl RequiredWindowKinds {
+    pub fn from_values(values: &[&str]) -> Self {
+        Self(
+            values
+                .iter()
+                .map(|value| RequiredWindowKind::new(*value))
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, value: &str) -> bool {
+        self.0.iter().any(|kind| kind.as_str() == value)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &RequiredWindowKind> {
+        self.0.iter()
+    }
+}
+
 /// What an adapter hands back for one observation attempt.
 ///
 /// The failure arms are data, not errors. Every variant here is an outcome
@@ -144,10 +187,12 @@ pub struct AdapterDeclarations {
     pub provider_contract_id: ProviderContractId,
     /// What a reading from this adapter physically means.
     pub meter_semantics_id: MeterSemanticsId,
+    /// Provider constraint kinds that must be present for a measured reading.
+    pub required_window_kinds: RequiredWindowKinds,
 }
 
 impl AdapterDeclarations {
-    pub const fn new(
+    pub fn new(
         measurement_basis: MeasurementBasis,
         provider_contract_id: ProviderContractId,
         meter_semantics_id: MeterSemanticsId,
@@ -156,7 +201,13 @@ impl AdapterDeclarations {
             measurement_basis,
             provider_contract_id,
             meter_semantics_id,
+            required_window_kinds: RequiredWindowKinds::default(),
         }
+    }
+
+    pub fn with_required_window_kinds(mut self, kinds: RequiredWindowKinds) -> Self {
+        self.required_window_kinds = kinds;
+        self
     }
 }
 

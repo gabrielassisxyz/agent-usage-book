@@ -52,6 +52,8 @@ fn window(
         resets_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(nanos(10_800))
             .into(),
         nominal_duration_nanos: NominalWindowDuration::from_nanos(nanos(duration_seconds) as u64),
+        is_active: true,
+        severity: agent_usage_book::domain::window::WindowSeverity::unknown(),
     }
 }
 
@@ -62,6 +64,7 @@ fn success_observation(
     use agent_usage_book::domain::time::MeasurementBasis;
     agent_usage_book::projection::SuccessfulObservation {
         observation_id: agent_usage_book::store::meter_evidence::ObservationRowId::new(7),
+        provider_contract_id: agent_usage_book::domain::ids::ProviderContractId::new("contract-v1"),
         provider_observed_at: Some(
             agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
                 NOW_NANOS - nanos(received_seconds_ago),
@@ -426,11 +429,16 @@ fn not_started_window_renders_no_window_in_progress() {
         quantization: agent_usage_book::domain::window::QuantizationSemantics::Exact,
         resets_at: WindowResetState::NotStarted,
         nominal_duration_nanos: NominalWindowDuration::from_nanos(5 * 3_600 * 1_000_000_000),
+        is_active: false,
+        severity: agent_usage_book::domain::window::WindowSeverity::unknown(),
     };
     let account = account(
         "work-primary",
         Some(agent_usage_book::projection::SuccessfulObservation {
             observation_id: agent_usage_book::store::meter_evidence::ObservationRowId::new(1),
+            provider_contract_id: agent_usage_book::domain::ids::ProviderContractId::new(
+                "contract-v1",
+            ),
             provider_observed_at: None,
             received_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
                 NOW_NANOS - nanos(41),
@@ -478,6 +486,87 @@ fn not_started_window_renders_no_window_in_progress() {
         render(&report),
         "aub work-primary 100% left · no window in progress"
     );
+}
+
+/// A model-scoped weekly limit participates in the normal minimum selection,
+/// and the explain rendering exposes the contract and provider facts that
+/// produced that value.
+#[test]
+fn scoped_weekly_limit_is_the_tightest_status_value_and_is_explainable() {
+    let mut session = window(80_000, None, 5 * 3_600);
+    session.semantic_key = "session".to_string();
+    session.severity = agent_usage_book::domain::window::WindowSeverity::new("normal");
+    let mut weekly_all = window(210_000, None, 7 * 86_400);
+    weekly_all.semantic_key = "weekly_all".to_string();
+    weekly_all.severity = agent_usage_book::domain::window::WindowSeverity::new("warning");
+    let mut scoped = window(240_000, Some("sonnet"), 7 * 86_400);
+    scoped.semantic_key = "weekly_scoped_sonnet".to_string();
+    scoped.severity = agent_usage_book::domain::window::WindowSeverity::new("critical");
+
+    let projected = account(
+        "work-primary",
+        Some(success_observation(
+            vec![session, weekly_all, scoped.clone()],
+            41,
+        )),
+        Some(latest_attempt(
+            42,
+            Some(agent_usage_book::projection::TerminalOutcome {
+                completed_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
+                    NOW_NANOS - nanos(41),
+                ),
+                outcome: agent_usage_book::domain::attempt::AttemptOutcome::Success,
+            }),
+        )),
+    );
+    let (freshness_horizon, command_horizon, skew) = horizon();
+    let clock =
+        FakeClock::new(agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(NOW_NANOS));
+    let reading = account_reading(
+        Some(&projected),
+        Some("sonnet"),
+        freshness_horizon,
+        command_horizon,
+        skew,
+        &clock,
+    );
+    let limit = reading
+        .limiting_window
+        .clone()
+        .expect("a scoped limit is selected");
+    assert_eq!(limit.scope.scoped_model().unwrap().as_str(), "sonnet");
+    let account = reading_for(
+        Some(&projected),
+        reading.freshness,
+        reading.included_scopes,
+        Some(LimitingWindow {
+            scope: limit.scope,
+            nominal_duration: limit.nominal_duration,
+            reset_state: limit.reset_state,
+        }),
+    )
+    .with_meter_explanation(agent_usage_book::report::MeterExplanation {
+        provider_contract_id: agent_usage_book::domain::ids::ProviderContractId::new(
+            "anthropic-oauth-usage-limits-v1",
+        ),
+        windows: vec![agent_usage_book::report::MeterWindowExplanation {
+            semantic_key: scoped.semantic_key,
+            scope: scoped.scope,
+            is_active: scoped.is_active,
+            severity: scoped.severity,
+        }],
+    });
+    let report = report_with(vec![account], ProjectionReadState::Read);
+    assert_eq!(render(&report), "aub work-primary 76% left · 7d");
+
+    let explained = render_status_report_with_explain(
+        &report,
+        clock.now(),
+        ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60)),
+        ExplainMode::Summary,
+    );
+    assert!(explained.contains("provider contract: anthropic-oauth-usage-limits-v1"));
+    assert!(explained.contains("is_active=true, severity=critical"));
 }
 
 /// The window duration labels the fresh line carries, at the ladder's every rung.

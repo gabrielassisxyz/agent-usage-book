@@ -292,6 +292,8 @@ fn make_fixture_bundles(
             quantization: "rounded_to_nearest".into(),
             resets_at_nanos: Some(completed_at.unix_nanos()),
             nominal_duration_nanos: 18_000_000_000_000,
+            is_active: true,
+            severity: "unknown".into(),
         }],
     };
 
@@ -859,6 +861,8 @@ fn pending_bundle_for(
             quantization: "exact".into(),
             resets_at_nanos: Some(started_at.unix_nanos().saturating_add(5_000)),
             nominal_duration_nanos: 18_000_000_000_000,
+            is_active: true,
+            severity: "unknown".into(),
         }],
     }
 }

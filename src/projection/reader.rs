@@ -25,13 +25,14 @@ use super::{
 };
 use crate::domain::attempt::{AttemptId, AttemptOutcome, AttemptResult, AttemptStarted};
 use crate::domain::freshness::{Freshness, FreshnessInput, Observed, compute_freshness};
-use crate::domain::ids::CredentialContextId;
+use crate::domain::ids::{CredentialContextId, ProviderContractId};
 use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining, QuotaUsed};
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, ProviderObservedAt, ReceivedAt, UtcTimestamp,
 };
 use crate::domain::window::{
     ModelId, NominalWindowDuration, ReportedResolution, WindowResetState, WindowScope,
+    WindowSeverity,
 };
 use crate::store::account::AccountId;
 use crate::store::ledger_generation::Generation;
@@ -207,6 +208,9 @@ fn successful_observation_from_document(value: &Value) -> Result<SuccessfulObser
     let basis_code = required_str(object, "measurement_basis")?;
     Ok(SuccessfulObservation {
         observation_id: ObservationRowId::new(required_i64(object, "observation_id")?),
+        provider_contract_id: ProviderContractId::new(
+            required_str(object, "provider_contract_id")?.to_string(),
+        ),
         provider_observed_at: optional_nanos(object, "provider_observed_at_nanos")?,
         received_at: UtcTimestamp::from_unix_nanos(required_i64(object, "received_at_nanos")?),
         measurement_basis: measurement_basis_sql::from_sql(basis_code)
@@ -251,6 +255,11 @@ fn window_from_document(value: &Value) -> Result<ProjectedWindow, String> {
             object,
             "nominal_duration_nanos",
         )?),
+        is_active: object
+            .get("is_active")
+            .and_then(Value::as_bool)
+            .ok_or_else(|| "no provider activity flag".to_string())?,
+        severity: WindowSeverity::new(required_str(object, "severity")?.to_string()),
     })
 }
 
@@ -533,6 +542,8 @@ mod tests {
             quantization: QuantizationSemantics::Exact,
             resets_at: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            is_active: true,
+            severity: WindowSeverity::unknown(),
         }
     }
 
@@ -586,6 +597,7 @@ mod tests {
             provider: "anthropic".to_string(),
             last_successful_observation: Some(SuccessfulObservation {
                 observation_id: ObservationRowId::new(1),
+                provider_contract_id: ProviderContractId::new("contract-v1"),
                 provider_observed_at: Some(UtcTimestamp::from_unix_nanos(1_000)),
                 received_at: UtcTimestamp::from_unix_nanos(1_100),
                 measurement_basis: MeasurementBasis::ProviderObserved,
@@ -636,6 +648,7 @@ mod tests {
             provider: "anthropic".to_string(),
             last_successful_observation: Some(SuccessfulObservation {
                 observation_id: ObservationRowId::new(1),
+                provider_contract_id: ProviderContractId::new("contract-v1"),
                 provider_observed_at: None,
                 received_at: UtcTimestamp::from_unix_nanos(1_000),
                 measurement_basis: MeasurementBasis::ProviderObserved,
@@ -674,6 +687,7 @@ mod tests {
             provider: "anthropic".to_string(),
             last_successful_observation: Some(SuccessfulObservation {
                 observation_id: ObservationRowId::new(1),
+                provider_contract_id: ProviderContractId::new("contract-v1"),
                 provider_observed_at: Some(UtcTimestamp::from_unix_nanos(1_000)),
                 received_at: UtcTimestamp::from_unix_nanos(1_100),
                 measurement_basis: MeasurementBasis::ProviderObserved,
@@ -763,6 +777,7 @@ mod read_tests {
                 provider: "anthropic".to_string(),
                 last_successful_observation: Some(SuccessfulObservation {
                     observation_id: ObservationRowId::new(7),
+                    provider_contract_id: ProviderContractId::new("contract-v1"),
                     provider_observed_at: Some(UtcTimestamp::from_unix_nanos(3_400)),
                     received_at: UtcTimestamp::from_unix_nanos(3_500),
                     measurement_basis: MeasurementBasis::ProviderObserved,
@@ -781,6 +796,8 @@ mod read_tests {
                         nominal_duration_nanos: NominalWindowDuration::from_nanos(
                             18_000_000_000_000,
                         ),
+                        is_active: true,
+                        severity: WindowSeverity::unknown(),
                     }],
                 }),
                 latest_attempt: Some(LatestAttempt {

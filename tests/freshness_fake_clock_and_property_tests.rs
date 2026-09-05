@@ -105,6 +105,8 @@ impl Snapshot {
             quantization: QuantizationSemantics::Exact,
             resets_at: UtcTimestamp::from_unix_nanos(nanos(999_999)).into(),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            is_active: true,
+            severity: agent_usage_book::domain::window::WindowSeverity::unknown(),
         }
     }
 
@@ -116,6 +118,9 @@ impl Snapshot {
             last_successful_observation: self.last_good_used_ppm.map(|used_ppm| {
                 SuccessfulObservation {
                     observation_id: ObservationRowId::new(1),
+                    provider_contract_id: agent_usage_book::domain::ids::ProviderContractId::new(
+                        "contract-v1",
+                    ),
                     provider_observed_at: self
                         .provider_observed_at_nanos
                         .map(UtcTimestamp::from_unix_nanos),

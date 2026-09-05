@@ -158,7 +158,50 @@ pub fn render_status_report_with_explain(
         return line;
     }
     let lines = meter_account_lines(&report.accounts, now, envelope);
-    join_report_with_explain(lines, &report.provenance, explain)
+    let mut rendered = join_report_with_explain(lines, &report.provenance, explain);
+    if explain != ExplainMode::Off {
+        let meter_explain = render_meter_explain(&report.accounts);
+        if !meter_explain.is_empty() {
+            if !rendered.is_empty() {
+                rendered.push_str("\n\n");
+            }
+            rendered.push_str(&meter_explain);
+        }
+    }
+    rendered
+}
+
+/// Renders provider contract and raw window facts retained by the meter
+/// projection. The ordinary status value remains derived from all applicable
+/// windows; these lines make the provider's inputs auditable without changing
+/// that selection rule.
+fn render_meter_explain(accounts: &[crate::report::MeterAccount]) -> String {
+    let mut lines = Vec::new();
+    for account in accounts {
+        let Some(explanation) = &account.meter_explanation else {
+            continue;
+        };
+        lines.push(format!("meter account: {}", account.account.as_str()));
+        lines.push(format!(
+            "  provider contract: {}",
+            explanation.provider_contract_id.as_str()
+        ));
+        for window in &explanation.windows {
+            lines.push(format!(
+                "  window {}: is_active={}, severity={}",
+                window.semantic_key,
+                window.is_active,
+                window.severity.as_str()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut rendered = vec!["meter explain:".to_string()];
+        rendered.extend(lines.into_iter().map(|line| format!("  {line}")));
+        rendered.join("\n")
+    }
 }
 
 /// Renders a now live report.

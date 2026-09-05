@@ -2762,19 +2762,39 @@ fn projection_accounts(
                 status_clock_skew_envelope(),
                 clock,
             );
-            MeterAccount::from_projection(
-                LogicalName::new(account.name.clone()),
-                reading.freshness,
-                reading
-                    .limiting_window
-                    .map(|limit| crate::report::LimitingWindow {
-                        scope: limit.scope,
-                        nominal_duration: limit.nominal_duration,
-                        reset_state: limit.reset_state,
-                    }),
-                reading.included_scopes,
-                model_selector.map(crate::domain::window::ModelId::new),
-            )
+            {
+                let account = MeterAccount::from_projection(
+                    LogicalName::new(account.name.clone()),
+                    reading.freshness,
+                    reading
+                        .limiting_window
+                        .map(|limit| crate::report::LimitingWindow {
+                            scope: limit.scope,
+                            nominal_duration: limit.nominal_duration,
+                            reset_state: limit.reset_state,
+                        }),
+                    reading.included_scopes,
+                    model_selector.map(crate::domain::window::ModelId::new),
+                );
+                match projected.and_then(|account| account.last_successful_observation.as_ref()) {
+                    Some(success) => {
+                        account.with_meter_explanation(crate::report::MeterExplanation {
+                            provider_contract_id: success.provider_contract_id.clone(),
+                            windows: success
+                                .windows
+                                .iter()
+                                .map(|window| crate::report::MeterWindowExplanation {
+                                    semantic_key: window.semantic_key.clone(),
+                                    scope: window.scope.clone(),
+                                    is_active: window.is_active,
+                                    severity: window.severity.clone(),
+                                })
+                                .collect(),
+                        })
+                    }
+                    None => account,
+                }
+            }
         })
         .collect()
 }

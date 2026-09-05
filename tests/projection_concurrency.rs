@@ -511,7 +511,7 @@ fn status_opens_no_sqlite_connection_during_concurrent_projection_replacement() 
     let projection_path = state_dir.path().join("projection");
     let now_nanos = RealClock::new().now().unix_nanos();
     let initial_doc = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "ledger_generation": 1,
         "accounts": [{
             "account_id": 1,
@@ -522,6 +522,7 @@ fn status_opens_no_sqlite_connection_during_concurrent_projection_replacement() 
                 "provider_observed_at_nanos": now_nanos - 30_000_000_000i64,
                 "received_at_nanos": now_nanos - 30_000_000_000i64,
                 "measurement_basis": "provider_observed",
+                "provider_contract_id": "contract-v1",
                 "windows": [{
                     "semantic_key": "five_hour",
                     "scope_kind": "account_wide",
@@ -530,7 +531,9 @@ fn status_opens_no_sqlite_connection_during_concurrent_projection_replacement() 
                     "reported_resolution_ppm": 10_000,
                     "quantization": "rounded_to_nearest",
                     "resets_at_nanos": now_nanos + 18_000_000_000_000i64,
-                    "nominal_duration_nanos": 18_000_000_000_000u64
+                    "nominal_duration_nanos": 18_000_000_000_000u64,
+                    "is_active": true,
+                    "severity": "unknown"
                 }]
             },
             "latest_attempt": {
@@ -886,7 +889,7 @@ fn property_over_randomized_interleavings_every_projection_read_parses_successfu
             // Seed initial valid projection
             let make_json = |generation_num: u64| {
                 serde_json::json!({
-                    "schema_version": 1,
+                    "schema_version": 2,
                     "ledger_generation": generation_num,
                     "accounts": [{
                         "account_id": 1,
@@ -897,6 +900,7 @@ fn property_over_randomized_interleavings_every_projection_read_parses_successfu
                             "provider_observed_at_nanos": 1_000_000_000i64 + generation_num as i64,
                             "received_at_nanos": 1_000_000_000i64 + generation_num as i64,
                             "measurement_basis": "provider_observed",
+                            "provider_contract_id": "contract-v1",
                             "windows": [{
                                 "semantic_key": "five_hour",
                                 "scope_kind": "account_wide",
@@ -905,7 +909,9 @@ fn property_over_randomized_interleavings_every_projection_read_parses_successfu
                                 "reported_resolution_ppm": 10_000,
                                 "quantization": "rounded_to_nearest",
                                 "resets_at_nanos": 1_000_000_000i64 + generation_num as i64,
-                                "nominal_duration_nanos": 18_000_000_000_000u64
+                                "nominal_duration_nanos": 18_000_000_000_000u64,
+                                "is_active": true,
+                                "severity": "unknown"
                             }]
                         },
                         "latest_attempt": {
