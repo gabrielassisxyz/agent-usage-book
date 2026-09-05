@@ -8,7 +8,7 @@ use crate::error::Error;
 use crate::store::migrate::Migration;
 
 /// The schema version this step produces.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 26;
 
 const ADD_SETTLEMENT_POLICY_COLUMNS: &str = "\
 ALTER TABLE calibration_experiment ADD COLUMN settlement_policy_version TEXT NOT NULL DEFAULT 'settled-boundary-v1' CHECK (length(settlement_policy_version) > 0);\
