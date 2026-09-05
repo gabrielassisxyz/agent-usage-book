@@ -247,8 +247,12 @@ fn read_candidate_groups(
     Ok(groups)
 }
 
+/// `pub(crate)`: also the seeding path `aub-cab.4`'s can-run task-history
+/// tests use for a resolved task kind, since no CLI command resolves task
+/// identity yet (`rebuild_task_identities` is the only other writer, and it
+/// insists on real tracker candidate evidence this fixture has none of).
 #[cfg(test)]
-fn insert_identity(
+pub(crate) fn insert_identity(
     connection: &rusqlite::Connection,
     task_source: &str,
     task_native: &str,

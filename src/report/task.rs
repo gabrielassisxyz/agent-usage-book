@@ -183,7 +183,12 @@ pub fn assemble_task_overhead(
     ))
 }
 
-fn all_canonical_events(conn: &rusqlite::Connection) -> Result<Vec<CanonicalSpendEvent>, Error> {
+/// `pub(crate)`: also the entry point `aub-cab.4`'s can-run task-history
+/// gathering uses to enumerate every completed task's usage, rather than
+/// opening a second `canonical_events` scan of its own.
+pub(crate) fn all_canonical_events(
+    conn: &rusqlite::Connection,
+) -> Result<Vec<CanonicalSpendEvent>, Error> {
     crate::store::spend::canonical_events(
         conn,
         UtcTimestamp::from_unix_nanos(0),
@@ -194,7 +199,11 @@ fn all_canonical_events(conn: &rusqlite::Connection) -> Result<Vec<CanonicalSpen
 /// Attributes every event to its target, keyed by the event's own
 /// `canonical_id`, calling the shared segmentation wiring exactly once per
 /// assembly rather than once per task or per bucket.
-fn attribute_all(
+///
+/// `pub(crate)`: shared with `aub-cab.4`'s can-run task-history gathering,
+/// for the same reason `all_canonical_events` is: one segmentation pass over
+/// the whole ledger, not one per task.
+pub(crate) fn attribute_all(
     conn: &rusqlite::Connection,
     events: &[CanonicalSpendEvent],
 ) -> Result<BTreeMap<String, SegmentTarget>, Error> {
@@ -214,7 +223,10 @@ fn attribute_all(
         .collect())
 }
 
-fn known_vector(event: &CanonicalSpendEvent) -> crate::domain::tokens::KnownTokenVector {
+/// `pub(crate)`: shared with `aub-cab.4`'s can-run task-history gathering,
+/// which needs the same per-event known-token extraction to build the account
+/// segmentation input for each task's own attributed events.
+pub(crate) fn known_vector(event: &CanonicalSpendEvent) -> crate::domain::tokens::KnownTokenVector {
     use crate::domain::tokens::{
         CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
     };

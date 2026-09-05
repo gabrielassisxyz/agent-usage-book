@@ -85,6 +85,8 @@ aub_command_enum! {
     Drill,
     Task,
     Compare,
+    CalibrationFixture,
+    CanRun,
     Calibrate,
 }
 
@@ -114,7 +116,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 24] = [
+    pub const ALL: [Self; 26] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -138,6 +140,8 @@ impl Command {
         Self::Drill,
         Self::Task,
         Self::Compare,
+        Self::CalibrationFixture,
+        Self::CanRun,
         Self::Calibrate,
     ];
 
@@ -527,6 +531,36 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::CalibrationFixture => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "calibration-fixture drives the store, not a report",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "calibration-fixture derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "calibration-fixture names its own scope",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "calibration-fixture names its own scope",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "calibration-fixture prints a plain activation line",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
+            Command::CanRun => FlagPolicy {
+                format: FlagSupport::Accepted,
+                explain: FlagSupport::Accepted,
+                account: FlagSupport::Accepted,
+                model: FlagSupport::Rejected {
+                    reason: "can-run names the proposed model with --task-model; --model is status's own reporting-scope selector",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "can-run prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
             Command::Calibrate => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Rejected {
@@ -571,6 +605,8 @@ impl Command {
             Command::Drill => "drill",
             Command::Task => "task",
             Command::Compare => "compare",
+            Command::CalibrationFixture => "__calibration-fixture",
+            Command::CanRun => "can-run",
             Command::Calibrate => "calibrate",
         }
     }
@@ -626,6 +662,10 @@ impl Command {
             Command::Compare => Some(
                 "record and inspect adapter-semantics comparisons against the provider's authoritative surface",
             ),
+            Command::CalibrationFixture => None,
+            Command::CanRun => Some(
+                "compare calibrated credit headroom against historical task cost, refusing rather than guessing when evidence is missing",
+            ),
             Command::Calibrate => Some(
                 "record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence",
             ),
@@ -675,6 +715,9 @@ impl Command {
             Command::Compare => Some(
                 "does the adapter's stored reading of one window agree with what the provider's own authoritative surface showed for it?",
             ),
+            Command::CanRun => Some(
+                "given a fresh or cached calibrated credit headroom and the historical cost of this task kind, can the proposed task run now?",
+            ),
             Command::Calibrate => Some(
                 "what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?",
             ),
@@ -682,6 +725,7 @@ impl Command {
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
             Command::CostModelFixture => None,
+            Command::CalibrationFixture => None,
         }
     }
 
@@ -752,6 +796,9 @@ impl Command {
                 "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
+            Command::CanRun => {
+                Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
+            }
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -759,6 +806,7 @@ impl Command {
             | Command::AttemptCrashHook
             | Command::ProjectionCrashHook
             | Command::CostModelFixture
+            | Command::CalibrationFixture
             | Command::RateCard => None,
         }
     }
@@ -1068,6 +1116,8 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Drill => drill_command(&RealClock::new(), &invocation),
         Command::Task => task_command(&RealClock::new(), level, &invocation),
         Command::Compare => compare_command(&RealClock::new(), &invocation),
+        Command::CalibrationFixture => calibration_fixture_command(&RealClock::new(), &invocation),
+        Command::CanRun => can_run_command(&RealClock::new(), level, &invocation),
         Command::Calibrate => calibrate_command(&RealClock::new(), &invocation),
     }
 }
@@ -3403,6 +3453,107 @@ fn cost_model_fixture(clock: &impl Clock, invocation: &Invocation) -> Result<(),
     Ok(())
 }
 
+/// `__calibration-fixture WINDOW_KEY FITTED_MICROS_PER_POINT [--plan-tier TIER]
+/// [--provider NAME]`: seeds a minimal but fully valid, immediately current
+/// window calibration through the real experiment/result/activation chain
+/// (`aub-cab.4`), so an end-to-end case can give `aub can-run` an applicable
+/// calibration without hand-writing SQL against a schema this file does not
+/// own. `--plan-tier` defaults to `default`, the plan tier every real
+/// observation resolves to today (no adapter populates `observed_tier` or
+/// `observed_plan` yet), so a case that seeds no override matches what a
+/// live sample actually reports.
+fn calibration_fixture_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let window_key = invocation.rest.first().ok_or_else(|| {
+        Error::Usage("__calibration-fixture requires WINDOW_KEY FITTED_MICROS_PER_POINT".into())
+    })?;
+    let fitted_raw = invocation.rest.get(1).ok_or_else(|| {
+        Error::Usage("__calibration-fixture requires WINDOW_KEY FITTED_MICROS_PER_POINT".into())
+    })?;
+    let fitted_micros: i64 = fitted_raw.parse().map_err(|_| {
+        Error::Usage(format!(
+            "__calibration-fixture: '{fitted_raw}' is not an integer"
+        ))
+    })?;
+
+    let mut plan_tier = "default".to_string();
+    let mut provider = "anthropic".to_string();
+    let mut args = invocation.rest[2..].iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--plan-tier" => {
+                plan_tier = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--plan-tier requires a value".into()))?
+                    .clone();
+            }
+            "--provider" => {
+                provider = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--provider requires a value".into()))?
+                    .clone();
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "unknown argument: {other}; run __calibration-fixture WINDOW_KEY FITTED_MICROS_PER_POINT [--plan-tier TIER] [--provider NAME]"
+                )));
+            }
+        }
+    }
+
+    let timestamp = clock.now();
+    let scope = crate::store::calibration::CalibrationScope {
+        provider: crate::store::cost_model::ProviderKey::new(&provider),
+        plan_tier: crate::store::calibration::PlanTier::new(&plan_tier),
+        window_semantic_key: crate::domain::window::WindowSemanticKey::new(window_key.as_str()),
+    };
+    let meter_semantics_id = crate::domain::ids::MeterSemanticsId::new("fixture-meter-v1");
+    let billing_semantics_id = crate::domain::ids::BillingSemanticsId::new("fixture-billing-v1");
+    let cost_model_id = crate::domain::provenance::CostModelId::new("fixture-cost-model");
+    let fitted =
+        crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(fitted_micros);
+    let validity = crate::store::cost_model::ValidityInterval::new(
+        UtcTimestamp::from_unix_nanos(0),
+        UtcTimestamp::from_unix_nanos(i64::MAX),
+    )?;
+
+    let mut conn = open_ledger(clock)?;
+    let experiment_id = format!("{window_key}-fixture-experiment");
+    let experiment = crate::store::calibration::minimal_experiment(
+        &experiment_id,
+        &scope,
+        &meter_semantics_id,
+        &billing_semantics_id,
+        validity,
+        timestamp,
+    );
+    crate::store::calibration::insert_experiment(&conn, &experiment)?;
+
+    let calibration_id = format!("{window_key}-fixture-calibration");
+    let calibration = crate::store::calibration::minimal_fixture(
+        &calibration_id,
+        &scope,
+        &meter_semantics_id,
+        &billing_semantics_id,
+        &cost_model_id,
+        fitted,
+        validity,
+        timestamp,
+    );
+    crate::store::calibration::insert_result(
+        &mut conn,
+        &calibration,
+        &[crate::store::calibration::ExperimentId::new(&experiment_id)],
+    )?;
+    crate::store::calibration::activate(
+        &mut conn,
+        &crate::domain::provenance::WindowCalibrationId::new(&calibration_id),
+        timestamp,
+        None,
+    )?;
+    println!("calibration {calibration_id} active for window {window_key}");
+    Ok(())
+}
+
 /// Carries the store's clearing result across the presentation boundary as a report model,
 /// which is the only shape a renderer is allowed to see.
 fn clear_diagnostics_report(
@@ -4242,6 +4393,537 @@ fn compare_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
         other => Err(Error::Usage(format!(
             "compare requires a subcommand (record | uncompared), got {other:?}"
         ))),
+    }
+}
+
+/// `aub can-run --task-kind TYPE --account NAME --model MODEL [--cached]`
+/// (`aub-cab.4`): joins a fresh (default) or cached persisted meter sample,
+/// each constraining window's calibration health, the active cost model's
+/// token-class coverage and the historical distribution for `TYPE` into one
+/// advisory, refusing a quantitative answer and naming every missing
+/// prerequisite when any of the seven conditions PLAN.md 26.6 names is not
+/// met. A refusal is a normal, successful outcome: this function returns
+/// `Err` only for a usage or store failure, never for a refused advisory.
+fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("can-run");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let mut task_kind_raw: Option<String> = None;
+    let mut model_raw: Option<String> = None;
+    let mut cached = false;
+    let mut args = invocation.rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--task-kind" => {
+                task_kind_raw = Some(
+                    args.next()
+                        .ok_or_else(|| Error::Usage("--task-kind requires a value".into()))?
+                        .clone(),
+                );
+            }
+            other if other.starts_with("--task-kind=") => {
+                let val = other.strip_prefix("--task-kind=").unwrap();
+                if val.is_empty() {
+                    return Err(Error::Usage("--task-kind requires a value".into()));
+                }
+                task_kind_raw = Some(val.to_string());
+            }
+            // Not the shared `--model` flag: that one is status's own
+            // reporting-scope selector and every other command's policy
+            // rejects it outright, before the argument surface even reaches
+            // here. The proposed model this advisory evaluates has its own
+            // name so the two never collide.
+            "--task-model" => {
+                model_raw = Some(
+                    args.next()
+                        .ok_or_else(|| Error::Usage("--task-model requires a value".into()))?
+                        .clone(),
+                );
+            }
+            other if other.starts_with("--task-model=") => {
+                let val = other.strip_prefix("--task-model=").unwrap();
+                if val.is_empty() {
+                    return Err(Error::Usage("--task-model requires a value".into()));
+                }
+                model_raw = Some(val.to_string());
+            }
+            "--cached" => cached = true,
+            other => {
+                return Err(Error::Usage(format!(
+                    "unknown argument: {other}; run aub can-run --help for options"
+                )));
+            }
+        }
+    }
+
+    let task_kind_raw =
+        task_kind_raw.ok_or_else(|| Error::Usage("can-run requires --task-kind TYPE".into()))?;
+    let task_kind = crate::attribution::TaskKind::parse(&task_kind_raw)
+        .ok_or_else(|| Error::Usage(format!("unknown task kind '{task_kind_raw}'")))?;
+    let account_name = invocation
+        .account
+        .as_deref()
+        .ok_or_else(|| Error::Usage("can-run requires --account NAME".into()))?;
+    let model_raw =
+        model_raw.ok_or_else(|| Error::Usage("can-run requires --task-model MODEL".into()))?;
+    let model = crate::domain::window::ModelId::new(&model_raw);
+
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+
+    let account_config = config
+        .accounts
+        .iter()
+        .find(|acc| acc.name == account_name)
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "unknown account '{account_name}': can-run --account names a configured account"
+            ))
+        })?;
+
+    crate::store::startup::ensure_state_dir_ready(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+    )?;
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let busy_policy = sample_busy_policy(&config);
+    let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
+    crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
+
+    if !cached {
+        // Default: perform and persist one fresh meter sample for the
+        // requested account first, the same sampler path `aub sample
+        // --account` uses, before reading anything back.
+        let repo = crate::store::repository::Repository::new(&db_path, busy_policy);
+        let resolved = crate::auth::resolve(
+            account_config,
+            &crate::auth::RealFs,
+            invocation.verbosity > 0,
+        )?;
+        let credential_handle =
+            crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
+        let credential_context_id = Some(resolved.context_id.as_str().to_string());
+        let resolved_policy = crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
+            ordinary_cadence: config.sampling.default_interval,
+            freshness_horizon: config.freshness.meter,
+            reset_edge_policy: format!(
+                "lead-{}s",
+                config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
+            ),
+            retry_backoff_policy: "none".to_string(),
+            command_budget: config.sampling.command_budget,
+            policy_algorithm_version: "v1".to_string(),
+        };
+        let adapter = if account_config.provider == "anthropic" {
+            let endpoint = std::env::var("AUB_ANTHROPIC_ENDPOINT").unwrap_or_else(|_| {
+                crate::meter::anthropic::AnthropicAdapter::DEFAULT_ENDPOINT.to_string()
+            });
+            crate::meter::anthropic::AnthropicAdapter::with_endpoint(endpoint)
+        } else {
+            return Err(Error::Usage(format!(
+                "unsupported provider '{}' for account '{}' (supported: anthropic)",
+                account_config.provider, account_config.name
+            )));
+        };
+        let batch_accounts = vec![crate::meter::sampler::BatchAccount {
+            name: crate::store::sampling_lease::AccountName::new(&account_config.name),
+            provider_key: account_config.provider.clone(),
+            adapter,
+            credential: credential_handle,
+            credential_context_id,
+            request: crate::meter::adapter::MeterRequest::default(),
+            policy: resolved_policy,
+            reset_edge_lead: config.sampling.reset_edge_lead,
+            forced: true,
+            adapter_version: crate::domain::ids::AdapterVersion::new(
+                crate::build_info::crate_version(),
+            ),
+        }];
+        let orchestrator = crate::meter::sampler::SamplingOrchestrator {
+            repository: &repo,
+            transport: crate::meter::transport::BlockingTransport,
+            clock: crate::domain::time::RealClock::new(),
+            trigger: crate::store::sample_run::Trigger::Live,
+            configuration_fingerprint: "aub-v1".to_string(),
+            holder: crate::store::sampling_lease::LeaseHolder::new(format!(
+                "pid-{}",
+                std::process::id()
+            )),
+            lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
+            command_budget: config.sampling.command_budget,
+            max_concurrent_requests: config.sampling.max_concurrent_requests,
+        };
+        let batch_report = orchestrator.run(&batch_accounts)?;
+        sampling_disposition_error(&batch_report.accounts)?;
+    }
+
+    let projection_path = crate::projection::projection_path_in(&config.state.dir);
+    let projection = match crate::projection::reader::read_projection(&projection_path) {
+        crate::projection::reader::ProjectionRead::Available(projection) => projection,
+        crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
+            return Err(Error::Store(format!(
+                "no projection could be read: {}",
+                unavailable.reason()
+            )));
+        }
+    };
+    let projected_account = projection
+        .accounts
+        .iter()
+        .find(|acc| acc.logical_name == account_config.name);
+
+    let meter = gather_meter_readiness(projected_account, &config, clock);
+
+    // The account plan tier a live observation resolves to: no adapter in
+    // this codebase populates `observed_tier`/`observed_plan` yet (verified:
+    // every real caller carries the literal `"default"` fallback
+    // `crate::store::reconciliation` already reads through), so a calibration
+    // seeded under any other plan tier can never be found for a live
+    // account. `can-run` uses the same literal rather than querying a field
+    // that is always absent, and updates this the day an adapter starts
+    // reporting one.
+    let plan_tier = "default";
+
+    let window_calibrations = match &meter {
+        crate::report::can_run::CanRunMeterReadiness::Fresh { windows, .. } => {
+            gather_window_calibrations(
+                &conn,
+                windows,
+                &model,
+                plan_tier,
+                &account_config.provider,
+                timestamp,
+            )?
+        }
+        crate::report::can_run::CanRunMeterReadiness::Stale { .. }
+        | crate::report::can_run::CanRunMeterReadiness::AuthRequired => {
+            std::collections::BTreeMap::new()
+        }
+    };
+
+    let cost_model_missing_token_classes =
+        gather_cost_model_missing_token_classes(&conn, timestamp)?;
+
+    // The selection period is the full known history: no configuration key
+    // bounds it anywhere in this codebase (`crate::report::can_run_evidence`
+    // records the same finding for its own caller). A narrower configured
+    // window is a later, separate decision.
+    let period = crate::advice::historical_distribution::SelectionPeriod {
+        start: UtcTimestamp::from_unix_nanos(0),
+        end: timestamp,
+    };
+    let group_report = crate::report::gather_task_history_group_report(
+        &conn,
+        task_kind,
+        period,
+        timestamp,
+        &config.task_distribution,
+    )?;
+
+    let inputs = crate::report::can_run::CanRunJoinInputs {
+        metadata: crate::report::ReportMetadata::new(
+            timestamp,
+            timestamp,
+            crate::report::LedgerGeneration::new(projection.ledger_generation.value()),
+            None,
+        ),
+        task_kind: task_kind_raw.clone(),
+        account: account_config.name.clone(),
+        model,
+        meter,
+        window_calibrations,
+        cost_model_missing_token_classes,
+        // A plan-tier mismatch is realized through the calibration-health
+        // path above (`load_active_at` finds nothing for a tier nobody
+        // fitted), the only real signal this store computes for it; there is
+        // no independent plan-tier registry to check separately yet.
+        plan_tier_mismatch: None,
+        task: crate::advice::verdict::TaskReferenceInput {
+            verdict: group_report.verdict,
+            sample_count: group_report.sample_count,
+        },
+        attribution: group_report.attribution,
+        attribution_exclusions: group_report.exclusions,
+        attribution_selection_window: format!(
+            "{}..{}",
+            period.start.utc_date().iso(),
+            period.end.utc_date().iso()
+        ),
+        attribution_group: task_kind_raw,
+        ample_margin_multiple: config.can_run.ample_margin_multiple,
+        headroom_bound: config.can_run.headroom_bound,
+        // No per-field provenance graph is assembled in this first wiring:
+        // every quantity here already travels with its own typed evidence
+        // (a calibration id, a cost-model id, an exclusion count), and a
+        // provenance node per field is a later, separate decision rather
+        // than a silently skipped one.
+        provenance: crate::report::ProvenanceGraph::default(),
+    };
+    let report = crate::report::can_run::compose_can_run_report(inputs);
+
+    match invocation.format {
+        OutputFormat::Text => {
+            println!(
+                "{}",
+                crate::presentation::render::render_can_run_report(&report)
+            )
+        }
+        OutputFormat::Json => println!(
+            "{}",
+            crate::presentation::json::can_run_json_with_explain(&report, run, invocation.explain)
+        ),
+    }
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::ReportRendered,
+            &[("report_kind", &LogicalName::new("can-run"))],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    Ok(())
+}
+
+/// Converts every provider-reported window constraining `model` into a
+/// [`CanRunMeterReadiness`]-ready calibration lookup: `load_active_at`
+/// against the window's own scope, and the shared health decision
+/// (`crate::calibration::health`) over whatever it finds. Absent entirely
+/// from the returned map means no calibration record exists for that window
+/// at all.
+fn gather_window_calibrations(
+    conn: &rusqlite::Connection,
+    windows: &[crate::domain::window::MeterWindow],
+    model: &crate::domain::window::ModelId,
+    plan_tier: &str,
+    provider: &str,
+    generated_at: UtcTimestamp,
+) -> Result<
+    std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::report::can_run::WindowCalibrationLookup,
+    >,
+    Error,
+> {
+    let mut result = std::collections::BTreeMap::new();
+    for window in windows.iter().filter(|w| w.constrains(model)) {
+        let scope = crate::store::calibration::CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new(provider),
+            plan_tier: crate::store::calibration::PlanTier::new(plan_tier),
+            window_semantic_key: window.semantic_key().clone(),
+        };
+        let Some(cal) = crate::store::calibration::load_active_at(conn, &scope, generated_at)?
+        else {
+            continue;
+        };
+        // The applicability context mirrors the calibration's own scope
+        // rather than an independently tracked lifecycle: no caller anywhere
+        // in this codebase queries `calibration_lifecycle` for drift
+        // findings or a review horizon yet (`crate::store::reconciliation`
+        // makes the same simplification, `LifecycleState::Active` and no
+        // drift, for the same reason). A genuine plan-tier or semantics
+        // mismatch still surfaces correctly through `load_active_at` itself
+        // returning nothing for a tier nobody fitted.
+        let facts = crate::calibration::health::CalibrationFacts {
+            plan_tier: cal.plan_tier().clone(),
+            meter_semantics_id: cal.meter_semantics_id().clone(),
+            billing_semantics_id: cal.billing_semantics_id().clone(),
+        };
+        let context = crate::calibration::health::ApplicabilityContext {
+            plan_tier: cal.plan_tier().clone(),
+            meter_semantics_id: cal.meter_semantics_id().clone(),
+            billing_semantics_id: cal.billing_semantics_id().clone(),
+        };
+        let health_inputs = crate::calibration::health::HealthInputs {
+            calibration: &facts,
+            context: &context,
+            lifecycle: crate::calibration::health::LifecycleState::Active,
+            cost_model_superseded: false,
+            drift: None,
+            review_due_at: None,
+        };
+        let health = crate::calibration::health::compute_health(&health_inputs, generated_at);
+        let constraint = crate::advice::headroom::CalibratedWindowConstraint::new(
+            cal.uncertainty(),
+            map_calibration_health(health),
+        );
+        result.insert(
+            window.semantic_key().clone(),
+            crate::report::can_run::WindowCalibrationLookup {
+                calibration_id: cal.id().as_str().to_string(),
+                constraint,
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// Maps the calibration-fitting subsystem's own
+/// [`CalibrationHealth`](crate::calibration::health::CalibrationHealth) onto
+/// [`crate::advice::headroom::CalibrationHealth`], the copy the advice layer
+/// carries because `crate::advice::headroom` may not depend on
+/// `crate::calibration` (see that module's own boundary comment). The two
+/// enums name the same six states in the same order; this is the one place
+/// this crate is allowed to know that.
+fn map_calibration_health(
+    health: crate::calibration::health::CalibrationHealth,
+) -> crate::advice::headroom::CalibrationHealth {
+    use crate::advice::headroom::CalibrationHealth as Advice;
+    use crate::calibration::health::CalibrationHealth as Fitting;
+    match health {
+        Fitting::Provisional => Advice::Provisional,
+        Fitting::Current => Advice::Current,
+        Fitting::ReviewDue => Advice::ReviewDue,
+        Fitting::Suspect => Advice::Suspect,
+        Fitting::Superseded => Advice::Superseded,
+        Fitting::Inapplicable => Advice::Inapplicable,
+    }
+}
+
+/// Every [`TokenKind`](crate::domain::tokens::TokenKind) the active cost
+/// model carries no term for, by its stable label. All four when no cost
+/// model is active at all: the maximal case of the same problem.
+fn gather_cost_model_missing_token_classes(
+    conn: &rusqlite::Connection,
+    generated_at: UtcTimestamp,
+) -> Result<Vec<String>, Error> {
+    match crate::store::cost_model::load_active_at(conn, generated_at)? {
+        Some(model) => Ok(crate::domain::tokens::TokenKind::ALL
+            .into_iter()
+            .filter(|kind| !model.terms().iter().any(|term| term.token_kind() == *kind))
+            .map(|kind| kind.label().to_string())
+            .collect()),
+        None => Ok(crate::domain::tokens::TokenKind::ALL
+            .into_iter()
+            .map(|kind| kind.label().to_string())
+            .collect()),
+    }
+}
+
+/// The meter readiness `aub-cab.4`'s join needs, computed the same way
+/// `status`/`now` compute per-account freshness
+/// (`crate::projection::reader::account_reading`), but over `()` rather than
+/// a single reduced `QuotaRemaining`: can-run needs the full constraining
+/// window list, not one window's remaining fraction, so the freshness
+/// decision and the window extraction are kept apart here.
+fn gather_meter_readiness(
+    projected: Option<&crate::projection::ProjectedAccount>,
+    config: &crate::config::Config,
+    clock: &impl Clock,
+) -> crate::report::can_run::CanRunMeterReadiness {
+    let credential_context = crate::domain::ids::CredentialContextId::new(
+        projected
+            .and_then(|account| account.latest_attempt.as_ref())
+            .and_then(|attempt| attempt.credential_context_id.clone())
+            .unwrap_or_else(|| "no-recorded-credential-context".to_string()),
+    );
+    let last_good = projected
+        .and_then(|account| account.last_successful_observation.as_ref())
+        .map(|success| {
+            crate::domain::freshness::Observed::new(
+                (),
+                success
+                    .provider_observed_at
+                    .map(crate::domain::time::ProviderObservedAt::new),
+                crate::domain::time::ReceivedAt::new(success.received_at),
+                success.measurement_basis,
+            )
+        });
+    let latest = projected
+        .and_then(|account| account.latest_attempt.as_ref())
+        .map(|attempt| {
+            let result = attempt.result.as_ref().map(|terminal| {
+                let started_nanos = attempt.request_started_at.unix_nanos();
+                let finished_nanos = terminal.completed_at.unix_nanos();
+                let elapsed_nanos = (finished_nanos - started_nanos).max(0) as u64;
+                crate::domain::attempt::AttemptResult::new(
+                    attempt.attempt_id,
+                    terminal.completed_at,
+                    MonotonicDuration::from_nanos(elapsed_nanos),
+                    terminal.outcome,
+                )
+            });
+            crate::domain::freshness::LatestAttempt::new(
+                crate::domain::attempt::AttemptStarted::new(
+                    attempt.attempt_id,
+                    attempt.request_started_at,
+                ),
+                result,
+                &credential_context,
+            )
+        });
+    let input = crate::domain::freshness::FreshnessInput::new(
+        last_good,
+        None,
+        latest,
+        None,
+        None,
+        config.freshness.meter,
+        config.sampling.command_budget,
+        status_clock_skew_envelope(),
+    );
+    let freshness = crate::domain::freshness::compute_freshness::<()>(&input, clock);
+    match freshness {
+        crate::domain::freshness::Freshness::Fresh { .. } => {
+            let success = projected
+                .and_then(|account| account.last_successful_observation.as_ref())
+                .expect("Fresh freshness is only computed from a successful observation");
+            let observed_age = crate::domain::time::age(
+                success
+                    .provider_observed_at
+                    .map(crate::domain::time::ProviderObservedAt::new),
+                crate::domain::time::ReceivedAt::new(success.received_at),
+                success.measurement_basis,
+                clock.now(),
+                status_clock_skew_envelope(),
+            )
+            .ok()
+            .map(|age| MonotonicDuration::from_nanos(age.as_nanos()));
+            let windows = success
+                .windows
+                .iter()
+                .map(|window| {
+                    crate::domain::window::MeterWindow::new_with_facts(
+                        crate::domain::window::WindowSemanticKey::new(window.semantic_key.clone()),
+                        window.scope.clone(),
+                        window.quota_used_ppm,
+                        window.reported_resolution_ppm,
+                        window.quantization,
+                        window.resets_at,
+                        window.nominal_duration_nanos,
+                        window.is_active,
+                        window.severity.clone(),
+                    )
+                })
+                .collect();
+            crate::report::can_run::CanRunMeterReadiness::Fresh {
+                windows,
+                observed_age,
+            }
+        }
+        crate::domain::freshness::Freshness::Stale { reason, .. } => {
+            crate::report::can_run::CanRunMeterReadiness::Stale { reason }
+        }
+        crate::domain::freshness::Freshness::AuthRequired { .. } => {
+            crate::report::can_run::CanRunMeterReadiness::AuthRequired
+        }
     }
 }
 
