@@ -41,6 +41,9 @@ pub mod aliases;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::advice::historical_distribution::{
+    HistoricalDistributionConfig, Percentile, QuantileMethod,
+};
 use crate::attribution::quality::AttributionQualityFloor;
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
@@ -343,6 +346,10 @@ pub struct Config {
     pub freshness: FreshnessConfig,
     pub coverage: CoverageConfig,
     pub attribution: AttributionConfig,
+    /// The historical task distribution's default quantiles, minimum sample
+    /// count and attribution-quality floor (`aub-1o3`, `aub-cab.7`), owned
+    /// and documented by `crate::advice::historical_distribution`.
+    pub task_distribution: HistoricalDistributionConfig,
     pub reconciliation: ReconciliationConfig,
     pub accounts: Vec<AccountConfig>,
     pub ingest: IngestConfig,
@@ -369,6 +376,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "freshness",
     "coverage",
     "attribution",
+    "task_distribution",
     "reconciliation",
     "accounts",
     "transcripts",
@@ -394,6 +402,14 @@ const INGEST_KEYS: &[&str] = &["max_batch_events", "max_batch_files", "max_batch
 const FRESHNESS_KEYS: &[&str] = &["meter"];
 const COVERAGE_KEYS: &[&str] = &["attempt_floor", "measurement_floor"];
 const ATTRIBUTION_KEYS: &[&str] = &["quality_floor", "recent_window"];
+const TASK_DISTRIBUTION_KEYS: &[&str] = &[
+    "central_low",
+    "central_high",
+    "upper",
+    "min_samples",
+    "quantile_method",
+    "attribution_floor",
+];
 const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
@@ -464,6 +480,12 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("attribution").and_then(toml::Value::as_table) {
         check_keys(t, ATTRIBUTION_KEYS, "attribution", file_display)?;
+    }
+    if let Some(t) = table
+        .get("task_distribution")
+        .and_then(toml::Value::as_table)
+    {
+        check_keys(t, TASK_DISTRIBUTION_KEYS, "task_distribution", file_display)?;
     }
     if let Some(t) = table.get("reconciliation").and_then(toml::Value::as_table) {
         check_keys(t, RECONCILIATION_KEYS, "reconciliation", file_display)?;
@@ -663,6 +685,59 @@ fn resolve_floor(
         .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a number")))?;
     CoverageFloor::new(value)
         .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
+}
+
+/// Resolves a percentile in `[0, 100]` through the four-level order.
+fn resolve_percentile(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<Percentile, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    let value: u8 = raw
+        .parse()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a whole number 0-100")))?;
+    Percentile::new(value)
+        .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0, 100]")))
+}
+
+/// Resolves a [`QuantileMethod`] by its stable name through the four-level
+/// order.
+fn resolve_quantile_method(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<QuantileMethod, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    QuantileMethod::parse(&raw).ok_or_else(|| {
+        Error::Usage(format!(
+            "{key}: {raw:?} is not a recognized quantile method"
+        ))
+    })
 }
 
 /// An attribution-quality floor with no platform default: absent everywhere
@@ -932,6 +1007,86 @@ pub fn resolve(
         )?,
     };
 
+    // Defaults documented on `aub-1o3` (2026-09-04, option A) and
+    // `aub-cab.7` (2026-09-04, option B): central range p25-p75, upper
+    // reference p90, minimum 12 samples, nearest-rank, attribution floor
+    // 0.80.
+    let task_distribution_central_low = resolve_percentile(
+        "task_distribution.central_low",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "task_distribution", "central_low"),
+        Some("25"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let task_distribution_central_high = resolve_percentile(
+        "task_distribution.central_high",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "task_distribution", "central_high"),
+        Some("75"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let task_distribution_upper = resolve_percentile(
+        "task_distribution.upper",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "task_distribution", "upper"),
+        Some("90"),
+        &file_display,
+        &mut provenance,
+    )?;
+    if task_distribution_central_low >= task_distribution_central_high
+        || task_distribution_central_high > task_distribution_upper
+    {
+        return Err(Error::Usage(format!(
+            "task_distribution: central_low ({}) must be less than central_high ({}), which must be at most upper ({})",
+            task_distribution_central_low.value(),
+            task_distribution_central_high.value(),
+            task_distribution_upper.value()
+        )));
+    }
+    let task_distribution_min_samples = resolve_count(
+        "task_distribution.min_samples",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "task_distribution", "min_samples"),
+        Some("12"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let task_distribution_quantile_method = resolve_quantile_method(
+        "task_distribution.quantile_method",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "task_distribution", "quantile_method"),
+        Some("nearest-rank"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let task_distribution_attribution_floor_fraction = resolve_floor(
+        "task_distribution.attribution_floor",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "task_distribution", "attribution_floor"),
+        Some("0.80"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let task_distribution = HistoricalDistributionConfig {
+        central_low: task_distribution_central_low,
+        central_high: task_distribution_central_high,
+        upper: task_distribution_upper,
+        min_samples: task_distribution_min_samples,
+        quantile_method: task_distribution_quantile_method,
+        attribution_floor: AttributionQualityFloor::new(
+            task_distribution_attribution_floor_fraction.get(),
+        )
+        .expect("CoverageFloor's [0,1] range matches AttributionQualityFloor::new's domain"),
+    };
+
     let reconciliation = ReconciliationConfig {
         residual_window: resolve_duration(
             "reconciliation.residual_window",
@@ -1142,6 +1297,7 @@ pub fn resolve(
             freshness,
             coverage,
             attribution,
+            task_distribution,
             reconciliation,
             accounts,
             transcripts,
@@ -1611,6 +1767,67 @@ credential = { kind = "unknown-future-kind", anything = "goes" }
         let file = "[attribution]\nnope = 1\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("attribution.nope"), "{err}");
+    }
+
+    #[test]
+    fn the_task_distribution_policy_has_the_decided_defaults() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(config.task_distribution.central_low.value(), 25);
+        assert_eq!(config.task_distribution.central_high.value(), 75);
+        assert_eq!(config.task_distribution.upper.value(), 90);
+        assert_eq!(config.task_distribution.min_samples, 12);
+        assert_eq!(
+            config.task_distribution.quantile_method,
+            QuantileMethod::NearestRank
+        );
+        assert_eq!(config.task_distribution.attribution_floor.ppm(), 800_000);
+        assert_eq!(
+            provenance.get("task_distribution.min_samples"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    #[test]
+    fn the_task_distribution_policy_is_set_from_the_file() {
+        let file = "[task_distribution]\ncentral_low = 20\ncentral_high = 80\nupper = 95\nmin_samples = 20\nquantile_method = \"nearest-rank\"\nattribution_floor = 0.9\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.task_distribution.central_low.value(), 20);
+        assert_eq!(config.task_distribution.central_high.value(), 80);
+        assert_eq!(config.task_distribution.upper.value(), 95);
+        assert_eq!(config.task_distribution.min_samples, 20);
+        assert_eq!(config.task_distribution.attribution_floor.ppm(), 900_000);
+        assert_eq!(
+            provenance.get("task_distribution.central_low"),
+            Some(ConfigSource::File)
+        );
+    }
+
+    #[test]
+    fn a_task_distribution_percentile_out_of_range_is_a_usage_error() {
+        let file = "[task_distribution]\ncentral_low = 200\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    #[test]
+    fn task_distribution_percentiles_out_of_order_is_a_usage_error() {
+        let file = "[task_distribution]\ncentral_low = 80\ncentral_high = 25\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("central_low"), "{err}");
+    }
+
+    #[test]
+    fn an_unrecognized_task_distribution_quantile_method_is_a_usage_error() {
+        let file = "[task_distribution]\nquantile_method = \"linear-interpolation\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("quantile_method"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_under_task_distribution_is_a_usage_error() {
+        let file = "[task_distribution]\nnope = 1\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("task_distribution.nope"), "{err}");
     }
 
     #[test]
