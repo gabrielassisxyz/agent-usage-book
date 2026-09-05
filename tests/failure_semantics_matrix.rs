@@ -1561,7 +1561,7 @@ fn row_31_passive_fit_contaminated() {
     let refusal = require_uncontaminated_for_activation(&verdict)
         .expect_err("an overlapping session must refuse activation");
     // Presented: named as an overlapping-session finding, not the flat-credits
-    // signal row 19 exercises — the two contaminated rows are distinguished by
+    // signal row 19 exercises; the two contaminated rows are distinguished by
     // which signal fired.
     assert_eq!(
         refusal.signal,

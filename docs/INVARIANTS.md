@@ -41,7 +41,7 @@ same thing in both documents.
 | 10 | Unknown token components block complete conversions. | tests/cost_model.rs | tests::conversion_fails_closed_on_unknown_components |
 | 11 | Cost-model coefficients and window calibrations are distinct versioned witnesses. | src/domain/provenance.rs | tests::witness_identifier_types_are_distinct |
 | 12 | Calibrated values have immutable IDs and no consumer-side literals. | unenforced aub-c0b.13 | (single-source calibration proof) |
-| 13 | Calibration cannot cross incompatible plan tiers, reset boundaries, or provider semantics. | unenforced aub-c0b.11 | (calibration rejection test) |
+| 13 | Calibration cannot cross incompatible plan tiers, reset boundaries, or provider semantics. | tests/calibration_recovery_and_rejection.rs | test_eleven_rejection_conditions_table_driven |
 | 14 | Passive calibration is evidence and candidate generation, not automatic truth. | src/calibration/passive.rs | tests::passive_calibration_produces_candidate_and_never_activates |
 | 15 | `status` never opens SQLite, performs network I/O, or writes. | src/cli.rs | tests::the_status_function_performs_only_the_status_contract |
 | 16 | The projection is disposable and contains no stored freshness boolean. | src/projection.rs | tests::deleting_the_projection_and_republishing_reproduces_it_byte_for_byte |
@@ -59,4 +59,4 @@ same thing in both documents.
 
 ## Enforcement status
 
-Of the 27 invariants above, 25 are enforced by mechanical checks present at HEAD (file paths and tests), and 2 are unenforced and tracked by open beads in the tracker.
+Of the 27 invariants above, 26 are enforced by mechanical checks present at HEAD (file paths and tests), and 1 are unenforced and tracked by open beads in the tracker.
