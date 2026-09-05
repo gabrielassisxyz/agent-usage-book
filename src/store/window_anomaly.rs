@@ -540,8 +540,25 @@ pub fn all_window_set_changes(conn: &Connection) -> Result<Vec<StoredWindowSetCh
 /// observations to share the same declared plan and tier: a plan change
 /// invalidates the comparison rather than producing a false anomaly, per the
 /// "per account, plan tier and stable window identity" acceptance criterion.
-/// Window-set-change classification carries no such requirement, since it is
-/// about the constraint set's shape rather than one constraint's value.
+///
+/// It also requires the pair to be in observation-time order.
+/// `observation_immediately_before` picks its candidate by row id, which is
+/// commit order, not observed-time order: a spool drain can commit a batch of
+/// concurrently-gathered observations in an order that disagrees with when
+/// each one was actually measured, so the row-id-adjacent "previous"
+/// observation can carry a *later* measurement instant than the "current"
+/// one. Typed reset semantics are inherently temporal (a reset is "due" when
+/// the current instant reaches the previous one's boundary), so comparing a
+/// pair that is not chronologically consecutive would not answer the
+/// question the comparison claims to answer - it would only coincidentally
+/// share an account, plan, tier and window identity. Such a pair is skipped
+/// rather than reordered into a false consecutiveness: forcing an order
+/// would make `interval_end_at >= interval_start_at` hold, but it would not
+/// make the two readings actually adjacent in time, and a third observation
+/// could sit between them that this pairing never saw. Window-set-change
+/// classification carries neither requirement, since it is about the
+/// constraint set's shape rather than one constraint's value or the interval
+/// between two instants.
 pub fn detect_and_persist(
     conn: &Connection,
     account_id: AccountId,
@@ -562,6 +579,10 @@ pub fn detect_and_persist(
         && previous_observation.observed_tier == current_observation.observed_tier;
     let previous_instant = measurement_instant(&previous_observation);
     let current_instant = measurement_instant(current_observation);
+    // Equal instants are a legitimate degenerate case (a zero-length interval
+    // is well-formed, `interval_end_at >= interval_start_at` allows it); only
+    // a strictly reversed pair is not a comparison.
+    let observations_in_order = previous_instant <= current_instant;
 
     let identity_matches = |a: &StoredMeterWindow, b: &StoredMeterWindow| {
         a.semantic_key == b.semantic_key && a.scope == b.scope
@@ -573,7 +594,7 @@ pub fn detect_and_persist(
             .find(|previous_window| identity_matches(previous_window, current_window))
         {
             Some(previous_window) => {
-                if !plan_tier_matches {
+                if !plan_tier_matches || !observations_in_order {
                     continue;
                 }
                 let previous_reading = WindowReading {
@@ -1302,6 +1323,54 @@ mod tests {
         .unwrap();
         assert!(outcome.anomalies.is_empty());
         assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
+    }
+
+    /// The out-of-order pair `projection_concurrency`'s concurrent-writer
+    /// spool drain surfaced: `observation_immediately_before` picks its
+    /// candidate by row id (commit order), and a drain can commit a batch of
+    /// concurrently-gathered observations out of their true observed-time
+    /// order. Here the row-id-earlier ("previous") observation carries a
+    /// *later* measurement instant than the row-id-later ("current") one -
+    /// the same shape that produced `interval_end_at < interval_start_at`
+    /// against the calibration-exclusion CHECK before this fix. The pair
+    /// must be skipped rather than compared, even though the used fraction
+    /// drops with no reset (which would be an anomaly for a properly
+    /// ordered pair).
+    #[test]
+    fn an_out_of_order_pair_is_not_compared_for_anomalies() {
+        let fx = fixture();
+        let (first_obs, first_window) = record_observation(
+            &fx,
+            100_000,
+            900_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000)),
+        );
+        // Committed second (higher row id), but measured earlier: the pair is
+        // row-id-adjacent yet not observation-time-adjacent.
+        let (second_obs, second_window) = record_observation(
+            &fx,
+            50_000,
+            400_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000)),
+        );
+
+        let outcome = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &[second_window],
+            UtcTimestamp::from_unix_nanos(200_000),
+        )
+        .expect("an out-of-order pair must not panic or fail the CHECK, only be skipped");
+
+        assert!(
+            outcome.anomalies.is_empty(),
+            "an out-of-order pair is not a comparison, even though the fraction drops"
+        );
+        assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
+        assert!(all_exclusions(&fx.conn).unwrap().is_empty());
+        let _ = first_obs;
+        let _ = first_window;
     }
 
     /// Input reordering: shuffling the current windows passed in produces the
