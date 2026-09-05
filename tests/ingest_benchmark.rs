@@ -74,13 +74,24 @@ format = "claude-code"
 /// and after the profiled change (`aub-mh1c`); the numbers this bead records
 /// came from this test against the real 3831-file corpus copied into a
 /// scratch directory, not this synthetic one, but the shape is the same.
+///
+/// aub-n27.3 extends this with the full transcript rebuild's other half: a
+/// projection publication timed immediately after ingest completes, against
+/// the same corpus. Both numbers are printed with the corpus size and
+/// workload that produced them (file count, total bytes, event count), so a
+/// future reading of these prints is not "5.2s" in isolation but "5.2s for
+/// 1000 files / 20000 events / N bytes".
 #[test]
-#[ignore = "prints a wall-clock number for a human to read; not a pass/fail gate"]
+#[ignore = "prints wall-clock numbers for a human to read; not a pass/fail gate"]
 fn benchmark_a_1000_file_corpus_ingest() {
     let root = scratch("corpus");
     let corpus = root.join("corpus");
     let state_dir = root.join("state");
     write_corpus(&corpus, 1_000, 20);
+    let corpus_bytes: u64 = fs::read_dir(&corpus)
+        .unwrap()
+        .map(|entry| entry.unwrap().metadata().unwrap().len())
+        .sum();
     let config = config_for(&corpus, &state_dir);
 
     let db_path = state_dir.join("ledger.db");
@@ -126,6 +137,9 @@ fn benchmark_a_1000_file_corpus_ingest() {
         report.outcome.events_written.value() + report.outcome.events_already_ingested.value();
     let events_per_second = total_events as f64 / elapsed.as_secs_f64();
     eprintln!(
+        "benchmark: corpus files=1000 bytes={corpus_bytes} events={total_events} (full rebuild pass, not incremental)"
+    );
+    eprintln!(
         "benchmark: files_parsed={} events={} elapsed={:.2}s events_per_second={:.1}",
         report.files_parsed,
         total_events,
@@ -134,4 +148,18 @@ fn benchmark_a_1000_file_corpus_ingest() {
     );
     assert_eq!(report.files_parsed, 1_000);
     assert_eq!(total_events, 20_000);
+
+    let projection_path = agent_usage_book::projection::projection_path_in(&state_dir);
+    let publish_started = Instant::now();
+    let publication = agent_usage_book::projection::publish(&conn, &projection_path);
+    let publish_elapsed = publish_started.elapsed();
+    assert!(
+        publication.published_generation().is_some(),
+        "the benchmark's own publish must succeed: {publication:?}"
+    );
+    eprintln!(
+        "benchmark: projection publication over {} session(s) elapsed={:.4}s",
+        report.outcome.sessions_upserted.value(),
+        publish_elapsed.as_secs_f64()
+    );
 }
