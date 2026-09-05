@@ -33,5 +33,10 @@ These are part of the contract rather than exceptions to it.
 * Scheduled `sample --due` returns 0 when every attempt outcome was durably
   recorded, including remote auth and transport failures; it returns non-zero
   when evidence could not be durably preserved.
+* A terminal commit that fails after a measured reading is spooled durably to
+  disk (`aub-1r3m`) is not the same event as one that lost the reading: the
+  former exits class 8 (`IngestIncomplete`), because the observation still
+  reaches the ledger on the next drain; the latter exits class 5 (`Store`),
+  because nothing durable survived the failure.
 * `sample --require-success` records the same evidence and then reports remote
   failures through their ordinary live-source classes.

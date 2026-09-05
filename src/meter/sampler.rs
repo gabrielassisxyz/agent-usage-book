@@ -97,6 +97,7 @@ use crate::store::repository::{NewMeterInterpretation, Repository, TerminalMeter
 use crate::store::sample_run::{SampleRunId, Trigger};
 use crate::store::sampling_lease::{AccountName, LeaseHolder, LeaseOutcome};
 use crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy;
+use crate::store::spool::{SpoolCycleOutcome, spool_then_commit};
 use crate::store::window_anomaly::StoredWindowAnomaly;
 
 /// The recipe token inside the normalized fingerprint, so a later change to
@@ -218,11 +219,26 @@ pub enum AccountDisposition {
     EligibilityFailed { reason: String },
     /// The attempt ran and its terminal fact was committed.
     Sampled(SampledAttempt),
-    /// The attempt ran but its terminal fact could not be committed. The
-    /// attempt row remains as the evidence it is; the outcome the request
-    /// produced is carried so the report does not lose what happened on the
-    /// network.
+    /// The attempt ran but its terminal fact could not be committed, and
+    /// nothing durable preserved the reading either. The attempt row remains
+    /// as the evidence it is; the outcome the request produced is carried so
+    /// the report does not lose what happened on the network. Distinct from
+    /// [`AccountDisposition::Spooled`]: this variant means the observation
+    /// itself is gone, which for a measured reading only happens when the
+    /// spool write itself fails, since a commit failure after a successful
+    /// spool write is `Spooled` instead.
     PersistFailed {
+        attempt_id: AttemptId,
+        outcome: AttemptOutcome,
+        reason: String,
+    },
+    /// The attempt ran, the reading was durably spooled to disk, but the
+    /// terminal commit into SQLite failed. Unlike `PersistFailed`, the
+    /// observation is not lost: the pending record on disk is what the next
+    /// drain applies (PLAN.md section 13, `aub doctor`'s `pending-evidence`
+    /// check). The outcome is always `AttemptOutcome::Success`, because only
+    /// a measured reading is spooled.
+    Spooled {
         attempt_id: AttemptId,
         outcome: AttemptOutcome,
         reason: String,
@@ -677,24 +693,40 @@ where
         } = payload;
         match &captured.observation {
             ProviderObservation::Measured(reading) => {
-                let commit = match self.terminal_bundle(
+                let bundle = match self.terminal_bundle(
                     item,
                     captured.evidence.as_ref(),
                     reading,
                     received_at,
                     elapsed,
                 ) {
-                    Ok(bundle) => self.repository.commit_terminal_bundle(&bundle),
+                    Ok(bundle) => bundle,
                     Err(error) => return persist_error(error),
                 };
-                match commit {
-                    Ok(committed) => AccountDisposition::Sampled(SampledAttempt {
+                // PLAN.md section 13, steps 5 to 7: spool the parsed reading
+                // durably before the commit is attempted, so a commit that
+                // cannot run (busy database, a refused constraint, a crash)
+                // leaves the observation on disk instead of destroying it.
+                match spool_then_commit(self.repository, &bundle, &self.clock) {
+                    Ok(SpoolCycleOutcome::Committed {
+                        ids, publication, ..
+                    }) => AccountDisposition::Sampled(SampledAttempt {
                         attempt_id,
                         outcome: AttemptOutcome::Success,
                         observation_committed: true,
-                        publication: committed.publication,
-                        window_anomalies: committed.ids.window_anomalies,
+                        publication,
+                        window_anomalies: ids.window_anomalies,
                     }),
+                    Ok(SpoolCycleOutcome::LeftPending { error, .. }) => {
+                        AccountDisposition::Spooled {
+                            attempt_id,
+                            outcome: AttemptOutcome::Success,
+                            reason: error.to_string(),
+                        }
+                    }
+                    // The spool write itself failed: the reading was never
+                    // made durable anywhere, so this is a real loss rather
+                    // than a deferred commit.
                     Err(error) => persist_error(error),
                 }
             }
@@ -955,6 +987,7 @@ mod tests {
     use crate::store::meter_attempt;
     use crate::store::migrate::run_migrations;
     use crate::store::migrations::registry;
+    use crate::store::spool::{drain_pending, pending_file_path};
     use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -1226,7 +1259,9 @@ mod tests {
             .filter(|entry| {
                 matches!(
                     entry.disposition,
-                    AccountDisposition::Sampled(_) | AccountDisposition::PersistFailed { .. }
+                    AccountDisposition::Sampled(_)
+                        | AccountDisposition::PersistFailed { .. }
+                        | AccountDisposition::Spooled { .. }
                 )
             })
             .count();
@@ -1398,7 +1433,8 @@ mod tests {
             | AccountDisposition::LeaseHeld { .. }
             | AccountDisposition::EligibilityFailed { .. }
             | AccountDisposition::Sampled(_)
-            | AccountDisposition::PersistFailed { .. }) => {
+            | AccountDisposition::PersistFailed { .. }
+            | AccountDisposition::Spooled { .. }) => {
                 panic!("the fresh account must be not yet due, got {other:?}")
             }
         }
@@ -1463,9 +1499,11 @@ mod tests {
     /// evidence: account `broken` carries an empty adapter version, which the
     /// database refuses on the observation row, so its terminal commit fails
     /// after its request succeeded, while `healthy` commits its observation.
+    /// `aub-1r3m`: the broken account's reading is durably spooled rather than
+    /// lost, and a subsequent drain applies it to the ledger exactly once.
     #[test]
     fn a_store_failure_on_one_account_does_not_discard_another_accounts_evidence() {
-        let (_scratch_dir, database_path) = fixture_database();
+        let (scratch_dir, database_path) = fixture_database();
         let transport = ScriptedTransport::new(SharedClock::new());
         let clock = transport.clock.clone();
         let mut broken = batch_account("broken");
@@ -1491,8 +1529,10 @@ mod tests {
         };
         let repository = Repository::new(&database_path, policy());
 
-        if let AccountDisposition::PersistFailed {
-            outcome, reason, ..
+        let broken_attempt_id = if let AccountDisposition::Spooled {
+            attempt_id,
+            outcome,
+            reason,
         } = &report.accounts[0].disposition
         {
             assert_eq!(*outcome, AttemptOutcome::Success);
@@ -1500,19 +1540,21 @@ mod tests {
                 reason.contains("adapter_version") || reason.contains("constraint"),
                 "the refusal must name the database constraint: {reason}"
             );
+            *attempt_id
         } else {
             panic!(
-                "the broken account must fail to persist, got {:?}",
+                "the broken account's reading must be spooled rather than lost, got {:?}",
                 report.accounts[0].disposition
             );
-        }
+        };
         let healthy_attempt = sampled(&report.accounts[1]);
         assert_eq!(healthy_attempt.outcome, AttemptOutcome::Success);
         assert!(healthy_attempt.observation_committed);
 
         // The healthy account's observation is committed and readable, and
         // the broken account's attempt remains as the evidence it is: a
-        // started attempt with no terminal result.
+        // started attempt with no terminal result, because the commit that
+        // would have written one is exactly what failed.
         assert!(
             repository
                 .attempt_started(healthy_attempt.attempt_id)
@@ -1527,26 +1569,192 @@ mod tests {
                 .is_some(),
             "the healthy account's result is committed"
         );
-        if let AccountDisposition::PersistFailed { attempt_id, .. } =
-            &report.accounts[0].disposition
-        {
-            assert!(
-                repository
-                    .attempt_started(*attempt_id)
-                    .expect("the read must succeed")
-                    .is_some(),
-                "the broken account's attempt start is durable evidence"
-            );
-            assert!(
-                repository
-                    .attempt_result(*attempt_id)
-                    .expect("the read must succeed")
-                    .is_none(),
-                "the broken account has no terminal result; its attempt stays open"
-            );
-        } else {
-            panic!("expected the broken account to persist-fail");
-        }
+        assert!(
+            repository
+                .attempt_started(broken_attempt_id)
+                .expect("the read must succeed")
+                .is_some(),
+            "the broken account's attempt start is durable evidence"
+        );
+        assert!(
+            repository
+                .attempt_result(broken_attempt_id)
+                .expect("the read must succeed")
+                .is_none(),
+            "the broken account has no terminal result yet; the commit never landed"
+        );
+
+        // The reading itself is not gone: a pending record for exactly this
+        // attempt sits durably in the spool, which is what `aub doctor`'s
+        // `pending-evidence` check surfaces before any drain runs.
+        let pending_path = pending_file_path(
+            scratch_dir.path(),
+            i64::try_from(broken_attempt_id.value()).unwrap(),
+        );
+        assert!(
+            pending_path.exists(),
+            "a durable pending record must exist for the spooled attempt at {pending_path:?}"
+        );
+
+        // The constraint that made the commit fail is still there, so a drain
+        // right now still refuses the terminal fact: this proves the record
+        // on disk is real evidence gated on a real condition, not a
+        // placeholder that would apply under anything. The full spool then
+        // recover then drain cycle, through a failure that clears on its own,
+        // is `spool_then_commit_recovers_after_a_transient_commit_failure`
+        // below.
+        let mut conn = open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
+        let refused = drain_pending(&mut conn, scratch_dir.path())
+            .expect_err("draining against the same broken constraint must still refuse");
+        assert!(
+            refused.to_string().contains("constraint") || refused.to_string().contains("adapter"),
+            "the refusal must still name the database constraint: {refused}"
+        );
+        assert!(
+            pending_path.exists(),
+            "a refused drain must leave the pending record in place"
+        );
+    }
+
+    /// End to end: the live sampling path spools a reading whose commit fails
+    /// on a transient condition (the writer slot held by another connection),
+    /// and once that condition clears, the ordinary startup drain applies the
+    /// spooled record and the observation is readable in the ledger. A second
+    /// drain is a no-op, proving replay is idempotent rather than merely
+    /// silent about a record it no longer finds (`aub-1r3m`).
+    ///
+    /// Due determination, lease acquisition and request execution run through
+    /// `SamplingOrchestrator`'s own stage methods rather than `run`, because
+    /// the writer slot must stay free for those (they commit the run row and
+    /// the attempt start) and busy only for the one terminal commit under
+    /// test; `run` gives no seam to hold the lock over one stage but not the
+    /// others. Every call below is the same private method `run` itself
+    /// calls, in the same order, over the same production types.
+    #[test]
+    fn spool_then_commit_recovers_after_a_transient_commit_failure() {
+        let (scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let account = batch_account("recoverable");
+
+        let busy_policy = crate::store::connection::PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(150),
+        };
+        let repository = Repository::new(&database_path, busy_policy);
+        let orchestrator = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 1,
+        };
+
+        let started_at = clock.now();
+        let run_id = orchestrator
+            .repository
+            .start_sample_run(
+                orchestrator.trigger,
+                started_at,
+                &orchestrator.configuration_fingerprint,
+            )
+            .expect("the run row must commit with no contention");
+        let leased = match orchestrator.determine_due(&account, started_at) {
+            DueStageOutcome::Due { account_id } => orchestrator
+                .acquire_eligibility(0, &account, account_id, run_id)
+                .unwrap_or_else(|_| panic!("eligibility must be acquired with no contention")),
+            DueStageOutcome::NotYet { .. } | DueStageOutcome::LookupFailed { .. } => {
+                panic!("a fresh account with no history must be due")
+            }
+        };
+        let attempt_id = leased.attempt.attempt_id();
+        let budget = CommandBudget::new(orchestrator.command_budget, &clock);
+        let (mut products, _, _) =
+            orchestrator.execute_requests(std::slice::from_ref(&leased), &budget);
+        let payload = products[0]
+            .take()
+            .expect("the one worker must have produced a result");
+
+        // Another writer holds the slot for exactly the terminal-commit call
+        // below, so `persist_one`'s own commit is refused past its busy
+        // bound, the shape a lock timeout or a busy database produces in
+        // production. Everything before this point already committed with
+        // the slot free, matching how `run` never holds the writer lock
+        // across stages either.
+        // The guard comes from the store rather than being built here: the meter
+        // layer may not name a SQLite type at all, which the boundary rule
+        // `03-meter-no-sqlite` enforces on every file under `src/meter/`.
+        let mut holder = open(&database_path, AccessMode::ReadWrite, &busy_policy).unwrap();
+        let held = crate::store::connection::hold_writer_slot(&mut holder);
+        let disposition = orchestrator.persist_one(&leased, payload);
+        let attempt_id_from_disposition =
+            if let AccountDisposition::Spooled { attempt_id, .. } = &disposition {
+                *attempt_id
+            } else {
+                panic!("a commit refused by a held writer slot must spool, got {disposition:?}");
+            };
+        assert_eq!(attempt_id_from_disposition, attempt_id);
+
+        let pending_path = pending_file_path(
+            scratch_dir.path(),
+            i64::try_from(attempt_id.value()).unwrap(),
+        );
+        assert!(
+            pending_path.exists(),
+            "the transient failure must leave a durable pending record"
+        );
+
+        // The condition clears: release the writer slot, exactly like a busy
+        // database becoming free or a crashed process's lock expiring.
+        held.commit().unwrap();
+        drop(holder);
+
+        assert!(
+            repository
+                .attempt_result(attempt_id)
+                .expect("the read must succeed")
+                .is_none(),
+            "nothing committed yet; only the pending record carries the reading"
+        );
+
+        // The ordinary startup drain, not a test-only reconstruction: this is
+        // the same call every mutating command makes before doing anything
+        // else.
+        let mut conn = open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
+        let drain_report =
+            drain_pending(&mut conn, scratch_dir.path()).expect("the drain must apply cleanly");
+        assert_eq!(drain_report.applied, 1, "exactly one record is applied");
+        drop(conn);
+
+        assert!(
+            !pending_path.exists(),
+            "an applied record must be removed from the spool"
+        );
+        assert!(
+            repository
+                .attempt_result(attempt_id)
+                .expect("the read must succeed")
+                .is_some(),
+            "the drain must have committed the observation into the ledger"
+        );
+
+        // Idempotent replay: draining again with no pending record left finds
+        // nothing to apply and nothing already-applied, per the
+        // attempt-id-keyed replay contract PLAN.md section 13 describes.
+        let mut conn = open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
+        let second_drain =
+            drain_pending(&mut conn, scratch_dir.path()).expect("a no-op drain must not fail");
+        assert_eq!(
+            second_drain.applied, 0,
+            "nothing new is applied on a second drain"
+        );
+        assert_eq!(
+            second_drain.already_applied, 0,
+            "there is no pending record left to find already-applied"
+        );
     }
 
     /// Budget expiry persists exactly one logical attempt and at most one
@@ -1702,7 +1910,12 @@ mod tests {
         for report in &reports {
             for entry in &report.accounts {
                 match &entry.disposition {
-                    AccountDisposition::Sampled(_) => sampled_count += 1,
+                    // A winner's outcome, whether or not its commit landed:
+                    // both mean this invocation held the lease and ran the
+                    // request, which is the one-winner property under test.
+                    AccountDisposition::Sampled(_) | AccountDisposition::Spooled { .. } => {
+                        sampled_count += 1
+                    }
                     AccountDisposition::NotYet { .. } | AccountDisposition::LeaseHeld { .. } => {}
                     other @ (AccountDisposition::DueLookupFailed { .. }
                     | AccountDisposition::EligibilityFailed { .. }
@@ -1760,7 +1973,8 @@ mod tests {
                 | AccountDisposition::DueLookupFailed { .. }
                 | AccountDisposition::LeaseHeld { .. }
                 | AccountDisposition::EligibilityFailed { .. }
-                | AccountDisposition::PersistFailed { .. } => None,
+                | AccountDisposition::PersistFailed { .. }
+                | AccountDisposition::Spooled { .. } => None,
             })
             .expect("the winning invocation published");
         let conn = open(

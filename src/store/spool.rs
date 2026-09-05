@@ -501,9 +501,13 @@ pub enum SpoolCycleOutcome {
     /// The bundle committed into SQLite and the pending record was deleted:
     /// PLAN.md section 13's steps 5 through 7 completed. `commit_wait` is how
     /// long the commit call took, which under contention is dominated by the
-    /// wait for the writer slot.
+    /// wait for the writer slot. `publication` is the projection publication
+    /// that followed the commit, carried through unchanged from
+    /// [`Repository::commit_terminal_bundle`] so a caller does not have to
+    /// republish to learn it.
     Committed {
         ids: TerminalBundleIds,
+        publication: crate::projection::Publication,
         commit_wait: crate::domain::time::MonotonicDuration,
     },
     /// The bundle could not commit (the writer slot stayed held past the
@@ -548,6 +552,7 @@ pub fn spool_then_commit(
             ))?;
             Ok(SpoolCycleOutcome::Committed {
                 ids: commit.ids,
+                publication: commit.publication,
                 commit_wait,
             })
         }

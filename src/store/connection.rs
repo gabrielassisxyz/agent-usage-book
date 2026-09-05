@@ -192,6 +192,22 @@ fn shm_sidecar_path(path: &Path) -> PathBuf {
 /// momentarily at the process's default create mode; after the pragma policy has
 /// transitioned the file into WAL, its `-wal` and `-shm` sidecars are repaired to
 /// 0600 the same way (PLAN.md line 4775, `aub-c2bw`).
+/// Test-only: take the database's single writer slot and hold it until the
+/// returned guard is dropped, which is how a test produces the busy database a
+/// lock timeout sees in production.
+///
+/// It lives here rather than at each call site because a caller would otherwise
+/// have to name a SQLite transaction type, and two layers are forbidden from
+/// doing that at all: `bin/checks/boundary-rules/03-meter-no-sqlite` fails the
+/// build when anything under `src/meter/` so much as mentions `rusqlite::`.
+/// Returning the guard by inference keeps the knowledge of what a writer slot is
+/// in the layer that owns connections.
+#[cfg(test)]
+pub(crate) fn hold_writer_slot(conn: &mut rusqlite::Connection) -> rusqlite::Transaction<'_> {
+    conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .expect("a connection with the writer slot free must be able to take it")
+}
+
 pub fn open(
     path: &Path,
     mode: AccessMode,
