@@ -9,6 +9,7 @@
 
 pub mod activation;
 pub mod contamination;
+pub mod conversion;
 pub mod fitter;
 pub mod health;
 pub mod multivariate;

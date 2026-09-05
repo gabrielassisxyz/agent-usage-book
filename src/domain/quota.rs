@@ -6,7 +6,9 @@
 //! distinct despite sharing a display unit, because they are complements and mixing
 //! them inverts a decision without changing the shape of anything.
 
-use std::ops::Sub;
+use std::ops::{Add, Mul, Sub};
+
+use super::interval::DomainQuantity;
 
 /// A quota fraction stored in parts per million: 0 is 0% and 1_000_000 is 100%.
 ///
@@ -92,7 +94,7 @@ impl QuotaRemaining {
 ///
 /// The range is `[-1_000_000, 1_000_000]`: the difference between any two levels in
 /// `[0, 1_000_000]` is always representable here.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub struct PercentagePoints(i32);
 
 impl PercentagePoints {
@@ -107,6 +109,56 @@ impl PercentagePoints {
 
     pub fn get(self) -> i32 {
         self.0
+    }
+}
+
+impl Add for PercentagePoints {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self::Output {
+        Self(self.0.saturating_add(rhs.0).clamp(Self::MIN, Self::MAX))
+    }
+}
+
+impl Sub for PercentagePoints {
+    type Output = Self;
+
+    fn sub(self, rhs: Self) -> Self::Output {
+        Self(self.0.saturating_sub(rhs.0).clamp(Self::MIN, Self::MAX))
+    }
+}
+
+impl Mul for PercentagePoints {
+    type Output = Self;
+
+    fn mul(self, rhs: Self) -> Self::Output {
+        let scaled = (i64::from(self.0) * i64::from(rhs.0)) / 10_000;
+        Self(scaled.clamp(i64::from(Self::MIN), i64::from(Self::MAX)) as i32)
+    }
+}
+
+impl DomainQuantity for PercentagePoints {
+    fn unit() -> &'static str {
+        "percentage_points"
+    }
+
+    fn to_f64(self) -> f64 {
+        self.0 as f64 / 10_000.0
+    }
+
+    fn from_f64(value: f64) -> Self {
+        let raw = (value * 10_000.0)
+            .round()
+            .clamp(Self::MIN as f64, Self::MAX as f64);
+        Self(raw as i32)
+    }
+
+    fn to_exact_string(self) -> String {
+        self.0.to_string()
+    }
+
+    fn from_exact_str(s: &str) -> Option<Self> {
+        s.parse::<i32>().ok().and_then(Self::new)
     }
 }
 
@@ -147,6 +199,16 @@ mod tests {
         );
         assert_eq!(PercentagePoints::new(-1_000_001), None);
         assert_eq!(PercentagePoints::new(1_000_001), None);
+    }
+
+    #[test]
+    fn percentage_point_arithmetic_uses_its_fixed_point_scale() {
+        let one = PercentagePoints::new(10_000).unwrap();
+        let half = PercentagePoints::new(5_000).unwrap();
+
+        assert_eq!(one + half, PercentagePoints::new(15_000).unwrap());
+        assert_eq!(one - half, half);
+        assert_eq!(one * half, half);
     }
 
     #[test]

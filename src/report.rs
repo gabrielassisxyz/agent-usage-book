@@ -37,8 +37,9 @@ pub use models::{
     MeterExplanation, MeterReadingProvenance, MeterWindowExplanation, NowReport,
     ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport, SharePpm, SpendDiagnostic,
     SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
-    SpendGrouping, SpendReport, StatusReport, TaskIdentityRow, TaskIngestReport,
-    TaskOverheadBucket, TaskOverheadReport, TaskReport, TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL,
+    SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, StatusReport,
+    TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
+    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowEquivalentDerivation, WindowEquivalentValue,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

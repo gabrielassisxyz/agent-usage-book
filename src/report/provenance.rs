@@ -52,6 +52,8 @@ pub enum ReportField {
     SpendGroupTokens { key: LogicalName },
     /// The subscription-credit derivation of one spend group.
     SpendGroupCredits { key: LogicalName },
+    /// The calibrated window-equivalent percentage-point interval of one spend group.
+    SpendGroupWindowEquivalent { key: LogicalName },
     /// Canonical event records selected for a spend report.
     SpendCanonicalRecords,
     /// Replayed occurrences retained as diagnostics, not added to canonical usage.
@@ -88,6 +90,9 @@ impl ReportField {
             ReportField::SpendGroupCredits { key } => {
                 format!("spend_group_credits[{}]", key.as_str())
             }
+            ReportField::SpendGroupWindowEquivalent { key } => {
+                format!("spend_group_window_equivalent[{}]", key.as_str())
+            }
             ReportField::SpendCanonicalRecords => "spend_canonical_records".to_string(),
             ReportField::SpendReplayedOccurrences => "spend_replayed_occurrences".to_string(),
             ReportField::SpendHeuristicIdentities => "spend_heuristic_identities".to_string(),
@@ -109,6 +114,7 @@ impl ReportField {
             ReportField::MeterQuotaRemaining { account } => account.as_str(),
             ReportField::SpendGroupTokens { key } => key.as_str(),
             ReportField::SpendGroupCredits { key } => key.as_str(),
+            ReportField::SpendGroupWindowEquivalent { key } => key.as_str(),
             ReportField::SpendCanonicalRecords
             | ReportField::SpendReplayedOccurrences
             | ReportField::SpendHeuristicIdentities => "spend",
@@ -161,6 +167,7 @@ pub enum Unit {
     Cost,
     Credits,
     QuotaFraction,
+    PercentagePoints,
 }
 
 impl Unit {
@@ -171,6 +178,7 @@ impl Unit {
             Unit::Cost => "cost",
             Unit::Credits => "credits",
             Unit::QuotaFraction => "quota_fraction",
+            Unit::PercentagePoints => "percentage_points",
         }
     }
 }

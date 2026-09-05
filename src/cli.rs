@@ -30,7 +30,10 @@ use crate::presentation::render::{
 use crate::report::ReportEnvelope;
 use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as assemble_coverage};
 use crate::report::export::assemble as assemble_export;
-use crate::report::spend::{CreditReporting, SpendWindow, assemble_canonical as assemble_spend};
+use crate::report::spend::{
+    CreditReporting, SpendWindow, WindowEquivalentResolver,
+    assemble_canonical_with_window_equivalent as assemble_spend,
+};
 use crate::report::{
     CalibrateActivateReport, CalibrateCompareReport, CalibrateCostModelCoverage,
     CalibrateCostModelKindCoverage, CalibrateHistoryEntry, CalibrateHistoryReport,
@@ -769,7 +772,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --refresh auto|never|force | --value api-list",
+                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -2516,6 +2519,16 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         None if options.credits => CreditReporting::NoActiveModel,
         None => CreditReporting::NotRequested,
     };
+    let window_resolver =
+        options
+            .window_equivalent
+            .as_deref()
+            .map(|window_key| SpendWindowResolver {
+                conn: &conn,
+                active_cost_model: active_cost_model.as_ref(),
+                window_key,
+                timestamp,
+            });
     let mut report = assemble_spend(
         &conn,
         options.window,
@@ -2525,6 +2538,9 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         refresh_failure.clone(),
         rate_book.as_ref(),
         credit_reporting,
+        window_resolver
+            .as_ref()
+            .map(|resolver| resolver as &dyn WindowEquivalentResolver),
     )?;
     if let Some(refresh) = refresh_report {
         report.ingest.files_read = refresh.files_parsed;
@@ -2553,6 +2569,114 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
     }
 }
 
+/// Resolves the current calibration for each spend stratum. The lookup happens
+/// during report assembly rather than at process startup so an append-only
+/// calibration supersession changes every subsequent spend report without a
+/// source or configuration edit.
+struct SpendWindowResolver<'a> {
+    conn: &'a rusqlite::Connection,
+    active_cost_model: Option<&'a crate::store::cost_model::CostModel>,
+    window_key: &'a str,
+    timestamp: UtcTimestamp,
+}
+
+impl WindowEquivalentResolver for SpendWindowResolver<'_> {
+    fn window_semantic_key(&self) -> &str {
+        self.window_key
+    }
+
+    fn resolve(
+        &self,
+        account: Option<&str>,
+        provider: Option<&str>,
+        credits: Option<&crate::evidence::Derivation<crate::domain::credits::Credits>>,
+    ) -> Result<crate::report::WindowEquivalentDerivation, Error> {
+        let Some(account) = account.filter(|account| {
+            !account.is_empty() && *account != crate::report::UNKNOWN_ACCOUNT_LABEL
+        }) else {
+            return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                "account attribution",
+            )]));
+        };
+        let Some(provider) = provider else {
+            return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                "provider identity",
+            )]));
+        };
+        let Some(model) = self.active_cost_model else {
+            return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                "active cost model",
+            )]));
+        };
+        let Some(credits) = credits else {
+            return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                "qualified credits",
+            )]));
+        };
+
+        let scope = crate::store::calibration::CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new(provider),
+            plan_tier: crate::store::calibration::PlanTier::new("default"),
+            window_semantic_key: crate::domain::window::WindowSemanticKey::new(self.window_key),
+        };
+        let Some(calibration) =
+            crate::store::calibration::load_active_at(self.conn, &scope, self.timestamp)?
+        else {
+            return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                format!(
+                    "active calibration for provider {} and window {}",
+                    provider, self.window_key
+                ),
+            )]));
+        };
+
+        let conversion_context = crate::calibration::conversion::WindowConversionContext::new(
+            Some(account.to_string()),
+            crate::store::cost_model::ProviderKey::new(provider),
+            crate::store::calibration::PlanTier::new("default"),
+            crate::domain::window::WindowSemanticKey::new(self.window_key),
+            calibration.meter_semantics_id().clone(),
+            model.billing_semantics_id().clone(),
+            Some(model.id().clone()),
+        );
+        let calibration_facts = crate::calibration::health::CalibrationFacts {
+            plan_tier: calibration.plan_tier().clone(),
+            meter_semantics_id: calibration.meter_semantics_id().clone(),
+            billing_semantics_id: calibration.billing_semantics_id().clone(),
+        };
+        let applicability = crate::calibration::health::ApplicabilityContext {
+            plan_tier: conversion_context.plan_tier.clone(),
+            meter_semantics_id: conversion_context.meter_semantics_id.clone(),
+            billing_semantics_id: conversion_context.billing_semantics_id.clone(),
+        };
+        let health_inputs = crate::calibration::health::HealthInputs {
+            calibration: &calibration_facts,
+            context: &applicability,
+            lifecycle: crate::calibration::health::LifecycleState::Active,
+            cost_model_superseded: crate::store::cost_model::is_superseded(self.conn, model.id())?,
+            drift: None,
+            review_due_at: None,
+        };
+        let health = crate::calibration::health::compute_health(&health_inputs, self.timestamp);
+        Ok(crate::calibration::conversion::convert(
+            credits,
+            &calibration,
+            &conversion_context,
+            health,
+        ))
+    }
+}
+
+fn window_refusal(
+    missing: impl IntoIterator<Item = crate::evidence::RequiredFact>,
+) -> crate::report::WindowEquivalentDerivation {
+    crate::report::WindowEquivalentDerivation::unavailable(
+        missing,
+        crate::evidence::Provenance::new(["window-equivalent:unavailable".to_string()]),
+    )
+    .expect("a window-equivalent refusal names a missing fact")
+}
+
 /// The window from `--today`, `--since YYYY-MM-DD` and `--days N`. Today is the
 /// default, in UTC, because the binary has no local time zone facility and must not
 /// pretend to. The window is always stated in the output.
@@ -2574,6 +2698,7 @@ struct SpendOptions {
     refresh: RefreshPolicy,
     value: Option<SpendValuationMode>,
     credits: bool,
+    window_equivalent: Option<String>,
 }
 
 fn spend_options(
@@ -2586,6 +2711,7 @@ fn spend_options(
     let mut refresh = RefreshPolicy::Auto;
     let mut value = None;
     let mut credits = false;
+    let mut window_equivalent = None;
     let mut args = rest.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -2630,6 +2756,18 @@ fn spend_options(
                 }
             }
             "--credits" => credits = true,
+            "--window-equivalent" => {
+                let window = args.next().ok_or_else(|| {
+                    Error::Usage("--window-equivalent requires a window semantic key".into())
+                })?;
+                if window.is_empty() {
+                    return Err(Error::Usage(
+                        "--window-equivalent requires a non-empty window semantic key".into(),
+                    ));
+                }
+                window_equivalent = Some(window.clone());
+                credits = true;
+            }
             other => match other.strip_prefix("--since=") {
                 Some(val_str) => since = Some(parse_date(val_str)?),
                 None => match other.strip_prefix("--days=") {
@@ -2649,9 +2787,23 @@ fn spend_options(
                                         "--value must be api-list, got {val_str}"
                                     )));
                                 }
-                                None => {
-                                    return Err(Error::Usage(format!("unknown argument: {other}")));
-                                }
+                                None => match other.strip_prefix("--window-equivalent=") {
+                                    Some(window) if !window.is_empty() => {
+                                        window_equivalent = Some(window.to_string());
+                                        credits = true;
+                                    }
+                                    Some(_) => {
+                                        return Err(Error::Usage(
+                                            "--window-equivalent requires a non-empty window semantic key"
+                                                .into(),
+                                        ));
+                                    }
+                                    None => {
+                                        return Err(Error::Usage(format!(
+                                            "unknown argument: {other}"
+                                        )));
+                                    }
+                                },
                             },
                         },
                     },
@@ -2669,6 +2821,7 @@ fn spend_options(
         refresh,
         value,
         credits,
+        window_equivalent,
     })
 }
 
@@ -3554,8 +3707,6 @@ fn calibration_fixture_command(clock: &impl Clock, invocation: &Invocation) -> R
         window_semantic_key: crate::domain::window::WindowSemanticKey::new(window_key.as_str()),
     };
     let meter_semantics_id = crate::domain::ids::MeterSemanticsId::new("fixture-meter-v1");
-    let billing_semantics_id = crate::domain::ids::BillingSemanticsId::new("fixture-billing-v1");
-    let cost_model_id = crate::domain::provenance::CostModelId::new("fixture-cost-model");
     let fitted =
         crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(fitted_micros);
     let validity = crate::store::cost_model::ValidityInterval::new(
@@ -3564,7 +3715,21 @@ fn calibration_fixture_command(clock: &impl Clock, invocation: &Invocation) -> R
     )?;
 
     let mut conn = open_ledger(clock)?;
-    let experiment_id = format!("{window_key}-fixture-experiment");
+    let active_model = crate::store::cost_model::load_active_at(&conn, timestamp)?;
+    let (billing_semantics_id, cost_model_id) = match active_model.as_ref() {
+        Some(model) => (model.billing_semantics_id().clone(), model.id().clone()),
+        None => (
+            crate::domain::ids::BillingSemanticsId::new("fixture-billing-v1"),
+            crate::domain::provenance::CostModelId::new("fixture-cost-model"),
+        ),
+    };
+    let calibration_count = crate::store::calibration::list_all_results(&conn)?.len();
+    let suffix = if calibration_count == 0 {
+        String::new()
+    } else {
+        format!("-{calibration_count}")
+    };
+    let experiment_id = format!("{window_key}-fixture-experiment{suffix}");
     let experiment = crate::store::calibration::minimal_experiment(
         &experiment_id,
         &scope,
@@ -3575,7 +3740,8 @@ fn calibration_fixture_command(clock: &impl Clock, invocation: &Invocation) -> R
     );
     crate::store::calibration::insert_experiment(&conn, &experiment)?;
 
-    let calibration_id = format!("{window_key}-fixture-calibration");
+    let calibration_id = format!("{window_key}-fixture-calibration{suffix}");
+    let previous = crate::store::calibration::load_active_at(&conn, &scope, timestamp)?;
     let calibration = crate::store::calibration::minimal_fixture(
         &calibration_id,
         &scope,
@@ -3631,7 +3797,7 @@ fn calibration_fixture_command(clock: &impl Clock, invocation: &Invocation) -> R
         &mut conn,
         &crate::domain::provenance::WindowCalibrationId::new(&calibration_id),
         timestamp,
-        None,
+        previous.as_ref().map(|calibration| calibration.id()),
         &request,
     )?;
     println!("calibration {calibration_id} active for window {window_key}");
@@ -7646,6 +7812,10 @@ mod tests {
             vec![SpendGrouping::Session, SpendGrouping::Repository]
         );
         assert_eq!(explicit.refresh, RefreshPolicy::Never);
+        let calibrated = spend_options(&["--window-equivalent=five_hour".into()], now).unwrap();
+        assert_eq!(calibrated.window_equivalent.as_deref(), Some("five_hour"));
+        assert!(calibrated.credits, "window conversion implies credits");
+        assert!(spend_options(&["--window-equivalent".into()], now).is_err());
         assert!(spend_options(&["--since".into(), "25/08/2026".into()], now).is_err());
         assert!(spend_options(&["--days".into(), "0".into()], now).is_err());
         assert_eq!(

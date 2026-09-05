@@ -33,7 +33,7 @@ spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions?
   refuses: --account (spend groups by account with --group-by account; it has no single-account filter); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --refresh auto|never|force | --value api-list
+  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list
 
 config:
   answers: which configuration key resolved from where?

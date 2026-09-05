@@ -5,7 +5,7 @@
 //! meter reading carries exactly one freshness variant. A renderer cannot produce
 //! an unqualified number because it never holds one.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::attribution::account_segment::AccountEvidenceClass;
 use crate::config::CoverageFloor;
@@ -14,15 +14,19 @@ use crate::domain::attempt::AttemptOutcome;
 use crate::domain::credits::Credits;
 use crate::domain::freshness::Freshness;
 use crate::domain::ids::{NativeRunId, ProviderContractId};
+use crate::domain::interval::Interval;
 use crate::domain::money::Usd;
-use crate::domain::provenance::{CostModelId, DerivationId, RateCardId};
-use crate::domain::quota::QuotaRemaining;
+use crate::domain::provenance::{CostModelId, DerivationId, RateCardId, WindowCalibrationId};
+use crate::domain::quota::{PercentagePoints, QuotaRemaining};
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, WindowResetState, WindowScope, WindowSeverity,
 };
-use crate::evidence::{Derivation, Provenance};
+use crate::evidence::{
+    CoverageCompleteness, Derivation, EvidenceQuality, MissingRequiredFacts, Provenance,
+    RequiredFact,
+};
 use crate::logging::LogicalName;
 use crate::report::activity::ActiveActivityState;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
@@ -304,6 +308,10 @@ pub struct SpendGroup {
     /// Subscription credits when the caller explicitly requested conversion.
     /// A refusal stays alongside tokens, rather than suppressing the token report.
     pub credits: Option<Derivation<Credits>>,
+    /// The optional calibrated movement represented by this group's qualified credits.
+    /// A refusal stays alongside both credits and tokens, so an unavailable calibration
+    /// never erases the independently reportable spend dimensions.
+    pub window_equivalent: Option<WindowEquivalentDerivation>,
     /// Groups requested after this one. A report with more than one grouping
     /// dimension is a tree, so every parent subtotal has the same typed usage
     /// vector as its children rather than a lossy scalar total.
@@ -324,6 +332,7 @@ impl SpendGroup {
             provenance,
             derivation_id,
             credits: None,
+            window_equivalent: None,
             children: Vec::new(),
         }
     }
@@ -340,6 +349,11 @@ impl SpendGroup {
 
     pub fn with_credits(mut self, credits: Derivation<Credits>) -> Self {
         self.credits = Some(credits);
+        self
+    }
+
+    pub fn with_window_equivalent(mut self, window_equivalent: WindowEquivalentDerivation) -> Self {
+        self.window_equivalent = Some(window_equivalent);
         self
     }
 }
@@ -498,6 +512,85 @@ impl SpendGroupCreditsProvenance {
     }
 }
 
+/// A qualified interval of quota-window percentage-point movement. The calibration
+/// identifier travels with the interval because the same credit subtotal can map to
+/// a different movement under another window or another fitted result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowEquivalentValue {
+    pub interval: Interval<PercentagePoints>,
+    pub calibration_id: WindowCalibrationId,
+    pub coverage: CoverageCompleteness,
+    pub quality: EvidenceQuality<PercentagePoints>,
+    pub provenance: Provenance,
+}
+
+/// The calibrated window-equivalent result for one spend group.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowEquivalentDerivation {
+    /// A bounded movement interval with its calibration and evidence witnesses.
+    Available(WindowEquivalentValue),
+    /// A requested conversion that could not be justified. The token and credit
+    /// derivations remain available independently of this refusal.
+    Unavailable {
+        missing: BTreeSet<RequiredFact>,
+        provenance: Provenance,
+    },
+}
+
+impl WindowEquivalentDerivation {
+    /// Constructs a refusal only when at least one missing fact is named.
+    pub fn unavailable(
+        missing: impl IntoIterator<Item = RequiredFact>,
+        provenance: Provenance,
+    ) -> Result<Self, MissingRequiredFacts> {
+        let missing = missing.into_iter().collect::<BTreeSet<_>>();
+        if missing.is_empty() {
+            return Err(MissingRequiredFacts);
+        }
+        Ok(Self::Unavailable {
+            missing,
+            provenance,
+        })
+    }
+
+    /// The missing facts in a refusal, or `None` for an available interval.
+    pub fn missing(&self) -> Option<&BTreeSet<RequiredFact>> {
+        match self {
+            Self::Available(_) => None,
+            Self::Unavailable { missing, .. } => Some(missing),
+        }
+    }
+
+    /// The provenance carried by either an interval or its refusal.
+    pub fn provenance(&self) -> &Provenance {
+        match self {
+            Self::Available(value) => &value.provenance,
+            Self::Unavailable { provenance, .. } => provenance,
+        }
+    }
+
+    /// The calibration witness when one was resolved for this result.
+    pub fn calibration_id(&self) -> Option<&WindowCalibrationId> {
+        match self {
+            Self::Available(value) => Some(&value.calibration_id),
+            Self::Unavailable { .. } => None,
+        }
+    }
+}
+
+/// Provenance for one spend group's requested calibrated window-equivalent result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendGroupWindowEquivalentProvenance {
+    pub key: LogicalName,
+    pub node: ProvenanceNode,
+}
+
+impl SpendGroupWindowEquivalentProvenance {
+    pub fn new(key: LogicalName, node: ProvenanceNode) -> Self {
+        Self { key, node }
+    }
+}
+
 /// What `aub clear-diagnostics` removed, as the renderer sees it.
 ///
 /// Separate from `store::retention`'s own result of the same name, and deliberately so:
@@ -530,6 +623,9 @@ pub struct SpendReport {
     /// group's provenance so that a window whose every group refused conversion
     /// still names the model the refusal was measured against.
     pub credit_model: Option<CostModelId>,
+    /// The semantic window requested for calibrated spend conversion, when that
+    /// optional dimension was requested.
+    pub window_equivalent_window: Option<String>,
     /// One entry per distinct account group when `--group-by account` was
     /// requested, naming the marker evidence behind each attribution. Empty
     /// otherwise.
@@ -560,6 +656,7 @@ impl SpendReport {
             ingest,
             stale_rate_card_note: None,
             credit_model: None,
+            window_equivalent_window: None,
             account_explain: Vec::new(),
         }
     }
@@ -584,6 +681,11 @@ impl SpendReport {
         self
     }
 
+    pub fn with_window_equivalent_window(mut self, window: Option<String>) -> Self {
+        self.window_equivalent_window = window;
+        self
+    }
+
     pub fn with_credit_provenance(mut self, credits: Vec<SpendGroupCreditsProvenance>) -> Self {
         self.provenance = self
             .provenance
@@ -593,6 +695,19 @@ impl SpendReport {
                     credit.node,
                 )
             }));
+        self
+    }
+
+    pub fn with_window_equivalent_provenance(
+        mut self,
+        values: Vec<SpendGroupWindowEquivalentProvenance>,
+    ) -> Self {
+        self.provenance = self.provenance.with_added(values.into_iter().map(|value| {
+            (
+                ReportField::SpendGroupWindowEquivalent { key: value.key },
+                value.node,
+            )
+        }));
         self
     }
 
@@ -1510,6 +1625,10 @@ mod tests {
             LogicalName::new("by-day"),
             node(),
         )])
+        .with_window_equivalent_provenance(vec![SpendGroupWindowEquivalentProvenance::new(
+            LogicalName::new("by-day"),
+            node(),
+        )])
         .with_diagnostics(vec![
             SpendDiagnosticProvenance {
                 diagnostic: SpendDiagnostic::CanonicalRecords,
@@ -1571,6 +1690,9 @@ mod tests {
             ReportField::SpendGroupCredits {
                 key: LogicalName::new("by-day"),
             },
+            ReportField::SpendGroupWindowEquivalent {
+                key: LogicalName::new("by-day"),
+            },
             ReportField::SpendCanonicalRecords,
             ReportField::SpendReplayedOccurrences,
             ReportField::SpendHeuristicIdentities,
@@ -1596,7 +1718,9 @@ mod tests {
                     assert!(status.provenance.resolve(field).is_some(), "{account:?}");
                     assert!(now.provenance.resolve(field).is_some(), "{account:?}");
                 }
-                ReportField::SpendGroupTokens { key } | ReportField::SpendGroupCredits { key } => {
+                ReportField::SpendGroupTokens { key }
+                | ReportField::SpendGroupCredits { key }
+                | ReportField::SpendGroupWindowEquivalent { key } => {
                     assert!(spend.provenance.resolve(field).is_some(), "{key:?}");
                 }
                 ReportField::SpendCanonicalRecords

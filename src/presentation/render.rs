@@ -12,7 +12,7 @@ use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
 use crate::domain::money::{Currency, Money};
 use crate::domain::provenance::DerivationId;
-use crate::domain::quota::QuotaRemaining;
+use crate::domain::quota::{PercentagePoints, QuotaRemaining};
 use crate::domain::render::Precision;
 use crate::domain::time::{Age, ClockSkewEnvelope, MonotonicDuration, UtcTimestamp, age};
 use crate::domain::tokens::{TokenKind, UsageVector};
@@ -23,7 +23,7 @@ use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
     ActiveActivityState, CoverageReport, LivenessGap, NowReport, ProvenanceGraph, SpendGroup,
-    SpendReport, StatusReport, TaskOverheadReport, TaskReport,
+    SpendReport, StatusReport, TaskOverheadReport, TaskReport, WindowEquivalentDerivation,
 };
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
@@ -345,8 +345,13 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
         }
         None => String::new(),
     };
+    let window_equivalent_clause = report
+        .window_equivalent_window
+        .as_deref()
+        .map(|window| format!(", converted to window-equivalent percentage points for {window}"))
+        .unwrap_or_default();
     let mut lines = vec![format!(
-        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}{valuation_clause}{credit_clause}",
+        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}{valuation_clause}{credit_clause}{window_equivalent_clause}",
         report.since.iso(),
         report.until.iso()
     )];
@@ -526,6 +531,9 @@ fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>)
     if let Some(credits) = &group.credits {
         parts.push(render_credits(credits));
     }
+    if let Some(window_equivalent) = &group.window_equivalent {
+        parts.push(render_window_equivalent(window_equivalent));
+    }
     let qualification = match quality_term(group.usage.quality()) {
         Some(term) => term,
         None => coverage_term(group.usage.coverage()),
@@ -569,6 +577,39 @@ fn render_credits(credits: &Derivation<Credits>) -> String {
                 .join(", ")
         ),
     }
+}
+
+fn render_window_equivalent(result: &WindowEquivalentDerivation) -> String {
+    match result {
+        WindowEquivalentDerivation::Available(value) => {
+            let qualification = match quality_term(&value.quality) {
+                Some(term) => term,
+                None => coverage_term(&value.coverage),
+            };
+            format!(
+                "window equivalent [{}, {}] percentage points ({}; calibration {})",
+                render_percentage_points(value.interval.lower()),
+                render_percentage_points(value.interval.upper()),
+                qualification.term(),
+                value.calibration_id.as_str(),
+            )
+        }
+        WindowEquivalentDerivation::Unavailable { missing, .. } => format!(
+            "window equivalent unavailable: {}",
+            missing
+                .iter()
+                .map(RequiredFact::as_str)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+fn render_percentage_points(points: PercentagePoints) -> String {
+    let raw = i64::from(points.get());
+    let absolute = raw.unsigned_abs();
+    let sign = if raw < 0 { "-" } else { "" };
+    format!("{sign}{}.{:04}", absolute / 10_000, absolute % 10_000)
 }
 
 /// Formats a credit amount with two fractional digits, the same precision the

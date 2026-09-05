@@ -1,6 +1,6 @@
 //! Guards the module skeleton's dependency direction: the three lowest layers must not
-//! depend on SQLite, HTTP, or terminal-formatting crates, and the not-yet-implemented
-//! conversion-owning modules must document typed witnesses without implementing them.
+//! depend on SQLite, HTTP, or terminal-formatting crates, and every conversion-owning
+//! module must document its typed witness boundary.
 
 use std::fs;
 
@@ -12,8 +12,8 @@ const LOWEST_LAYERS: [&str; 3] = ["domain", "evidence", "config"];
 const ALL_CONVERSION_MODULES: [&str; 3] = ["cost_model", "calibration", "valuation"];
 
 /// The conversion-owning modules from PLAN.md section 9 (`UsageVector -> Credits`,
-/// `Credits -> PercentDelta`, `UsageVector -> ApiListPriceEquivalent`) that have not
-/// yet received their implementing bead.
+/// `Credits -> PercentDelta`, `UsageVector -> ApiListPriceEquivalent`) that may be
+/// intentionally documented before their implementing bead lands.
 ///
 /// Retired as implementation beads land:
 /// - `cost_model` retired in aub-ai3.2 (PLAN.md sections 9, 13.1, 24.1): implemented
@@ -21,8 +21,10 @@ const ALL_CONVERSION_MODULES: [&str; 3] = ["cost_model", "calibration", "valuati
 /// - `valuation` retired in aub-wyu.2 (PLAN.md sections 9, 25.1, 25.2, 25.4): implemented
 ///   `value_usage_vector()` and `value_batch()` behind explicit `RateBook` / `RateCard` witness.
 ///
-/// `calibration` stays listed until its own bead (aub-c0b.3/aub-c0b.4) lands the same way.
-const SKELETON_CONVERSION_MODULES: [&str; 1] = ["calibration"];
+/// All conversion modules now contain their implementation; this list remains as
+/// an extension point for a future conversion module that is intentionally staged
+/// as documentation before its consumer lands.
+const SKELETON_CONVERSION_MODULES: [&str; 0] = [];
 
 /// Crate families the lowest layers must not depend on (PLAN.md section 8.1).
 const FORBIDDEN_CRATES: &[&str] = &[
