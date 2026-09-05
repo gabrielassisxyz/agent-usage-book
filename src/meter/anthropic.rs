@@ -370,7 +370,7 @@ fn parse_limits_response(
         match kind {
             "session" | "weekly_all" | "weekly_scoped" => match parse_limit_window(kind, object) {
                 Ok(window) => {
-                    if is_required && !seen_required.iter().any(|seen| *seen == kind) {
+                    if is_required && !seen_required.contains(&kind) {
                         seen_required.push(kind);
                     }
                     windows.push(window);

@@ -363,7 +363,7 @@ fn limits_sample_reaches_the_ledger_and_projection() {
         .find(|window| window.scope.scoped_model().is_some())
         .expect("the scoped window must be stored");
     assert_eq!(scoped.quota_used.as_ppm().get(), 240_000);
-    assert_eq!(scoped.is_active, true);
+    assert!(scoped.is_active);
     assert_eq!(scoped.severity.as_str(), "critical");
     drop(conn);
 
