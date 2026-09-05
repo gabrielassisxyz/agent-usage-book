@@ -3286,7 +3286,7 @@ Representative modes:
 ```text
 aub sample --due
 aub sample --account work-a
-aub sample --all
+aub sample
 aub sample --account work-a --session-id SESSION
 ```
 
