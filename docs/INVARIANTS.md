@@ -60,3 +60,21 @@ same thing in both documents.
 ## Enforcement status
 
 Of the 27 invariants above, 26 are enforced by mechanical checks present at HEAD (file paths and tests), and 1 are unenforced and tracked by open beads in the tracker.
+
+## Maintaining this document
+
+Each row is satisfied one of two ways: it names the file path and test that
+enforce the invariant, or it names an open tracker bead that will. The audit
+test `tests::every_invariant_names_existing_file_and_test_or_open_tracker_bead`
+in `src/lib.rs` holds that rule, and its failure names every stale row number
+with the bead id that row points at, so the repair is one commit rather than
+an investigation.
+
+The change that makes an invariant enforced repoints its row in the same
+commit series: the Enforcing path column takes the enforcing file path, the
+Test or constraint column takes the test name, and both enforcement-summary
+counts are updated to match the table. Start the bead from
+`docs/INVARIANT_BEAD_TEMPLATE.md`, which carries that update as an acceptance
+criterion. No gate running before the close can observe a status the close
+has not yet produced, so a row left pointing at a bead turns the audit red on
+`main` only after that bead closes, in a run that touched none of it.

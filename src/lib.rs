@@ -281,6 +281,19 @@ mod tests {
         }
     }
 
+    /// Validates every row of one invariants document, returning one message per
+    /// stale row rather than stopping at the first. The audit test fails with
+    /// the joined messages, so a landing that leaves two rows stale names both
+    /// instead of sending the reader back for a second run (aub-p6ke). Each
+    /// message keeps the row number and the bead id (or enforcer path) the
+    /// single-row validator already reports; this only changes how many are
+    /// reported, never what one says.
+    fn validate_invariant_rows(rows: &[InvariantRow], base_dir: &str) -> Vec<String> {
+        rows.iter()
+            .filter_map(|row| validate_invariant_row(row, base_dir).err())
+            .collect()
+    }
+
     /// Compares the table's invariant list against docs/PLAN.md section 42.
     #[test]
     fn invariants_document_matches_plan_section_42() {
@@ -326,6 +339,7 @@ mod tests {
         let mut enforced_count = 0;
         let mut unenforced_count = 0;
         let mut tracker_membership_skipped = false;
+        let mut failures: Vec<String> = Vec::new();
 
         for row in &rows {
             match validate_invariant_row(row, manifest_dir) {
@@ -335,8 +349,16 @@ mod tests {
                     tracker_membership_skipped = true;
                     unenforced_count += 1;
                 }
-                Err(err) => panic!("{err}"),
+                Err(err) => failures.push(err),
             }
+        }
+
+        if !failures.is_empty() {
+            panic!(
+                "{} stale invariant row(s):\n{}",
+                failures.len(),
+                failures.join("\n")
+            );
         }
 
         if tracker_membership_skipped {
@@ -467,6 +489,86 @@ mod tests {
         assert_eq!(
             validate_invariant_row(&row, scratch.path()),
             Ok(InvariantRowValidation::Unenforced)
+        );
+    }
+
+    /// Builds a minimal invariants document around fixture table rows, parsed by
+    /// the same parser the audit uses, so the message the audit prints is proved
+    /// row by row rather than only against the live document.
+    fn fixture_invariants_document(rows_markdown: &str) -> String {
+        format!(
+            "# Fixture invariants\n\n| # | Invariant | Enforcing path | Test or constraint |\n|---:|---|---|---|\n{rows_markdown}"
+        )
+    }
+
+    /// A fixture row naming a closed bead fails, and the message names that row
+    /// number and that bead id (aub-p6ke).
+    #[test]
+    fn audit_fixture_row_naming_a_closed_bead_fails_naming_that_row_and_bead() {
+        let scratch =
+            ScratchTrackerDir::with_issues("{\"id\":\"aub-stale-bead\",\"status\":\"closed\"}\n");
+        let docs = fixture_invariants_document(
+            "| 7 | Fixture invariant seven. | unenforced aub-stale-bead | (some check) |\n",
+        );
+        let failures = validate_invariant_rows(&parse_invariant_rows(&docs), scratch.path());
+        assert_eq!(failures.len(), 1, "unexpected failures: {failures:?}");
+        assert!(
+            failures[0].contains("invariant 7") && failures[0].contains("aub-stale-bead"),
+            "message names neither the row nor the bead: {}",
+            failures[0]
+        );
+    }
+
+    /// A fixture row naming an open bead passes.
+    #[test]
+    fn audit_fixture_row_naming_an_open_bead_passes() {
+        let scratch =
+            ScratchTrackerDir::with_issues("{\"id\":\"aub-live-bead\",\"status\":\"open\"}\n");
+        let docs = fixture_invariants_document(
+            "| 7 | Fixture invariant seven. | unenforced aub-live-bead | (some check) |\n",
+        );
+        let failures = validate_invariant_rows(&parse_invariant_rows(&docs), scratch.path());
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+    }
+
+    /// A fixture row naming an existing file and test passes with no bead
+    /// involved at all.
+    #[test]
+    fn audit_fixture_row_naming_a_file_and_test_passes_with_no_bead() {
+        let scratch =
+            ScratchTrackerDir::with_issues("{\"id\":\"aub-other\",\"status\":\"open\"}\n");
+        fs::write(
+            format!("{}/fixture_enforcer.rs", scratch.path()),
+            "// fixture enforcer\nfn fixture_check() {}\n",
+        )
+        .expect("scratch enforcer file must be writable");
+        let docs = fixture_invariants_document(
+            "| 3 | Fixture invariant three. | fixture_enforcer.rs | tests::fixture_check |\n",
+        );
+        let failures = validate_invariant_rows(&parse_invariant_rows(&docs), scratch.path());
+        assert!(failures.is_empty(), "unexpected failures: {failures:?}");
+    }
+
+    /// A fixture document with two stale rows names both row numbers and both
+    /// bead ids, not only the first (aub-p6ke).
+    #[test]
+    fn audit_fixture_with_two_stale_rows_names_both() {
+        let scratch = ScratchTrackerDir::with_issues(
+            "{\"id\":\"aub-stale-one\",\"status\":\"closed\"}\n{\"id\":\"aub-stale-two\",\"status\":\"closed\"}\n",
+        );
+        let docs = fixture_invariants_document(
+            "| 4 | Fixture invariant four. | unenforced aub-stale-one | (some check) |\n| 9 | Fixture invariant nine. | unenforced aub-stale-two | (some check) |\n",
+        );
+        let failures = validate_invariant_rows(&parse_invariant_rows(&docs), scratch.path());
+        assert_eq!(failures.len(), 2, "unexpected failures: {failures:?}");
+        let joined = failures.join("\n");
+        assert!(
+            joined.contains("invariant 4") && joined.contains("aub-stale-one"),
+            "missing row 4 and its bead: {joined}"
+        );
+        assert!(
+            joined.contains("invariant 9") && joined.contains("aub-stale-two"),
+            "missing row 9 and its bead: {joined}"
         );
     }
 
