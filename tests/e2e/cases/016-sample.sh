@@ -55,12 +55,20 @@ case_steps() {
     # 5. Assert marker exists in SQLite
     step "query-marker" sqlite3 "$LEDGER_DB" "SELECT session_native, logical_account FROM session_account_marker WHERE session_native = 'test-sess-1'"
 
-    # 6. Usage error: bare aub sample without selector exits 2
-    step "sample-usage-error" env \
+    # 6. Bare aub sample with no selector samples every configured account
+    step "sample-bare-no-selector" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
+        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
         "$AUB_BIN" sample
+
+    # 7. Refusal: aub sample --all exits 2 naming the bare form
+    step "sample-all-refused" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_STATE_DIR=$STATE_DIR" \
+        "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
+        "$AUB_BIN" sample --all
 }
 
 case_assertions() {
@@ -84,7 +92,12 @@ case_assertions() {
     assert_exit 0 5
     assert_stdout_contains 5 "test-sess-1|work-primary"
 
-    # Step 6: bare sample exits 2
-    assert_exit 2 6
-    assert_stderr_contains 6 "sample requires --due, --account, or --all"
+    # Step 6: bare sample with no selector samples every configured account
+    assert_exit 0 6
+    assert_stdout_contains 6 "sample: account=work-primary outcome=unreachable"
+
+    # Step 7: aub sample --all exits 2 naming the bare form
+    assert_exit 2 7
+    assert_stderr_contains 7 "unknown argument: --all"
+    assert_stderr_contains 7 "run aub sample alone"
 }

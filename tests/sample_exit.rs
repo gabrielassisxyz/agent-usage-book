@@ -268,18 +268,19 @@ fn require_success_exits_zero_on_success() {
 fn usage_flag_validation_errors_exit_2() {
     let env = Environment::new("usage-errors");
 
-    // Bare aub sample (no selector)
-    let (status, _, stderr) = env.run("http://127.0.0.1:0", &["sample"]);
+    // Refusal of removed --all flag naming bare aub sample
+    let (status, _, stderr) = env.run("http://127.0.0.1:0", &["sample", "--all"]);
     assert_eq!(status, 2);
-    assert!(stderr.contains("sample requires --due, --account, or --all"));
+    assert!(stderr.contains("unknown argument: --all"));
+    assert!(stderr.contains("run aub sample alone"));
 
-    // Conflicting --all and --account
     let (status, _, stderr) = env.run(
         "http://127.0.0.1:0",
         &["sample", "--all", "--account", "work-primary"],
     );
     assert_eq!(status, 2);
-    assert!(stderr.contains("--all and --account cannot be used together"));
+    assert!(stderr.contains("unknown argument: --all"));
+    assert!(stderr.contains("run aub sample alone"));
 
     // --session-id without --account
     let (status, _, stderr) = env.run(
@@ -465,5 +466,55 @@ fn sample_and_status_idle_five_hour_window_stores_observation_and_renders_no_win
     assert!(
         status_stdout.contains("100% left · no window in progress"),
         "status stdout must contain '100% left · no window in progress', got: {status_stdout}"
+    );
+}
+
+#[test]
+fn bare_sample_covers_every_configured_account_with_two_stub_accounts() {
+    let env = Environment::new("bare-sample-two-accounts");
+
+    let toml_content = format!(
+        "state.dir = \"{}\"\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}\" }}\n\n[[accounts]]\nname = \"work-secondary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}\" }}\n",
+        env.state_dir().display(),
+        env.root.join("creds/token.json").display(),
+        env.root.join("creds/token.json").display(),
+    );
+    std::fs::write(env.root.join("aub.toml"), toml_content).unwrap();
+
+    let server = SyntheticServer::start(vec![
+        ScriptedOutcome::Success(ScriptedResponseBody::json_ok(
+            ANTHROPIC_SUCCESS_BODY.to_vec(),
+        )),
+        ScriptedOutcome::Success(ScriptedResponseBody::json_ok(
+            ANTHROPIC_SUCCESS_BODY.to_vec(),
+        )),
+    ])
+    .unwrap();
+
+    // Bare aub sample samples both accounts
+    let (code, stdout, stderr) = env.run(&server.url(), &["sample"]);
+    assert_eq!(code, 0, "bare sample must succeed; stderr: {stderr}");
+    assert!(
+        stdout.contains("sample: account=work-primary outcome=success"),
+        "stdout must contain work-primary success: {stdout}"
+    );
+    assert!(
+        stdout.contains("sample: account=work-secondary outcome=success"),
+        "stdout must contain work-secondary success: {stdout}"
+    );
+
+    // aub sample --all exits 2 naming the bare form
+    let (code_all, stdout_all, stderr_all) = env.run(&server.url(), &["sample", "--all"]);
+    assert_eq!(
+        code_all, 2,
+        "sample --all must exit 2; stdout: {stdout_all}"
+    );
+    assert!(
+        stderr_all.contains("unknown argument: --all"),
+        "stderr must report unknown argument: {stderr_all}"
+    );
+    assert!(
+        stderr_all.contains("run aub sample alone"),
+        "stderr must name bare form: {stderr_all}"
     );
 }
