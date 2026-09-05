@@ -75,6 +75,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         accumulated_diagnostic_material(ctx),
         adapter_semantics_comparison_age(ctx),
         last_sample_tick(ctx),
+        sampling_failure_counts(ctx),
     ]
 }
 
@@ -130,6 +131,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::AccumulatedDiagnosticMaterial => "store::retention",
         CheckName::AdapterSemanticsComparisonAge => "store::adapter_semantics_validation",
         CheckName::LastSampleTick => "store::sample_tick",
+        CheckName::SamplingFailureCounts => "store::sampling_failure_counts",
     }
 }
 
@@ -182,6 +184,9 @@ fn condition_of(name: CheckName) -> &'static str {
              surface is within its configured review horizon"
         }
         CheckName::LastSampleTick => "the last aub sample invocation succeeded",
+        CheckName::SamplingFailureCounts => {
+            "no persist-failed or due-lookup-failed sampler disposition has ever been recorded"
+        }
     }
 }
 
@@ -1062,6 +1067,34 @@ fn last_sample_tick(ctx: &DoctorContext) -> CheckOutcome {
         Err(error) => CheckStatus::Fail(format!("cannot read the last sample tick: {error}")),
     };
     outcome(CheckName::LastSampleTick, status)
+}
+
+/// Every persist-failed and due-lookup-failed sampler disposition ever
+/// recorded, by reason (`aub-b0w6`), read from
+/// `crate::store::sampling_failure_counts` rather than the ledger or the
+/// scheduler's journal. Cumulative and never self-clearing, the same shape as
+/// [`accumulated_diagnostic_material`]'s retained rows: a nonzero total is a
+/// recurrence worth a human's attention, so it stays a `Fail` until whoever
+/// reads it acts on it, not until the next tick happens to succeed.
+fn sampling_failure_counts(ctx: &DoctorContext) -> CheckOutcome {
+    let status = match crate::store::sampling_failure_counts::read_sampling_failure_counts(
+        &ctx.config.state.dir,
+    ) {
+        Ok(counts) if counts.is_empty() => CheckStatus::Pass,
+        Ok(mut counts) => {
+            counts.sort_by(|a, b| (&a.category, &a.reason).cmp(&(&b.category, &b.reason)));
+            let detail = counts
+                .iter()
+                .map(|c| format!("{}: {} (count={})", c.category, c.reason, c.count))
+                .collect::<Vec<_>>()
+                .join(", ");
+            CheckStatus::Fail(detail)
+        }
+        Err(error) => {
+            CheckStatus::Fail(format!("cannot read the sampling failure counts: {error}"))
+        }
+    };
+    outcome(CheckName::SamplingFailureCounts, status)
 }
 
 #[cfg(test)]
