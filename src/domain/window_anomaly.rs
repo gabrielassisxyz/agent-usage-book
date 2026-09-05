@@ -31,7 +31,7 @@ use crate::domain::window::{WindowResetState, WindowScopeKind};
 /// The two evidence-problem classes a consecutive-window comparison can
 /// surface. There is no third: every other transition, including one that
 /// changes nothing, classifies as `None` from [`classify_window_transition`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WindowAnomalyKind {
     /// The reported used fraction fell without a boundary reset that could
     /// explain the drop.

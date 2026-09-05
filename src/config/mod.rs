@@ -290,6 +290,56 @@ pub struct AdapterSemanticsConfig {
     pub max_comparison_age: MonotonicDuration,
 }
 
+/// The exclusivity policy for a configured account (`aub-c0b.7`).
+///
+/// Exhaustive with no wildcard arm: an unrecognized configured value fails
+/// configuration resolution with [`Error::Usage`] naming `accounts[].exclusivity_policy`,
+/// matching this repository's rule for configured values (`QuantileMethod`, `CanRunHeadroomBound`).
+///
+/// Accepted values:
+/// - `"permit_passive"`: passive calibration fitting is permitted on this account.
+/// - `"forbid_passive"`: passive calibration fitting is forbidden on this account.
+///
+/// An absent `exclusivity_policy` key in `[[accounts]]` defaults to [`Self::ForbidPassive`].
+/// This conservative (fail-closed) default ensures an account without an explicit policy
+/// is not assumed to have exclusive traffic, preventing multi-consumer or unverified
+/// sessions from silently contaminating passive calibration candidates.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AccountExclusivityPolicy {
+    /// Passive calibration fitting is permitted on this account.
+    PermitPassive,
+    /// Passive calibration fitting is forbidden on this account (the conservative default).
+    #[default]
+    ForbidPassive,
+}
+
+impl AccountExclusivityPolicy {
+    /// The stable name this policy resolves from and renders under.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PermitPassive => "permit_passive",
+            Self::ForbidPassive => "forbid_passive",
+        }
+    }
+
+    /// Parses the stable name, returning `None` for any unrecognized value.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "permit_passive" => Some(Self::PermitPassive),
+            "forbid_passive" => Some(Self::ForbidPassive),
+            _ => None,
+        }
+    }
+
+    /// True when this policy permits passive calibration fitting.
+    pub const fn permits_passive_fitting(self) -> bool {
+        match self {
+            Self::PermitPassive => true,
+            Self::ForbidPassive => false,
+        }
+    }
+}
+
 /// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
 /// of the file's `credential` table (`kind`, plus its `ref` or `path`): the typed,
 /// validated credential model belongs to `aub-eun.1`, which consumes this section.
@@ -299,6 +349,14 @@ pub struct AccountConfig {
     pub provider: String,
     pub credential_kind: String,
     pub credential_detail: String,
+    pub exclusivity_policy: AccountExclusivityPolicy,
+}
+
+impl AccountConfig {
+    /// True when this account's exclusivity policy permits passive calibration fitting (`aub-c0b.7`).
+    pub fn permits_passive_fitting(&self) -> bool {
+        self.exclusivity_policy.permits_passive_fitting()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -417,7 +475,7 @@ const TASK_DISTRIBUTION_KEYS: &[&str] = &[
 ];
 const CAN_RUN_KEYS: &[&str] = &["labels", "ample_margin_multiple", "headroom_bound"];
 const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible"];
-const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
+const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential", "exclusivity_policy"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
@@ -1301,7 +1359,22 @@ pub fn resolve(
                 .filter_map(toml::Value::as_table)
                 .map(|entry| {
                     let credential = entry.get("credential").and_then(toml::Value::as_table);
-                    AccountConfig {
+                    let exclusivity_policy = match entry.get("exclusivity_policy") {
+                        Some(val) => {
+                            let raw = val.as_str().ok_or_else(|| {
+                                Error::Usage(
+                                    "accounts[].exclusivity_policy must be a string".to_string(),
+                                )
+                            })?;
+                            AccountExclusivityPolicy::parse(raw).ok_or_else(|| {
+                                Error::Usage(format!(
+                                    "accounts[].exclusivity_policy: {raw:?} is not a recognized exclusivity policy"
+                                ))
+                            })?
+                        }
+                        None => AccountExclusivityPolicy::ForbidPassive,
+                    };
+                    Ok(AccountConfig {
                         name: entry
                             .get("name")
                             .and_then(toml::Value::as_str)
@@ -1322,10 +1395,12 @@ pub fn resolve(
                             .and_then(toml::Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
-                    }
+                        exclusivity_policy,
+                    })
                 })
-                .collect()
+                .collect::<Result<Vec<_>, Error>>()
         })
+        .transpose()?
         .unwrap_or_default();
     if !accounts.is_empty() {
         provenance.set("accounts", ConfigSource::File);
@@ -2037,5 +2112,98 @@ credential = { kind = "unknown-future-kind", anything = "goes" }
         let file = "[can_run]\nnope = 1\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("can_run.nope"), "{err}");
+    }
+
+    #[test]
+    fn account_exclusivity_policy_accepted_spellings() {
+        let file = r#"
+[[accounts]]
+name = "work-permit"
+provider = "anthropic"
+exclusivity_policy = "permit_passive"
+
+[[accounts]]
+name = "work-forbid"
+provider = "anthropic"
+exclusivity_policy = "forbid_passive"
+"#;
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.accounts[0].exclusivity_policy,
+            AccountExclusivityPolicy::PermitPassive
+        );
+        assert!(config.accounts[0].permits_passive_fitting());
+        assert_eq!(
+            config.accounts[1].exclusivity_policy,
+            AccountExclusivityPolicy::ForbidPassive
+        );
+        assert!(!config.accounts[1].permits_passive_fitting());
+    }
+
+    #[test]
+    fn account_exclusivity_policy_unknown_value_is_usage_error() {
+        let file = r#"
+[[accounts]]
+name = "work"
+provider = "anthropic"
+exclusivity_policy = "shared"
+"#;
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("accounts[].exclusivity_policy"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn account_exclusivity_policy_absent_key_defaults_to_forbid_passive() {
+        let file = r#"
+[[accounts]]
+name = "work"
+provider = "anthropic"
+"#;
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.accounts[0].exclusivity_policy,
+            AccountExclusivityPolicy::ForbidPassive
+        );
+        assert!(!config.accounts[0].permits_passive_fitting());
+    }
+
+    #[test]
+    fn account_exclusivity_policy_parse_and_as_str() {
+        assert_eq!(
+            AccountExclusivityPolicy::PermitPassive.as_str(),
+            "permit_passive"
+        );
+        assert_eq!(
+            AccountExclusivityPolicy::ForbidPassive.as_str(),
+            "forbid_passive"
+        );
+        assert_eq!(
+            AccountExclusivityPolicy::parse("permit_passive"),
+            Some(AccountExclusivityPolicy::PermitPassive)
+        );
+        assert_eq!(
+            AccountExclusivityPolicy::parse("forbid_passive"),
+            Some(AccountExclusivityPolicy::ForbidPassive)
+        );
+        assert_eq!(AccountExclusivityPolicy::parse("shared"), None);
+        assert_eq!(AccountExclusivityPolicy::parse("dedicated"), None);
+        assert_eq!(AccountExclusivityPolicy::parse(""), None);
+    }
+
+    #[test]
+    fn account_exclusivity_alias_is_rejected_as_unknown_key() {
+        let file = r#"
+[[accounts]]
+name = "work"
+provider = "anthropic"
+exclusivity = "permit_passive"
+"#;
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("exclusivity"), "{err}");
     }
 }

@@ -187,9 +187,15 @@ external scheduler, never by a loop inside `aub`. `begin` refuses when the
 named cost model covers none of the expected token kinds, when the account has
 no sampled baseline yet, and when the account already runs an experiment;
 `end` records the end of controlled work and never declares the meter
-settled. `fit` refuses to activate candidate calibrations automatically:
+settled. `fit` and `passive` refuse to activate candidate calibrations automatically:
 candidates are written immutably and never promoted to active status by the
-fitter. The command also refuses `--explain`, `--model` and `--no-color`: a
+fitter (Invariant 14). Subcommand `passive` generates candidates from
+uncontrolled, recorded observations across clean intervals under strict
+eligibility rules. Intervals are eligible only when the account's configured
+exclusivity policy explicitly permits passive fitting (`exclusivity_policy = "permit_passive"`
+under `[[accounts]]`). Absent key defaults to `"forbid_passive"` (conservative/fail-closed),
+and unknown values fail configuration loading with an error naming `accounts[].exclusivity_policy`.
+The command also refuses `--explain`, `--model` and `--no-color`: a
 calibration experiment or fit is scoped by account, window or evidence set,
 never by those dimensions.
 

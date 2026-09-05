@@ -12,4 +12,5 @@ pub mod contamination;
 pub mod fitter;
 pub mod health;
 pub mod multivariate;
+pub mod passive;
 pub mod settlement;
