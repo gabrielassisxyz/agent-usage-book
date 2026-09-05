@@ -52,7 +52,11 @@ monotonic_ns() {
 state_digest() {
     local dir="$1"
     if [ -d "$dir" ]; then
-        (cd "$dir" && find . -type f -print0 | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
+        # The 006 case deliberately holds a mode-000 directory while its steps
+        # run, which find cannot descend into: its stderr is suppressed like
+        # every other find in this runner, so a green run prints no
+        # permission errors for a condition the suite created on purpose.
+        (cd "$dir" && find . -type f -print0 2>/dev/null | sort -z | xargs -0 sha256sum 2>/dev/null | sha256sum | cut -d' ' -f1)
     else
         echo "absent"
     fi
