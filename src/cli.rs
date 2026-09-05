@@ -4522,13 +4522,13 @@ fn calibrate_begin_validated(
             ))
         })?;
     let baseline =
-        crate::store::meter_evidence::newest_observation_for_account(&conn, account_id)?
+        crate::store::meter_evidence::newest_observation_for_account(conn, account_id)?
             .ok_or_else(|| {
                 Error::Usage(format!(
                     "no meter observation for account '{account}': sample first with `aub sample --account {account}`"
                 ))
             })?;
-    let windows = crate::store::meter_evidence::windows_by_observation(&conn, baseline.row_id)?;
+    let windows = crate::store::meter_evidence::windows_by_observation(conn, baseline.row_id)?;
     let window = windows
         .iter()
         .find(|entry| entry.semantic_key.as_str() == args.window)
@@ -6352,50 +6352,14 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
     /// A scratch ledger for the `calibrate` unit tests: a migrated database in
     /// a temp directory that removes itself. The tests drive
     /// [`calibrate_begin_validated`] and [`calibrate_resolve_experiment`]
-    /// against it with no environment involved.
-    struct CalibrateScratchDir(std::path::PathBuf);
-
-    impl CalibrateScratchDir {
-        fn new() -> Self {
-            static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-            let suffix = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            let path = std::env::temp_dir().join(format!(
-                "aub-cli-calibrate-test-{}-{suffix}",
-                std::process::id()
-            ));
-            std::fs::create_dir(&path).expect("scratch dir must be creatable");
-            Self(path)
-        }
-    }
-
-    impl Drop for CalibrateScratchDir {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    fn calibrate_fixture_db() -> (CalibrateScratchDir, rusqlite::Connection) {
-        use crate::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
-        use crate::store::connection::{AccessMode, PragmaPolicy, open};
-        use crate::store::migrate::run_migrations;
-        use crate::store::migrations::registry;
-        let scratch = CalibrateScratchDir::new();
-        let mut conn = open(
-            &scratch.0.join("calibrate.db"),
-            AccessMode::ReadWrite,
-            &PragmaPolicy {
-                busy_timeout: MonotonicDuration::from_millis(1_000),
-            },
-        )
-        .expect("scratch database must open");
-        run_migrations(
-            &mut conn,
-            &registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-        )
-        .expect("migrations must run");
-        (scratch, conn)
+    /// against it with no environment involved. The ledger lives in the store
+    /// so this file carries no SQL and no migration import (boundary rules 15
+    /// and 16); the wrappers below only delegate.
+    fn calibrate_fixture_db() -> (
+        crate::store::calibrate_cli_test_ledger::CalibrateCliTestLedgerDir,
+        rusqlite::Connection,
+    ) {
+        crate::store::calibrate_cli_test_ledger::open_calibrate_cli_test_ledger()
     }
 
     fn calibrate_insert_meter_chain(
@@ -6405,89 +6369,13 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
         received_at: crate::domain::time::UtcTimestamp,
         quota_ppm: i64,
     ) {
-        use rusqlite::params;
-        let account_id: i64 = conn
-            .query_row(
-                "INSERT INTO account (logical_name, provider_key, first_observed_at, last_observed_at)
-                 VALUES (?1, 'anthropic', ?2, ?2)
-                 ON CONFLICT (provider_key, logical_name) DO UPDATE SET
-                     last_observed_at = MAX(last_observed_at, excluded.last_observed_at)
-                 RETURNING id",
-                params![account, received_at.unix_nanos()],
-                |row| row.get(0),
-            )
-            .expect("account insert must work");
-        let run_id: i64 = conn
-            .query_row(
-                "INSERT INTO sample_run (trigger, started_at, ended_at, aub_version, configuration_fingerprint)
-                 VALUES ('manual', ?1, NULL, 'test', 'fp') RETURNING id",
-                params![received_at.unix_nanos()],
-                |row| row.get(0),
-            )
-            .expect("sample run insert must work");
-        let snapshot_id: i64 = conn
-            .query_row(
-                "INSERT INTO sampling_policy_snapshot (
-                    account_id, effective_at, ordinary_cadence_nanos, freshness_horizon_nanos,
-                    reset_edge_policy, retry_backoff_policy, command_budget_nanos, policy_algorithm_version
-                 ) VALUES (?1, ?2, 3600000000000, 300000000000, 'lead-60s', 'none', 10000000000, 'v1')
-                 RETURNING id",
-                params![account_id, received_at.unix_nanos()],
-                |row| row.get(0),
-            )
-            .expect("policy snapshot insert must work");
-        let attempt_id: i64 = conn
-            .query_row(
-                "INSERT INTO meter_attempt (
-                    run_id, account_id, provider, request_started_at, policy_snapshot_id,
-                    due_at, due_reason, provider_contract_id, meter_semantics_id
-                 ) VALUES (?1, ?2, 'anthropic', ?3, ?4, ?3, 'forced_or_manual', 'contract-v1', 'meter-v1')
-                 RETURNING id",
-                params![run_id, account_id, received_at.unix_nanos(), snapshot_id],
-                |row| row.get(0),
-            )
-            .expect("attempt insert must work");
-        let evidence_id: i64 = conn
-            .query_row(
-                "INSERT INTO meter_response_evidence (
-                    attempt_id, response_classification, received_at, evidence_capsule,
-                    capsule_schema_version, sanitizer_version, content_hash, capture_truncated
-                 ) VALUES (?1, 'success', ?2, 'capsule', 'v1', 'v1', 'hash', 0) RETURNING id",
-                params![attempt_id, received_at.unix_nanos()],
-                |row| row.get(0),
-            )
-            .expect("evidence insert must work");
-        let observation_id: i64 = conn
-            .query_row(
-                "INSERT INTO meter_observation (
-                    attempt_id, evidence_id, account_id, provider, received_at,
-                    measurement_basis, adapter_version, provider_contract_id,
-                    meter_semantics_id, normalized_fingerprint
-                 ) VALUES (?1, ?2, ?3, 'anthropic', ?4, 'locally_received', 'adapter-v1',
-                    'contract-v1', 'meter-v1', 'fingerprint') RETURNING id",
-                params![
-                    attempt_id,
-                    evidence_id,
-                    account_id,
-                    received_at.unix_nanos()
-                ],
-                |row| row.get(0),
-            )
-            .expect("observation insert must work");
-        conn.execute(
-            "INSERT INTO meter_window (
-                observation_id, semantic_key, scope_kind, quota_used_ppm,
-                reported_resolution_ppm, quantization, resets_at, reset_state,
-                nominal_duration_nanos, is_active, severity
-             ) VALUES (?1, ?2, 'account_wide', ?3, 10000, 'exact', ?4, 'known', 18000000000000, 1, 'unknown')",
-            params![
-                observation_id,
-                semantic_key,
-                quota_ppm,
-                received_at.unix_nanos() + 18_000_000_000_000
-            ],
-        )
-        .expect("window insert must work");
+        crate::store::calibrate_cli_test_ledger::insert_calibrate_cli_meter_chain(
+            conn,
+            account,
+            semantic_key,
+            received_at,
+            quota_ppm,
+        );
     }
 
     fn calibrate_activate_cost_model(conn: &mut rusqlite::Connection, complete: bool) {
