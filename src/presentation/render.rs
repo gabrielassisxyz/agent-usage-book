@@ -1477,6 +1477,188 @@ pub fn render_clear_diagnostics(report: &crate::report::ClearDiagnosticsReport) 
     }
 }
 
+use crate::domain::interval::Interval;
+
+fn format_credit_int_commas(credits: Credits) -> String {
+    let whole = credits.micros() / 1_000_000;
+    format_int_with_commas(whole)
+}
+
+fn format_int_with_commas(n: i64) -> String {
+    let sign = if n < 0 { "-" } else { "" };
+    let s = n.abs().to_string();
+    let mut out = String::new();
+    for (count, c) in s.chars().rev().enumerate() {
+        if count > 0 && count % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{}{}", sign, out.chars().rev().collect::<String>())
+}
+
+fn format_credit_interval_commas(interval: Interval<Credits>) -> String {
+    format!(
+        "{}–{}",
+        format_credit_int_commas(interval.lower()),
+        format_credit_int_commas(interval.upper())
+    )
+}
+
+pub(crate) fn format_duration_age(duration: MonotonicDuration) -> String {
+    let seconds = duration.as_nanos() / 1_000_000_000;
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 3_600 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h", seconds / 3_600)
+    } else {
+        format!("{}d", seconds / 86_400)
+    }
+}
+
+pub(crate) fn format_time_hh_mm(timestamp: UtcTimestamp) -> String {
+    let total_seconds = timestamp.unix_nanos().div_euclid(1_000_000_000);
+    let day_seconds = total_seconds.rem_euclid(86_400);
+    let hour = day_seconds / 3600;
+    let minute = (day_seconds % 3600) / 60;
+    format!("{:02}:{:02}", hour, minute)
+}
+
+/// Renders the can-run report according to PLAN.md §51.
+pub fn render_can_run_report(report: &crate::report::CanRunReport) -> String {
+    match &report.outcome {
+        crate::report::CanRunOutcome::Ready(ready) => {
+            let mut out = String::new();
+            out.push_str(&format!("can-run: {}\n", report.task_kind));
+            out.push_str(&format!("account: {}\n", report.account));
+            out.push_str(&format!("model: {}\n\n", report.model));
+
+            let age_str = match ready.observed_age {
+                Some(age) => format!("{} ago", format_duration_age(age)),
+                None => "just now".to_string(),
+            };
+            out.push_str(&format!(
+                "constraining windows, fresh, observed {age_str}:\n"
+            ));
+            for w in &ready.windows {
+                let pct = format!("{:.1}%", w.remaining_fraction_ppm as f64 / 10_000.0);
+                out.push_str(&format!(
+                    "  - {:<14}  {:>4} remaining  calibration #{}  headroom {} credits\n",
+                    w.semantic_key.as_str(),
+                    pct,
+                    w.calibration_id,
+                    format_credit_interval_commas(w.headroom)
+                ));
+            }
+            out.push_str(&format!(
+                "  - lowest remaining percentage: {}\n",
+                ready.lowest_percentage_window.as_str()
+            ));
+            out.push_str(&format!(
+                "  - limiting calibrated window:  {}\n",
+                ready.limiting_window.as_str()
+            ));
+            for w in &ready.windows {
+                if let Some(resets) = w.resets_at {
+                    out.push_str(&format!(
+                        "  - {} resets {}\n",
+                        w.semantic_key.as_str(),
+                        format_time_hh_mm(resets)
+                    ));
+                }
+            }
+            out.push('\n');
+
+            out.push_str("historical exact task evidence:\n");
+            out.push_str(&format!("  - n = {}\n", ready.task_evidence.sample_count));
+            out.push_str(&format!(
+                "  - median = {} credits\n",
+                format_credit_int_commas(ready.task_evidence.median)
+            ));
+            out.push_str(&format!(
+                "  - p25–p75 = {} credits\n",
+                format_credit_interval_commas(ready.task_evidence.central_range)
+            ));
+            out.push_str(&format!(
+                "  - p90 = {} credits\n\n",
+                format_credit_int_commas(ready.task_evidence.upper_reference)
+            ));
+
+            out.push_str("calibration:\n");
+            out.push_str(&format!("  - {}\n", ready.calibration_summary.description));
+            if ready.calibration_summary.token_kind_coverage_complete {
+                out.push_str("  - complete token-kind coverage\n\n");
+            } else {
+                out.push_str("  - incomplete token-kind coverage\n\n");
+            }
+
+            out.push_str("comparison:\n");
+            for c in &ready.comparisons {
+                out.push_str(&format!(
+                    "  - {:<14}  central range leaves {} credits\n",
+                    c.semantic_key.as_str(),
+                    format_credit_interval_commas(c.margin)
+                ));
+            }
+            if let Some(u) = &ready.upper_reference_comparison {
+                if u.exceeds {
+                    out.push_str(&format!(
+                        "  - p90 reference exceeds {} headroom by {} credits\n\n",
+                        u.limiting_window.as_str(),
+                        format_credit_interval_commas(u.diff)
+                    ));
+                } else {
+                    out.push_str(&format!(
+                        "  - p90 reference leaves {} credits of {} headroom\n\n",
+                        format_credit_interval_commas(u.diff),
+                        u.limiting_window.as_str()
+                    ));
+                }
+            } else {
+                out.push('\n');
+            }
+
+            out.push_str(&format!("assessment: {}\n", ready.assessment.as_str()));
+            out.push_str(&format!(
+                "limiting window: {}\n",
+                ready.limiting_window.as_str()
+            ));
+            out
+        }
+        crate::report::CanRunOutcome::Refused(refused) => {
+            let mut out = format!("assessment: {}\n", refused.verdict.as_str());
+            if refused.missing.len() == 1 && refused.attribution_quality.is_none() {
+                out.push_str(&format!("reason: {}\n", refused.missing[0].reason));
+            } else {
+                out.push_str("missing:\n");
+                for fact in &refused.missing {
+                    out.push_str(&format!("  - {}: {}\n", fact.subject, fact.reason));
+                }
+                if let Some(attr) = &refused.attribution_quality {
+                    let num_cr = format_int_with_commas(attr.numerator_micros / 1_000_000);
+                    let denom_cr = format_int_with_commas(attr.denominator_micros / 1_000_000);
+                    out.push_str(&format!(
+                        "  - attribution_coverage_below_floor: numerator={}cr, denominator={}cr, fraction={:.2}, floor={:.2}, window={}, group={}, exclusions: unknown_tokens={}, unknown_account={}, incomplete_segmentation={}, estimated_tokens={}\n",
+                        num_cr,
+                        denom_cr,
+                        attr.observed_fraction_ppm as f64 / 1_000_000.0,
+                        attr.required_floor_ppm as f64 / 1_000_000.0,
+                        attr.selection_window,
+                        attr.group,
+                        attr.unknown_token_components,
+                        attr.unknown_account_attribution,
+                        attr.incomplete_segmentation,
+                        attr.estimated_tokens
+                    ));
+                }
+            }
+            out
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

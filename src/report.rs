@@ -9,6 +9,8 @@ pub mod models;
 pub mod provenance;
 
 pub mod activity;
+pub mod can_run;
+pub mod can_run_evidence;
 pub mod coverage;
 pub mod export;
 pub mod spend;
@@ -18,6 +20,8 @@ pub use activity::{
     ActiveActivityState, ActiveActivityStateKind, ActiveSpendClaim, InactiveSpendClaim,
     LivenessGap, compose_active_activity,
 };
+pub use can_run::*;
+pub use can_run_evidence::gather_task_history_group_report;
 pub use models::{
     AccountGroupExplain, AccountMarkerReference, BackupReport, CalibrateReport,
     ClearDiagnosticsReport, CoverageAccount, CoverageBreach, CoverageBreachDimension,

@@ -19,4 +19,5 @@ now
 drill
 task
 compare
+can-run
 calibrate

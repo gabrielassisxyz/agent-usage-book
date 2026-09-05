@@ -86,6 +86,25 @@ a task total and a task-grouped spend row can never disagree. Usage outside
 every claim window is not dropped and not folded into a neighbouring task: it
 is reported under a named overhead bucket that says why it was unattributable.
 
+## `aub can-run`
+
+**Answers:** given a fresh or cached calibrated credit headroom and the
+historical cost of `--task-kind TYPE`, can `--task-model MODEL` run now under
+`--account NAME`? By default the command performs and persists one fresh
+meter sample for the account first, the same sampler path `aub sample
+--account` uses, before advising; `--cached` uses the newest persisted
+reading instead, but only while it still satisfies the freshness policy.
+
+**Refuses:** to guess. Any of seven missing prerequisites, a stale meter,
+authentication required, a constraining window with no applicable current
+calibration, a cost model missing a token class, a plan tier mismatch, too
+few historical tasks, or mostly unattributable task records, produces a
+refusal naming every one that applies in the same invocation rather than the
+first one found, and a refusal exits `0` with the refusal rendered, not a
+usage error. It never substitutes a global average task cost, a different
+plan tier's calibration, an estimated-token session, a stale meter reading,
+or an API-list-price conversion for a number it cannot justify.
+
 ## `aub config`
 
 **Answers:** which configuration key resolved from where?
