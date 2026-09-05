@@ -82,6 +82,9 @@ pub enum DurableClass {
     LegacyMeterImportRecord,
     AuthoritativeSurfaceComparison,
     AdapterSemanticsAnnotation,
+    MeterWindowAnomaly,
+    MeterCalibrationExclusion,
+    MeterWindowSetChange,
 
     // Core SQLite tables: Versioned interpretation
     MeterObservation,
@@ -142,7 +145,10 @@ impl DurableClass {
             | Self::LegacyMeterImport
             | Self::LegacyMeterImportRecord
             | Self::AuthoritativeSurfaceComparison
-            | Self::AdapterSemanticsAnnotation => DurableClassCategory::Irreplaceable,
+            | Self::AdapterSemanticsAnnotation
+            | Self::MeterWindowAnomaly
+            | Self::MeterCalibrationExclusion
+            | Self::MeterWindowSetChange => DurableClassCategory::Irreplaceable,
 
             Self::SamplingPolicySnapshot
             | Self::MeterObservation
@@ -205,7 +211,10 @@ impl DurableClass {
             | Self::LegacyMeterImport
             | Self::LegacyMeterImportRecord
             | Self::AuthoritativeSurfaceComparison
-            | Self::AdapterSemanticsAnnotation => RetentionRule::Forever,
+            | Self::AdapterSemanticsAnnotation
+            | Self::MeterWindowAnomaly
+            | Self::MeterCalibrationExclusion
+            | Self::MeterWindowSetChange => RetentionRule::Forever,
 
             Self::SessionAccountMarker => RetentionRule::ForeverUnlessExplicitlyPurged,
 
@@ -275,6 +284,9 @@ impl DurableClass {
             Self::LegacyMeterImportRecord => Some("legacy_meter_import_record"),
             Self::AuthoritativeSurfaceComparison => Some("authoritative_surface_comparison"),
             Self::AdapterSemanticsAnnotation => Some("adapter_semantics_annotation"),
+            Self::MeterWindowAnomaly => Some("meter_window_anomaly"),
+            Self::MeterCalibrationExclusion => Some("meter_calibration_exclusion"),
+            Self::MeterWindowSetChange => Some("meter_window_set_change"),
             Self::StatusProjection | Self::PendingObservationSpool | Self::RetainedProviderBody => {
                 None
             }
@@ -348,6 +360,9 @@ impl DurableClass {
             | Self::LegacyMeterImportRecord
             | Self::AuthoritativeSurfaceComparison
             | Self::AdapterSemanticsAnnotation
+            | Self::MeterWindowAnomaly
+            | Self::MeterCalibrationExclusion
+            | Self::MeterWindowSetChange
             | Self::MeterObservation
             | Self::MeterWindow
             | Self::MeterObservationPreference
@@ -406,6 +421,9 @@ impl DurableClass {
             Self::LegacyMeterImportRecord,
             Self::AuthoritativeSurfaceComparison,
             Self::AdapterSemanticsAnnotation,
+            Self::MeterWindowAnomaly,
+            Self::MeterCalibrationExclusion,
+            Self::MeterWindowSetChange,
             Self::StatusProjection,
             Self::PendingObservationSpool,
             Self::RetainedProviderBody,
@@ -453,6 +471,9 @@ impl DurableClass {
             Self::LegacyMeterImportRecord,
             Self::AuthoritativeSurfaceComparison,
             Self::AdapterSemanticsAnnotation,
+            Self::MeterWindowAnomaly,
+            Self::MeterCalibrationExclusion,
+            Self::MeterWindowSetChange,
         ]
     }
 }

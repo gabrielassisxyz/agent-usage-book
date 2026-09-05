@@ -97,6 +97,7 @@ use crate::store::repository::{NewMeterInterpretation, Repository, TerminalMeter
 use crate::store::sample_run::{SampleRunId, Trigger};
 use crate::store::sampling_lease::{AccountName, LeaseHolder, LeaseOutcome};
 use crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy;
+use crate::store::window_anomaly::StoredWindowAnomaly;
 
 /// The recipe token inside the normalized fingerprint, so a later change to
 /// how the fingerprint is computed cannot collide with an earlier one under
@@ -227,6 +228,11 @@ pub struct SampledAttempt {
     pub observation_committed: bool,
     /// The publication that followed this commit.
     pub publication: Publication,
+    /// Any window anomaly the commit's consecutive-window comparison found
+    /// against the account's immediately preceding observation
+    /// (`aub-eun.14`). Always empty when `observation_committed` is false:
+    /// a result with no observation has no window to compare.
+    pub window_anomalies: Vec<StoredWindowAnomaly>,
 }
 
 /// Stage 1's per-account outcome.
@@ -676,6 +682,7 @@ where
                         outcome: AttemptOutcome::Success,
                         observation_committed: true,
                         publication: committed.publication,
+                        window_anomalies: committed.ids.window_anomalies,
                     }),
                     Err(error) => persist_error(error),
                 }
@@ -699,6 +706,7 @@ where
                         outcome,
                         observation_committed: false,
                         publication,
+                        window_anomalies: Vec::new(),
                     }),
                     Err(error) => persist_error(error),
                 }

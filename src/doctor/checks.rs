@@ -1,8 +1,9 @@
 //! The registered checks: the seven this bead owns (sampling cadence, unresolved
 //! authentication, transcript roots, backup age, projection versus database
-//! generation, clock skew, missing active calibrations), the eleven whose evidence
-//! belongs elsewhere but whose subsystem already exists and is read here, and the
-//! three not-yet-available placeholders naming the bead that will own them.
+//! generation, clock skew, missing active calibrations), the twelve whose evidence
+//! belongs elsewhere but whose subsystem already exists and is read here (including
+//! `MeterAnomalies`, `aub-eun.14`'s own read of `store::window_anomaly`), and the
+//! one not-yet-available placeholder naming the bead that will own it.
 //!
 //! Every check is read-only: `doctor` performs no network operation and no check
 //! here writes to the ledger. [`super::fix`] is the only writer, and only under
@@ -66,15 +67,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         stale_rate_cards(ctx),
         projection_versus_database_generation(ctx),
         backup_age(ctx),
-        CheckOutcome {
-            name: CheckName::MeterAnomalies,
-            owner_module: "meter",
-            condition: "no meter window carries an anomalous reading",
-            has_repair: false,
-            status: CheckStatus::NotYetAvailable {
-                owning_bead: "aub-eun.14",
-            },
-        },
+        meter_anomalies(ctx),
         unexplained_residual(ctx),
         heuristic_dedup_counts(ctx),
         clock_skew(ctx),
@@ -129,7 +122,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::StaleRateCards => "store::rate_card",
         CheckName::ProjectionVersusDatabaseGeneration => "doctor",
         CheckName::BackupAge => "doctor",
-        CheckName::MeterAnomalies => "meter",
+        CheckName::MeterAnomalies => "store::window_anomaly",
         CheckName::UnexplainedResidual => "reconciliation",
         CheckName::HeuristicDedupCounts => "store::ingest_quarantine",
         CheckName::ClockSkew => "doctor",
@@ -725,6 +718,49 @@ fn backup_age(ctx: &DoctorContext) -> CheckOutcome {
         }
     };
     outcome(CheckName::BackupAge, status)
+}
+
+/// Every recorded window anomaly (`store::window_anomaly::all_anomalies`,
+/// `aub-eun.14`). This reads the persisted count and evidence references only:
+/// it never re-runs consecutive-window comparison, which is exactly what lets
+/// doctor consume anomaly counts without reimplementing detection.
+fn meter_anomalies(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => match crate::store::window_anomaly::all_anomalies(conn) {
+                Err(error) => CheckStatus::Fail(format!("cannot read window anomalies: {error}")),
+                Ok(anomalies) if anomalies.is_empty() => {
+                    CheckStatus::PassWithDetail("0 window anomalies recorded".to_string())
+                }
+                Ok(anomalies) => {
+                    let references: Vec<String> = anomalies
+                        .iter()
+                        .map(|anomaly| {
+                            format!(
+                                "id={} kind={} account={} prior_observation={} current_observation={}",
+                                anomaly.row_id.value(),
+                                anomaly.kind.as_str(),
+                                anomaly.account_id.value(),
+                                anomaly.prior_observation_id.value(),
+                                anomaly.current_observation_id.value(),
+                            )
+                        })
+                        .collect();
+                    CheckStatus::Fail(format!(
+                        "{} window anomaly(ies): {}",
+                        anomalies.len(),
+                        references.join("; ")
+                    ))
+                }
+            },
+        }
+    };
+    outcome(CheckName::MeterAnomalies, status)
 }
 
 /// The age of the newest recorded adapter-semantics comparison
