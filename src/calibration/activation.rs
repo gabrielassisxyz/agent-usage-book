@@ -180,6 +180,16 @@ pub enum ActivationRefusal {
         maximum: Credits,
         policy_version: String,
     },
+    /// The referenced cost model covers no term for a token class the
+    /// calibration workload carries. This is the cache-write completeness
+    /// rule (PLAN.md 23.8): no window calibration becomes active unless its
+    /// referenced cost model covers every token class present in its
+    /// workload. It names the cost model and the missing classes, never the
+    /// calibration, so a legacy record fails it like any other would.
+    IncompleteCostModel {
+        cost_model_id: String,
+        missing: Vec<String>,
+    },
 }
 
 impl fmt::Display for ActivationRefusal {
@@ -241,6 +251,17 @@ impl fmt::Display for ActivationRefusal {
                 residual.micros(),
                 maximum.micros()
             ),
+            Self::IncompleteCostModel {
+                cost_model_id,
+                missing,
+            } => write!(
+                formatter,
+                "activation refused: cost model '{cost_model_id}' is incomplete: \
+                 missing coverage for token class(es): {}; \
+                 no window calibration becomes active unless its referenced cost model \
+                 covers every token class present in its workload",
+                missing.join(", ")
+            ),
         }
     }
 }
@@ -296,6 +317,28 @@ pub fn check_evidence_disjoint(
         Ok(())
     } else {
         Err(ActivationRefusal::OverlappingEvidence { overlap })
+    }
+}
+
+/// The cache-write completeness rule (PLAN.md 23.8): no window calibration
+/// becomes active unless its referenced cost model covers every token class
+/// present in its workload.
+///
+/// The caller names the missing classes; an empty slice passes. A non-empty
+/// slice refuses with [`ActivationRefusal::IncompleteCostModel`], naming the
+/// cost model and the missing classes rather than the calibration, so a
+/// legacy record fails this rule like any other would.
+pub fn check_cost_model_completeness(
+    cost_model_id: &str,
+    missing: &[String],
+) -> Result<(), ActivationRefusal> {
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ActivationRefusal::IncompleteCostModel {
+            cost_model_id: cost_model_id.to_string(),
+            missing: missing.to_vec(),
+        })
     }
 }
 
@@ -644,7 +687,8 @@ mod tests {
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
-            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }) => {
+            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
         }
@@ -687,7 +731,8 @@ mod tests {
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
-            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }) => {
+            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
         }
@@ -796,7 +841,8 @@ mod tests {
             | ActivationRefusal::OverlappingEvidence { .. }
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::IllConditioned { .. }
-            | ActivationRefusal::MissingHeldOutResidual) => {
+            | ActivationRefusal::MissingHeldOutResidual
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
         }
@@ -885,7 +931,8 @@ mod tests {
             | ActivationRefusal::OverlappingEvidence { .. }
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
-            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }) => {
+            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
         }
@@ -923,7 +970,8 @@ mod tests {
             | ActivationRefusal::OverlappingEvidence { .. }
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::MissingHeldOutResidual
-            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }) => {
+            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
         }

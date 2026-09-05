@@ -124,6 +124,9 @@ pub enum DiagnosticEvent {
     /// A pre-implementation seed archive was imported. Its source is identified by
     /// digest, never by path or raw record content.
     SeedArchiveImported,
+    /// A legacy regression fit was imported as calibration history. Its
+    /// source is identified by digest, never by path or raw content.
+    LegacyCalibrationImported,
     /// A commit's consecutive-window comparison classified a typed anomaly
     /// against the account's immediately preceding observation (`aub-eun.14`).
     /// `anomaly` is the persisted row's own id, so a reader can look up its
@@ -132,7 +135,7 @@ pub enum DiagnosticEvent {
 }
 
 impl DiagnosticEvent {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::RunStarted,
         Self::ReportRendered,
         Self::RequestAttempted,
@@ -143,6 +146,7 @@ impl DiagnosticEvent {
         Self::ProjectionRead,
         Self::LegacyMeterImported,
         Self::SeedArchiveImported,
+        Self::LegacyCalibrationImported,
         Self::MeterWindowAnomalyDetected,
     ];
 
@@ -158,6 +162,7 @@ impl DiagnosticEvent {
             Self::ProjectionRead => "projection_read",
             Self::LegacyMeterImported => "legacy_meter_imported",
             Self::SeedArchiveImported => "seed_archive_imported",
+            Self::LegacyCalibrationImported => "legacy_calibration_imported",
             Self::MeterWindowAnomalyDetected => "meter_window_anomaly_detected",
         }
     }
@@ -172,7 +177,9 @@ impl DiagnosticEvent {
             | Self::MeterEvidenceSpooled
             | Self::MeterSpoolDrained => Level::Info,
             Self::ProjectionRead => Level::Debug,
-            Self::LegacyMeterImported | Self::SeedArchiveImported => Level::Info,
+            Self::LegacyMeterImported
+            | Self::SeedArchiveImported
+            | Self::LegacyCalibrationImported => Level::Info,
             Self::MeterWindowAnomalyDetected => Level::Warn,
         }
     }
@@ -191,6 +198,9 @@ impl DiagnosticEvent {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined"
             }
             Self::SeedArchiveImported => {
+                "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome"
+            }
+            Self::LegacyCalibrationImported => {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome"
             }
             Self::MeterWindowAnomalyDetected => "anomaly, kind, account",

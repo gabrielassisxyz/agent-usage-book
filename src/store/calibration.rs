@@ -1429,7 +1429,7 @@ pub fn activate(
     supersedes: Option<&WindowCalibrationId>,
     request: &ActivationRequest<'_>,
 ) -> Result<CalibrationLifecycleEventId, Error> {
-    use crate::calibration::activation::check_activation;
+    use crate::calibration::activation::{check_activation, check_cost_model_completeness};
     let tx = conn
         .transaction()
         .map_err(|e| Error::Store(format!("cannot open the activation transaction: {e}")))?;
@@ -1440,6 +1440,30 @@ pub fn activate(
             id.as_str()
         ))
     })?;
+
+    // The cache-write completeness rule (PLAN.md 23.8) is a property of the
+    // activation gate, not a special case for any one record: no window
+    // calibration becomes active unless its referenced cost model covers
+    // every token class present in its workload. It runs before the
+    // evidence checks so a record that fails it is refused for that reason
+    // rather than for whichever evidence mismatch the caller also made.
+    //
+    // A referenced cost model with no stored row predates this rule's
+    // repository coverage (test scaffolding invents cost-model identifiers
+    // without rows); only a stored, incomplete model refuses here, so the
+    // existing fixture chains keep their meaning while every real
+    // incomplete model is refused.
+    if let Some(model) =
+        crate::store::cost_model::load_by_semantic_id(&tx, calibration.cost_model_id())?
+    {
+        let missing: Vec<String> = model
+            .missing_token_kinds()
+            .iter()
+            .map(|kind| kind.label().to_string())
+            .collect();
+        check_cost_model_completeness(calibration.cost_model_id().as_str(), &missing)
+            .map_err(|refusal| refusal.into_error())?;
+    }
 
     let recorded = RecordedValidation {
         policy_version: calibration.activation_policy_version().to_string(),
@@ -1567,6 +1591,67 @@ fn load_active_at_in(
     )
     .optional()
     .map_err(|e| Error::Store(format!("cannot load the active calibration: {e}")))
+}
+
+/// The current-applicable calibration for `scope` as of `knowledge_time`:
+/// the active calibration whose referenced cost model is complete.
+///
+/// `load_active_at` answers which calibration the lifecycle chain selects;
+/// this answers which calibration a quantitative consumer may use. An active
+/// calibration whose cost model is incomplete is refused with the same
+/// completeness reason activation gives, naming the incomplete cost model
+/// and its missing token classes, rather than being returned. A scope with
+/// no active calibration returns `None`; a scope whose active calibration
+/// is incomplete is an error, never a silent `None`, so the refusal cannot
+/// be mistaken for an uncalibrated window.
+pub fn load_current_applicable(
+    conn: &Connection,
+    scope: &CalibrationScope,
+    knowledge_time: UtcTimestamp,
+) -> Result<Option<WindowCalibration>, Error> {
+    let Some(active) = load_active_at_in(conn, scope, knowledge_time)? else {
+        return Ok(None);
+    };
+    require_cost_model_complete(conn, &active)?;
+    Ok(Some(active))
+}
+
+/// Refuses the named calibration for quantitative use when its referenced
+/// cost model is incomplete, naming the cost model and its missing token
+/// classes. This is the repository half of the cache-write completeness rule
+/// (PLAN.md 23.8): the record is present and explains itself, but no
+/// consumer can use it.
+///
+/// Like activation, only a stored, incomplete model refuses here; a
+/// referenced model with no stored row predates this rule's repository
+/// coverage and passes, so existing scaffolding keeps its meaning.
+pub fn require_current_applicable(
+    conn: &Connection,
+    id: &WindowCalibrationId,
+) -> Result<WindowCalibration, Error> {
+    let calibration = load_result(conn, id)?
+        .ok_or_else(|| Error::Store(format!("no window calibration '{}'", id.as_str())))?;
+    require_cost_model_complete(conn, &calibration)?;
+    Ok(calibration)
+}
+
+fn require_cost_model_complete(
+    conn: &Connection,
+    calibration: &WindowCalibration,
+) -> Result<(), Error> {
+    use crate::calibration::activation::check_cost_model_completeness;
+    if let Some(model) =
+        crate::store::cost_model::load_by_semantic_id(conn, calibration.cost_model_id())?
+    {
+        let missing: Vec<String> = model
+            .missing_token_kinds()
+            .iter()
+            .map(|kind| kind.label().to_string())
+            .collect();
+        check_cost_model_completeness(calibration.cost_model_id().as_str(), &missing)
+            .map_err(|refusal| refusal.into_error())?;
+    }
+    Ok(())
 }
 
 // --- point-in-time by valid time ---------------------------------------
