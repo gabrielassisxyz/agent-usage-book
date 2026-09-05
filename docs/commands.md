@@ -144,6 +144,22 @@ a window that already carries one, naming the existing record instead of overwri
 it, and refuses `--format`, `--explain`, `--account` and `--model`: a comparison is
 scoped by observation and window, not by any of those dimensions.
 
+## `aub calibrate`
+
+**Answers:** what is the state of the controlled calibration experiment?
+
+**Refuses:** to run a resident process. `begin`, `status` and `end` each open
+the ledger, do their read or write, and exit; the experiment survives in the
+database between them, including across a reboot. Sampling cadence during an
+experiment is tightened by invoking `sample --due` more often through the
+external scheduler, never by a loop inside `aub`. `begin` refuses when the
+named cost model covers none of the expected token kinds, when the account has
+no sampled baseline yet, and when the account already runs an experiment; `end`
+records the end of controlled work and never declares the meter settled. It
+also refuses `--format`, `--explain`, `--model` and `--no-color`: a
+calibration experiment is scoped by account and window, not by any of those
+dimensions.
+
 ## `aub ingest`
 
 **Answers:** have the transcript-derived tables been refreshed from the

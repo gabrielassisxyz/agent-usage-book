@@ -20,6 +20,7 @@ pub mod attempt_crash_hook;
 pub mod attribution_segment;
 pub mod backup;
 pub mod calibration;
+pub mod calibration_controlled;
 pub mod connection;
 pub mod cost_model;
 pub mod export;
