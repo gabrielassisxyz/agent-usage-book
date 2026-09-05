@@ -436,7 +436,7 @@ fn insert_window_set_change(
                 previous_observation_id, previous_window_id, current_observation_id, current_window_id,
                 detected_at
             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
-            ON CONFLICT (kind, account_id, semantic_key, scope_kind, scoped_model, previous_observation_id, current_observation_id)
+            ON CONFLICT (kind, account_id, semantic_key, scope_kind, coalesce(scoped_model, ''), previous_observation_id, current_observation_id)
             DO NOTHING
             RETURNING id",
             params![
@@ -1654,6 +1654,31 @@ mod tests {
 
         // Structural evolution never touches original evidence: both windows exist unchanged.
         assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
+        assert_eq!(all_window_set_changes(&fx.conn).unwrap().len(), 2);
+
+        // Rerunning detection over the same pair of observations persists
+        // nothing new: the two rows already recorded are found again, not
+        // duplicated. Windows are read back rather than reusing the moved
+        // `second_window` binding, exactly as a real rerun would read them.
+        let second_windows_again = windows_by_observation(&fx.conn, second_obs.row_id).unwrap();
+        let rerun = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &second_windows_again,
+            UtcTimestamp::from_unix_nanos(41_000),
+        )
+        .unwrap();
+        assert_eq!(rerun.window_set_changes.len(), 2);
+        let mut first_run_ids: Vec<_> = outcome
+            .window_set_changes
+            .iter()
+            .map(|c| c.row_id)
+            .collect();
+        let mut rerun_ids: Vec<_> = rerun.window_set_changes.iter().map(|c| c.row_id).collect();
+        first_run_ids.sort();
+        rerun_ids.sort();
+        assert_eq!(first_run_ids, rerun_ids);
         assert_eq!(all_window_set_changes(&fx.conn).unwrap().len(), 2);
     }
 

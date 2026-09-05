@@ -95,9 +95,19 @@ CREATE TABLE meter_window_set_change (
             AND current_window_id IS NOT NULL)
         OR (kind = 'missing_model_specific_window' AND current_window_id IS NULL
             AND previous_window_id IS NOT NULL)
-    ),
-    UNIQUE (kind, account_id, semantic_key, scope_kind, scoped_model, previous_observation_id, current_observation_id)
+    )
 ) STRICT;
+
+-- A plain table-level UNIQUE over scoped_model would not dedupe two
+-- account-wide rows (scoped_model NULL): SQL treats every NULL as distinct
+-- from every other NULL in a uniqueness check, so a rerun over the same pair
+-- of observations would insert a fresh account-wide row every time while the
+-- model-scoped row correctly deduplicated. coalesce(scoped_model, '') gives
+-- NULL a real, comparable value for this index only.
+CREATE UNIQUE INDEX idx_meter_window_set_change_identity ON meter_window_set_change (
+    kind, account_id, semantic_key, scope_kind, coalesce(scoped_model, ''),
+    previous_observation_id, current_observation_id
+);
 
 CREATE TRIGGER meter_window_anomaly_rejects_update BEFORE UPDATE ON meter_window_anomaly
 BEGIN
