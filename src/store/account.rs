@@ -55,6 +55,44 @@ impl Account {
     pub fn last_observed_at(&self) -> UtcTimestamp {
         self.last_observed_at
     }
+
+    pub fn identity(&self) -> AccountIdentity {
+        AccountIdentity::new(&self.provider_key, &self.logical_name)
+    }
+}
+
+/// The logical identity of an account: (provider_key, logical_name).
+///
+/// The database schema enforces `UNIQUE (provider_key, logical_name)`, and
+/// the sampler matches configured accounts to database rows through this
+/// exact identity pair.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct AccountIdentity {
+    provider_key: String,
+    logical_name: String,
+}
+
+impl AccountIdentity {
+    pub fn new(provider_key: impl Into<String>, logical_name: impl Into<String>) -> Self {
+        Self {
+            provider_key: provider_key.into(),
+            logical_name: logical_name.into(),
+        }
+    }
+
+    pub fn provider_key(&self) -> &str {
+        &self.provider_key
+    }
+
+    pub fn logical_name(&self) -> &str {
+        &self.logical_name
+    }
+}
+
+impl From<&crate::config::AccountConfig> for AccountIdentity {
+    fn from(config: &crate::config::AccountConfig) -> Self {
+        Self::new(&config.provider, &config.name)
+    }
 }
 
 fn row_to_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<Account> {
@@ -107,6 +145,14 @@ pub fn account_id_by_identity(
     )
     .optional()
     .map_err(|e| Error::Store(format!("cannot look up the account row: {e}")))
+}
+
+/// Reads one account id by its structured identity pair.
+pub fn account_id_by_account_identity(
+    conn: &rusqlite::Connection,
+    identity: &AccountIdentity,
+) -> Result<Option<AccountId>, Error> {
+    account_id_by_identity(conn, identity.provider_key(), identity.logical_name())
 }
 
 /// Reads every account row in identity order.
@@ -242,6 +288,12 @@ mod tests {
             account_id_by_identity(&conn, "anthropic", "never-sampled").unwrap(),
             None,
             "an account never observed has no row and no history"
+        );
+        let id = AccountIdentity::new("anthropic", "work");
+        assert_eq!(
+            account_id_by_account_identity(&conn, &id).unwrap(),
+            Some(created),
+            "the structured identity must resolve to its row"
         );
     }
 

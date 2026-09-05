@@ -23,10 +23,25 @@ case_preconditions() {
 
     LEDGER_DB="$STATE_DIR/ledger.db"
 
+    # Both seeded accounts are declared here, matching the (provider_key, logical_name)
+    # pair the ledger rows carry below. Coverage judges only accounts the configuration
+    # asks the sampler to observe, so an account absent from this table is reported as
+    # not configured and never breaches a floor. That is the point of the rule, and it
+    # would silently turn this case into one that asserts nothing.
     cat > "$STATE_DIR/aub.toml" <<'EOF'
 [coverage]
 attempt_floor = 0.98
 measurement_floor = 0.95
+
+[[accounts]]
+name = "dead-scheduler"
+provider = "provider-a"
+credential = { kind = "file", path = "/nonexistent/dead-scheduler.json" }
+
+[[accounts]]
+name = "cred-failing"
+provider = "provider-a"
+credential = { kind = "file", path = "/nonexistent/cred-failing.json" }
 EOF
 }
 
