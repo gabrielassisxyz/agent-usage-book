@@ -95,6 +95,25 @@ fn anthropic_body(five_hour_pct: f64, five_hour_resets_at: &str) -> Vec<u8> {
     .into_bytes()
 }
 
+/// A body identical in its two required account-wide windows across the
+/// whole test (so neither ever triggers an anomaly of its own), plus an
+/// optional `seven_day_<model>` key: the one window shape this adapter can
+/// make appear or disappear between two responses, since `five_hour` and
+/// `seven_day` are both required fields and can never be absent from a
+/// parseable response.
+fn anthropic_body_with_optional_model(model_window: bool) -> Vec<u8> {
+    const FIVE_HOUR_RESETS_AT: &str = "2027-01-01T00:00:00Z";
+    let model_field = if model_window {
+        r#","seven_day_model_a":{"utilization":30.0,"resets_at":"2027-02-01T00:00:00Z"}"#
+    } else {
+        ""
+    };
+    format!(
+        r#"{{"five_hour":{{"utilization":50.0,"resets_at":"{FIVE_HOUR_RESETS_AT}"}},"seven_day":{{"utilization":20.0,"resets_at":"{SEVEN_DAY_RESETS_AT}"}}{model_field}}}"#
+    )
+    .into_bytes()
+}
+
 struct Environment {
     root: PathBuf,
 }
@@ -297,4 +316,66 @@ fn decreasing_percentage_changed_reset_and_legitimate_reset_sequence() {
     );
     assert!(doctor_stdout.contains("percentage_decrease_without_reset"));
     assert!(doctor_stdout.contains("unexpected_reset_change"));
+}
+
+/// The one window-set-evolution direction the current Anthropic adapter can
+/// actually produce end to end: `five_hour` and `seven_day` are both required
+/// fields the adapter refuses a whole response without, so an account-wide
+/// window can never newly appear through this adapter today. A
+/// `seven_day_<model>` key is optional and dynamic, so its disappearance
+/// between two responses is the reachable case, and this proves it through
+/// the real binary rather than only through `store::window_anomaly`'s own
+/// fixtures.
+#[test]
+fn a_disappearing_model_specific_window_persists_its_typed_classification() {
+    let env = Environment::new("window-set-evolution");
+    let server = SyntheticServer::start(vec![
+        ScriptedOutcome::Success(ScriptedResponseBody::json_ok(
+            anthropic_body_with_optional_model(true),
+        )),
+        ScriptedOutcome::Success(ScriptedResponseBody::json_ok(
+            anthropic_body_with_optional_model(false),
+        )),
+    ])
+    .expect("synthetic server must start");
+    let args = ["sample", "--account", "work-primary", "--require-success"];
+
+    let (status, _stdout, stderr) = env.run(&server.url(), &args);
+    assert_eq!(status, 0, "stderr: {stderr}");
+    let (status, _stdout, stderr) = env.run(&server.url(), &args);
+    assert_eq!(status, 0, "stderr: {stderr}");
+
+    let conn = rusqlite::Connection::open(env.db_path()).expect("ledger must open");
+    // No anomaly: the two required windows never changed, and a window-set
+    // change is not itself an anomaly.
+    assert_eq!(
+        scalar(&conn, "SELECT count(*) FROM meter_window_anomaly"),
+        0
+    );
+    assert_eq!(
+        scalar(&conn, "SELECT count(*) FROM meter_window_set_change"),
+        1
+    );
+    let kind: String = conn
+        .query_row("SELECT kind FROM meter_window_set_change", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(kind, "missing_model_specific_window");
+    let semantic_key: String = conn
+        .query_row(
+            "SELECT semantic_key FROM meter_window_set_change",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(semantic_key, "seven_day_model_a");
+
+    // Neither observation's windows were touched: the first observation's
+    // model-specific reading is still there, immutable and queryable.
+    let model_window_count: i64 = scalar(
+        &conn,
+        "SELECT count(*) FROM meter_window WHERE semantic_key = 'seven_day_model_a'",
+    );
+    assert_eq!(model_window_count, 1);
 }
