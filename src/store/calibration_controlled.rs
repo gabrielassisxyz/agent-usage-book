@@ -24,10 +24,16 @@
 
 use rusqlite::{Connection, OptionalExtension, params};
 
+use crate::calibration::contamination::{
+    ContaminationInputs, ContaminationMarkerPoint, ContaminationMeterPoint,
+    ContaminationThresholds, ContaminationVerdict, evaluate_contamination,
+    require_uncontaminated_for_activation,
+};
 use crate::calibration::settlement::{
     SettlementMeterObservation, SettlementObservationSeries, SettlementOutcome, SettlementPolicy,
     SettlementRole, detect_settlement,
 };
+use crate::domain::credits::Credits;
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::domain::tokens::TokenKind;
@@ -77,6 +83,13 @@ impl ControlledRunPhase {
 /// never an enforced lock: `aub` does not stop other work on the account, it
 /// records that the experiment assumed none, which is what makes a later
 /// contamination finding meaningful rather than a surprise.
+///
+/// `baseline_plateau_started_at` is the idle plateau period `begin` asserted:
+/// the earliest stored observation in the trailing stable run ending at the
+/// baseline, so the pre-burn contamination check examines exactly the window
+/// `begin` vouched for. `contamination_thresholds` are the per-signal
+/// thresholds `begin` recorded; detection reads them from this row, never from
+/// a source constant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlledExperimentRun {
     pub id: ControlledExperimentId,
@@ -90,6 +103,8 @@ pub struct ControlledExperimentRun {
     pub baseline_quota_used: QuotaUsed,
     pub baseline_resolution: ReportedResolution,
     pub baseline_observed_at: UtcTimestamp,
+    pub baseline_plateau_started_at: UtcTimestamp,
+    pub contamination_thresholds: ContaminationThresholds,
     pub started_at: UtcTimestamp,
     pub ended_at: Option<UtcTimestamp>,
     pub exclusivity_assertion: String,
@@ -217,6 +232,51 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> Result<ControlledExperimentRun, Error>
         .and_then(QuotaFractionPpm::new)
         .and_then(ReportedResolution::new)
         .ok_or_else(|| Error::Store("stored baseline resolution is invalid".into()))?;
+    let baseline_observed_at_nanos: i64 = row
+        .get(10)
+        .map_err(|e| Error::Store(format!("cannot read baseline_observed_at: {e}")))?;
+    let plateau_started_at_nanos: i64 = row
+        .get(14)
+        .map_err(|e| Error::Store(format!("cannot read baseline_plateau_started_at: {e}")))?;
+    let contamination_version: String = row
+        .get(15)
+        .map_err(|e| Error::Store(format!("cannot read contamination version: {e}")))?;
+    let pre_burn_max: i64 = row
+        .get(16)
+        .map_err(|e| Error::Store(format!("cannot read contamination pre-burn tolerance: {e}")))?;
+    let post_settlement_max: i64 = row
+        .get(17)
+        .map_err(|e| Error::Store(format!("cannot read contamination drift tolerance: {e}")))?;
+    let post_settlement_grace: i64 = row
+        .get(18)
+        .map_err(|e| Error::Store(format!("cannot read contamination grace: {e}")))?;
+    let flat_meter_min: i64 = row.get(19).map_err(|e| {
+        Error::Store(format!(
+            "cannot read contamination flat-meter threshold: {e}"
+        ))
+    })?;
+    let flat_local_max: i64 = row.get(20).map_err(|e| {
+        Error::Store(format!(
+            "cannot read contamination flat-local threshold: {e}"
+        ))
+    })?;
+    let contamination_thresholds = ContaminationThresholds::new(
+        contamination_version,
+        u32::try_from(pre_burn_max).map_err(|_| {
+            Error::Store("stored contamination pre-burn tolerance is out of u32 range".into())
+        })?,
+        u32::try_from(post_settlement_max).map_err(|_| {
+            Error::Store("stored contamination drift tolerance is out of u32 range".into())
+        })?,
+        u64::try_from(post_settlement_grace)
+            .map(MonotonicDuration::from_nanos)
+            .map_err(|_| Error::Store("stored contamination grace is negative".into()))?,
+        u32::try_from(flat_meter_min).map_err(|_| {
+            Error::Store("stored contamination flat-meter threshold is out of u32 range".into())
+        })?,
+        Credits::from_micros(flat_local_max),
+    )
+    .map_err(|e| Error::Store(format!("stored contamination thresholds are invalid: {e}")))?;
     let get_string = |index: usize| -> Result<String, Error> {
         row.get(index)
             .map_err(|e| Error::Store(format!("cannot read column {index}: {e}")))
@@ -235,10 +295,9 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> Result<ControlledExperimentRun, Error>
         ),
         baseline_quota_used: baseline_quota,
         baseline_resolution,
-        baseline_observed_at: UtcTimestamp::from_unix_nanos(
-            row.get(10)
-                .map_err(|e| Error::Store(format!("cannot read baseline_observed_at: {e}")))?,
-        ),
+        baseline_observed_at: UtcTimestamp::from_unix_nanos(baseline_observed_at_nanos),
+        baseline_plateau_started_at: UtcTimestamp::from_unix_nanos(plateau_started_at_nanos),
+        contamination_thresholds,
         started_at: UtcTimestamp::from_unix_nanos(
             row.get(11)
                 .map_err(|e| Error::Store(format!("cannot read started_at: {e}")))?,
@@ -259,7 +318,10 @@ fn parse_stored_expected_kinds(text: &str) -> Result<Vec<TokenKind>, Error> {
 const RUN_COLUMNS: &str = "experiment_id, account, provider, plan_tier, window_semantic_key, \
      cost_model_id, expected_token_kinds, baseline_observation_id, baseline_quota_used_ppm, \
      baseline_reported_resolution_ppm, baseline_observed_at, started_at, ended_at, \
-     exclusivity_assertion";
+     exclusivity_assertion, baseline_plateau_started_at, contamination_policy_version, \
+     contamination_pre_burn_max_movement_ppm, contamination_post_settlement_max_movement_ppm, \
+     contamination_post_settlement_grace_nanos, contamination_flat_meter_min_movement_ppm, \
+     contamination_flat_local_max_micros";
 
 /// Records the `begin` premise. The `experiment_id` is unique; a second
 /// `begin` with the same identifier fails at the database.
@@ -280,8 +342,15 @@ pub fn insert_begin(conn: &Connection, run: &ControlledExperimentRun) -> Result<
             experiment_id, account, provider, plan_tier, window_semantic_key,
             cost_model_id, expected_token_kinds, baseline_observation_id,
             baseline_quota_used_ppm, baseline_reported_resolution_ppm,
-            baseline_observed_at, started_at, ended_at, exclusivity_assertion
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            baseline_observed_at, started_at, ended_at, exclusivity_assertion,
+            baseline_plateau_started_at, contamination_policy_version,
+            contamination_pre_burn_max_movement_ppm,
+            contamination_post_settlement_max_movement_ppm,
+            contamination_post_settlement_grace_nanos,
+            contamination_flat_meter_min_movement_ppm,
+            contamination_flat_local_max_micros
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
+                  ?15, ?16, ?17, ?18, ?19, ?20, ?21)
         RETURNING id",
         params![
             run.id.as_str(),
@@ -298,6 +367,28 @@ pub fn insert_begin(conn: &Connection, run: &ControlledExperimentRun) -> Result<
             run.started_at.unix_nanos(),
             run.ended_at.map(UtcTimestamp::unix_nanos),
             run.exclusivity_assertion,
+            run.baseline_plateau_started_at.unix_nanos(),
+            run.contamination_thresholds.version(),
+            i64::from(run.contamination_thresholds.pre_burn_max_movement_ppm()),
+            i64::from(
+                run.contamination_thresholds
+                    .post_settlement_max_movement_ppm()
+            ),
+            i64::try_from(
+                run.contamination_thresholds
+                    .post_settlement_grace()
+                    .as_nanos()
+            )
+            .map_err(|_| Error::Store(
+                "contamination grace does not fit in SQLite INTEGER".into()
+            ))?,
+            i64::from(
+                run.contamination_thresholds
+                    .flat_credits_min_meter_movement_ppm()
+            ),
+            run.contamination_thresholds
+                .flat_credits_max_local()
+                .micros(),
         ],
         |row| row.get::<_, i64>(0),
     )
@@ -516,6 +607,286 @@ pub fn status_for_run(
     })
 }
 
+/// The idle plateau period `begin` asserts for the pre-burn check: the earliest
+/// stored observation in the trailing stable run ending at the baseline, where
+/// stable means within `tolerance_ppm` of the baseline quota. With no earlier
+/// stable observation the plateau is degenerate at the baseline instant, which
+/// keeps the pre-burn check vacuous rather than inventing a period nobody
+/// observed.
+pub fn baseline_plateau_start_for(
+    conn: &Connection,
+    provider: &str,
+    account: &str,
+    window_key: &WindowSemanticKey,
+    baseline_quota: QuotaUsed,
+    baseline_at: UtcTimestamp,
+    tolerance_ppm: u32,
+) -> Result<UtcTimestamp, Error> {
+    let Some(account_id) = account_id_by_identity(conn, provider, account)? else {
+        return Ok(baseline_at);
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT mo.received_at, mw.quota_used_ppm
+             FROM meter_window mw
+             JOIN meter_observation mo ON mo.id = mw.observation_id
+             WHERE mo.account_id = ?1
+               AND mw.semantic_key = ?2
+               AND mo.received_at <= ?3
+             ORDER BY mo.received_at DESC, mw.id DESC",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the plateau scan: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![
+                account_id.value(),
+                window_key.as_str(),
+                baseline_at.unix_nanos(),
+            ],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .map_err(|e| Error::Store(format!("cannot read the plateau scan: {e}")))?;
+    let baseline_ppm = baseline_quota.as_ppm().get();
+    let mut start = baseline_at;
+    for row in rows {
+        let (at, quota_ppm) =
+            row.map_err(|e| Error::Store(format!("cannot read a plateau row: {e}")))?;
+        let quota_ppm = u32::try_from(quota_ppm)
+            .map_err(|_| Error::Store("stored plateau quota is outside the u32 range".into()))?;
+        if baseline_ppm.abs_diff(quota_ppm) <= tolerance_ppm {
+            start = UtcTimestamp::from_unix_nanos(at);
+        } else {
+            break;
+        }
+    }
+    Ok(start)
+}
+
+/// One locally known session marked against the experiment's account inside
+/// the experiment window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverlappingSessionRef {
+    pub session_source: String,
+    pub session_native: String,
+}
+
+impl OverlappingSessionRef {
+    /// The session identity as one display string, `source/native`.
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.session_source, self.session_native)
+    }
+}
+
+/// Every distinct session marked against the run's account inside the
+/// experiment window (from `begin` to the recorded `end`, else to now),
+/// oldest first. Reads the marker timeline for the same account, so the
+/// overlapping-session check reports which sessions overlapped.
+pub fn overlapping_sessions_for_run(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    now: UtcTimestamp,
+) -> Result<Vec<OverlappingSessionRef>, Error> {
+    let window_end = run.ended_at.unwrap_or(now);
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT session_source, session_native
+             FROM session_account_marker
+             WHERE logical_account = ?1
+               AND observed_at >= ?2
+               AND observed_at <= ?3
+             ORDER BY session_source, session_native",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the overlap scan: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![
+                run.account,
+                run.started_at.unix_nanos(),
+                window_end.unix_nanos(),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+        )
+        .map_err(|e| Error::Store(format!("cannot read the overlap scan: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (source, native) =
+            row.map_err(|e| Error::Store(format!("cannot read an overlap row: {e}")))?;
+        out.push(OverlappingSessionRef {
+            session_source: source,
+            session_native: native,
+        });
+    }
+    Ok(out)
+}
+
+/// The stored quota series for the run's account and target window between two
+/// instants, oldest first. The narrow helper behind both the plateau assembly
+/// and the drift tail.
+fn meter_points_between(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    from: UtcTimestamp,
+    to: UtcTimestamp,
+) -> Result<Vec<ContaminationMeterPoint>, Error> {
+    Ok(quota_series_between_raw(conn, run, from, to)?
+        .into_iter()
+        .map(|(at, quota_used, _)| ContaminationMeterPoint::new(at, quota_used))
+        .collect())
+}
+
+/// The raw stored quota series between two instants, oldest first.
+fn quota_series_between_raw(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    from: UtcTimestamp,
+    to: UtcTimestamp,
+) -> Result<Vec<(UtcTimestamp, QuotaUsed, ReportedResolution)>, Error> {
+    let Some(account_id) = account_id_by_identity(conn, run.provider.as_str(), &run.account)?
+    else {
+        return Ok(Vec::new());
+    };
+    let mut statement = conn
+        .prepare(
+            "SELECT mo.received_at, mw.quota_used_ppm, mw.reported_resolution_ppm
+             FROM meter_window mw
+             JOIN meter_observation mo ON mo.id = mw.observation_id
+             WHERE mo.account_id = ?1
+               AND mw.semantic_key = ?2
+               AND mo.received_at >= ?3
+               AND mo.received_at <= ?4
+             ORDER BY mo.received_at, mw.id",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the run quota window: {e}")))?;
+    let rows = statement
+        .query_map(
+            params![
+                account_id.value(),
+                run.window_semantic_key.as_str(),
+                from.unix_nanos(),
+                to.unix_nanos(),
+            ],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            },
+        )
+        .map_err(|e| Error::Store(format!("cannot read the run quota window: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (at, quota_ppm, resolution_ppm) =
+            row.map_err(|e| Error::Store(format!("cannot read a window row: {e}")))?;
+        let quota = i32::try_from(quota_ppm)
+            .ok()
+            .and_then(QuotaFractionPpm::new)
+            .map(QuotaUsed::new);
+        let resolution = i32::try_from(resolution_ppm)
+            .ok()
+            .and_then(QuotaFractionPpm::new)
+            .and_then(ReportedResolution::new);
+        match (quota, resolution) {
+            (Some(quota), Some(resolution)) => {
+                out.push((UtcTimestamp::from_unix_nanos(at), quota, resolution));
+            }
+            _ => {
+                return Err(Error::Store("stored run window quota is invalid".into()));
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Computes all four contamination signals for one stored run at one instant.
+///
+/// The thresholds and the plateau period are read from the run row (`begin`
+/// recorded them); only the evidence is fresh. `local_credits` is the
+/// caller-computed locally attributed total for the controlled window in the
+/// experiment's cost model: the usage-to-credits pipeline that produces it is
+/// a later fit bead's work, and this function takes the total rather than
+/// inventing one.
+pub fn evaluate_contamination_for_run(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    local_credits: Credits,
+    now: UtcTimestamp,
+) -> Result<ContaminationVerdict, Error> {
+    let pre_burn_series =
+        meter_points_between(conn, run, run.baseline_plateau_started_at, run.started_at)?;
+    let series_start = run.ended_at.unwrap_or(run.started_at);
+    let post_series = meter_points_between(conn, run, series_start, now)?;
+    let controlled_end = meter_points_between(conn, run, run.started_at, now)?
+        .last()
+        .copied()
+        .map(|point| point.quota_used())
+        .unwrap_or(run.baseline_quota_used);
+    let mut marker_statement = conn
+        .prepare(
+            "SELECT session_source, session_native, logical_account, observed_at
+             FROM session_account_marker
+             ORDER BY observed_at, id",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare the marker timeline: {e}")))?;
+    let marker_rows = marker_statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| Error::Store(format!("cannot read the marker timeline: {e}")))?;
+    let mut markers = Vec::new();
+    for row in marker_rows {
+        let (source, native, account, at) =
+            row.map_err(|e| Error::Store(format!("cannot read a marker row: {e}")))?;
+        markers.push(ContaminationMarkerPoint::new(
+            source,
+            native,
+            account,
+            UtcTimestamp::from_unix_nanos(at),
+        ));
+    }
+    let inputs = ContaminationInputs {
+        experiment_account: &run.account,
+        baseline_plateau_started_at: run.baseline_plateau_started_at,
+        started_at: run.started_at,
+        ended_at: run.ended_at,
+        evaluated_at: now,
+        pre_burn_series: &pre_burn_series,
+        post_series: &post_series,
+        controlled_meter_start: run.baseline_quota_used,
+        controlled_meter_end: controlled_end,
+        local_credits_delta: local_credits,
+        markers: &markers,
+    };
+    Ok(evaluate_contamination(
+        &inputs,
+        &run.contamination_thresholds,
+    ))
+}
+
+/// The store-level activation gate: evaluates the run and refuses with the
+/// named signal when contaminated. A contaminated candidate is never
+/// activatable; a contaminated fit that still publishes must carry the
+/// verdict's explicit mark instead.
+pub fn refuse_activation_for_contaminated_run(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    local_credits: Credits,
+    now: UtcTimestamp,
+) -> Result<(), Error> {
+    let verdict = evaluate_contamination_for_run(conn, run, local_credits, now)?;
+    require_uncontaminated_for_activation(&verdict).map_err(|refusal| {
+        Error::ThresholdNotMet(format!(
+            "controlled experiment '{}' is contaminated: {refusal}",
+            run.id.as_str()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +1064,8 @@ mod tests {
             )
             .expect("non-zero test resolution"),
             baseline_observed_at: received_at,
+            baseline_plateau_started_at: received_at,
+            contamination_thresholds: ContaminationThresholds::conservative_default(),
             started_at: received_at,
             ended_at: None,
             exclusivity_assertion: "account work-a reserved for controlled experiment exp-1"
@@ -869,6 +1242,179 @@ mod tests {
         assert!(
             delete.contains("append-only"),
             "a begin delete must be refused, got: {delete}"
+        );
+    }
+
+    #[test]
+    fn contamination_thresholds_round_trip_through_the_begin_row() {
+        let (_scratch, conn) = migrated();
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        let observation_id = insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let thresholds = ContaminationThresholds::new(
+            "custom-v9",
+            1_000,
+            2_000,
+            MonotonicDuration::from_nanos(7_200_000_000_000),
+            5_000,
+            Credits::from_micros(42),
+        )
+        .unwrap();
+        let run = ControlledExperimentRun {
+            contamination_thresholds: thresholds.clone(),
+            baseline_plateau_started_at: at,
+            ..begin_fixture(observation_id, at)
+        };
+        insert_begin(&conn, &run).expect("begin insert must work");
+        let loaded = load_by_experiment_id(&conn, &run.id)
+            .expect("load must work")
+            .expect("run must exist");
+        assert_eq!(loaded.contamination_thresholds, thresholds);
+        assert_eq!(loaded.baseline_plateau_started_at, at);
+    }
+
+    #[test]
+    fn plateau_scan_asserts_the_trailing_stable_run() {
+        let (_scratch, conn) = migrated();
+        let minute: i64 = 60_000_000_000;
+        insert_meter_chain(
+            &conn,
+            "work-a",
+            "five_hour",
+            UtcTimestamp::from_unix_nanos(0),
+            500_000,
+        );
+        insert_meter_chain(
+            &conn,
+            "work-a",
+            "five_hour",
+            UtcTimestamp::from_unix_nanos(minute),
+            100_000,
+        );
+        insert_meter_chain(
+            &conn,
+            "work-a",
+            "five_hour",
+            UtcTimestamp::from_unix_nanos(2 * minute),
+            100_000,
+        );
+        let baseline = QuotaUsed::new(QuotaFractionPpm::new(100_000).unwrap());
+        let start = baseline_plateau_start_for(
+            &conn,
+            "anthropic",
+            "work-a",
+            &WindowSemanticKey::new("five_hour"),
+            baseline,
+            UtcTimestamp::from_unix_nanos(2 * minute),
+            10_000,
+        )
+        .expect("plateau scan must work");
+        assert_eq!(start, UtcTimestamp::from_unix_nanos(minute));
+    }
+
+    #[test]
+    fn overlap_scan_reports_sessions_marked_against_the_same_account() {
+        use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
+        use crate::store::session_account_marker::{
+            EvidenceDesignation, MarkerSource, NewSessionAccountMarker, insert_marker,
+        };
+        let (_scratch, conn) = migrated();
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        let observation_id = insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let run = begin_fixture(observation_id, at);
+        insert_begin(&conn, &run).expect("begin insert must work");
+        let mark = |source: &str, native: &str, account: &str, observed: i64| {
+            insert_marker(
+                &conn,
+                &NewSessionAccountMarker {
+                    session_id: SessionId::new(
+                        SourceNamespace::new(source),
+                        NativeSessionId::new(native),
+                    ),
+                    observed_at: UtcTimestamp::from_unix_nanos(observed),
+                    source_ordering_key: None,
+                    logical_account: account.to_string(),
+                    resolved_account_id: None,
+                    marker_source: MarkerSource::new("hook"),
+                    run_id: None,
+                    evidence_designation: EvidenceDesignation::ExplicitLauncherOrHook,
+                },
+            )
+            .expect("marker insert must work");
+        };
+        mark("claude-code", "sess-other", "work-a", 1_000_000_001);
+        mark("codex", "sess-unrelated", "personal", 1_000_000_001);
+        let overlapping =
+            overlapping_sessions_for_run(&conn, &run, UtcTimestamp::from_unix_nanos(1_000_000_002))
+                .expect("overlap scan must work");
+        assert_eq!(overlapping.len(), 1);
+        assert_eq!(overlapping[0].label(), "claude-code/sess-other");
+    }
+
+    #[test]
+    fn hidden_traffic_with_flat_local_credits_is_contaminated() {
+        let (_scratch, conn) = migrated();
+        let start = UtcTimestamp::from_unix_nanos(0);
+        let five_minutes: i64 = 300_000_000_000;
+        let baseline_id = insert_meter_chain(&conn, "work-a", "five_hour", start, 100_000);
+        // Hidden traffic moves the meter while no local work is attributed.
+        insert_meter_chain(
+            &conn,
+            "work-a",
+            "five_hour",
+            UtcTimestamp::from_unix_nanos(five_minutes),
+            200_000,
+        );
+        insert_meter_chain(
+            &conn,
+            "work-a",
+            "five_hour",
+            UtcTimestamp::from_unix_nanos(2 * five_minutes),
+            200_000,
+        );
+        let run = begin_fixture(baseline_id, start);
+        insert_begin(&conn, &run).expect("begin insert must work");
+        let verdict = evaluate_contamination_for_run(
+            &conn,
+            &run,
+            Credits::from_micros(0),
+            UtcTimestamp::from_unix_nanos(2 * five_minutes),
+        )
+        .expect("evaluation must work");
+        assert!(
+            !verdict
+                .findings_for(
+                    crate::calibration::contamination::ContaminationSignal::FlatCreditsWithMeterMovement
+                )
+                .is_empty(),
+            "injected hidden traffic with flat local credits must fire the flat-credits signal"
+        );
+    }
+
+    #[test]
+    fn activation_is_refused_for_a_contaminated_run() {
+        let (_scratch, conn) = migrated();
+        let start = UtcTimestamp::from_unix_nanos(0);
+        let five_minutes: i64 = 300_000_000_000;
+        let baseline_id = insert_meter_chain(&conn, "work-a", "five_hour", start, 100_000);
+        insert_meter_chain(
+            &conn,
+            "work-a",
+            "five_hour",
+            UtcTimestamp::from_unix_nanos(five_minutes),
+            200_000,
+        );
+        let run = begin_fixture(baseline_id, start);
+        insert_begin(&conn, &run).expect("begin insert must work");
+        let refusal = refuse_activation_for_contaminated_run(
+            &conn,
+            &run,
+            Credits::from_micros(0),
+            UtcTimestamp::from_unix_nanos(five_minutes),
+        )
+        .unwrap_err();
+        assert!(
+            refusal.to_string().contains("contaminated"),
+            "refusal must name contamination, got: {refusal}"
         );
     }
 }
