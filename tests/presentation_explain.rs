@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agent_usage_book::domain::attempt::AttemptId;
 use agent_usage_book::domain::freshness::{Freshness, Observed};
+use agent_usage_book::domain::ids::ProviderContractId;
 use agent_usage_book::domain::provenance::{
     CostModelId, DerivationId, EvidenceId, QuerySemantics, RateCardId, WindowCalibrationId,
     WitnessId, canonical_inputs_hash,
@@ -15,6 +16,7 @@ use agent_usage_book::domain::time::{
 use agent_usage_book::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, UsageVector,
 };
+use agent_usage_book::domain::window::{WindowScope, WindowSeverity};
 use agent_usage_book::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use agent_usage_book::logging::{LogicalName, RunId};
 use agent_usage_book::presentation::json::{
@@ -26,9 +28,9 @@ use agent_usage_book::presentation::render::{
     render_status_report, render_status_report_with_explain,
 };
 use agent_usage_book::report::{
-    IngestSummary, LedgerGeneration, MeterAccount, MeterReadingProvenance, ProvenanceGraph,
-    ProvenanceNode, ReportField, ReportMetadata, SpendGroup, SpendGroupProvenance, SpendReport,
-    StatusReport, Unit, ValueArithmetic,
+    IngestSummary, LedgerGeneration, MeterAccount, MeterExplanation, MeterReadingProvenance,
+    MeterWindowExplanation, ProvenanceGraph, ProvenanceNode, ReportField, ReportMetadata,
+    SpendGroup, SpendGroupProvenance, SpendReport, StatusReport, Unit, ValueArithmetic,
 };
 
 fn test_metadata() -> ReportMetadata {
@@ -129,6 +131,47 @@ fn seed_status_report() -> StatusReport {
         readings,
         agent_usage_book::report::ProjectionReadState::Read,
     )
+}
+
+#[test]
+fn meter_explain_names_legacy_and_limits_contracts() {
+    let account_for = |contract: &str| {
+        MeterAccount::new(
+            LogicalName::new("primary"),
+            Freshness::Fresh {
+                observed: observed_reading(500_000),
+                latest_attempt: AttemptId::new(1),
+            },
+        )
+        .with_meter_explanation(MeterExplanation {
+            provider_contract_id: ProviderContractId::new(contract),
+            windows: vec![MeterWindowExplanation {
+                semantic_key: "session".to_string(),
+                scope: WindowScope::AccountWide,
+                is_active: true,
+                severity: WindowSeverity::new("normal"),
+            }],
+        })
+    };
+
+    for contract in [
+        "anthropic-oauth-usage-v1",
+        "anthropic-oauth-usage-limits-v1",
+    ] {
+        let report = StatusReport::new(
+            test_metadata(),
+            vec![account_for(contract)],
+            vec![],
+            agent_usage_book::report::ProjectionReadState::Read,
+        );
+        let rendered = render_status_report_with_explain(
+            &report,
+            UtcTimestamp::from_unix_nanos(2_000),
+            test_envelope(),
+            ExplainMode::Summary,
+        );
+        assert!(rendered.contains(&format!("provider contract: {contract}")));
+    }
 }
 
 fn seed_spend_report() -> SpendReport {

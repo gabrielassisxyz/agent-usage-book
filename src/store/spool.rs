@@ -116,6 +116,8 @@ pub struct PendingWindow {
     pub quantization: String,
     pub resets_at_nanos: Option<i64>,
     pub nominal_duration_nanos: i64,
+    pub is_active: bool,
+    pub severity: String,
 }
 
 /// The complete terminal bundle for one attempt: its result, response evidence,
@@ -169,6 +171,8 @@ impl PendingWindow {
             "quantization": self.quantization,
             "resets_at_nanos": self.resets_at_nanos,
             "nominal_duration_nanos": self.nominal_duration_nanos,
+            "is_active": self.is_active,
+            "severity": self.severity,
         })
     }
 
@@ -182,6 +186,11 @@ impl PendingWindow {
             quantization: required_str(value, "quantization")?,
             resets_at_nanos: optional_i64(value, "resets_at_nanos")?,
             nominal_duration_nanos: required_i64(value, "nominal_duration_nanos")?,
+            is_active: value
+                .get("is_active")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
+            severity: optional_str(value, "severity").unwrap_or_else(|| "unknown".to_owned()),
         })
     }
 }
@@ -353,6 +362,8 @@ fn pending_window_from_window(window: &MeterWindow) -> PendingWindow {
         quantization: quantization_sql::as_sql(window.quantization()).to_owned(),
         resets_at_nanos: window.reset_state().instant().map(|ts| ts.unix_nanos()),
         nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
+        is_active: window.is_active(),
+        severity: window.severity().as_str().to_owned(),
     }
 }
 
@@ -955,7 +966,7 @@ fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
             ReportedResolution::new(ppm)
                 .ok_or_else(|| "reported_resolution_ppm must be non-zero".to_owned())
         })?;
-    Ok(MeterWindow::new(
+    Ok(MeterWindow::new_with_facts(
         WindowSemanticKey::new(window.semantic_key.clone()),
         scope,
         quota_used,
@@ -966,6 +977,8 @@ fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
             None => WindowResetState::NotStarted,
         },
         NominalWindowDuration::from_nanos(window.nominal_duration_nanos as u64),
+        window.is_active,
+        crate::domain::window::WindowSeverity::new(window.severity.clone()),
     ))
 }
 
@@ -1095,6 +1108,8 @@ mod tests {
                 .to_owned(),
                 resets_at_nanos: Some(5_000),
                 nominal_duration_nanos: 18_000_000_000_000,
+                is_active: true,
+                severity: "unknown".into(),
             }],
         }
     }
@@ -1182,6 +1197,8 @@ mod tests {
             quantization: "rounded_to_nearest".to_owned(),
             resets_at_nanos: Some(6_000),
             nominal_duration_nanos: 604_800_000_000_000,
+            is_active: true,
+            severity: "warning".to_owned(),
         });
 
         let reconstructed = reconstruct(&pending).unwrap();

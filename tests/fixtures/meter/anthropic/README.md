@@ -13,6 +13,8 @@ All fixtures in this directory are vetted to ensure:
 ## Catalog of Fixtures
 
 - `valid-success.json`: Normal subscription usage response with 5h and 7d windows.
+- `limits-success.json`: The limits contract with required session and weekly-all constraints,
+  one model-scoped weekly constraint, and matching named-block calibration values.
 - `zero-percentage.json`: Unused quota (0.0% utilization).
 - `multiple-windows.json`: Account-wide 5h/7d windows plus multiple model-specific windows (`seven_day_sonnet`, `seven_day_opus`).
 - `model-specific.json`: Model-specific weekly window (`seven_day_sonnet`).

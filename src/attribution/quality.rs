@@ -64,7 +64,10 @@ impl AttributionObservation {
     }
 }
 
-/// An exact ratio of one slice of usage to a total, for one token kind.
+/// An exact ratio of one slice of usage to a total, for one token kind or,
+/// equally, for any other usage-weighted evidence-coverage measure that
+/// needs the same exact-integer floor comparison (`aub-cab.1`, which weighs
+/// canonical usage per grouping key rather than per [`TokenKind`]).
 ///
 /// Kept as numerator and denominator rather than a float so the floor
 /// comparison is exact and a zero denominator stays representable as "no
@@ -76,6 +79,18 @@ pub struct AttributionFraction {
 }
 
 impl AttributionFraction {
+    /// Builds a fraction directly from an already-computed numerator and
+    /// denominator, for a caller measuring coverage over something other
+    /// than this module's own per-token-kind breakdown (`aub-cab.1`'s
+    /// per-group attribution-quality gate, PLAN.md 26, decided by
+    /// `aub-cab.7`).
+    pub fn new(numerator: u64, denominator: u64) -> Self {
+        Self {
+            numerator,
+            denominator,
+        }
+    }
+
     /// The numerator: attributed tokens, or the tokens of one evidence class.
     pub fn numerator(self) -> u64 {
         self.numerator

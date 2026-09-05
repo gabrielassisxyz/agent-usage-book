@@ -713,7 +713,7 @@ impl Command {
                 "legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE",
             ),
             Command::Sample => Some(
-                "--due | --account NAME | --all | --if-due | --session-id SESSION | --run-id RUN | --require-success",
+                "--due | --account NAME | --if-due | --session-id SESSION | --run-id RUN | --require-success",
             ),
             Command::ClearDiagnostics => Some("[--provider NAME | --all]"),
             Command::Drill => Some(
@@ -1065,7 +1065,6 @@ pub(crate) fn sample_command(
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
     let mut due = false;
-    let mut all = false;
     let mut if_due = false;
     let mut require_success = false;
     let mut session_id: Option<String> = None;
@@ -1075,7 +1074,11 @@ pub(crate) fn sample_command(
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--due" => due = true,
-            "--all" => all = true,
+            "--all" => {
+                return Err(Error::Usage(
+                    "unknown argument: --all; run aub sample alone".into(),
+                ));
+            }
             "--if-due" => if_due = true,
             "--require-success" => require_success = true,
             "--session-id" => {
@@ -1112,21 +1115,11 @@ pub(crate) fn sample_command(
         }
     }
 
-    if all && invocation.account.is_some() {
-        return Err(Error::Usage(
-            "--all and --account cannot be used together".into(),
-        ));
-    }
     if session_id.is_some() && invocation.account.is_none() {
         return Err(Error::Usage("--session-id requires --account NAME".into()));
     }
     if run_id.is_some() && session_id.is_none() {
         return Err(Error::Usage("--run-id requires --session-id".into()));
-    }
-    if !due && !all && invocation.account.is_none() {
-        return Err(Error::Usage(
-            "sample requires --due, --account, or --all".into(),
-        ));
     }
 
     let env = crate::config::RealEnv;
@@ -1245,13 +1238,7 @@ pub(crate) fn sample_command(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    let forced = if invocation.account.is_some() {
-        !due && !if_due
-    } else if all {
-        !if_due
-    } else {
-        false
-    };
+    let forced = !due && !if_due;
 
     let trigger = if session_id.is_some() {
         crate::store::sample_run::Trigger::Hook
@@ -2839,19 +2826,39 @@ fn projection_accounts(
                 status_clock_skew_envelope(),
                 clock,
             );
-            MeterAccount::from_projection(
-                LogicalName::new(account.name.clone()),
-                reading.freshness,
-                reading
-                    .limiting_window
-                    .map(|limit| crate::report::LimitingWindow {
-                        scope: limit.scope,
-                        nominal_duration: limit.nominal_duration,
-                        reset_state: limit.reset_state,
-                    }),
-                reading.included_scopes,
-                model_selector.map(crate::domain::window::ModelId::new),
-            )
+            {
+                let account = MeterAccount::from_projection(
+                    LogicalName::new(account.name.clone()),
+                    reading.freshness,
+                    reading
+                        .limiting_window
+                        .map(|limit| crate::report::LimitingWindow {
+                            scope: limit.scope,
+                            nominal_duration: limit.nominal_duration,
+                            reset_state: limit.reset_state,
+                        }),
+                    reading.included_scopes,
+                    model_selector.map(crate::domain::window::ModelId::new),
+                );
+                match projected.and_then(|account| account.last_successful_observation.as_ref()) {
+                    Some(success) => {
+                        account.with_meter_explanation(crate::report::MeterExplanation {
+                            provider_contract_id: success.provider_contract_id.clone(),
+                            windows: success
+                                .windows
+                                .iter()
+                                .map(|window| crate::report::MeterWindowExplanation {
+                                    semantic_key: window.semantic_key.clone(),
+                                    scope: window.scope.clone(),
+                                    is_active: window.is_active,
+                                    severity: window.severity.clone(),
+                                })
+                                .collect(),
+                        })
+                    }
+                    None => account,
+                }
+            }
         })
         .collect()
 }
@@ -5804,6 +5811,80 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
 
     /// The body of one function in this file: from its declaration to the
     /// next top-level `fn`, or to the end of the file.
+    #[test]
+    fn sample_options_help_does_not_mention_all() {
+        let options = Command::Sample
+            .options_help()
+            .expect("sample has options help");
+        assert!(
+            !options.contains("--all"),
+            "sample options must not mention --all: {options}"
+        );
+        let clear_options = Command::ClearDiagnostics
+            .options_help()
+            .expect("clear-diagnostics has options help");
+        assert!(
+            clear_options.contains("--all"),
+            "clear-diagnostics must keep --all: {clear_options}"
+        );
+    }
+
+    #[test]
+    fn sample_parser_refuses_all_naming_bare_form() {
+        let inv = Invocation {
+            command: Command::Sample,
+            format: OutputFormat::Text,
+            verbosity: 0,
+            explain: ExplainMode::Off,
+            account: None,
+            model: None,
+            no_color: false,
+            rest: vec!["--all".to_string()],
+        };
+        let result = sample_command(&RealClock::new(), Level::DEFAULT, &inv);
+        match result {
+            Err(Error::Usage(msg)) => {
+                assert!(
+                    msg.contains("unknown argument: --all"),
+                    "expected unknown argument: --all, got {msg}"
+                );
+                assert!(
+                    msg.contains("run aub sample alone"),
+                    "expected bare form naming, got {msg}"
+                );
+            }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn sample_parser_refuses_all_with_account() {
+        let inv = Invocation {
+            command: Command::Sample,
+            format: OutputFormat::Text,
+            verbosity: 0,
+            explain: ExplainMode::Off,
+            account: Some("work-primary".to_string()),
+            model: None,
+            no_color: false,
+            rest: vec!["--all".to_string()],
+        };
+        let result = sample_command(&RealClock::new(), Level::DEFAULT, &inv);
+        match result {
+            Err(Error::Usage(msg)) => {
+                assert!(
+                    msg.contains("unknown argument: --all"),
+                    "expected unknown argument: --all, got {msg}"
+                );
+                assert!(
+                    msg.contains("run aub sample alone"),
+                    "expected bare form naming, got {msg}"
+                );
+            }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
     fn function_body(source: &str, declaration: &str) -> String {
         let start = source
             .find(declaration)

@@ -20,12 +20,12 @@ EOT
     mkdir -p "$STATE_DIR/state"
 }
 
-# seed_projection OBSERVATION_JSON ATTEMPT_JSON: writes a schema-v1 projection
+# seed_projection OBSERVATION_JSON ATTEMPT_JSON: writes a schema-v2 projection
 # with one account and the given observation and attempt records.
 seed_projection() {
     local observation="$1" attempt="$2"
     cat > "$STATE_DIR/state/projection" <<EOT
-{"schema_version":1,"ledger_generation":12,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"provider-a","last_successful_observation":${observation},"latest_attempt":${attempt}}]}
+{"schema_version":2,"ledger_generation":12,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"provider-a","last_successful_observation":${observation},"latest_attempt":${attempt}}]}
 EOT
     echo "$now" > "$CASE_LOG_DIR/seeded-at-nanos.txt"
 }
@@ -33,7 +33,7 @@ EOT
 # window USED_PPM RECEIVED_NANOS: one account-wide five-hour window.
 window() {
     local used_ppm="$1" received="$2"
-    printf '{"semantic_key":"five_hour","scope_kind":"account_wide","scoped_model":null,"quota_used_ppm":%s,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":%s,"nominal_duration_nanos":18000000000000}' \
+    printf '{"semantic_key":"five_hour","scope_kind":"account_wide","scoped_model":null,"quota_used_ppm":%s,"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":%s,"nominal_duration_nanos":18000000000000,"is_active":true,"severity":"unknown"}' \
         "$used_ppm" "$((now + 3 * 3600 * 1000000000))"
 }
 
@@ -42,21 +42,21 @@ case_steps() {
     # Step 1: fresh, observed 41 seconds ago, success 41 seconds ago.
     local received="$((now - 41 * 1000000000))"
     seed_projection \
-        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"windows\":[$(window 620000 "$received")]}" \
+        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"provider_contract_id\":\"contract-v1\",\"windows\":[$(window 620000 "$received")]}" \
         "{\"attempt_id\":9,\"request_started_at_nanos\":${received},\"credential_context_id\":\"ctx\",\"result\":{\"completed_at_nanos\":${received},\"outcome\":\"success\",\"failure_class\":null}}"
     step "fresh" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status
 
     # Step 2: stale by age, observed 14 minutes ago.
     received="$((now - 14 * 60 * 1000000000))"
     seed_projection \
-        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"windows\":[$(window 620000 "$received")]}" \
+        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"provider_contract_id\":\"contract-v1\",\"windows\":[$(window 620000 "$received")]}" \
         "{\"attempt_id\":9,\"request_started_at_nanos\":${received},\"credential_context_id\":\"ctx\",\"result\":{\"completed_at_nanos\":${received},\"outcome\":\"success\",\"failure_class\":null}}"
     step "stale" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status
 
     # Step 3: auth required.
     received="$((now - 5 * 60 * 1000000000))"
     seed_projection \
-        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"windows\":[$(window 620000 "$received")]}" \
+        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"provider_contract_id\":\"contract-v1\",\"windows\":[$(window 620000 "$received")]}" \
         "{\"attempt_id\":9,\"request_started_at_nanos\":${received},\"credential_context_id\":\"ctx\",\"result\":{\"completed_at_nanos\":${received},\"outcome\":\"auth_required\",\"failure_class\":null}}"
     step "auth" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status
 
@@ -67,7 +67,7 @@ case_steps() {
     # Step 5: collector interrupted, an attempt started and never finished.
     received="$((now - 9 * 60 * 1000000000))"
     seed_projection \
-        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"windows\":[$(window 620000 "$received")]}" \
+        "{\"observation_id\":7,\"provider_observed_at_nanos\":${received},\"received_at_nanos\":${received},\"measurement_basis\":\"provider_observed\",\"provider_contract_id\":\"contract-v1\",\"windows\":[$(window 620000 "$received")]}" \
         "{\"attempt_id\":9,\"request_started_at_nanos\":${received},\"credential_context_id\":\"ctx\",\"result\":null}"
     step "interrupted" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status
 

@@ -96,8 +96,17 @@ pub(crate) mod migration_0023;
 #[path = "0024_task_classification_axes.rs"]
 pub(crate) mod migration_0024;
 
-#[path = "0025_session_heartbeat.rs"]
+#[path = "0025_meter_window_reset_state.rs"]
 pub(crate) mod migration_0025;
+
+#[path = "0026_settlement_policy.rs"]
+pub(crate) mod migration_0026;
+
+#[path = "0027_meter_window_provider_facts.rs"]
+pub(crate) mod migration_0027;
+
+#[path = "0028_session_heartbeat.rs"]
+pub(crate) mod migration_0028;
 
 /// Every migration this binary knows, in version order.
 ///
@@ -130,5 +139,8 @@ pub fn registry() -> Vec<Migration> {
         migration_0023::migration(),
         migration_0024::migration(),
         migration_0025::migration(),
+        migration_0026::migration(),
+        migration_0027::migration(),
+        migration_0028::migration(),
     ]
 }

@@ -1620,6 +1620,10 @@ mod tests {
                     "fixture-meter-semantics",
                 ),
                 billing_semantics_id: BillingSemanticsId::new("fixture-billing-semantics"),
+                settlement_policy:
+                    crate::calibration::settlement::SettlementPolicy::conservative_default(
+                        ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+                    ),
                 validity: ValidityInterval::new(
                     now,
                     UtcTimestamp::from_unix_nanos(now.unix_nanos() + 1_000),

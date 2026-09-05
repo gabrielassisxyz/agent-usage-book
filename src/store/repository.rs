@@ -502,7 +502,7 @@ pub(crate) fn commit_terminal_bundle_on_connection(
         },
     )?;
     for window in bundle.windows() {
-        meter_evidence::insert_window(
+        meter_evidence::insert_window_with_facts(
             &tx,
             &NewMeterWindow {
                 observation_id,
@@ -514,6 +514,8 @@ pub(crate) fn commit_terminal_bundle_on_connection(
                 resets_at: window.reset_state(),
                 nominal_duration: window.nominal_duration(),
             },
+            window.is_active(),
+            window.severity().clone(),
         )?;
     }
 
