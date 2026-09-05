@@ -4563,6 +4563,22 @@ fn calibrate_begin_validated(
         baseline_quota_used: window.quota_used,
         baseline_resolution: window.reported_resolution,
         baseline_observed_at: baseline.received_at,
+        baseline_plateau_started_at: {
+            use crate::store::calibration_controlled::baseline_plateau_start_for;
+            let thresholds =
+                crate::calibration::contamination::ContaminationThresholds::conservative_default();
+            baseline_plateau_start_for(
+                conn,
+                provider,
+                account,
+                &crate::domain::window::WindowSemanticKey::new(args.window.clone()),
+                window.quota_used,
+                baseline.received_at,
+                thresholds.pre_burn_max_movement_ppm(),
+            )?
+        },
+        contamination_thresholds:
+            crate::calibration::contamination::ContaminationThresholds::conservative_default(),
         started_at,
         ended_at: None,
         exclusivity_assertion: format!(

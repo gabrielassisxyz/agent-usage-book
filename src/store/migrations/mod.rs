@@ -114,6 +114,9 @@ pub(crate) mod migration_0029;
 #[path = "0030_calibration_controlled_run.rs"]
 pub(crate) mod migration_0030;
 
+#[path = "0031_calibration_contamination.rs"]
+pub(crate) mod migration_0031;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -150,5 +153,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0028::migration(),
         migration_0029::migration(),
         migration_0030::migration(),
+        migration_0031::migration(),
     ]
 }

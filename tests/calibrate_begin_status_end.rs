@@ -211,6 +211,9 @@ fn begin_experiment(
         baseline_quota_used: window.quota_used,
         baseline_resolution: window.reported_resolution,
         baseline_observed_at: baseline.received_at,
+        baseline_plateau_started_at: baseline.received_at,
+        contamination_thresholds:
+            agent_usage_book::calibration::contamination::ContaminationThresholds::conservative_default(),
         started_at,
         ended_at: None,
         exclusivity_assertion: format!(
