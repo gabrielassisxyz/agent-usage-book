@@ -1056,7 +1056,7 @@ mod tests {
             &fx.conn,
             fx.account,
             &second_obs,
-            &[second_window.clone()],
+            std::slice::from_ref(&second_window),
             UtcTimestamp::from_unix_nanos(40_500),
         )
         .unwrap();
