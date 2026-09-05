@@ -1684,10 +1684,11 @@ mod tests {
         // production. Everything before this point already committed with
         // the slot free, matching how `run` never holds the writer lock
         // across stages either.
+        // The guard comes from the store rather than being built here: the meter
+        // layer may not name a SQLite type at all, which the boundary rule
+        // `03-meter-no-sqlite` enforces on every file under `src/meter/`.
         let mut holder = open(&database_path, AccessMode::ReadWrite, &busy_policy).unwrap();
-        let held = holder
-            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
-            .unwrap();
+        let held = crate::store::connection::hold_writer_slot(&mut holder);
         let disposition = orchestrator.persist_one(&leased, payload);
         let attempt_id_from_disposition =
             if let AccountDisposition::Spooled { attempt_id, .. } = &disposition {
