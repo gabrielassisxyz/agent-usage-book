@@ -227,6 +227,9 @@ pub fn execute_single(
     execute_single_with_resolver(request, budget, clock, None)
 }
 
+/// A hostname resolver in std types, so no ureq type leaves this module.
+type HostResolver = fn(&str) -> std::io::Result<Vec<std::net::SocketAddr>>;
+
 /// Executes a single HTTP request, resolving hostnames through `resolver`
 /// instead of the system resolver when one is given.
 ///
@@ -238,7 +241,7 @@ fn execute_single_with_resolver(
     request: &HttpRequest,
     budget: &CommandBudget,
     clock: &impl Clock,
-    resolver: Option<fn(&str) -> std::io::Result<Vec<std::net::SocketAddr>>>,
+    resolver: Option<HostResolver>,
 ) -> Result<HttpResponse, FailureClass> {
     let Some(remaining) = budget.remaining(clock) else {
         return Err(FailureClass::TotalBudgetExpired);
