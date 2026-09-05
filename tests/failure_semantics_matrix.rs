@@ -1343,8 +1343,8 @@ fn row_26_meter_percent_decreases_without_reset() {
 
 #[test]
 fn row_27_reset_timestamp_changes_unexpectedly() {
-    // The instants are seconds rather than microseconds apart on purpose. The
-    // classifier now carries a 100 ms jitter envelope, so a reset that moves by
+    // The instants are seconds apart on purpose. The
+    // classifier now carries a 2 s jitter envelope, so a reset that moves by
     // less than that is the same boundary reported twice and not an anomaly at
     // all; and "not yet due" is judged against the old instant minus that same
     // envelope, which near zero would go negative and make every reading due.
@@ -1352,16 +1352,16 @@ fn row_27_reset_timestamp_changes_unexpectedly() {
     // boundary materially, and has to observe well before it.
     let previous = WindowReading {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(500_000).unwrap()),
-        resets_at: WindowResetState::Known(ts(1_000_000_000)),
-        observed_at: ts(400_000_000),
+        resets_at: WindowResetState::Known(ts(10_000_000_000)),
+        observed_at: ts(4_000_000_000),
     };
     let current = WindowReading {
-        // No decrease, but the reset instant moved by 300 ms with no boundary
+        // No decrease, but the reset instant moved by 3 s with no boundary
         // having been due yet (observed_at is still before the old reset
         // instant, by more than the jitter envelope).
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(500_000).unwrap()),
-        resets_at: WindowResetState::Known(ts(1_300_000_000)),
-        observed_at: ts(500_000_000),
+        resets_at: WindowResetState::Known(ts(13_000_000_000)),
+        observed_at: ts(5_000_000_000),
     };
 
     let anomaly = classify_window_transition(previous, current);
