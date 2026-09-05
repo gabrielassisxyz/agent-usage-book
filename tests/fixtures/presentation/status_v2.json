@@ -1,0 +1,35 @@
+{
+  "schema": 2,
+  "command": "status",
+  "run": "run-1000-2000-1",
+  "generated_at": 2000,
+  "knowledge_at": 1000,
+  "ledger_generation": 7,
+  "accounts": [
+    {
+      "account": "primary",
+      "freshness": "fresh",
+      "remaining": {
+        "value": "500000",
+        "unit": "ppm"
+      },
+      "latest_attempt": 1
+    },
+    {
+      "account": "secondary",
+      "freshness": "stale",
+      "reason": "age_exceeded",
+      "last_good": {
+        "value": "250000",
+        "unit": "ppm"
+      },
+      "latest_attempt": 2
+    },
+    {
+      "account": "tertiary",
+      "freshness": "auth_required",
+      "last_good": null,
+      "latest_attempt": 3
+    }
+  ]
+}

@@ -42,7 +42,7 @@ case_assertions() {
     assert_exit 0 3
 
     assert_json_field 1 "command" "spend"
-    assert_json_field 1 "schema" "1"
+    assert_json_field 1 "schema" "2"
     assert_json_field 1 "window.since" "2026-08-25"
     assert_json_field 1 "groups[0].tokens.input.value" "1200"
     assert_json_field 1 "groups[0].tokens.output.value" "600"

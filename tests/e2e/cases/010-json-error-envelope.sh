@@ -16,7 +16,7 @@ case_steps() {
 case_assertions() {
     # assert_exit CODE STEP
     assert_exit 2 1
-    assert_json_field 1 schema 1
+    assert_json_field 1 schema 2
     assert_json_field 1 command spend
     assert_json_field 1 error.code INVALID_USAGE
     assert_json_field 1 error.exit_class 2
