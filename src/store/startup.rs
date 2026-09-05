@@ -486,6 +486,31 @@ fileserver:/export /home nfs rw,relatime 0 0
 
     // --- ensure_state_dir_ready: unwritable (blocked parent) ----------------------
 
+    /// Owns the scratch tree behind a `blocked_parent` case: the `blocked`
+    /// parent directory with mode 000 plus the scratch root around it.
+    /// Restores `blocked` to a removable mode on drop, so the removal in
+    /// `ScratchDir`'s own drop can descend into it. Drop runs on the failure
+    /// path too (unwinding), which is what keeps a failing case from leaving
+    /// the same unremovable tree behind that a passing one used to. The mode
+    /// drop itself stays: `blocked` still has mode 000 while the case's
+    /// assertions run, and is only restored when the case's scope ends.
+    struct BlockedParentScratch {
+        scratch: ScratchDir,
+        blocked: PathBuf,
+    }
+
+    impl BlockedParentScratch {
+        fn path(&self) -> &Path {
+            self.scratch.path()
+        }
+    }
+
+    impl Drop for BlockedParentScratch {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.blocked, fs::Permissions::from_mode(0o700));
+        }
+    }
+
     /// Blocks the *parent* rather than the leaf: `ensure_dir_mode_0700` forces the
     /// leaf's own mode to 0700 regardless of what it finds, which is the correct,
     /// self-healing behaviour for the "permissions wider than intended" case above,
@@ -493,13 +518,13 @@ fileserver:/export /home nfs rw,relatime 0 0
     /// unreadable. A parent with no execute bit cannot be traversed by this process
     /// (uid 1000, no `CAP_DAC_OVERRIDE`) regardless of who owns it, which is the
     /// genuinely unrecoverable case the acceptance criteria mean by "unwritable".
-    fn blocked_parent() -> (ScratchDir, PathBuf) {
+    fn blocked_parent() -> (BlockedParentScratch, PathBuf) {
         let scratch = ScratchDir::new();
         let blocked = scratch.path().join("blocked");
         fs::create_dir(&blocked).unwrap();
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o000)).unwrap();
         let target = blocked.join("aub");
-        (scratch, target)
+        (BlockedParentScratch { scratch, blocked }, target)
     }
 
     #[test]
@@ -551,5 +576,69 @@ fileserver:/export /home nfs rw,relatime 0 0
 
         assert!(result.is_ok());
         assert!(called.get());
+    }
+
+    // --- blocked_parent cleanup (aub-omtm) --------------------------------------
+    //
+    // The scratch tree behind a `blocked_parent` case must stay removable by its
+    // owner after the case runs: `remove_dir_all` cannot descend into the
+    // mode-000 `blocked` directory, so without a restore the scratch root
+    // survives its own `Drop` and is left behind under the lane's TMPDIR.
+
+    /// The scratch tree is gone after a passing case. Fails against the case
+    /// without cleanup: the mode-000 directory is still there, so the removal
+    /// in `Drop` cannot descend into it and the root survives.
+    #[test]
+    fn blocked_parent_scratch_tree_is_removable_after_a_passing_case() {
+        let scratch_path: PathBuf;
+        {
+            let (scratch, target) = blocked_parent();
+            scratch_path = scratch.path().to_path_buf();
+            assert_eq!(
+                mode_of(&scratch.path().join("blocked")),
+                0o000,
+                "the case must still prove the refusal against a mode-000 directory"
+            );
+            let mounts = FakeMountTable::new();
+            let err = ensure_state_dir_ready(&target, &mounts).unwrap_err();
+            assert_eq!(err.exit_class(), crate::error::ExitClass::Store);
+        }
+        assert!(
+            !scratch_path.exists(),
+            "scratch tree was not removed: {}",
+            scratch_path.display()
+        );
+    }
+
+    /// The same holds when the case fails partway through: the injected panic
+    /// stands in for any mid-case failure after the mode drop, and the restore
+    /// must run on that path too, not only when the case passes.
+    #[test]
+    fn blocked_parent_scratch_tree_is_removable_after_a_failing_case() {
+        use std::sync::Mutex;
+        let captured: Mutex<Option<PathBuf>> = Mutex::new(None);
+        let result = std::panic::catch_unwind(|| {
+            let (scratch, target) = blocked_parent();
+            *captured.lock().unwrap() = Some(scratch.path().to_path_buf());
+            assert_eq!(
+                mode_of(&scratch.path().join("blocked")),
+                0o000,
+                "the case must still prove the refusal against a mode-000 directory"
+            );
+            let mounts = FakeMountTable::new();
+            assert!(ensure_state_dir_ready(&target, &mounts).is_err());
+            panic!("injected failure after the mode was dropped");
+        });
+        assert!(result.is_err(), "the injected failure did not panic");
+        let scratch_path = captured
+            .lock()
+            .unwrap()
+            .take()
+            .expect("the case ran far enough to capture its scratch path");
+        assert!(
+            !scratch_path.exists(),
+            "scratch tree was not removed on the failure path: {}",
+            scratch_path.display()
+        );
     }
 }
