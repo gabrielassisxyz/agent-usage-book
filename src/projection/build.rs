@@ -47,6 +47,7 @@ fn projected_account(state: &AccountMeterState) -> ProjectedAccount {
 fn projected_success(success: &StoredSuccess) -> SuccessfulObservation {
     SuccessfulObservation {
         observation_id: success.observation.row_id,
+        provider_contract_id: success.observation.provider_contract_id.clone(),
         provider_observed_at: success.observation.provider_observed_at,
         received_at: success.observation.received_at,
         measurement_basis: success.observation.measurement_basis,
@@ -63,6 +64,8 @@ fn projected_window(window: &crate::store::meter_evidence::StoredMeterWindow) ->
         quantization: window.quantization,
         resets_at: window.resets_at,
         nominal_duration_nanos: window.nominal_duration,
+        is_active: window.is_active,
+        severity: window.severity.clone(),
     }
 }
 

@@ -697,9 +697,9 @@ mod tests {
             "agrees within granularity",
             "unresolved mismatch",
             "no configurable tolerance",
-            "`five_hour`",
-            "`seven_day`",
-            "`seven_day_<model>`",
+            "`limits[].kind=session`",
+            "`limits[].kind=weekly_all`",
+            "`limits[].kind=weekly_scoped`",
             "Anthropic idle / not-started",
         ] {
             assert!(

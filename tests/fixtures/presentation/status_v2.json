@@ -1,5 +1,5 @@
 {
-  "schema": 1,
+  "schema": 2,
   "command": "status",
   "run": "run-1000-2000-1",
   "generated_at": 2000,

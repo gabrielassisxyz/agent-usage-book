@@ -22,8 +22,8 @@ use crate::evidence::{CoverageCompleteness, Derivation, RequiredFact};
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
-    CoverageReport, NowReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport,
-    TaskOverheadReport, TaskReport,
+    ActiveActivityState, CoverageReport, LivenessGap, NowReport, ProvenanceGraph, SpendGroup,
+    SpendReport, StatusReport, TaskOverheadReport, TaskReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
@@ -158,7 +158,50 @@ pub fn render_status_report_with_explain(
         return line;
     }
     let lines = meter_account_lines(&report.accounts, now, envelope);
-    join_report_with_explain(lines, &report.provenance, explain)
+    let mut rendered = join_report_with_explain(lines, &report.provenance, explain);
+    if explain != ExplainMode::Off {
+        let meter_explain = render_meter_explain(&report.accounts);
+        if !meter_explain.is_empty() {
+            if !rendered.is_empty() {
+                rendered.push_str("\n\n");
+            }
+            rendered.push_str(&meter_explain);
+        }
+    }
+    rendered
+}
+
+/// Renders provider contract and raw window facts retained by the meter
+/// projection. The ordinary status value remains derived from all applicable
+/// windows; these lines make the provider's inputs auditable without changing
+/// that selection rule.
+fn render_meter_explain(accounts: &[crate::report::MeterAccount]) -> String {
+    let mut lines = Vec::new();
+    for account in accounts {
+        let Some(explanation) = &account.meter_explanation else {
+            continue;
+        };
+        lines.push(format!("meter account: {}", account.account.as_str()));
+        lines.push(format!(
+            "  provider contract: {}",
+            explanation.provider_contract_id.as_str()
+        ));
+        for window in &explanation.windows {
+            lines.push(format!(
+                "  window {}: is_active={}, severity={}",
+                window.semantic_key,
+                window.is_active,
+                window.severity.as_str()
+            ));
+        }
+    }
+    if lines.is_empty() {
+        String::new()
+    } else {
+        let mut rendered = vec!["meter explain:".to_string()];
+        rendered.extend(lines.into_iter().map(|line| format!("  {line}")));
+        rendered.join("\n")
+    }
 }
 
 /// Renders a now live report.
@@ -181,8 +224,41 @@ pub fn render_now_report_with_explain(
     envelope: ClockSkewEnvelope,
     explain: ExplainMode,
 ) -> String {
-    let lines = meter_account_lines(&report.accounts, now, envelope);
+    let mut lines = meter_account_lines(&report.accounts, now, envelope);
+    if let Some(activity_line) = render_activity_line(&report.activity) {
+        lines.push(activity_line);
+    }
     join_report_with_explain(lines, &report.provenance, explain)
+}
+
+/// The one line naming `aub-mgv.5`'s composed activity state, or `None` when the
+/// report evaluated no session at all (no `--session-id` was given). A bare `aub
+/// now` therefore reads identically to `aub status`, a contract this bead does
+/// not touch; the line appears only once something was actually evaluated.
+fn render_activity_line(activity: &ActiveActivityState) -> Option<String> {
+    match activity {
+        ActiveActivityState::NoEvidence => None,
+        ActiveActivityState::ExplicitMarkerEvidence(claim) => Some(format!(
+            "aub session: spending account={} marker={} heartbeat={}",
+            claim.logical_account, claim.marker_reference, claim.heartbeat_reference
+        )),
+        ActiveActivityState::ConflictingEvidence(logical_accounts) => Some(format!(
+            "aub session: conflicting_evidence accounts=[{}]",
+            logical_accounts.join(", ")
+        )),
+        ActiveActivityState::Inactive(claim) => {
+            let liveness = match &claim.liveness_gap {
+                LivenessGap::NeverObserved => "never_observed".to_string(),
+                LivenessGap::Aged {
+                    last_heartbeat_at, ..
+                } => format!("aged last_heartbeat={}", last_heartbeat_at.unix_nanos()),
+            };
+            Some(format!(
+                "aub session: inactive account={} marker={} liveness={liveness}",
+                claim.logical_account, claim.marker_reference
+            ))
+        }
+    }
 }
 
 /// One `aub <account> <reading>` line per account, in order, through the shared

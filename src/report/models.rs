@@ -13,15 +13,18 @@ use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
 use crate::domain::credits::Credits;
 use crate::domain::freshness::Freshness;
-use crate::domain::ids::NativeRunId;
+use crate::domain::ids::{NativeRunId, ProviderContractId};
 use crate::domain::money::Usd;
 use crate::domain::provenance::{CostModelId, DerivationId, RateCardId};
 use crate::domain::quota::QuotaRemaining;
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
-use crate::domain::window::{ModelId, NominalWindowDuration, WindowResetState, WindowScope};
+use crate::domain::window::{
+    ModelId, NominalWindowDuration, WindowResetState, WindowScope, WindowSeverity,
+};
 use crate::evidence::{Derivation, Provenance};
 use crate::logging::LogicalName;
+use crate::report::activity::ActiveActivityState;
 use crate::report::provenance::{ProvenanceGraph, ProvenanceNode, ReportField};
 pub use crate::store::export::{ExportKey, ExportRow, UsageByTokenClass};
 pub use crate::store::task_identity::TaskIdentityRow;
@@ -116,6 +119,9 @@ pub struct MeterAccount {
     /// The model a `--model` selector chose, reported so the output identifies
     /// the selection the reading was computed under.
     pub selected_model: Option<ModelId>,
+    /// Provider facts available to the explain renderer for a projected
+    /// observation. This is absent for reports assembled without meter state.
+    pub meter_explanation: Option<MeterExplanation>,
 }
 
 impl MeterAccount {
@@ -126,6 +132,7 @@ impl MeterAccount {
             limiting_window: None,
             included_scopes: Vec::new(),
             selected_model: None,
+            meter_explanation: None,
         }
     }
 
@@ -144,8 +151,30 @@ impl MeterAccount {
             limiting_window,
             included_scopes,
             selected_model,
+            meter_explanation: None,
         }
     }
+
+    pub fn with_meter_explanation(mut self, explanation: MeterExplanation) -> Self {
+        self.meter_explanation = Some(explanation);
+        self
+    }
+}
+
+/// Provider contract and raw window facts shown by `--explain`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeterExplanation {
+    pub provider_contract_id: ProviderContractId,
+    pub windows: Vec<MeterWindowExplanation>,
+}
+
+/// The non-derived provider facts behind one explained window.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MeterWindowExplanation {
+    pub semantic_key: String,
+    pub scope: WindowScope,
+    pub is_active: bool,
+    pub severity: WindowSeverity,
 }
 
 /// The window behind a reading: its scope and the nominal length the design's
@@ -223,6 +252,9 @@ pub struct NowReport {
     pub metadata: ReportMetadata,
     pub accounts: Vec<MeterAccount>,
     pub provenance: ProvenanceGraph,
+    /// Explicit marker-backed live account activity (`aub-mgv.5`), separate from
+    /// the meter readings above: a moving meter never substitutes for it.
+    pub activity: ActiveActivityState,
 }
 
 impl NowReport {
@@ -243,7 +275,17 @@ impl NowReport {
             metadata,
             accounts,
             provenance,
+            activity: ActiveActivityState::NoEvidence,
         }
+    }
+
+    /// Attaches the composed activity state. A report built without evaluating
+    /// any session (no `--session-id` given) keeps the [`NowReport::new`]
+    /// default of [`ActiveActivityState::NoEvidence`], which is the correct
+    /// disposition rather than an omission: nothing was named to claim.
+    pub fn with_activity(mut self, activity: ActiveActivityState) -> Self {
+        self.activity = activity;
+        self
     }
 }
 

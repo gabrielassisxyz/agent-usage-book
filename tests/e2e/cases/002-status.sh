@@ -29,7 +29,7 @@ case_steps() {
     # attempt: the state on disk is then the fixture the third step reads, and
     # the step digests record exactly when it appeared.
     cat > "$STATE_DIR/state/projection" <<EOT
-{"schema_version":1,"ledger_generation":12,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"provider-a","last_successful_observation":null,"latest_attempt":null}]}
+{"schema_version":2,"ledger_generation":12,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"provider-a","last_successful_observation":null,"latest_attempt":null}]}
 EOT
     step "status with projection" \
         env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "$AUB_BIN" status

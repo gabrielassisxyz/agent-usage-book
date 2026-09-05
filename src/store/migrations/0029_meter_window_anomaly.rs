@@ -30,7 +30,7 @@ use crate::error::Error;
 use crate::store::migrate::Migration;
 
 /// The schema version this step produces.
-pub const VERSION: u32 = 25;
+pub const VERSION: u32 = 29;
 
 const CREATE_WINDOW_ANOMALY_TABLES: &str = "
 CREATE TABLE meter_window_anomaly (

@@ -16,9 +16,9 @@
 //! constraint set itself changing shape. It is classified separately, and
 //! only in the two directions PLAN.md's window-set-evolution decision names
 //! - a new account-wide window, and a missing model-specific window. The two
-//! other directions (a new model-specific window, a missing account-wide
-//! window) are left unclassified here rather than guessed at, because no
-//! decision has fixed what either one means yet.
+//!   other directions (a new model-specific window, a missing account-wide
+//!   window) are left unclassified here rather than guessed at, because no
+//!   decision has fixed what either one means yet.
 //!
 //! May not depend on:
 //! - SQLite, HTTP, or terminal-formatting crates

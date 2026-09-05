@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# aub-n27.3: the status latency budget, enforced. Builds the release binary,
+# spawns it 4000 times across four contention cases (uncontended, a large
+# seeded database, an active writer, a migration in flight), and fails the
+# build the moment any case's own p99 exceeds the budget recorded in
+# tests/status_benchmark.rs (STATUS_P99_BUDGET_NS). The comparison itself
+# lives in that Rust test, not here, so there is exactly one definition of
+# "exceeded" -- this script only runs it against the release binary and
+# records platform and revision alongside the result.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+cargo build --release || {
+    echo "==> status-latency-budget FAILED (release build failed; the crate must compile before the benchmark can run)" >&2
+    exit 1
+}
+
+revision="$(git -C "$repo_root" rev-parse HEAD 2>/dev/null || echo "unknown")"
+platform="$(uname -sm)"
+artifact="$(mktemp "${TMPDIR:-/tmp}/aub-status-benchmark-XXXXXX.json")"
+
+start="$(date +%s)"
+output="$(AUB_STATUS_BENCHMARK_OUTPUT="$artifact" cargo test --release --test status_benchmark emit_status_benchmark_json -- --exact --ignored --nocapture 2>&1)"
+rc=$?
+elapsed=$(( $(date +%s) - start ))
+
+printf '%s\n' "$output"
+echo "status-latency-budget: revision=$revision platform=$platform elapsed=${elapsed}s"
+
+if [ -s "$artifact" ]; then
+    echo "status-latency-budget: artifact recorded at $artifact"
+fi
+
+if [ "$rc" -ne 0 ]; then
+    echo "==> status-latency-budget FAILED (a case's p99 exceeded the accepted budget, or the benchmark itself failed; see output above)" >&2
+    exit 1
+fi
+
+echo "status-latency-budget pass."

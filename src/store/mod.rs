@@ -47,6 +47,7 @@ pub mod schema_audit;
 pub mod seed_archive_import;
 pub mod session;
 pub mod session_account_marker;
+pub mod session_heartbeat;
 pub mod spend;
 pub mod spool;
 pub mod startup;

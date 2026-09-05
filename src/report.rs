@@ -8,21 +8,26 @@
 pub mod models;
 pub mod provenance;
 
+pub mod activity;
 pub mod coverage;
 pub mod export;
 pub mod spend;
 pub mod task;
 
+pub use activity::{
+    ActiveActivityState, ActiveActivityStateKind, ActiveSpendClaim, InactiveSpendClaim,
+    LivenessGap, compose_active_activity,
+};
 pub use models::{
     AccountGroupExplain, AccountMarkerReference, BackupReport, CalibrateReport,
     ClearDiagnosticsReport, CoverageAccount, CoverageBreach, CoverageBreachDimension,
     CoverageReport, CoverageReset, CoverageThreshold, DoctorReport, ExportReport, IngestReport,
     IngestSummary, IngestionGeneration, LedgerGeneration, LimitingWindow, MeterAccount,
-    MeterReadingProvenance, NowReport, ProjectionReadState, ReportMetadata, SampleAttempt,
-    SampleReport, SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
-    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport, StatusReport,
-    TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
-    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL,
+    MeterExplanation, MeterReadingProvenance, MeterWindowExplanation, NowReport,
+    ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport, SharePpm, SpendDiagnostic,
+    SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
+    SpendGrouping, SpendReport, StatusReport, TaskIdentityRow, TaskIngestReport,
+    TaskOverheadBucket, TaskOverheadReport, TaskReport, TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

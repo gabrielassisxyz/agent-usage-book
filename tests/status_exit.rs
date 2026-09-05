@@ -83,7 +83,7 @@ fn now_nanos() -> i64 {
 
 fn window(used_ppm: i32) -> String {
     format!(
-        r#"{{"semantic_key":"five_hour","scope_kind":"account_wide","scoped_model":null,"quota_used_ppm":{used_ppm},"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{}}}"#,
+        r#"{{"semantic_key":"five_hour","scope_kind":"account_wide","scoped_model":null,"quota_used_ppm":{used_ppm},"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{},"is_active":true,"severity":"unknown"}}"#,
         now_nanos() + 3 * 3600 * NANOS_PER_SECOND,
         5 * 3600 * NANOS_PER_SECOND,
     )
@@ -91,7 +91,7 @@ fn window(used_ppm: i32) -> String {
 
 fn weekly_window(used_ppm: i32, model: &str) -> String {
     format!(
-        r#"{{"semantic_key":"weekly","scope_kind":"model_specific","scoped_model":"{model}","quota_used_ppm":{used_ppm},"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{}}}"#,
+        r#"{{"semantic_key":"weekly","scope_kind":"model_specific","scoped_model":"{model}","quota_used_ppm":{used_ppm},"reported_resolution_ppm":10000,"quantization":"exact","resets_at_nanos":{},"nominal_duration_nanos":{},"is_active":true,"severity":"unknown"}}"#,
         now_nanos() + 3600 * NANOS_PER_SECOND,
         7 * 86_400 * NANOS_PER_SECOND
     )
@@ -104,7 +104,7 @@ fn projection_document(windows: &str, received: i64, outcome: &str, completed: i
         "null"
     };
     serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "ledger_generation": 12,
         "accounts": [{
             "account_id": 1,
@@ -115,6 +115,7 @@ fn projection_document(windows: &str, received: i64, outcome: &str, completed: i
                 "provider_observed_at_nanos": received,
                 "received_at_nanos": received,
                 "measurement_basis": "provider_observed",
+                "provider_contract_id": "anthropic-oauth-usage-v1",
                 "windows": serde_json::from_str::<serde_json::Value>(
                     &format!("[{windows}]"),
                 )
@@ -144,7 +145,7 @@ fn projection_body(
         .map(|(used_ppm, received_seconds_ago)| {
             let received = now_nanos() - received_seconds_ago * NANOS_PER_SECOND;
             format!(
-                r#"{{"observation_id":7,"provider_observed_at_nanos":{received},"received_at_nanos":{received},"measurement_basis":"provider_observed","windows":[{}]}}"#,
+                r#"{{"observation_id":7,"provider_observed_at_nanos":{received},"received_at_nanos":{received},"measurement_basis":"provider_observed","provider_contract_id":"anthropic-oauth-usage-v1","windows":[{}]}}"#,
                 window(used_ppm)
             )
         })
@@ -173,7 +174,7 @@ fn projection_body(
         }
     };
     format!(
-        r#"{{"schema_version":1,"ledger_generation":12,"accounts":[{{"account_id":1,"logical_name":"work-primary","provider":"anthropic","last_successful_observation":{observation},"latest_attempt":{attempt}}}]}}"#,
+        r#"{{"schema_version":2,"ledger_generation":12,"accounts":[{{"account_id":1,"logical_name":"work-primary","provider":"anthropic","last_successful_observation":{observation},"latest_attempt":{attempt}}}]}}"#,
         observation = observation_json,
         attempt = attempt_json,
     )

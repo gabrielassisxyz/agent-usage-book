@@ -72,7 +72,7 @@ use sha2::{Digest, Sha256};
 use crate::domain::attempt::DueReason as DecisionDueReason;
 use crate::domain::attempt::{AttemptId, AttemptOutcome, AttemptStarted};
 use crate::domain::failure::FailureClass;
-use crate::domain::ids::AdapterVersion;
+use crate::domain::ids::{AdapterVersion, ProviderContractId};
 use crate::domain::time::{Clock, MonotonicDuration, ProviderObservedAt, UtcTimestamp};
 use crate::domain::window::{MeterWindow, QuantizationSemantics, WindowScope};
 use crate::error::Error;
@@ -112,6 +112,13 @@ const NORMALIZED_FINGERPRINT_RECIPE: &[u8] = b"aub-normalized-windows-v1";
 pub trait MeteredReading {
     fn windows(&self) -> &[MeterWindow];
     fn provider_observed_at(&self) -> Option<ProviderObservedAt>;
+
+    /// A reading may identify a response-shape contract more precisely than
+    /// the adapter's default declaration, which keeps legacy replays labelled
+    /// without rewriting their immutable observations.
+    fn provider_contract_id(&self) -> Option<&ProviderContractId> {
+        None
+    }
 }
 
 impl MeteredReading for AnthropicReading {
@@ -121,6 +128,10 @@ impl MeteredReading for AnthropicReading {
 
     fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
         self.provider_observed_at
+    }
+
+    fn provider_contract_id(&self) -> Option<&ProviderContractId> {
+        Some(&self.provider_contract_id)
     }
 }
 
@@ -739,8 +750,15 @@ where
             ))
         })?;
         let declarations = item.account.adapter.declarations();
-        let fingerprint =
-            normalized_fingerprint(declarations.meter_semantics_id.as_str(), reading.windows());
+        let provider_contract_id = reading
+            .provider_contract_id()
+            .cloned()
+            .unwrap_or_else(|| declarations.provider_contract_id.clone());
+        let fingerprint = normalized_fingerprint(
+            declarations.meter_semantics_id.as_str(),
+            provider_contract_id.as_str(),
+            reading.windows(),
+        );
         let result = NewMeterAttemptResult {
             attempt_id: row_id,
             completed_at: received_at,
@@ -773,7 +791,7 @@ where
             observed_plan: None,
             observed_tier: None,
             adapter_version: item.account.adapter_version.clone(),
-            provider_contract_id: declarations.provider_contract_id,
+            provider_contract_id,
             meter_semantics_id: declarations.meter_semantics_id,
             normalized_fingerprint: fingerprint,
         };
@@ -869,14 +887,20 @@ fn stored_due_basis(basis: Option<DueBasisRef>) -> Result<Option<DueBasis>, Erro
 /// read under and every window in canonical field order. Deterministic by
 /// construction, so the same evidence reinterpreted under the same semantics
 /// produces the same fingerprint and a changed reading a different one.
-fn normalized_fingerprint(meter_semantics_id: &str, windows: &[MeterWindow]) -> String {
+fn normalized_fingerprint(
+    meter_semantics_id: &str,
+    provider_contract_id: &str,
+    windows: &[MeterWindow],
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(NORMALIZED_FINGERPRINT_RECIPE);
     hasher.update(b"\n");
     hasher.update(meter_semantics_id.as_bytes());
+    hasher.update(b"\n");
+    hasher.update(provider_contract_id.as_bytes());
     for window in windows {
         let line = format!(
-            "|{}|{}|{}|{}|{}|{}|{}\n",
+            "|{}|{}|{}|{}|{}|{}|{}|{}|{}\n",
             window.semantic_key().as_str(),
             scope_token(window.scope()),
             window.quota_used().as_ppm().get(),
@@ -887,6 +911,8 @@ fn normalized_fingerprint(meter_semantics_id: &str, windows: &[MeterWindow]) -> 
                 crate::domain::window::WindowResetState::NotStarted => "not_started".to_string(),
             },
             window.nominal_duration().as_nanos(),
+            window.is_active(),
+            window.severity().as_str(),
         );
         hasher.update(line.as_bytes());
     }
@@ -1599,27 +1625,27 @@ mod tests {
             window("five_hour", 250_000, 9_000),
             window("seven_day", 400_000, 9_000),
         ];
-        let first = normalized_fingerprint("semantics-v1", &windows);
+        let first = normalized_fingerprint("semantics-v1", "contract-v1", &windows);
         assert_eq!(
             first,
-            normalized_fingerprint("semantics-v1", &windows),
+            normalized_fingerprint("semantics-v1", "contract-v1", &windows),
             "the same reading must fingerprint identically"
         );
         assert_ne!(
             first,
-            normalized_fingerprint("semantics-v2", &windows),
+            normalized_fingerprint("semantics-v2", "contract-v1", &windows),
             "the semantics version is part of the fingerprint"
         );
         let mut changed = windows.clone();
         changed[0] = window("five_hour", 250_001, 9_000);
         assert_ne!(
             first,
-            normalized_fingerprint("semantics-v1", &changed),
+            normalized_fingerprint("semantics-v1", "contract-v1", &changed),
             "a changed window value must change the fingerprint"
         );
         assert_ne!(
             first,
-            normalized_fingerprint("semantics-v1", &windows[..1]),
+            normalized_fingerprint("semantics-v1", "contract-v1", &windows[..1]),
             "a changed window set must change the fingerprint"
         );
     }

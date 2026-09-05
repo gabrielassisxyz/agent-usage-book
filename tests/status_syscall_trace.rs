@@ -180,7 +180,7 @@ impl Environment {
         .unwrap();
         std::fs::write(
             root.join("state").join("projection"),
-            r#"{"schema_version":1,"ledger_generation":1,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"anthropic","last_successful_observation":null,"latest_attempt":null}]}"#,
+            r#"{"schema_version":2,"ledger_generation":1,"accounts":[{"account_id":1,"logical_name":"work-primary","provider":"anthropic","last_successful_observation":null,"latest_attempt":null}]}"#,
         )
         .unwrap();
         Self { root }

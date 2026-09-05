@@ -22,8 +22,8 @@ use agent_usage_book::domain::time::{
     Clock as _, FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
 };
 use agent_usage_book::domain::window::{
-    MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
-    WindowSemanticKey,
+    MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
+    WindowResetState, WindowScope, WindowSemanticKey,
 };
 use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
 use agent_usage_book::store::ledger_generation::{self, Generation};
@@ -442,6 +442,8 @@ fn pending_bundle_json(attempt_id: i64, bundle: &TerminalMeterBundle) -> String 
             quantization: "rounded_to_nearest".into(),
             resets_at_nanos: window.resets_at().map(|t| t.unix_nanos()),
             nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
+            is_active: window.is_active(),
+            severity: window.severity().as_str().into(),
         }],
     }
     .to_json()
@@ -719,4 +721,119 @@ fn publication_stays_within_its_budget_after_a_committed_batch() {
         fastest <= Duration::from_millis(100),
         "publication took {fastest:?} at its fastest of three, over the stated 100 ms budget"
     );
+}
+
+#[test]
+fn rebuild_reconstructs_projection_from_ledger_holding_not_started_windows() {
+    let mut fixture = fixture("rebuild-not-started");
+    let attempt_id = fixture.start_attempt();
+    fixture.clock.advance(MonotonicDuration::from_millis(500));
+    let completed_at = fixture.clock.now();
+
+    let not_started_window = MeterWindow::new(
+        WindowSemanticKey::new("five_hour"),
+        WindowScope::AccountWide,
+        QuotaUsed::new(QuotaFractionPpm::new(0).unwrap()),
+        ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+        QuantizationSemantics::Exact,
+        WindowResetState::NotStarted,
+        NominalWindowDuration::from_nanos(18_000_000_000_000),
+    );
+    let known_window = MeterWindow::new(
+        WindowSemanticKey::new("seven_day"),
+        WindowScope::AccountWide,
+        QuotaUsed::new(QuotaFractionPpm::new(0).unwrap()),
+        ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+        QuantizationSemantics::Exact,
+        completed_at,
+        NominalWindowDuration::from_nanos(604_800_000_000_000),
+    );
+
+    let evidence = agent_usage_book::store::meter_evidence::NewMeterResponseEvidence {
+        attempt_id,
+        response_classification: "success".into(),
+        received_at: completed_at,
+        provider_observed_at_original: None,
+        evidence_capsule: "{}".into(),
+        capsule_schema_version: "capsule-v1".into(),
+        sanitizer_version: "sanitizer-v1".into(),
+        capture_truncated: false,
+    };
+    let interpretation = NewMeterInterpretation {
+        account_id: fixture.account_id,
+        provider: "anthropic".into(),
+        provider_observed_at: None,
+        received_at: completed_at,
+        measurement_basis: MeasurementBasis::LocallyReceived,
+        observed_plan: Some("pro".into()),
+        observed_tier: None,
+        adapter_version: agent_usage_book::domain::ids::AdapterVersion::new("adapter-v1"),
+        provider_contract_id: agent_usage_book::domain::ids::ProviderContractId::new("contract-v1"),
+        meter_semantics_id: agent_usage_book::domain::ids::MeterSemanticsId::new("semantics-v1"),
+        normalized_fingerprint: "fp-idle".into(),
+    };
+    let bundle = TerminalMeterBundle::new(
+        NewMeterAttemptResult {
+            attempt_id,
+            completed_at,
+            elapsed: MonotonicDuration::from_nanos(1),
+            outcome: AttemptOutcome::Success,
+            sanitized_error_classification: None,
+            retry_index: None,
+            clock_anomaly: false,
+        },
+        evidence,
+        interpretation,
+        vec![not_started_window, known_window],
+    )
+    .unwrap();
+    fixture.repository.commit_terminal_bundle(&bundle).unwrap();
+
+    // Rebuild projection: delete existing projection file to ensure it is reconstructed from SQLite ledger
+    let proj_path = fixture.projection_path();
+    let _ = std::fs::remove_file(&proj_path);
+    assert!(!proj_path.exists());
+
+    // Rebuild (publish from connection)
+    let publication = agent_usage_book::projection::publish(&fixture.conn, &proj_path);
+    assert!(matches!(
+        publication,
+        agent_usage_book::projection::Publication::Published { .. }
+    ));
+
+    // Read back rebuilt projection
+    let read = agent_usage_book::projection::reader::read_projection(&proj_path);
+    let agent_usage_book::projection::reader::ProjectionRead::Available(projection) = read else {
+        panic!("rebuilt projection must be available");
+    };
+
+    let account = &projection.accounts[0];
+    let success = account.last_successful_observation.as_ref().unwrap();
+    assert_eq!(success.windows.len(), 2);
+
+    let ns_window = success
+        .windows
+        .iter()
+        .find(|w| w.semantic_key == "five_hour")
+        .unwrap();
+    assert_eq!(ns_window.resets_at, WindowResetState::NotStarted);
+
+    let k_window = success
+        .windows
+        .iter()
+        .find(|w| w.semantic_key == "seven_day")
+        .unwrap();
+    assert_eq!(k_window.resets_at, WindowResetState::Known(completed_at));
+
+    // Verify projection reader account_reading produces LimitingWindow with NotStarted
+    let reading = agent_usage_book::projection::reader::account_reading(
+        Some(account),
+        None,
+        MonotonicDuration::from_seconds(900),
+        MonotonicDuration::from_seconds(30),
+        agent_usage_book::domain::time::ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60)),
+        &fixture.clock,
+    );
+    let limiting = reading.limiting_window.expect("must have limiting window");
+    assert_eq!(limiting.reset_state, WindowResetState::NotStarted);
 }

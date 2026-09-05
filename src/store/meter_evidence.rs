@@ -27,7 +27,7 @@ use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
-    WindowSemanticKey,
+    WindowSemanticKey, WindowSeverity,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -177,6 +177,8 @@ pub struct StoredMeterWindow {
     pub quantization: QuantizationSemantics,
     pub resets_at: crate::domain::window::WindowResetState,
     pub nominal_duration: NominalWindowDuration,
+    pub is_active: bool,
+    pub severity: WindowSeverity,
 }
 
 /// The hex-encoded SHA-256 of the evidence capsule bytes: the stored proof
@@ -427,8 +429,9 @@ pub fn observation_by_row_id(
 const INSERT_WINDOW: &str = "
 INSERT INTO meter_window (
     observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
-    reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id";
+    reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos,
+    is_active, severity
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) RETURNING id";
 
 /// Writes one provider-reported quota constraint, stored exactly as the
 /// provider expressed it. No derived remaining value is computed here.
@@ -436,9 +439,31 @@ pub fn insert_window(
     conn: &rusqlite::Connection,
     window: &NewMeterWindow,
 ) -> Result<WindowRowId, Error> {
+    insert_window_with_facts(
+        conn,
+        window,
+        window.resets_at.is_known(),
+        WindowSeverity::unknown(),
+    )
+}
+
+/// Writes a window together with provider facts that were not part of the
+/// original generic insertion surface. Legacy importers use [`insert_window`]
+/// and receive explicit compatibility defaults; provider adapters use this
+/// function so their reported facts reach the immutable ledger row.
+pub fn insert_window_with_facts(
+    conn: &rusqlite::Connection,
+    window: &NewMeterWindow,
+    is_active: bool,
+    severity: WindowSeverity,
+) -> Result<WindowRowId, Error> {
     let (scope_kind, scoped_model) = match &window.scope {
         WindowScope::AccountWide => ("account_wide", None),
         WindowScope::ModelSpecific(model) => ("model_specific", Some(model.as_str())),
+    };
+    let reset_state_sql = match &window.resets_at {
+        crate::domain::window::WindowResetState::Known(_) => "known",
+        crate::domain::window::WindowResetState::NotStarted => "not_started",
     };
     conn.query_row(
         INSERT_WINDOW,
@@ -451,7 +476,10 @@ pub fn insert_window(
             window.reported_resolution.as_ppm().get() as i64,
             quantization_sql::as_sql(window.quantization),
             window.resets_at.instant().map(|ts| ts.unix_nanos()),
+            reset_state_sql,
             window.nominal_duration.as_nanos() as i64,
+            is_active as i64,
+            severity.as_str(),
         ],
         |row| row.get(0),
     )
@@ -490,7 +518,8 @@ pub mod quantization_sql {
 
 const SELECT_WINDOW_COLUMNS: &str = "
     id, observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
-    reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos";
+    reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos,
+    is_active, severity";
 
 fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow> {
     let scope_kind: String = row.get("scope_kind")?;
@@ -516,6 +545,25 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
             Box::new(e),
         )
     })?;
+    let reset_state_str: String = row.get("reset_state")?;
+    let resets_at = match (
+        reset_state_str.as_str(),
+        row.get::<_, Option<i64>>("resets_at")?,
+    ) {
+        ("known", Some(nanos)) => {
+            crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos))
+        }
+        ("not_started", None) => crate::domain::window::WindowResetState::NotStarted,
+        (state, instant) => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                9, // reset_state, by position in SELECT_WINDOW_COLUMNS
+                rusqlite::types::Type::Text,
+                Box::new(crate::error::Error::Store(format!(
+                    "inconsistent reset state row in the database: state {state:?} with instant {instant:?}"
+                ))),
+            ));
+        }
+    };
     Ok(StoredMeterWindow {
         row_id: WindowRowId::new(row.get("id")?),
         observation_id: ObservationRowId::new(row.get("observation_id")?),
@@ -536,15 +584,12 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
         )
         .expect("the table CHECK keeps reported_resolution_ppm non-zero"),
         quantization,
-        resets_at: match row.get::<_, Option<i64>>("resets_at")? {
-            Some(nanos) => {
-                crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos))
-            }
-            None => crate::domain::window::WindowResetState::NotStarted,
-        },
+        resets_at,
         nominal_duration: NominalWindowDuration::from_nanos(
             row.get::<_, i64>("nominal_duration_nanos")? as u64,
         ),
+        is_active: row.get::<_, i64>("is_active")? == 1,
+        severity: WindowSeverity::new(row.get::<_, String>("severity")?),
     })
 }
 
@@ -1400,5 +1445,137 @@ mod tests {
         );
         assert_eq!(read_known.quota_used, known_window.quota_used);
         assert_eq!(read_known.scope, known_window.scope);
+    }
+
+    #[test]
+    fn migration_from_prior_schema_preserves_existing_windows_as_known_and_accepts_not_started() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("test.db");
+        let policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).expect("open db");
+
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(0));
+        let all_migrations = registry();
+        // Migrate up to version 24 (before migration 25)
+        run_migrations(&mut conn, &all_migrations[..24], None, &clock)
+            .expect("migrations up to 24 must succeed");
+
+        let account = observe_account(
+            &conn,
+            "test-provider",
+            "test-account",
+            UtcTimestamp::from_unix_nanos(10_000),
+        )
+        .expect("fixture account must insert");
+        let run = start_sample_run(
+            &conn,
+            Trigger::Manual,
+            UtcTimestamp::from_unix_nanos(10_000),
+            "test",
+        )
+        .expect("fixture sample run must insert");
+        let snapshot = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(10_000),
+            &POLICY,
+        )
+        .expect("fixture policy snapshot must insert");
+        let attempt = start_meter_attempt(
+            &conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "test-provider".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(20_000),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(19_000),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "semantics-v1".into(),
+            },
+        )
+        .expect("fixture attempt must start");
+        let evidence_row =
+            insert_response_evidence(&conn, &evidence(attempt)).expect("insert evidence");
+        let observation_row = insert_observation(
+            &conn,
+            &observation(attempt, evidence_row, account, "semantics-v1", "fp-1"),
+        )
+        .expect("insert observation");
+
+        // Insert window using raw SQL in schema 24 (which only had resets_at INTEGER NOT NULL)
+        conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos
+            ) VALUES (?1, 'seven_day', 'account_wide', NULL, 200000, 10000, 'exact', 500000000, 604800000000000)",
+            [observation_row.value()],
+        ).unwrap();
+
+        // Now run migration 25
+        run_migrations(&mut conn, &all_migrations, None, &clock)
+            .expect("migration 25 must apply cleanly to existing database");
+
+        // Existing row must read back as Known
+        let read_windows = windows_by_observation(&conn, observation_row)
+            .expect("must read windows by observation");
+        assert_eq!(read_windows.len(), 1);
+        assert_eq!(
+            read_windows[0].resets_at,
+            crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                500_000_000
+            ))
+        );
+
+        // Insert new NotStarted window via insert_window
+        let not_started_window = NewMeterWindow {
+            observation_id: observation_row,
+            semantic_key: WindowSemanticKey::new("five_hour"),
+            scope: WindowScope::AccountWide,
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(0).unwrap()),
+            reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+                .unwrap(),
+            quantization: QuantizationSemantics::Exact,
+            resets_at: crate::domain::window::WindowResetState::NotStarted,
+            nominal_duration: NominalWindowDuration::from_nanos(18000000000000),
+        };
+        insert_window(&conn, &not_started_window).expect("not-started window must insert");
+
+        // Both windows read back
+        let read_windows_after =
+            windows_by_observation(&conn, observation_row).expect("must read windows after insert");
+        assert_eq!(read_windows_after.len(), 2);
+        let ns = read_windows_after
+            .iter()
+            .find(|w| w.semantic_key.as_str() == "five_hour")
+            .unwrap();
+        assert_eq!(
+            ns.resets_at,
+            crate::domain::window::WindowResetState::NotStarted
+        );
+
+        // CHECK constraint rejects inconsistent rows
+        let err_known_null = conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos
+            ) VALUES (?1, 'bad_1', 'account_wide', NULL, 0, 10000, 'exact', NULL, 'known', 1000)",
+            [observation_row.value()],
+        ).unwrap_err();
+        assert!(err_known_null.to_string().contains("CHECK"));
+
+        let err_not_started_instant = conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos
+            ) VALUES (?1, 'bad_2', 'account_wide', NULL, 0, 10000, 'exact', 1000, 'not_started', 1000)",
+            [observation_row.value()],
+        ).unwrap_err();
+        assert!(err_not_started_instant.to_string().contains("CHECK"));
     }
 }
