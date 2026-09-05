@@ -126,6 +126,84 @@ impl TaskKind {
     }
 }
 
+/// The closed vocabulary of tracker-authored task size classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TaskSize {
+    S,
+    M,
+    L,
+    XL,
+}
+
+impl TaskSize {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::S => "S",
+            Self::M => "M",
+            Self::L => "L",
+            Self::XL => "XL",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::S => "size:S",
+            Self::M => "size:M",
+            Self::L => "size:L",
+            Self::XL => "size:XL",
+        }
+    }
+
+    /// Parses the resolved value stored in the ledger. The label spelling is
+    /// accepted too for callers that are still at the tracker boundary.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "S" | "size:S" => Some(Self::S),
+            "M" | "size:M" => Some(Self::M),
+            "L" | "size:L" => Some(Self::L),
+            "XL" | "size:XL" => Some(Self::XL),
+            _ => None,
+        }
+    }
+}
+
+/// The closed vocabulary of tracker-authored task difficulty classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TaskDifficulty {
+    Mechanical,
+    Reasoning,
+    Critical,
+}
+
+impl TaskDifficulty {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mechanical => "mechanical",
+            Self::Reasoning => "reasoning",
+            Self::Critical => "critical",
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Mechanical => "difficulty:mechanical",
+            Self::Reasoning => "difficulty:reasoning",
+            Self::Critical => "difficulty:critical",
+        }
+    }
+
+    /// Parses the resolved value stored in the ledger. The label spelling is
+    /// accepted too for callers that are still at the tracker boundary.
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "mechanical" | "difficulty:mechanical" => Some(Self::Mechanical),
+            "reasoning" | "difficulty:reasoning" => Some(Self::Reasoning),
+            "critical" | "difficulty:critical" => Some(Self::Critical),
+            _ => None,
+        }
+    }
+}
+
 /// Where one task-kind candidate came from, and the precedence rank that
 /// decides disagreements between candidates for the same task.
 ///
@@ -172,7 +250,8 @@ impl TaskKindOrigin {
     }
 }
 
-/// One piece of structured tracker evidence that may assert a task kind.
+/// One piece of structured tracker evidence that may assert a task
+/// classification value.
 ///
 /// The record deliberately carries no free-form text: a candidate can only
 /// come from a categorical tracker field or a tag, so no code path in this
@@ -185,11 +264,11 @@ pub struct TaskKindCandidate {
     pub raw_value: String,
 }
 
-/// One task read from a tracker before `aub` assigns kinds to it.
+/// One task read from a tracker before `aub` assigns classification values to it.
 ///
-/// Fields are the tracker's structured kind evidence only. The absence of a
-/// title or description field is the guarantee that candidates never derive
-/// from free-form task text.
+/// Fields are the tracker's structured classification evidence only. The
+/// absence of a title or description field is the guarantee that candidates
+/// never derive from free-form task text.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TrackerTaskRecord {
     pub native: String,
@@ -207,9 +286,9 @@ pub trait TrackerTaskReader {
 /// Emits every candidate one tracker task carries, each with its source
 /// provenance: one from the categorical identity field, one per tag.
 ///
-/// Emitting is not resolving: a raw value becomes a kind only through a
-/// [`TaskKindMapping`], at rebuild time, so changing the mapping re-evaluates
-/// the same immutable candidates.
+/// Emitting is not resolving: a raw value becomes a typed classification only
+/// through a [`TaskKindMapping`], at rebuild time, so changing the mapping
+/// re-evaluates the same immutable candidates.
 pub fn emit_task_kind_candidates(
     tracker_source: SourceNamespace,
     record: TrackerTaskRecord,
@@ -228,18 +307,21 @@ pub fn emit_task_kind_candidates(
     candidates
 }
 
-/// The versioned mapping from raw tracker values to task kinds.
+/// The versioned mapping from raw tracker values to task classification axes.
 ///
 /// One mapping applies to every candidate regardless of origin: normalization
 /// is source-independent, while precedence between origins is decided by
 /// [`TaskKindOrigin::rank`]. The version is persisted with every resolved
 /// identity so a rebuild under a newer mapping is distinguishable from the
 /// result of the older one, and re-running a rebuild under an unchanged
-/// mapping is a no-op on the persisted state.
+/// mapping is a no-op on the persisted state. The kind, size and difficulty
+/// entries remain independent even though they share one rebuild version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskKindMapping {
     version: u32,
     entries: BTreeMap<String, TaskKind>,
+    size_entries: BTreeMap<String, TaskSize>,
+    difficulty_entries: BTreeMap<String, TaskDifficulty>,
 }
 
 impl TaskKindMapping {
@@ -250,23 +332,36 @@ impl TaskKindMapping {
         version: u32,
         entries: impl IntoIterator<Item = (String, TaskKind)>,
     ) -> Result<Self, Error> {
+        Self::new_with_classification_entries(
+            version,
+            entries,
+            default_size_entries(),
+            default_difficulty_entries(),
+        )
+    }
+
+    /// Validates and builds a mapping for all three independent classification
+    /// axes. The shared version lets one rebuild identify exactly which
+    /// interpretation produced a derived identity row.
+    pub fn new_with_classification_entries(
+        version: u32,
+        entries: impl IntoIterator<Item = (String, TaskKind)>,
+        size_entries: impl IntoIterator<Item = (String, TaskSize)>,
+        difficulty_entries: impl IntoIterator<Item = (String, TaskDifficulty)>,
+    ) -> Result<Self, Error> {
         if version == 0 {
             return Err(Error::Usage(
                 "task-kind mapping version must be at least 1".to_owned(),
             ));
         }
-        let mut table = BTreeMap::new();
-        for (raw, kind) in entries {
-            if raw.is_empty() || raw.trim() != raw {
-                return Err(Error::Usage(format!(
-                    "task-kind mapping has an empty or padded raw value: {raw:?}"
-                )));
-            }
-            table.insert(raw, kind);
-        }
+        let table = validate_mapping_entries("task-kind", entries)?;
+        let size_table = validate_mapping_entries("task-size", size_entries)?;
+        let difficulty_table = validate_mapping_entries("task-difficulty", difficulty_entries)?;
         Ok(Self {
             version,
             entries: table,
+            size_entries: size_table,
+            difficulty_entries: difficulty_table,
         })
     }
 
@@ -274,9 +369,9 @@ impl TaskKindMapping {
     /// Identity-preserving: every kind the tracker names has its own variant,
     /// so the default normalization invents nothing.
     pub fn default_v1() -> Self {
-        Self {
-            version: 1,
-            entries: [
+        Self::new(
+            1,
+            [
                 ("task", TaskKind::Task),
                 ("epic", TaskKind::Epic),
                 ("bug", TaskKind::Bug),
@@ -284,9 +379,9 @@ impl TaskKindMapping {
                 ("question", TaskKind::Question),
             ]
             .into_iter()
-            .map(|(raw, kind)| (raw.to_owned(), kind))
-            .collect(),
-        }
+            .map(|(raw, kind)| (raw.to_owned(), kind)),
+        )
+        .expect("the built-in task classification mapping must be valid")
     }
 
     pub fn version(&self) -> u32 {
@@ -298,6 +393,89 @@ impl TaskKindMapping {
     pub fn normalize(&self, raw: &str) -> Option<TaskKind> {
         self.entries.get(raw).copied()
     }
+
+    pub fn normalize_size(&self, raw: &str) -> Option<TaskSize> {
+        self.size_entries.get(raw).copied()
+    }
+
+    pub fn normalize_difficulty(&self, raw: &str) -> Option<TaskDifficulty> {
+        self.difficulty_entries.get(raw).copied()
+    }
+
+    /// Returns a copy with one additional size label interpretation. This is
+    /// used when a mapping revision deliberately teaches the ledger a value it
+    /// previously retained as unknown.
+    pub fn with_size_entry(
+        mut self,
+        version: u32,
+        raw: String,
+        size: TaskSize,
+    ) -> Result<Self, Error> {
+        validate_mapping_raw("task-size", &raw)?;
+        if version == 0 {
+            return Err(Error::Usage(
+                "task-kind mapping version must be at least 1".to_owned(),
+            ));
+        }
+        self.version = version;
+        self.size_entries.insert(raw, size);
+        Ok(self)
+    }
+
+    /// Returns a copy with one additional difficulty label interpretation.
+    pub fn with_difficulty_entry(
+        mut self,
+        version: u32,
+        raw: String,
+        difficulty: TaskDifficulty,
+    ) -> Result<Self, Error> {
+        validate_mapping_raw("task-difficulty", &raw)?;
+        if version == 0 {
+            return Err(Error::Usage(
+                "task-kind mapping version must be at least 1".to_owned(),
+            ));
+        }
+        self.version = version;
+        self.difficulty_entries.insert(raw, difficulty);
+        Ok(self)
+    }
+}
+
+fn default_size_entries() -> impl Iterator<Item = (String, TaskSize)> {
+    [TaskSize::S, TaskSize::M, TaskSize::L, TaskSize::XL]
+        .into_iter()
+        .map(|size| (size.label().to_owned(), size))
+}
+
+fn default_difficulty_entries() -> impl Iterator<Item = (String, TaskDifficulty)> {
+    [
+        TaskDifficulty::Mechanical,
+        TaskDifficulty::Reasoning,
+        TaskDifficulty::Critical,
+    ]
+    .into_iter()
+    .map(|difficulty| (difficulty.label().to_owned(), difficulty))
+}
+
+fn validate_mapping_raw(axis: &str, raw: &str) -> Result<(), Error> {
+    if raw.is_empty() || raw.trim() != raw {
+        return Err(Error::Usage(format!(
+            "{axis} mapping has an empty or padded raw value: {raw:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_mapping_entries<T>(
+    axis: &str,
+    entries: impl IntoIterator<Item = (String, T)>,
+) -> Result<BTreeMap<String, T>, Error> {
+    let mut table = BTreeMap::new();
+    for (raw, value) in entries {
+        validate_mapping_raw(axis, &raw)?;
+        table.insert(raw, value);
+    }
+    Ok(table)
 }
 
 /// The task-kind state one task resolves to, with no winner chosen by input
@@ -327,12 +505,67 @@ pub enum ResolvedTaskKind {
 /// is the only serialization they have.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TaskIdentityState {
-    /// Every kind-asserting candidate at the winning rank agreed.
+    /// Every candidate asserting a value at the winning rank agreed.
     Resolved,
-    /// Evidence existed but none of it asserted a kind under the mapping.
+    /// Evidence existed but none of it asserted a value under the mapping.
     Unknown,
     /// Equal-rank evidence disagreed; no winner was selected.
     Conflict,
+}
+
+/// The typed task-size resolution, including the evidence that justified its
+/// state. Size labels all come from the same tracker-label rank, so a
+/// disagreement is always a conflict rather than an order-dependent winner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTaskSize {
+    Resolved {
+        size: TaskSize,
+        winner: TaskKindOrigin,
+        evidence: String,
+    },
+    Unknown {
+        evidence: String,
+    },
+    Conflict {
+        evidence: String,
+    },
+}
+
+impl ResolvedTaskSize {
+    pub fn state(&self) -> TaskIdentityState {
+        match self {
+            Self::Resolved { .. } => TaskIdentityState::Resolved,
+            Self::Unknown { .. } => TaskIdentityState::Unknown,
+            Self::Conflict { .. } => TaskIdentityState::Conflict,
+        }
+    }
+}
+
+/// The typed task-difficulty resolution, with the same exhaustive state
+/// vocabulary as task kind and task size.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTaskDifficulty {
+    Resolved {
+        difficulty: TaskDifficulty,
+        winner: TaskKindOrigin,
+        evidence: String,
+    },
+    Unknown {
+        evidence: String,
+    },
+    Conflict {
+        evidence: String,
+    },
+}
+
+impl ResolvedTaskDifficulty {
+    pub fn state(&self) -> TaskIdentityState {
+        match self {
+            Self::Resolved { .. } => TaskIdentityState::Resolved,
+            Self::Unknown { .. } => TaskIdentityState::Unknown,
+            Self::Conflict { .. } => TaskIdentityState::Conflict,
+        }
+    }
 }
 
 impl TaskIdentityState {
@@ -391,6 +624,7 @@ pub fn resolve_task_kind(
     let evidence = render_evidence(candidates);
     let mut asserted: Vec<(u8, TaskKind)> = candidates
         .iter()
+        .filter(|candidate| !is_size_or_difficulty_label(&candidate.raw_value))
         .filter_map(|candidate| {
             mapping
                 .normalize(&candidate.raw_value)
@@ -428,6 +662,104 @@ pub fn resolve_task_kind(
         winner,
         evidence,
     }
+}
+
+/// Resolves the size labels carried by one task. Unrecognized labels remain in
+/// the evidence, but do not assert a value until a later mapping revision.
+pub fn resolve_task_size(
+    candidates: &[TaskKindCandidate],
+    mapping: &TaskKindMapping,
+) -> ResolvedTaskSize {
+    let relevant = candidates
+        .iter()
+        .filter(|candidate| {
+            matches!(&candidate.origin, TaskKindOrigin::TrackerLabel(_))
+                && candidate.raw_value.starts_with("size:")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let evidence = render_evidence(&relevant);
+    let mut asserted = relevant
+        .iter()
+        .filter_map(|candidate| {
+            mapping
+                .normalize_size(&candidate.raw_value)
+                .map(|size| (size, candidate.origin.clone()))
+        })
+        .collect::<Vec<_>>();
+    asserted.sort_by_key(|(size, origin)| (*size, origin.provenance_id()));
+    let Some((winning_size, _)) = asserted.first() else {
+        return ResolvedTaskSize::Unknown { evidence };
+    };
+    let distinct = asserted
+        .iter()
+        .map(|(size, _)| *size)
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() > 1 {
+        return ResolvedTaskSize::Conflict { evidence };
+    }
+    let winner = asserted
+        .iter()
+        .filter(|(size, _)| size == winning_size)
+        .map(|(_, origin)| origin.clone())
+        .min_by_key(|origin| origin.provenance_id())
+        .expect("a winning size candidate exists by construction");
+    ResolvedTaskSize::Resolved {
+        size: *winning_size,
+        winner,
+        evidence,
+    }
+}
+
+/// Resolves the difficulty labels carried by one task. The two labels are an
+/// independent axis: a valid size never makes a difficulty missing or valid.
+pub fn resolve_task_difficulty(
+    candidates: &[TaskKindCandidate],
+    mapping: &TaskKindMapping,
+) -> ResolvedTaskDifficulty {
+    let relevant = candidates
+        .iter()
+        .filter(|candidate| {
+            matches!(&candidate.origin, TaskKindOrigin::TrackerLabel(_))
+                && candidate.raw_value.starts_with("difficulty:")
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    let evidence = render_evidence(&relevant);
+    let mut asserted = relevant
+        .iter()
+        .filter_map(|candidate| {
+            mapping
+                .normalize_difficulty(&candidate.raw_value)
+                .map(|difficulty| (difficulty, candidate.origin.clone()))
+        })
+        .collect::<Vec<_>>();
+    asserted.sort_by_key(|(difficulty, origin)| (*difficulty, origin.provenance_id()));
+    let Some((winning_difficulty, _)) = asserted.first() else {
+        return ResolvedTaskDifficulty::Unknown { evidence };
+    };
+    let distinct = asserted
+        .iter()
+        .map(|(difficulty, _)| *difficulty)
+        .collect::<std::collections::BTreeSet<_>>();
+    if distinct.len() > 1 {
+        return ResolvedTaskDifficulty::Conflict { evidence };
+    }
+    let winner = asserted
+        .iter()
+        .filter(|(difficulty, _)| difficulty == winning_difficulty)
+        .map(|(_, origin)| origin.clone())
+        .min_by_key(|origin| origin.provenance_id())
+        .expect("a winning difficulty candidate exists by construction");
+    ResolvedTaskDifficulty::Resolved {
+        difficulty: *winning_difficulty,
+        winner,
+        evidence,
+    }
+}
+
+fn is_size_or_difficulty_label(raw: &str) -> bool {
+    raw.starts_with("size:") || raw.starts_with("difficulty:")
 }
 
 /// Renders candidate evidence deterministically: sorted by rank, provenance
@@ -817,6 +1149,193 @@ mod tests {
             mapping.normalize(&field.raw_value),
             mapping.normalize(&label.raw_value)
         );
+    }
+
+    #[test]
+    fn every_size_and_difficulty_label_normalizes_to_its_typed_value() {
+        let mapping = TaskKindMapping::default_v1();
+        for (raw, expected) in [
+            ("size:S", TaskSize::S),
+            ("size:M", TaskSize::M),
+            ("size:L", TaskSize::L),
+            ("size:XL", TaskSize::XL),
+        ] {
+            assert_eq!(mapping.normalize_size(raw), Some(expected));
+            assert_eq!(TaskSize::parse(expected.as_str()), Some(expected));
+        }
+        for (raw, expected) in [
+            ("difficulty:mechanical", TaskDifficulty::Mechanical),
+            ("difficulty:reasoning", TaskDifficulty::Reasoning),
+            ("difficulty:critical", TaskDifficulty::Critical),
+        ] {
+            assert_eq!(mapping.normalize_difficulty(raw), Some(expected));
+            assert_eq!(TaskDifficulty::parse(expected.as_str()), Some(expected));
+        }
+        assert_eq!(mapping.normalize_size("size:m"), None);
+        assert_eq!(mapping.normalize_difficulty("Difficulty:reasoning"), None);
+    }
+
+    #[test]
+    fn unknown_axis_labels_keep_raw_evidence_and_conflicts_have_no_winner() {
+        let mapping = TaskKindMapping::default_v1();
+        let unknown_size = task_kind_candidate(
+            "aub-size",
+            TaskKindOrigin::TrackerLabel("size:medium".to_owned()),
+            "size:medium",
+        );
+        match resolve_task_size(&[unknown_size], &mapping) {
+            ResolvedTaskSize::Unknown { evidence } => {
+                assert_eq!(evidence, "tracker_label:size:medium=size:medium")
+            }
+            ResolvedTaskSize::Resolved { .. } | ResolvedTaskSize::Conflict { .. } => {
+                panic!("an unmapped size label must remain unknown")
+            }
+        }
+
+        let first = task_kind_candidate(
+            "aub-conflict",
+            TaskKindOrigin::TrackerLabel("size:S".to_owned()),
+            "size:S",
+        );
+        let second = task_kind_candidate(
+            "aub-conflict",
+            TaskKindOrigin::TrackerLabel("size:L".to_owned()),
+            "size:L",
+        );
+        let forward = resolve_task_size(&[first.clone(), second.clone()], &mapping);
+        let reverse = resolve_task_size(&[second, first], &mapping);
+        assert_eq!(forward, reverse);
+        match forward {
+            ResolvedTaskSize::Conflict { evidence } => {
+                assert!(evidence.contains("tracker_label:size:S=size:S"));
+                assert!(evidence.contains("tracker_label:size:L=size:L"));
+            }
+            ResolvedTaskSize::Resolved { .. } | ResolvedTaskSize::Unknown { .. } => {
+                panic!("two different size labels must remain a conflict")
+            }
+        }
+
+        let difficulty_candidates = [
+            task_kind_candidate(
+                "aub-difficulty-conflict",
+                TaskKindOrigin::TrackerLabel("difficulty:mechanical".to_owned()),
+                "difficulty:mechanical",
+            ),
+            task_kind_candidate(
+                "aub-difficulty-conflict",
+                TaskKindOrigin::TrackerLabel("difficulty:critical".to_owned()),
+                "difficulty:critical",
+            ),
+        ];
+        assert!(matches!(
+            resolve_task_difficulty(&difficulty_candidates, &mapping),
+            ResolvedTaskDifficulty::Conflict { .. }
+        ));
+    }
+
+    #[test]
+    fn axis_normalization_is_deterministic_and_idempotent() {
+        let mapping = TaskKindMapping::default_v1();
+        let candidates = vec![
+            task_kind_candidate(
+                "aub-axes",
+                TaskKindOrigin::TrackerLabel("size:M".to_owned()),
+                "size:M",
+            ),
+            task_kind_candidate(
+                "aub-axes",
+                TaskKindOrigin::TrackerLabel("difficulty:reasoning".to_owned()),
+                "difficulty:reasoning",
+            ),
+        ];
+        let baseline_size = resolve_task_size(&candidates, &mapping);
+        let baseline_difficulty = resolve_task_difficulty(&candidates, &mapping);
+        assert_eq!(baseline_size, resolve_task_size(&candidates, &mapping));
+        assert_eq!(
+            baseline_difficulty,
+            resolve_task_difficulty(&candidates, &mapping)
+        );
+        let mut reversed = candidates;
+        reversed.reverse();
+        assert_eq!(baseline_size, resolve_task_size(&reversed, &mapping));
+        assert_eq!(
+            baseline_difficulty,
+            resolve_task_difficulty(&reversed, &mapping)
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn prop_axis_resolution_is_independent_of_input_order(
+            sizes in proptest::collection::vec(0u8..5, 0..8),
+            difficulties in proptest::collection::vec(0u8..4, 0..8),
+        ) {
+            let mapping = TaskKindMapping::default_v1();
+            let size_candidates = sizes.iter().map(|selector| {
+                let (label, raw) = match selector {
+                    0 => ("size:S", "size:S"),
+                    1 => ("size:M", "size:M"),
+                    2 => ("size:L", "size:L"),
+                    3 => ("size:XL", "size:XL"),
+                    _ => ("size:medium", "size:medium"),
+                };
+                task_kind_candidate(
+                    "aub-generated-size",
+                    TaskKindOrigin::TrackerLabel(label.to_owned()),
+                    raw,
+                )
+            }).collect::<Vec<_>>();
+            let difficulty_candidates = difficulties.iter().map(|selector| {
+                let (label, raw) = match selector {
+                    0 => ("difficulty:mechanical", "difficulty:mechanical"),
+                    1 => ("difficulty:reasoning", "difficulty:reasoning"),
+                    2 => ("difficulty:critical", "difficulty:critical"),
+                    _ => ("difficulty:unfamiliar", "difficulty:unfamiliar"),
+                };
+                task_kind_candidate(
+                    "aub-generated-difficulty",
+                    TaskKindOrigin::TrackerLabel(label.to_owned()),
+                    raw,
+                )
+            }).collect::<Vec<_>>();
+            let mut reversed_sizes = size_candidates.clone();
+            reversed_sizes.reverse();
+            let mut reversed_difficulties = difficulty_candidates.clone();
+            reversed_difficulties.reverse();
+            prop_assert_eq!(
+                resolve_task_size(&size_candidates, &mapping),
+                resolve_task_size(&reversed_sizes, &mapping),
+            );
+            prop_assert_eq!(
+                resolve_task_difficulty(&difficulty_candidates, &mapping),
+                resolve_task_difficulty(&reversed_difficulties, &mapping),
+            );
+        }
+    }
+
+    #[test]
+    fn a_mapping_revision_can_teach_an_unknown_axis_value() {
+        let mapping = TaskKindMapping::default_v1();
+        let candidate = task_kind_candidate(
+            "aub-remap",
+            TaskKindOrigin::TrackerLabel("size:medium".to_owned()),
+            "size:medium",
+        );
+        assert!(matches!(
+            resolve_task_size(std::slice::from_ref(&candidate), &mapping),
+            ResolvedTaskSize::Unknown { .. }
+        ));
+        let revised = mapping
+            .with_size_entry(2, "size:medium".to_owned(), TaskSize::M)
+            .unwrap();
+        assert_eq!(revised.normalize_size("size:medium"), Some(TaskSize::M));
+        assert!(matches!(
+            resolve_task_size(&[candidate], &revised),
+            ResolvedTaskSize::Resolved {
+                size: TaskSize::M,
+                ..
+            }
+        ));
     }
 
     #[test]

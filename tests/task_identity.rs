@@ -11,7 +11,8 @@
 //! states as typed values with no fallback string anywhere.
 
 use agent_usage_book::attribution::{
-    TaskIdentityState, TaskKind, TaskKindMapping, TaskKindOrigin, TrackerTaskReader,
+    TaskDifficulty, TaskIdentityState, TaskKind, TaskKindMapping, TaskKindOrigin, TaskSize,
+    TrackerTaskReader,
 };
 use agent_usage_book::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
 use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
@@ -20,7 +21,7 @@ use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::task_identity::{
     BeadsTaskKindReader, ingest_task_kind_candidates, read_task_identity, rebuild_task_identities,
-    task_kind_distribution,
+    task_kind_distribution, task_size_distribution, task_size_distribution_with_filters,
 };
 
 /// One scratch state directory per test, removed on drop.
@@ -96,6 +97,49 @@ fn fixture_tracker() -> rusqlite::Connection {
                 ('aub-6', 'experiment'),
                 ('aub-7', 'alpha'),
                 ('aub-7', 'beta');",
+        )
+        .unwrap();
+    connection
+}
+
+/// A classification fixture with independent valid, missing, unknown and
+/// conflicting size/difficulty labels.
+fn classification_fixture_tracker() -> rusqlite::Connection {
+    let connection = rusqlite::Connection::open_in_memory().unwrap();
+    connection
+        .execute_batch(
+            "CREATE TABLE issues (
+                id TEXT PRIMARY KEY,
+                issue_type TEXT NOT NULL DEFAULT 'task',
+                title TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE labels (
+                issue_id TEXT NOT NULL,
+                label TEXT NOT NULL,
+                PRIMARY KEY (issue_id, label)
+            );
+            INSERT INTO issues (id, issue_type) VALUES
+                ('aub-size-s', 'task'),
+                ('aub-size-m', 'bug'),
+                ('aub-size-m-unknown-difficulty', 'task'),
+                ('aub-no-labels', 'docs'),
+                ('aub-size-conflict', 'task'),
+                ('aub-size-unknown', 'task'),
+                ('aub-size-xl', 'task');
+            INSERT INTO labels VALUES
+                ('aub-size-s', 'size:S'),
+                ('aub-size-s', 'difficulty:mechanical'),
+                ('aub-size-m', 'size:M'),
+                ('aub-size-m', 'difficulty:reasoning'),
+                ('aub-size-m-unknown-difficulty', 'size:M'),
+                ('aub-size-m-unknown-difficulty', 'difficulty:unfamiliar'),
+                ('aub-size-conflict', 'size:S'),
+                ('aub-size-conflict', 'size:L'),
+                ('aub-size-conflict', 'difficulty:critical'),
+                ('aub-size-unknown', 'size:medium'),
+                ('aub-size-unknown', 'difficulty:mechanical'),
+                ('aub-size-xl', 'size:XL'),
+                ('aub-size-xl', 'difficulty:critical');",
         )
         .unwrap();
     connection
@@ -331,6 +375,137 @@ fn identity_rows_from_two_tracker_sources_do_not_merge() {
     assert_eq!(a.task_id, task("beads-a", "aub-2"));
     assert_eq!(b.task_id, task("beads-b", "aub-2"));
     assert_ne!(a.task_id, b.task_id);
+}
+
+#[test]
+fn labelled_axes_persist_rebuild_and_group_by_size_with_difficulty_mix() {
+    let (_scratch, connection) = state_db("classification-axes");
+    let tracker = classification_fixture_tracker();
+    let reader = FixtureTracker {
+        inner: BeadsTaskKindReader::new(&tracker),
+    };
+
+    let first =
+        ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
+    assert_eq!(first.candidates_inserted, 20);
+    let candidate_snapshot: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT origin, raw_value FROM task_kind_candidate
+             WHERE task_source = 'beads-a' ORDER BY origin, raw_value",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert!(
+        candidate_snapshot
+            .iter()
+            .any(|(origin, raw)| origin == "tracker_label:size:medium" && raw == "size:medium")
+    );
+
+    rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
+    let small = read_task_identity(&connection, &task("beads-a", "aub-size-s"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(small.size_state, TaskIdentityState::Resolved);
+    assert_eq!(small.size, Some(TaskSize::S));
+    assert_eq!(small.difficulty_state, TaskIdentityState::Resolved);
+    assert_eq!(small.difficulty, Some(TaskDifficulty::Mechanical));
+
+    let no_labels = read_task_identity(&connection, &task("beads-a", "aub-no-labels"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(no_labels.size_state, TaskIdentityState::Unknown);
+    assert_eq!(no_labels.difficulty_state, TaskIdentityState::Unknown);
+
+    let conflict = read_task_identity(&connection, &task("beads-a", "aub-size-conflict"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(conflict.size_state, TaskIdentityState::Conflict);
+    assert_eq!(conflict.size, None);
+    assert!(conflict.size_evidence.contains("size:S"));
+    assert!(conflict.size_evidence.contains("size:L"));
+
+    let unknown = read_task_identity(&connection, &task("beads-a", "aub-size-unknown"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(unknown.size_state, TaskIdentityState::Unknown);
+    assert!(unknown.size_evidence.contains("size:medium"));
+
+    let distribution = task_kind_distribution(&connection).unwrap();
+    assert_eq!(distribution.count_for_size(TaskSize::S), 1);
+    assert_eq!(distribution.count_for_size(TaskSize::M), 2);
+    assert_eq!(distribution.count_for_size(TaskSize::XL), 1);
+    assert_eq!(distribution.unknown_size, 2);
+    assert_eq!(distribution.conflict_size, 1);
+    let medium = distribution.group_for_size(TaskSize::M).unwrap();
+    assert_eq!(medium.sample_count, 2);
+    assert_eq!(
+        medium.difficulty_mix.count_for(TaskDifficulty::Reasoning),
+        1
+    );
+    assert_eq!(medium.difficulty_mix.unknown, 1);
+    assert_eq!(
+        distribution
+            .group_for_size(TaskSize::S)
+            .unwrap()
+            .difficulty_mix
+            .count_for(TaskDifficulty::Mechanical),
+        1
+    );
+    assert_eq!(distribution.exclusions().unknown_size, 2);
+    assert_eq!(distribution.exclusions().conflict_size, 1);
+
+    let bug_distribution = task_size_distribution(&connection, Some(TaskKind::Bug)).unwrap();
+    assert_eq!(bug_distribution.count_for_size(TaskSize::M), 1);
+    assert_eq!(bug_distribution.count_for_size(TaskSize::S), 0);
+    let reasoning_distribution =
+        task_size_distribution_with_filters(&connection, None, Some(TaskDifficulty::Reasoning))
+            .unwrap();
+    assert_eq!(reasoning_distribution.count_for_size(TaskSize::M), 1);
+    assert_eq!(reasoning_distribution.count_for_size(TaskSize::S), 0);
+
+    let revised = TaskKindMapping::default_v1()
+        .with_size_entry(2, "size:medium".to_owned(), TaskSize::M)
+        .unwrap()
+        .with_difficulty_entry(
+            2,
+            "difficulty:unfamiliar".to_owned(),
+            TaskDifficulty::Reasoning,
+        )
+        .unwrap();
+    rebuild_task_identities(&connection, &revised).unwrap();
+    let reinterpreted = read_task_identity(&connection, &task("beads-a", "aub-size-unknown"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(reinterpreted.size_state, TaskIdentityState::Resolved);
+    assert_eq!(reinterpreted.size, Some(TaskSize::M));
+    assert_eq!(reinterpreted.difficulty, Some(TaskDifficulty::Mechanical));
+    assert_eq!(reinterpreted.normalization_version, 2);
+    assert!(reinterpreted.size_evidence.contains("size:medium"));
+    let difficulty_reinterpreted = read_task_identity(
+        &connection,
+        &task("beads-a", "aub-size-m-unknown-difficulty"),
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        difficulty_reinterpreted.difficulty,
+        Some(TaskDifficulty::Reasoning)
+    );
+
+    let candidate_snapshot_after: Vec<(String, String)> = connection
+        .prepare(
+            "SELECT origin, raw_value FROM task_kind_candidate
+             WHERE task_source = 'beads-a' ORDER BY origin, raw_value",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(candidate_snapshot, candidate_snapshot_after);
 }
 
 #[test]

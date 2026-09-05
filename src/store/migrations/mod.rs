@@ -93,6 +93,9 @@ pub(crate) mod migration_0022;
 #[path = "0023_usage_occurrence_ingest_indexes.rs"]
 pub(crate) mod migration_0023;
 
+#[path = "0024_task_classification_axes.rs"]
+pub(crate) mod migration_0024;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -122,5 +125,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0021::migration(),
         migration_0022::migration(),
         migration_0023::migration(),
+        migration_0024::migration(),
     ]
 }

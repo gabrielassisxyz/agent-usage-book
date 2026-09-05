@@ -1,5 +1,5 @@
-//! Task-kind identity: candidate persistence, rebuild, and the distribution
-//! read the historical-distribution queries group on.
+//! Task identity: candidate persistence, rebuild, and the distribution read
+//! the historical-distribution queries group on.
 //!
 //! May not depend on:
 //! - HTTP or terminal-formatting crates
@@ -16,9 +16,10 @@ use std::collections::BTreeMap;
 use rusqlite::params;
 
 use crate::attribution::{
-    ResolvedTaskKind, TaskIdentityState, TaskKind, TaskKindCandidate, TaskKindMapping,
-    TaskKindOrigin, TrackerTaskReader, TrackerTaskRecord, emit_task_kind_candidates,
-    resolve_task_kind,
+    ResolvedTaskDifficulty, ResolvedTaskKind, ResolvedTaskSize, TaskDifficulty, TaskIdentityState,
+    TaskKind, TaskKindCandidate, TaskKindMapping, TaskKindOrigin, TaskSize, TrackerTaskReader,
+    TrackerTaskRecord, emit_task_kind_candidates, resolve_task_difficulty, resolve_task_kind,
+    resolve_task_size,
 };
 use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
 use crate::error::Error;
@@ -174,12 +175,16 @@ pub fn rebuild_task_identities(
         .map_err(|error| Error::Store(format!("cannot clear task identities: {error}")))?;
     let mut written = 0u64;
     for (task_source, task_native, candidates) in &groups {
-        let resolved = resolve_task_kind(candidates, mapping);
-        insert_identity(
+        let resolved_kind = resolve_task_kind(candidates, mapping);
+        let resolved_size = resolve_task_size(candidates, mapping);
+        let resolved_difficulty = resolve_task_difficulty(candidates, mapping);
+        insert_identity_with_classification(
             &transaction,
             task_source,
             task_native,
-            resolved,
+            resolved_kind,
+            resolved_size,
+            resolved_difficulty,
             mapping.version(),
         )?;
         written += 1;
@@ -242,6 +247,7 @@ fn read_candidate_groups(
     Ok(groups)
 }
 
+#[cfg(test)]
 fn insert_identity(
     connection: &rusqlite::Connection,
     task_source: &str,
@@ -249,8 +255,32 @@ fn insert_identity(
     resolved: ResolvedTaskKind,
     normalization_version: u32,
 ) -> Result<(), Error> {
-    let state = resolved.state().state_label();
-    let (kind, winner, evidence) = match resolved {
+    insert_identity_with_classification(
+        connection,
+        task_source,
+        task_native,
+        resolved,
+        ResolvedTaskSize::Unknown {
+            evidence: String::new(),
+        },
+        ResolvedTaskDifficulty::Unknown {
+            evidence: String::new(),
+        },
+        normalization_version,
+    )
+}
+
+fn insert_identity_with_classification(
+    connection: &rusqlite::Connection,
+    task_source: &str,
+    task_native: &str,
+    resolved_kind: ResolvedTaskKind,
+    resolved_size: ResolvedTaskSize,
+    resolved_difficulty: ResolvedTaskDifficulty,
+    normalization_version: u32,
+) -> Result<(), Error> {
+    let kind_state = resolved_kind.state().state_label();
+    let (kind, winner, kind_evidence) = match resolved_kind {
         ResolvedTaskKind::Resolved {
             kind,
             winner,
@@ -260,20 +290,44 @@ fn insert_identity(
             (None, None, evidence)
         }
     };
+    let size_state = resolved_size.state().state_label();
+    let (size, size_evidence) = match resolved_size {
+        ResolvedTaskSize::Resolved { size, evidence, .. } => (Some(size.as_str()), evidence),
+        ResolvedTaskSize::Unknown { evidence } | ResolvedTaskSize::Conflict { evidence } => {
+            (None, evidence)
+        }
+    };
+    let difficulty_state = resolved_difficulty.state().state_label();
+    let (difficulty, difficulty_evidence) = match resolved_difficulty {
+        ResolvedTaskDifficulty::Resolved {
+            difficulty,
+            evidence,
+            ..
+        } => (Some(difficulty.as_str()), evidence),
+        ResolvedTaskDifficulty::Unknown { evidence }
+        | ResolvedTaskDifficulty::Conflict { evidence } => (None, evidence),
+    };
     connection
         .execute(
             "INSERT INTO task_identity (
                 task_source, task_native, state, kind, winner_origin,
-                evidence, normalization_version
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                evidence, normalization_version, size_state, size, size_evidence,
+                difficulty_state, difficulty, difficulty_evidence
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 task_source,
                 task_native,
-                state,
+                kind_state,
                 kind,
                 winner,
-                evidence,
+                kind_evidence,
                 normalization_version,
+                size_state,
+                size,
+                size_evidence,
+                difficulty_state,
+                difficulty,
+                difficulty_evidence,
             ],
         )
         .map(|_| ())
@@ -289,6 +343,12 @@ pub struct TaskIdentityRow {
     pub winner: Option<TaskKindOrigin>,
     pub evidence: String,
     pub normalization_version: u32,
+    pub size_state: TaskIdentityState,
+    pub size: Option<TaskSize>,
+    pub size_evidence: String,
+    pub difficulty_state: TaskIdentityState,
+    pub difficulty: Option<TaskDifficulty>,
+    pub difficulty_evidence: String,
 }
 
 /// Reads one task's identity, or `None` when the task has none (either never
@@ -300,7 +360,9 @@ pub fn read_task_identity(
 ) -> Result<Option<TaskIdentityRow>, Error> {
     let mut statement = connection
         .prepare(
-            "SELECT state, kind, winner_origin, evidence, normalization_version
+            "SELECT state, kind, winner_origin, evidence, normalization_version,
+                    size_state, size, size_evidence,
+                    difficulty_state, difficulty, difficulty_evidence
              FROM task_identity
              WHERE task_source = ?1 AND task_native = ?2",
         )
@@ -315,16 +377,35 @@ pub fn read_task_identity(
                     row.get::<_, Option<String>>(2)?,
                     row.get::<_, String>(3)?,
                     row.get::<_, u32>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, String>(10)?,
                 ))
             },
         )
         .map_err(|error| Error::Store(format!("cannot query task identity: {error}")))?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| Error::Store(format!("cannot decode task identity: {error}")))?;
-    let Some((state, kind, winner, evidence, version)) = rows.pop() else {
+    let Some((
+        state,
+        kind,
+        winner,
+        evidence,
+        version,
+        size_state,
+        size,
+        size_evidence,
+        difficulty_state,
+        difficulty,
+        difficulty_evidence,
+    )) = rows.pop()
+    else {
         return Ok(None);
     };
-    if rows.len() > 1 {
+    if !rows.is_empty() {
         return Err(Error::Store(
             "task identity UNIQUE constraint was violated at the database".to_owned(),
         ));
@@ -348,6 +429,23 @@ pub fn read_task_identity(
             ))
         })?),
     };
+    let size_state = TaskIdentityState::parse(&size_state).ok_or_else(|| {
+        Error::Store(format!(
+            "task identity carries an unknown size state label: {size_state}"
+        ))
+    })?;
+    let size = parse_identity_axis_value("size", size_state, size.as_deref(), TaskSize::parse)?;
+    let difficulty_state = TaskIdentityState::parse(&difficulty_state).ok_or_else(|| {
+        Error::Store(format!(
+            "task identity carries an unknown difficulty state label: {difficulty_state}"
+        ))
+    })?;
+    let difficulty = parse_identity_axis_value(
+        "difficulty",
+        difficulty_state,
+        difficulty.as_deref(),
+        TaskDifficulty::parse,
+    )?;
     Ok(Some(TaskIdentityRow {
         task_id: task_id.clone(),
         state,
@@ -355,21 +453,92 @@ pub fn read_task_identity(
         winner,
         evidence,
         normalization_version: version,
+        size_state,
+        size,
+        size_evidence,
+        difficulty_state,
+        difficulty,
+        difficulty_evidence,
     }))
 }
 
-/// The historical-distribution input over task kinds: grouped counts by
-/// justified kind plus the unknown and conflict counts, in typed states.
+fn parse_identity_axis_value<T>(
+    axis: &str,
+    state: TaskIdentityState,
+    raw: Option<&str>,
+    parse: fn(&str) -> Option<T>,
+) -> Result<Option<T>, Error> {
+    match state {
+        TaskIdentityState::Resolved => {
+            let raw = raw.ok_or_else(|| {
+                Error::Store(format!("resolved task identity {axis} carries no value"))
+            })?;
+            parse(raw)
+                .ok_or_else(|| {
+                    Error::Store(format!(
+                        "task identity carries an unknown {axis} value: {raw}"
+                    ))
+                })
+                .map(Some)
+        }
+        TaskIdentityState::Unknown | TaskIdentityState::Conflict => {
+            if raw.is_some() {
+                return Err(Error::Store(format!(
+                    "unresolved task identity {axis} carries a value"
+                )));
+            }
+            Ok(None)
+        }
+    }
+}
+
+/// The difficulty composition inside one size group.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskDifficultyMix {
+    pub resolved: Vec<(TaskDifficulty, u64)>,
+    pub unknown: u64,
+    pub conflict: u64,
+}
+
+impl TaskDifficultyMix {
+    pub fn count_for(&self, difficulty: TaskDifficulty) -> u64 {
+        self.resolved
+            .iter()
+            .find(|(candidate, _)| *candidate == difficulty)
+            .map(|(_, count)| *count)
+            .unwrap_or(0)
+    }
+}
+
+/// One reference-distribution group. Unknown and conflicting difficulty
+/// states remain in the mix because difficulty is a filterable secondary axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSizeGroup {
+    pub size: TaskSize,
+    pub sample_count: u64,
+    pub difficulty_mix: TaskDifficultyMix,
+}
+
+impl TaskSizeGroup {
+    pub fn count(&self) -> u64 {
+        self.sample_count
+    }
+}
+
+/// The historical-distribution input. Size is the grouping axis; task kind is
+/// retained as a filter and as refusal evidence for the older identity axis.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskKindDistribution {
-    /// Count of tasks resolved to each kind, ordered by kind.
+    pub by_size: Vec<TaskSizeGroup>,
+    pub unknown_size: u64,
+    pub conflict_size: u64,
+    /// Counts retained for callers that inspect the optional task-kind filter.
     pub resolved: Vec<(TaskKind, u64)>,
     pub unknown: u64,
     pub conflict: u64,
 }
 
 impl TaskKindDistribution {
-    /// The count for one kind, or zero when no task resolved to it.
     pub fn count_for(&self, kind: TaskKind) -> u64 {
         self.resolved
             .iter()
@@ -377,31 +546,104 @@ impl TaskKindDistribution {
             .map(|(_, count)| *count)
             .unwrap_or(0)
     }
+
+    pub fn count_for_size(&self, size: TaskSize) -> u64 {
+        self.by_size
+            .iter()
+            .find(|group| group.size == size)
+            .map(TaskSizeGroup::count)
+            .unwrap_or(0)
+    }
+
+    pub fn group_for_size(&self, size: TaskSize) -> Option<&TaskSizeGroup> {
+        self.by_size.iter().find(|group| group.size == size)
+    }
+
+    /// The exclusion counts that keep unresolved size outside the reference
+    /// distribution while leaving the kind diagnostics available alongside it.
+    pub fn exclusions(&self) -> TaskDistributionExclusions {
+        TaskDistributionExclusions {
+            unknown_kind: self.unknown,
+            conflict_kind: self.conflict,
+            unknown_size: self.unknown_size,
+            conflict_size: self.conflict_size,
+        }
+    }
 }
 
-/// Reads the task-kind distribution input from the persisted identities.
+/// Refusal evidence for both the historical grouping axis and the retained
+/// task-kind filter axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TaskDistributionExclusions {
+    pub unknown_kind: u64,
+    pub conflict_kind: u64,
+    pub unknown_size: u64,
+    pub conflict_size: u64,
+}
+
+/// Reads the size-grouped distribution with no task-kind filter.
 pub fn task_kind_distribution(
     connection: &rusqlite::Connection,
 ) -> Result<TaskKindDistribution, Error> {
+    task_size_distribution(connection, None)
+}
+
+/// Reads the size-grouped distribution, optionally restricting the reference
+/// population to one resolved task kind.
+pub fn task_size_distribution(
+    connection: &rusqlite::Connection,
+    kind_filter: Option<TaskKind>,
+) -> Result<TaskKindDistribution, Error> {
+    task_size_distribution_with_filters(connection, kind_filter, None)
+}
+
+/// Reads the size-grouped distribution with independent task-kind and
+/// difficulty filters. A difficulty filter selects only resolved difficulty
+/// values; without it, unknown and conflicting difficulty remain in each
+/// size group's mix.
+pub fn task_size_distribution_with_filters(
+    connection: &rusqlite::Connection,
+    kind_filter: Option<TaskKind>,
+    difficulty_filter: Option<TaskDifficulty>,
+) -> Result<TaskKindDistribution, Error> {
     let mut statement = connection
-        .prepare("SELECT state, kind, COUNT(*) FROM task_identity GROUP BY state, kind")
-        .map_err(|error| Error::Store(format!("cannot read task-kind distribution: {error}")))?;
+        .prepare(
+            "SELECT state, kind, size_state, size, difficulty_state, difficulty
+             FROM task_identity
+             WHERE (?1 IS NULL OR (state = 'resolved' AND kind = ?1))
+               AND (?2 IS NULL OR (
+                   difficulty_state = 'resolved' AND difficulty = ?2
+               ))
+             ORDER BY task_source, task_native",
+        )
+        .map_err(|error| Error::Store(format!("cannot read task distribution: {error}")))?;
+    let kind_filter = kind_filter.map(|kind| kind.as_str().to_owned());
+    let difficulty_filter = difficulty_filter.map(|difficulty| difficulty.as_str().to_owned());
     let rows = statement
-        .query_map([], |row| {
+        .query_map(params![kind_filter, difficulty_filter], |row| {
             Ok((
                 row.get::<_, String>(0)?,
                 row.get::<_, Option<String>>(1)?,
-                row.get::<_, u64>(2)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, Option<String>>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
             ))
         })
-        .map_err(|error| Error::Store(format!("cannot query task-kind distribution: {error}")))?
+        .map_err(|error| Error::Store(format!("cannot query task distribution: {error}")))?
         .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| Error::Store(format!("cannot decode task-kind distribution: {error}")))?;
+        .map_err(|error| Error::Store(format!("cannot decode task distribution: {error}")))?;
 
     let mut distribution = TaskKindDistribution::default();
-    for (state, kind, count) in rows {
-        match state.as_str() {
-            "resolved" => {
+    let mut groups = BTreeMap::<TaskSize, TaskSizeGroup>::new();
+    for (state, kind, size_state, size, difficulty_state, difficulty) in rows {
+        let kind_state = TaskIdentityState::parse(&state).ok_or_else(|| {
+            Error::Store(format!(
+                "task distribution carries an unknown state label: {state}"
+            ))
+        })?;
+        match kind_state {
+            TaskIdentityState::Resolved => {
                 let raw = kind.ok_or_else(|| {
                     Error::Store(
                         "resolved identity row carries no kind, though the database forbids it"
@@ -409,23 +651,86 @@ pub fn task_kind_distribution(
                     )
                 })?;
                 let kind = TaskKind::parse(&raw).ok_or_else(|| {
-                    Error::Store(format!(
-                        "task-kind distribution carries an unknown kind: {raw}"
-                    ))
+                    Error::Store(format!("task distribution carries an unknown kind: {raw}"))
                 })?;
-                distribution.resolved.push((kind, count));
+                increment_kind_count(&mut distribution.resolved, kind);
             }
-            "unknown" => distribution.unknown += count,
-            "conflict" => distribution.conflict += count,
-            other => {
-                return Err(Error::Store(format!(
-                    "task-kind distribution carries an unknown state label: {other}"
-                )));
+            TaskIdentityState::Unknown => distribution.unknown += 1,
+            TaskIdentityState::Conflict => distribution.conflict += 1,
+        }
+
+        let size_state = TaskIdentityState::parse(&size_state).ok_or_else(|| {
+            Error::Store(format!(
+                "task distribution carries an unknown size state label: {size_state}"
+            ))
+        })?;
+        let size = parse_identity_axis_value("size", size_state, size.as_deref(), TaskSize::parse)?;
+        let difficulty_state = TaskIdentityState::parse(&difficulty_state).ok_or_else(|| {
+            Error::Store(format!(
+                "task distribution carries an unknown difficulty state label: {difficulty_state}"
+            ))
+        })?;
+        let difficulty = parse_identity_axis_value(
+            "difficulty",
+            difficulty_state,
+            difficulty.as_deref(),
+            TaskDifficulty::parse,
+        )?;
+
+        let Some(size) = size else {
+            match size_state {
+                TaskIdentityState::Unknown => distribution.unknown_size += 1,
+                TaskIdentityState::Conflict => distribution.conflict_size += 1,
+                TaskIdentityState::Resolved => {
+                    return Err(Error::Store(
+                        "resolved task size carried no parsed value".to_owned(),
+                    ));
+                }
             }
+            continue;
+        };
+        let group = groups.entry(size).or_insert_with(|| TaskSizeGroup {
+            size,
+            sample_count: 0,
+            difficulty_mix: TaskDifficultyMix::default(),
+        });
+        group.sample_count += 1;
+        match difficulty_state {
+            TaskIdentityState::Resolved => {
+                let difficulty = difficulty.ok_or_else(|| {
+                    Error::Store("resolved task difficulty carried no parsed value".to_owned())
+                })?;
+                increment_difficulty_count(&mut group.difficulty_mix.resolved, difficulty);
+            }
+            TaskIdentityState::Unknown => group.difficulty_mix.unknown += 1,
+            TaskIdentityState::Conflict => group.difficulty_mix.conflict += 1,
         }
     }
+    distribution.by_size = groups.into_values().collect();
     distribution.resolved.sort();
+    for group in &mut distribution.by_size {
+        group.difficulty_mix.resolved.sort();
+    }
     Ok(distribution)
+}
+
+fn increment_kind_count(counts: &mut Vec<(TaskKind, u64)>, kind: TaskKind) {
+    if let Some((_, count)) = counts.iter_mut().find(|(candidate, _)| *candidate == kind) {
+        *count += 1;
+    } else {
+        counts.push((kind, 1));
+    }
+}
+
+fn increment_difficulty_count(counts: &mut Vec<(TaskDifficulty, u64)>, difficulty: TaskDifficulty) {
+    if let Some((_, count)) = counts
+        .iter_mut()
+        .find(|(candidate, _)| *candidate == difficulty)
+    {
+        *count += 1;
+    } else {
+        counts.push((difficulty, 1));
+    }
 }
 
 #[cfg(test)]
