@@ -232,6 +232,7 @@ const POPULATION: &[(&str, Populate)] = &[
     ("transcript_file", populate_transcript_file),
     ("session", populate_session),
     ("session_account_marker", populate_session_account_marker),
+    ("session_heartbeat", populate_session_heartbeat),
     ("task_event", populate_task_event),
     ("task_event_quarantine", populate_task_event_quarantine),
     ("meter_attempt", populate_meter_attempt),
@@ -445,6 +446,17 @@ fn populate_session_account_marker(conn: &rusqlite::Connection) -> Result<(), St
         "INSERT INTO session_account_marker (id, session_source, session_native, observed_at, logical_account, resolved_account_id, marker_source, evidence_designation) VALUES
             (1, 'claude-code', 'matrix-native-1', 150, 'alpha', 1, 'transcript', 'direct'),
             (2, 'claude-code', 'matrix-native-2', 250, 'unlinked', NULL, 'inference', 'heuristic')",
+    )
+}
+
+fn populate_session_heartbeat(conn: &rusqlite::Connection) -> Result<(), String> {
+    // One row per session, keyed by (session_source, session_native): the
+    // UNIQUE constraint the table's own upsert relies on.
+    exec(
+        conn,
+        "session_heartbeat",
+        "INSERT INTO session_heartbeat (session_source, session_native, last_heartbeat_at, heartbeat_source) VALUES
+            ('claude-code', 'matrix-native-1', 150, 'turn_end')",
     )
 }
 

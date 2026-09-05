@@ -370,7 +370,7 @@ fn validate_freshness_accounts(
     Ok(())
 }
 
-/// Validates that a status report JSON string strictly conforms to schema version 1.
+/// Validates that a status report JSON string strictly conforms to the current schema version.
 pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "status" {
@@ -444,7 +444,7 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
     Ok(parsed)
 }
 
-/// Validates that a now report JSON string strictly conforms to schema version 1.
+/// Validates that a now report JSON string strictly conforms to the current schema version.
 pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "now" {
@@ -489,7 +489,7 @@ pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonCo
     Ok(parsed)
 }
 
-/// Validates that a spend report JSON string strictly conforms to schema version 1.
+/// Validates that a spend report JSON string strictly conforms to the current schema version.
 pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "spend" {
@@ -1443,7 +1443,7 @@ pub fn coverage_json(report: &CoverageReport, run: RunId) -> String {
     JsonEnvelope::new("coverage", run, report.metadata.clone()).to_json_with(&body)
 }
 
-/// Validates that a coverage report JSON strictly conforms to schema version 1.
+/// Validates that a coverage report JSON strictly conforms to the current schema version.
 pub fn validate_coverage_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "coverage" {
@@ -1490,7 +1490,7 @@ pub fn validate_coverage_report_json(json_str: &str) -> Result<ParsedEnvelope, J
     Ok(parsed)
 }
 
-/// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.
+/// Validates that a doctor transcript format drift report JSON strictly conforms to the current schema version.
 pub fn validate_doctor_drift_report_json(
     json_str: &str,
 ) -> Result<ParsedEnvelope, JsonContractError> {
@@ -2218,7 +2218,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON envelope");
         let expected = serde_json::json!({
-            "schema": 2,
+            "schema": SCHEMA_VERSION,
             "command": "now",
             "run": run.as_str(),
             "generated_at": 2000,
@@ -2228,7 +2228,7 @@ mod tests {
         assert_eq!(parsed, expected);
 
         let validated = validate_envelope_strict(&json).expect("envelope validates strictly");
-        assert_eq!(validated.schema, 1);
+        assert_eq!(validated.schema, SCHEMA_VERSION);
         assert_eq!(validated.command, "now");
         assert_eq!(validated.run.as_str(), run.as_str());
         assert_eq!(validated.generated_at.unix_nanos(), 2000);
@@ -2257,7 +2257,8 @@ mod tests {
     fn bumping_schema_version_without_schema_update_fails_contract() {
         let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
         let invalid_version_json = format!(
-            "\"schema\":2,\"command\":\"now\",\"run\":{},\"generated_at\":2000,\"knowledge_at\":1000,\"ledger_generation\":7",
+            "\"schema\":{},\"command\":\"now\",\"run\":{},\"generated_at\":2000,\"knowledge_at\":1000,\"ledger_generation\":7",
+            SCHEMA_VERSION + 1,
             json_string(run.as_str())
         );
         let wrapped = format!("{{{invalid_version_json}}}");
@@ -2267,8 +2268,8 @@ mod tests {
         assert_eq!(
             err,
             JsonContractError::SchemaVersionMismatch {
-                expected: 1,
-                actual: 2
+                expected: SCHEMA_VERSION,
+                actual: SCHEMA_VERSION + 1
             }
         );
     }

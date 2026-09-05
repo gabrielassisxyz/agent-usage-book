@@ -362,7 +362,11 @@ mod tests {
                 assert_eq!(claim.marker_reference, "session_account_marker:1");
                 assert_eq!(claim.heartbeat_reference, "session_heartbeat:1");
             }
-            other => panic!("expected ExplicitMarkerEvidence, got {other:?}"),
+            other @ (ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)
+            | ActiveActivityState::Inactive(_)) => {
+                panic!("expected ExplicitMarkerEvidence, got {other:?}")
+            }
         }
     }
 
@@ -422,7 +426,11 @@ mod tests {
                 assert_eq!(claim.logical_account, "work");
                 assert_eq!(claim.liveness_gap, LivenessGap::NeverObserved);
             }
-            other => panic!("expected Inactive/NeverObserved, got {other:?}"),
+            other @ (ActiveActivityState::ExplicitMarkerEvidence(_)
+            | ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)) => {
+                panic!("expected Inactive/NeverObserved, got {other:?}")
+            }
         }
     }
 
@@ -454,7 +462,11 @@ mod tests {
                 } => assert_eq!(last_heartbeat_at, t(0)),
                 other => panic!("expected Aged, got {other:?}"),
             },
-            other => panic!("expected Inactive, got {other:?}"),
+            other @ (ActiveActivityState::ExplicitMarkerEvidence(_)
+            | ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)) => {
+                panic!("expected Inactive, got {other:?}")
+            }
         }
     }
 
@@ -497,7 +509,11 @@ mod tests {
                     vec!["account-a".to_string(), "account-b".to_string()]
                 );
             }
-            other => panic!("expected ConflictingEvidence, got {other:?}"),
+            other @ (ActiveActivityState::ExplicitMarkerEvidence(_)
+            | ActiveActivityState::NoEvidence
+            | ActiveActivityState::Inactive(_)) => {
+                panic!("expected ConflictingEvidence, got {other:?}")
+            }
         }
     }
 
@@ -535,7 +551,11 @@ mod tests {
             ActiveActivityState::ExplicitMarkerEvidence(claim) => {
                 assert_eq!(claim.logical_account, "account-b");
             }
-            other => panic!("expected ExplicitMarkerEvidence(account-b), got {other:?}"),
+            other @ (ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)
+            | ActiveActivityState::Inactive(_)) => {
+                panic!("expected ExplicitMarkerEvidence(account-b), got {other:?}")
+            }
         }
     }
 
@@ -571,7 +591,11 @@ mod tests {
             ActiveActivityState::ExplicitMarkerEvidence(claim) => {
                 assert_eq!(claim.logical_account, "account-a")
             }
-            other => panic!("expected account-a just before the switch, got {other:?}"),
+            other @ (ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)
+            | ActiveActivityState::Inactive(_)) => {
+                panic!("expected account-a just before the switch, got {other:?}")
+            }
         }
 
         let at_boundary = compose_active_activity(
@@ -584,7 +608,11 @@ mod tests {
             ActiveActivityState::ExplicitMarkerEvidence(claim) => {
                 assert_eq!(claim.logical_account, "account-b")
             }
-            other => panic!("expected account-b at the switch boundary, got {other:?}"),
+            other @ (ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)
+            | ActiveActivityState::Inactive(_)) => {
+                panic!("expected account-b at the switch boundary, got {other:?}")
+            }
         }
     }
 
@@ -647,7 +675,11 @@ mod tests {
                     "the current association is the post-switch account, even though liveness fails it"
                 );
             }
-            other => panic!("expected Inactive(account-b), got {other:?}"),
+            other @ (ActiveActivityState::ExplicitMarkerEvidence(_)
+            | ActiveActivityState::NoEvidence
+            | ActiveActivityState::ConflictingEvidence(_)) => {
+                panic!("expected Inactive(account-b), got {other:?}")
+            }
         }
     }
 
