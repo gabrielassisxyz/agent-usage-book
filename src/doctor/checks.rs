@@ -720,10 +720,10 @@ fn backup_age(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::BackupAge, status)
 }
 
-/// Every recorded window anomaly (`store::window_anomaly::all_anomalies`,
-/// `aub-eun.14`). This reads the persisted count and evidence references only:
-/// it never re-runs consecutive-window comparison, which is exactly what lets
-/// doctor consume anomaly counts without reimplementing detection.
+/// How many anomaly references the check prints. The count is always exact; only
+/// the sample is bounded, because a check that prints hundreds of records on one
+/// line is read as broken and then ignored, which is how a real anomaly hides
+/// among the noise of an over-eager detector.
 const METER_ANOMALY_SAMPLE_LIMIT: usize = 5;
 
 fn meter_anomaly_detail(anomalies: &[crate::store::window_anomaly::StoredWindowAnomaly]) -> String {
@@ -749,6 +749,10 @@ fn meter_anomaly_detail(anomalies: &[crate::store::window_anomaly::StoredWindowA
     )
 }
 
+/// Every recorded window anomaly (`store::window_anomaly::all_anomalies`,
+/// `aub-eun.14`). This reads the persisted count and evidence references only:
+/// it never re-runs consecutive-window comparison, which is exactly what lets
+/// doctor consume anomaly counts without reimplementing detection.
 fn meter_anomalies(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
         CheckStatus::NotApplicable("no ledger database exists yet".to_string())
