@@ -319,7 +319,11 @@ panes at once is the bottleneck the whole model exists to remove.
 
    **An invariant row travels with its bead.** If `docs/INVARIANTS.md` names the bead as
    unenforced, prepare the same commit series to flip that row to its enforcing path and
-   check, and update both enforcement-summary counts. The Phase 2 close evidence must point
+   check, and update both enforcement-summary counts. Start the bead from
+   `docs/INVARIANT_BEAD_TEMPLATE.md` and keep its row-update acceptance criterion, filled
+   in with the row number and what the row must say afterwards; a bead that enforces an
+   invariant without that criterion is not ready, because the row update is the one part
+   of the change no later step can supply. The Phase 2 close evidence must point
    at that series; a later hand edit would make the verified revision and the tracker state
    disagree.
 
