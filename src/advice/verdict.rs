@@ -670,7 +670,9 @@ mod tests {
     fn ready_of(assessment: CanRunAssessment<'_>) -> CanRunReady<'_> {
         match assessment {
             CanRunAssessment::Ready(ready) => ready,
-            other => panic!("expected a Ready assessment, got {other:?}"),
+            other @ (CanRunAssessment::InsufficientEvidence(_) | CanRunAssessment::Unknown(_)) => {
+                panic!("expected a Ready assessment, got {other:?}")
+            }
         }
     }
 
