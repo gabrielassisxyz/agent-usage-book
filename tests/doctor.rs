@@ -1642,12 +1642,11 @@ fn integration_synthetic_step_change_produces_step_change_pattern_and_no_causal_
 // --- MeterAnomalies: doctor consumes persisted evidence, never re-detects ---
 
 /// `aub-eun.14`: `MeterAnomalies` reads what `store::window_anomaly` already
-/// persisted - a count and evidence references - without calling any
-/// detection function itself. A percentage decrease with no reset produces a
-/// `Fail` naming the anomaly's evidence references; a ledger with none is a
-/// `PassWithDetail` naming zero, never a silent pass with no detail at all.
+/// persisted without calling any detection function itself. It fails only for
+/// anomalies inside the configured horizon, while retained older evidence stays
+/// discoverable in a passing result.
 #[test]
-fn meter_anomalies_reports_persisted_evidence_without_reimplementing_detection() {
+fn meter_anomalies_report_recent_health_without_hiding_history() {
     use agent_usage_book::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
     use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
     use agent_usage_book::domain::time::MeasurementBasis;
@@ -1782,7 +1781,7 @@ fn meter_anomalies_reports_persisted_evidence_without_reimplementing_detection()
 
     let ctx_after = DoctorContext {
         config: &config,
-        timestamp: ts(1_000),
+        timestamp: ts(60),
         db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
         db: Some(&conn),
         db_missing: false,
@@ -1794,10 +1793,82 @@ fn meter_anomalies_reports_persisted_evidence_without_reimplementing_detection()
         .expect("MeterAnomalies present");
     match after.status {
         CheckStatus::Fail(ref detail) => {
+            assert!(detail.contains("1 recent of 1 total window anomaly"));
             assert!(detail.contains("1 window anomaly"));
             assert!(detail.contains("percentage_decrease_without_reset"));
             assert!(detail.contains(&format!("account={}", account.value())));
         }
         other => panic!("expected Fail naming the anomaly's evidence references, got {other:?}"),
+    }
+
+    let ctx_historical = DoctorContext {
+        config: &config,
+        timestamp: ts(1_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let historical = build_registry(&ctx_historical)
+        .into_iter()
+        .find(|o| o.name == CheckName::MeterAnomalies)
+        .expect("MeterAnomalies present");
+    assert_eq!(
+        historical.status,
+        CheckStatus::PassWithDetail(
+            "1 historical window anomaly(ies) recorded; none within the 900s horizon".to_string()
+        )
+    );
+
+    let historical_report = agent_usage_book::doctor::DoctorReport {
+        metadata: agent_usage_book::report::ReportMetadata::new(
+            ts(1_000),
+            ts(1_000),
+            agent_usage_book::report::LedgerGeneration::new(0),
+            None,
+        ),
+        outcomes: vec![historical],
+        residual: None,
+    };
+    let historical_text = agent_usage_book::presentation::render_doctor_report(&historical_report);
+    assert!(historical_text.contains("[PASS] meter-anomalies: 1 historical window anomaly"));
+    let historical_json = agent_usage_book::presentation::doctor_report_json(
+        &historical_report,
+        agent_usage_book::logging::RunId::new(ts(1_000)),
+    );
+    let historical_value: serde_json::Value = serde_json::from_str(&historical_json).unwrap();
+    let historical_check = historical_value["checks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|check| check["name"] == "meter-anomalies")
+        .expect("meter-anomalies must be rendered in JSON");
+    assert_eq!(historical_check["status"], "pass");
+    assert!(
+        historical_check["reason"]
+            .as_str()
+            .unwrap()
+            .contains("1 historical window anomaly")
+    );
+
+    let (third_obs, third_windows) = record(950, 200_000, WindowResetState::Known(ts(100)));
+    detect_and_persist(&conn, account, &third_obs, &third_windows, ts(950)).unwrap();
+    let mixed = build_registry(&ctx_historical)
+        .into_iter()
+        .find(|o| o.name == CheckName::MeterAnomalies)
+        .expect("MeterAnomalies present");
+    match mixed.status {
+        CheckStatus::Fail(ref detail) => {
+            assert!(
+                detail.contains("1 recent of 2 total window anomaly"),
+                "{detail}"
+            );
+            assert!(
+                detail.contains("1 window anomaly(ies), showing 1"),
+                "{detail}"
+            );
+            assert!(detail.contains("current_observation="), "{detail}");
+        }
+        other => panic!("expected a recent anomaly to fail the check, got {other:?}"),
     }
 }

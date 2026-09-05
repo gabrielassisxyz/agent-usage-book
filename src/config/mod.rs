@@ -23,9 +23,10 @@
 //! using exactly the four labels above: `flag`, `environment`, `file`, `default`.
 //!
 //! Scope, stated rather than left implicit: the four scalar sections (`state`,
-//! `sampling`, `freshness`, `coverage`) plus `backup.review_after`, `drill.max_age`
-//! and `adapter_semantics.max_comparison_age` go through the full four-level order
-//! and are individually provenance-tracked, since those are the keys
+//! `sampling`, `freshness`, `coverage`) plus the doctor review horizons
+//! (`backup.review_after`, `drill.max_age`, `adapter_semantics.max_comparison_age`, and
+//! `doctor.meter_anomaly_horizon`) go through the full four-level order and are
+//! individually provenance-tracked, since those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
 //! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
@@ -290,6 +291,15 @@ pub struct AdapterSemanticsConfig {
     pub max_comparison_age: MonotonicDuration,
 }
 
+/// The thresholds `aub doctor` uses to distinguish current health from retained
+/// evidence. The 15-minute anomaly horizon spans several normal sampling cycles,
+/// so an ongoing detector fault remains visible while a corrected false-positive
+/// detector can return to a meaningful passing state.
+#[derive(Debug, Clone)]
+pub struct DoctorConfig {
+    pub meter_anomaly_horizon: MonotonicDuration,
+}
+
 /// The exclusivity policy for a configured account (`aub-c0b.7`).
 ///
 /// Exhaustive with no wildcard arm: an unrecognized configured value fails
@@ -421,6 +431,7 @@ pub struct Config {
     pub backup: BackupConfig,
     pub drill: DrillConfig,
     pub adapter_semantics: AdapterSemanticsConfig,
+    pub doctor: DoctorConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
@@ -448,6 +459,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "backup",
     "drill",
     "adapter_semantics",
+    "doctor",
     "projects",
     "repositories",
 ];
@@ -484,6 +496,7 @@ const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
+const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -574,6 +587,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
         .and_then(toml::Value::as_table)
     {
         check_keys(t, ADAPTER_SEMANTICS_KEYS, "adapter_semantics", file_display)?;
+    }
+    if let Some(t) = table.get("doctor").and_then(toml::Value::as_table) {
+        check_keys(t, DOCTOR_KEYS, "doctor", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -1316,6 +1332,18 @@ pub fn resolve(
         )?,
     };
 
+    let doctor = DoctorConfig {
+        meter_anomaly_horizon: resolve_duration(
+            "doctor.meter_anomaly_horizon",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "doctor", "meter_anomaly_horizon"),
+            Some("15m"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let valuation = ValuationConfig {
         default_rate_book: file
             .as_ref()
@@ -1474,6 +1502,7 @@ pub fn resolve(
             backup,
             drill,
             adapter_semantics,
+            doctor,
             projects,
             repositories,
         },
@@ -2041,6 +2070,38 @@ credential = { kind = "unknown-future-kind", anything = "goes" }
         let file = "[reconciliation]\nnope = 1\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("reconciliation.nope"), "{err}");
+    }
+
+    #[test]
+    fn the_doctor_anomaly_horizon_defaults_and_resolves_from_the_file() {
+        let (default_config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            default_config.doctor.meter_anomaly_horizon,
+            MonotonicDuration::from_seconds(15 * 60)
+        );
+        assert_eq!(
+            provenance.get("doctor.meter_anomaly_horizon"),
+            Some(ConfigSource::Default)
+        );
+
+        let file = "[doctor]\nmeter_anomaly_horizon = \"45m\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.doctor.meter_anomaly_horizon,
+            MonotonicDuration::from_seconds(45 * 60)
+        );
+        assert_eq!(
+            provenance.get("doctor.meter_anomaly_horizon"),
+            Some(ConfigSource::File)
+        );
+    }
+
+    #[test]
+    fn an_unknown_key_under_doctor_is_a_usage_error() {
+        let file = "[doctor]\nnope = 1\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("doctor.nope"), "{err}");
     }
 
     #[test]

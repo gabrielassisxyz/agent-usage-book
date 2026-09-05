@@ -161,7 +161,9 @@ fn condition_of(name: CheckName) -> &'static str {
             "the last verified backup and the last successful drill are each within their \
              configured review horizon"
         }
-        CheckName::MeterAnomalies => "no meter window carries an anomalous reading",
+        CheckName::MeterAnomalies => {
+            "no meter window anomaly was recorded inside the configured recent horizon"
+        }
         CheckName::UnexplainedResidual => "rolling residual stays within its explained bound",
         CheckName::HeuristicDedupCounts => {
             "no usage record was quarantined for a heuristic-key collision"
@@ -749,10 +751,10 @@ fn meter_anomaly_detail(anomalies: &[crate::store::window_anomaly::StoredWindowA
     )
 }
 
-/// Every recorded window anomaly (`store::window_anomaly::all_anomalies`,
-/// `aub-eun.14`). This reads the persisted count and evidence references only:
-/// it never re-runs consecutive-window comparison, which is exactly what lets
-/// doctor consume anomaly counts without reimplementing detection.
+/// Recent window anomalies (`store::window_anomaly::all_anomalies`, `aub-eun.14`).
+/// This reads the persisted count and evidence references only: it never re-runs
+/// consecutive-window comparison. Retained anomalies outside the configured horizon
+/// remain visible as history but do not keep a recovered meter permanently failed.
 fn meter_anomalies(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
         CheckStatus::NotApplicable("no ledger database exists yet".to_string())
@@ -766,7 +768,36 @@ fn meter_anomalies(ctx: &DoctorContext) -> CheckOutcome {
                 Ok(anomalies) if anomalies.is_empty() => {
                     CheckStatus::PassWithDetail("0 window anomalies recorded".to_string())
                 }
-                Ok(anomalies) => CheckStatus::Fail(meter_anomaly_detail(&anomalies)),
+                Ok(anomalies) => {
+                    let horizon_nanos = ctx.config.doctor.meter_anomaly_horizon.as_nanos();
+                    let recent_anomalies: Vec<_> = anomalies
+                        .iter()
+                        .filter(|anomaly| {
+                            ctx.timestamp
+                                .unix_nanos()
+                                .saturating_sub(anomaly.detected_at.unix_nanos())
+                                .max(0) as u64
+                                <= horizon_nanos
+                        })
+                        .cloned()
+                        .collect();
+
+                    if recent_anomalies.is_empty() {
+                        CheckStatus::PassWithDetail(format!(
+                            "{} historical window anomaly(ies) recorded; none within the {}s horizon",
+                            anomalies.len(),
+                            horizon_nanos / 1_000_000_000,
+                        ))
+                    } else {
+                        CheckStatus::Fail(format!(
+                            "{} recent of {} total window anomaly(ies) within the {}s horizon; {}",
+                            recent_anomalies.len(),
+                            anomalies.len(),
+                            horizon_nanos / 1_000_000_000,
+                            meter_anomaly_detail(&recent_anomalies),
+                        ))
+                    }
+                }
             },
         }
     };
