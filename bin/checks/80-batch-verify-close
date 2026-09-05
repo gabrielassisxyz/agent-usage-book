@@ -207,18 +207,36 @@ wave_close_allows_bead() { # $1 = bead id, $2 = optional repo_dir or INVARIANTS 
 
 # --- Unit assertions over refusal predicate against repo docs/INVARIANTS.md ---
 
-# Unit 1: A bead named by an unenforced row in the real repo INVARIANTS.md is refused with row and bead id.
-# The row is read from the table rather than pinned, because every landed bead moves its row
-# from unenforced to enforced, and a pinned example goes stale the moment its bead lands.
-real_unenforced_row="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced[[:space:]]+aub-/ { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' docs/INVARIANTS.md)"
-real_unenforced_bead="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced[[:space:]]+aub-/ { sub(/.*unenforced[[:space:]]+/, "", $4); gsub(/[[:space:]]+$/, "", $4); print $4; exit }' docs/INVARIANTS.md)"
-if [ -z "$real_unenforced_bead" ]; then
-    echo "unit: docs/INVARIANTS.md has no unenforced row left to exercise the refusal predicate" >&2
+# Unit 1: A bead named by an unenforced row is refused, naming the row number and the bead id.
+# The fixture is a copy of the real table with its first row flipped to unenforced, rather than a
+# row read out of the live document. Every landed bead moves a row from unenforced to enforced, so
+# the live table trends towards zero unenforced rows, and a unit that needs one to exist fails at
+# the moment the project succeeds: repointing invariant 12 took the table to 27 enforced and 0
+# unenforced, and this unit went red on a document that had just become correct. Copying the real
+# table rather than writing a synthetic one keeps the predicate's parsing under test against the
+# formatting it actually has to survive.
+unit_table="$scratch/INVARIANTS-planted.md"
+real_unenforced_bead="aub-fixture-unenforced-row"
+awk -F '|' -v bead="$real_unenforced_bead" 'BEGIN { OFS = "|" }
+    !planted && /^\|[[:space:]]*[0-9]+[[:space:]]*\|/ { $4 = " unenforced " bead " "; planted = 1 }
+    { print }
+' docs/INVARIANTS.md > "$unit_table"
+
+real_unenforced_row="$(awk -F '|' -v bead="$real_unenforced_bead" '$4 ~ ("unenforced[[:space:]]+" bead "([[:space:]]|$)") { gsub(/^[[:space:]]+|[[:space:]]+$/, "", $2); print $2; exit }' "$unit_table")"
+if [ -z "$real_unenforced_row" ]; then
+    echo "unit: could not plant an unenforced row into the INVARIANTS fixture" >&2
     fail=1
 fi
-refusal_out="$(wave_close_allows_bead "$real_unenforced_bead" 2>&1 || true)"
-if wave_close_allows_bead "$real_unenforced_bead" >/dev/null 2>&1; then
-    echo "unit: wave_close_allows_bead allowed close of $real_unenforced_bead which is unenforced in docs/INVARIANTS.md" >&2
+
+# Keep the fixture's summary consistent with its own rows, so what this unit proves is the refusal
+# and not a summary mismatch, which would refuse every bead for an unrelated reason.
+planted_enforced="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 !~ /unenforced/ { c += 1 } END { print c + 0 }' "$unit_table")"
+planted_unenforced="$(awk -F '|' '/^\|[[:space:]]*[0-9]+[[:space:]]*\|/ && $4 ~ /unenforced/ { c += 1 } END { print c + 0 }' "$unit_table")"
+sed -i -E "s/[0-9]+ are enforced/$planted_enforced are enforced/; s/[0-9]+ are unenforced/$planted_unenforced are unenforced/" "$unit_table"
+
+refusal_out="$(wave_close_allows_bead "$real_unenforced_bead" "$unit_table" 2>&1 || true)"
+if wave_close_allows_bead "$real_unenforced_bead" "$unit_table" >/dev/null 2>&1; then
+    echo "unit: wave_close_allows_bead allowed close of $real_unenforced_bead which is unenforced in the fixture" >&2
     fail=1
 fi
 if ! printf '%s' "$refusal_out" | command grep -qF "row $real_unenforced_row" || ! printf '%s' "$refusal_out" | command grep -qF "$real_unenforced_bead"; then
