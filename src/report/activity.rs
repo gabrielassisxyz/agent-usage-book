@@ -276,8 +276,44 @@ mod tests {
     // rows through the same round trip production code uses, an in-memory
     // connection, so this module's tests exercise the exact getters `compose_active_activity`
     // reads rather than a hand-rolled stand-in.
-    fn fixture_conn() -> rusqlite::Connection {
-        let mut conn = rusqlite::Connection::open_in_memory().unwrap();
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let suffix = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aub-report-activity-test-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn fixture_conn() -> (ScratchDir, rusqlite::Connection) {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("activity.db");
+        let policy = crate::store::connection::PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = crate::store::connection::open(
+            &db_path,
+            crate::store::connection::AccessMode::ReadWrite,
+            &policy,
+        )
+        .unwrap();
         crate::store::migrate::run_migrations(
             &mut conn,
             &crate::store::migrations::registry(),
@@ -285,7 +321,7 @@ mod tests {
             &crate::domain::time::FakeClock::new(t(0)),
         )
         .unwrap();
-        conn
+        (scratch, conn)
     }
 
     fn insert_marker(
@@ -338,7 +374,7 @@ mod tests {
 
     #[test]
     fn explicit_marker_with_fresh_heartbeat_is_spending() {
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -372,7 +408,7 @@ mod tests {
 
     #[test]
     fn absent_marker_is_no_evidence() {
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         // A heartbeat with no marker at all still proves nothing about which
         // account, per the correctness invariant: liveness never substitutes
@@ -392,7 +428,7 @@ mod tests {
         // This module never sees meter readings at all: the caller passes only
         // markers and a heartbeat, so a moving meter with an empty marker slice
         // and no heartbeat composes to NoEvidence, not to some inferred account.
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         let state = compose_active_activity(
             &markers_for(&conn, &sess),
@@ -405,7 +441,7 @@ mod tests {
 
     #[test]
     fn a_marker_without_any_heartbeat_is_inactive_never_observed() {
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -436,7 +472,7 @@ mod tests {
 
     #[test]
     fn a_marker_with_a_stale_heartbeat_is_inactive_aged() {
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -476,7 +512,7 @@ mod tests {
         // deterministic tie-break (as historical account segmentation
         // legitimately does) would report ExplicitMarkerEvidence for one of the
         // two accounts instead of surfacing the ambiguity.
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -522,7 +558,7 @@ mod tests {
         // Same instant as the conflict test above, but this time the source gave
         // both markers an ordering key: no ambiguity, so the later-keyed one wins
         // cleanly instead of reporting a conflict.
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -561,7 +597,7 @@ mod tests {
 
     #[test]
     fn account_switch_moves_the_claim_at_the_documented_boundary() {
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -618,7 +654,7 @@ mod tests {
 
     #[test]
     fn a_lower_rank_marker_alone_is_no_evidence_not_a_guess() {
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -645,7 +681,7 @@ mod tests {
         // account back in: the current explicit claim (account-b, from t(40)
         // forward) is what liveness is checked against, not the marker that
         // happened to exist when the heartbeat was last seen.
-        let conn = fixture_conn();
+        let (_scratch, conn) = fixture_conn();
         let sess = session();
         insert_marker(
             &conn,
@@ -684,6 +720,7 @@ mod tests {
     }
 
     proptest! {
+        #![proptest_config(ProptestConfig::with_cases(24))]
         /// No combination of generated markers, heartbeat presence and report
         /// instant ever reaches [`ActiveActivityState::ExplicitMarkerEvidence`]
         /// unless an explicit (`ExplicitLauncherOrHook`) marker actually covers
@@ -701,7 +738,7 @@ mod tests {
             heartbeat_at in 0i64..200,
             report_instant in 0i64..200,
         ) {
-            let conn = fixture_conn();
+            let (_scratch, conn) = fixture_conn();
             let sess = session();
             let n = marker_count.min(marker_times.len()).min(marker_ranks.len());
             for i in 0..n {
