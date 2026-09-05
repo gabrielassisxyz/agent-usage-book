@@ -44,6 +44,7 @@ use std::path::PathBuf;
 use crate::advice::historical_distribution::{
     HistoricalDistributionConfig, Percentile, QuantileMethod,
 };
+use crate::advice::verdict::{AmpleMarginMultiple, CanRunHeadroomBound, CanRunVerdictConfig};
 use crate::attribution::quality::AttributionQualityFloor;
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
@@ -350,6 +351,9 @@ pub struct Config {
     /// count and attribution-quality floor (`aub-1o3`, `aub-cab.7`), owned
     /// and documented by `crate::advice::historical_distribution`.
     pub task_distribution: HistoricalDistributionConfig,
+    /// The can-run verdict thresholds (`aub-jsq`, decided 2026-08-25), owned
+    /// and documented by `crate::advice::verdict`.
+    pub can_run: CanRunVerdictConfig,
     pub reconciliation: ReconciliationConfig,
     pub accounts: Vec<AccountConfig>,
     pub ingest: IngestConfig,
@@ -377,6 +381,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "coverage",
     "attribution",
     "task_distribution",
+    "can_run",
     "reconciliation",
     "accounts",
     "transcripts",
@@ -410,6 +415,7 @@ const TASK_DISTRIBUTION_KEYS: &[&str] = &[
     "quantile_method",
     "attribution_floor",
 ];
+const CAN_RUN_KEYS: &[&str] = &["labels", "ample_margin_multiple", "headroom_bound"];
 const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible"];
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
@@ -486,6 +492,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
         .and_then(toml::Value::as_table)
     {
         check_keys(t, TASK_DISTRIBUTION_KEYS, "task_distribution", file_display)?;
+    }
+    if let Some(t) = table.get("can_run").and_then(toml::Value::as_table) {
+        check_keys(t, CAN_RUN_KEYS, "can_run", file_display)?;
     }
     if let Some(t) = table.get("reconciliation").and_then(toml::Value::as_table) {
         check_keys(t, RECONCILIATION_KEYS, "reconciliation", file_display)?;
@@ -772,6 +781,36 @@ fn resolve_optional_floor(
     AttributionQualityFloor::new(value)
         .map(Some)
         .ok_or_else(|| Error::Usage(format!("{key}: {value} is not in the range [0.0, 1.0]")))
+}
+
+/// Resolves a boolean through the four-level order, accepting only the TOML
+/// spellings `true` and `false`, so a mistyped value is a usage error naming
+/// the key rather than a silently false flag.
+fn resolve_bool(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<bool, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    match raw.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(Error::Usage(format!(
+            "{key}: {raw:?} is not a boolean (expected \"true\" or \"false\")"
+        ))),
+    }
 }
 
 /// A count a configuration file expresses as a bare positive integer. A value
@@ -1087,6 +1126,59 @@ pub fn resolve(
         .expect("CoverageFloor's [0,1] range matches AttributionQualityFloor::new's domain"),
     };
 
+    // Defaults decided on `aub-jsq` (2026-08-25, option A): labels enabled in
+    // both output modes, AMPLE at twice the upper reference against the low end
+    // of the headroom. The multiple is coupled to `aub-1o3`'s upper reference
+    // (p90, decided 2026-09-04, so the threshold does not move); the trail on
+    // `aub-cab.3` records both halves of that coupling.
+    let can_run_labels = resolve_bool(
+        "can_run.labels",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "can_run", "labels"),
+        Some("true"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let can_run_multiple_raw = resolve_string(
+        "can_run.ample_margin_multiple",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "can_run", "ample_margin_multiple"),
+        Some("2.0"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let can_run_multiple_value: f64 = can_run_multiple_raw.parse().map_err(|_| {
+        Error::Usage(format!(
+            "can_run.ample_margin_multiple: {can_run_multiple_raw:?} is not a number"
+        ))
+    })?;
+    let can_run_multiple = AmpleMarginMultiple::new(can_run_multiple_value).ok_or_else(|| {
+        Error::Usage(format!(
+            "can_run.ample_margin_multiple: {can_run_multiple_value} is not a positive finite number"
+        ))
+    })?;
+    let can_run_bound_raw = resolve_string(
+        "can_run.headroom_bound",
+        overrides,
+        env,
+        file_raw(file.as_ref(), "can_run", "headroom_bound"),
+        Some("low"),
+        &file_display,
+        &mut provenance,
+    )?;
+    let can_run_bound = CanRunHeadroomBound::parse(&can_run_bound_raw).ok_or_else(|| {
+        Error::Usage(format!(
+            "can_run.headroom_bound: {can_run_bound_raw:?} is not a recognized headroom bound"
+        ))
+    })?;
+    let can_run = CanRunVerdictConfig {
+        labels_enabled: can_run_labels,
+        ample_margin_multiple: can_run_multiple,
+        headroom_bound: can_run_bound,
+    };
+
     let reconciliation = ReconciliationConfig {
         residual_window: resolve_duration(
             "reconciliation.residual_window",
@@ -1298,6 +1390,7 @@ pub fn resolve(
             coverage,
             attribution,
             task_distribution,
+            can_run,
             reconciliation,
             accounts,
             transcripts,
@@ -1873,5 +1966,76 @@ credential = { kind = "unknown-future-kind", anything = "goes" }
         let file = "[reconciliation]\nnope = 1\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert!(err.to_string().contains("reconciliation.nope"), "{err}");
+    }
+
+    #[test]
+    fn the_can_run_policy_has_the_jsq_decided_defaults() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(config.can_run.labels_enabled);
+        assert_eq!(config.can_run.ample_margin_multiple.get(), 2.0);
+        assert_eq!(config.can_run.headroom_bound, CanRunHeadroomBound::Low);
+        assert_eq!(
+            provenance.get("can_run.labels"),
+            Some(ConfigSource::Default)
+        );
+        assert_eq!(
+            provenance.get("can_run.ample_margin_multiple"),
+            Some(ConfigSource::Default)
+        );
+        assert_eq!(
+            provenance.get("can_run.headroom_bound"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    #[test]
+    fn the_can_run_policy_is_set_from_the_file() {
+        let file =
+            "[can_run]\nlabels = false\nample_margin_multiple = 3.5\nheadroom_bound = \"low\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert!(!config.can_run.labels_enabled);
+        assert_eq!(config.can_run.ample_margin_multiple.get(), 3.5);
+        assert_eq!(config.can_run.headroom_bound, CanRunHeadroomBound::Low);
+        assert_eq!(provenance.get("can_run.labels"), Some(ConfigSource::File));
+        assert_eq!(
+            provenance.get("can_run.ample_margin_multiple"),
+            Some(ConfigSource::File)
+        );
+    }
+
+    #[test]
+    fn a_non_boolean_can_run_labels_is_a_usage_error() {
+        let file = "[can_run]\nlabels = \"yes\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("can_run.labels"), "{err}");
+    }
+
+    #[test]
+    fn a_non_positive_can_run_multiple_is_a_usage_error() {
+        for raw in ["0", "-1.5", "nan", "inf"] {
+            let file = format!("[can_run]\nample_margin_multiple = {raw}\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&file)).unwrap_err();
+            assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+            assert!(
+                err.to_string().contains("can_run.ample_margin_multiple"),
+                "{err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unrecognized_can_run_headroom_bound_is_a_usage_error() {
+        let file = "[can_run]\nheadroom_bound = \"high\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("can_run.headroom_bound"), "{err}");
+    }
+
+    #[test]
+    fn an_unknown_key_under_can_run_is_a_usage_error() {
+        let file = "[can_run]\nnope = 1\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("can_run.nope"), "{err}");
     }
 }

@@ -6,3 +6,4 @@
 
 pub mod headroom;
 pub mod historical_distribution;
+pub mod verdict;
