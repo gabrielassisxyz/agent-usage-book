@@ -678,4 +678,270 @@ mod tests {
             elapsed.as_nanos() / 1_000_000,
         );
     }
+
+    // --- integration: overlapping writers under the one policy (aub-lz0k) --------
+
+    /// A 2026-09-04 sampling tick reported `database disk image is malformed`
+    /// on a write and then on a read inside one process, while the next tick
+    /// and every later check found the ledger clean. The journal shows that
+    /// tick ran alone in its window (single pid 2839281, neighbours 10 s
+    /// away, the `aub ingest transcripts` run finished at 21:02:23), so the
+    /// suspect was contention in general rather than that tick in particular.
+    /// The 15:32 ticks that same day prove what contention looks like here:
+    /// overlapping `aub ingest transcripts` while sampling made the sampler
+    /// report `database is locked`, never a malformation. This test drives
+    /// that pattern against a scratch database: one bulk-ingest writer
+    /// holding each write transaction open while sampler-style short
+    /// `BEGIN IMMEDIATE` transactions run against the same file, every
+    /// connection through this module's one open path, and pins the contract
+    /// the design relies on: overlap surfaces `SQLITE_BUSY` (which the caller
+    /// reports and retries, as the 2026-09-04 15:32 ticks did), never
+    /// `SQLITE_CORRUPT`, and the file verifies clean afterwards.
+    ///
+    /// The planted negative is the same test with the busy allowance
+    /// removed: forbidding busy failures turns lock contention into a test
+    /// failure, which proves this test actually contends rather than passing
+    /// because the threads never met.
+    #[test]
+    fn overlapping_policy_writers_surface_busy_never_corrupt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::{Arc, Barrier};
+
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("meter.db");
+        open(&db_path, AccessMode::ReadWrite, &policy())
+            .unwrap()
+            .execute_batch("CREATE TABLE samples (id INTEGER PRIMARY KEY, value INTEGER)")
+            .unwrap();
+
+        // Long enough that a blocked short transaction waits rather than
+        // failing instantly, short enough the test stays in seconds. The
+        // bulk holder below keeps the write slot for three seconds, so a
+        // 300 ms sampler timeout fails busy on every attempt inside the
+        // hold and succeeds outside it: contention is structural, not a
+        // scheduling accident.
+        let sampler_policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(300),
+        };
+        let bulk_policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_seconds(10),
+        };
+        let sampler_threads = 4usize;
+        let sampler_attempts_each = 200usize;
+        let start = Arc::new(Barrier::new(sampler_threads));
+        let holding = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let busy_count = Arc::new(AtomicUsize::new(0));
+        let corrupt_count = Arc::new(AtomicUsize::new(0));
+        let committed = Arc::new(AtomicUsize::new(0));
+
+        std::thread::scope(|scope| {
+            // The ingest-shaped writer: one transaction holding the write
+            // slot open for three seconds, so every sampler attempt inside
+            // the hold meets a held lock and every attempt after the
+            // release can commit. It takes the slot before the samplers
+            // start: racing all five threads at one barrier let a sampler
+            // win the slot and starve this holder past its own busy
+            // timeout, which tests the test's scheduling rather than the
+            // overlap contract.
+            let bulk_holding = Arc::clone(&holding);
+            let bulk_released = Arc::clone(&released);
+            let bulk_path = &db_path;
+            scope.spawn(move || {
+                let mut conn = open(bulk_path, AccessMode::ReadWrite, &bulk_policy)
+                    .expect("bulk writer must open");
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .expect("bulk writer must take the write slot");
+                tx.execute("INSERT INTO samples (value) VALUES (1)", [])
+                    .expect("bulk insert must run");
+                bulk_holding.store(true, Ordering::Release);
+                std::thread::sleep(std::time::Duration::from_millis(3000));
+                tx.commit().expect("bulk writer must commit");
+                bulk_released.store(true, Ordering::Release);
+            });
+
+            // The hold is structural: the samplers start only once the
+            // holder owns the slot, so every attempt inside the hold meets
+            // a held lock. Bounded, because an uncontended immediate
+            // transaction takes microseconds; anything slower is a stuck
+            // holder the test must fail on rather than wait out.
+            for _ in 0..10_000 {
+                if holding.load(Ordering::Acquire) {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            assert!(
+                holding.load(Ordering::Acquire),
+                "the bulk writer must own the write slot before the samplers start"
+            );
+
+            for _ in 0..sampler_threads {
+                let thread_start = start.clone();
+                let thread_released = Arc::clone(&released);
+                let thread_path = &db_path;
+                let thread_busy = Arc::clone(&busy_count);
+                let thread_corrupt = Arc::clone(&corrupt_count);
+                let thread_committed = Arc::clone(&committed);
+                scope.spawn(move || {
+                    let mut sampler = open(thread_path, AccessMode::ReadWrite, &sampler_policy)
+                        .expect("sampler must open");
+                    thread_start.wait();
+                    for _ in 0..sampler_attempts_each {
+                        // Stop once the hold is over and this thread has
+                        // committed since: further attempts only repeat the
+                        // uncontended case.
+                        if thread_released.load(Ordering::Acquire)
+                            && thread_committed.load(Ordering::Relaxed) > 0
+                        {
+                            break;
+                        }
+                        let outcome = (|| {
+                            let tx = sampler.transaction_with_behavior(
+                                rusqlite::TransactionBehavior::Immediate,
+                            )?;
+                            tx.execute("INSERT INTO samples (value) VALUES (1)", [])?;
+                            tx.commit()?;
+                            Ok::<(), rusqlite::Error>(())
+                        })();
+                        match outcome {
+                            Ok(()) => {
+                                thread_committed.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(e) => {
+                                let text = e.to_string();
+                                if text.contains("malformed") {
+                                    thread_corrupt.fetch_add(1, Ordering::Relaxed);
+                                } else if text.contains("locked") || text.contains("busy") {
+                                    thread_busy.fetch_add(1, Ordering::Relaxed);
+                                } else {
+                                    panic!("overlap must surface busy or corrupt, not: {text}");
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+        });
+
+        let corrupt = corrupt_count.load(Ordering::Relaxed);
+        let busy = busy_count.load(Ordering::Relaxed);
+        let done = committed.load(Ordering::Relaxed);
+        eprintln!("store overlap: committed={done} busy={busy} corrupt={corrupt}");
+        assert_eq!(
+            corrupt, 0,
+            "overlapping policy writers must never report a malformed database"
+        );
+        assert!(
+            busy > 0,
+            "the sampler threads must have met the held write slot, or this test proved nothing"
+        );
+        assert!(
+            done > 0,
+            "at least one transaction must commit, or the test exercised nothing"
+        );
+
+        let reader = open(&db_path, AccessMode::ReadOnly, &policy()).unwrap();
+        let messages: Vec<String> = reader
+            .prepare("PRAGMA integrity_check")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(messages.as_slice(), ["ok"]);
+    }
+
+    // --- unit: the integrity check is not vacuous (aub-lz0k) ----------------------
+
+    /// The `aub-lz0k` verdict leans on `PRAGMA integrity_check` reporting `ok`
+    /// against the live ledger, so this test proves the check can say
+    /// otherwise: a scratch database with one deliberately damaged page must
+    /// not verify clean, through the raw pragma and through the
+    /// `store::backup` verification the `doctor` health check runs.
+    #[test]
+    fn integrity_check_reports_a_deliberately_damaged_page() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("meter.db");
+        {
+            let conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE samples (id INTEGER PRIMARY KEY, value BLOB); \
+                 INSERT INTO samples (value) VALUES (zeroblob(3000)); \
+                 INSERT INTO samples (value) VALUES (zeroblob(3000)); \
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        }
+
+        // Damage structure, not content: flip a byte in the samples
+        // table's own root page cell-pointer array. The page size and the
+        // root page come from the file itself (header offset 16, and
+        // sqlite_master), so no layout is assumed. Flipping payload bytes
+        // would only change opaque blob content, which no check validates;
+        // a cell pointer out of range is what a structurally damaged page
+        // looks like.
+        let bytes = std::fs::read(&db_path).expect("scratch database must be readable");
+        let page_size = u16::from_be_bytes([bytes[16], bytes[17]]) as usize;
+        let page_size = if page_size == 1 { 65536 } else { page_size };
+        let rootpage: i64 = {
+            let probe = open(&db_path, AccessMode::ReadOnly, &policy()).unwrap();
+            probe
+                .query_row(
+                    "SELECT rootpage FROM sqlite_master WHERE name = 'samples'",
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("samples must be in the schema")
+        };
+        assert!(rootpage >= 2, "the table root must not be the schema page");
+        let mut damaged = bytes;
+        let cell_pointer = (rootpage as usize - 1) * page_size + 8;
+        damaged[cell_pointer] ^= 0xff;
+        std::fs::write(&db_path, &damaged).expect("scratch database must be writable");
+
+        let reader = open(&db_path, AccessMode::ReadOnly, &policy()).unwrap();
+        // Page damage surfaces either as off-`ok` rows or as the query
+        // itself failing corrupt, depending on which page the damage lands
+        // on; both prove the check is not vacuous.
+        let outcome: Result<Vec<String>, String> = (|| {
+            let mut statement = reader
+                .prepare("PRAGMA integrity_check")
+                .map_err(|error| error.to_string())?;
+            statement
+                .query_map([], |row| row.get(0))
+                .map_err(|error| error.to_string())?
+                .collect::<Result<_, _>>()
+                .map_err(|error| error.to_string())
+        })();
+        match &outcome {
+            Ok(messages) => assert_ne!(
+                messages.as_slice(),
+                ["ok"],
+                "a damaged page must not verify clean"
+            ),
+            Err(text) => assert!(
+                text.contains("malformed"),
+                "an integrity failure must name the malformation: {text}"
+            ),
+        }
+
+        // The same damage through the verification the `doctor` health
+        // check runs: an inner integrity-stage failure, or an outer store
+        // error naming the malformation when the check query itself cannot
+        // run. A clean pass is the only outcome that fails this test.
+        match crate::store::backup::verify_database_on_connection(&reader) {
+            Ok(Ok(_)) => panic!("a damaged database must not verify clean: {outcome:?}"),
+            Ok(Err(failure)) => assert_eq!(
+                failure.stage,
+                crate::store::backup::DatabaseVerificationStage::Integrity,
+                "page damage must fail the integrity stage, not the foreign-key stage",
+            ),
+            Err(error) => assert!(
+                error.to_string().contains("malformed"),
+                "a verification failure must name the malformation: {error}"
+            ),
+        }
+    }
 }
