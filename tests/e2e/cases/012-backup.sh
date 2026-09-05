@@ -56,7 +56,7 @@ case_assertions() {
     # that adds a migration bumps this number, and now it will say so.
     assert_exit 0 2
     assert_stdout_contains 2 "verified=true"
-    assert_stdout_contains 2 "schema=24 generation="
+    assert_stdout_contains 2 "schema=25 generation="
     assert_stdout_contains 2 "generation=0"
     assert_stdout_contains 2 "pending=0"
     assert_stdout_contains 2 "drain_completed=true"
@@ -66,7 +66,7 @@ case_assertions() {
     # result rather than a stale cached one.
     assert_exit 0 3
     assert_stdout_contains 3 "verified=true"
-    assert_stdout_contains 3 "schema=24 generation="
+    assert_stdout_contains 3 "schema=25 generation="
     assert_stdout_contains 3 "generation=0"
     assert_stdout_contains 3 "pending=0"
 
