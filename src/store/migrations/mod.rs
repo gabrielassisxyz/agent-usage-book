@@ -99,6 +99,9 @@ pub(crate) mod migration_0024;
 #[path = "0025_meter_window_reset_state.rs"]
 pub(crate) mod migration_0025;
 
+#[path = "0026_settlement_policy.rs"]
+pub(crate) mod migration_0026;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -130,5 +133,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0023::migration(),
         migration_0024::migration(),
         migration_0025::migration(),
+        migration_0026::migration(),
     ]
 }
