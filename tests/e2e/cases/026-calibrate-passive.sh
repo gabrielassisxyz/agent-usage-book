@@ -21,6 +21,7 @@ state.dir = "$STATE_DIR"
 name = "work"
 provider = "anthropic"
 credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
+exclusivity_policy = "permit_passive"
 CFG_EOF
 }
 

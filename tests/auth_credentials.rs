@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use agent_usage_book::auth::{RealFs, resolve};
-use agent_usage_book::config::AccountConfig;
+use agent_usage_book::config::{AccountConfig, AccountExclusivityPolicy};
 
 fn account(path: &str) -> AccountConfig {
     AccountConfig {
@@ -17,6 +17,7 @@ fn account(path: &str) -> AccountConfig {
         provider: "anthropic".to_string(),
         credential_kind: "file".to_string(),
         credential_detail: path.to_string(),
+        exclusivity_policy: AccountExclusivityPolicy::ForbidPassive,
     }
 }
 

@@ -260,7 +260,7 @@ credential = {{ kind = "file", path = "/tmp/dummy" }}
 #[test]
 fn test_calibrate_passive_cli_reports_intervals_considered_and_eligible_and_failing_counts() {
     let state = StateDir::new();
-    seed_test_ledger(&state, None);
+    seed_test_ledger(&state, Some("permit_passive"));
 
     let output = aub()
         .args(["calibrate", "passive", "--account", "work"])
@@ -310,7 +310,7 @@ fn test_calibrate_passive_cli_reports_intervals_considered_and_eligible_and_fail
 #[test]
 fn test_calibrate_passive_cli_json_format() {
     let state = StateDir::new();
-    seed_test_ledger(&state, None);
+    seed_test_ledger(&state, Some("permit_passive"));
 
     let output = aub()
         .args([
@@ -347,7 +347,7 @@ fn test_calibrate_passive_cli_json_format() {
 #[test]
 fn test_persisted_anomaly_annotation_excludes_affected_interval_and_keeps_adjacent_eligible() {
     let state = StateDir::new();
-    seed_test_ledger(&state, None);
+    seed_test_ledger(&state, Some("permit_passive"));
 
     let conn = open_test_ledger(&state);
 
@@ -400,7 +400,7 @@ fn test_persisted_anomaly_annotation_excludes_affected_interval_and_keeps_adjace
 #[test]
 fn test_external_validation_mismatch_annotation_alone_excludes_interval() {
     let state = StateDir::new();
-    seed_test_ledger(&state, None);
+    seed_test_ledger(&state, Some("permit_passive"));
 
     let conn = open_test_ledger(&state);
 
@@ -452,8 +452,8 @@ fn test_external_validation_mismatch_annotation_alone_excludes_interval() {
 #[test]
 fn test_configured_exclusivity_policy_forbids_passive_fitting_producing_no_candidates() {
     let state = StateDir::new();
-    // Configure dedicated exclusivity policy forbidding passive fitting
-    seed_test_ledger(&state, Some("dedicated_calibration_only"));
+    // Configure exclusivity policy forbidding passive fitting
+    seed_test_ledger(&state, Some("forbid_passive"));
 
     let output = aub()
         .args([
@@ -477,11 +477,58 @@ fn test_configured_exclusivity_policy_forbids_passive_fitting_producing_no_candi
     assert_eq!(
         json["eligible_intervals"].as_i64(),
         Some(0),
-        "dedicated account must yield 0 eligible passive intervals"
+        "forbid_passive account must yield 0 eligible passive intervals"
     );
     assert!(
         json["candidate"].is_null(),
         "forbidden passive fitting account must produce no candidate"
+    );
+    let failing_counts = json["failing_condition_counts"]
+        .as_object()
+        .expect("failing_condition_counts must be an object");
+    assert!(
+        failing_counts
+            .get("exclusivity_policy_permits_passive")
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0)
+            > 0,
+        "failing condition count for exclusivity_policy_permits_passive must be > 0, got: {failing_counts:?}"
+    );
+}
+
+#[test]
+fn test_absent_exclusivity_policy_defaults_to_forbid_passive_producing_no_candidates() {
+    let state = StateDir::new();
+    // Absent exclusivity policy in config -> defaults to forbid_passive (fail-closed)
+    seed_test_ledger(&state, None);
+
+    let output = aub()
+        .args([
+            "calibrate",
+            "passive",
+            "--account",
+            "work",
+            "--format",
+            "json",
+        ])
+        .env("AUB_STATE_DIR", state.path())
+        .env("AUB_CONFIG_FILE", state.path().join("aub.toml"))
+        .env("AUB_LOG_LEVEL", "off")
+        .current_dir(state.path())
+        .output()
+        .expect("aub binary must run");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("output must be valid JSON");
+
+    assert_eq!(
+        json["eligible_intervals"].as_i64(),
+        Some(0),
+        "absent exclusivity policy must yield 0 eligible passive intervals"
+    );
+    assert!(
+        json["candidate"].is_null(),
+        "absent exclusivity policy must produce no candidate"
     );
     let failing_counts = json["failing_condition_counts"]
         .as_object()

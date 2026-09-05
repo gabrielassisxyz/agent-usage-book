@@ -8,7 +8,7 @@
 use std::collections::BTreeMap;
 use std::fmt;
 
-use rusqlite::{Connection, params};
+use rusqlite::Connection;
 
 use crate::attribution::account_segment::AccountEvidenceClass;
 use crate::calibration::fitter::{FitObservation, fit};
@@ -28,7 +28,10 @@ use crate::error::Error;
 use crate::store::account::AccountId;
 use crate::store::calibration::{
     CalibrationExperiment, ExcludedSample, ExperimentId, PlanTier, WindowCalibrationCandidate,
-    insert_candidate, insert_experiment, load_candidate, load_latest_experiment,
+    count_overlapping_sessions, distinct_account_window_keys_and_tiers,
+    has_unresolved_mismatch_annotation, insert_candidate, insert_experiment,
+    load_attribution_evidence_classes, load_candidate, load_latest_experiment,
+    load_marker_evidence_designations, load_passive_observations, load_passive_usage_components,
 };
 use crate::store::cost_model::{ProviderKey, ValidityInterval};
 
@@ -471,19 +474,19 @@ fn fit_passive_candidate(
         knowledge_time: clock.now(),
     };
 
-    if let Some(c) = conn {
-        if load_latest_experiment(c)?.is_none() {
-            let _ = insert_experiment(c, &experiment);
-        }
+    if let Some(c) = conn
+        && load_latest_experiment(c)?.is_none()
+    {
+        let _ = insert_experiment(c, &experiment);
     }
 
     match fit(&fit_observations, &experiment) {
         Ok(mut fit_result) => {
             fit_result.candidate.knowledge_time = clock.now();
-            if let Some(c) = conn {
-                if load_candidate(c, &fit_result.candidate.id)?.is_none() {
-                    let _ = insert_candidate(c, &fit_result.candidate);
-                }
+            if let Some(c) = conn
+                && load_candidate(c, &fit_result.candidate.id)?.is_none()
+            {
+                let _ = insert_candidate(c, &fit_result.candidate);
             }
             Ok(Some(fit_result.candidate))
         }
@@ -498,125 +501,51 @@ pub fn generate_candidate_intervals_from_ledger(
     filter_account: Option<&str>,
     filter_window: Option<&str>,
 ) -> Result<Vec<CandidateInterval>, Error> {
-    let mut candidate_intervals = Vec::new();
-
-    // Query accounts from database
-    let mut account_stmt = conn
-        .prepare("SELECT id, logical_name, provider_key FROM account ORDER BY id ASC")
-        .map_err(|e| Error::Store(format!("cannot list accounts: {e}")))?;
-
-    let account_rows = account_stmt
-        .query_map([], |row| {
-            Ok((
-                AccountId::new(row.get("id")?),
-                row.get::<_, String>("logical_name")?,
-                row.get::<_, String>("provider_key")?,
-            ))
-        })
-        .map_err(|e| Error::Store(format!("cannot query accounts: {e}")))?;
-
+    let all_accs = crate::store::account::all_accounts(conn)?;
     let mut accounts = Vec::new();
-    for row in account_rows {
-        let (id, name, provider) =
-            row.map_err(|e| Error::Store(format!("account row error: {e}")))?;
-        if let Some(target) = filter_account {
-            if name != target {
-                continue;
-            }
+    for acc in all_accs {
+        if let Some(target) = filter_account
+            && acc.logical_name() != target
+        {
+            continue;
         }
-        accounts.push((id, name, provider));
+        accounts.push((
+            acc.id(),
+            acc.logical_name().to_string(),
+            acc.provider_key().to_string(),
+        ));
     }
 
     // Query all exclusions once
     let all_excl = crate::store::window_anomaly::all_exclusions(conn).unwrap_or_default();
+    let mut candidate_intervals = Vec::new();
 
     for (account_id, account_name, provider_str) in accounts {
         let account_cfg = config.accounts.iter().find(|a| a.name == account_name);
         let exclusivity_permits_passive = account_cfg
             .map(|a| a.permits_passive_fitting())
-            .unwrap_or(true);
+            .unwrap_or(false);
 
         // Query distinct semantic keys and plan tiers
-        let mut win_stmt = conn.prepare(
-            "SELECT DISTINCT mw.semantic_key, COALESCE(mo.observed_tier, mo.observed_plan, 'default')
-             FROM meter_window mw
-             JOIN meter_observation mo ON mo.id = mw.observation_id
-             WHERE mo.account_id = ?1",
-        ).map_err(|e| Error::Store(format!("cannot query windows: {e}")))?;
+        let win_rows = distinct_account_window_keys_and_tiers(conn, account_id)?;
 
-        let win_rows = win_stmt
-            .query_map(params![account_id.value()], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })
-            .map_err(|e| Error::Store(format!("cannot query windows: {e}")))?;
-
-        for win in win_rows {
-            let (semantic_key_str, plan_tier_str) = win.map_err(|e| Error::Store(e.to_string()))?;
-            if let Some(target_win) = filter_window {
-                if semantic_key_str != target_win {
-                    continue;
-                }
+        for (semantic_key_str, plan_tier_str) in win_rows {
+            if let Some(target_win) = filter_window
+                && semantic_key_str != target_win
+            {
+                continue;
             }
 
             // Fetch observations ordered by time
-            let mut obs_stmt = conn
-                .prepare(
-                    "SELECT
-                    re.content_hash,
-                    mo.received_at,
-                    mw.quota_used_ppm,
-                    mw.reported_resolution_ppm,
-                    mw.quantization,
-                    mw.resets_at
-                 FROM meter_observation mo
-                 JOIN meter_window mw ON mw.observation_id = mo.id
-                 JOIN meter_response_evidence re ON re.id = mo.evidence_id
-                 WHERE mo.account_id = ?1
-                   AND mw.semantic_key = ?2
-                   AND COALESCE(mo.observed_tier, mo.observed_plan, 'default') = ?3
-                 ORDER BY mo.received_at ASC, mo.id ASC",
-                )
-                .map_err(|e| Error::Store(format!("cannot query observations: {e}")))?;
-
-            let obs_rows = obs_stmt
-                .query_map(
-                    params![account_id.value(), semantic_key_str, plan_tier_str],
-                    |row| {
-                        let quantization_code: String = row.get("quantization")?;
-                        let quantization = QuantizationSemantics::from_code(&quantization_code)
-                            .ok_or_else(|| {
-                                rusqlite::Error::FromSqlConversionFailure(
-                                    4,
-                                    rusqlite::types::Type::Text,
-                                    Box::new(Error::Store("unknown quantization".into())),
-                                )
-                            })?;
-                        let resets_at: Option<UtcTimestamp> = row
-                            .get::<_, Option<i64>>("resets_at")?
-                            .map(UtcTimestamp::from_unix_nanos);
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            UtcTimestamp::from_unix_nanos(row.get("received_at")?),
-                            row.get::<_, i64>("quota_used_ppm")?,
-                            row.get::<_, i64>("reported_resolution_ppm")?,
-                            quantization,
-                            resets_at,
-                        ))
-                    },
-                )
-                .map_err(|e| Error::Store(format!("cannot query observations: {e}")))?;
-
-            let mut observations = Vec::new();
-            for r in obs_rows {
-                observations.push(r.map_err(|e| Error::Store(e.to_string()))?);
-            }
+            let observations =
+                load_passive_observations(conn, account_id, &semantic_key_str, &plan_tier_str)?;
 
             if observations.len() < 2 {
                 continue;
             }
 
             // Detect settled plateaus using SettlementPolicy
-            let resolution_ppm = observations[0].3;
+            let resolution_ppm = observations[0].reported_resolution_ppm;
             let reported_res = ReportedResolution::new(
                 QuotaFractionPpm::new(resolution_ppm as i32).unwrap_or_else(|| {
                     QuotaFractionPpm::new(10_000).expect("valid fallback resolution")
@@ -627,12 +556,14 @@ pub fn generate_candidate_intervals_from_ledger(
 
             let settlement_obs: Vec<SettlementMeterObservation> = observations
                 .iter()
-                .map(|(_, at, used, res, _, _)| {
+                .map(|obs| {
                     SettlementMeterObservation::new(
-                        *at,
-                        QuotaUsed::new(QuotaFractionPpm::new(*used as i32).unwrap()),
-                        ReportedResolution::new(QuotaFractionPpm::new(*res as i32).unwrap())
-                            .unwrap(),
+                        obs.received_at,
+                        QuotaUsed::new(QuotaFractionPpm::new(obs.quota_used_ppm as i32).unwrap()),
+                        ReportedResolution::new(
+                            QuotaFractionPpm::new(obs.reported_resolution_ppm as i32).unwrap(),
+                        )
+                        .unwrap(),
                     )
                 })
                 .collect();
@@ -672,119 +603,72 @@ pub fn generate_candidate_intervals_from_ledger(
                 let start_obs_data = &observations[start_idx];
                 let end_obs_data = &observations[end_idx];
 
-                let start_at = start_obs_data.1;
-                let end_at = end_obs_data.1;
+                let start_at = start_obs_data.received_at;
+                let end_at = end_obs_data.received_at;
 
                 let start_obs = FitObservation::new(
-                    EvidenceId::new(&start_obs_data.0),
-                    start_obs_data.1,
-                    start_obs_data.2,
-                    start_obs_data.3,
-                    start_obs_data.4,
+                    EvidenceId::new(&start_obs_data.content_hash),
+                    start_obs_data.received_at,
+                    start_obs_data.quota_used_ppm,
+                    start_obs_data.reported_resolution_ppm,
+                    start_obs_data.quantization,
                     Credits::from_micros(0),
                 );
                 let end_obs = FitObservation::new(
-                    EvidenceId::new(&end_obs_data.0),
-                    end_obs_data.1,
-                    end_obs_data.2,
-                    end_obs_data.3,
-                    end_obs_data.4,
+                    EvidenceId::new(&end_obs_data.content_hash),
+                    end_obs_data.received_at,
+                    end_obs_data.quota_used_ppm,
+                    end_obs_data.reported_resolution_ppm,
+                    end_obs_data.quantization,
                     Credits::from_micros(0),
                 );
 
                 // Check reset inside
                 let mut reset_inside = false;
                 for obs in &observations[start_idx..=end_idx] {
-                    if let Some(r_at) = obs.5 {
-                        if r_at > start_at && r_at < end_at {
-                            reset_inside = true;
-                            break;
-                        }
+                    if let Some(r_at) = obs.resets_at
+                        && r_at > start_at
+                        && r_at < end_at
+                    {
+                        reset_inside = true;
+                        break;
                     }
                 }
-                if end_obs_data.2 < start_obs_data.2 - start_obs_data.3 {
+                if end_obs_data.quota_used_ppm
+                    < start_obs_data.quota_used_ppm - start_obs_data.reported_resolution_ppm
+                {
                     reset_inside = true;
                 }
 
                 // Check overlapping sessions
-                let overlapping_sessions: i64 = conn
-                    .query_row(
-                        "SELECT COUNT(DISTINCT sess.id)
-                     FROM session sess
-                     WHERE sess.start <= ?2
-                       AND (sess.end IS NULL OR sess.end >= ?1)
-                       AND (
-                           EXISTS (
-                               SELECT 1 FROM session_account_marker m
-                               WHERE m.session_source = sess.source
-                                 AND m.session_native = sess.native_session_id
-                                 AND (m.resolved_account_id = ?3 OR m.logical_account = ?4)
-                           )
-                           OR NOT EXISTS (SELECT 1 FROM session_account_marker)
-                       )",
-                        params![
-                            start_at.unix_nanos(),
-                            end_at.unix_nanos(),
-                            account_id.value(),
-                            account_name
-                        ],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(0);
+                let overlapping_sessions =
+                    count_overlapping_sessions(conn, account_id, &account_name, start_at, end_at)
+                        .unwrap_or(0);
                 let has_overlapping_session_or_consumer = overlapping_sessions > 1;
 
                 // Check inferred account attribution
-                let mut attr_stmt = conn
-                    .prepare(
-                        "SELECT seg.evidence_class
-                     FROM account_attribution_segment seg
-                     LEFT JOIN session sess
-                       ON seg.session_id = (sess.source || ':' || sess.native_session_id)
-                     WHERE (seg.logical_account = ?1 OR seg.logical_account IS NULL)
-                       AND (sess.start IS NULL OR sess.start <= ?3)
-                       AND (sess.end IS NULL OR sess.end >= ?2)",
-                    )
-                    .map_err(|e| Error::Store(e.to_string()))?;
-
-                let attr_classes = attr_stmt
-                    .query_map(
-                        params![account_name, start_at.unix_nanos(), end_at.unix_nanos()],
-                        |row| row.get::<_, String>(0),
-                    )
-                    .map_err(|e| Error::Store(e.to_string()))?;
+                let attr_classes =
+                    load_attribution_evidence_classes(conn, &account_name, start_at, end_at)?;
 
                 let mut has_inferred_account_attribution = false;
-                for cls_res in attr_classes {
-                    let cls_str = cls_res.map_err(|e| Error::Store(e.to_string()))?;
-                    if let Some(class) = AccountEvidenceClass::parse(&cls_str) {
-                        if !class.is_eligible_for_passive_calibration() {
-                            has_inferred_account_attribution = true;
-                            break;
-                        }
+                for cls_str in attr_classes {
+                    if let Some(class) = AccountEvidenceClass::parse(&cls_str)
+                        && !class.is_eligible_for_passive_calibration()
+                    {
+                        has_inferred_account_attribution = true;
+                        break;
                     }
                 }
 
                 if !has_inferred_account_attribution {
-                    let mut marker_stmt = conn
-                        .prepare(
-                            "SELECT evidence_designation FROM session_account_marker
-                         WHERE (resolved_account_id = ?1 OR logical_account = ?2)
-                           AND observed_at >= ?3 AND observed_at <= ?4",
-                        )
-                        .map_err(|e| Error::Store(e.to_string()))?;
-                    let marker_rows = marker_stmt
-                        .query_map(
-                            params![
-                                account_id.value(),
-                                account_name,
-                                start_at.unix_nanos(),
-                                end_at.unix_nanos()
-                            ],
-                            |row| row.get::<_, String>(0),
-                        )
-                        .map_err(|e| Error::Store(e.to_string()))?;
-                    for m_res in marker_rows {
-                        let des = m_res.map_err(|e| Error::Store(e.to_string()))?;
+                    let marker_rows = load_marker_evidence_designations(
+                        conn,
+                        account_id,
+                        &account_name,
+                        start_at,
+                        end_at,
+                    )?;
+                    for des in marker_rows {
                         if des == "conservative_temporal_inference"
                             || des == "unattributed"
                             || des == "inferred"
@@ -796,57 +680,38 @@ pub fn generate_candidate_intervals_from_ledger(
                 }
 
                 // Check usage events & components
-                let mut usage_stmt = conn
-                    .prepare(
-                        "SELECT ue.evidence_kind, uc.token_class, uc.count
-                     FROM usage_component uc
-                     JOIN usage_event ue ON ue.id = uc.event_id
-                     WHERE ue.event_timestamp >= ?1 AND ue.event_timestamp <= ?2",
-                    )
-                    .map_err(|e| Error::Store(e.to_string()))?;
-
-                let usage_rows = usage_stmt
-                    .query_map(params![start_at.unix_nanos(), end_at.unix_nanos()], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, i64>(2)?,
-                        ))
-                    })
-                    .map_err(|e| Error::Store(e.to_string()))?;
+                let usage_rows = load_passive_usage_components(conn, start_at, end_at)?;
 
                 let mut has_estimated_tokens = false;
                 let mut has_unknown_token_components = false;
                 let mut contributing_credits = Credits::from_micros(0);
 
-                for u_res in usage_rows {
-                    let (kind_str, token_class, count) =
-                        u_res.map_err(|e| Error::Store(e.to_string()))?;
-                    if kind_str == "estimated"
-                        || kind_str.starts_with("reconstructed")
-                        || kind_str.starts_with("estimate")
+                for u in usage_rows {
+                    if u.evidence_kind == "estimated"
+                        || u.evidence_kind.starts_with("reconstructed")
+                        || u.evidence_kind.starts_with("estimate")
                     {
                         has_estimated_tokens = true;
                     }
-                    match token_class.as_str() {
+                    match u.token_class.as_str() {
                         "input" => {
                             // 3 credits per 1,000,000 input tokens (standard Claude Messages cost model)
-                            let micros = (count as f64 * 3.0).round() as i64;
+                            let micros = (u.count as f64 * 3.0).round() as i64;
                             contributing_credits =
                                 Credits::from_micros(contributing_credits.micros() + micros);
                         }
                         "output" => {
-                            let micros = (count as f64 * 15.0).round() as i64;
+                            let micros = (u.count as f64 * 15.0).round() as i64;
                             contributing_credits =
                                 Credits::from_micros(contributing_credits.micros() + micros);
                         }
                         "cache_read" => {
-                            let micros = (count as f64 * 0.3).round() as i64;
+                            let micros = (u.count as f64 * 0.3).round() as i64;
                             contributing_credits =
                                 Credits::from_micros(contributing_credits.micros() + micros);
                         }
                         "cache_write" => {
-                            let micros = (count as f64 * 3.75).round() as i64;
+                            let micros = (u.count as f64 * 3.75).round() as i64;
                             contributing_credits =
                                 Credits::from_micros(contributing_credits.micros() + micros);
                         }
@@ -862,36 +727,17 @@ pub fn generate_candidate_intervals_from_ledger(
                     if excl.account_id == account_id
                         && excl.interval_start_at < end_at
                         && excl.interval_end_at > start_at
+                        && let Ok(Some(anomaly)) =
+                            crate::store::window_anomaly::anomaly_by_row_id(conn, excl.anomaly_id)
                     {
-                        // Query anomaly kind
-                        if let Ok(kind_str) = conn.query_row(
-                            "SELECT kind FROM meter_window_anomaly WHERE id = ?1",
-                            params![excl.anomaly_id.value()],
-                            |row| row.get::<_, String>(0),
-                        ) {
-                            if let Some(kind) = WindowAnomalyKind::from_code(&kind_str) {
-                                anomaly_exclusions.push(kind);
-                            }
-                        }
+                        anomaly_exclusions.push(anomaly.kind);
                     }
                 }
 
                 // Check external validation mismatch
-                let has_external_validation_mismatch: bool = conn.query_row(
-                    "SELECT EXISTS(
-                        SELECT 1 FROM adapter_semantics_annotation
-                        WHERE kind = 'mismatch'
-                          AND semantic_key = ?1
-                          AND created_at >= ?2
-                          AND created_at <= ?3
-                          AND NOT EXISTS (
-                              SELECT 1 FROM adapter_semantics_annotation c
-                              WHERE c.kind = 'correction' AND c.corrects_annotation_id = adapter_semantics_annotation.id
-                          )
-                    )",
-                    params![semantic_key_str, start_at.unix_nanos(), end_at.unix_nanos()],
-                    |row| row.get(0),
-                ).unwrap_or(false);
+                let has_external_validation_mismatch: bool =
+                    has_unresolved_mismatch_annotation(conn, &semantic_key_str, start_at, end_at)
+                        .unwrap_or(false);
 
                 let interval_id = format!("{}-{}-{}", account_name, start_idx, end_idx);
                 candidate_intervals.push(CandidateInterval {
