@@ -26,7 +26,7 @@ case_preconditions() {
     # Both seeded accounts are declared here, matching the (provider_key, logical_name)
     # pair the ledger rows carry below. Coverage judges only accounts the configuration
     # asks the sampler to observe, so an account absent from this table is reported as
-    # not configured and never breaches a floor — which is the point of that rule, and
+    # not configured and never breaches a floor. That is the point of the rule, and it
     # would silently turn this case into one that asserts nothing.
     cat > "$STATE_DIR/aub.toml" <<'EOF'
 [coverage]
