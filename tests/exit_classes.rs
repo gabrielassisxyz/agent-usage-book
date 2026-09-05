@@ -126,7 +126,7 @@ fn json_format_error_prints_the_problem_code_envelope() {
     let stdout = String::from_utf8(output.stdout).expect("stdout is UTF-8");
     let parsed: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout is the JSON error envelope");
-    assert_eq!(parsed["schema"], 1);
+    assert_eq!(parsed["schema"], 2);
     assert_eq!(parsed["command"], "spend");
     assert_eq!(parsed["error"]["code"], "INVALID_USAGE");
     assert_eq!(parsed["error"]["exit_class"], 2);

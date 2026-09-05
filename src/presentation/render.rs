@@ -22,8 +22,8 @@ use crate::evidence::{CoverageCompleteness, Derivation, RequiredFact};
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
-    CoverageReport, NowReport, ProvenanceGraph, SpendGroup, SpendReport, StatusReport,
-    TaskOverheadReport, TaskReport,
+    ActiveActivityState, CoverageReport, LivenessGap, NowReport, ProvenanceGraph, SpendGroup,
+    SpendReport, StatusReport, TaskOverheadReport, TaskReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
@@ -224,8 +224,41 @@ pub fn render_now_report_with_explain(
     envelope: ClockSkewEnvelope,
     explain: ExplainMode,
 ) -> String {
-    let lines = meter_account_lines(&report.accounts, now, envelope);
+    let mut lines = meter_account_lines(&report.accounts, now, envelope);
+    if let Some(activity_line) = render_activity_line(&report.activity) {
+        lines.push(activity_line);
+    }
     join_report_with_explain(lines, &report.provenance, explain)
+}
+
+/// The one line naming `aub-mgv.5`'s composed activity state, or `None` when the
+/// report evaluated no session at all (no `--session-id` was given). A bare `aub
+/// now` therefore reads identically to `aub status`, a contract this bead does
+/// not touch; the line appears only once something was actually evaluated.
+fn render_activity_line(activity: &ActiveActivityState) -> Option<String> {
+    match activity {
+        ActiveActivityState::NoEvidence => None,
+        ActiveActivityState::ExplicitMarkerEvidence(claim) => Some(format!(
+            "aub session: spending account={} marker={} heartbeat={}",
+            claim.logical_account, claim.marker_reference, claim.heartbeat_reference
+        )),
+        ActiveActivityState::ConflictingEvidence(logical_accounts) => Some(format!(
+            "aub session: conflicting_evidence accounts=[{}]",
+            logical_accounts.join(", ")
+        )),
+        ActiveActivityState::Inactive(claim) => {
+            let liveness = match &claim.liveness_gap {
+                LivenessGap::NeverObserved => "never_observed".to_string(),
+                LivenessGap::Aged {
+                    last_heartbeat_at, ..
+                } => format!("aged last_heartbeat={}", last_heartbeat_at.unix_nanos()),
+            };
+            Some(format!(
+                "aub session: inactive account={} marker={} liveness={liveness}",
+                claim.logical_account, claim.marker_reference
+            ))
+        }
+    }
 }
 
 /// One `aub <account> <reading>` line per account, in order, through the shared

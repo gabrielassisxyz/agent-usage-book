@@ -725,6 +725,7 @@ impl Command {
             Command::Compare => Some(
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
+            Command::Now => Some("[--session-id SESSION]"),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -732,8 +733,7 @@ impl Command {
             | Command::AttemptCrashHook
             | Command::ProjectionCrashHook
             | Command::CostModelFixture
-            | Command::RateCard
-            | Command::Now => None,
+            | Command::RateCard => None,
         }
     }
 
@@ -1035,10 +1035,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::Coverage => coverage_command(&RealClock::new(), level, &invocation),
         Command::Import => import_command(&RealClock::new(), level, &invocation),
         Command::Sample => sample_command(&RealClock::new(), level, &invocation),
-        Command::Now => {
-            reject_positionals(&invocation)?;
-            now_command(&RealClock::new(), level, &invocation)
-        }
+        Command::Now => now_command(&RealClock::new(), level, &invocation),
         Command::ClearDiagnostics => {
             clear_diagnostics_command(&RealClock::new(), level, &invocation)
         }
@@ -1556,6 +1553,35 @@ pub(crate) fn now_command(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
+    // `--session-id` names the session the live report evaluates for explicit
+    // marker-backed activity (aub-mgv.5). Absent, the report evaluates nothing
+    // and carries `ActiveActivityState::NoEvidence`: there is no substitute
+    // session to guess at from the currently selected account or profile.
+    let mut session_id: Option<String> = None;
+    let mut args = invocation.rest.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--session-id" => {
+                let val = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--session-id requires a value".into()))?;
+                session_id = Some(val.clone());
+            }
+            other if other.starts_with("--session-id=") => {
+                let val = other.strip_prefix("--session-id=").unwrap();
+                if val.is_empty() {
+                    return Err(Error::Usage("--session-id requires a value".into()));
+                }
+                session_id = Some(val.to_string());
+            }
+            other => {
+                return Err(Error::Usage(format!(
+                    "unknown argument: {other}; run aub now --help for options"
+                )));
+            }
+        }
+    }
+
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -1591,6 +1617,11 @@ pub(crate) fn now_command(
     crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
     let repo = crate::store::repository::Repository::new(&db_path, busy_policy);
 
+    // Composed once, independent of which accounts get sampled below: activity
+    // evidence answers "who is spending right now," not "what did this
+    // invocation poll."
+    let activity = now_activity_state(&conn, session_id.as_deref(), timestamp)?;
+
     let target_accounts: Vec<&crate::config::AccountConfig> = match &invocation.account {
         Some(name) => config
             .accounts
@@ -1605,7 +1636,7 @@ pub(crate) fn now_command(
         // record, so this is not an unrecorded-fetch path. The empty current
         // state is the whole answer.
         let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
-        let report = NowReport::new(metadata, Vec::new(), Vec::new());
+        let report = NowReport::new(metadata, Vec::new(), Vec::new()).with_activity(activity);
         emit_now_report(&report, run, timestamp, invocation);
         return Ok(());
     }
@@ -1725,7 +1756,7 @@ pub(crate) fn now_command(
         };
 
     let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
-    let report = NowReport::new(metadata, accounts, Vec::new());
+    let report = NowReport::new(metadata, accounts, Vec::new()).with_activity(activity);
     emit_now_report(&report, run, timestamp, invocation);
     logger
         .emit(
@@ -1735,6 +1766,39 @@ pub(crate) fn now_command(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     Ok(())
+}
+
+/// Composes `now`'s activity state for the named session, or
+/// [`crate::report::ActiveActivityState::NoEvidence`] when `--session-id` was not
+/// given: absent a named session there is nothing to evaluate, never a guess from
+/// the currently selected account.
+fn now_activity_state(
+    conn: &rusqlite::Connection,
+    session_id: Option<&str>,
+    report_instant: crate::domain::time::UtcTimestamp,
+) -> Result<crate::report::ActiveActivityState, Error> {
+    let Some(sess_str) = session_id else {
+        return Ok(crate::report::ActiveActivityState::NoEvidence);
+    };
+    let session_id = if let Some((src, nat)) = sess_str.split_once(':') {
+        crate::domain::ids::SessionId::new(
+            crate::domain::ids::SourceNamespace::new(src),
+            crate::domain::ids::NativeSessionId::new(nat),
+        )
+    } else {
+        crate::domain::ids::SessionId::new(
+            crate::domain::ids::SourceNamespace::new("cli"),
+            crate::domain::ids::NativeSessionId::new(sess_str),
+        )
+    };
+    let markers = crate::store::session_account_marker::markers_for_session(conn, &session_id)?;
+    let heartbeat = crate::store::session_heartbeat::latest_heartbeat(conn, &session_id)?;
+    Ok(crate::report::compose_active_activity(
+        &markers,
+        heartbeat.as_ref(),
+        report_instant,
+        crate::report::activity::DEFAULT_LIVENESS_HORIZON,
+    ))
 }
 
 /// Returns the store-class error for the first disposition that failed to record

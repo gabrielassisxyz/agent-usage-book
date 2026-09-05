@@ -24,14 +24,15 @@ use crate::logging::RunId;
 use crate::presentation::render::{CREDIT_UNIT, ExplainMode, render_credits_amount};
 use crate::problem_code::ProblemCode;
 use crate::report::{
-    CoverageReport, LedgerGeneration, NowReport, ProvenanceGraph, ReportMetadata, SpendReport,
-    StatusReport, TaskIdentityRow, TaskIngestReport, TaskOverheadReport, TaskReport,
+    ActiveActivityState, CoverageReport, LedgerGeneration, LivenessGap, NowReport, ProvenanceGraph,
+    ReportMetadata, SpendReport, StatusReport, TaskIdentityRow, TaskIngestReport,
+    TaskOverheadReport, TaskReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
 /// below pin the exact shape, so a field added without bumping this fails them.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// An error during JSON contract validation or deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -369,7 +370,7 @@ fn validate_freshness_accounts(
     Ok(())
 }
 
-/// Validates that a status report JSON string strictly conforms to schema version 1.
+/// Validates that a status report JSON string strictly conforms to the current schema version.
 pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "status" {
@@ -443,7 +444,7 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
     Ok(parsed)
 }
 
-/// Validates that a now report JSON string strictly conforms to schema version 1.
+/// Validates that a now report JSON string strictly conforms to the current schema version.
 pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "now" {
@@ -458,7 +459,7 @@ pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonCo
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_NOW_KEYS: [&str; 8] = [
+    const KNOWN_NOW_KEYS: [&str; 9] = [
         "schema",
         "command",
         "run",
@@ -466,6 +467,7 @@ pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonCo
         "knowledge_at",
         "ledger_generation",
         "accounts",
+        "activity",
         "explain",
     ];
     for key in obj.keys() {
@@ -487,7 +489,7 @@ pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonCo
     Ok(parsed)
 }
 
-/// Validates that a spend report JSON string strictly conforms to schema version 1.
+/// Validates that a spend report JSON string strictly conforms to the current schema version.
 pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "spend" {
@@ -649,7 +651,10 @@ pub fn now_json_with_explain(report: &NowReport, run: RunId, explain: ExplainMod
         .map(status_account_json)
         .collect::<Vec<_>>()
         .join(",");
-    let mut body = format!("\"accounts\":[{accounts}]");
+    let mut body = format!(
+        "\"accounts\":[{accounts}],\"activity\":{}",
+        active_activity_json(&report.activity)
+    );
     if explain != ExplainMode::Off {
         body.push_str(&format!(
             ",\"explain\":{}",
@@ -657,6 +662,55 @@ pub fn now_json_with_explain(report: &NowReport, run: RunId, explain: ExplainMod
         ));
     }
     JsonEnvelope::new("now", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// The composed activity state (`aub-mgv.5`), always present: absence of a key
+/// would leave a consumer unable to tell "evaluated, no evidence" from "this
+/// build predates the field," exactly the ambiguity a versioned schema exists to
+/// remove.
+fn active_activity_json(activity: &ActiveActivityState) -> String {
+    match activity {
+        ActiveActivityState::NoEvidence => {
+            format!("{{\"state\":{}}}", json_string(activity.kind().as_str()))
+        }
+        ActiveActivityState::ExplicitMarkerEvidence(claim) => format!(
+            "{{\"state\":{},\"account\":{},\"marker\":{},\"heartbeat\":{}}}",
+            json_string(activity.kind().as_str()),
+            json_string(&claim.logical_account),
+            json_string(&claim.marker_reference),
+            json_string(&claim.heartbeat_reference),
+        ),
+        ActiveActivityState::ConflictingEvidence(logical_accounts) => {
+            let accounts = logical_accounts
+                .iter()
+                .map(|account| json_string(account))
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"state\":{},\"accounts\":[{accounts}]}}",
+                json_string(activity.kind().as_str()),
+            )
+        }
+        ActiveActivityState::Inactive(claim) => {
+            let liveness = match &claim.liveness_gap {
+                LivenessGap::NeverObserved => "\"liveness\":\"never_observed\"".to_string(),
+                LivenessGap::Aged {
+                    last_heartbeat_at,
+                    heartbeat_reference,
+                } => format!(
+                    "\"liveness\":\"aged\",\"last_heartbeat_at\":{},\"heartbeat\":{}",
+                    last_heartbeat_at.unix_nanos(),
+                    json_string(heartbeat_reference),
+                ),
+            };
+            format!(
+                "{{\"state\":{},\"account\":{},\"marker\":{},{liveness}}}",
+                json_string(activity.kind().as_str()),
+                json_string(&claim.logical_account),
+                json_string(&claim.marker_reference),
+            )
+        }
+    }
 }
 
 /// The spend report under the envelope: the window, one object per group with a
@@ -1389,7 +1443,7 @@ pub fn coverage_json(report: &CoverageReport, run: RunId) -> String {
     JsonEnvelope::new("coverage", run, report.metadata.clone()).to_json_with(&body)
 }
 
-/// Validates that a coverage report JSON strictly conforms to schema version 1.
+/// Validates that a coverage report JSON strictly conforms to the current schema version.
 pub fn validate_coverage_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
     let (parsed, value) = JsonEnvelope::parse(json_str)?;
     if parsed.command != "coverage" {
@@ -1436,7 +1490,7 @@ pub fn validate_coverage_report_json(json_str: &str) -> Result<ParsedEnvelope, J
     Ok(parsed)
 }
 
-/// Validates that a doctor transcript format drift report JSON strictly conforms to schema version 1.
+/// Validates that a doctor transcript format drift report JSON strictly conforms to the current schema version.
 pub fn validate_doctor_drift_report_json(
     json_str: &str,
 ) -> Result<ParsedEnvelope, JsonContractError> {
@@ -2164,7 +2218,7 @@ mod tests {
 
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON envelope");
         let expected = serde_json::json!({
-            "schema": 1,
+            "schema": SCHEMA_VERSION,
             "command": "now",
             "run": run.as_str(),
             "generated_at": 2000,
@@ -2174,7 +2228,7 @@ mod tests {
         assert_eq!(parsed, expected);
 
         let validated = validate_envelope_strict(&json).expect("envelope validates strictly");
-        assert_eq!(validated.schema, 1);
+        assert_eq!(validated.schema, SCHEMA_VERSION);
         assert_eq!(validated.command, "now");
         assert_eq!(validated.run.as_str(), run.as_str());
         assert_eq!(validated.generated_at.unix_nanos(), 2000);
@@ -2203,7 +2257,8 @@ mod tests {
     fn bumping_schema_version_without_schema_update_fails_contract() {
         let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
         let invalid_version_json = format!(
-            "\"schema\":2,\"command\":\"now\",\"run\":{},\"generated_at\":2000,\"knowledge_at\":1000,\"ledger_generation\":7",
+            "\"schema\":{},\"command\":\"now\",\"run\":{},\"generated_at\":2000,\"knowledge_at\":1000,\"ledger_generation\":7",
+            SCHEMA_VERSION + 1,
             json_string(run.as_str())
         );
         let wrapped = format!("{{{invalid_version_json}}}");
@@ -2213,8 +2268,8 @@ mod tests {
         assert_eq!(
             err,
             JsonContractError::SchemaVersionMismatch {
-                expected: 1,
-                actual: 2
+                expected: SCHEMA_VERSION,
+                actual: SCHEMA_VERSION + 1
             }
         );
     }
@@ -2365,7 +2420,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 1,
+                "schema": 2,
                 "command": "spend",
                 "error": {
                     "code": "INVALID_USAGE",
@@ -2381,7 +2436,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 1,
+                "schema": 2,
                 "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
             })
         );
