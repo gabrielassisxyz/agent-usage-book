@@ -108,6 +108,29 @@ pub enum QuantizationSemantics {
     Unknown,
 }
 
+impl QuantizationSemantics {
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "exact" => Some(Self::Exact),
+            "rounded_to_nearest" => Some(Self::RoundedToNearest),
+            "rounded_down" => Some(Self::RoundedDown),
+            "rounded_up" => Some(Self::RoundedUp),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::RoundedToNearest => "rounded_to_nearest",
+            Self::RoundedDown => "rounded_down",
+            Self::RoundedUp => "rounded_up",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
 /// Nominal length of a provider quota window, in nanoseconds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NominalWindowDuration(u64);

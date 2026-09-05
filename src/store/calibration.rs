@@ -37,6 +37,7 @@ use crate::domain::quota::QuotaFractionPpm;
 use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowSemanticKey};
 use crate::error::Error;
+use crate::store::account::AccountId;
 use crate::store::cost_model::{ProviderKey, ValidityInterval};
 
 /// A `calibration_experiment` row's SQLite rowid.
@@ -1645,6 +1646,274 @@ pub(crate) fn minimal_fixture(
         knowledge_time,
     })
     .expect("the fixture's own fields satisfy the constructor's invariants")
+}
+
+// --- passive calibration queries (aub-c0b.7) ----------------------------------
+
+/// Returns distinct (semantic_key, observed_tier_or_plan) pairs for an account.
+pub fn distinct_account_window_keys_and_tiers(
+    conn: &Connection,
+    account_id: AccountId,
+) -> Result<Vec<(String, String)>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT mw.semantic_key, COALESCE(mo.observed_tier, mo.observed_plan, 'default')
+             FROM meter_window mw
+             JOIN meter_observation mo ON mo.id = mw.observation_id
+             WHERE mo.account_id = ?1",
+        )
+        .map_err(|e| Error::Store(format!("cannot query windows: {e}")))?;
+
+    let rows = stmt
+        .query_map(params![account_id.value()], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+        .map_err(|e| Error::Store(format!("cannot query windows: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| Error::Store(e.to_string()))?);
+    }
+    Ok(result)
+}
+
+/// A stored observation row loaded for passive calibration candidate generation.
+#[derive(Debug, Clone)]
+pub struct PassiveObservationData {
+    pub content_hash: String,
+    pub received_at: UtcTimestamp,
+    pub quota_used_ppm: i64,
+    pub reported_resolution_ppm: i64,
+    pub quantization: QuantizationSemantics,
+    pub resets_at: Option<UtcTimestamp>,
+}
+
+/// Loads meter observations ordered by received_at ASC, id ASC for an account,
+/// window semantic key, and plan tier.
+pub fn load_passive_observations(
+    conn: &Connection,
+    account_id: AccountId,
+    semantic_key: &str,
+    plan_tier: &str,
+) -> Result<Vec<PassiveObservationData>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                re.content_hash,
+                mo.received_at,
+                mw.quota_used_ppm,
+                mw.reported_resolution_ppm,
+                mw.quantization,
+                mw.resets_at
+             FROM meter_observation mo
+             JOIN meter_window mw ON mw.observation_id = mo.id
+             JOIN meter_response_evidence re ON re.id = mo.evidence_id
+             WHERE mo.account_id = ?1
+               AND mw.semantic_key = ?2
+               AND COALESCE(mo.observed_tier, mo.observed_plan, 'default') = ?3
+             ORDER BY mo.received_at ASC, mo.id ASC",
+        )
+        .map_err(|e| Error::Store(format!("cannot query observations: {e}")))?;
+
+    let rows = stmt
+        .query_map(
+            params![account_id.value(), semantic_key, plan_tier],
+            |row| {
+                let quantization_code: String = row.get("quantization")?;
+                let quantization = QuantizationSemantics::from_code(&quantization_code)
+                    .ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            4,
+                            rusqlite::types::Type::Text,
+                            Box::new(Error::Store("unknown quantization".into())),
+                        )
+                    })?;
+                let resets_at: Option<UtcTimestamp> = row
+                    .get::<_, Option<i64>>("resets_at")?
+                    .map(UtcTimestamp::from_unix_nanos);
+                Ok(PassiveObservationData {
+                    content_hash: row.get("content_hash")?,
+                    received_at: UtcTimestamp::from_unix_nanos(row.get("received_at")?),
+                    quota_used_ppm: row.get("quota_used_ppm")?,
+                    reported_resolution_ppm: row.get("reported_resolution_ppm")?,
+                    quantization,
+                    resets_at,
+                })
+            },
+        )
+        .map_err(|e| Error::Store(format!("cannot query observations: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| Error::Store(e.to_string()))?);
+    }
+    Ok(result)
+}
+
+/// Counts distinct sessions overlapping with the given interval for an account.
+pub fn count_overlapping_sessions(
+    conn: &Connection,
+    account_id: AccountId,
+    account_name: &str,
+    start_at: UtcTimestamp,
+    end_at: UtcTimestamp,
+) -> Result<i64, Error> {
+    conn.query_row(
+        "SELECT COUNT(DISTINCT sess.id)
+         FROM session sess
+         WHERE sess.start <= ?2
+           AND (sess.end IS NULL OR sess.end >= ?1)
+           AND (
+               EXISTS (
+                   SELECT 1 FROM session_account_marker m
+                   WHERE m.session_source = sess.source
+                     AND m.session_native = sess.native_session_id
+                     AND (m.resolved_account_id = ?3 OR m.logical_account = ?4)
+               )
+               OR NOT EXISTS (SELECT 1 FROM session_account_marker)
+           )",
+        params![
+            start_at.unix_nanos(),
+            end_at.unix_nanos(),
+            account_id.value(),
+            account_name
+        ],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("cannot count overlapping sessions: {e}")))
+}
+
+/// Loads attribution evidence classes for account segments overlapping an interval.
+pub fn load_attribution_evidence_classes(
+    conn: &Connection,
+    account_name: &str,
+    start_at: UtcTimestamp,
+    end_at: UtcTimestamp,
+) -> Result<Vec<String>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT seg.evidence_class
+             FROM account_attribution_segment seg
+             LEFT JOIN session sess
+               ON seg.session_id = (sess.source || ':' || sess.native_session_id)
+             WHERE (seg.logical_account = ?1 OR seg.logical_account IS NULL)
+               AND (sess.start IS NULL OR sess.start <= ?3)
+               AND (sess.end IS NULL OR sess.end >= ?2)",
+        )
+        .map_err(|e| Error::Store(format!("cannot query attribution segments: {e}")))?;
+
+    let rows = stmt
+        .query_map(
+            params![account_name, start_at.unix_nanos(), end_at.unix_nanos()],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| Error::Store(format!("cannot query attribution segments: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| Error::Store(e.to_string()))?);
+    }
+    Ok(result)
+}
+
+/// Loads marker evidence designations for an account during an interval.
+pub fn load_marker_evidence_designations(
+    conn: &Connection,
+    account_id: AccountId,
+    account_name: &str,
+    start_at: UtcTimestamp,
+    end_at: UtcTimestamp,
+) -> Result<Vec<String>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT evidence_designation FROM session_account_marker
+             WHERE (resolved_account_id = ?1 OR logical_account = ?2)
+               AND observed_at >= ?3 AND observed_at <= ?4",
+        )
+        .map_err(|e| Error::Store(format!("cannot query account markers: {e}")))?;
+
+    let rows = stmt
+        .query_map(
+            params![
+                account_id.value(),
+                account_name,
+                start_at.unix_nanos(),
+                end_at.unix_nanos()
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .map_err(|e| Error::Store(format!("cannot query account markers: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| Error::Store(e.to_string()))?);
+    }
+    Ok(result)
+}
+
+/// A stored usage component row for passive calibration contributing usage.
+#[derive(Debug, Clone)]
+pub struct PassiveUsageComponentRow {
+    pub evidence_kind: String,
+    pub token_class: String,
+    pub count: i64,
+}
+
+/// Loads usage components for events falling within the given timestamp range.
+pub fn load_passive_usage_components(
+    conn: &Connection,
+    start_at: UtcTimestamp,
+    end_at: UtcTimestamp,
+) -> Result<Vec<PassiveUsageComponentRow>, Error> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ue.evidence_kind, uc.token_class, uc.count
+             FROM usage_component uc
+             JOIN usage_event ue ON ue.id = uc.event_id
+             WHERE ue.event_timestamp >= ?1 AND ue.event_timestamp <= ?2",
+        )
+        .map_err(|e| Error::Store(format!("cannot query usage components: {e}")))?;
+
+    let rows = stmt
+        .query_map(params![start_at.unix_nanos(), end_at.unix_nanos()], |row| {
+            Ok(PassiveUsageComponentRow {
+                evidence_kind: row.get("evidence_kind")?,
+                token_class: row.get("token_class")?,
+                count: row.get("count")?,
+            })
+        })
+        .map_err(|e| Error::Store(format!("cannot query usage components: {e}")))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        result.push(row.map_err(|e| Error::Store(e.to_string()))?);
+    }
+    Ok(result)
+}
+
+/// Checks whether an unresolved mismatch annotation exists for the window semantic key in the range.
+pub fn has_unresolved_mismatch_annotation(
+    conn: &Connection,
+    semantic_key: &str,
+    start_at: UtcTimestamp,
+    end_at: UtcTimestamp,
+) -> Result<bool, Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM adapter_semantics_annotation
+            WHERE kind = 'mismatch'
+              AND semantic_key = ?1
+              AND created_at >= ?2
+              AND created_at <= ?3
+              AND NOT EXISTS (
+                  SELECT 1 FROM adapter_semantics_annotation c
+                  WHERE c.kind = 'correction' AND c.corrects_annotation_id = adapter_semantics_annotation.id
+              )
+        )",
+        params![semantic_key, start_at.unix_nanos(), end_at.unix_nanos()],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("cannot query mismatch annotation: {e}")))
 }
 
 #[cfg(test)]

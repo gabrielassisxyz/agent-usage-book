@@ -221,6 +221,7 @@ fn source_label(path: &Path, verbose: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::AccountExclusivityPolicy;
     use crate::error::ExitClass;
     use std::collections::BTreeMap;
 
@@ -264,6 +265,7 @@ mod tests {
             provider: "test-provider".to_string(),
             credential_kind: kind.to_string(),
             credential_detail: detail.to_string(),
+            exclusivity_policy: AccountExclusivityPolicy::ForbidPassive,
         }
     }
 
