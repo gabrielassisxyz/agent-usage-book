@@ -31,8 +31,8 @@
 //!    has passed yet, the freshness anchor falls back to ordinary recency:
 //!    evidence within the ordinary cadence of now counts as the window's
 //!    pre-reset sample.
-//! 4. **Ordinary cadence**: the account's interval expired since the last
-//!    attempt started. An account with no history at all is due.
+//! 4. **Ordinary cadence**: the account's interval expired since the previous
+//!    due instant. An account with no history at all is due.
 //! 5. **Rate-limit postponement**: if the most recent result was rate limited
 //!    with a `Retry-After` longer than the remaining cadence, the computed
 //!    due instant is clamped up to the postponement's end, honoring the
@@ -52,6 +52,10 @@ use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptHistoryEntry {
     pub attempt: AttemptStarted,
+    /// The instant this attempt was owed. This is distinct from when the
+    /// scheduler observed and started it, so ordinary cadence can retain its
+    /// grid after a late tick.
+    pub due_at: UtcTimestamp,
     pub result: Option<AttemptResult>,
 }
 
@@ -101,6 +105,9 @@ pub enum DueBasisRef {
 pub enum DueDecision {
     /// An attempt is owed now, carrying this reason on the attempt row.
     Due {
+        /// The logical instant at which this attempt became owed. The sampler
+        /// persists it separately from the observed request start.
+        due_at: UtcTimestamp,
         reason: DueReason,
         /// The prior attempt or result the decision was based on, persisted
         /// as the attempt's due basis.
@@ -138,6 +145,7 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
 
     if inputs.forced {
         return DueDecision::Due {
+            due_at: inputs.now,
             reason: DueReason::ForcedOrManual,
             basis: None,
         };
@@ -162,6 +170,7 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
         && !last.is_some_and(|entry| entry.attempt.started_at().unix_nanos() >= reset.unix_nanos())
     {
         return DueDecision::Due {
+            due_at: reset,
             reason: DueReason::PostResetConfirmation,
             basis: last.as_ref().map(|entry| entry.basis()),
         };
@@ -177,22 +186,29 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
         });
         if lead_left <= inputs.policy.reset_edge_lead.as_nanos() as i64 && !evidence_fresh_enough {
             return DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(
+                    reset.unix_nanos() - inputs.policy.reset_edge_lead.as_nanos() as i64,
+                ),
                 reason: DueReason::ResetEdge,
                 basis: last.as_ref().map(|entry| entry.basis()),
             };
         }
     }
 
-    // Rule 4: the ordinary interval expired since the last attempt started.
+    // Rule 4: the ordinary interval expired since the previous due instant.
     let Some(entry) = last else {
         return DueDecision::Due {
+            due_at: inputs.now,
             reason: DueReason::OrdinaryCadence,
             basis: None,
         };
     };
-    let elapsed = (now - entry.attempt.started_at().unix_nanos()).max(0) as u64;
-    if elapsed >= inputs.policy.ordinary_cadence.as_nanos() {
+    let cadence_due_at = UtcTimestamp::from_unix_nanos(
+        entry.due_at.unix_nanos() + inputs.policy.ordinary_cadence.as_nanos() as i64,
+    );
+    if now >= cadence_due_at.unix_nanos() {
         return DueDecision::Due {
+            due_at: cadence_due_at,
             reason: DueReason::OrdinaryCadence,
             basis: Some(AttemptHistoryEntry::basis(entry)),
         };
@@ -200,9 +216,6 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
 
     // Rule 5: not yet due - the next due instant is the cadence boundary,
     // clamped up by a Retry-After the most recent result carries.
-    let cadence_due_at = UtcTimestamp::from_unix_nanos(
-        entry.attempt.started_at().unix_nanos() + inputs.policy.ordinary_cadence.as_nanos() as i64,
-    );
     let next_due_at = retry_postponement(entry)
         .filter(|postponed_until| postponed_until.unix_nanos() > cadence_due_at.unix_nanos())
         .unwrap_or(cadence_due_at);
@@ -281,6 +294,7 @@ mod tests {
         let started_at = UtcTimestamp::from_unix_nanos(started_nanos);
         AttemptHistoryEntry {
             attempt: AttemptStarted::new(id, started_at),
+            due_at: started_at,
             result: Some(AttemptResult::new(
                 id,
                 started_at,
@@ -290,17 +304,33 @@ mod tests {
         }
     }
 
+    fn success_entry_due_at(due_at_nanos: i64, started_nanos: i64) -> AttemptHistoryEntry {
+        let mut entry = success_entry(started_nanos);
+        entry.due_at = UtcTimestamp::from_unix_nanos(due_at_nanos);
+        entry
+    }
+
     fn rate_limited_entry(
         started_nanos: i64,
         retry_after_secs: Option<u64>,
     ) -> AttemptHistoryEntry {
+        rate_limited_entry_finished_at(started_nanos, started_nanos, retry_after_secs)
+    }
+
+    fn rate_limited_entry_finished_at(
+        started_nanos: i64,
+        finished_nanos: i64,
+        retry_after_secs: Option<u64>,
+    ) -> AttemptHistoryEntry {
         let id = AttemptId::new(started_nanos as u64);
         let started_at = UtcTimestamp::from_unix_nanos(started_nanos);
+        let finished_at = UtcTimestamp::from_unix_nanos(finished_nanos);
         AttemptHistoryEntry {
             attempt: AttemptStarted::new(id, started_at),
+            due_at: started_at,
             result: Some(AttemptResult::new(
                 id,
-                started_at,
+                finished_at,
                 MonotonicDuration::from_nanos(0),
                 AttemptOutcome::Unreachable(FailureClass::RateLimited {
                     retry_after: retry_after_secs.map(MonotonicDuration::from_seconds),
@@ -323,6 +353,7 @@ mod tests {
         assert_eq!(
             evaluate(&inputs),
             DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(10 * MINUTE),
                 reason: DueReason::ForcedOrManual,
                 basis: None,
             }
@@ -342,13 +373,14 @@ mod tests {
         assert_eq!(
             evaluate(&inputs),
             DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(0),
                 reason: DueReason::OrdinaryCadence,
                 basis: None,
             }
         );
     }
 
-    // Rule 4: the ordinary interval expired since the last attempt started.
+    // Rule 4: the ordinary interval expired since the previous due instant.
     #[test]
     fn expired_cadence_is_due_on_ordinary_cadence_with_a_basis() {
         let last = success_entry(0);
@@ -362,6 +394,7 @@ mod tests {
         assert_eq!(
             evaluate(&inputs),
             DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(5 * MINUTE),
                 reason: DueReason::OrdinaryCadence,
                 basis: Some(last.basis()),
             }
@@ -406,6 +439,7 @@ mod tests {
         assert_eq!(
             evaluate(&inputs),
             DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(MINUTE),
                 reason: DueReason::ResetEdge,
                 basis: Some(last.basis()),
             }
@@ -446,6 +480,7 @@ mod tests {
         assert_eq!(
             evaluate(&inputs),
             DueDecision::Due {
+                due_at: reset,
                 reason: DueReason::PostResetConfirmation,
                 basis: Some(last.basis()),
             }
@@ -496,6 +531,26 @@ mod tests {
         );
     }
 
+    #[test]
+    fn retry_after_is_anchored_on_the_result_finish_not_the_attempt_start() {
+        let last = rate_limited_entry_finished_at(0, MINUTE, Some(600));
+        let inputs = DueInputs {
+            policy: policy(300, 120),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
+            forced: false,
+        };
+
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(11 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
     // A Retry-After shorter than the remaining cadence must not shorten the
     // wait: the cadence boundary still governs.
     #[test]
@@ -515,6 +570,62 @@ mod tests {
                 reason: DueReason::OrdinaryCadence,
             }
         );
+    }
+
+    #[test]
+    fn ordinary_cadence_keeps_its_grid_after_a_late_attempt() {
+        let inputs = DueInputs {
+            policy: policy(300, 120),
+            // The attempt became due at t=0 but did not start until t=40s.
+            history: vec![success_entry_due_at(0, 40 * 1_000_000_000)],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(MINUTE),
+            forced: false,
+        };
+
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                // 260 seconds remain from the first-minute scheduler tick,
+                // rather than a full cadence after the observed start.
+                next_due_at: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    #[test]
+    fn simulated_hour_with_late_starts_keeps_twelve_attempts_on_the_grid() {
+        let sim_policy = policy(300, 120);
+        let late_start = 40 * 1_000_000_000;
+        let mut history = Vec::new();
+        let mut due_instants = Vec::new();
+
+        for tick in 0..60i64 {
+            let now = UtcTimestamp::from_unix_nanos(tick * MINUTE);
+            let inputs = DueInputs {
+                policy: sim_policy,
+                history: history.clone(),
+                known_resets: vec![],
+                now,
+                forced: false,
+            };
+            if let DueDecision::Due {
+                due_at,
+                reason: DueReason::OrdinaryCadence,
+                ..
+            } = evaluate(&inputs)
+            {
+                due_instants.push(due_at);
+                history.push(success_entry_due_at(
+                    due_at.unix_nanos(),
+                    now.unix_nanos() + late_start,
+                ));
+            }
+        }
+
+        assert_eq!(due_instants.len(), 12);
+        assert_eq!(due_instants[3].unix_nanos(), 15 * MINUTE);
     }
 
     /// Integration: a scheduler ticking every minute against a 5-minute
@@ -560,7 +671,7 @@ mod tests {
                 now,
                 forced: false,
             };
-            if let DueDecision::Due { reason, .. } = evaluate(&inputs) {
+            if let DueDecision::Due { due_at, reason, .. } = evaluate(&inputs) {
                 total += 1;
                 match reason {
                     DueReason::ResetEdge => reset_edge += 1,
@@ -568,7 +679,7 @@ mod tests {
                     DueReason::OrdinaryCadence => ordinary += 1,
                     DueReason::ForcedOrManual => unreachable!("forced is never set in this sim"),
                 }
-                history.push(success_entry(now.unix_nanos()));
+                history.push(success_entry_due_at(due_at.unix_nanos(), now.unix_nanos()));
             }
         }
 

@@ -458,6 +458,9 @@ where
             .latest_attempt
             .map(|attempt| AttemptHistoryEntry {
                 attempt,
+                due_at: snapshot.latest_due_at.expect(
+                    "a due-evidence snapshot with an attempt carries its persisted due instant",
+                ),
                 result: latest_result,
             })
             .into_iter()
@@ -510,8 +513,12 @@ where
         }
 
         let evaluated_at = self.clock.now();
-        let (reason, basis) = match self.evaluate_due(account, account_id, evaluated_at) {
-            Ok(DueDecision::Due { reason, basis }) => (reason, basis),
+        let (due_at, reason, basis) = match self.evaluate_due(account, account_id, evaluated_at) {
+            Ok(DueDecision::Due {
+                due_at,
+                reason,
+                basis,
+            }) => (due_at, reason, basis),
             Ok(DueDecision::NotYet { next_due_at, .. }) => {
                 let _ = self
                     .repository
@@ -558,7 +565,7 @@ where
             request_started_at: self.clock.now(),
             credential_context_id: account.credential_context_id.clone(),
             policy_snapshot_id,
-            due_at: evaluated_at,
+            due_at,
             due_reason: stored_due_reason(reason),
             due_basis: stored_basis,
             provider_contract_id: declarations.provider_contract_id.as_str().to_string(),
