@@ -42,8 +42,8 @@ use crate::logging::LogicalName;
 use crate::report::models::{
     AccountGroupExplain, AccountMarkerReference, IngestSummary, IngestionGeneration,
     LedgerGeneration, ReportMetadata, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
-    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGrouping, SpendReport,
-    UNKNOWN_ACCOUNT_LABEL,
+    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGroupWindowEquivalentProvenance,
+    SpendGrouping, SpendReport, UNKNOWN_ACCOUNT_LABEL, WindowEquivalentDerivation,
 };
 use crate::report::provenance::{ProvenanceNode, Unit, ValueArithmetic};
 use crate::store::cost_model::CostModel;
@@ -68,6 +68,21 @@ pub enum CreditReporting<'model> {
     NotRequested,
     Active(&'model CostModel),
     NoActiveModel,
+}
+
+/// Resolves the optional calibrated window-equivalent dimension for one spend
+/// group. The report layer supplies only the group stratum and qualified credits;
+/// resolving a calibration remains outside this module so report assembly cannot
+/// reach into calibration persistence or invent a coefficient.
+pub trait WindowEquivalentResolver {
+    fn window_semantic_key(&self) -> &str;
+
+    fn resolve(
+        &self,
+        account: Option<&str>,
+        provider: Option<&str>,
+        credits: Option<&Derivation<Credits>>,
+    ) -> Result<WindowEquivalentDerivation, Error>;
 }
 
 impl SpendWindow {
@@ -460,6 +475,34 @@ pub fn assemble_canonical(
     rate_book: Option<&RateBook>,
     credit_reporting: CreditReporting<'_>,
 ) -> Result<SpendReport, Error> {
+    assemble_canonical_with_window_equivalent(
+        conn,
+        window,
+        generated_at,
+        grouping,
+        refresh_attempted,
+        refresh_failure,
+        rate_book,
+        credit_reporting,
+        None,
+    )
+}
+
+/// Assembles a canonical spend report with an optional calibrated
+/// window-equivalent conversion. The legacy entry point above deliberately
+/// remains unchanged for callers that did not request the new dimension.
+#[allow(clippy::too_many_arguments)]
+pub fn assemble_canonical_with_window_equivalent(
+    conn: &rusqlite::Connection,
+    window: SpendWindow,
+    generated_at: UtcTimestamp,
+    grouping: Vec<SpendGrouping>,
+    refresh_attempted: bool,
+    refresh_failure: Option<String>,
+    rate_book: Option<&RateBook>,
+    credit_reporting: CreditReporting<'_>,
+    window_resolver: Option<&dyn WindowEquivalentResolver>,
+) -> Result<SpendReport, Error> {
     let grouping = if grouping.is_empty() {
         vec![SpendGrouping::Day]
     } else {
@@ -478,8 +521,9 @@ pub fn assemble_canonical(
     };
     let mut provenance = Vec::new();
     let mut credit_provenance = Vec::new();
+    let mut window_provenance = Vec::new();
     let mut account_explain = Vec::new();
-    let account_of = if grouping.contains(&SpendGrouping::Account) {
+    let account_of = if grouping.contains(&SpendGrouping::Account) || window_resolver.is_some() {
         let (map, explain) = account_attribution(conn, &events)?;
         account_explain = explain;
         map
@@ -499,7 +543,9 @@ pub fn assemble_canonical(
         &mut credit_provenance,
         credit_reporting,
         &task_labels,
-    );
+        window_resolver,
+        &mut window_provenance,
+    )?;
     let mut metadata = ReportMetadata::new(
         generated_at,
         generated_at,
@@ -574,11 +620,15 @@ pub fn assemble_canonical(
     .with_stale_rate_card_note(stale_note)
     .with_grouping(grouping)
     .with_account_explain(account_explain)
+    .with_window_equivalent_window(
+        window_resolver.map(|resolver| resolver.window_semantic_key().to_string()),
+    )
     .with_credit_model(match credit_reporting {
         CreditReporting::Active(model) => Some(model.id().clone()),
         CreditReporting::NotRequested | CreditReporting::NoActiveModel => None,
     })
     .with_credit_provenance(credit_provenance)
+    .with_window_equivalent_provenance(window_provenance)
     .with_diagnostics(vec![
         SpendDiagnosticProvenance {
             diagnostic: SpendDiagnostic::CanonicalRecords,
@@ -609,9 +659,11 @@ fn canonical_groups(
     credit_provenance: &mut Vec<SpendGroupCreditsProvenance>,
     credit_reporting: CreditReporting<'_>,
     task_labels: &BTreeMap<String, String>,
-) -> Vec<SpendGroup> {
+    window_resolver: Option<&dyn WindowEquivalentResolver>,
+    window_provenance: &mut Vec<SpendGroupWindowEquivalentProvenance>,
+) -> Result<Vec<SpendGroup>, Error> {
     let Some(dimension) = grouping.get(depth).copied() else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
     let mut by_key: BTreeMap<String, Vec<&CanonicalSpendEvent>> = BTreeMap::new();
     for event in events {
@@ -622,7 +674,7 @@ fn canonical_groups(
     }
     by_key
         .into_iter()
-        .map(|(value, members)| {
+        .map(|(value, members)| -> Result<SpendGroup, Error> {
             path.push(format!("{}={value}", dimension.as_str()));
             let key = LogicalName::new(path.join(" / "));
             let usage = canonical_usage(&members, partial);
@@ -680,6 +732,44 @@ fn canonical_groups(
                 );
                 credit_provenance.push(SpendGroupCreditsProvenance::new(key.clone(), credit_node));
             }
+            let account = uniform_account(&members, account_of);
+            let provider = uniform_provider(&members);
+            let window_equivalent = window_resolver
+                .map(|resolver| resolver.resolve(account, provider.as_deref(), credits.as_ref()))
+                .transpose()?;
+            if let Some(result) = &window_equivalent {
+                let mut window_witnesses = Vec::new();
+                if let CreditReporting::Active(model) = credit_reporting {
+                    window_witnesses.push(WitnessId::CostModel(model.id().clone()));
+                }
+                if let Some(calibration_id) = result.calibration_id() {
+                    window_witnesses.push(WitnessId::WindowCalibration(calibration_id.clone()));
+                }
+                let window_node = ProvenanceNode::new(
+                    members
+                        .iter()
+                        .map(|event| EvidenceId::new(event.canonical_id.clone())),
+                    window_witnesses,
+                    QuerySemantics::new(
+                        grouping[..=depth]
+                            .iter()
+                            .map(|dimension| dimension.as_str())
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        format!("{}..{}", window.since.iso(), window.until.iso()),
+                    ),
+                    sources.len() as u64,
+                    members.len() as u64,
+                    ValueArithmetic::Converted {
+                        from: Unit::Credits,
+                        to: Unit::PercentagePoints,
+                    },
+                );
+                window_provenance.push(SpendGroupWindowEquivalentProvenance::new(
+                    key.clone(),
+                    window_node,
+                ));
+            }
             let children = canonical_groups(
                 &members.into_iter().cloned().collect::<Vec<_>>(),
                 grouping,
@@ -693,7 +783,9 @@ fn canonical_groups(
                 credit_provenance,
                 credit_reporting,
                 task_labels,
-            );
+                window_resolver,
+                window_provenance,
+            )?;
             path.pop();
             let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
                 .with_valuation(valuation)
@@ -702,13 +794,17 @@ fn canonical_groups(
                 Some(credits) => group.with_credits(credits),
                 None => group,
             };
+            let group = match window_equivalent {
+                Some(window_equivalent) => group.with_window_equivalent(window_equivalent),
+                None => group,
+            };
             // The unknown-account group is usage no marker could justify: its
             // coverage says so on every subtotal it holds, rather than reading
             // as a complete account (aub-mgv.4, PLAN.md 19.2).
             if dimension == SpendGrouping::Account && value == UNKNOWN_ACCOUNT_LABEL {
-                qualify_tree_unattributed(group)
+                Ok(qualify_tree_unattributed(group))
             } else {
-                group
+                Ok(group)
             }
         })
         .collect()
@@ -915,6 +1011,28 @@ fn group_value(
     }
 }
 
+fn uniform_account<'a>(
+    members: &[&CanonicalSpendEvent],
+    account_of: &'a BTreeMap<String, String>,
+) -> Option<&'a str> {
+    let mut accounts = members.iter().map(|event| {
+        account_of
+            .get(&event.canonical_id)
+            .map(String::as_str)
+            .unwrap_or(UNKNOWN_ACCOUNT_LABEL)
+    });
+    let first = accounts.next()?;
+    accounts.all(|account| account == first).then_some(first)
+}
+
+fn uniform_provider(members: &[&CanonicalSpendEvent]) -> Option<String> {
+    let first = members.first()?.vendor.as_deref()?;
+    members
+        .iter()
+        .all(|event| event.vendor.as_deref() == Some(first))
+        .then(|| first.to_string())
+}
+
 /// The task-or-overhead label for every event, keyed by its own
 /// `canonical_id`, computed by the shared segmentation engine
 /// ([`crate::attribution::segment`]) rather than by any grouping logic of
@@ -1009,6 +1127,9 @@ mod tests {
     use super::*;
     use crate::config::TranscriptConfig;
     use crate::domain::ids::SourceNamespace;
+    use crate::domain::interval::Interval;
+    use crate::domain::provenance::WindowCalibrationId;
+    use crate::domain::quota::PercentagePoints;
     use crate::domain::time::{FakeClock, MonotonicDuration};
     use crate::sessions::{ProjectKey, RepositoryKey};
     use crate::store::connection::{AccessMode, PragmaPolicy};
@@ -1459,6 +1580,111 @@ mod tests {
         assert_eq!(cell("2026-08-25", "work"), 4);
         assert_eq!(cell("2026-08-26", "research"), 6);
         assert_eq!(cell("2026-08-26", "work"), 0, "day 26 switched to research");
+    }
+
+    #[test]
+    fn window_equivalent_splits_mixed_accounts_without_combining_percentage_points() {
+        let (_root, conn) = canonical_conn("window-equivalent-strata");
+        seed_session(&conn, "s1");
+        seed_session(&conn, "s2");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        use crate::store::session_account_marker::EvidenceDesignation;
+        seed_marker(
+            &conn,
+            "s1",
+            "work",
+            day,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_marker(
+            &conn,
+            "s2",
+            "research",
+            day,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(&conn, "e1", day + 10, "s1", "reported", &[("input", 100)]);
+        seed_canonical(&conn, "e2", day + 20, "s2", "reported", &[("input", 200)]);
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        struct FixtureResolver;
+        impl WindowEquivalentResolver for FixtureResolver {
+            fn window_semantic_key(&self) -> &str {
+                "five_hour"
+            }
+
+            fn resolve(
+                &self,
+                account: Option<&str>,
+                provider: Option<&str>,
+                _credits: Option<&Derivation<Credits>>,
+            ) -> Result<WindowEquivalentDerivation, Error> {
+                let Some(account) = account else {
+                    return Ok(WindowEquivalentDerivation::unavailable(
+                        [RequiredFact::new("account attribution")],
+                        Provenance::new(["fixture-window:unavailable".to_string()]),
+                    )
+                    .unwrap());
+                };
+                assert_eq!(provider, Some("fixture"));
+                let (calibration_id, lower, upper) = match account {
+                    "work" => ("cal-work-v1", 10, 20),
+                    "research" => ("cal-research-v1", 30, 40),
+                    other => panic!("unexpected account {other}"),
+                };
+                Ok(WindowEquivalentDerivation::Available(
+                    crate::report::WindowEquivalentValue {
+                        interval: Interval::new(
+                            PercentagePoints::new(lower).unwrap(),
+                            PercentagePoints::new(upper).unwrap(),
+                        )
+                        .unwrap(),
+                        calibration_id: WindowCalibrationId::new(calibration_id),
+                        coverage: CoverageCompleteness::Complete,
+                        quality: EvidenceQuality::Estimated {
+                            methods: [EstimatorId::new(calibration_id.to_string())]
+                                .into_iter()
+                                .collect(),
+                            uncertainty: None,
+                        },
+                        provenance: Provenance::new([format!(
+                            "window-calibration:{calibration_id}"
+                        )]),
+                    },
+                ))
+            }
+        }
+
+        let model = crate::store::cost_model::anthropic_claude_messages_v1(now());
+        let report = assemble_canonical_with_window_equivalent(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Day, SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::Active(&model),
+            Some(&FixtureResolver),
+        )
+        .unwrap();
+
+        let day_group = &report.groups[0];
+        assert!(matches!(
+            day_group.window_equivalent,
+            Some(WindowEquivalentDerivation::Unavailable { .. })
+        ));
+        assert_eq!(day_group.children.len(), 2);
+        let child_calibrations: BTreeSet<&str> = day_group
+            .children
+            .iter()
+            .filter_map(|child| child.window_equivalent.as_ref()?.calibration_id())
+            .map(WindowCalibrationId::as_str)
+            .collect();
+        assert_eq!(
+            child_calibrations,
+            BTreeSet::from(["cal-research-v1", "cal-work-v1"])
+        );
     }
 
     #[test]

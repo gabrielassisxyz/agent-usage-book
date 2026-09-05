@@ -506,7 +506,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 15] = [
+    const KNOWN_SPEND_KEYS: [&str; 16] = [
         "schema",
         "command",
         "run",
@@ -522,6 +522,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "rate_card_version",
         "stale_rate_card_note",
         "credit_model",
+        "window_equivalent_window",
     ];
     for key in obj.keys() {
         if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
@@ -798,6 +799,12 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
             json_string(model.as_str())
         ));
     }
+    if let Some(window) = &report.window_equivalent_window {
+        body.push_str(&format!(
+            ",\"window_equivalent_window\":{}",
+            json_string(window)
+        ));
+    }
     if explain != ExplainMode::Off {
         // explain_json always yields a `{...}` object; splice the spend-only
         // account_groups array in before its closing brace rather than
@@ -917,6 +924,12 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
     if let Some(credits) = &group.credits {
         fields.push_str(&format!(",\"credits\":{}", credits_json(credits)));
     }
+    if let Some(window_equivalent) = &group.window_equivalent {
+        fields.push_str(&format!(
+            ",\"window_equivalent\":{}",
+            window_equivalent_json(window_equivalent)
+        ));
+    }
     format!("{{{fields}}}")
 }
 
@@ -943,6 +956,38 @@ fn credits_json(credits: &Derivation<Credits>) -> String {
             missing
                 .iter()
                 .map(|fact| json_string(RequiredFact::as_str(fact)))
+                .collect::<Vec<_>>()
+                .join(","),
+            provenance_json(provenance),
+        ),
+    }
+}
+
+/// Serializes one calibrated window-equivalent result. The interval's endpoints,
+/// unit, calibration identifier and qualification travel together; a refusal uses
+/// the same field with its missing facts instead of replacing the field with null.
+fn window_equivalent_json(result: &crate::report::WindowEquivalentDerivation) -> String {
+    match result {
+        crate::report::WindowEquivalentDerivation::Available(value) => {
+            let interval_json = interval_json(&value.interval);
+            let interval = strip_braces(&interval_json);
+            format!(
+                "{{{interval},\"calibration_id\":{},\"coverage\":{},\"evidence_quality\":{},\"provenance\":{}}}",
+                json_string(value.calibration_id.as_str()),
+                json_string(coverage_name(&value.coverage)),
+                json_string(quality_name(&value.quality)),
+                provenance_json(&value.provenance),
+            )
+        }
+        crate::report::WindowEquivalentDerivation::Unavailable {
+            missing,
+            provenance,
+        } => format!(
+            "{{\"status\":\"unavailable\",\"unit\":{},\"missing\":[{}],\"provenance\":{}}}",
+            json_string(crate::domain::quota::PercentagePoints::unit()),
+            missing
+                .iter()
+                .map(|fact| json_string(fact.as_str()))
                 .collect::<Vec<_>>()
                 .join(","),
             provenance_json(provenance),
