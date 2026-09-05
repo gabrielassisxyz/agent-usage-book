@@ -264,6 +264,10 @@ const POPULATION: &[(&str, Populate)] = &[
         populate_window_calibration_source_experiment,
     ),
     ("calibration_lifecycle", populate_calibration_lifecycle),
+    (
+        "calibration_controlled_run",
+        populate_calibration_controlled_run,
+    ),
     ("attribution_segment", populate_attribution_segment),
     ("ingest_quarantine", populate_ingest_quarantine),
     ("ingestion_generation", populate_ingestion_generation),
@@ -677,6 +681,19 @@ fn populate_calibration_lifecycle(conn: &rusqlite::Connection) -> Result<(), Str
         "calibration_lifecycle",
         "INSERT INTO calibration_lifecycle (id, calibration_result_id, event_kind, event_at, supersedes_result_id) VALUES
             (1, 1, 'activation', 30, NULL)",
+    )
+}
+
+fn populate_calibration_controlled_run(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Row 1 is the still-running case, whose end is NULL, on the quota and
+    // resolution floors. Row 2 is ended exactly at its start, the CHECK
+    // boundary, on both ceilings with a single expected token kind.
+    exec(
+        conn,
+        "calibration_controlled_run",
+        "INSERT INTO calibration_controlled_run (id, experiment_id, account, provider, plan_tier, window_semantic_key, cost_model_id, expected_token_kinds, baseline_observation_id, baseline_quota_used_ppm, baseline_reported_resolution_ppm, baseline_observed_at, started_at, ended_at, exclusivity_assertion) VALUES
+            (1, 'matrix-controlled-1', 'matrix-account', 'anthropic', 'pro', 'matrix-key-1', 'matrix-cm-1', 'input,output,cache_read,cache_write', 1, 0, 1, 420, 500, NULL, 'matrix-account reserved for controlled experiment matrix-controlled-1'),
+            (2, 'matrix-controlled-2', 'matrix-account', 'anthropic', 'pro', 'matrix-key-1', 'matrix-cm-1', 'input', 2, 1000000, 1000000, 630, 700, 700, 'matrix-account reserved for controlled experiment matrix-controlled-2')",
     )
 }
 

@@ -19,7 +19,10 @@ pub mod adapter_semantics_validation;
 pub mod attempt_crash_hook;
 pub mod attribution_segment;
 pub mod backup;
+#[cfg(test)]
+pub mod calibrate_cli_test_ledger;
 pub mod calibration;
+pub mod calibration_controlled;
 pub mod connection;
 pub mod cost_model;
 pub mod export;
