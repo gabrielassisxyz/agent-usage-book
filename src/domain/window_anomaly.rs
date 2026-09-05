@@ -28,6 +28,14 @@ use crate::domain::quota::QuotaUsed;
 use crate::domain::time::UtcTimestamp;
 use crate::domain::window::{WindowResetState, WindowScopeKind};
 
+/// Anthropic supplies `resets_at` as a provider-owned RFC 3339 instant, which
+/// the adapter preserves without deriving or rounding it. The recorded
+/// provider pair moved by 40.435 milliseconds, so a 100-millisecond envelope
+/// treats that provider-side jitter as one boundary while retaining a clear
+/// separation from real window advances. A movement exactly at this limit
+/// remains material.
+pub const RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS: i64 = 100_000_000;
+
 /// The two evidence-problem classes a consecutive-window comparison can
 /// surface. There is no third: every other transition, including one that
 /// changes nothing, classifies as `None` from [`classify_window_transition`].
@@ -75,7 +83,14 @@ pub struct WindowReading {
 /// between the two readings.
 fn reset_due(previous_reset: WindowResetState, current_observed_at: UtcTimestamp) -> bool {
     match previous_reset {
-        WindowResetState::Known(instant) => current_observed_at >= instant,
+        WindowResetState::Known(instant) => {
+            current_observed_at
+                >= UtcTimestamp::from_unix_nanos(
+                    instant
+                        .unix_nanos()
+                        .saturating_sub(RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS),
+                )
+        }
         WindowResetState::NotStarted => false,
     }
 }
@@ -85,10 +100,30 @@ fn reset_due(previous_reset: WindowResetState, current_observed_at: UtcTimestamp
 /// by a freshly known instant. Idle-to-idle carries no forward motion.
 fn reset_advanced(previous_reset: WindowResetState, current_reset: WindowResetState) -> bool {
     match (previous_reset, current_reset) {
-        (WindowResetState::Known(old), WindowResetState::Known(new)) => new > old,
+        (WindowResetState::Known(old), WindowResetState::Known(new)) => {
+            new.unix_nanos()
+                >= old
+                    .unix_nanos()
+                    .saturating_add(RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS)
+        }
         (WindowResetState::Known(_), WindowResetState::NotStarted)
         | (WindowResetState::NotStarted, WindowResetState::Known(_)) => true,
         (WindowResetState::NotStarted, WindowResetState::NotStarted) => false,
+    }
+}
+
+/// Whether two reset states differ by enough to represent a material window
+/// transition. Known instants inside the jitter envelope describe the same
+/// boundary; changes to or from `NotStarted` remain material.
+fn reset_changed(previous_reset: WindowResetState, current_reset: WindowResetState) -> bool {
+    match (previous_reset, current_reset) {
+        (WindowResetState::Known(old), WindowResetState::Known(new)) => {
+            old.unix_nanos().abs_diff(new.unix_nanos())
+                >= RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS as u64
+        }
+        (WindowResetState::NotStarted, WindowResetState::NotStarted) => false,
+        (WindowResetState::Known(_), WindowResetState::NotStarted)
+        | (WindowResetState::NotStarted, WindowResetState::Known(_)) => true,
     }
 }
 
@@ -107,7 +142,7 @@ pub fn classify_window_transition(
     previous: WindowReading,
     current: WindowReading,
 ) -> Option<WindowAnomalyKind> {
-    let reset_changed = previous.resets_at != current.resets_at;
+    let reset_changed = reset_changed(previous.resets_at, current.resets_at);
     let legitimate_reset = reset_changed
         && reset_due(previous.resets_at, current.observed_at)
         && reset_advanced(previous.resets_at, current.resets_at);
@@ -226,12 +261,74 @@ mod tests {
     fn unexpected_reset_timestamp_change_is_classified() {
         let previous = reading(
             300_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000)),
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000_000)),
             500,
         );
         let current = reading(
             300_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(20_000)),
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_200_000_001)),
+            600,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+    }
+
+    /// Regression: the provider returned this production pair with unchanged
+    /// usage. Its 40.435-millisecond movement is inside the named jitter
+    /// envelope and therefore is not an anomaly.
+    #[test]
+    fn recorded_provider_jitter_is_not_an_anomaly() {
+        let previous = reading(
+            760_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_788_623_999_652_629_000)),
+            1_788_600_000_000_000_000,
+        );
+        let current = reading(
+            760_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_788_623_999_693_064_000)),
+            1_788_600_000_001_000_000,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// A movement greater than the tolerance remains the unexpected-reset
+    /// anomaly this detector exists to preserve.
+    #[test]
+    fn reset_timestamp_change_above_jitter_tolerance_is_classified() {
+        let previous = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000_000)),
+            500,
+        );
+        let current = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                1_000_000_000 + RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS + 1,
+            )),
+            600,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+    }
+
+    /// The tolerance is exclusive: exactly 100 milliseconds is a material
+    /// change and, before the old boundary is due, remains an anomaly.
+    #[test]
+    fn reset_timestamp_change_at_jitter_tolerance_is_material() {
+        let previous = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000_000)),
+            500,
+        );
+        let current = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                1_000_000_000 + RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS,
+            )),
             600,
         );
         assert_eq!(
@@ -247,13 +344,34 @@ mod tests {
     fn legitimate_boundary_reset_produces_no_anomaly() {
         let previous = reading(
             900_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000)),
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000_000)),
             500,
         );
         let current = reading(
             50_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(5_000)),
-            1_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(5_000_000_000)),
+            1_000_000_000,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// The jitter envelope applies to the due and forward-motion helpers as
+    /// well: an observation just before the old reported instant can still
+    /// describe the boundary reset, provided the next boundary advances by a
+    /// material amount.
+    #[test]
+    fn legitimate_reset_inside_the_jitter_envelope_produces_no_anomaly() {
+        let previous = reading(
+            900_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000_000)),
+            500,
+        );
+        let current = reading(
+            50_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                1_000_000_000 + RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS,
+            )),
+            1_000_000_000 - RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS,
         );
         assert_eq!(classify_window_transition(previous, current), None);
     }
@@ -295,23 +413,24 @@ mod tests {
         );
     }
 
-    /// Boundary test: the reset instant is exclusive on the low side and
-    /// inclusive at and after the instant itself, matching
-    /// `MeterWindow::is_active_at`'s own `now < reset` convention.
+    /// Boundary test: outside the jitter envelope the reset instant is
+    /// exclusive on the low side and inclusive at and after the instant
+    /// itself, matching `MeterWindow::is_active_at`'s own `now < reset`
+    /// convention.
     #[test]
     fn reset_boundary_is_exact() {
         let previous = reading(
             900_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000)),
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_000_000_000)),
             500,
         );
 
-        // One nanosecond before the boundary: not due, so the drop is an anomaly
-        // even though the reset state did move forward.
+        // One nanosecond beyond the jitter envelope: not due, so the drop is
+        // an anomaly even though the reset state did move forward.
         let just_before = reading(
             50_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000)),
-            999,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000_000_000)),
+            1_000_000_000 - RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS - 1,
         );
         assert_eq!(
             classify_window_transition(previous, just_before),
@@ -321,16 +440,16 @@ mod tests {
         // Exactly at the boundary: due, so the same drop and forward reset is legitimate.
         let at_boundary = reading(
             50_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000)),
-            1_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000_000_000)),
+            1_000_000_000,
         );
         assert_eq!(classify_window_transition(previous, at_boundary), None);
 
         // One nanosecond after: also due.
         let just_after = reading(
             50_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000)),
-            1_001,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000_000_000)),
+            1_000_000_001,
         );
         assert_eq!(classify_window_transition(previous, just_after), None);
     }

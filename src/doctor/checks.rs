@@ -724,6 +724,31 @@ fn backup_age(ctx: &DoctorContext) -> CheckOutcome {
 /// `aub-eun.14`). This reads the persisted count and evidence references only:
 /// it never re-runs consecutive-window comparison, which is exactly what lets
 /// doctor consume anomaly counts without reimplementing detection.
+const METER_ANOMALY_SAMPLE_LIMIT: usize = 5;
+
+fn meter_anomaly_detail(anomalies: &[crate::store::window_anomaly::StoredWindowAnomaly]) -> String {
+    let references: Vec<String> = anomalies
+        .iter()
+        .take(METER_ANOMALY_SAMPLE_LIMIT)
+        .map(|anomaly| {
+            format!(
+                "id={} kind={} account={} prior_observation={} current_observation={}",
+                anomaly.row_id.value(),
+                anomaly.kind.as_str(),
+                anomaly.account_id.value(),
+                anomaly.prior_observation_id.value(),
+                anomaly.current_observation_id.value(),
+            )
+        })
+        .collect();
+    format!(
+        "{} window anomaly(ies), showing {}: {}",
+        anomalies.len(),
+        references.len(),
+        references.join("; ")
+    )
+}
+
 fn meter_anomalies(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
         CheckStatus::NotApplicable("no ledger database exists yet".to_string())
@@ -737,26 +762,7 @@ fn meter_anomalies(ctx: &DoctorContext) -> CheckOutcome {
                 Ok(anomalies) if anomalies.is_empty() => {
                     CheckStatus::PassWithDetail("0 window anomalies recorded".to_string())
                 }
-                Ok(anomalies) => {
-                    let references: Vec<String> = anomalies
-                        .iter()
-                        .map(|anomaly| {
-                            format!(
-                                "id={} kind={} account={} prior_observation={} current_observation={}",
-                                anomaly.row_id.value(),
-                                anomaly.kind.as_str(),
-                                anomaly.account_id.value(),
-                                anomaly.prior_observation_id.value(),
-                                anomaly.current_observation_id.value(),
-                            )
-                        })
-                        .collect();
-                    CheckStatus::Fail(format!(
-                        "{} window anomaly(ies): {}",
-                        anomalies.len(),
-                        references.join("; ")
-                    ))
-                }
+                Ok(anomalies) => CheckStatus::Fail(meter_anomaly_detail(&anomalies)),
             },
         }
     };
@@ -1116,6 +1122,38 @@ mod tests {
         assert!(
             matches!(outcome.status, CheckStatus::Fail(ref msg) if msg.contains("permission denied"))
         );
+    }
+
+    #[test]
+    fn meter_anomaly_detail_includes_a_bounded_sample() {
+        use crate::domain::window::WindowScope;
+        use crate::store::account::AccountId;
+        use crate::store::meter_evidence::{ObservationRowId, WindowRowId};
+        use crate::store::window_anomaly::{StoredWindowAnomaly, WindowAnomalyRowId};
+
+        let anomalies: Vec<_> = (1..=METER_ANOMALY_SAMPLE_LIMIT as i64 + 1)
+            .map(|id| StoredWindowAnomaly {
+                row_id: WindowAnomalyRowId::new(id),
+                kind: crate::domain::window_anomaly::WindowAnomalyKind::UnexpectedResetTimestampChange,
+                account_id: AccountId::new(id),
+                scope: WindowScope::AccountWide,
+                prior_observation_id: ObservationRowId::new(id * 10),
+                prior_window_id: WindowRowId::new(id * 10),
+                current_observation_id: ObservationRowId::new(id * 10 + 1),
+                current_window_id: WindowRowId::new(id * 10 + 1),
+                detected_at: UtcTimestamp::from_unix_nanos(id),
+                detail: String::new(),
+            })
+            .collect();
+
+        let detail = meter_anomaly_detail(&anomalies);
+        assert!(
+            detail.contains("6 window anomaly(ies), showing 5"),
+            "{detail}"
+        );
+        assert!(detail.contains("id=1 "), "{detail}");
+        assert!(detail.contains("id=5 "), "{detail}");
+        assert!(!detail.contains("id=6 "), "{detail}");
     }
 
     #[test]

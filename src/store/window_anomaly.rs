@@ -1031,7 +1031,48 @@ mod tests {
             &fx,
             40_000,
             50_000,
-            WindowResetState::Known(UtcTimestamp::from_unix_nanos(60_000)),
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(100_035_000)),
+        );
+        let outcome = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &[second_window],
+            UtcTimestamp::from_unix_nanos(40_500),
+        )
+        .unwrap();
+
+        assert!(outcome.anomalies.is_empty());
+        assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
+        assert!(all_exclusions(&fx.conn).unwrap().is_empty());
+    }
+
+    /// Jitter inside the configured provider-boundary envelope is ignored by
+    /// the classifier, so persistence creates neither an
+    /// anomaly row nor a calibration exclusion.
+    #[test]
+    fn provider_reset_jitter_persists_no_anomaly_or_exclusion() {
+        let fx = fixture();
+        let (first_obs, first_window) = record_observation(
+            &fx,
+            30_000,
+            760_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000_000)),
+        );
+        detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &first_obs,
+            &[first_window],
+            UtcTimestamp::from_unix_nanos(30_500),
+        )
+        .unwrap();
+
+        let (second_obs, second_window) = record_observation(
+            &fx,
+            40_000,
+            760_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(50_435_000)),
         );
         let outcome = detect_and_persist(
             &fx.conn,
