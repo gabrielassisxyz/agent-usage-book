@@ -103,12 +103,15 @@ impl Repository {
                     }
                     None => Vec::new(),
                 };
-            let latest_attempt_started = match latest_attempt {
+            let (latest_attempt_started, latest_due_at) = match latest_attempt {
                 Some(stored) => {
                     let id = stored.row_id.as_attempt_id()?;
-                    Some(AttemptStarted::new(id, stored.request_started_at))
+                    (
+                        Some(AttemptStarted::new(id, stored.request_started_at)),
+                        Some(stored.due_at),
+                    )
                 }
-                None => None,
+                None => (None, None),
             };
             let latest_result_typed = match latest_result {
                 Some(stored) => {
@@ -124,6 +127,7 @@ impl Repository {
             };
             Ok(DueEvidenceSnapshot {
                 latest_attempt: latest_attempt_started,
+                latest_due_at,
                 latest_result: latest_result_typed,
                 known_resets,
             })
@@ -461,6 +465,7 @@ pub struct TerminalBundleCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueEvidenceSnapshot {
     pub latest_attempt: Option<AttemptStarted>,
+    pub latest_due_at: Option<UtcTimestamp>,
     pub latest_result: Option<AttemptResult>,
     pub known_resets: Vec<UtcTimestamp>,
 }
@@ -950,6 +955,7 @@ mod tests {
             .due_evidence_snapshot(fixture.account_id)
             .unwrap();
         assert_eq!(fresh.latest_attempt, None);
+        assert_eq!(fresh.latest_due_at, None);
         assert_eq!(fresh.latest_result, None);
         assert_eq!(fresh.known_resets, Vec::new());
 
@@ -967,6 +973,7 @@ mod tests {
             .due_evidence_snapshot(fixture.account_id)
             .unwrap();
         assert_eq!(sampled.latest_attempt, Some(started));
+        assert_eq!(sampled.latest_due_at, Some(fixture.attempt.due_at));
         let result = sampled
             .latest_result
             .expect("the committed bundle's result must be visible to the snapshot");
