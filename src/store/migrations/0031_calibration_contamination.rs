@@ -25,11 +25,11 @@ pub const VERSION: u32 = 31;
 const ADD_CONTAMINATION_COLUMNS: &str = "\
 ALTER TABLE calibration_controlled_run ADD COLUMN baseline_plateau_started_at INTEGER NOT NULL DEFAULT 0;\
 ALTER TABLE calibration_controlled_run ADD COLUMN contamination_policy_version TEXT NOT NULL DEFAULT 'contamination-v1' CHECK (length(contamination_policy_version) > 0);\
-ALTER TABLE calibration_controlled_run ADD COLUMN contamination_pre_burn_max_movement_ppm INTEGER NOT NULL DEFAULT 10000 CHECK (contamination_pre_burn_max_movement_ppm >= 0);\
-ALTER TABLE calibration_controlled_run ADD COLUMN contamination_post_settlement_max_movement_ppm INTEGER NOT NULL DEFAULT 10000 CHECK (contamination_post_settlement_max_movement_ppm >= 0);\
+ALTER TABLE calibration_controlled_run ADD COLUMN contamination_pre_burn_max_movement_ppm INTEGER NOT NULL DEFAULT 10000 CHECK (contamination_pre_burn_max_movement_ppm >= 0 AND contamination_pre_burn_max_movement_ppm <= 1000000);\
+ALTER TABLE calibration_controlled_run ADD COLUMN contamination_post_settlement_max_movement_ppm INTEGER NOT NULL DEFAULT 10000 CHECK (contamination_post_settlement_max_movement_ppm >= 0 AND contamination_post_settlement_max_movement_ppm <= 1000000);\
 ALTER TABLE calibration_controlled_run ADD COLUMN contamination_post_settlement_grace_nanos INTEGER NOT NULL DEFAULT 3600000000000 CHECK (contamination_post_settlement_grace_nanos > 0);\
-ALTER TABLE calibration_controlled_run ADD COLUMN contamination_flat_meter_min_movement_ppm INTEGER NOT NULL DEFAULT 20000 CHECK (contamination_flat_meter_min_movement_ppm >= 0);\
-ALTER TABLE calibration_controlled_run ADD COLUMN contamination_flat_local_max_micros INTEGER NOT NULL DEFAULT 0;\
+ALTER TABLE calibration_controlled_run ADD COLUMN contamination_flat_meter_min_movement_ppm INTEGER NOT NULL DEFAULT 20000 CHECK (contamination_flat_meter_min_movement_ppm >= 0 AND contamination_flat_meter_min_movement_ppm <= 1000000);\
+ALTER TABLE calibration_controlled_run ADD COLUMN contamination_flat_local_max_micros INTEGER NOT NULL DEFAULT 0 CHECK (contamination_flat_local_max_micros >= 0);\
 ";
 
 const DROP_NO_REWRITE: &str = "DROP TRIGGER calibration_controlled_run_no_rewrite";
