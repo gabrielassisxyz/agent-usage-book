@@ -2066,6 +2066,219 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
     Ok(parsed)
 }
 
+/// Serializes one `calibrate show` entry: every quantity carries its unit and
+/// every claim carries its provenance identifiers (calibration, cost model,
+/// evidence experiments, input digests, fitter version).
+fn calibrate_show_entry_json(entry: &crate::report::CalibrateShowEntry) -> String {
+    let kinds = entry
+        .cost_model
+        .kinds
+        .iter()
+        .map(|kind| {
+            format!(
+                "{{\"kind\":{},\"modeled\":{}}}",
+                json_string(&kind.kind_label),
+                kind.modeled
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let unknown = entry
+        .cost_model
+        .unknown_kinds
+        .iter()
+        .map(|kind| json_string(kind))
+        .collect::<Vec<_>>()
+        .join(",");
+    let experiments = entry
+        .evidence_experiment_ids
+        .iter()
+        .map(|id| json_string(id))
+        .collect::<Vec<_>>()
+        .join(",");
+    let held_out = match entry.out_of_sample_residual_micros {
+        Some(micros) => quantity_json(&micros.to_string(), "credits"),
+        None => "null".to_string(),
+    };
+    format!(
+        "{{\"calibration_id\":{},\"provider\":{},\"window_semantic_key\":{},\"plan_tier\":{},\"cost_model\":{{\"id\":{},\"found\":{},\"kinds\":[{}],\"unknown_kinds\":[{}]}},\"fitted\":{},\"window_capacity\":{},\"fit_residual\":{},\"held_out_residual\":{},\"uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}},\"statistical_method\":{},\"statistical_parameters\":{},\"validation_method\":{},\"validation_version\":{},\"evidence_experiments\":[{}],\"inputs_digest\":{},\"inputs_count\":{},\"fitting_evidence_digest\":{},\"validation_evidence_digest\":{},\"fit_timestamp_nanos\":{},\"activation_policy_version\":{},\"fitter_version\":{},\"source_revision\":{},\"health\":{},\"is_active\":{}}}",
+        json_string(&entry.calibration_id),
+        json_string(&entry.provider),
+        json_string(&entry.window_semantic_key),
+        json_string(&entry.plan_tier),
+        json_string(&entry.cost_model.cost_model_id),
+        entry.cost_model.cost_model_found,
+        kinds,
+        unknown,
+        quantity_json(
+            &entry.fitted_micros_per_point.to_string(),
+            "micros_per_point"
+        ),
+        quantity_json(
+            &entry.equivalent_full_window_capacity_micros.to_string(),
+            "credits"
+        ),
+        quantity_json(&entry.fit_residual_micros.to_string(), "credits"),
+        held_out,
+        json_string(&entry.uncertainty_low_micros_per_point.to_string()),
+        json_string(&entry.uncertainty_high_micros_per_point.to_string()),
+        json_string("micros_per_point"),
+        json_string(&entry.statistical_method),
+        json_string(&entry.statistical_parameters),
+        json_string(&entry.validation_method),
+        json_string(&entry.validation_version),
+        experiments,
+        json_string(&entry.inputs_digest_hex),
+        entry.inputs_count,
+        json_string(&entry.fitting_evidence_digest_hex),
+        json_string(&entry.validation_evidence_digest_hex),
+        entry.fit_timestamp_nanos,
+        json_string(&entry.activation_policy_version),
+        json_string(&entry.aub_version),
+        json_string(&entry.source_revision),
+        json_string(&entry.health_label),
+        entry.is_active
+    )
+}
+
+/// Serializes a `calibrate show` report under the JSON envelope.
+pub fn calibrate_show_json(report: &crate::report::CalibrateShowReport, run: RunId) -> String {
+    let entries = report
+        .entries
+        .iter()
+        .map(calibrate_show_entry_json)
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!("\"entries\":[{entries}]");
+    JsonEnvelope::new("calibrate-show", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `calibrate history` report under the JSON envelope.
+pub fn calibrate_history_json(
+    report: &crate::report::CalibrateHistoryReport,
+    run: RunId,
+) -> String {
+    let entries = report
+        .entries
+        .iter()
+        .map(|entry| {
+            let events = entry
+                .events
+                .iter()
+                .map(|event| {
+                    let supersedes = match &event.supersedes {
+                        Some(id) => json_string(id),
+                        None => "null".to_string(),
+                    };
+                    format!(
+                        "{{\"kind\":{},\"event_at_nanos\":{},\"actor\":{},\"activation_policy_version\":{},\"supersedes\":{}}}",
+                        json_string(&event.kind_label),
+                        event.event_at_nanos,
+                        json_string(&event.actor),
+                        json_string(&event.activation_policy_version),
+                        supersedes
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            format!(
+                "{{\"calibration_id\":{},\"provider\":{},\"window_semantic_key\":{},\"plan_tier\":{},\"fitted\":{},\"fit_residual\":{},\"uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}},\"fit_timestamp_nanos\":{},\"health\":{},\"events\":[{}]}}",
+                json_string(&entry.calibration_id),
+                json_string(&entry.provider),
+                json_string(&entry.window_semantic_key),
+                json_string(&entry.plan_tier),
+                quantity_json(
+                    &entry.fitted_micros_per_point.to_string(),
+                    "micros_per_point"
+                ),
+                quantity_json(&entry.fit_residual_micros.to_string(), "credits"),
+                json_string(&entry.uncertainty_low_micros_per_point.to_string()),
+                json_string(&entry.uncertainty_high_micros_per_point.to_string()),
+                json_string("micros_per_point"),
+                entry.fit_timestamp_nanos,
+                json_string(&entry.health_label),
+                events
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    let body = format!("\"entries\":[{entries}]");
+    JsonEnvelope::new("calibrate-history", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `calibrate compare` report under the JSON envelope.
+pub fn calibrate_compare_json(
+    report: &crate::report::CalibrateCompareReport,
+    run: RunId,
+) -> String {
+    let body = format!(
+        "\"candidate_id\":{},\"active_id\":{},\"difference_bps\":{},\"difference_percent\":{},\"candidate_fitted\":{},\"active_fitted\":{},\"candidate_residual\":{},\"candidate_uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}},\"active_residual\":{},\"active_uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}},\"candidate_health\":{},\"candidate_is_active\":{}",
+        json_string(&report.candidate_id),
+        json_string(&report.active_id),
+        report.difference_bps,
+        json_string(&crate::report::format_calibrate_difference_percent(
+            report.difference_bps
+        )),
+        quantity_json(
+            &report.candidate_fitted_micros_per_point.to_string(),
+            "micros_per_point"
+        ),
+        quantity_json(
+            &report.active_fitted_micros_per_point.to_string(),
+            "micros_per_point"
+        ),
+        quantity_json(&report.candidate_fit_residual_micros.to_string(), "credits"),
+        json_string(
+            &report
+                .candidate_uncertainty_low_micros_per_point
+                .to_string()
+        ),
+        json_string(
+            &report
+                .candidate_uncertainty_high_micros_per_point
+                .to_string()
+        ),
+        json_string("micros_per_point"),
+        quantity_json(&report.active_fit_residual_micros.to_string(), "credits"),
+        json_string(&report.active_uncertainty_low_micros_per_point.to_string()),
+        json_string(&report.active_uncertainty_high_micros_per_point.to_string()),
+        json_string("micros_per_point"),
+        json_string(&report.candidate_health_label),
+        report.candidate_is_active
+    );
+    JsonEnvelope::new("calibrate-compare", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `calibrate activate` report under the JSON envelope.
+pub fn calibrate_activate_json(
+    report: &crate::report::CalibrateActivateReport,
+    run: RunId,
+) -> String {
+    let supersedes = match &report.supersedes {
+        Some(id) => json_string(id),
+        None => "null".to_string(),
+    };
+    let body = format!(
+        "\"calibration_id\":{},\"supersedes\":{},\"actor\":{},\"activation_policy_version\":{},\"event_at_nanos\":{},\"fitting_evidence_digest\":{},\"validation_evidence_digest\":{},\"fitted\":{},\"fit_residual\":{},\"uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}}",
+        json_string(&report.calibration_id),
+        supersedes,
+        json_string(&report.actor),
+        json_string(&report.activation_policy_version),
+        report.event_at_nanos,
+        json_string(&report.fitting_evidence_digest_hex),
+        json_string(&report.validation_evidence_digest_hex),
+        quantity_json(
+            &report.fitted_micros_per_point.to_string(),
+            "micros_per_point"
+        ),
+        quantity_json(&report.fit_residual_micros.to_string(), "credits"),
+        json_string(&report.uncertainty_low_micros_per_point.to_string()),
+        json_string(&report.uncertainty_high_micros_per_point.to_string()),
+        json_string("micros_per_point")
+    );
+    JsonEnvelope::new("calibrate-activate", run, report.metadata.clone()).to_json_with(&body)
+}
+
 /// Serializes a provenance graph into its JSON explain representation.
 pub fn explain_json(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
     let mode_str = match mode {

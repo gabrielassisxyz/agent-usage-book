@@ -2046,6 +2046,43 @@ pub fn has_unresolved_mismatch_annotation(
     .map_err(|e| Error::Store(format!("cannot query mismatch annotation: {e}")))
 }
 
+/// Every calibration result in the ledger, ordered by knowledge time then row
+/// id: the full history `calibrate history` lists. Results are immutable, so
+/// this order is stable across calls.
+pub fn list_all_results(conn: &Connection) -> Result<Vec<WindowCalibration>, Error> {
+    let sql = format!(
+        "SELECT {RESULT_COLUMNS} FROM window_calibration_result ORDER BY knowledge_time, id"
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| Error::Store(format!("cannot prepare the calibration history query: {e}")))?;
+    let rows = stmt
+        .query_map([], |row| result_from_row(row).map_err(store_error_to_sql))
+        .map_err(|e| Error::Store(format!("cannot query calibration history: {e}")))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| Error::Store(format!("cannot read a calibration row: {e}")))?);
+    }
+    Ok(out)
+}
+
+/// Whether a later lifecycle event names this calibration as superseded: a
+/// calibration is retired exactly when another calibration's activation
+/// records it as the predecessor, never by editing a flag on its own row.
+pub fn is_superseded(conn: &Connection, id: &WindowCalibrationId) -> Result<bool, Error> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM calibration_lifecycle
+            WHERE supersedes_result_id = (
+                SELECT id FROM window_calibration_result WHERE calibration_id = ?1
+            )
+        )",
+        params![id.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|e| Error::Store(format!("cannot query calibration supersession: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

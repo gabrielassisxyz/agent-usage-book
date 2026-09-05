@@ -9,6 +9,7 @@ pub mod models;
 pub mod provenance;
 
 pub mod activity;
+pub mod calibrate;
 pub mod can_run;
 pub mod can_run_evidence;
 pub mod coverage;
@@ -19,6 +20,12 @@ pub mod task;
 pub use activity::{
     ActiveActivityState, ActiveActivityStateKind, ActiveSpendClaim, InactiveSpendClaim,
     LivenessGap, compose_active_activity,
+};
+pub use calibrate::{
+    CalibrateActivateReport, CalibrateCompareReport, CalibrateCostModelCoverage,
+    CalibrateCostModelKindCoverage, CalibrateHistoryEntry, CalibrateHistoryReport,
+    CalibrateLifecycleEventView, CalibrateShowEntry, CalibrateShowReport, calibrate_difference_bps,
+    format_calibrate_difference_percent,
 };
 pub use can_run::*;
 pub use can_run_evidence::gather_task_history_group_report;
