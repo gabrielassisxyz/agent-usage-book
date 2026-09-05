@@ -2533,6 +2533,128 @@ mod tests {
         assert_eq!(validated.ledger_generation.get(), 7);
     }
 
+    /// Contract (`aub-cab.4`): the can-run report's JSON carries the credit
+    /// interval endpoints, the limiting window identity and the provenance
+    /// identifiers, for both a ready and a refused outcome.
+    #[test]
+    fn can_run_json_carries_interval_endpoints_limiting_window_and_provenance() {
+        use crate::advice::headroom::CalibratedWindowConstraint;
+        use crate::advice::historical_distribution::{
+            AttributionCoverage, DistributionVerdict, ExclusionCounts, Percentile, QuantileMethod,
+        };
+        use crate::advice::verdict::{
+            AmpleMarginMultiple, CanRunHeadroomBound, TaskReferenceInput,
+        };
+        use crate::attribution::quality::{AttributionFraction, AttributionQualityFloor};
+        use crate::domain::credits::CreditsPerPercentagePoint;
+        use crate::domain::interval::Interval;
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::time::MonotonicDuration;
+        use crate::domain::window::{
+            MeterWindow, ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
+            WindowScope, WindowSemanticKey,
+        };
+        use crate::report::can_run::{
+            CanRunJoinInputs, CanRunMeterReadiness, WindowCalibrationLookup, compose_can_run_report,
+        };
+        use crate::store::calibration::CoefficientUncertainty;
+        use std::collections::BTreeMap;
+
+        fn credits_of(whole: i64) -> Credits {
+            Credits::from_micros(whole * 1_000_000)
+        }
+
+        let window = MeterWindow::new(
+            WindowSemanticKey::new("account:5h"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(600_000).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::RoundedToNearest,
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+            NominalWindowDuration::from_nanos(1_000_000_000),
+        );
+        let unc = CoefficientUncertainty::new(
+            CreditsPerPercentagePoint::from_micros_per_point(8_000),
+            CreditsPerPercentagePoint::from_micros_per_point(9_000),
+        )
+        .unwrap();
+        let mut calibrations = BTreeMap::new();
+        calibrations.insert(
+            WindowSemanticKey::new("account:5h"),
+            WindowCalibrationLookup {
+                calibration_id: "17".to_string(),
+                constraint: CalibratedWindowConstraint::current(unc),
+            },
+        );
+
+        let inputs = CanRunJoinInputs {
+            metadata: metadata(),
+            task_kind: "refactor-module".to_string(),
+            account: "work-primary".to_string(),
+            model: ModelId::new("model-x"),
+            meter: CanRunMeterReadiness::Fresh {
+                windows: vec![window],
+                observed_age: Some(MonotonicDuration::from_seconds(41)),
+            },
+            window_calibrations: calibrations,
+            cost_model_missing_token_classes: Vec::new(),
+            plan_tier_mismatch: None,
+            task: TaskReferenceInput {
+                verdict: DistributionVerdict::Distribution {
+                    median: credits_of(640),
+                    central_range: Interval::new(credits_of(550), credits_of(940)).unwrap(),
+                    central_low_percentile: Percentile::new(25).unwrap(),
+                    central_high_percentile: Percentile::new(75).unwrap(),
+                    upper_reference: credits_of(1520),
+                    upper_percentile: Percentile::new(90).unwrap(),
+                    quantile_method: QuantileMethod::NearestRank,
+                },
+                sample_count: 23,
+            },
+            attribution: AttributionCoverage {
+                fraction: AttributionFraction::new(95, 100),
+                floor: AttributionQualityFloor::new(0.80).unwrap(),
+            },
+            attribution_exclusions: ExclusionCounts::default(),
+            attribution_selection_window: "2026-08-01..2026-09-01".to_string(),
+            attribution_group: "refactor-module".to_string(),
+            ample_margin_multiple: AmpleMarginMultiple::new(2.0).unwrap(),
+            headroom_bound: CanRunHeadroomBound::Low,
+            provenance: ProvenanceGraph::default(),
+        };
+
+        let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
+
+        let ready_report = compose_can_run_report(inputs.clone());
+        let ready_json = can_run_json(&ready_report, run.clone());
+        validate_can_run_report_json(&ready_json).expect("ready report validates its own contract");
+        let value: serde_json::Value =
+            serde_json::from_str(&ready_json).expect("valid JSON expected");
+        assert_eq!(value["outcome"]["status"], "ready");
+        assert_eq!(value["limiting_window"], "account:5h");
+        let headroom = &value["outcome"]["windows"][0]["headroom"];
+        assert!(headroom.get("lower").is_some(), "{value}");
+        assert!(headroom.get("upper").is_some(), "{value}");
+        assert!(value["provenance"]["sources"].is_array(), "{value}");
+
+        let mut stale_inputs = inputs;
+        stale_inputs.meter = CanRunMeterReadiness::Stale {
+            reason: crate::domain::freshness::StaleReason::AgeExceeded,
+        };
+        let refused_report = compose_can_run_report(stale_inputs);
+        let refused_json = can_run_json(&refused_report, run);
+        validate_can_run_report_json(&refused_json)
+            .expect("refused report validates its own contract");
+        let refused_value: serde_json::Value =
+            serde_json::from_str(&refused_json).expect("valid JSON expected");
+        assert_eq!(refused_value["outcome"]["status"], "refused");
+        assert!(
+            refused_value["limiting_window"].is_null(),
+            "{refused_value}"
+        );
+        assert!(refused_value["outcome"]["missing"][0]["subject"] == "meter");
+    }
+
     #[test]
     fn adding_field_without_version_bump_fails_strict_validation() {
         let run = RunId::new(UtcTimestamp::from_unix_nanos(42));

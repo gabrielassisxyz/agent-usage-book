@@ -204,6 +204,7 @@ pub struct PlanTierMismatch {
 /// calibration store, the cost model, the plan tier configuration and the
 /// historical task distribution (`aub-cab.1`). This function performs no I/O:
 /// every refusal is a pure decision over these already-fetched typed facts.
+#[derive(Clone)]
 pub struct CanRunJoinInputs {
     pub metadata: ReportMetadata,
     pub task_kind: String,
