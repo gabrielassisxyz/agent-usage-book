@@ -27,7 +27,7 @@ use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
-    WindowSemanticKey,
+    WindowSemanticKey, WindowSeverity,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -177,6 +177,8 @@ pub struct StoredMeterWindow {
     pub quantization: QuantizationSemantics,
     pub resets_at: crate::domain::window::WindowResetState,
     pub nominal_duration: NominalWindowDuration,
+    pub is_active: bool,
+    pub severity: WindowSeverity,
 }
 
 /// The hex-encoded SHA-256 of the evidence capsule bytes: the stored proof
@@ -427,14 +429,33 @@ pub fn observation_by_row_id(
 const INSERT_WINDOW: &str = "
 INSERT INTO meter_window (
     observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
-    reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) RETURNING id";
+    reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos,
+    is_active, severity
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11) RETURNING id";
 
 /// Writes one provider-reported quota constraint, stored exactly as the
 /// provider expressed it. No derived remaining value is computed here.
 pub fn insert_window(
     conn: &rusqlite::Connection,
     window: &NewMeterWindow,
+) -> Result<WindowRowId, Error> {
+    insert_window_with_facts(
+        conn,
+        window,
+        window.resets_at.is_known(),
+        WindowSeverity::unknown(),
+    )
+}
+
+/// Writes a window together with provider facts that were not part of the
+/// original generic insertion surface. Legacy importers use [`insert_window`]
+/// and receive explicit compatibility defaults; provider adapters use this
+/// function so their reported facts reach the immutable ledger row.
+pub fn insert_window_with_facts(
+    conn: &rusqlite::Connection,
+    window: &NewMeterWindow,
+    is_active: bool,
+    severity: WindowSeverity,
 ) -> Result<WindowRowId, Error> {
     let (scope_kind, scoped_model) = match &window.scope {
         WindowScope::AccountWide => ("account_wide", None),
@@ -452,6 +473,8 @@ pub fn insert_window(
             quantization_sql::as_sql(window.quantization),
             window.resets_at.instant().map(|ts| ts.unix_nanos()),
             window.nominal_duration.as_nanos() as i64,
+            is_active as i64,
+            severity.as_str(),
         ],
         |row| row.get(0),
     )
@@ -490,7 +513,8 @@ pub mod quantization_sql {
 
 const SELECT_WINDOW_COLUMNS: &str = "
     id, observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
-    reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos";
+    reported_resolution_ppm, quantization, resets_at, nominal_duration_nanos,
+    is_active, severity";
 
 fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow> {
     let scope_kind: String = row.get("scope_kind")?;
@@ -545,6 +569,8 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
         nominal_duration: NominalWindowDuration::from_nanos(
             row.get::<_, i64>("nominal_duration_nanos")? as u64,
         ),
+        is_active: row.get::<_, i64>("is_active")? == 1,
+        severity: WindowSeverity::new(row.get::<_, String>("severity")?),
     })
 }
 

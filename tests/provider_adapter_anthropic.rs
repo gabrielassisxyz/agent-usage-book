@@ -124,6 +124,26 @@ fn fixture_corpus_sanitization_scan() {
 }
 
 #[test]
+fn adapter_semantics_table_names_limits_kinds() {
+    let path = crate_root().join("docs/adapter-semantics-validation.md");
+    let table = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
+    let adapter_row = table
+        .lines()
+        .find(|line| {
+            line.starts_with("| Anthropic (`src/meter/anthropic.rs`)")
+                && !line.starts_with("| Anthropic idle")
+        })
+        .expect("the Anthropic adapter row must be present");
+    for kind in ["session", "weekly_all", "weekly_scoped"] {
+        assert!(
+            adapter_row.contains(&format!("limits[].kind={kind}")),
+            "the adapter semantics table must document limits[].kind={kind}"
+        );
+    }
+}
+
+#[test]
 fn contract_all_fourteen_cases() {
     let adapter = AnthropicAdapter::new();
     let cred = test_credential();
@@ -320,7 +340,15 @@ fn semantic_identifiers_and_changed_semantics_declaration() {
     assert_eq!(decls.measurement_basis, MeasurementBasis::LocallyReceived);
     assert_eq!(
         decls.provider_contract_id.as_str(),
-        "anthropic-oauth-usage-v1"
+        AnthropicAdapter::LIMITS_CONTRACT_ID
+    );
+    assert_eq!(
+        decls
+            .required_window_kinds
+            .iter()
+            .map(|kind| kind.as_str())
+            .collect::<Vec<_>>(),
+        vec!["session", "weekly_all"]
     );
     assert_eq!(
         decls.meter_semantics_id.as_str(),
@@ -337,5 +365,164 @@ fn semantic_identifiers_and_changed_semantics_declaration() {
     assert_ne!(
         adapter.declarations().meter_semantics_id,
         changed_adapter.declarations().meter_semantics_id
+    );
+}
+
+#[test]
+fn limits_fixture_preserves_kinds_scope_activity_and_severity() {
+    let adapter = AnthropicAdapter::new();
+    let observation = adapter.observe(
+        &test_credential(),
+        &MeterRequest::default(),
+        &MockTransport::ok(200, read_fixture("limits-success.json")),
+        &test_clock(),
+    );
+    let ProviderObservation::Measured(reading) = observation else {
+        panic!("limits fixture must produce a measured reading");
+    };
+
+    assert_eq!(reading.windows.len(), 3);
+    assert_eq!(reading.windows[0].semantic_key().as_str(), "session");
+    assert_eq!(reading.windows[0].scope(), &WindowScope::AccountWide);
+    assert!(reading.windows[0].is_active());
+    assert_eq!(reading.windows[0].severity().as_str(), "normal");
+    assert_eq!(reading.windows[1].semantic_key().as_str(), "weekly_all");
+    let scoped = reading
+        .windows
+        .iter()
+        .find(|window| window.scope().scoped_model().is_some())
+        .expect("weekly_scoped window must be present");
+    assert_eq!(scoped.semantic_key().as_str(), "weekly_scoped_sonnet");
+    assert_eq!(
+        scoped.scope(),
+        &WindowScope::ModelSpecific(ModelId::new("sonnet"))
+    );
+    assert_eq!(scoped.severity().as_str(), "critical");
+    assert_eq!(
+        reading.calibration_applicability,
+        agent_usage_book::meter::anthropic::CalibrationApplicability::CarryOver
+    );
+    assert_eq!(
+        reading.provider_contract_id.as_str(),
+        AnthropicAdapter::LIMITS_CONTRACT_ID
+    );
+}
+
+#[test]
+fn limits_preserve_an_inactive_provider_fact() {
+    let mut body: serde_json::Value =
+        serde_json::from_slice(&read_fixture("limits-success.json")).unwrap();
+    body["limits"][2]["is_active"] = serde_json::json!(false);
+    let observation = AnthropicAdapter::new().observe(
+        &test_credential(),
+        &MeterRequest::default(),
+        &MockTransport::ok(200, serde_json::to_vec(&body).unwrap()),
+        &test_clock(),
+    );
+    let ProviderObservation::Measured(reading) = observation else {
+        panic!("an inactive constraint remains a measured response");
+    };
+    let scoped = reading
+        .windows
+        .iter()
+        .find(|window| window.semantic_key().as_str() == "weekly_scoped_sonnet")
+        .expect("the scoped constraint must remain present");
+    assert!(!scoped.is_active());
+}
+
+fn limits_body(include_scoped: bool, include_weekly_all: bool) -> Vec<u8> {
+    let mut limits = vec![serde_json::json!({
+        "kind": "session",
+        "percent": 8.0,
+        "severity": "normal",
+        "resets_at": "2026-09-05T17:00:00.000Z",
+        "scope": null,
+        "is_active": true
+    })];
+    if include_weekly_all {
+        limits.push(serde_json::json!({
+            "kind": "weekly_all",
+            "percent": 21.0,
+            "severity": "warning",
+            "resets_at": "2026-09-06T12:00:00.000Z",
+            "scope": null,
+            "is_active": true
+        }));
+    }
+    if include_scoped {
+        limits.push(serde_json::json!({
+            "kind": "weekly_scoped",
+            "percent": 24.0,
+            "severity": "critical",
+            "resets_at": "2026-09-06T12:00:00.000Z",
+            "scope": {"model": "sonnet"},
+            "is_active": true
+        }));
+    }
+    serde_json::to_vec(&serde_json::json!({"limits": limits})).unwrap()
+}
+
+#[test]
+fn limits_require_weekly_all_but_not_weekly_scoped() {
+    let adapter = AnthropicAdapter::new();
+    let missing_required = adapter.observe(
+        &test_credential(),
+        &MeterRequest::default(),
+        &MockTransport::ok(200, limits_body(true, false)),
+        &test_clock(),
+    );
+    assert_eq!(
+        missing_required,
+        ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
+    );
+
+    let without_scoped = adapter.observe(
+        &test_credential(),
+        &MeterRequest::default(),
+        &MockTransport::ok(200, limits_body(false, true)),
+        &test_clock(),
+    );
+    let ProviderObservation::Measured(reading) = without_scoped else {
+        panic!("weekly_scoped is optional");
+    };
+    assert_eq!(reading.windows.len(), 2);
+    assert!(reading.anomalies.is_empty());
+}
+
+#[test]
+fn matching_named_blocks_allow_calibration_and_disagreement_is_an_anomaly() {
+    let adapter = AnthropicAdapter::new();
+    let mut agreeing: serde_json::Value =
+        serde_json::from_slice(&read_fixture("limits-success.json")).unwrap();
+    let ProviderObservation::Measured(reading) = adapter.observe(
+        &test_credential(),
+        &MeterRequest::default(),
+        &MockTransport::ok(200, serde_json::to_vec(&agreeing).unwrap()),
+        &test_clock(),
+    ) else {
+        panic!("matching shapes must parse");
+    };
+    assert_eq!(
+        reading.calibration_applicability,
+        agent_usage_book::meter::anthropic::CalibrationApplicability::CarryOver
+    );
+    assert!(reading.anomalies.is_empty());
+
+    agreeing["limits"][1]["percent"] = serde_json::json!(22.0);
+    let ProviderObservation::Measured(reading) = adapter.observe(
+        &test_credential(),
+        &MeterRequest::default(),
+        &MockTransport::ok(200, serde_json::to_vec(&agreeing).unwrap()),
+        &test_clock(),
+    ) else {
+        panic!("a disagreement still leaves a measured provider response");
+    };
+    assert_eq!(
+        reading.calibration_applicability,
+        agent_usage_book::meter::anthropic::CalibrationApplicability::Inapplicable
+    );
+    assert_eq!(
+        reading.anomalies[0].code,
+        "limits_named_window_disagreement"
     );
 }

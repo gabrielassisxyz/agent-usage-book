@@ -29,11 +29,11 @@ use crate::domain::time::{
 };
 use crate::domain::window::{
     MeterWindow, ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
-    WindowResetState, WindowScope, WindowSemanticKey,
+    WindowResetState, WindowScope, WindowSemanticKey, WindowSeverity,
 };
 use crate::meter::adapter::{
     AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
-    ProviderObservation,
+    ProviderObservation, RequiredWindowKinds,
 };
 use crate::meter::evidence::{
     CapturedProviderResponse, SensitiveResponseMaterial, capture_json_body, capture_json_response,
@@ -59,6 +59,24 @@ pub struct DroppedWindow {
     pub payload_fragment: String,
 }
 
+/// A semantic discrepancy retained with an Anthropic reading instead of being
+/// hidden behind a successful parse.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicAnomaly {
+    pub code: String,
+    pub detail: String,
+}
+
+/// The result of comparing the two Anthropic response shapes used by
+/// calibration. A mismatch makes an old calibration inapplicable to the new
+/// contract; an absent comparison is not evidence either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CalibrationApplicability {
+    NotEvaluated,
+    CarryOver,
+    Inapplicable,
+}
+
 /// The typed observation reading produced by [`AnthropicAdapter`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AnthropicReading {
@@ -66,6 +84,9 @@ pub struct AnthropicReading {
     pub provider_observed_at: Option<ProviderObservedAt>,
     pub extra_usage: Option<AnthropicExtraUsage>,
     pub dropped_windows: Vec<DroppedWindow>,
+    pub anomalies: Vec<AnthropicAnomaly>,
+    pub calibration_applicability: CalibrationApplicability,
+    pub provider_contract_id: ProviderContractId,
 }
 
 impl AnthropicReading {
@@ -75,6 +96,9 @@ impl AnthropicReading {
             provider_observed_at: None,
             extra_usage: None,
             dropped_windows: Vec::new(),
+            anomalies: Vec::new(),
+            calibration_applicability: CalibrationApplicability::NotEvaluated,
+            provider_contract_id: ProviderContractId::new(AnthropicAdapter::DEFAULT_CONTRACT_ID),
         }
     }
 }
@@ -94,8 +118,11 @@ impl Default for AnthropicAdapter {
 impl AnthropicAdapter {
     pub const DEFAULT_ENDPOINT: &'static str = "https://api.anthropic.com/api/oauth/usage";
     pub const ANTHROPIC_BETA_HEADER: &'static str = "oauth-2025-04-20";
-    pub const DEFAULT_CONTRACT_ID: &'static str = "anthropic-oauth-usage-v1";
+    pub const LEGACY_CONTRACT_ID: &'static str = "anthropic-oauth-usage-v1";
+    pub const LIMITS_CONTRACT_ID: &'static str = "anthropic-oauth-usage-limits-v1";
+    pub const DEFAULT_CONTRACT_ID: &'static str = Self::LIMITS_CONTRACT_ID;
     pub const DEFAULT_SEMANTICS_ID: &'static str = "anthropic-subscription-v1";
+    pub const REQUIRED_WINDOW_KINDS: &'static [&'static str] = &["session", "weekly_all"];
 
     pub fn new() -> Self {
         Self::with_endpoint(Self::DEFAULT_ENDPOINT)
@@ -108,7 +135,10 @@ impl AnthropicAdapter {
                 MeasurementBasis::LocallyReceived,
                 ProviderContractId::new(Self::DEFAULT_CONTRACT_ID),
                 MeterSemanticsId::new(Self::DEFAULT_SEMANTICS_ID),
-            ),
+            )
+            .with_required_window_kinds(RequiredWindowKinds::from_values(
+                Self::REQUIRED_WINDOW_KINDS,
+            )),
         }
     }
 
@@ -188,7 +218,22 @@ pub fn parse_anthropic_usage_body(
 /// corrected observation beside the original interpretation.
 pub fn replay_anthropic_capsule(
     capsule: &str,
+    request: &MeterRequest,
+) -> Result<AnthropicReading, FailureClass> {
+    let required = RequiredWindowKinds::from_values(AnthropicAdapter::REQUIRED_WINDOW_KINDS);
+    replay_anthropic_capsule_with_metadata(
+        capsule,
+        request,
+        &required,
+        ProviderContractId::new(AnthropicAdapter::DEFAULT_CONTRACT_ID),
+    )
+}
+
+fn replay_anthropic_capsule_with_metadata(
+    capsule: &str,
     _request: &MeterRequest,
+    required_window_kinds: &RequiredWindowKinds,
+    provider_contract_id: ProviderContractId,
 ) -> Result<AnthropicReading, FailureClass> {
     let val = quota_response_from_capsule(capsule).map_err(|message| {
         if message == "capsule does not contain a quota response" {
@@ -200,6 +245,23 @@ pub fn replay_anthropic_capsule(
 
     let root = val.as_object().ok_or(FailureClass::MalformedBody)?;
 
+    if root.contains_key("limits") {
+        return parse_limits_response(root, required_window_kinds, provider_contract_id);
+    }
+
+    let legacy_contract_id =
+        if provider_contract_id.as_str() == AnthropicAdapter::DEFAULT_CONTRACT_ID {
+            ProviderContractId::new(AnthropicAdapter::LEGACY_CONTRACT_ID)
+        } else {
+            provider_contract_id
+        };
+    parse_legacy_response(root, legacy_contract_id)
+}
+
+fn parse_legacy_response(
+    root: &serde_json::Map<String, serde_json::Value>,
+    provider_contract_id: ProviderContractId,
+) -> Result<AnthropicReading, FailureClass> {
     let five_hour_obj = root
         .get("five_hour")
         .and_then(|v| v.as_object())
@@ -278,7 +340,273 @@ pub fn replay_anthropic_capsule(
         provider_observed_at: None,
         extra_usage,
         dropped_windows,
+        anomalies: Vec::new(),
+        calibration_applicability: CalibrationApplicability::NotEvaluated,
+        provider_contract_id,
     })
+}
+
+fn parse_limits_response(
+    root: &serde_json::Map<String, serde_json::Value>,
+    required_window_kinds: &RequiredWindowKinds,
+    provider_contract_id: ProviderContractId,
+) -> Result<AnthropicReading, FailureClass> {
+    let limits = root
+        .get("limits")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(FailureClass::MissingRequiredField)?;
+    let mut windows = Vec::new();
+    let mut dropped_windows = Vec::new();
+    let mut seen_required = Vec::new();
+
+    for limit in limits {
+        let Some(object) = limit.as_object() else {
+            continue;
+        };
+        let Some(kind) = object.get("kind").and_then(serde_json::Value::as_str) else {
+            continue;
+        };
+        let is_required = required_window_kinds.contains(kind);
+        match kind {
+            "session" | "weekly_all" | "weekly_scoped" => match parse_limit_window(kind, object) {
+                Ok(window) => {
+                    if is_required && !seen_required.iter().any(|seen| *seen == kind) {
+                        seen_required.push(kind);
+                    }
+                    windows.push(window);
+                }
+                Err(error) if is_required => return Err(error.failure_class),
+                Err(error) => dropped_windows.push(DroppedWindow {
+                    semantic_key: WindowSemanticKey::new(kind),
+                    reason: error.failure_class,
+                    field: error.field.to_string(),
+                    payload_fragment: error.payload_fragment,
+                }),
+            },
+            _ => {}
+        }
+    }
+
+    if required_window_kinds
+        .iter()
+        .any(|kind| !seen_required.iter().any(|seen| *seen == kind.as_str()))
+    {
+        return Err(FailureClass::MissingRequiredField);
+    }
+
+    let (anomalies, calibration_applicability) = compare_named_blocks_with_limits(root, &windows);
+    Ok(AnthropicReading {
+        windows,
+        provider_observed_at: None,
+        extra_usage: root.get("extra_usage").and_then(parse_extra_usage),
+        dropped_windows,
+        anomalies,
+        calibration_applicability,
+        provider_contract_id,
+    })
+}
+
+fn parse_limit_window(
+    kind: &str,
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<MeterWindow, WindowParseError> {
+    let fragment = serde_json::to_string(object).unwrap_or_default();
+    let percent = object.get("percent").ok_or_else(|| WindowParseError {
+        field: "percent",
+        payload_fragment: fragment.clone(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
+    let percent = percent.as_f64().ok_or_else(|| WindowParseError {
+        field: "percent",
+        payload_fragment: fragment.clone(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
+    let quota_used = percentage_to_quota(percent, "percent", &fragment)?;
+
+    let severity = object
+        .get("severity")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(WindowSeverity::new)
+        .ok_or_else(|| WindowParseError {
+            field: "severity",
+            payload_fragment: fragment.clone(),
+            failure_class: FailureClass::MissingRequiredField,
+        })?;
+    let is_active = object
+        .get("is_active")
+        .and_then(serde_json::Value::as_bool)
+        .ok_or_else(|| WindowParseError {
+            field: "is_active",
+            payload_fragment: fragment.clone(),
+            failure_class: FailureClass::MissingRequiredField,
+        })?;
+    let reset_state = parse_reset_state(object, &fragment)?;
+    let (key, scope, duration) = match kind {
+        "session" => {
+            require_null_scope(object, &fragment)?;
+            (
+                "session".to_string(),
+                WindowScope::AccountWide,
+                NominalWindowDuration::from_nanos(5 * 3600 * 1_000_000_000),
+            )
+        }
+        "weekly_all" => {
+            require_null_scope(object, &fragment)?;
+            (
+                "weekly_all".to_string(),
+                WindowScope::AccountWide,
+                NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
+            )
+        }
+        "weekly_scoped" => {
+            let model = object
+                .get("scope")
+                .and_then(|value| value.get("model"))
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| WindowParseError {
+                    field: "scope.model",
+                    payload_fragment: fragment.clone(),
+                    failure_class: FailureClass::MissingRequiredField,
+                })?;
+            (
+                format!("weekly_scoped_{model}"),
+                WindowScope::ModelSpecific(ModelId::new(model)),
+                NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
+            )
+        }
+        _ => unreachable!("unknown limit kinds are filtered before parsing"),
+    };
+    let resolution = ReportedResolution::new(QuotaFractionPpm::new(100).unwrap())
+        .expect("100 ppm is a non-zero resolution");
+    Ok(MeterWindow::new_with_facts(
+        WindowSemanticKey::new(key),
+        scope,
+        QuotaUsed::new(quota_used),
+        resolution,
+        QuantizationSemantics::Exact,
+        reset_state,
+        duration,
+        is_active,
+        severity,
+    ))
+}
+
+fn parse_reset_state(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fragment: &str,
+) -> Result<WindowResetState, WindowParseError> {
+    let resets_val = object.get("resets_at").ok_or_else(|| WindowParseError {
+        field: "resets_at",
+        payload_fragment: fragment.to_string(),
+        failure_class: FailureClass::MissingRequiredField,
+    })?;
+    if resets_val.is_null() {
+        return Ok(WindowResetState::NotStarted);
+    }
+    let Some(resets_str) = resets_val.as_str() else {
+        return Err(WindowParseError {
+            field: "resets_at",
+            payload_fragment: fragment.to_string(),
+            failure_class: FailureClass::MissingRequiredField,
+        });
+    };
+    UtcTimestamp::parse_rfc3339(resets_str)
+        .map(WindowResetState::Known)
+        .ok_or_else(|| WindowParseError {
+            field: "resets_at",
+            payload_fragment: fragment.to_string(),
+            failure_class: FailureClass::MissingRequiredField,
+        })
+}
+
+fn require_null_scope(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fragment: &str,
+) -> Result<(), WindowParseError> {
+    if object.get("scope").is_some_and(serde_json::Value::is_null) {
+        Ok(())
+    } else {
+        Err(WindowParseError {
+            field: "scope",
+            payload_fragment: fragment.to_string(),
+            failure_class: FailureClass::MissingRequiredField,
+        })
+    }
+}
+
+fn percentage_to_quota(
+    percentage: f64,
+    field: &'static str,
+    fragment: &str,
+) -> Result<QuotaFractionPpm, WindowParseError> {
+    if !(0.0..=100.0).contains(&percentage) || !percentage.is_finite() {
+        return Err(WindowParseError {
+            field,
+            payload_fragment: fragment.to_string(),
+            failure_class: FailureClass::MissingRequiredField,
+        });
+    }
+    QuotaFractionPpm::new((percentage * 10_000.0).round() as i32).ok_or_else(|| WindowParseError {
+        field,
+        payload_fragment: fragment.to_string(),
+        failure_class: FailureClass::MissingRequiredField,
+    })
+}
+
+fn compare_named_blocks_with_limits(
+    root: &serde_json::Map<String, serde_json::Value>,
+    windows: &[MeterWindow],
+) -> (Vec<AnthropicAnomaly>, CalibrationApplicability) {
+    let Some(five_hour) = root
+        .get("five_hour")
+        .and_then(|value| value.get("utilization"))
+        .and_then(serde_json::Value::as_f64)
+        .and_then(|value| percentage_to_quota(value, "utilization", "").ok())
+    else {
+        return (Vec::new(), CalibrationApplicability::NotEvaluated);
+    };
+    let Some(seven_day) = root
+        .get("seven_day")
+        .and_then(|value| value.get("utilization"))
+        .and_then(serde_json::Value::as_f64)
+        .and_then(|value| percentage_to_quota(value, "utilization", "").ok())
+    else {
+        return (Vec::new(), CalibrationApplicability::NotEvaluated);
+    };
+    let Some(session) = windows
+        .iter()
+        .find(|window| window.semantic_key().as_str() == "session")
+        .map(|window| window.quota_used().as_ppm())
+    else {
+        return (Vec::new(), CalibrationApplicability::NotEvaluated);
+    };
+    let Some(weekly_all) = windows
+        .iter()
+        .find(|window| window.semantic_key().as_str() == "weekly_all")
+        .map(|window| window.quota_used().as_ppm())
+    else {
+        return (Vec::new(), CalibrationApplicability::NotEvaluated);
+    };
+
+    if session == five_hour && weekly_all == seven_day {
+        return (Vec::new(), CalibrationApplicability::CarryOver);
+    }
+
+    (
+        vec![AnthropicAnomaly {
+            code: "limits_named_window_disagreement".to_string(),
+            detail: format!(
+                "limits session={} weekly_all={} disagrees with five_hour={} seven_day={}",
+                session.get(),
+                weekly_all.get(),
+                five_hour.get(),
+                seven_day.get()
+            ),
+        }],
+        CalibrationApplicability::Inapplicable,
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -472,10 +800,24 @@ impl ProviderAdapter for AnthropicAdapter {
         let sensitive = SensitiveResponseMaterial::new([credential.expose(), token.as_str()]);
         let evidence = capture_json_response(&response, &sensitive);
         let observation = match response.status() {
-            200 => match replay_anthropic_capsule(evidence.serialized(), request) {
-                Ok(reading) => ProviderObservation::Measured(reading),
-                Err(failure) => ProviderObservation::Unreachable(failure),
-            },
+            200 => {
+                let default_required =
+                    RequiredWindowKinds::from_values(Self::REQUIRED_WINDOW_KINDS);
+                let required = if self.declarations.required_window_kinds.is_empty() {
+                    &default_required
+                } else {
+                    &self.declarations.required_window_kinds
+                };
+                match replay_anthropic_capsule_with_metadata(
+                    evidence.serialized(),
+                    request,
+                    required,
+                    self.declarations.provider_contract_id.clone(),
+                ) {
+                    Ok(reading) => ProviderObservation::Measured(reading),
+                    Err(failure) => ProviderObservation::Unreachable(failure),
+                }
+            }
             401 => {
                 let reason = parse_401_auth_reason(response.body());
                 ProviderObservation::AuthRequired(reason)
@@ -1040,7 +1382,7 @@ mod tests {
         assert_eq!(decls.measurement_basis, MeasurementBasis::LocallyReceived);
         assert_eq!(
             decls.provider_contract_id.as_str(),
-            "anthropic-oauth-usage-v1"
+            AnthropicAdapter::LIMITS_CONTRACT_ID
         );
         assert_eq!(
             decls.meter_semantics_id.as_str(),

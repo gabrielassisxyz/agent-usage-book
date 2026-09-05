@@ -34,7 +34,7 @@ use agent_usage_book::store::meter_attempt::{
     MeterAttemptRowId, attempt_by_row_id, count_attempts,
 };
 use agent_usage_book::store::meter_evidence::{
-    count_meter_observations, newest_observation_for_account,
+    count_meter_observations, newest_observation_for_account, windows_by_observation,
 };
 use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::migrations::registry;
@@ -47,6 +47,13 @@ use test_support::{ScriptedOutcome, ScriptedResponseBody, SyntheticServer};
 /// A valid Anthropic usage body, so the adapter measures a reading from it.
 const ANTHROPIC_SUCCESS_BODY: &[u8] =
     br#"{"five_hour":{"utilization":10.0,"resets_at":"2026-01-01T00:00:00.000Z"},"seven_day":{"utilization":20.0,"resets_at":"2026-01-08T00:00:00.000Z"}}"#;
+const ANTHROPIC_LIMITS_BODY: &[u8] = br#"{
+    "limits": [
+        {"kind":"session","percent":10.0,"severity":"normal","resets_at":"2026-09-06T17:00:00.000Z","scope":null,"is_active":true},
+        {"kind":"weekly_all","percent":20.0,"severity":"warning","resets_at":"2026-09-08T12:00:00.000Z","scope":null,"is_active":true},
+        {"kind":"weekly_scoped","percent":24.0,"severity":"critical","resets_at":"2026-09-08T12:00:00.000Z","scope":{"model":"sonnet"},"is_active":true}
+    ]
+}"#;
 
 const NAMED_ACCOUNT_AMBIENT_CREDENTIAL: &str = "ambient-credential-must-not-be-used";
 const NAMED_ACCOUNT_AMBIENT_CREDENTIAL_ENV: &str = "AUB_EUN_11_AMBIENT_CREDENTIAL";
@@ -312,6 +319,77 @@ fn one_success_one_auth_failure_one_timeout_persists_three_attempts_one_observat
     measured.stop();
     refused.stop();
     stalled.stop();
+}
+
+/// A real socket sample stores the limits contract and republishes its scoped
+/// constraint, so status has the provider's model-specific cap available.
+#[test]
+fn limits_sample_reaches_the_ledger_and_projection() {
+    let (_scratch, repository) = fixture_repository("limits");
+    let mut server = SyntheticServer::start(vec![ScriptedOutcome::Success(
+        ScriptedResponseBody::json_ok(ANTHROPIC_LIMITS_BODY.to_vec()),
+    )])
+    .unwrap();
+    let accounts = vec![batch_account("limits", format!("{}/usage", server.url()))];
+
+    let report = orchestrator(&repository, MonotonicDuration::from_seconds(30), 1)
+        .run(&accounts)
+        .expect("the limits sample must run");
+    assert!(matches!(
+        &report.accounts[0].disposition,
+        AccountDisposition::Sampled(_)
+    ));
+
+    let conn = open(
+        repository.database_path(),
+        AccessMode::ReadOnly,
+        &busy_policy(),
+    )
+    .unwrap();
+    let account_id = account_id_by_identity(&conn, "anthropic", "limits")
+        .unwrap()
+        .expect("the sampled account must exist");
+    let observation = newest_observation_for_account(&conn, account_id)
+        .unwrap()
+        .expect("the limits response must create an observation");
+    assert_eq!(
+        observation.provider_contract_id.as_str(),
+        AnthropicAdapter::LIMITS_CONTRACT_ID
+    );
+    let windows = windows_by_observation(&conn, observation.row_id).unwrap();
+    assert_eq!(windows.len(), 3);
+    let scoped = windows
+        .iter()
+        .find(|window| window.scope.scoped_model().is_some())
+        .expect("the scoped window must be stored");
+    assert_eq!(scoped.quota_used.as_ppm().get(), 240_000);
+    assert_eq!(scoped.is_active, true);
+    assert_eq!(scoped.severity.as_str(), "critical");
+    drop(conn);
+
+    let projection_path = repository.projection_path();
+    let projection = match agent_usage_book::projection::reader::read_projection(&projection_path) {
+        agent_usage_book::projection::reader::ProjectionRead::Available(projection) => projection,
+        other => panic!("limits sample must publish a readable projection: {other:?}"),
+    };
+    let projected = projection
+        .accounts
+        .iter()
+        .find(|account| account.logical_name == "limits")
+        .and_then(|account| account.last_successful_observation.as_ref())
+        .expect("the projection must retain the limits observation");
+    assert_eq!(
+        projected.provider_contract_id.as_str(),
+        AnthropicAdapter::LIMITS_CONTRACT_ID
+    );
+    assert!(
+        projected
+            .windows
+            .iter()
+            .any(|window| window.semantic_key == "weekly_scoped_sonnet")
+    );
+
+    server.stop();
 }
 
 // --- the hanging provider ------------------------------------------------------

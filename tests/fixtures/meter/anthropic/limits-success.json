@@ -1,0 +1,36 @@
+{
+  "five_hour": {
+    "utilization": 8.0
+  },
+  "seven_day": {
+    "utilization": 21.0
+  },
+  "limits": [
+    {
+      "kind": "session",
+      "percent": 8.0,
+      "severity": "normal",
+      "resets_at": "2026-09-05T17:00:00.000Z",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_all",
+      "percent": 21.0,
+      "severity": "warning",
+      "resets_at": "2026-09-06T12:00:00.000Z",
+      "scope": null,
+      "is_active": true
+    },
+    {
+      "kind": "weekly_scoped",
+      "percent": 24.0,
+      "severity": "critical",
+      "resets_at": "2026-09-06T12:00:00.000Z",
+      "scope": {
+        "model": "sonnet"
+      },
+      "is_active": true
+    }
+  ]
+}

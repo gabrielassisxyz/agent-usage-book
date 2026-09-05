@@ -122,6 +122,8 @@ fn undrainable_bundle(attempt_id: i64) -> PendingTerminalBundle {
             quantization: quantization_sql::as_sql(QuantizationSemantics::Exact).to_owned(),
             resets_at_nanos: Some(5_000),
             nominal_duration_nanos: 18_000_000_000_000,
+            is_active: true,
+            severity: "unknown".into(),
         }],
     }
 }

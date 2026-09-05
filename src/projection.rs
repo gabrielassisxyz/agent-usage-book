@@ -35,8 +35,9 @@ use rusqlite::Connection;
 use serde_json::{Value, json};
 
 use crate::domain::attempt::{AttemptId, AttemptOutcome};
+use crate::domain::ids::ProviderContractId;
 use crate::domain::time::{MeasurementBasis, UtcTimestamp};
-use crate::domain::window::{QuantizationSemantics, WindowResetState, WindowScope};
+use crate::domain::window::{QuantizationSemantics, WindowResetState, WindowScope, WindowSeverity};
 use crate::error::Error;
 use crate::store::ledger_generation::Generation;
 use crate::store::meter_attempt::failure_class_sql;
@@ -57,7 +58,7 @@ pub fn recorded_generation(text: &str) -> Option<u64> {
 /// The schema version of the projection file format, written into every file
 /// so a reader can refuse an older or newer one instead of misreading it.
 /// Bumped only by a format change a reader must be told about.
-pub const PROJECTION_SCHEMA_VERSION: u32 = 1;
+pub const PROJECTION_SCHEMA_VERSION: u32 = 2;
 
 /// The file name of the projection inside the state directory, next to the
 /// ledger it describes. Status locates it from the state directory alone,
@@ -163,6 +164,7 @@ pub struct ProjectedAccount {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SuccessfulObservation {
     pub observation_id: crate::store::meter_evidence::ObservationRowId,
+    pub provider_contract_id: ProviderContractId,
     /// The provider's own measurement timestamp, when it documented one. Part
     /// of the freshness machine's input, alongside `received_at` and the
     /// basis that says which of the two the staleness arithmetic uses.
@@ -182,6 +184,8 @@ pub struct ProjectedWindow {
     pub quantization: QuantizationSemantics,
     pub resets_at: WindowResetState,
     pub nominal_duration_nanos: crate::domain::window::NominalWindowDuration,
+    pub is_active: bool,
+    pub severity: WindowSeverity,
 }
 
 /// The newest attempt of an account: its identity, when it started, the
@@ -240,6 +244,7 @@ impl SuccessfulObservation {
     fn to_json(&self) -> Value {
         json!({
             "observation_id": self.observation_id.value(),
+            "provider_contract_id": self.provider_contract_id.as_str(),
             "provider_observed_at_nanos": self.provider_observed_at.map(|t| t.unix_nanos()),
             "received_at_nanos": self.received_at.unix_nanos(),
             "measurement_basis": measurement_basis_sql::as_sql(self.measurement_basis),
@@ -263,6 +268,8 @@ impl ProjectedWindow {
             "quantization": quantization_sql::as_sql(self.quantization),
             "resets_at_nanos": self.resets_at.instant().map(|ts| ts.unix_nanos()),
             "nominal_duration_nanos": self.nominal_duration_nanos.as_nanos(),
+            "is_active": self.is_active,
+            "severity": self.severity.as_str(),
         })
     }
 }
@@ -442,6 +449,8 @@ mod tests {
             quantization: QuantizationSemantics::RoundedToNearest,
             resets_at: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
             nominal_duration_nanos: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            is_active: true,
+            severity: WindowSeverity::unknown(),
         }
     }
 
@@ -462,6 +471,7 @@ mod tests {
     fn full_projection() -> Projection {
         let success = SuccessfulObservation {
             observation_id: ObservationRowId::new(7),
+            provider_contract_id: ProviderContractId::new("contract-v1"),
             provider_observed_at: Some(UtcTimestamp::from_unix_nanos(3_400)),
             received_at: UtcTimestamp::from_unix_nanos(3_500),
             measurement_basis: MeasurementBasis::ProviderObserved,
@@ -543,6 +553,7 @@ mod tests {
             vec![
                 "measurement_basis",
                 "observation_id",
+                "provider_contract_id",
                 "provider_observed_at_nanos",
                 "received_at_nanos",
                 "windows"
@@ -561,6 +572,7 @@ mod tests {
         assert_eq!(
             window_keys,
             vec![
+                "is_active",
                 "nominal_duration_nanos",
                 "quantization",
                 "quota_used_ppm",
@@ -568,7 +580,8 @@ mod tests {
                 "resets_at_nanos",
                 "scope_kind",
                 "scoped_model",
-                "semantic_key"
+                "semantic_key",
+                "severity"
             ],
             "windows carry the provider's reported values, nothing derived"
         );

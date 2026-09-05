@@ -154,6 +154,32 @@ impl From<UtcTimestamp> for WindowResetState {
     }
 }
 
+/// A provider-reported severity label for a quota constraint.
+///
+/// The provider owns the vocabulary, so the domain preserves the label as a
+/// typed value instead of guessing an enum that would turn a future provider
+/// label into an unmeasured window.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct WindowSeverity(String);
+
+impl WindowSeverity {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn unknown() -> Self {
+        Self::new("unknown")
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn is_unknown(&self) -> bool {
+        self.0 == "unknown"
+    }
+}
+
 /// A normalized provider quota constraint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MeterWindow {
@@ -164,6 +190,8 @@ pub struct MeterWindow {
     quantization: QuantizationSemantics,
     resets_at: WindowResetState,
     nominal_duration: NominalWindowDuration,
+    is_active: bool,
+    severity: WindowSeverity,
 }
 
 impl MeterWindow {
@@ -177,6 +205,33 @@ impl MeterWindow {
         resets_at: impl Into<WindowResetState>,
         nominal_duration: NominalWindowDuration,
     ) -> Self {
+        let resets_at = resets_at.into();
+        let is_active = resets_at.is_known();
+        Self::new_with_facts(
+            semantic_key,
+            scope,
+            quota_used,
+            reported_resolution,
+            quantization,
+            resets_at,
+            nominal_duration,
+            is_active,
+            WindowSeverity::unknown(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_facts(
+        semantic_key: WindowSemanticKey,
+        scope: WindowScope,
+        quota_used: QuotaUsed,
+        reported_resolution: ReportedResolution,
+        quantization: QuantizationSemantics,
+        resets_at: impl Into<WindowResetState>,
+        nominal_duration: NominalWindowDuration,
+        is_active: bool,
+        severity: WindowSeverity,
+    ) -> Self {
         Self {
             semantic_key,
             scope,
@@ -185,6 +240,8 @@ impl MeterWindow {
             quantization,
             resets_at: resets_at.into(),
             nominal_duration,
+            is_active,
+            severity,
         }
     }
 
@@ -218,6 +275,19 @@ impl MeterWindow {
 
     pub fn nominal_duration(&self) -> NominalWindowDuration {
         self.nominal_duration
+    }
+
+    /// Whether the provider marked this constraint active in the response.
+    ///
+    /// This is a provider fact, not the display-selection rule. In particular,
+    /// [`lowest_remaining_fraction_window`] still considers every applicable
+    /// window whose reset state is current.
+    pub fn is_active(&self) -> bool {
+        self.is_active
+    }
+
+    pub fn severity(&self) -> &WindowSeverity {
+        &self.severity
     }
 
     /// True before the provider's stated reset instant. At that instant this reading
@@ -372,6 +442,27 @@ mod tests {
                 .as_str(),
             "model"
         );
+    }
+
+    #[test]
+    fn display_selection_does_not_use_provider_activity_as_a_filter() {
+        let model = ModelId::new("model-a");
+        let inactive_tight_window = MeterWindow::new_with_facts(
+            WindowSemanticKey::new("inactive-tight"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(900_000).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Exact,
+            UtcTimestamp::from_unix_nanos(100),
+            NominalWindowDuration::from_nanos(1_000),
+            false,
+            WindowSeverity::new("critical"),
+        );
+        let windows = [inactive_tight_window];
+        let selected = lowest_remaining_fraction_window(&windows, &model)
+            .expect("an applicable inactive provider window remains a measured constraint");
+        assert_eq!(selected.semantic_key().as_str(), "inactive-tight");
+        assert!(!selected.is_active());
     }
 
     #[test]
