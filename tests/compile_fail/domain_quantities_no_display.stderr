@@ -119,15 +119,15 @@ error[E0277]: `QuotaRemaining` doesn't implement `std::fmt::Display`
     = help: the trait `std::fmt::Display` is not implemented for `QuotaRemaining`
     = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
-error[E0277]: `PercentagePoints` doesn't implement `std::fmt::Display`
+error[E0277]: `agent_usage_book::domain::quota::PercentagePoints` doesn't implement `std::fmt::Display`
    --> tests/compile_fail/domain_quantities_no_display.rs:116:20
     |
 116 |     println!("{}", percentage_points());
-    |               --   ^^^^^^^^^^^^^^^^^^^ `PercentagePoints` cannot be formatted with the default formatter
+    |               --   ^^^^^^^^^^^^^^^^^^^ `agent_usage_book::domain::quota::PercentagePoints` cannot be formatted with the default formatter
     |               |
     |               required by this formatting parameter
     |
-    = help: the trait `std::fmt::Display` is not implemented for `PercentagePoints`
+    = help: the trait `std::fmt::Display` is not implemented for `agent_usage_book::domain::quota::PercentagePoints`
     = note: in format strings you may be able to use `{:?}` (or {:#?} for pretty-print) instead
 
 error[E0277]: `MoneyPerMillionTokens<agent_usage_book::domain::money::Usd>` doesn't implement `std::fmt::Display`

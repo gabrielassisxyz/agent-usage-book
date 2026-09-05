@@ -166,13 +166,13 @@ note: if you're trying to build a new `QuotaRemaining`, consider using `QuotaRem
    |     pub fn new(ppm: QuotaFractionPpm) -> Self {
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0599]: no associated function or constant named `default` found for struct `PercentagePoints` in the current scope
+error[E0599]: no associated function or constant named `default` found for struct `agent_usage_book::domain::quota::PercentagePoints` in the current scope
   --> tests/compile_fail/domain_quantities_no_default.rs:32:31
    |
 32 |     let _ = PercentagePoints::default();
-   |                               ^^^^^^^ associated function or constant not found in `PercentagePoints`
+   |                               ^^^^^^^ associated function or constant not found in `agent_usage_book::domain::quota::PercentagePoints`
    |
-note: if you're trying to build a new `PercentagePoints`, consider using `PercentagePoints::new` which returns `Option<PercentagePoints>`
+note: if you're trying to build a new `agent_usage_book::domain::quota::PercentagePoints`, consider using `agent_usage_book::domain::quota::PercentagePoints::new` which returns `Option<agent_usage_book::domain::quota::PercentagePoints>`
   --> src/domain/quota.rs
    |
    |     pub fn new(value: i32) -> Option<Self> {
