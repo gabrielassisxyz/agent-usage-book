@@ -361,13 +361,22 @@ mod tests {
             );
         }
 
-        if tracker_membership_skipped {
-            let tracker_path = format!("{manifest_dir}/.beads/issues.jsonl");
+        // The marker reports that tracker membership was NOT verified in this run, and the
+        // condition for that is the tracker file's absence rather than a row having needed it.
+        // Keying it on `tracker_membership_skipped` alone made it disappear the moment the table
+        // reached zero unenforced rows, because the flag is only ever set inside the match arm for
+        // an unenforced row whose bead could not be looked up. That state is not hypothetical: it
+        // is the table's state since aub-hhdo, and it is invisible on any developer machine because
+        // .beads/issues.jsonl is gitignored and present locally while absent on the runner. Two
+        // commits reached main red that way (aub-ju53).
+        let tracker_path = format!("{manifest_dir}/.beads/issues.jsonl");
+        let tracker_absent = !std::path::Path::new(&tracker_path).exists();
+        if tracker_membership_skipped || tracker_absent {
             eprintln!(
                 "{INVARIANT_TRACKER_MEMBERSHIP_SKIPPED_MARKER} \
                  every_invariant_names_existing_file_and_test_or_open_tracker_bead: \
-                 {tracker_path} absent (gitignored, machine-local); skipping the \
-                 tracker-membership check for unenforced rows in this run"
+                 {tracker_path} absent (gitignored, machine-local); tracker membership was \
+                 not verified in this run ({unenforced_count} unenforced row(s) present)"
             );
         }
 
