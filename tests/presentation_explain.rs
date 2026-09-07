@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent_usage_book::domain::attempt::AttemptId;
+use agent_usage_book::domain::burn_rate::BurnRate;
 use agent_usage_book::domain::freshness::{Freshness, Observed};
 use agent_usage_book::domain::ids::ProviderContractId;
 use agent_usage_book::domain::provenance::{
@@ -31,6 +32,7 @@ use agent_usage_book::report::{
     IngestSummary, LedgerGeneration, MeterAccount, MeterExplanation, MeterReadingProvenance,
     MeterWindowExplanation, ProvenanceGraph, ProvenanceNode, ReportField, ReportMetadata,
     SpendGroup, SpendGroupProvenance, SpendReport, StatusReport, Unit, ValueArithmetic,
+    WindowBurnRate,
 };
 
 fn test_metadata() -> ReportMetadata {
@@ -172,6 +174,61 @@ fn meter_explain_names_legacy_and_limits_contracts() {
         );
         assert!(rendered.contains(&format!("provider contract: {contract}")));
     }
+}
+
+/// `--explain=full` names the observation instant the limiting window's burn
+/// rate was derived from, and prints the rate. `--explain` (summary) does not.
+#[test]
+fn explain_full_names_the_burn_rate_and_its_observation_instant() {
+    let account = MeterAccount::new(
+        LogicalName::new("primary"),
+        Freshness::Fresh {
+            observed: observed_reading(500_000),
+            latest_attempt: AttemptId::new(1),
+        },
+    )
+    .with_meter_explanation(MeterExplanation {
+        provider_contract_id: ProviderContractId::new("anthropic-oauth-usage-limits-v1"),
+        windows: vec![MeterWindowExplanation {
+            semantic_key: "session".to_string(),
+            scope: WindowScope::AccountWide,
+            is_active: true,
+            severity: WindowSeverity::new("normal"),
+        }],
+    })
+    .with_burn_rate(WindowBurnRate {
+        rate: BurnRate::from_window(400_000, Some(0.2)),
+        capped_at: None,
+        derived_from: UtcTimestamp::from_unix_nanos(1_234),
+    });
+    let report = StatusReport::new(
+        test_metadata(),
+        vec![account],
+        vec![],
+        agent_usage_book::report::ProjectionReadState::Read,
+    );
+
+    let full = render_status_report_with_explain(
+        &report,
+        UtcTimestamp::from_unix_nanos(2_000),
+        test_envelope(),
+        ExplainMode::Full,
+    );
+    assert!(
+        full.contains("burn rate: 2.00x, from observation received_at=1234"),
+        "explain=full names the rate and the instant it was read from: {full}"
+    );
+
+    let summary = render_status_report_with_explain(
+        &report,
+        UtcTimestamp::from_unix_nanos(2_000),
+        test_envelope(),
+        ExplainMode::Summary,
+    );
+    assert!(
+        !summary.contains("burn rate:"),
+        "the burn-rate line is a full-explain detail, not a summary one: {summary}"
+    );
 }
 
 fn seed_spend_report() -> SpendReport {

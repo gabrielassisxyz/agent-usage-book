@@ -11,6 +11,7 @@ use crate::attribution::account_segment::AccountEvidenceClass;
 use crate::config::CoverageFloor;
 use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
+use crate::domain::burn_rate::BurnRate;
 use crate::domain::credits::Credits;
 use crate::domain::freshness::Freshness;
 use crate::domain::ids::{NativeRunId, ProviderContractId};
@@ -126,6 +127,10 @@ pub struct MeterAccount {
     /// Provider facts available to the explain renderer for a projected
     /// observation. This is absent for reports assembled without meter state.
     pub meter_explanation: Option<MeterExplanation>,
+    /// The burn rate of the limiting window, when the reading was computed from
+    /// a projection observation with a window that has a `Known` reset. Absent
+    /// for a reading with no window context.
+    pub burn_rate: Option<WindowBurnRate>,
 }
 
 impl MeterAccount {
@@ -137,6 +142,7 @@ impl MeterAccount {
             included_scopes: Vec::new(),
             selected_model: None,
             meter_explanation: None,
+            burn_rate: None,
         }
     }
 
@@ -156,11 +162,19 @@ impl MeterAccount {
             included_scopes,
             selected_model,
             meter_explanation: None,
+            burn_rate: None,
         }
     }
 
     pub fn with_meter_explanation(mut self, explanation: MeterExplanation) -> Self {
         self.meter_explanation = Some(explanation);
+        self
+    }
+
+    /// Attaches the limiting window's burn rate. A reading with no window
+    /// context keeps the [`MeterAccount::new`] default of `None`.
+    pub fn with_burn_rate(mut self, burn_rate: WindowBurnRate) -> Self {
+        self.burn_rate = Some(burn_rate);
         self
     }
 }
@@ -188,6 +202,22 @@ pub struct LimitingWindow {
     pub scope: WindowScope,
     pub nominal_duration: NominalWindowDuration,
     pub reset_state: WindowResetState,
+}
+
+/// The burn rate of the account's limiting window.
+///
+/// `rate` is the ratio to render, or `None` when the window has not started,
+/// when too little of it has elapsed to divide by, or when it has capped and
+/// the freeze instant is not available to the status path. `capped_at` names
+/// the instant the window first reached its cap in the current reset cycle;
+/// when it is `Some`, `rate` is the ratio as of that instant, frozen, not as of
+/// now. `derived_from` is the `received_at` of the observation the rate was
+/// read from, named by `--explain=full`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WindowBurnRate {
+    pub rate: Option<BurnRate>,
+    pub capped_at: Option<UtcTimestamp>,
+    pub derived_from: UtcTimestamp,
 }
 
 /// Whether the status command could read the projection, and why not when it

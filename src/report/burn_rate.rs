@@ -43,7 +43,7 @@ pub fn elapsed_fraction(
 /// The live burn rate of a window from its single current observation.
 ///
 /// `None` for a `NotStarted` window, for a sub-1%-elapsed window that is not
-/// capped, and — deliberately — for a window already at its cap: a capped
+/// capped, and (deliberately) for a window already at its cap: a capped
 /// window's rate is the one frozen when it capped ([`frozen_burn_rate`]), which
 /// needs the observation series, and recomputing it at `now` would decay it
 /// toward `1.00x`. `aub status` reads only the projection's latest observation,

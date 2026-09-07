@@ -12,21 +12,30 @@
 //! quantities it needs no coverage, freshness or precision context to be read,
 //! which is why it carries its own `Display` (`Nx`) instead of routing through a
 //! presentation helper. `docs/domain-quantity-inventory.md` records that
-//! deviation.
+//! deviation. The representation is fixed point in millionths of `x`, the same
+//! parts-per-million idiom `QuotaFractionPpm` and `PercentagePoints` use, so the
+//! type is `Eq` and `Ord` and slots into a report model without forcing a float.
 
 use std::fmt;
 
 /// A window burn rate: a finite, non-negative ratio of quota-used fraction to
-/// elapsed-window fraction.
+/// elapsed-window fraction, stored as millionths of `x`.
 ///
-/// Private representation with a checked constructor: a negative or non-finite
-/// candidate never becomes a `BurnRate`.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub struct BurnRate(f64);
+/// Private representation with a checked constructor: a negative, non-finite or
+/// absurdly large candidate never becomes a `BurnRate`.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+pub struct BurnRate(u64);
 
 impl BurnRate {
+    /// Millionths of `x` per whole `x`.
+    const MICRO_PER_X: u64 = 1_000_000;
+
     /// The parts-per-million value a window's `quota_used` reaches at its cap.
     const CAP_PPM: u32 = 1_000_000;
+
+    /// The largest ratio [`Self::new`] accepts, in whole `x`. A burn rate beyond
+    /// this is a computation bug, not a fast window.
+    const MAX_X: f64 = 1_000_000.0;
 
     /// The smallest elapsed fraction that yields a rate for a window that is not
     /// yet capped. Below this the divisor is so small that the rate is dominated
@@ -35,19 +44,37 @@ impl BurnRate {
     /// instant is meaningful however little of the window had elapsed.
     pub const MIN_ELAPSED_FRACTION: f64 = 0.01;
 
-    /// The largest rate that renders as `<0.01x` rather than as `0.00x`, so a
-    /// tiny but non-zero rate is never shown as no consumption at all. The
-    /// interval is open: exactly `0.005` renders as `0.01x`.
-    const NEAR_ZERO_DISPLAY_CEILING: f64 = 0.005;
+    /// Millionths of `x` below which a non-zero rate renders as `<0.01x` rather
+    /// than as `0.00x`. `0.005x` exactly (`5_000`) is above it and renders as
+    /// `0.01x`.
+    const NEAR_ZERO_MICRO: u64 = 5_000;
 
-    /// Constructs a rate, rejecting a negative or non-finite candidate.
+    /// Constructs a rate, rejecting a negative, non-finite or absurdly large
+    /// candidate.
     pub fn new(value: f64) -> Option<Self> {
-        (value.is_finite() && value >= 0.0).then_some(Self(value))
+        if !value.is_finite() || !(0.0..=Self::MAX_X).contains(&value) {
+            return None;
+        }
+        Some(Self((value * Self::MICRO_PER_X as f64).round() as u64))
     }
 
-    /// The raw ratio.
+    /// The ratio as a floating-point value.
     pub fn get(self) -> f64 {
+        self.0 as f64 / Self::MICRO_PER_X as f64
+    }
+
+    /// The ratio in millionths of `x`, the exact stored value.
+    pub fn micro_x(self) -> u64 {
         self.0
+    }
+
+    /// An exact decimal string of the ratio, for a JSON value: `"2.000000"`.
+    pub fn as_decimal_string(self) -> String {
+        format!(
+            "{}.{:06}",
+            self.0 / Self::MICRO_PER_X,
+            self.0 % Self::MICRO_PER_X
+        )
     }
 
     /// The rate of a window from its used parts-per-million and the fraction of
@@ -72,16 +99,16 @@ impl BurnRate {
     }
 }
 
-/// Two decimals and an `x` suffix (`0.88x`). A rate in the open interval
-/// `(0, 0.005)` renders as `<0.01x` so a real but tiny burn is never shown as
-/// `0.00x`; a rate of exactly zero renders as `0.00x`.
+/// Two decimals and an `x` suffix (`0.88x`), rounding half up. A rate in the
+/// open interval `(0, 0.005)` renders as `<0.01x` so a real but tiny burn is
+/// never shown as `0.00x`; a rate of exactly zero renders as `0.00x`.
 impl fmt::Display for BurnRate {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.0 > 0.0 && self.0 < Self::NEAR_ZERO_DISPLAY_CEILING {
-            write!(f, "<0.01x")
-        } else {
-            write!(f, "{:.2}x", self.0)
+        if self.0 > 0 && self.0 < Self::NEAR_ZERO_MICRO {
+            return write!(f, "<0.01x");
         }
+        let hundredths = (self.0 + 5_000) / 10_000;
+        write!(f, "{}.{:02}x", hundredths / 100, hundredths % 100)
     }
 }
 
@@ -102,12 +129,13 @@ mod tests {
     }
 
     #[test]
-    fn construction_rejects_negative_and_non_finite() {
+    fn construction_rejects_negative_non_finite_and_absurd() {
         assert!(BurnRate::new(0.0).is_some());
         assert!(BurnRate::new(4.06).is_some());
         assert!(BurnRate::new(-0.001).is_none());
         assert!(BurnRate::new(f64::NAN).is_none());
         assert!(BurnRate::new(f64::INFINITY).is_none());
+        assert!(BurnRate::new(2_000_000.0).is_none());
     }
 
     #[test]
@@ -129,7 +157,7 @@ mod tests {
     fn from_window_applies_the_elapsed_guard_unless_capped() {
         // 40% used at 20% elapsed is 2.00x.
         let rate = BurnRate::from_window(400_000, Some(0.2)).unwrap();
-        assert!((rate.get() - 2.0).abs() < 1e-9);
+        assert_eq!(rate.to_string(), "2.00x");
 
         // Below 1% elapsed and not capped: no rate.
         assert!(BurnRate::from_window(400_000, Some(0.004)).is_none());
@@ -145,22 +173,30 @@ mod tests {
     }
 
     #[test]
+    fn decimal_string_is_exact_fixed_point() {
+        assert_eq!(BurnRate::new(2.0).unwrap().as_decimal_string(), "2.000000");
+        assert_eq!(
+            BurnRate::new(0.004).unwrap().as_decimal_string(),
+            "0.004000"
+        );
+    }
+
+    #[test]
     fn from_window_is_finite_non_negative_and_monotonic_over_the_sample() {
         for sample in sample_fractions().take(64) {
             let elapsed = 0.01 + sample * 0.99; // [0.01, 1.0]
-            let mut previous: Option<f64> = None;
+            let mut previous: Option<u64> = None;
             for used_ppm in (0..=1_000_000).step_by(25_000) {
                 let rate = BurnRate::from_window(used_ppm, Some(elapsed))
-                    .expect("a fraction in [0.01, 1.0] always yields a rate")
-                    .get();
-                assert!(rate.is_finite() && rate >= 0.0);
+                    .expect("a fraction in [0.01, 1.0] always yields a rate");
+                assert!(rate.get().is_finite() && rate.get() >= 0.0);
                 if let Some(previous) = previous {
                     assert!(
-                        rate >= previous - 1e-12,
+                        rate.micro_x() >= previous,
                         "rate must not decrease as used_ppm grows at a fixed elapsed fraction"
                     );
                 }
-                previous = Some(rate);
+                previous = Some(rate.micro_x());
             }
         }
     }

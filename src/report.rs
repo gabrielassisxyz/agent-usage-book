@@ -40,7 +40,8 @@ pub use models::{
     SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
     SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, StatusReport,
     TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
-    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowEquivalentDerivation, WindowEquivalentValue,
+    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowBurnRate, WindowEquivalentDerivation,
+    WindowEquivalentValue,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 
