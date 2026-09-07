@@ -338,6 +338,17 @@ fn the_grid_columns_line_up_and_the_model_row_follows_the_weekly_one() {
     let width = rows[0].chars().count();
     for row in &rows {
         assert_eq!(row.chars().count(), width, "row width drift: {row:?}");
+        // The fixed column starts: 4 indent + 8 label + 1 space, so the bar's
+        // first cell is at char 13 on every row, whatever the label.
+        let bar_start = row.chars().position(|c| c == '\u{2501}' || c == '\u{2500}');
+        assert_eq!(bar_start, Some(13), "bar column start drifted: {row:?}");
+        // The 30-cell bar ends at char 42, and a space separates it from the
+        // percent column, so char 43 is that space on every row.
+        assert_eq!(
+            row.chars().nth(43),
+            Some(' '),
+            "percent column start drifted: {row:?}"
+        );
     }
     assert!(rows[0].trim_start().starts_with("5h"));
     assert!(rows[1].trim_start().starts_with("week"));
