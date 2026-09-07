@@ -3276,6 +3276,11 @@ fn projection_accounts(
                         derived_from: observation.received_at,
                     })
                 });
+                // Every window of the account shares the observation freshness
+                // the reading was computed under; it rides onto each grid row
+                // so a row renderer never reaches back to the account.
+                let observation_freshness = reading.freshness.clone();
+                let provider = account.provider.clone();
                 let account = MeterAccount::from_projection(
                     LogicalName::new(account.name.clone()),
                     reading.freshness,
@@ -3288,32 +3293,54 @@ fn projection_accounts(
                         }),
                     reading.included_scopes,
                     model_selector.map(crate::domain::window::ModelId::new),
-                );
+                )
+                .with_provider(provider);
                 let account = match burn_rate {
                     Some(burn_rate) => account.with_burn_rate(burn_rate),
                     None => account,
                 };
                 match projected.and_then(|account| account.last_successful_observation.as_ref()) {
                     Some(success) => {
-                        account.with_meter_explanation(crate::report::MeterExplanation {
-                            provider_contract_id: success.provider_contract_id.clone(),
-                            windows: success
-                                .windows
-                                .iter()
-                                .map(|window| crate::report::MeterWindowExplanation {
-                                    semantic_key: window.semantic_key.clone(),
-                                    scope: window.scope.clone(),
-                                    is_active: window.is_active,
-                                    severity: window.severity.clone(),
-                                    rate: crate::report::burn_rate::live_burn_rate(
-                                        window.quota_used_ppm,
-                                        window.resets_at,
-                                        window.nominal_duration_nanos,
-                                        clock.now(),
-                                    ),
-                                })
-                                .collect(),
-                        })
+                        let status_windows = success
+                            .windows
+                            .iter()
+                            .map(|window| crate::report::StatusWindow {
+                                semantic_key: window.semantic_key.clone(),
+                                scope: window.scope.clone(),
+                                quota_used: window.quota_used_ppm,
+                                reset_state: window.resets_at,
+                                nominal_duration: window.nominal_duration_nanos,
+                                rate: crate::report::burn_rate::live_burn_rate(
+                                    window.quota_used_ppm,
+                                    window.resets_at,
+                                    window.nominal_duration_nanos,
+                                    clock.now(),
+                                ),
+                                capped_at: None,
+                                observation: observation_freshness.clone(),
+                            })
+                            .collect();
+                        account.with_windows(status_windows).with_meter_explanation(
+                            crate::report::MeterExplanation {
+                                provider_contract_id: success.provider_contract_id.clone(),
+                                windows: success
+                                    .windows
+                                    .iter()
+                                    .map(|window| crate::report::MeterWindowExplanation {
+                                        semantic_key: window.semantic_key.clone(),
+                                        scope: window.scope.clone(),
+                                        is_active: window.is_active,
+                                        severity: window.severity.clone(),
+                                        rate: crate::report::burn_rate::live_burn_rate(
+                                            window.quota_used_ppm,
+                                            window.resets_at,
+                                            window.nominal_duration_nanos,
+                                            clock.now(),
+                                        ),
+                                    })
+                                    .collect(),
+                            },
+                        )
                     }
                     None => account,
                 }

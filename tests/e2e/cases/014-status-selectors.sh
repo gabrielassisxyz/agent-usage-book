@@ -89,10 +89,12 @@ case_steps() {
 
 case_assertions() {
     # Step 1: the selector renders exactly the configured account it names.
-    # No model selector is given, so every window applies, and the unrelated
-    # model's 95%-used weekly window is the account's most constrained fact.
+    # No model selector is given, so every window is a grid row: the 5h
+    # account-wide window at 50% used and both models' weekly windows.
     assert_exit 0 1
-    assert_stdout_contains 1 "aub research 5% left · 7d"
+    assert_stdout_contains 1 "  research  provider-a"
+    assert_stdout_contains 1 " 50% "
+    assert_stdout_contains 1 " 95% "
 
     # Step 2: both accounts, each limited by the chosen model's weekly window;
     # the unrelated model's window is excluded by name.

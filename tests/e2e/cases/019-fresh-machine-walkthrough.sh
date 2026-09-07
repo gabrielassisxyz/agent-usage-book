@@ -122,7 +122,8 @@ case_assertions() {
     # tracked (a recorded, if unreachable, attempt exists) instead of the
     # degraded question mark step 2 rendered before any sample ran.
     assert_exit 0 5
-    assert_stdout_contains 5 "aub work-primary ? · stale · timeout"
+    assert_stdout_contains 5 "work-primary  anthropic"
+    assert_stdout_contains 5 "? · stale · timeout"
 
     # Step 6: the archive is created and verified the moment it is written.
     assert_exit 0 6

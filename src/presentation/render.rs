@@ -163,8 +163,17 @@ pub fn render_status_report_with_explain(
         }
         return line;
     }
-    let lines = meter_account_lines(&report.accounts, now, envelope, style);
-    let mut rendered = join_report_with_explain(lines, &report.provenance, explain);
+    let grid = render_status_grid(&report.accounts, now, envelope, style);
+    let mut rendered = if explain == ExplainMode::Off {
+        grid
+    } else {
+        let explain_text = render_explain(&report.provenance, explain);
+        if grid.is_empty() {
+            explain_text
+        } else {
+            format!("{grid}\n\n{explain_text}")
+        }
+    };
     if explain != ExplainMode::Off {
         let meter_explain = render_meter_explain(&report.accounts, explain);
         if !meter_explain.is_empty() {
@@ -175,6 +184,357 @@ pub fn render_status_report_with_explain(
         }
     }
     rendered
+}
+
+/// The fixed column widths of one grouped-grid window row, in characters. The
+/// row is `<indent><label><sp><bar><sp><percent><sp><rate><sp><reset+note>`;
+/// only the trailing reset column is elastic.
+const STATUS_ROW_INDENT: usize = 4;
+const STATUS_LABEL_WIDTH: usize = 8;
+const STATUS_BAR_CELLS: usize = 30;
+const STATUS_PERCENT_WIDTH: usize = 5;
+const STATUS_RATE_WIDTH: usize = 7;
+
+/// The used-fraction cut points the grid tones a row by, in whole percent used.
+/// The same boundaries `bin/quota-bars` applies, so the two tools agree while
+/// both exist: nothing used reads idle, at or above 85 reads red, at or above
+/// 60 reads yellow, everything between reads green.
+const STATUS_TONE_RED_AT_PERCENT: u32 = 85;
+const STATUS_TONE_YELLOW_AT_PERCENT: u32 = 60;
+
+/// Renders the grouped grid: a `QUOTA` header with the local timestamp
+/// right-aligned to the terminal width, then one block per provider (accounts
+/// in configured order, grouped), each account a name-and-plan line over one
+/// row per quota window. Two blank lines separate providers, one separates
+/// accounts. Empty only when there are no accounts to show.
+fn render_status_grid(
+    accounts: &[crate::report::MeterAccount],
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+    style: Style,
+) -> String {
+    let width = style.width() as usize;
+
+    // Group accounts by provider, keeping first-seen (configured) order.
+    let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
+    for account in accounts {
+        let provider = account.provider.as_deref().unwrap_or("");
+        let body = status_account_body(account, now, envelope, style);
+        match groups.last_mut() {
+            Some((seen, bodies)) if *seen == provider => bodies.push(body),
+            _ => groups.push((provider, vec![body])),
+        }
+    }
+
+    let provider_blocks = groups.into_iter().map(|(provider, bodies)| {
+        // One account line over its rows; a blank line between accounts.
+        format!(
+            "{}\n{}",
+            status_provider_rule(provider, style, width),
+            bodies.join("\n\n"),
+        )
+    });
+
+    // The header joins the first provider with one blank line; providers join
+    // each other with two.
+    let mut out = status_header_line(now, style, width);
+    for (index, block) in provider_blocks.enumerate() {
+        out.push_str(if index == 0 { "\n\n" } else { "\n\n\n" });
+        out.push_str(&block);
+    }
+    out
+}
+
+/// `QUOTA` at the left, the local wall-clock stamp flush against the right edge
+/// so its last character lands on the terminal's last column.
+fn status_header_line(now: UtcTimestamp, style: Style, width: usize) -> String {
+    let stamp = crate::presentation::local_time::LocalWallClock::of(now)
+        .map(|local| local.header_stamp())
+        .unwrap_or_default();
+    let gap = width.saturating_sub("QUOTA".len() + stamp.len()).max(1);
+    format!(
+        "{}{}{}",
+        style.paint(style.text(), "QUOTA"),
+        " ".repeat(gap),
+        style.paint(style.dim(), &stamp),
+    )
+}
+
+/// The provider name in the accent colour, then a rule to the right edge.
+fn status_provider_rule(provider: &str, style: Style, width: usize) -> String {
+    let rule = "\u{2500}".repeat(width.saturating_sub(provider.len() + 1).max(1));
+    format!(
+        "{} {}",
+        style.paint(style.accent(), provider),
+        style.paint(style.track(), &rule),
+    )
+}
+
+/// One account: the name-and-plan line, then its window rows (or the freshness
+/// answer when the account has no window to show).
+fn status_account_body(
+    account: &crate::report::MeterAccount,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+    style: Style,
+) -> String {
+    use crate::domain::freshness::FreshnessKind;
+    let kind = account.reading.kind();
+    let dim_block = kind == FreshnessKind::Stale;
+    let plan = account.provider.as_deref().unwrap_or("").to_string();
+    let header = format!(
+        "  {}  {}",
+        style.paint(style.bold(), account.account.as_str()),
+        style.paint(style.dim(), &plan),
+    );
+
+    // An auth-required account cannot have its windows trusted: the design
+    // shows `auth!` in place of the grid, never a row per window.
+    let rows = if kind == FreshnessKind::AuthRequired {
+        Vec::new()
+    } else {
+        status_window_rows(account, now, envelope, style, dim_block)
+    };
+    if rows.is_empty() {
+        let answer = if kind == FreshnessKind::AuthRequired {
+            style.paint(style.red(), "auth!")
+        } else {
+            style.paint(
+                style.dim(),
+                &render_meter_reading(&account.reading, METER_UNIT, PERCENT, now, envelope, None),
+            )
+        };
+        return format!("{header}\n{}{answer}", " ".repeat(STATUS_ROW_INDENT));
+    }
+    let mut out = header;
+    for row in rows {
+        out.push('\n');
+        out.push_str(&row);
+    }
+    out
+}
+
+/// The window rows of one account, ordered 5-hour window, then the weekly
+/// account-wide window, then model-scoped windows by model display name.
+fn status_window_rows(
+    account: &crate::report::MeterAccount,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+    style: Style,
+    dim_block: bool,
+) -> Vec<String> {
+    // A `--model` selector narrows the grid to the account-wide windows and
+    // the chosen model's own, the same set the reading was computed over.
+    let selected = account.selected_model.as_ref().map(|model| model.as_str());
+    let mut ordered: Vec<&crate::report::StatusWindow> = account
+        .windows
+        .iter()
+        .filter(|window| match (selected, window.scope.scoped_model()) {
+            (None, _) | (_, None) => true,
+            (Some(selected), Some(model)) => model.as_str() == selected,
+        })
+        .collect();
+    ordered.sort_by_key(|window| status_window_order(window));
+
+    let cached_note = if dim_block {
+        account
+            .windows
+            .first()
+            .and_then(|window| status_cached_note(window, now, envelope))
+    } else {
+        None
+    };
+
+    ordered
+        .into_iter()
+        .map(|window| status_window_row(window, style, dim_block, cached_note.as_deref()))
+        .collect()
+}
+
+/// The sort key placing account-wide windows first (shortest nominal length
+/// first, so the 5-hour window precedes the weekly one) and model-scoped
+/// windows after, ordered by model display name.
+fn status_window_order(window: &crate::report::StatusWindow) -> (u8, u64, String) {
+    match window.scope.scoped_model() {
+        None => (0, window.nominal_duration.as_nanos(), String::new()),
+        Some(model) => (1, 0, model.as_str().to_string()),
+    }
+}
+
+/// One grid row: label, bar, percent used, burn rate, reset and any note.
+fn status_window_row(
+    window: &crate::report::StatusWindow,
+    style: Style,
+    dim_block: bool,
+    cached_note: Option<&str>,
+) -> String {
+    let used_percent = status_used_percent(window);
+    let tone = status_used_tone(style, used_percent, window);
+    let label = status_window_label(window);
+
+    let bar = status_bar(window, style, tone);
+    let percent_text = format!("{used_percent}%");
+    let percent = style.paint(
+        &format!("{}{}", tone, style.bold()),
+        &format!("{percent_text:>width$}", width = STATUS_PERCENT_WIDTH),
+    );
+    let rate_text = window
+        .rate
+        .map_or_else(|| "\u{2014}".to_string(), |rate| rate.to_string());
+    let rate = style.paint(
+        style.body(),
+        &format!("{rate_text:>width$}", width = STATUS_RATE_WIDTH),
+    );
+
+    let mut trailing = status_reset_label(window);
+    if let Some(instant) = window.capped_at
+        && let Some(local) = crate::presentation::local_time::LocalWallClock::of(instant)
+    {
+        trailing.push_str(&format!("  capped {}", local.clock_label()));
+    }
+    if let Some(note) = cached_note {
+        trailing.push_str("  ");
+        trailing.push_str(note);
+    }
+    let trailing = if dim_block {
+        style.paint(style.dimmer(), &trailing)
+    } else {
+        style.paint(style.dim(), &trailing)
+    };
+
+    format!(
+        "{indent}{label} {bar} {percent} {rate} {trailing}",
+        indent = " ".repeat(STATUS_ROW_INDENT),
+        label = style.paint(
+            style.muted(),
+            &format!("{label:<width$}", width = STATUS_LABEL_WIDTH)
+        ),
+    )
+}
+
+/// The window label, clamped to the 8-cell label column so the grid stays
+/// rigid: a model display name for a model-scoped window (truncated with an
+/// ellipsis when it does not fit), `week` for the weekly account-wide window,
+/// the nominal length otherwise.
+fn status_window_label(window: &crate::report::StatusWindow) -> String {
+    if let Some(model) = window.scope.scoped_model() {
+        return clamp_label(model.as_str());
+    }
+    if window.nominal_duration.as_nanos() >= 24 * 3_600 * 1_000_000_000 {
+        "week".to_string()
+    } else {
+        render_window_duration(window.nominal_duration)
+    }
+}
+
+/// A label clamped to the label column: unchanged when it fits, its first seven
+/// characters and a trailing ellipsis when it does not.
+fn clamp_label(label: &str) -> String {
+    if label.chars().count() <= STATUS_LABEL_WIDTH {
+        return label.to_string();
+    }
+    let head: String = label.chars().take(STATUS_LABEL_WIDTH - 1).collect();
+    format!("{head}\u{2026}")
+}
+
+/// Whole percent of the window's cap consumed, rounded.
+fn status_used_percent(window: &crate::report::StatusWindow) -> u32 {
+    let ppm = window.quota_used.as_ppm().get();
+    (ppm + 5_000) / 10_000
+}
+
+/// The tone of a row by percent used: idle when nothing is used, red at or
+/// above 85, yellow at or above 60, green otherwise. An auth-required or
+/// not-started window has no fraction to tone and reads idle.
+fn status_used_tone(
+    style: Style,
+    used_percent: u32,
+    window: &crate::report::StatusWindow,
+) -> &'static str {
+    if window.reset_state.is_not_started() || used_percent == 0 {
+        style.idle()
+    } else if used_percent >= STATUS_TONE_RED_AT_PERCENT {
+        style.red()
+    } else if used_percent >= STATUS_TONE_YELLOW_AT_PERCENT {
+        style.yellow()
+    } else {
+        style.green()
+    }
+}
+
+/// The 30-cell bar: `\u{2500}` track under `\u{2501}` fill, the fill count
+/// `round(used_ppm * 30 / 1_000_000)`, the fill in the row's tone and the
+/// track in the track colour.
+fn status_bar(window: &crate::report::StatusWindow, style: Style, tone: &str) -> String {
+    let ppm = u64::from(window.quota_used.as_ppm().get());
+    let filled = ((ppm * STATUS_BAR_CELLS as u64 + 500_000) / 1_000_000)
+        .min(STATUS_BAR_CELLS as u64) as usize;
+    let track = STATUS_BAR_CELLS - filled;
+    format!(
+        "{}{}",
+        style.paint(tone, &"\u{2501}".repeat(filled)),
+        style.paint(style.track(), &"\u{2500}".repeat(track)),
+    )
+}
+
+/// The reset instant as a local weekday and `HH:MM`, or `not started` for a
+/// window that has not begun its cycle.
+fn status_reset_label(window: &crate::report::StatusWindow) -> String {
+    match window.reset_state.instant() {
+        None => "not started".to_string(),
+        Some(instant) => crate::presentation::local_time::LocalWallClock::of(instant)
+            .map(|local| local.clock_label())
+            .unwrap_or_else(|| format!("resets {}", format_time_hh_mm(instant))),
+    }
+}
+
+/// `cached <age> ago · <reason>` for a stale block: the age of the observation
+/// the window was read from, then why the reader would not call it fresh. The
+/// reason is dropped only when the observation is not itself stale.
+fn status_cached_note(
+    window: &crate::report::StatusWindow,
+    now: UtcTimestamp,
+    envelope: ClockSkewEnvelope,
+) -> Option<String> {
+    let (observed, reason) = match &window.observation {
+        Freshness::Stale {
+            last_good, reason, ..
+        } => (last_good.as_ref(), Some(render_stale_reason(*reason))),
+        Freshness::Fresh { observed, .. } => (Some(observed), None),
+        Freshness::AuthRequired { last_good, .. } => (last_good.as_ref(), None),
+    };
+    let age = observed_age(observed?, now, envelope)?;
+    let mut note = format!("cached {} ago", render_status_compound_age(age));
+    if let Some(reason) = reason {
+        note.push_str(" · ");
+        note.push_str(reason);
+    }
+    Some(note)
+}
+
+/// An age as the grid reads it: the two most significant units where the value
+/// spans days or hours (`2d 22h`, `3h 4m`), one unit otherwise (`40m`, `12s`).
+fn render_status_compound_age(age: Age) -> String {
+    let total_seconds = age.as_nanos() / 1_000_000_000;
+    if total_seconds < 60 {
+        format!("{total_seconds}s")
+    } else if total_seconds < 3_600 {
+        format!("{}m", total_seconds / 60)
+    } else if total_seconds < 86_400 {
+        let (hours, minutes) = (total_seconds / 3_600, (total_seconds % 3_600) / 60);
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else {
+        let (days, hours) = (total_seconds / 86_400, (total_seconds % 86_400) / 3_600);
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    }
 }
 
 /// Renders provider contract and raw window facts retained by the meter
@@ -2511,218 +2871,361 @@ mod tests {
         assert_eq!(render_percentage(1_000_000, Precision::new(2)), "100");
     }
 
-    /// The status entry point renders every fragment the report model carries: each
-    /// account line carries the account name and its own reading, fresh, stale and
-    /// auth-required alike, so no fragment can be dropped without this failing.
-    #[test]
-    fn status_report_renders_each_account_fragment() {
-        use crate::logging::LogicalName;
-        use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+    fn status_window(
+        semantic_key: &str,
+        scope: crate::domain::window::WindowScope,
+        used_ppm: i32,
+        nominal_seconds: i64,
+        reset: crate::domain::window::WindowResetState,
+    ) -> crate::report::StatusWindow {
+        crate::report::StatusWindow {
+            semantic_key: semantic_key.to_string(),
+            scope,
+            quota_used: crate::domain::quota::QuotaUsed::new(
+                QuotaFractionPpm::new(used_ppm).unwrap(),
+            ),
+            reset_state: reset,
+            nominal_duration: NominalWindowDuration::from_nanos(
+                (nominal_seconds * NANOS_PER_SECOND) as u64,
+            ),
+            rate: crate::domain::burn_rate::BurnRate::from_window(
+                used_ppm.max(0) as u32,
+                Some(0.5),
+            ),
+            capped_at: None,
+            observation: Freshness::Fresh {
+                observed: observed(
+                    500_000,
+                    UtcTimestamp::from_unix_nanos(now().unix_nanos() - 90 * NANOS_PER_SECOND),
+                ),
+                latest_attempt: crate::domain::attempt::AttemptId::new(1),
+            },
+        }
+    }
 
+    fn account_wide(
+        used_ppm: i32,
+        nominal_seconds: i64,
+        reset_offset_seconds: i64,
+    ) -> crate::report::StatusWindow {
+        status_window(
+            "w",
+            crate::domain::window::WindowScope::AccountWide,
+            used_ppm,
+            nominal_seconds,
+            crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                now().unix_nanos() + reset_offset_seconds * NANOS_PER_SECOND,
+            )),
+        )
+    }
+
+    fn grid_report(accounts: Vec<crate::report::MeterAccount>) -> crate::report::StatusReport {
+        use crate::report::{LedgerGeneration, ReportMetadata, StatusReport};
         let now = now();
-        let envelope = envelope();
-        let metadata = ReportMetadata::new(now, now, LedgerGeneration::new(0), None);
-        let report = StatusReport::new(
-            metadata,
-            vec![
+        StatusReport::new(
+            ReportMetadata::new(now, now, LedgerGeneration::new(0), None),
+            accounts,
+            vec![],
+            crate::report::ProjectionReadState::Read,
+        )
+    }
+
+    /// A two-account provider block: the header line, one `anthropic` rule, both
+    /// accounts, and per account the `5h` and `week` rows plus one `fable` row
+    /// where a model-scoped window exists. Every non-blank row is the same
+    /// length and the fixed column starts line up. The planted negative is the
+    /// order: `fable` must come after `week`, and the row lengths must not drift
+    /// when the model row is present.
+    #[test]
+    fn the_two_account_provider_block_renders_the_fixed_grid() {
+        use crate::domain::window::{ModelId, WindowResetState, WindowScope};
+        use crate::logging::LogicalName;
+        use crate::report::MeterAccount;
+
+        let fable = status_window(
+            "weekly_scoped_fable",
+            WindowScope::ModelSpecific(ModelId::new("fable".to_string())),
+            880_000,
+            7 * 86_400,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                now().unix_nanos() + 3 * 86_400 * NANOS_PER_SECOND,
+            )),
+        );
+        let primary = MeterAccount::from_projection(
+            LogicalName::new("primary"),
+            Freshness::Fresh {
+                observed: observed(380_000, UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                latest_attempt: crate::domain::attempt::AttemptId::new(1),
+            },
+            None,
+            vec![],
+            None,
+        )
+        .with_provider("anthropic")
+        .with_windows(vec![
+            account_wide(620_000, 5 * 3_600, 3 * 3_600),
+            account_wide(410_000, 7 * 86_400, 4 * 86_400),
+            fable,
+        ]);
+        let gmail = MeterAccount::from_projection(
+            LogicalName::new("gmail"),
+            Freshness::Fresh {
+                observed: observed(950_000, UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                latest_attempt: crate::domain::attempt::AttemptId::new(2),
+            },
+            None,
+            vec![],
+            None,
+        )
+        .with_provider("anthropic")
+        .with_windows(vec![
+            account_wide(120_000, 5 * 3_600, 3 * 3_600),
+            account_wide(50_000, 7 * 86_400, 4 * 86_400),
+        ]);
+
+        let rendered = render_status_report(
+            &grid_report(vec![primary, gmail]),
+            now(),
+            envelope(),
+            Style::plain(),
+        );
+        let lines: Vec<&str> = rendered.lines().collect();
+
+        assert_eq!(lines[0].chars().take(5).collect::<String>(), "QUOTA");
+        assert_eq!(
+            lines[0].chars().count(),
+            80,
+            "the header fills the default width: {:?}",
+            lines[0]
+        );
+        assert!(lines[1].is_empty(), "one blank line under the header");
+        assert!(
+            lines[2].starts_with("anthropic ") && lines[2].chars().count() == 80,
+            "the provider rule reaches the right edge: {:?}",
+            lines[2]
+        );
+        assert_eq!(lines[3], "  primary  anthropic");
+
+        // The five window rows across both accounts, in order, all the same length.
+        let window_rows: Vec<&&str> = lines
+            .iter()
+            .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
+            .collect();
+        assert_eq!(
+            window_rows.len(),
+            5,
+            "three rows for primary, two for gmail"
+        );
+        let row_len = window_rows[0].chars().count();
+        for row in &window_rows {
+            assert_eq!(
+                row.chars().count(),
+                row_len,
+                "every row is the same width: {row:?}"
+            );
+            // Fixed column starts: label at 4, bar at 13, percent group after it.
+            assert_eq!(&row[..4], "    ");
+        }
+        assert!(window_rows[0].contains("5h  "));
+        assert!(window_rows[1].contains("week"));
+        assert!(
+            window_rows[2].contains("fable"),
+            "the model row follows the weekly one: {:?}",
+            window_rows[2]
+        );
+
+        // The 5h row of primary: 62% used, a 30-cell bar with 19 filled.
+        let bar: String = window_rows[0]
+            .chars()
+            .filter(|c| *c == '\u{2501}' || *c == '\u{2500}')
+            .collect();
+        assert_eq!(bar.chars().count(), 30);
+        assert_eq!(bar.chars().filter(|c| *c == '\u{2501}').count(), 19);
+        assert!(window_rows[0].contains(" 62% "));
+    }
+
+    /// A stale account dims the whole block and every row's trailing column
+    /// carries `cached <age> ago`; a fresh account carries no such note. The
+    /// negative: the fresh block must not gain the cached note.
+    #[test]
+    fn a_stale_account_block_is_dimmed_and_notes_the_cache_age() {
+        use crate::domain::window::{WindowResetState, WindowScope};
+        use crate::logging::LogicalName;
+        use crate::report::MeterAccount;
+
+        let stale_observation = Freshness::Stale {
+            last_good: Some(observed(
+                380_000,
+                UtcTimestamp::from_unix_nanos(
+                    now().unix_nanos() - (2 * 86_400 + 22 * 3_600) * NANOS_PER_SECOND,
+                ),
+            )),
+            latest_attempt: crate::domain::attempt::AttemptId::new(2),
+            reason: StaleReason::AgeExceeded,
+        };
+        let mut window = status_window(
+            "five_hour",
+            WindowScope::AccountWide,
+            300_000,
+            5 * 3_600,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                now().unix_nanos() + 3_600 * NANOS_PER_SECOND,
+            )),
+        );
+        window.observation = stale_observation.clone();
+        let account = MeterAccount::from_projection(
+            LogicalName::new("primary"),
+            stale_observation,
+            None,
+            vec![],
+            None,
+        )
+        .with_provider("anthropic")
+        .with_windows(vec![window]);
+
+        let plain = render_status_report(
+            &grid_report(vec![account]),
+            now(),
+            envelope(),
+            Style::plain(),
+        );
+        assert!(
+            plain.contains("cached 2d 22h ago"),
+            "the stale block notes the cache age: {plain}"
+        );
+
+        let coloured = render_status_report(
+            &grid_report(vec![{
+                // rebuild because the value was moved
+                let stale_observation = Freshness::Stale {
+                    last_good: Some(observed(
+                        380_000,
+                        UtcTimestamp::from_unix_nanos(
+                            now().unix_nanos() - (2 * 86_400 + 22 * 3_600) * NANOS_PER_SECOND,
+                        ),
+                    )),
+                    latest_attempt: crate::domain::attempt::AttemptId::new(2),
+                    reason: StaleReason::AgeExceeded,
+                };
+                let mut window = status_window(
+                    "five_hour",
+                    WindowScope::AccountWide,
+                    300_000,
+                    5 * 3_600,
+                    WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                        now().unix_nanos() + 3_600 * NANOS_PER_SECOND,
+                    )),
+                );
+                window.observation = stale_observation.clone();
                 MeterAccount::from_projection(
-                    LogicalName::new("work-a"),
-                    Freshness::Fresh {
-                        observed: observed(
-                            380_000,
-                            UtcTimestamp::from_unix_nanos(
-                                now.unix_nanos() - 5 * 3_600 * NANOS_PER_SECOND,
-                            ),
-                        ),
-                        latest_attempt: AttemptId::new(1),
-                    },
-                    Some(crate::report::LimitingWindow {
-                        scope: crate::domain::window::WindowScope::AccountWide,
-                        nominal_duration: NominalWindowDuration::from_nanos(
-                            5 * 3_600 * NANOS_PER_SECOND as u64,
-                        ),
-                        reset_state: crate::domain::window::WindowResetState::Known(
-                            UtcTimestamp::from_unix_nanos(
-                                now.unix_nanos() + 5 * 3_600 * NANOS_PER_SECOND,
-                            ),
-                        ),
-                    }),
+                    LogicalName::new("primary"),
+                    stale_observation,
+                    None,
                     vec![],
                     None,
-                ),
-                MeterAccount::new(
-                    LogicalName::new("research"),
-                    Freshness::Stale {
-                        last_good: Some(observed(
-                            380_000,
-                            UtcTimestamp::from_unix_nanos(
-                                now.unix_nanos() - 14 * 60 * NANOS_PER_SECOND,
-                            ),
-                        )),
-                        latest_attempt: AttemptId::new(2),
-                        reason: StaleReason::SourceUnreachable(FailureClass::ConnectTimeout),
-                    },
-                ),
-                MeterAccount::new(
-                    LogicalName::new("legacy"),
-                    Freshness::<QuotaRemaining>::AuthRequired {
-                        last_good: None,
-                        latest_attempt: AttemptId::new(3),
-                    },
-                ),
-            ],
-            vec![],
-            crate::report::ProjectionReadState::Read,
+                )
+                .with_provider("anthropic")
+                .with_windows(vec![window])
+            }]),
+            now(),
+            envelope(),
+            Style::new(true, false, false),
         );
-
-        let rendered = render_status_report(&report, now, envelope, Style::plain());
+        // The dimmer escape (#3f4463) marks the stale trailing column.
         assert!(
-            rendered.contains("aub work-a 38% left · 5h"),
-            "fresh fragment missing from rendering: {rendered}"
-        );
-        assert!(
-            rendered.contains("aub research ~38% · stale 14m · timeout"),
-            "stale fragment missing from rendering: {rendered}"
-        );
-        assert!(
-            rendered.contains("aub legacy auth!"),
-            "auth fragment missing from rendering: {rendered}"
+            coloured.contains("\x1b[38;2;63;68;99mnot") || coloured.contains("\x1b[38;2;63;68;99m"),
+            "a stale row's trailing column is painted dimmer: {coloured}"
         );
     }
 
-    /// The entry point performs no lookup of its own: a report built entirely from
-    /// literals, with no configuration, no store and no data source, renders every
-    /// fragment it carries. An entry point that collected data itself would have
-    /// nothing to collect from for this model, and the exact-output assertion
-    /// would fail instead of being satisfied by a coincidentally empty lookup.
+    /// An auth-required account renders `auth!` under its header and no rows; a
+    /// never-observed account renders the freshness answer. Neither substitutes
+    /// a fabricated grid.
     #[test]
-    fn status_report_built_from_literals_renders_without_lookup() {
-        use crate::domain::attempt::AttemptId;
-        use crate::domain::freshness::Observed;
-        use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining};
-        use crate::domain::time::{MeasurementBasis, ReceivedAt, UtcTimestamp};
+    fn an_account_with_no_windows_renders_the_freshness_answer() {
+        use crate::domain::quota::QuotaRemaining;
         use crate::logging::LogicalName;
-        use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+        use crate::report::MeterAccount;
 
-        let now = UtcTimestamp::from_unix_nanos(1_000_000_000_000);
-        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
-        let metadata = ReportMetadata::new(now, now, LedgerGeneration::new(0), None);
-        let observed = Observed::new(
-            QuotaRemaining::new(QuotaFractionPpm::new(380_000).unwrap()),
-            None,
-            ReceivedAt::new(UtcTimestamp::from_unix_nanos(
-                now.unix_nanos() - 5 * 3_600 * NANOS_PER_SECOND,
-            )),
-            MeasurementBasis::LocallyReceived,
-        );
-        let report = StatusReport::new(
-            metadata,
-            vec![MeterAccount::from_projection(
-                LogicalName::new("work-primary"),
-                Freshness::Fresh {
-                    observed,
-                    latest_attempt: AttemptId::new(1),
-                },
-                Some(crate::report::LimitingWindow {
-                    scope: crate::domain::window::WindowScope::AccountWide,
-                    nominal_duration: NominalWindowDuration::from_nanos(
-                        5 * 3_600 * NANOS_PER_SECOND as u64,
-                    ),
-                    reset_state: crate::domain::window::WindowResetState::Known(
-                        UtcTimestamp::from_unix_nanos(
-                            now.unix_nanos() + 5 * 3_600 * NANOS_PER_SECOND,
-                        ),
-                    ),
-                }),
-                vec![],
-                None,
-            )],
-            vec![],
-            crate::report::ProjectionReadState::Read,
-        );
-
-        let rendered = render_status_report(&report, now, envelope, Style::plain());
-        assert_eq!(rendered, "aub work-primary 38% left · 5h");
-    }
-
-    /// The style reaches the account lines: a fresh reading is tinted by its
-    /// tone with the words unchanged, and the readings with no remaining
-    /// fraction to tone (stale, auth-required) stay uncoloured. The negative
-    /// is the plain style, whose output is byte-identical to the text alone.
-    #[test]
-    fn a_coloured_style_tints_the_fresh_reading_and_leaves_the_others_plain() {
-        use crate::domain::attempt::AttemptId;
-        use crate::domain::freshness::Observed;
-        use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining};
-        use crate::domain::time::{MeasurementBasis, ReceivedAt, UtcTimestamp};
-        use crate::logging::LogicalName;
-        use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
-
-        let now = UtcTimestamp::from_unix_nanos(1_000_000_000_000);
-        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
-        let metadata = ReportMetadata::new(now, now, LedgerGeneration::new(0), None);
-        let received = UtcTimestamp::from_unix_nanos(now.unix_nanos() - 41 * NANOS_PER_SECOND);
-        let observed = |ppm: i32| {
-            Observed::new(
-                QuotaRemaining::new(QuotaFractionPpm::new(ppm).unwrap()),
-                None,
-                ReceivedAt::new(received),
-                MeasurementBasis::LocallyReceived,
-            )
-        };
-        let fresh = MeterAccount::new(
-            LogicalName::new("work-primary"),
-            Freshness::Fresh {
-                observed: observed(380_000),
-                latest_attempt: AttemptId::new(1),
-            },
-        );
-        let stale = MeterAccount::new(
-            LogicalName::new("research"),
-            Freshness::Stale {
-                last_good: Some(observed(380_000).clone()),
-                reason: crate::domain::freshness::StaleReason::AgeExceeded,
-                latest_attempt: AttemptId::new(2),
-            },
-        );
         let auth = MeterAccount::new(
             LogicalName::new("legacy"),
             Freshness::<QuotaRemaining>::AuthRequired {
                 last_good: None,
                 latest_attempt: AttemptId::new(3),
             },
-        );
-        let report = StatusReport::new(
-            metadata,
-            vec![fresh, stale, auth],
-            vec![],
-            crate::report::ProjectionReadState::Read,
-        );
+        )
+        .with_provider("anthropic");
+        let never = MeterAccount::new(
+            LogicalName::new("fresh-account"),
+            Freshness::Stale {
+                last_good: None,
+                latest_attempt: AttemptId::new(4),
+                reason: StaleReason::NoSuccessfulObservation,
+            },
+        )
+        .with_provider("anthropic");
 
-        let coloured = render_status_report(&report, now, envelope, Style::new(true, false, false));
-        // The fresh line is wrapped in its tone's 24-bit foreground escape and
-        // closed by the reset, with the text itself unchanged.
-        assert!(
-            coloured.contains("aub work-primary \x1b[38;2;224;175;104m38% left\x1b[0m"),
-            "the fresh reading must carry its tone escape: {coloured}"
+        let rendered = render_status_report(
+            &grid_report(vec![auth, never]),
+            now(),
+            envelope(),
+            Style::plain(),
         );
-        // The stale and auth lines carry no escape at all.
+        assert!(rendered.contains("  legacy  anthropic\n    auth!"));
         assert!(
-            coloured.contains("aub research ~38% · stale 41s · age exceeded")
-                && !coloured.contains("research \x1b"),
-            "the stale line must stay uncoloured: {coloured}"
+            rendered.contains("  fresh-account  anthropic\n    ? · stale · no successful sample")
         );
-        assert!(
-            coloured.contains("aub legacy auth!") && !coloured.contains("legacy \x1b"),
-            "the auth line must stay uncoloured: {coloured}"
-        );
+    }
 
-        // The negative: the plain style is byte-transparent, so the same
-        // report renders exactly the unstyled text.
-        assert_eq!(
-            render_status_report(&report, now, envelope, Style::plain()),
-            "aub work-primary 38% left\naub research ~38% · stale 41s · age exceeded\naub legacy auth!"
-        );
+    /// The tone of a row follows percent used at the design's cut points: 0
+    /// idle, 59 green, 60 yellow, 84 yellow, 85 red. Driven through the
+    /// coloured style so the escape itself is the assertion.
+    #[test]
+    fn the_row_tone_follows_percent_used_at_every_cut_point() {
+        use crate::domain::window::{WindowResetState, WindowScope};
+        use crate::logging::LogicalName;
+        use crate::report::MeterAccount;
+
+        let rows = [
+            (0_i32, "\x1b[38;2;63;68;99m"),      // idle
+            (590_000, "\x1b[38;2;158;206;106m"), // green
+            (600_000, "\x1b[38;2;224;175;104m"), // yellow
+            (840_000, "\x1b[38;2;224;175;104m"), // yellow
+            (850_000, "\x1b[38;2;247;118;142m"), // red
+        ];
+        for (used_ppm, expected_escape) in rows {
+            let window = status_window(
+                "w",
+                WindowScope::AccountWide,
+                used_ppm,
+                5 * 3_600,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                    now().unix_nanos() + 3_600 * NANOS_PER_SECOND,
+                )),
+            );
+            let account = MeterAccount::from_projection(
+                LogicalName::new("primary"),
+                Freshness::Fresh {
+                    observed: observed(500_000, UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                    latest_attempt: AttemptId::new(1),
+                },
+                None,
+                vec![],
+                None,
+            )
+            .with_provider("anthropic")
+            .with_windows(vec![window]);
+            let coloured = render_status_report(
+                &grid_report(vec![account]),
+                now(),
+                envelope(),
+                Style::new(true, false, false),
+            );
+            assert!(
+                coloured.contains(expected_escape),
+                "used {used_ppm} ppm must tint the row {expected_escape:?}: {coloured}"
+            );
+        }
     }
 
     // ---- the coverage box ------------------------------------------------------

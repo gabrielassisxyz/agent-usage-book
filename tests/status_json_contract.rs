@@ -271,6 +271,112 @@ fn a_reading_without_window_context_stays_the_plain_shape() {
     );
 }
 
+/// `aub status --format json` lists every window under `accounts[].windows[]`
+/// (schema v3), each carrying the full field set, and the limiting window
+/// derived from the list is the active window with the highest used ppm. The
+/// planted negative: dropping one window field fails the contract, and a
+/// limiting-window pick that took the first window rather than the most used
+/// would disagree with `windows[]`.
+#[test]
+fn the_status_document_lists_every_window_with_its_full_field_set() {
+    use agent_usage_book::domain::burn_rate::BurnRate;
+    use agent_usage_book::domain::quota::QuotaUsed;
+    use agent_usage_book::report::StatusWindow;
+
+    let fresh = |ppm: u32| Freshness::Fresh {
+        observed: observed(1_000_000 - ppm),
+        latest_attempt: AttemptId::new(1),
+    };
+    let window =
+        |key: &str, scope: WindowScope, used_ppm: i32, reset: WindowResetState| StatusWindow {
+            semantic_key: key.to_string(),
+            scope,
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(used_ppm).unwrap()),
+            reset_state: reset,
+            nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            rate: BurnRate::from_window(used_ppm.max(0) as u32, Some(0.5)),
+            capped_at: None,
+            observation: fresh(500_000),
+        };
+    let account = MeterAccount::from_projection(
+        LogicalName::new("primary"),
+        fresh(380_000),
+        None,
+        vec![],
+        None,
+    )
+    .with_windows(vec![
+        window(
+            "five_hour",
+            WindowScope::AccountWide,
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
+        ),
+        window(
+            "weekly_scoped_fable",
+            WindowScope::ModelSpecific(ModelId::new("fable".to_string())),
+            910_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
+        ),
+        StatusWindow {
+            rate: None,
+            ..window(
+                "weekly_all",
+                WindowScope::AccountWide,
+                0,
+                WindowResetState::NotStarted,
+            )
+        },
+    ]);
+
+    // The limiting window is derived from the list, not stored: the most used
+    // started window.
+    assert_eq!(
+        account
+            .limiting_status_window()
+            .map(|w| w.semantic_key.as_str()),
+        Some("weekly_scoped_fable"),
+    );
+
+    let report = StatusReport::new(metadata(), vec![account], vec![], ProjectionReadState::Read);
+    let document = status_json_with_explain(&report, run(), ExplainMode::Off);
+    validate_status_report_json(&document).expect("the v3 windows document must validate");
+
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert_eq!(parsed["schema"], 3);
+    let windows = parsed["accounts"][0]["windows"].as_array().unwrap();
+    assert_eq!(windows.len(), 3);
+    let fable = windows
+        .iter()
+        .find(|w| w["semantic_key"] == "weekly_scoped_fable")
+        .unwrap();
+    assert_eq!(fable["scope"], "model");
+    assert_eq!(fable["model"], "fable");
+    assert_eq!(fable["quota_used_ppm"], 910_000);
+    assert_eq!(fable["resets_at_nanos"], 9_000);
+    assert_eq!(fable["nominal_duration_nanos"], 18_000_000_000_000i64);
+    assert!(fable["burn_rate"].is_string());
+    assert!(fable["capped_at"].is_null());
+    assert_eq!(fable["observation_freshness"], "fresh");
+
+    let idle = windows
+        .iter()
+        .find(|w| w["semantic_key"] == "weekly_all")
+        .unwrap();
+    assert!(
+        idle["resets_at_nanos"].is_null(),
+        "a not-started window has no reset instant"
+    );
+    assert!(idle["burn_rate"].is_null());
+
+    // The planted negative: a window missing a field is refused.
+    let broken = document.replacen(",\"observation_freshness\":\"fresh\"", "", 1);
+    assert!(
+        validate_status_report_json(&broken).is_err(),
+        "a window missing observation_freshness must be refused"
+    );
+}
+
 /// The validator refuses a projection object outside the four unavailable
 /// states, so a consumer can match the state exhaustively.
 #[test]

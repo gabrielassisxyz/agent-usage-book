@@ -32,10 +32,39 @@ exit 0 so a status bar never treats degraded output as process failure.
 Text output goes through one style layer (`src/presentation/style.rs`), which
 also answers `--no-color` where every other command refuses it. Colour is on
 only when stdout is a terminal, `NO_COLOR` is unset or empty, and
-`--no-color` was not passed; `--format json` is never styled. A fresh reading
-is tinted by its remaining fraction, green at or above half the window, yellow
-below half, red below a fifth, while the words stay the freshness answer, so
-the text is never colour-dependent.
+`--no-color` was not passed; `--format json` is never styled. A window row is
+tinted by percent used, green below 60, yellow from 60, red from 85, idle grey
+at nothing used, while the words stay the freshness answer, so the text is
+never colour-dependent.
+
+**Layout.** `status` prints a grouped grid: a `QUOTA` header with the current
+local time right-aligned to the terminal width, then one block per provider
+(accounts in the order the config lists them), each account a name-and-plan
+line over one row per quota window. The row columns are a fixed width: the
+window label (`5h`, `week`, or a model display name), a 30-cell bar that fills
+as quota is *used*, the percent used, the burn rate (`1.0x` is on pace to hit
+the cap exactly at the reset), then the reset in local time with any note.
+
+```
+QUOTA                                                       Mon 07 Sep 14:22 -03
+
+anthropic ──────────────────────────────────────────────────────────────────────
+  primary  anthropic
+    5h       ━━━━━━━━━━━━━━━━━━━───────────   62%   1.19x Mon 17:00
+    week     ━━━━━━━━━━━━──────────────────   41%   0.95x Fri 09:00
+    fable    ━━━━━━━━━━━━━━━━━━━━━━━━━━────   88%   2.04x Fri 09:00
+
+  gmail  anthropic
+    5h       ━━━━──────────────────────────   12%   0.23x Mon 17:00
+    week     ━━────────────────────────────    5%   0.12x Fri 09:00
+```
+
+A stale account dims its whole block and each row's note reads
+`cached <age> ago  <reason>`; an auth-required account shows `auth!` in place
+of the grid; an unreadable projection is the bare `aub ?`. `--format json`
+carries every window under `accounts[].windows[]`, not only the limiting one
+(schema v3). `--model NAME` narrows both the grid rows and the reading to the
+account-wide and named-model windows.
 
 ## `aub now`
 

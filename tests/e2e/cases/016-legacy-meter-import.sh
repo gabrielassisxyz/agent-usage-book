@@ -84,6 +84,6 @@ case_assertions() {
     assert_stdout_contains 7 "2|2|2|1"
 
     assert_exit 0 8
-    assert_stdout_contains 8 "aub primary"
-    assert_stdout_contains 8 "55%"
+    assert_stdout_contains 8 "primary  anthropic"
+    assert_stdout_contains 8 "45%"
 }

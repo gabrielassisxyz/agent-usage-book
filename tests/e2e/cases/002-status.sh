@@ -44,5 +44,6 @@ case_assertions() {
     assert_exit 0 2
     assert_stderr_contains 2 "run_started"
     assert_exit 0 3
-    assert_stdout_contains 3 "aub work-primary ? · stale · no successful sample"
+    assert_stdout_contains 3 "  work-primary  provider-a"
+    assert_stdout_contains 3 "? · stale · no successful sample"
 }

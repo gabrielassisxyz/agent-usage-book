@@ -223,13 +223,25 @@ fn now_forces_persistence_then_agrees_with_an_immediate_status() {
     );
 
     // Criteria 6 and 7: an immediate status reads the projection `now` just
-    // published and renders byte-for-byte the same account lines.
+    // published. `now` keeps the one-line-per-account form and `status` renders
+    // the grouped grid, so the two no longer match byte for byte; what must
+    // hold is that `status` reads `now`'s freshly published projection as a
+    // fresh reading for both accounts, never the never-observed form.
     let status = env.run("http://127.0.0.1:9", &["status"]);
     assert_eq!(status.code, 0, "aub status must exit 0: {}", status.stderr);
-    assert_eq!(
-        now_account_lines(&now.stdout),
-        status.stdout.trim(),
-        "now and an immediate status must render identical account lines"
+    let status_out = status.stdout.trim();
+    assert!(
+        status_out.contains("  work-a  ") && status_out.contains("  work-b  "),
+        "status must show both accounts from now's published projection: {status_out}"
+    );
+    assert!(
+        !status_out.contains("no successful sample") && !status_out.contains("aub ?"),
+        "status must read now's projection as a real reading, not the degraded form: {status_out}"
+    );
+    // The weekly window `now` reported at 50% used is a grid row at `50%`.
+    assert!(
+        status_out.contains(" 50% "),
+        "status renders the same weekly window now published: {status_out}"
     );
 
     // The planted negative for criterion 1: an implementation that rendered
@@ -240,12 +252,6 @@ fn now_forces_persistence_then_agrees_with_an_immediate_status() {
         "now rendered a never-observed reading despite a successful forced sample: {}",
         now.stdout
     );
-}
-
-/// The account lines of `now`'s text output, with the diagnostic lines (which
-/// `-v` sends to stderr, not stdout) and trailing whitespace removed.
-fn now_account_lines(stdout: &str) -> String {
-    stdout.trim().to_string()
 }
 
 #[test]

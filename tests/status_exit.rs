@@ -191,8 +191,14 @@ fn fresh_exits_zero() {
     let (code, stdout, _) = env.run(&["status"]);
     assert_eq!(code, 0, "status must exit zero for a fresh reading");
     assert!(
-        stdout.contains("aub work-primary 38% left · 5h"),
-        "{stdout}"
+        stdout.contains("  work-primary  anthropic"),
+        "the account block heads the grid: {stdout}"
+    );
+    assert!(
+        stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("5h") && line.contains(" 62% ")),
+        "the fresh 5h window is a grid row at 62% used: {stdout}"
     );
 }
 
@@ -207,8 +213,8 @@ fn stale_exits_zero() {
     let (code, stdout, _) = env.run(&["status"]);
     assert_eq!(code, 0, "status must exit zero for a stale reading");
     assert!(
-        stdout.contains("aub work-primary ~38% · stale 14m · age exceeded"),
-        "{stdout}"
+        stdout.contains("cached 14m ago · age exceeded"),
+        "the stale block notes the cache age and the reason: {stdout}"
     );
 }
 
@@ -222,7 +228,10 @@ fn auth_required_exits_zero() {
     ));
     let (code, stdout, _) = env.run(&["status"]);
     assert_eq!(code, 0, "status must exit zero for an auth-required state");
-    assert!(stdout.contains("aub work-primary auth!"), "{stdout}");
+    assert!(
+        stdout.contains("  work-primary  anthropic\n    auth!"),
+        "{stdout}"
+    );
 }
 
 /// No successful sample: exit zero, the question mark with the reason.
@@ -233,7 +242,7 @@ fn no_successful_sample_exits_zero() {
     let (code, stdout, _) = env.run(&["status"]);
     assert_eq!(code, 0, "status must exit zero with no successful sample");
     assert!(
-        stdout.contains("aub work-primary ? · stale · no successful sample"),
+        stdout.contains("  work-primary  anthropic\n    ? · stale · no successful sample"),
         "{stdout}"
     );
 }
@@ -252,7 +261,7 @@ fn collector_interrupted_exits_zero() {
         "status must exit zero when the collector was interrupted"
     );
     assert!(
-        stdout.contains("aub work-primary ~38% · stale 9m · collector interrupted"),
+        stdout.contains("cached 9m ago · collector interrupted"),
         "{stdout}"
     );
 }
@@ -359,7 +368,7 @@ fn account_selector_renders_one_account() {
     env.write_projection(&body);
     let (code, stdout, _) = env.run(&["status", "--account", "other"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("aub other"), "{stdout}");
+    assert!(stdout.contains("  other  anthropic"), "{stdout}");
     assert!(!stdout.contains("work-primary"), "{stdout}");
 }
 
@@ -369,24 +378,35 @@ fn account_selector_renders_one_account() {
 fn model_selector_excludes_unrelated_model_windows() {
     let env = Environment::new("model-selector");
     let received = now_nanos() - 41 * NANOS_PER_SECOND;
-    let scoped = weekly_window(700_000, "claude-model-x");
-    let unrelated = weekly_window(950_000, "claude-model-y");
+    let scoped = weekly_window(700_000, "aria");
+    let unrelated = weekly_window(950_000, "zeta");
     let windows = [window(500_000), scoped, unrelated].join(",");
     let body = projection_document(&windows, received, "success", received);
     env.write_projection(&body);
 
-    // Without a selector every window applies, so the unrelated model's 95%
-    // used window would limit the line to 5%. With the selector, only the
-    // account-wide and chosen-model windows apply: 30% left, 5h window.
+    // Without a selector every window is a grid row, including both models'.
     let (code, stdout, _) = env.run(&["status"]);
     assert_eq!(code, 0);
-    assert!(stdout.contains("aub work-primary 5% left"), "{stdout}");
+    let model_rows = |text: &str| {
+        text.lines()
+            .filter(|line| {
+                let label = line.trim_start();
+                label.starts_with("aria") || label.starts_with("zeta")
+            })
+            .count()
+    };
+    assert_eq!(
+        model_rows(&stdout),
+        2,
+        "the unfiltered grid shows both model rows: {stdout}"
+    );
 
-    let (code, stdout, _) = env.run(&["status", "--model", "claude-model-x"]);
+    // With the selector, only the account-wide and chosen-model rows remain.
+    let (code, stdout, _) = env.run(&["status", "--model", "aria"]);
     assert_eq!(code, 0);
     assert!(
-        stdout.contains("aub work-primary 30% left · 7d"),
-        "the unrelated model's window must be excluded, and the weekly window limits: {stdout}"
+        stdout.contains("aria") && !stdout.contains("zeta"),
+        "the unrelated model's row must be excluded under --model: {stdout}"
     );
 }
 

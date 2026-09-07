@@ -107,7 +107,8 @@ case_assertions() {
 
     # Step 3: status matches now, reading and freshness.
     assert_exit 0 4
-    assert_stdout_contains 4 "aub work-primary ? · stale"
+    assert_stdout_contains 4 "work-primary  anthropic"
+    assert_stdout_contains 4 "? · stale"
 
     # Step 4: JSON names the command and the single freshness variant.
     assert_exit 0 5
