@@ -69,6 +69,30 @@ pub(crate) fn serve_local_file(
     })
 }
 
+/// Whether a Codex home owns its sessions tree (aub-er47).
+///
+/// True only when `<home>/sessions` is a real directory. A `caam` shallow
+/// profile links every Codex dotdir except `auth.json` and `config.toml` back
+/// to the real home, so two configured accounts can share one sessions tree:
+/// a rollout under it carries no account identity and reading it under either
+/// name attributes one account's spend to the other. The Codex adapter takes
+/// the rollout path only for an owning home and the live-endpoint path
+/// otherwise, so this predicate is the fact that makes a rollout reading
+/// attributable.
+///
+/// `symlink_metadata` is deliberately not `metadata`: a symlink to a
+/// directory must report false here, and following it would report true for
+/// exactly the shared tree this exists to refuse. Anything that is not a
+/// real directory (a symlink, a missing path, a file) reports false, and the
+/// caller takes the endpoint path, which refuses cleanly on its own when the
+/// endpoint is unreachable rather than reading another account's block.
+pub fn codex_home_owns_sessions_tree(home: &Path) -> bool {
+    let sessions = home.join("sessions");
+    std::fs::symlink_metadata(&sessions)
+        .map(|metadata| metadata.file_type().is_dir())
+        .unwrap_or(false)
+}
+
 /// Unix-epoch nanoseconds for a filesystem modification time, or `None` for
 /// an instant before the epoch, which no real file has and no reading could
 /// justify.
@@ -161,4 +185,37 @@ fn local_file_glob_match(pattern: &str, name: &str) -> bool {
         pi += 1;
     }
     pi == pattern.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A real sessions directory is an owning home; a symlinked one, a
+    /// missing one and a file in the sessions place are not. The symlink
+    /// case is the production shape (aub-er47): the link points at a real
+    /// directory full of rollouts, and following it would answer true for
+    /// the shared tree the predicate exists to refuse.
+    #[test]
+    fn codex_sessions_ownership_holds_only_for_a_real_directory() {
+        let scratch = test_support::StateDir::new();
+
+        let owned = scratch.path().join("owned-home");
+        test_support::scratch_files::create_dir_all(&owned.join("sessions/2026/09/05"));
+        assert!(codex_home_owns_sessions_tree(&owned));
+
+        let shared = scratch.path().join("shared-sessions");
+        test_support::scratch_files::create_dir_all(&shared.join("2026/09/05"));
+        let linked = scratch.path().join("linked-home");
+        test_support::scratch_files::create_dir_all(&linked);
+        test_support::scratch_files::symlink(&shared, &linked.join("sessions"));
+        assert!(!codex_home_owns_sessions_tree(&linked));
+
+        let missing = scratch.path().join("absent-home");
+        assert!(!codex_home_owns_sessions_tree(&missing));
+
+        let file_home = scratch.path().join("file-home");
+        test_support::scratch_files::write(&file_home.join("sessions"), b"not a directory");
+        assert!(!codex_home_owns_sessions_tree(&file_home));
+    }
 }

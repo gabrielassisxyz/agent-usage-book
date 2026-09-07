@@ -169,6 +169,7 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
         model: None,
         workspace_id: Some("wrk_2345ABCDEFGHJKLMNOPQRSTuvwx".to_string()),
         local_home: None,
+        codex_sessions_owned: false,
     };
     let captured = adapter.observe_with_evidence(
         &CredentialHandle::new(FIXTURE_COOKIE),
