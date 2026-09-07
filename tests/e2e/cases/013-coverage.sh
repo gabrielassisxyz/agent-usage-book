@@ -14,6 +14,7 @@ aub_coverage() {
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
         "AUB_LOG_LEVEL=off" \
+        "COLUMNS=80" \
         "$AUB_BIN" coverage "$@"
 }
 
@@ -113,14 +114,19 @@ case_assertions() {
     # Step 3: seeding succeeded
     assert_exit 0 3
 
-    # Step 4: human report exits 7 (threshold breached), shows both accounts
-    # and distinguishes dead scheduler from credential failure
+    # Step 4: human report exits 7 (threshold breached) and renders one box:
+    # the framed title, the two accounts with their findings under their own
+    # rows, and the threshold verdict's next action as the footer. Under a pipe
+    # with COLUMNS pinned the frame is the default 80 columns wide, so the
+    # first and last box lines are pinned byte for byte.
     assert_exit 7 4
-    assert_stdout_contains 4 "coverage - last 24h"
+    assert_stdout_contains 4 "┌─ coverage · last 24h "
+    assert_stdout_contains 4 "└──────────────────────────────────────────────────────────────────────────────┘"
     assert_stdout_contains 4 "dead-scheduler"
     assert_stdout_contains 4 "cred-failing"
-    assert_stdout_contains 4 "scheduler ran normally"
-    assert_stdout_contains 4 "attempts required authentication"
+    assert_stdout_contains 4 "attempt coverage below the 98% floor"
+    assert_stdout_contains 4 "24 attempts required authentication"
+    assert_stdout_contains 4 "next: run coverage again once the floor condition changes"
     assert_stderr_contains 4 "is below the 98% floor"
     assert_stderr_contains 4 "dead-scheduler"
     assert_stderr_contains 4 "cred-failing"
@@ -138,7 +144,7 @@ case_assertions() {
     # Step 6: account selector isolates cred-failing
     assert_exit 7 6
     assert_stdout_contains 6 "cred-failing"
-    assert_stdout_contains 6 "attempts required authentication"
+    assert_stdout_contains 6 "24 attempts required authentication"
     if grep -qF "dead-scheduler" "$(step_dir 6)/stdout.txt"; then
         record_assertion "account selector excludes unselected account" "absent" "present" "fail"
         CASE_FAILED=1

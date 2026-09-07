@@ -294,6 +294,27 @@ detail views of one check's own evidence, not a repair mode.
 **Answers:** did the sampler attempt what the policy owed, and did those
 attempts observe?
 
+One box: a row per configured account, that account's findings indented
+under its own row, the ledger's retired accounts on one `not in config`
+line, and the threshold verdict's next action as the footer.
+
+```
+┌─ coverage · last 24h ────────────────────────────────────────────────────────┐
+│                                                                              │
+│  account  attempts  measurements  longest gap  resets unobserved             │
+│  ───────────────────────────────────────────────────────────────────             │
+│  primary  88.9%     100.0%        6m           3                             │
+│         attempt coverage below the 98% floor                                 │
+│         3 resets without an observation in the surrounding gaps              │
+│  gmail    100.0%    76.6%         6m           3                             │
+│         45 attempts were rate limited · 14 attempts required authentication  │
+│         3 resets without an observation in the surrounding gaps              │
+│                                                                              │
+│  not in config: primary-2026-09-04 (last observed 2026-09-04)                │
+│  next: run coverage again once the floor condition changes                   │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
+
 **Refuses:** the network. `coverage` reads only local ledger history, so it
 tells a dead scheduler apart from a live one that is failing on credentials
 by what the ledger recorded, never by asking a provider directly.

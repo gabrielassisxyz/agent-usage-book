@@ -5,7 +5,7 @@ use agent_usage_book::domain::time::{
     FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
 };
 use agent_usage_book::legacy_meter::read_source;
-use agent_usage_book::presentation::render_coverage_report;
+use agent_usage_book::presentation::{Style, render_coverage_report};
 use agent_usage_book::report::coverage::{
     AccountIdentity, CoverageFloors, CoverageSelector, assemble as assemble_coverage,
 };
@@ -220,7 +220,7 @@ fn integration_coverage_distinguishes_legacy_evidence_from_live_sampling() {
         "legacy_evidence_present must be true when legacy observations fall in the window"
     );
 
-    let rendered = render_coverage_report(&report, "24h");
+    let rendered = render_coverage_report(&report, "24h", Style::plain());
     assert!(
         rendered.contains(
             "legacy observations are shown as historical evidence, not ordinary attempt coverage"

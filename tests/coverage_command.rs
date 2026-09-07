@@ -18,7 +18,7 @@ use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp}
 use agent_usage_book::meter::adapter::HttpTransport;
 use agent_usage_book::meter::transport::{CommandBudget, HttpRequest, RequestTimeoutConfig};
 use agent_usage_book::presentation::{
-    coverage_json, render_coverage_report, validate_coverage_report_json,
+    Style, coverage_json, render_coverage_report, validate_coverage_report_json,
 };
 use agent_usage_book::report::coverage::{
     AccountIdentity, CoverageFloors, CoverageSelector, assemble as assemble_coverage,
@@ -395,26 +395,31 @@ fn the_two_worked_examples_render() {
     )
     .expect("the worked examples must assemble");
 
-    let rendered = render_coverage_report(&report, "24h");
-    assert_eq!(
-        rendered,
-        [
-            "coverage - last 24h",
-            "",
-            "account       attempts   measurements  longest blind gap  reset gaps",
-            "work-primary  99.3%      98.6%         9m                 0",
-            "research      98.9%      71.5%         2h 11m             1",
-            "",
-            "research:",
-            "  - scheduler ran normally",
-            "  - 41 attempts required authentication",
-            "  - 28 attempts were rate limited",
-            "  - 4 attempts hit an unreachable provider",
-            "  - 4 attempts started without a terminal result",
-            "  - one 5h reset occurred without a successful observation in the surrounding interval",
-        ]
-        .join("\n")
-    );
+    let rendered = render_coverage_report(&report, "24h", Style::plain());
+    let expected = [
+        "┌─ coverage · last 24h ────────────────────────────────────────────────────────┐",
+        "│                                                                              │",
+        "│  account       attempts  measurements  longest gap  resets unobserved        │",
+        "│  ────────────────────────────────────────────────────────────────────        │",
+        "│  work-primary  99.3%     98.6%         9m           0                        │",
+        "│  research      98.9%     71.5%         2h 11m       1                        │",
+        "│              measurement coverage below the 95% floor                        │",
+        "│              41 attempts required authentication                             │",
+        "│              28 attempts were rate limited                                   │",
+        "│              4 attempts hit an unreachable provider                          │",
+        "│              4 attempts started without a terminal result                    │",
+        "│              one 5h reset without an observation in the surrounding gap      │",
+        "│                                                                              │",
+        "│  next: run coverage again once the floor condition changes                   │",
+        "└──────────────────────────────────────────────────────────────────────────────┘",
+    ]
+    .join("\n");
+    assert_eq!(rendered, expected);
+    // The plain style measures 80 columns, and every box line honours it: a
+    // row or finding that drifted off the width would break the frame.
+    for line in rendered.lines() {
+        assert_eq!(line.chars().count(), 80, "{line}");
+    }
 }
 
 /// The JSON contract: every quantity carries its unit, the two coverages are
@@ -551,7 +556,7 @@ fn a_policy_unknown_interval_is_visible_in_both_modes() {
         &[AccountIdentity::new("provider-a", "ghost")],
     )
     .expect("the report must assemble");
-    let rendered = render_coverage_report(&report, "24h");
+    let rendered = render_coverage_report(&report, "24h", Style::plain());
     assert!(
         rendered.contains("unknown"),
         "the human table must show the unknown policy: {rendered}"
@@ -673,7 +678,7 @@ fn the_coverage_pipeline_performs_no_network_operation() {
         &worked_example_accounts(),
     )
     .expect("the report must assemble");
-    let _rendered = render_coverage_report(&report, "24h");
+    let _rendered = render_coverage_report(&report, "24h", Style::plain());
     let _json = coverage_json(
         &report,
         agent_usage_book::logging::RunId::new(ts(T1 / SECOND)),
@@ -896,7 +901,7 @@ fn threshold_exit_fires_for_the_attempt_floor_but_not_the_measurement_floor() {
     let (status, stdout, stderr) = run_coverage(&fixture, &[]);
 
     assert_eq!(status, 7, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.contains("coverage - last 24h"), "{stdout}");
+    assert!(stdout.contains("coverage · last 24h"), "{stdout}");
     assert!(stderr.contains("attempt coverage"), "{stderr}");
     assert!(!stderr.contains("measurement coverage"), "{stderr}");
 }
@@ -907,7 +912,7 @@ fn threshold_exit_fires_for_the_measurement_floor_but_not_the_attempt_floor() {
     let (status, stdout, stderr) = run_coverage(&fixture, &[]);
 
     assert_eq!(status, 7, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.contains("coverage - last 24h"), "{stdout}");
+    assert!(stdout.contains("coverage · last 24h"), "{stdout}");
     assert!(stderr.contains("measurement coverage"), "{stderr}");
     assert!(!stderr.contains("attempt coverage"), "{stderr}");
 }
@@ -918,7 +923,11 @@ fn threshold_exit_does_not_fire_when_both_floors_are_met() {
     let (status, stdout, stderr) = run_coverage(&fixture, &[]);
 
     assert_eq!(status, 0, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.contains("coverage - last 24h"), "{stdout}");
+    assert!(stdout.contains("coverage · last 24h"), "{stdout}");
+    assert!(
+        !stdout.contains("next: run coverage again"),
+        "a met verdict carries no footer: {stdout}"
+    );
     assert!(stderr.is_empty(), "{stderr}");
 }
 
@@ -956,12 +965,16 @@ fn unconfigured_account_in_ledger_produces_no_breach_and_renders_unconfigured_de
 
     assert_eq!(status, 0, "stdout: {stdout}\nstderr: {stderr}");
     assert!(
-        stdout.contains("retired"),
-        "retired account must be listed in stdout table: {stdout}"
+        stdout.contains("not in config: retired"),
+        "retired account must render on the one unconfigured line: {stdout}"
     );
     assert!(
-        stdout.contains("account is not configured"),
-        "retired account must be explained as not configured: {stdout}"
+        stdout.matches("retired").count() == 1,
+        "an unconfigured account is not a table row and carries no findings: {stdout}"
+    );
+    assert!(
+        !stdout.contains("attempt coverage below"),
+        "an unconfigured account never breaches a floor: {stdout}"
     );
     assert!(
         !stderr.contains("retired"),
@@ -1011,7 +1024,7 @@ fn configured_account_with_no_observations_still_produces_threshold_breach() {
     let (status, stdout, stderr) = run_coverage(&fixture, &[]);
 
     assert_eq!(status, 7, "stdout: {stdout}\nstderr: {stderr}");
-    assert!(stdout.contains("coverage - last 24h"), "{stdout}");
+    assert!(stdout.contains("coverage · last 24h"), "{stdout}");
     assert!(
         stderr.contains("unreached attempt coverage 0% is below the 90% floor"),
         "{stderr}"
