@@ -9,6 +9,7 @@ pub mod models;
 pub mod provenance;
 
 pub mod activity;
+pub mod burn_rate;
 pub mod calibrate;
 pub mod can_run;
 pub mod can_run_evidence;
