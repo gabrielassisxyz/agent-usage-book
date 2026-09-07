@@ -2832,7 +2832,7 @@ credential = { kind = "file", path = "/tmp/aub-golden/creds-primary.json" }
 [[accounts]]
 name = "work-secondary"
 provider = "provider-b"
-credential = { kind = "env", ref = "AUB_GOLDEN_TOKEN" }
+credential = { kind = "env", name = "AUB_GOLDEN_TOKEN" }
 exclusivity_policy = "permit_passive"
 
 [[transcripts]]
