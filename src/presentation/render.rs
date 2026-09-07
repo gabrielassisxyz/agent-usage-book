@@ -2015,6 +2015,7 @@ pub fn render_failure_class(class: FailureClass) -> &'static str {
         FailureClass::HttpStatus(_) => "http error",
         FailureClass::RateLimited { .. } => "rate limited",
         FailureClass::MalformedBody | FailureClass::MissingRequiredField => "malformed response",
+        FailureClass::SchemaDrift => "schema drift",
     }
 }
 

@@ -172,6 +172,7 @@ pub mod failure_class_sql {
             FailureClass::RateLimited { .. } => "rate_limited",
             FailureClass::MalformedBody => "malformed_body",
             FailureClass::MissingRequiredField => "missing_required_field",
+            FailureClass::SchemaDrift => "schema_drift",
         }
     }
 
@@ -188,6 +189,7 @@ pub mod failure_class_sql {
             "rate_limited" => Ok(FailureClass::RateLimited { retry_after: None }),
             "malformed_body" => Ok(FailureClass::MalformedBody),
             "missing_required_field" => Ok(FailureClass::MissingRequiredField),
+            "schema_drift" => Ok(FailureClass::SchemaDrift),
             other => Err(Error::Store(format!(
                 "unknown failure class stored in the database: {other:?}"
             ))),
@@ -221,7 +223,8 @@ pub(crate) fn outcome_failure_fields(outcome: &AttemptOutcome) -> (Option<String
                 | FailureClass::TotalBudgetExpired
                 | FailureClass::HttpStatus(_)
                 | FailureClass::MalformedBody
-                | FailureClass::MissingRequiredField => None,
+                | FailureClass::MissingRequiredField
+                | FailureClass::SchemaDrift => None,
             };
             (
                 Some(failure_class_sql::as_sql(class).to_owned()),

@@ -1390,6 +1390,7 @@ pub(crate) fn sample_command(
             &acc.name,
             &crate::meter::adapter::EndpointConfig {
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+                opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
             },
         )?;
 
@@ -1401,6 +1402,7 @@ pub(crate) fn sample_command(
             credential_context_id,
             request: crate::meter::adapter::MeterRequest {
                 model: None,
+                workspace_id: acc.opencode_workspace.clone(),
                 local_home: acc.codex_home.clone(),
             },
             policy: resolved_policy,
@@ -1874,6 +1876,7 @@ pub(crate) fn now_command(
             &acc.name,
             &crate::meter::adapter::EndpointConfig {
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+                opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
             },
         )?;
 
@@ -1885,6 +1888,7 @@ pub(crate) fn now_command(
             credential_context_id,
             request: crate::meter::adapter::MeterRequest {
                 model: None,
+                workspace_id: acc.opencode_workspace.clone(),
                 local_home: acc.codex_home.clone(),
             },
             policy: resolved_policy,
@@ -5072,6 +5076,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             &account_config.name,
             &crate::meter::adapter::EndpointConfig {
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+                opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
             },
         )?;
         let batch_accounts = vec![crate::meter::sampler::BatchAccount {
@@ -5082,6 +5087,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             credential_context_id,
             request: crate::meter::adapter::MeterRequest {
                 model: None,
+                workspace_id: account_config.opencode_workspace.clone(),
                 local_home: account_config.codex_home.clone(),
             },
             policy: resolved_policy,

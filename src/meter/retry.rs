@@ -188,7 +188,8 @@ fn is_transient(class: FailureClass) -> bool {
         | FailureClass::HttpStatus(HttpStatusClass::ServerError)
         | FailureClass::RateLimited { .. }
         | FailureClass::MalformedBody
-        | FailureClass::MissingRequiredField => false,
+        | FailureClass::MissingRequiredField
+        | FailureClass::SchemaDrift => false,
     }
 }
 
@@ -282,7 +283,8 @@ impl<T> RetryOutcome<T> {
             | FailureClass::TotalBudgetExpired
             | FailureClass::HttpStatus(_)
             | FailureClass::MalformedBody
-            | FailureClass::MissingRequiredField => None,
+            | FailureClass::MissingRequiredField
+            | FailureClass::SchemaDrift => None,
         }
     }
 }

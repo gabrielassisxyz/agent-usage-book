@@ -279,6 +279,7 @@ fn failure_class_text(class: FailureClass) -> String {
         FailureClass::RateLimited { .. } => "rate limited".to_string(),
         FailureClass::MalformedBody => "malformed body".to_string(),
         FailureClass::MissingRequiredField => "missing required field".to_string(),
+        FailureClass::SchemaDrift => "schema drift".to_string(),
     }
 }
 

@@ -30,6 +30,7 @@ use crate::meter::anthropic::{AnthropicAdapter, AnthropicReading};
 use crate::meter::codex::{CodexAdapter, CodexReading};
 use crate::meter::evidence::CapturedProviderResponse;
 use crate::meter::ollama::{OllamaAdapter, OllamaReading};
+use crate::meter::opencode::{OpenCodeAdapter, OpenCodeReading};
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 
 /// The authentication material an adapter authenticates a request with.
@@ -100,6 +101,10 @@ pub struct MeterRequest {
     /// model-specific query; `None` means every window the contract exposes.
     /// The adapter contract suite (section 34.8) exercises both forms.
     pub model: Option<ModelId>,
+    /// The provider-side workspace scope the caller resolved from the
+    /// account's configuration, for contracts that read a workspace-scoped
+    /// page. `None` when the provider has no such scope.
+    pub workspace_id: Option<String>,
     /// The provider home directory a file-backed meter reads its evidence
     /// from, resolved by the caller from the account's own configuration
     /// (`aub-cg6k`). This is the meter request's local source: the adapter
@@ -299,7 +304,7 @@ pub trait ProviderAdapter {
 /// Defined once and read everywhere a supported-provider list is rendered:
 /// the unsupported-provider error joins this table, so a hand-maintained
 /// copy of the list is the defect this constant exists to prevent.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "codex", "ollama"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "codex", "ollama", "opencode"];
 
 /// Endpoint overrides the caller resolved from the environment, handed across
 /// the boundary as data.
@@ -312,6 +317,12 @@ pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "codex", "ollama"];
 pub struct EndpointConfig {
     /// Overrides the Anthropic usage endpoint URL (`AUB_ANTHROPIC_ENDPOINT`).
     pub anthropic: Option<String>,
+    /// Overrides the OpenCode workspace page URL (`AUB_OPENCODE_ENDPOINT`):
+    /// the full page the adapter fetches, so a synthetic server can stand in
+    /// for `https://opencode.ai/workspace/<id>/go` in end-to-end runs. The
+    /// workspace id itself is account configuration, not an environment
+    /// override, and travels in [`MeterRequest::workspace_id`].
+    pub opencode: Option<String>,
 }
 
 /// The orchestrator-facing reading of whichever adapter the dispatch chose.
@@ -323,6 +334,7 @@ pub struct EndpointConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reading {
     Anthropic(AnthropicReading),
+    OpenCode(OpenCodeReading),
     Codex(CodexReading),
     Ollama(OllamaReading),
 }
@@ -337,6 +349,7 @@ pub enum Reading {
 /// [`adapter_for`], one variant here, and the delegation arms beside them.
 pub enum AnyAdapter {
     Anthropic(AnthropicAdapter),
+    OpenCode(OpenCodeAdapter),
     Codex(CodexAdapter),
     Ollama(OllamaAdapter),
 }
@@ -347,6 +360,7 @@ impl ProviderAdapter for AnyAdapter {
     fn declarations(&self) -> AdapterDeclarations {
         match self {
             AnyAdapter::Anthropic(adapter) => adapter.declarations(),
+            AnyAdapter::OpenCode(adapter) => adapter.declarations(),
             AnyAdapter::Codex(adapter) => adapter.declarations(),
             AnyAdapter::Ollama(adapter) => adapter.declarations(),
         }
@@ -363,6 +377,10 @@ impl ProviderAdapter for AnyAdapter {
             AnyAdapter::Anthropic(adapter) => map_observation(
                 adapter.observe(credential, request, transport, clock),
                 Reading::Anthropic,
+            ),
+            AnyAdapter::OpenCode(adapter) => map_observation(
+                adapter.observe(credential, request, transport, clock),
+                Reading::OpenCode,
             ),
             AnyAdapter::Codex(adapter) => map_observation(
                 adapter.observe(credential, request, transport, clock),
@@ -387,6 +405,14 @@ impl ProviderAdapter for AnyAdapter {
                 let captured = adapter.observe_with_evidence(credential, request, transport, clock);
                 CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::Anthropic),
+                    evidence: captured.evidence,
+                    failed_body: captured.failed_body,
+                }
+            }
+            AnyAdapter::OpenCode(adapter) => {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
+                    observation: map_observation(captured.observation, Reading::OpenCode),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
                 }
@@ -447,6 +473,9 @@ pub fn adapter_for(
                 endpoint,
             )))
         }
+        "opencode" => Ok(AnyAdapter::OpenCode(OpenCodeAdapter::new(
+            endpoint_overrides.opencode.clone(),
+        ))),
         "codex" => Ok(AnyAdapter::Codex(CodexAdapter::new())),
         "ollama" => Ok(AnyAdapter::Ollama(OllamaAdapter::new())),
         unsupported => Err(unsupported_provider_error(unsupported, account)),
@@ -548,8 +577,9 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), AnthropicAdapter::DEFAULT_ENDPOINT);
             }
-            AnyAdapter::Codex(_) => panic!("dispatch chose the codex arm for anthropic"),
-            AnyAdapter::Ollama(_) => panic!("expected the anthropic arm"),
+            AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) | AnyAdapter::OpenCode(_) => {
+                panic!("dispatch chose another arm for anthropic")
+            }
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"anthropic"));
     }
@@ -560,6 +590,7 @@ mod tests {
     fn adapter_for_honours_the_resolved_endpoint_override() {
         let overrides = EndpointConfig {
             anthropic: Some("http://127.0.0.1:9".to_string()),
+            opencode: None,
         };
         let adapter = adapter_for("anthropic", "work-primary", &overrides)
             .expect("anthropic is in the supported table");
@@ -567,9 +598,44 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), "http://127.0.0.1:9");
             }
-            AnyAdapter::Codex(_) => panic!("dispatch chose the codex arm for anthropic"),
-            AnyAdapter::Ollama(_) => panic!("expected the anthropic arm"),
+            AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) | AnyAdapter::OpenCode(_) => {
+                panic!("dispatch chose another arm for anthropic")
+            }
         }
+    }
+
+    /// The opencode arm dispatches to its adapter, carrying the endpoint
+    /// override the caller resolved and none when absent.
+    #[test]
+    fn adapter_for_dispatches_the_opencode_arm() {
+        let adapter = adapter_for("opencode", "go-primary", &EndpointConfig::default())
+            .expect("opencode is in the supported table");
+        match adapter {
+            AnyAdapter::OpenCode(opencode) => {
+                assert!(opencode.endpoint_override().is_none());
+            }
+            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) => {
+                panic!("the opencode dispatch cannot yield another arm")
+            }
+        }
+        let overrides = EndpointConfig {
+            anthropic: None,
+            opencode: Some("http://127.0.0.1:9/workspace/wrk_x/go".to_string()),
+        };
+        let adapter = adapter_for("opencode", "go-primary", &overrides)
+            .expect("opencode is in the supported table");
+        match adapter {
+            AnyAdapter::OpenCode(opencode) => {
+                assert_eq!(
+                    opencode.endpoint_override(),
+                    Some("http://127.0.0.1:9/workspace/wrk_x/go")
+                );
+            }
+            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) => {
+                panic!("the opencode dispatch cannot yield another arm")
+            }
+        }
+        assert!(SUPPORTED_PROVIDERS.contains(&"opencode"));
     }
 
     /// The codex arm dispatches to the rollout adapter and its declarations
@@ -592,7 +658,7 @@ mod tests {
                 assert!(declarations.required_window_kinds.contains("primary"));
                 assert!(declarations.required_window_kinds.contains("secondary"));
             }
-            AnyAdapter::Anthropic(_) | AnyAdapter::Ollama(_) => {
+            AnyAdapter::Anthropic(_) | AnyAdapter::Ollama(_) | AnyAdapter::OpenCode(_) => {
                 panic!("dispatch chose another arm for codex")
             }
         }
@@ -612,7 +678,9 @@ mod tests {
                     crate::meter::ollama::OllamaAdapter::DEFAULT_ENDPOINT
                 );
             }
-            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) => panic!("expected the ollama arm"),
+            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) | AnyAdapter::OpenCode(_) => {
+                panic!("expected the ollama arm")
+            }
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"ollama"));
     }
@@ -628,7 +696,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic, codex, ollama)"
+            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic, codex, ollama, opencode)"
         );
         assert!(matches!(error, Error::Usage(_)));
     }
