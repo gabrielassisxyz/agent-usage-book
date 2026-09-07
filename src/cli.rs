@@ -2473,7 +2473,14 @@ fn coverage_command(
     )?;
 
     match invocation.format {
-        OutputFormat::Text => println!("{}", render_coverage_report(&report, &window.description)),
+        OutputFormat::Text => println!(
+            "{}",
+            render_coverage_report(
+                &report,
+                &window.description,
+                Style::detect(invocation.no_color)
+            )
+        ),
         OutputFormat::Json => println!("{}", coverage_json(&report, run)),
     }
     if report.threshold.met {
