@@ -79,6 +79,7 @@ use crate::error::Error;
 use crate::meter::adapter::{
     CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter, ProviderObservation, Reading,
 };
+use crate::meter::agy::AgyReading;
 use crate::meter::anthropic::AnthropicReading;
 use crate::meter::codex::CodexReading;
 use crate::meter::due::{
@@ -162,6 +163,16 @@ impl MeteredReading for OllamaReading {
     }
 }
 
+impl MeteredReading for AgyReading {
+    fn windows(&self) -> &[MeterWindow] {
+        &self.windows
+    }
+
+    fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
+        None
+    }
+}
+
 impl MeteredReading for Reading {
     fn windows(&self) -> &[MeterWindow] {
         match self {
@@ -169,6 +180,7 @@ impl MeteredReading for Reading {
             Reading::OpenCode(reading) => &reading.windows,
             Reading::Codex(reading) => &reading.windows,
             Reading::Ollama(reading) => &reading.windows,
+            Reading::Agy(reading) => &reading.windows,
         }
     }
 
@@ -178,6 +190,7 @@ impl MeteredReading for Reading {
             Reading::OpenCode(reading) => reading.provider_observed_at,
             Reading::Codex(reading) => reading.provider_observed_at,
             Reading::Ollama(reading) => reading.provider_observed_at(),
+            Reading::Agy(reading) => reading.provider_observed_at(),
         }
     }
 
@@ -187,6 +200,7 @@ impl MeteredReading for Reading {
             Reading::OpenCode(reading) => Some(&reading.provider_contract_id),
             Reading::Codex(reading) => Some(&reading.provider_contract_id),
             Reading::Ollama(_) => None,
+            Reading::Agy(_) => None,
         }
     }
 }
@@ -1020,6 +1034,9 @@ fn scope_token(scope: &WindowScope) -> String {
     match scope {
         WindowScope::AccountWide => "account_wide".to_string(),
         WindowScope::ModelSpecific(model) => format!("model:{}", model.as_str()),
+        // The fingerprint's group spelling; a group budget is a distinct
+        // constraint from any model's own.
+        WindowScope::ModelGroup(group) => format!("group:{}", group.as_str()),
     }
 }
 

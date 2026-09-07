@@ -26,6 +26,7 @@ use crate::domain::ids::{MeterSemanticsId, ProviderContractId};
 use crate::domain::time::{Clock, MeasurementBasis};
 use crate::domain::window::ModelId;
 use crate::error::Error;
+use crate::meter::agy::{AgyAdapter, AgyReading};
 use crate::meter::anthropic::{AnthropicAdapter, AnthropicReading};
 use crate::meter::codex::{CodexAdapter, CodexReading};
 use crate::meter::evidence::CapturedProviderResponse;
@@ -304,7 +305,7 @@ pub trait ProviderAdapter {
 /// Defined once and read everywhere a supported-provider list is rendered:
 /// the unsupported-provider error joins this table, so a hand-maintained
 /// copy of the list is the defect this constant exists to prevent.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "codex", "ollama", "opencode"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "codex", "ollama", "opencode", "agy"];
 
 /// Endpoint overrides the caller resolved from the environment, handed across
 /// the boundary as data.
@@ -337,6 +338,7 @@ pub enum Reading {
     OpenCode(OpenCodeReading),
     Codex(CodexReading),
     Ollama(OllamaReading),
+    Agy(AgyReading),
 }
 
 /// The adapter choice the dispatch made, delegating [`ProviderAdapter`] to
@@ -352,6 +354,7 @@ pub enum AnyAdapter {
     OpenCode(OpenCodeAdapter),
     Codex(CodexAdapter),
     Ollama(OllamaAdapter),
+    Agy(AgyAdapter),
 }
 
 impl ProviderAdapter for AnyAdapter {
@@ -363,6 +366,7 @@ impl ProviderAdapter for AnyAdapter {
             AnyAdapter::OpenCode(adapter) => adapter.declarations(),
             AnyAdapter::Codex(adapter) => adapter.declarations(),
             AnyAdapter::Ollama(adapter) => adapter.declarations(),
+            AnyAdapter::Agy(adapter) => adapter.declarations(),
         }
     }
 
@@ -389,6 +393,10 @@ impl ProviderAdapter for AnyAdapter {
             AnyAdapter::Ollama(adapter) => map_observation(
                 adapter.observe(credential, request, transport, clock),
                 Reading::Ollama,
+            ),
+            AnyAdapter::Agy(adapter) => map_observation(
+                adapter.observe(credential, request, transport, clock),
+                Reading::Agy,
             ),
         }
     }
@@ -429,6 +437,14 @@ impl ProviderAdapter for AnyAdapter {
                 let captured = adapter.observe_with_evidence(credential, request, transport, clock);
                 CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::Ollama),
+                    evidence: captured.evidence,
+                    failed_body: captured.failed_body,
+                }
+            }
+            AnyAdapter::Agy(adapter) => {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
+                    observation: map_observation(captured.observation, Reading::Agy),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
                 }
@@ -478,6 +494,7 @@ pub fn adapter_for(
         ))),
         "codex" => Ok(AnyAdapter::Codex(CodexAdapter::new())),
         "ollama" => Ok(AnyAdapter::Ollama(OllamaAdapter::new())),
+        "agy" => Ok(AnyAdapter::Agy(AgyAdapter::new())),
         unsupported => Err(unsupported_provider_error(unsupported, account)),
     }
 }
@@ -577,7 +594,10 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), AnthropicAdapter::DEFAULT_ENDPOINT);
             }
-            AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) | AnyAdapter::OpenCode(_) => {
+            AnyAdapter::Codex(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::OpenCode(_)
+            | AnyAdapter::Agy(_) => {
                 panic!("dispatch chose another arm for anthropic")
             }
         }
@@ -598,7 +618,10 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), "http://127.0.0.1:9");
             }
-            AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) | AnyAdapter::OpenCode(_) => {
+            AnyAdapter::Codex(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::OpenCode(_)
+            | AnyAdapter::Agy(_) => {
                 panic!("dispatch chose another arm for anthropic")
             }
         }
@@ -614,7 +637,10 @@ mod tests {
             AnyAdapter::OpenCode(opencode) => {
                 assert!(opencode.endpoint_override().is_none());
             }
-            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) => {
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Codex(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::Agy(_) => {
                 panic!("the opencode dispatch cannot yield another arm")
             }
         }
@@ -631,7 +657,10 @@ mod tests {
                     Some("http://127.0.0.1:9/workspace/wrk_x/go")
                 );
             }
-            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) | AnyAdapter::Ollama(_) => {
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Codex(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::Agy(_) => {
                 panic!("the opencode dispatch cannot yield another arm")
             }
         }
@@ -658,7 +687,10 @@ mod tests {
                 assert!(declarations.required_window_kinds.contains("primary"));
                 assert!(declarations.required_window_kinds.contains("secondary"));
             }
-            AnyAdapter::Anthropic(_) | AnyAdapter::Ollama(_) | AnyAdapter::OpenCode(_) => {
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::OpenCode(_)
+            | AnyAdapter::Agy(_) => {
                 panic!("dispatch chose another arm for codex")
             }
         }
@@ -678,11 +710,42 @@ mod tests {
                     crate::meter::ollama::OllamaAdapter::DEFAULT_ENDPOINT
                 );
             }
-            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) | AnyAdapter::OpenCode(_) => {
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Codex(_)
+            | AnyAdapter::OpenCode(_)
+            | AnyAdapter::Agy(_) => {
                 panic!("expected the ollama arm")
             }
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"ollama"));
+    }
+
+    /// `aub-n8yx`: the agy arm dispatches to the Antigravity adapter, the
+    /// same shape the ollama dispatch test above proves.
+    #[test]
+    fn adapter_for_dispatches_the_agy_arm_to_the_quota_summary_adapter() {
+        let adapter = adapter_for("agy", "agy-primary", &EndpointConfig::default())
+            .expect("agy is in the supported table");
+        match adapter {
+            AnyAdapter::Agy(agy) => {
+                let declarations = agy.declarations();
+                assert_eq!(
+                    declarations.provider_contract_id.as_str(),
+                    crate::meter::agy::AgyAdapter::CONTRACT_ID
+                );
+                assert_eq!(
+                    declarations.meter_semantics_id.as_str(),
+                    crate::meter::agy::AgyAdapter::SEMANTICS_ID
+                );
+            }
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Codex(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::OpenCode(_) => {
+                panic!("expected the agy arm")
+            }
+        }
+        assert!(SUPPORTED_PROVIDERS.contains(&"agy"));
     }
 
     /// The negative: an unsupported provider yields the usage error that
@@ -696,7 +759,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic, codex, ollama, opencode)"
+            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic, codex, ollama, opencode, agy)"
         );
         assert!(matches!(error, Error::Usage(_)));
     }

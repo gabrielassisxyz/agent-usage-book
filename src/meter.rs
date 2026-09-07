@@ -6,6 +6,7 @@
 //! - calibration
 
 pub mod adapter;
+pub mod agy;
 pub mod anthropic;
 pub mod codex;
 pub mod due;
