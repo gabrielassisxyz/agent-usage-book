@@ -356,7 +356,7 @@ fn parse_limits_response(
         .and_then(serde_json::Value::as_array)
         .ok_or(FailureClass::MissingRequiredField)?;
     let mut windows = Vec::new();
-    let mut dropped_windows = Vec::new();
+    let dropped_windows = Vec::new();
     let mut seen_required = Vec::new();
 
     for limit in limits {
@@ -375,13 +375,22 @@ fn parse_limits_response(
                     }
                     windows.push(window);
                 }
-                Err(error) if is_required => return Err(error.failure_class),
-                Err(error) => dropped_windows.push(DroppedWindow {
-                    semantic_key: WindowSemanticKey::new(kind),
-                    reason: error.failure_class,
-                    field: error.field.to_string(),
-                    payload_fragment: error.payload_fragment,
-                }),
+                Err(error) => {
+                    // The swallow point for the live `weekly_scoped`
+                    // object-shape defect (aub-is93): a known-kind entry that
+                    // failed to parse used to be demoted to
+                    // `dropped_windows`, which nothing downstream reads (the
+                    // sampler persists only `MeteredReading::windows()`), so
+                    // the observation still committed with outcome=success
+                    // and the third limit silently missing. Every
+                    // account_wide row in the live ledger accumulated under
+                    // that swallow. An entry this adapter knows about must
+                    // parse when present: `weekly_scoped` stays optional by
+                    // absence only, and its parse failure now propagates so
+                    // the FailureClass reaches the attempt result as
+                    // `AttemptOutcome::Unreachable`.
+                    return Err(error.failure_class);
+                }
             },
             _ => {}
         }
@@ -460,16 +469,7 @@ fn parse_limit_window(
             )
         }
         "weekly_scoped" => {
-            let model = object
-                .get("scope")
-                .and_then(|value| value.get("model"))
-                .and_then(serde_json::Value::as_str)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| WindowParseError {
-                    field: "scope.model",
-                    payload_fragment: fragment.clone(),
-                    failure_class: FailureClass::MissingRequiredField,
-                })?;
+            let model = parse_scoped_model_identity(object, &fragment)?;
             (
                 format!("weekly_scoped_{model}"),
                 WindowScope::ModelSpecific(ModelId::new(model)),
@@ -491,6 +491,54 @@ fn parse_limit_window(
         is_active,
         severity,
     ))
+}
+
+/// Resolves the model identity of a `weekly_scoped` limit's `scope.model`.
+///
+/// The live endpoint sends the model as an object carrying `display_name` and
+/// a nullable `id` (aub-is93); older captures carry a plain string, which
+/// keeps its historical spelling unchanged. The identity must come from a
+/// stable string the provider supplied: the display name lowercased and
+/// trimmed, falling back to `id` only when the display name is absent or
+/// empty. When neither is present no identity is invented and the entry
+/// fails with `MissingRequiredField` on `scope.model`.
+fn parse_scoped_model_identity(
+    object: &serde_json::Map<String, serde_json::Value>,
+    fragment: &str,
+) -> Result<String, WindowParseError> {
+    let refused = || WindowParseError {
+        field: "scope.model",
+        payload_fragment: fragment.to_string(),
+        failure_class: FailureClass::MissingRequiredField,
+    };
+    let scope_model = object
+        .get("scope")
+        .and_then(|value| value.get("model"))
+        .ok_or_else(refused)?;
+    if let Some(name) = scope_model.as_str() {
+        // The plain-string shape: the string itself is the model identity.
+        return if name.is_empty() {
+            Err(refused())
+        } else {
+            Ok(name.to_string())
+        };
+    }
+    let display_name = scope_model
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|name| !name.is_empty());
+    display_name
+        .map(str::to_lowercase)
+        .or_else(|| {
+            scope_model
+                .get("id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_lowercase)
+        })
+        .ok_or_else(refused)
 }
 
 fn parse_reset_state(
@@ -943,6 +991,13 @@ mod tests {
         include_bytes!("../../tests/fixtures/meter/anthropic/reset-changed-a.json");
     const FIXTURE_RESET_CHANGED_B: &[u8] =
         include_bytes!("../../tests/fixtures/meter/anthropic/reset-changed-b.json");
+    const FIXTURE_WEEKLY_SCOPED_OBJECT: &[u8] =
+        include_bytes!("../../tests/fixtures/meter/anthropic/weekly-scoped-object.json");
+    const FIXTURE_WEEKLY_SCOPED_MODEL_UNIDENTIFIED: &[u8] = include_bytes!(
+        "../../tests/fixtures/meter/anthropic/weekly-scoped-model-unidentified.json"
+    );
+    const FIXTURE_LIMITS_SUCCESS: &[u8] =
+        include_bytes!("../../tests/fixtures/meter/anthropic/limits-success.json");
     const FIXTURE_IDLE_FIVE_HOUR: &[u8] =
         include_bytes!("../../tests/fixtures/meter/anthropic/idle-five-hour.json");
 
@@ -1313,6 +1368,208 @@ mod tests {
             Some(UtcTimestamp::parse_rfc3339("2026-09-06T12:00:00.000Z").unwrap())
         );
         assert!(reading.dropped_windows.is_empty());
+    }
+
+    /// The live endpoint (evidence capsule 2026-09-06) sends the model-scoped
+    /// weekly limit with `scope.model` as an object carrying `display_name` and
+    /// a nullable `id`. The sanitized capsule must yield three windows, the
+    /// third identified by the lowercased display name (aub-is93).
+    #[test]
+    fn case_16_weekly_scoped_object_model() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(200, FIXTURE_WEEKLY_SCOPED_OBJECT);
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 3);
+        assert_eq!(reading.windows[0].semantic_key().as_str(), "session");
+        assert_eq!(*reading.windows[0].scope(), WindowScope::AccountWide);
+        assert_eq!(reading.windows[1].semantic_key().as_str(), "weekly_all");
+        assert_eq!(*reading.windows[1].scope(), WindowScope::AccountWide);
+
+        let fable = &reading.windows[2];
+        assert_eq!(fable.semantic_key().as_str(), "weekly_scoped_fable");
+        assert_eq!(
+            *fable.scope(),
+            WindowScope::ModelSpecific(ModelId::new("fable"))
+        );
+        assert_eq!(fable.quota_used().as_ppm().get(), 250_000);
+        assert_eq!(
+            fable.resets_at(),
+            Some(UtcTimestamp::parse_rfc3339("2026-09-09T13:59:59.631948Z").unwrap())
+        );
+        assert!(!fable.is_active());
+        assert_eq!(fable.severity().as_str(), "normal");
+    }
+
+    /// The plain-string `scope.model` shape is the shape the parser accepted
+    /// before the object shape existed; it must keep parsing unchanged.
+    #[test]
+    fn case_17_weekly_scoped_string_model() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(200, FIXTURE_LIMITS_SUCCESS);
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+
+        let reading = expect_measured(obs);
+        assert_eq!(reading.windows.len(), 3);
+        let scoped = &reading.windows[2];
+        assert_eq!(scoped.semantic_key().as_str(), "weekly_scoped_sonnet");
+        assert_eq!(
+            *scoped.scope(),
+            WindowScope::ModelSpecific(ModelId::new("sonnet"))
+        );
+    }
+
+    /// A scoped model with neither a usable `display_name` nor an `id` fails:
+    /// no identity is invented. The fixture is identical to the positive
+    /// `weekly-scoped-object.json` except for the absent `display_name`.
+    #[test]
+    fn case_18_weekly_scoped_object_without_display_name_or_id_fails() {
+        let body: serde_json::Value =
+            serde_json::from_slice(FIXTURE_WEEKLY_SCOPED_MODEL_UNIDENTIFIED).unwrap();
+        let scoped = body["limits"][2].as_object().unwrap();
+        let error = parse_limit_window("weekly_scoped", scoped)
+            .expect_err("a scoped model with no display name and a null id must fail to parse");
+        assert_eq!(error.field, "scope.model");
+        assert_eq!(error.failure_class, FailureClass::MissingRequiredField);
+
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(200, FIXTURE_WEEKLY_SCOPED_MODEL_UNIDENTIFIED);
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+        assert_eq!(
+            obs,
+            ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
+        );
+    }
+
+    /// `id` alone is a stable string the provider supplied, so it backs the
+    /// identity when the display name is absent; it is normalized the same way.
+    #[test]
+    fn weekly_scoped_model_identity_falls_back_to_id() {
+        let object = serde_json::json!({
+            "kind": "weekly_scoped",
+            "percent": 25,
+            "severity": "normal",
+            "resets_at": "2026-09-09T13:59:59.631948+00:00",
+            "scope": {"model": {"id": "Fable-Alpha", "display_name": null}},
+            "is_active": false
+        });
+        let window = parse_limit_window("weekly_scoped", object.as_object().unwrap()).unwrap();
+        assert_eq!(window.semantic_key().as_str(), "weekly_scoped_fable-alpha");
+        assert_eq!(
+            *window.scope(),
+            WindowScope::ModelSpecific(ModelId::new("fable-alpha"))
+        );
+    }
+
+    /// The settled identity rule: a usable `display_name` wins over `id`.
+    #[test]
+    fn weekly_scoped_model_identity_prefers_display_name_over_id() {
+        let object = serde_json::json!({
+            "kind": "weekly_scoped",
+            "percent": 25,
+            "severity": "normal",
+            "resets_at": "2026-09-09T13:59:59.631948+00:00",
+            "scope": {"model": {"display_name": " Fable ", "id": "model-fable-01"}},
+            "is_active": false
+        });
+        let window = parse_limit_window("weekly_scoped", object.as_object().unwrap()).unwrap();
+        assert_eq!(window.semantic_key().as_str(), "weekly_scoped_fable");
+        assert_eq!(
+            *window.scope(),
+            WindowScope::ModelSpecific(ModelId::new("fable"))
+        );
+    }
+
+    /// An empty `display_name` with a null `id` is the other half of the
+    /// forbidden dimension: the same refusal as an absent display name.
+    #[test]
+    fn weekly_scoped_object_with_empty_display_name_and_null_id_fails() {
+        let object = serde_json::json!({
+            "kind": "weekly_scoped",
+            "percent": 25,
+            "severity": "normal",
+            "resets_at": "2026-09-09T13:59:59.631948+00:00",
+            "scope": {"model": {"display_name": "", "id": null}},
+            "is_active": false
+        });
+        let error = parse_limit_window("weekly_scoped", object.as_object().unwrap())
+            .expect_err("an empty display name with a null id must fail to parse");
+        assert_eq!(error.field, "scope.model");
+        assert_eq!(error.failure_class, FailureClass::MissingRequiredField);
+    }
+
+    /// The swallow point: a `weekly_scoped` entry that cannot be parsed is
+    /// reported on the observation rather than demoted to `dropped_windows`
+    /// behind an outcome=success reading. The window-level error names its
+    /// field, and the whole observation carries the FailureClass.
+    #[test]
+    fn weekly_scoped_parse_failure_reaches_the_observation_not_dropped() {
+        let body = serde_json::json!({
+            "limits": [
+                {
+                    "kind": "session",
+                    "percent": 8.0,
+                    "severity": "normal",
+                    "resets_at": "2026-09-05T17:00:00.000Z",
+                    "scope": null,
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_all",
+                    "percent": 21.0,
+                    "severity": "warning",
+                    "resets_at": "2026-09-06T12:00:00.000Z",
+                    "scope": null,
+                    "is_active": true
+                },
+                {
+                    "kind": "weekly_scoped",
+                    "percent": 25,
+                    "severity": "normal",
+                    "resets_at": "2026-09-09T13:59:59.631948+00:00",
+                    "scope": {},
+                    "is_active": false
+                }
+            ]
+        });
+        let scoped = body["limits"][2].as_object().unwrap();
+        let error = parse_limit_window("weekly_scoped", scoped)
+            .expect_err("a scoped entry without a model must fail to parse");
+        assert_eq!(error.field, "scope.model");
+        assert_eq!(error.failure_class, FailureClass::MissingRequiredField);
+
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(200, serde_json::to_vec(&body).unwrap());
+        let clock = test_clock();
+        let obs = adapter.observe(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &clock,
+        );
+        assert_eq!(
+            obs,
+            ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
+        );
     }
 
     #[test]
