@@ -957,7 +957,12 @@ the resulting typed measurement basis:
 * or the older of the two where the provider's semantics specifically require that
   conservative reading.
 
-A provider timestamp outside the configured clock-skew envelope is a `ClockAnomaly`.
+A provider timestamp ahead of the receive timestamp by more than the
+configured clock-skew envelope is a `ClockAnomaly`. A provider timestamp
+behind the receive timestamp is never an anomaly no matter how far behind:
+a file-sourced observation (the Codex rollout's modification time) is
+honestly old when the account has been idle for days, and that lateness
+surfaces as age against the freshness horizon, not as clock skew.
 It is never a licence to manufacture a negative age or a freshness in the future.
 
 Monotonic time governs in-process timeouts and the command budget. Wall-clock

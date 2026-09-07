@@ -337,11 +337,17 @@ pub struct ClockAnomaly {
 
 /// Computes the age of a reading at `now`.
 ///
-/// The measurement time is chosen by `basis`. When a provider timestamp is
-/// present it is checked against the clock-skew envelope: a provider
-/// timestamp more than `envelope` away from the receive timestamp is a
-/// [`ClockAnomaly`]. A measurement time in the future is also a
-/// [`ClockAnomaly`], never a negative age.
+/// The measurement time is chosen by `basis`. A provider timestamp ahead of
+/// the receive timestamp by more than `envelope` is a [`ClockAnomaly`]: the
+/// provider claims to have measured after the reading was received, which no
+/// honest delay explains. A provider timestamp behind the receive timestamp
+/// is never an anomaly no matter how far behind it is: a file-sourced
+/// observation (the Codex rollout's modification time) is honestly old when
+/// the account has been idle for days, and an endpoint-sourced observation
+/// held back by a queue is honestly delayed. That lateness surfaces as age
+/// against the freshness horizon (`AgeExceeded` when stale), not as clock
+/// skew. A measurement time in the future is also a [`ClockAnomaly`], never
+/// a negative age.
 pub fn age(
     provider_observed: Option<ProviderObservedAt>,
     received: ReceivedAt,
@@ -349,7 +355,9 @@ pub fn age(
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
 ) -> Result<Age, ClockAnomaly> {
-    if let Some(provider) = provider_observed {
+    if let Some(provider) = provider_observed
+        && provider.as_utc() > received.as_utc()
+    {
         let skew = provider.as_utc().abs_diff_nanos(received.as_utc());
         if skew > envelope.as_nanos() {
             return Err(ClockAnomaly {
@@ -527,17 +535,20 @@ mod tests {
         assert_eq!(unix_nanos(instant), 0);
     }
 
-    /// A provider timestamp exactly at the envelope boundary is inside; one
-    /// nanosecond past it, in either direction, is a `ClockAnomaly`.
+    /// A provider timestamp ahead of the receive timestamp by exactly the
+    /// envelope is inside; one nanosecond further ahead is a `ClockAnomaly`.
+    /// A provider timestamp behind the receive timestamp is never an anomaly
+    /// no matter how far behind: a file-sourced observation (the Codex
+    /// rollout's modification time) is honestly old when the account has been
+    /// idle, and that lateness surfaces as age, not as clock skew (aub-3o0w).
     #[test]
-    fn clock_skew_envelope_boundaries_in_both_directions() {
+    fn clock_skew_envelope_applies_ahead_of_receive_time_only() {
         let received = ReceivedAt::new(ts(1_000));
         let now = ts(1_100);
         let env = envelope(10);
 
-        // Inside, both directions.
+        // Inside, ahead direction.
         let ahead = ProviderObservedAt::new(ts(1_010));
-        let behind = ProviderObservedAt::new(ts(990));
         assert!(
             age(
                 Some(ahead),
@@ -548,22 +559,10 @@ mod tests {
             )
             .is_ok()
         );
-        assert!(
-            age(
-                Some(behind),
-                received,
-                MeasurementBasis::ProviderObserved,
-                now,
-                env
-            )
-            .is_ok()
-        );
 
-        // Outside, both directions.
+        // Outside, ahead direction.
         let too_far_ahead =
             ProviderObservedAt::new(UtcTimestamp::from_unix_nanos(1_010 * 1_000_000_000 + 1));
-        let too_far_behind =
-            ProviderObservedAt::new(UtcTimestamp::from_unix_nanos(990 * 1_000_000_000 - 1));
         assert!(
             age(
                 Some(too_far_ahead),
@@ -574,16 +573,22 @@ mod tests {
             )
             .is_err()
         );
-        assert!(
-            age(
-                Some(too_far_behind),
-                received,
-                MeasurementBasis::ProviderObserved,
-                now,
-                env
-            )
-            .is_err()
-        );
+
+        // Behind the receive timestamp by far more than the envelope is an
+        // honest age, not an anomaly: a rollout written days ago and read
+        // today.
+        let days_behind =
+            ProviderObservedAt::new(UtcTimestamp::from_unix_nanos(1_000 * 1_000_000_000));
+        let read_now = ts(1_000 + 2 * 86_400);
+        let aged = age(
+            Some(days_behind),
+            received,
+            MeasurementBasis::ProviderObserved,
+            read_now,
+            env,
+        )
+        .expect("a days-old file timestamp must not be a clock anomaly");
+        assert_eq!(aged.as_nanos(), 2 * 86_400 * 1_000_000_000);
     }
 
     /// A provider timestamp in the future is an anomaly, never a negative age,

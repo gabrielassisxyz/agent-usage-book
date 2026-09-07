@@ -86,7 +86,11 @@ pub struct CodexReading {
     /// The instant the provider wrote the chosen rollout record, taken from
     /// the file's modification time. This is the reading's measurement time:
     /// a local file's own mtime is the closest thing to a provider timestamp
-    /// a local source carries.
+    /// a local source carries, hence the `ProviderObserved` basis. An mtime
+    /// days behind the read is honest idleness, not clock skew: the
+    /// clock-skew envelope applies ahead of the receive timestamp only, so a
+    /// stale rollout ages into `AgeExceeded` while a future mtime is still a
+    /// `ClockAnomaly` (aub-3o0w).
     pub provider_observed_at: Option<ProviderObservedAt>,
     /// The identity decoded from the credential material's JWT payload, when
     /// the credential carries a decodable one. Its absence never blocks the

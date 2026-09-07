@@ -911,6 +911,114 @@ mod tests {
         assert_eq!(latest_attempt, AttemptId::new(1));
     }
 
+    /// A file-sourced observation two days old is `AgeExceeded`, never a
+    /// clock anomaly (aub-3o0w): the Codex adapter reads the newest
+    /// `rollout-*.jsonl` and takes the file's modification time as
+    /// `provider_observed_at`, so a home idle since Saturday honestly lags
+    /// Monday's read by days. Computed through the production state machine.
+    #[test]
+    fn a_file_sourced_observation_two_days_old_is_age_exceeded_not_a_clock_anomaly() {
+        let ctx = CredentialContextId::new("ctx-codex-idle");
+        let horizon = MonotonicDuration::from_seconds(720);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
+
+        // Written Saturday, read Monday: two days behind the receive time.
+        let written_nanos = 1_000_000_000_000i64;
+        let received_nanos = written_nanos + 2 * 86_400 * 1_000_000_000;
+        let obs = test_observed(42, Some(written_nanos), received_nanos);
+        let started = AttemptStarted::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(received_nanos),
+        );
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(received_nanos),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Success,
+        );
+
+        let input = FreshnessInput::new(
+            Some(obs.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        let clock = crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(
+            received_nanos + 5_000_000_000,
+        ));
+        let res = compute_freshness(&input, &clock);
+        assert_eq!(res.kind(), FreshnessKind::Stale);
+        let Freshness::Stale {
+            last_good: Some(good),
+            latest_attempt,
+            reason: StaleReason::AgeExceeded,
+        } = res
+        else {
+            panic!("a two-day-idle rollout must be Stale(AgeExceeded), got {res:?}");
+        };
+        assert_eq!(good, obs);
+        assert_eq!(latest_attempt, AttemptId::new(1));
+    }
+
+    /// A rollout whose timestamp is ahead of the local clock is still a
+    /// clock anomaly (aub-3o0w): the directional envelope excuses an old
+    /// file, never a file from the future. Computed through the production
+    /// state machine.
+    #[test]
+    fn a_rollout_timestamp_ahead_of_the_local_clock_is_a_clock_anomaly() {
+        let ctx = CredentialContextId::new("ctx-codex-future");
+        let horizon = MonotonicDuration::from_seconds(720);
+        let command_horizon = MonotonicDuration::from_seconds(10);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
+
+        // Modification time one hour ahead of the read.
+        let received_nanos = 1_000_000_000_000i64;
+        let future_nanos = received_nanos + 3_600 * 1_000_000_000;
+        let obs = test_observed(42, Some(future_nanos), received_nanos);
+        let started = AttemptStarted::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(received_nanos),
+        );
+        let result = AttemptResult::new(
+            AttemptId::new(1),
+            UtcTimestamp::from_unix_nanos(received_nanos),
+            MonotonicDuration::from_seconds(0),
+            AttemptOutcome::Success,
+        );
+
+        let input = FreshnessInput::new(
+            Some(obs.clone()),
+            Some(&ctx),
+            Some(LatestAttempt::new(started, Some(result), &ctx)),
+            None,
+            Some(&ctx),
+            horizon,
+            command_horizon,
+            envelope,
+        );
+
+        let clock =
+            crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(received_nanos));
+        let res = compute_freshness(&input, &clock);
+        assert_eq!(res.kind(), FreshnessKind::Stale);
+        let Freshness::Stale {
+            last_good: Some(good),
+            latest_attempt,
+            reason: StaleReason::ClockAnomaly,
+        } = res
+        else {
+            panic!("a future rollout timestamp must be Stale(ClockAnomaly), got {res:?}");
+        };
+        assert_eq!(good, obs);
+        assert_eq!(latest_attempt, AttemptId::new(1));
+    }
+
     #[test]
     fn pure_function_called_twice_with_identical_inputs_returns_identical_output() {
         let ctx = CredentialContextId::new("ctx-1");
