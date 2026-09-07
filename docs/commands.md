@@ -146,18 +146,92 @@ or an API-list-price conversion for a number it cannot justify.
 
 **Answers:** which configuration key resolved to which value, and from where?
 
-Three aligned columns (key, resolved value, source), one blank line between
-sections, array sections expanded one row per element and field:
+One box titled with the config file path (`~` for the home directory), one
+block per section with the section name as its title and the keys under it
+without the section prefix (the full box for a two-account config):
 
-    sampling.default_interval             5m                     default
-    sampling.max_concurrent_requests      2                      default
+```
+┌─ config · ~/.config/aub/config.toml ─────────────────────────────────────────┐
+│                                                                              │
+│  accounts                                                                    │
+│    work-primary    provider-a  file:/tmp/aub-golden/creds-primary.js…  file  │
+│    work-secondary  provider-b  env:AUB_GOLDEN_TOKEN                    file  │
+│      exclusivity_policy permit_passive                                       │
+│                                                                              │
+│  adapter_semantics                                                           │
+│    max_comparison_age       30d                                     default  │
+│                                                                              │
+│  attribution                                                                 │
+│    recent_window            30d                                     default  │
+│                                                                              │
+│  backup                                                                      │
+│    destination              /tmp/aub-golden/backups                    file  │
+│    review_after             36h                                        file  │
+│                                                                              │
+│  can_run                                                                     │
+│    ample_margin_multiple    2                                       default  │
+│    headroom_bound           low                                     default  │
+│    labels                   true                                    default  │
+│                                                                              │
+│  coverage                                                                    │
+│    attempt_floor            0.98                                    default  │
+│    measurement_floor        0.95                                    default  │
+│                                                                              │
+│  doctor                                                                      │
+│    meter_anomaly_horizon    15m                                     default  │
+│                                                                              │
+│  drill                                                                       │
+│    max_age                  30d                                     default  │
+│                                                                              │
+│  freshness                                                                   │
+│    meter                    12m                                     default  │
+│                                                                              │
+│  ingest                                                                      │
+│    max_batch_events         5000                                    default  │
+│    max_batch_files          200                                     default  │
+│    max_batch_seconds        2s                                      default  │
+│                                                                              │
+│  reconciliation                                                              │
+│    residual_min_eligible    5                                       default  │
+│    residual_window          30d                                     default  │
+│                                                                              │
+│  sampling                                                                    │
+│    busy_timeout             10s                                     default  │
+│    command_budget           8s                                      default  │
+│    default_interval         5m                                      default  │
+│    max_concurrent_requests  2                                       default  │
+│    request_timeout          5s                                      default  │
+│    reset_edge_lead          2m                                      default  │
+│    scheduler_tick           1m                                      default  │
+│                                                                              │
+│  state                                                                       │
+│    dir                      ~/.local/state/aub                      default  │
+│                                                                              │
+│  task_distribution                                                           │
+│    attribution_floor        0.8                                     default  │
+│    central_high             75                                      default  │
+│    central_low              25                                      default  │
+│    min_samples              12                                      default  │
+│    quantile_method          nearest-rank                            default  │
+│    upper                    90                                      default  │
+│                                                                              │
+│  transcripts                                                                 │
+│    cli-a  claude-code  /tmp/aub-golden/cli-a                           file  │
+│      pattern **/*.jsonl                                                      │
+│    cli-b  codex        /tmp/aub-golden/cli-b                           file  │
+│      pattern **/*.md                                                         │
+│      usage_evidence measured                                                 │
+└──────────────────────────────────────────────────────────────────────────────┘
+```
 
-    accounts[0].credential                file:/home/user/.claude/.credentials.json  file
-    accounts[0].name                      work                              file
-
-Column widths follow the rows: the key column fits the longest key, the value
-column fits the longest value up to 48 characters (longer values end in `…`).
-A `--set key=value` override prints with source `override`.
+`accounts` prints one line per account (`name  provider  credential  source`)
+with a second dim line only when the account's `exclusivity_policy` differs
+from the default; `transcripts` prints one line per source with the `pattern`
+(and any `usage_evidence`) on dim lines under it. The source column reads
+`default` in dim and `file`, `override` or `environment` in body text, so the
+keys the operator set stand out from the ones they did not. Values longer
+than the room to the source column end in `…`. A `--set key=value` override
+prints with source `override`.
 
 **Refuses:** to invent a value for a key nobody set. An unset key prints with
 source `default`, never a value that looks like it came from a file. It also
