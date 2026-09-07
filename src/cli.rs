@@ -3094,72 +3094,52 @@ fn config_boxed_scalar_line(
     )
 }
 
-/// One account's main boxed line (aub-34ik): `name  provider  credential
-/// source`, with the source right-aligned at the box edge and the
-/// credential truncated with `…` to the room left. Widths span the whole
-/// accounts section so the credential column starts at one offset.
-fn config_boxed_account_line(
-    name: &str,
-    provider: &str,
-    credential: &str,
-    source: crate::config::ConfigSource,
+/// The layout one `accounts` or `transcripts` line is measured against
+/// (aub-34ik): the two left column widths, computed over the whole section
+/// so the third column starts at one offset, the box's content area, the
+/// home prefix `~` stands for, and the style that paints the source.
+#[derive(Clone, Copy)]
+struct ConfigBoxedLineLayout<'a> {
     name_width: usize,
-    provider_width: usize,
+    second_width: usize,
     area: usize,
-    home: &str,
+    home: &'a str,
     style: Style,
+}
+
+/// One element line of a list section: `name  second  third  source`, with
+/// the source right-aligned at the box edge and the third column (a
+/// credential or a transcript root) truncated with `…` to the room left.
+/// An account line passes its provider and credential; a transcript line
+/// its format (`-` when unset, so the columns hold) and root.
+fn config_boxed_list_line(
+    name: &str,
+    second: &str,
+    third: &str,
+    source: crate::config::ConfigSource,
+    layout: ConfigBoxedLineLayout<'_>,
 ) -> String {
     let source_label = source.label();
-    let credential_tilde = config_boxed_tilde_value(credential, home);
-    let budget = area
-        .saturating_sub(2 + name_width + provider_width + source_label.chars().count() + 2)
+    let third_tilde = config_boxed_tilde_value(third, layout.home);
+    let budget = layout
+        .area
+        .saturating_sub(
+            2 + layout.name_width + layout.second_width + source_label.chars().count() + 2,
+        )
         .max(1);
-    let credential_fit = config_boxed_fit_value(&credential_tilde, budget);
-    let spaces = area.saturating_sub(
-        2 + name_width
-            + provider_width
-            + credential_fit.chars().count()
+    let third_fit = config_boxed_fit_value(&third_tilde, budget);
+    let spaces = layout.area.saturating_sub(
+        2 + layout.name_width
+            + layout.second_width
+            + third_fit.chars().count()
             + source_label.chars().count(),
     );
     format!(
-        "  {name}{}{provider}{}{credential_fit}{}{}",
-        " ".repeat(name_width.saturating_sub(name.chars().count())),
-        " ".repeat(provider_width.saturating_sub(provider.chars().count())),
+        "  {name}{}{second}{}{third_fit}{}{}",
+        " ".repeat(layout.name_width.saturating_sub(name.chars().count())),
+        " ".repeat(layout.second_width.saturating_sub(second.chars().count())),
         " ".repeat(spaces),
-        config_boxed_paint_source(source, style),
-    )
-}
-
-/// One transcript source's main boxed line (aub-34ik): `name  format  root
-/// source`, with the source right-aligned and the root truncated with `…`
-/// to the room left. An unset format prints as `-` so the columns hold.
-fn config_boxed_transcript_line(
-    name: &str,
-    format: Option<&str>,
-    root: &str,
-    source: crate::config::ConfigSource,
-    name_width: usize,
-    format_width: usize,
-    area: usize,
-    home: &str,
-    style: Style,
-) -> String {
-    let source_label = source.label();
-    let shown_format = format.unwrap_or("-");
-    let root_tilde = config_boxed_tilde_value(root, home);
-    let budget = area
-        .saturating_sub(2 + name_width + format_width + source_label.chars().count() + 2)
-        .max(1);
-    let root_fit = config_boxed_fit_value(&root_tilde, budget);
-    let spaces = area.saturating_sub(
-        2 + name_width + format_width + root_fit.chars().count() + source_label.chars().count(),
-    );
-    format!(
-        "  {name}{}{shown_format}{}{root_fit}{}{}",
-        " ".repeat(name_width.saturating_sub(name.chars().count())),
-        " ".repeat(format_width.saturating_sub(shown_format.chars().count())),
-        " ".repeat(spaces),
-        config_boxed_paint_source(source, style),
+        config_boxed_paint_source(source, layout.style),
     )
 }
 
@@ -3268,16 +3248,18 @@ fn config_boxed_render_with_width(
                     .map(|field| field.source)
                     .unwrap_or(crate::config::ConfigSource::Default);
                 lines.push(boxed_body(
-                    &config_boxed_account_line(
+                    &config_boxed_list_line(
                         name,
                         provider,
                         credential,
                         source,
-                        account_name_width,
-                        account_provider_width,
-                        area,
-                        home,
-                        style,
+                        ConfigBoxedLineLayout {
+                            name_width: account_name_width,
+                            second_width: account_provider_width,
+                            area,
+                            home,
+                            style,
+                        },
                     ),
                     width,
                 ));
@@ -3351,16 +3333,18 @@ fn config_boxed_render_with_width(
                     .map(|field| field.source)
                     .unwrap_or(crate::config::ConfigSource::Default);
                 lines.push(boxed_body(
-                    &config_boxed_transcript_line(
+                    &config_boxed_list_line(
                         name,
-                        format,
+                        format.unwrap_or("-"),
                         root,
                         source,
-                        transcript_name_width,
-                        transcript_format_width,
-                        area,
-                        home,
-                        style,
+                        ConfigBoxedLineLayout {
+                            name_width: transcript_name_width,
+                            second_width: transcript_format_width,
+                            area,
+                            home,
+                            style,
+                        },
                     ),
                     width,
                 ));
