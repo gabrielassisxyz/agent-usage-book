@@ -19,6 +19,9 @@ use crate::domain::tokens::{TokenKind, UsageVector};
 use crate::domain::window::NominalWindowDuration;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, Derivation, RequiredFact};
+use crate::presentation::boxed::{
+    boxed_blank, boxed_body, boxed_bottom, boxed_content_area, boxed_rule, boxed_top, boxed_width,
+};
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
@@ -1647,20 +1650,27 @@ fn coverage_cell(text: &str, width: usize) -> String {
     format!("{text:<width$}  ")
 }
 
+/// A coverage fraction as a percentage that always carries its one decimal:
+/// the table reads down a column, and "100" beside "88.9" reads as a
+/// different unit. The rounding is the same half-up step
+/// [`render_percentage`] applies, so a table cell and the threshold message
+/// can never disagree about the number they were both handed.
+fn coverage_percent_cell(fraction: crate::coverage::CoverageFraction) -> String {
+    let tenths = (u64::from(fraction.as_ppm()) * 10 + 5_000) / 10_000;
+    format!("{}.{:01}%", tenths / 10, tenths % 10)
+}
+
 /// The attempts cell: the coverage percentage where one exists, the named
 /// refusal where the engine refused to compute one. A policy the ledger
-/// cannot reconstruct reads as "unknown", never as a number.
+/// cannot reconstruct reads as "unknown", never as a number; a policy that
+/// owed nothing reads as "none", because there were no attempts to cover.
 fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
     match engine.attempt_coverage {
-        Some(fraction) => {
-            format!(
-                "{}%",
-                render_percentage(fraction.as_ppm(), COVERAGE_PERCENT)
-            )
-        }
+        Some(fraction) => coverage_percent_cell(fraction),
         None => match engine.expected_opportunities {
             None => "unknown".to_string(),
-            Some(0) => "n/a".to_string(),
+            // Nothing was owed: there were no attempts to cover.
+            Some(0) => "none".to_string(),
             Some(_) => "unknown".to_string(),
         },
     }
@@ -1670,25 +1680,25 @@ fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
 /// the named refusal when no attempt reached a terminal state.
 fn coverage_measurements_cell(engine: &crate::coverage::CoverageReport) -> String {
     match engine.measurement_coverage {
-        Some(fraction) => {
-            format!(
-                "{}%",
-                render_percentage(fraction.as_ppm(), COVERAGE_PERCENT)
-            )
-        }
+        Some(fraction) => coverage_percent_cell(fraction),
         None => "none".to_string(),
     }
 }
 
 /// The detail block of one account, when its numbers need explaining: the
-/// scheduler line, the non-zero failure classes largest first, the
+/// floor breaches, the non-zero failure classes largest first, the
 /// interruptions, and the resets lost to blind gaps. A healthy account
-/// renders no block: the table row already carries its numbers.
+/// renders no block: the table row already carries its numbers. An
+/// unconfigured account renders no block either: it is not a table row, and
+/// its history reaches the operator on the one "not in config" line.
 fn render_coverage_detail(
     report: &CoverageReport,
     account: &crate::report::CoverageAccount,
 ) -> Option<Vec<String>> {
     let engine = &account.engine;
+    if !account.configured {
+        return None;
+    }
     let attempt_below_floor = account.configured
         && engine
             .attempt_coverage
@@ -1700,8 +1710,7 @@ fn render_coverage_detail(
     let interrupted = engine.started_without_terminal_result > 0;
     let policy_unknown = engine.expected_opportunities.is_none();
     let severe = !engine.reset_spanning_gaps.is_empty();
-    if account.configured
-        && !policy_unknown
+    if !policy_unknown
         && !attempt_below_floor
         && !measurement_below_floor
         && !interrupted
@@ -1711,19 +1720,22 @@ fn render_coverage_detail(
     }
 
     let mut lines = Vec::new();
-    if !account.configured {
-        lines.push("account is not configured".to_string());
-    } else if policy_unknown {
+    if policy_unknown {
         lines.push("no sampling policy snapshot covers the whole interval".to_string());
-    } else {
-        match engine.attempt_coverage {
-            // The scheduler line names the only fact a high attempt coverage
-            // carries: the opportunities the policy owed were begun.
-            Some(_) if !attempt_below_floor => lines.push("scheduler ran normally".to_string()),
-            Some(_) => lines.push("attempt coverage is below the configured floor".to_string()),
-            // Nothing was owed: there is no attempt coverage to judge.
-            None => {}
-        }
+    } else if attempt_below_floor {
+        lines.push(format!(
+            "attempt coverage below the {}% floor",
+            render_percentage(report.threshold.attempt_floor.as_ppm(), COVERAGE_PERCENT)
+        ));
+    }
+    if measurement_below_floor {
+        lines.push(format!(
+            "measurement coverage below the {}% floor",
+            render_percentage(
+                report.threshold.measurement_floor.as_ppm(),
+                COVERAGE_PERCENT
+            )
+        ));
     }
     for (group, count) in account.failures.nonzero() {
         let noun = if count == 1 { "attempt" } else { "attempts" };
@@ -1750,30 +1762,31 @@ fn render_coverage_detail(
             .max();
         match (engine.reset_spanning_gaps.len(), window_length) {
             (1, Some(length)) if length.as_nanos() > 0 => lines.push(format!(
-                "one {} reset occurred without a successful observation in the surrounding interval",
+                "one {} reset without an observation in the surrounding gap",
                 render_coverage_duration(length)
             )),
-            (1, _) => lines.push(
-                "one reset occurred without a successful observation in the surrounding interval"
-                    .to_string(),
-            ),
+            (1, _) => {
+                lines.push("one reset without an observation in the surrounding gap".to_string())
+            }
             (count, _) => lines.push(format!(
-                "{count} resets occurred without successful observations in the surrounding intervals"
+                "{count} resets without an observation in the surrounding gaps"
             )),
         }
     }
     Some(lines)
 }
 
-/// The report-to-rendering seam for coverage: the interval, one row per
-/// covered account, and a detail block for every account whose numbers need
-/// explaining. The model arrives complete; this function formats it. The
-/// header echoes the window the command line asked for: "last 24h" is what
-/// the operator requested, and the interval itself is carried by the model's
-/// own timestamps.
-pub fn render_coverage_report(report: &CoverageReport, window: &str) -> String {
-    let mut lines = vec![format!("coverage - last {window}")];
+/// The report-to-rendering seam for coverage: one box carrying the title
+/// with the interval, one table row per configured account with that
+/// account's findings indented under its own row, the ledger's unconfigured
+/// accounts on one dim line, and the threshold verdict's next action as the
+/// footer. The model arrives complete; this function formats it. The title
+/// echoes the window the command line asked for: "last 24h" is what the
+/// operator requested, and the interval itself is carried by the model's own
+/// timestamps.
+pub fn render_coverage_report(report: &CoverageReport, window: &str, style: Style) -> String {
     if report.accounts.is_empty() {
+        let mut lines = vec![format!("coverage - last {window}")];
         if report.severe_only {
             lines.push("(no account has a severe interval)".to_string());
         } else {
@@ -1782,65 +1795,184 @@ pub fn render_coverage_report(report: &CoverageReport, window: &str) -> String {
         return lines.join("\n");
     }
 
-    lines.push(String::new());
+    let width = boxed_width(&style);
+    let area = boxed_content_area(width);
+    let table: Vec<&crate::report::CoverageAccount> =
+        report.accounts.iter().filter(|a| a.configured).collect();
+    let retired: Vec<&crate::report::CoverageAccount> =
+        report.accounts.iter().filter(|a| !a.configured).collect();
 
-    let name_width = report
-        .accounts
+    let name_width = table
         .iter()
         .map(|account| account.name.as_str().len())
         .chain(std::iter::once("account".len()))
         .max()
         .unwrap_or(7);
-    let headers: [(&str, usize); 5] = [
-        ("account", name_width),
-        ("attempts", 9),
-        ("measurements", 12),
-        ("longest blind gap", 17),
-        ("reset gaps", 10),
-    ];
-    lines.push(
-        headers
-            .iter()
-            .map(|(header, width)| coverage_cell(header, *width))
-            .collect::<String>()
-            .trim_end()
-            .to_string(),
-    );
-    for account in &report.accounts {
-        let engine = &account.engine;
-        let cells = [
-            coverage_cell(account.name.as_str(), name_width),
-            coverage_cell(&coverage_attempts_cell(engine), 9),
-            coverage_cell(&coverage_measurements_cell(engine), 12),
-            coverage_cell(
-                &engine
+    let rows: Vec<Vec<String>> = table
+        .iter()
+        .map(|account| {
+            let engine = &account.engine;
+            vec![
+                account.name.as_str().to_string(),
+                coverage_attempts_cell(engine),
+                coverage_measurements_cell(engine),
+                engine
                     .longest_no_attempt_gap
                     .map(|gap| render_coverage_duration(gap.duration()))
                     .unwrap_or_else(|| "none".to_string()),
-                17,
-            ),
-            engine.reset_spanning_gaps.len().to_string(),
-        ];
-        lines.push(cells.join("").trim_end().to_string());
+                engine.reset_spanning_gaps.len().to_string(),
+            ]
+        })
+        .collect();
+    let headers = [
+        ("account", name_width),
+        ("attempts", 8),
+        ("measurements", 12),
+        ("longest gap", 11),
+        ("resets unobserved", 17),
+    ];
+    let column_widths: [usize; 5] = std::array::from_fn(|column| {
+        headers[column]
+            .1
+            .max(rows.iter().map(|row| row[column].len()).max().unwrap_or(0))
+    });
+    let mut header = String::new();
+    for (column, (text, _)) in headers.iter().enumerate() {
+        header.push_str(&coverage_cell(text, column_widths[column]));
     }
-    for account in &report.accounts {
-        let detail = render_coverage_detail(report, account);
-        if detail.is_none() && !account.legacy_evidence_present {
-            continue;
+    let table_width = header.trim_end().len();
+
+    let mut lines = vec![boxed_top(
+        &style.paint(style.bold(), &format!("coverage \u{b7} last {window}")),
+        width,
+    )];
+    lines.push(boxed_blank(width));
+    lines.push(boxed_body(header.trim_end(), width));
+    lines.push(boxed_rule(table_width, width));
+    for (row_index, account) in table.iter().enumerate() {
+        let painted_name = style.paint(style.bold(), &rows[row_index][0]);
+        let mut row = format!(
+            "{painted_name}{}  ",
+            " ".repeat(name_width - rows[row_index][0].len())
+        );
+        for column in 1..rows[row_index].len() {
+            row.push_str(&coverage_cell(
+                &rows[row_index][column],
+                column_widths[column],
+            ));
         }
-        lines.push(String::new());
-        lines.push(format!("{}:", account.name.as_str()));
-        for line in detail.unwrap_or_default() {
-            lines.push(format!("  - {line}"));
-        }
+        lines.push(boxed_body(row.trim_end(), width));
+        let mut findings = render_coverage_detail(report, account).unwrap_or_default();
         if account.legacy_evidence_present {
-            lines.push(
-                "  - legacy observations are shown as historical evidence, not ordinary attempt coverage"
+            findings.push(
+                "legacy observations are shown as historical evidence, not ordinary attempt coverage"
                     .to_string(),
             );
         }
+        for line in coverage_finding_lines(findings, name_width, area) {
+            lines.push(boxed_body(&style.paint(style.body(), &line), width));
+        }
     }
+    let footer = coverage_footer_lines(report);
+    if !retired.is_empty() || !footer.is_empty() {
+        lines.push(boxed_blank(width));
+    }
+    for line in coverage_not_in_config_lines(&retired, area) {
+        lines.push(boxed_body(&style.paint(style.dim(), &line), width));
+    }
+    for line in footer {
+        lines.push(boxed_body(&line, width));
+    }
+    lines.push(boxed_bottom(width));
     lines.join("\n")
+}
+
+/// The findings of one account laid under its row: consecutive findings
+/// share one line, joined by " \u{b7} ", for as long as the joined line fits the
+/// columns the content area allows past the account indent; the rest keep
+/// one line each. The indent is the account column's own width, so the
+/// findings read as the row's explanation rather than a second table.
+fn coverage_finding_lines(findings: Vec<String>, indent: usize, area: usize) -> Vec<String> {
+    let pad = " ".repeat(indent);
+    let budget = area.saturating_sub(indent);
+    let mut lines = Vec::new();
+    let mut current: Option<String> = None;
+    for finding in findings {
+        match &mut current {
+            Some(line) if line.len() + 3 + finding.len() <= budget => {
+                line.push_str(" \u{b7} ");
+                line.push_str(&finding);
+            }
+            Some(line) => {
+                lines.push(format!("{pad}{line}"));
+                current = Some(finding);
+            }
+            None => current = Some(finding),
+        }
+    }
+    if let Some(line) = current {
+        lines.push(format!("{pad}{line}"));
+    }
+    lines
+}
+
+/// The ledger's unconfigured accounts on one line: `not in config:` with
+/// each account's name and the UTC date of its last observation, wrapped to
+/// further lines at name boundaries when the width is exceeded. An account
+/// with no observation in the interval names itself alone.
+fn coverage_not_in_config_lines(
+    accounts: &[&crate::report::CoverageAccount],
+    area: usize,
+) -> Vec<String> {
+    if accounts.is_empty() {
+        return Vec::new();
+    }
+    let prefix = "not in config: ";
+    let segments: Vec<String> = accounts
+        .iter()
+        .map(
+            |account| match account.engine.most_recent_successful_observation {
+                Some(observed) => format!(
+                    "{} (last observed {})",
+                    account.name.as_str(),
+                    observed.utc_date().iso()
+                ),
+                None => account.name.as_str().to_string(),
+            },
+        )
+        .collect();
+    let mut rows: Vec<String> = Vec::new();
+    let mut line = String::new();
+    for segment in segments {
+        if !line.is_empty() && prefix.len() + line.len() + 2 + segment.len() > area {
+            rows.push(std::mem::take(&mut line));
+        }
+        if !line.is_empty() {
+            line.push_str(", ");
+        }
+        line.push_str(&segment);
+    }
+    rows.push(line);
+    let indent = " ".repeat(prefix.len());
+    let mut rendered = vec![format!("{prefix}{}", rows[0])];
+    for row in &rows[1..] {
+        rendered.push(format!("{indent}{row}"));
+    }
+    rendered
+}
+
+/// The footer the box closes with: the `next:` sentence the threshold
+/// message travels with when the verdict reports a breach, derived from that
+/// message so the advice inside the box and the exit decision behind it come
+/// from one verdict. A report with no breach has no footer: the table is the
+/// whole answer, and nothing is advised.
+fn coverage_footer_lines(report: &CoverageReport) -> Vec<String> {
+    let message = render_coverage_threshold_message(report);
+    if message == "no threshold breach was recorded" {
+        Vec::new()
+    } else {
+        vec!["next: run coverage again once the floor condition changes".to_string()]
+    }
 }
 
 /// The threshold-breach message the coverage command fails with, naming every
@@ -2355,6 +2487,7 @@ pub fn render_calibrate_activate_report(report: &crate::report::CalibrateActivat
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::coverage::{CoverageFraction, Gap};
     use crate::domain::attempt::AttemptId;
     use crate::domain::freshness::Observed;
     use crate::domain::quota::QuotaFractionPpm;
@@ -2364,6 +2497,105 @@ mod tests {
 
     fn now() -> UtcTimestamp {
         UtcTimestamp::from_unix_nanos(1_000_000 * NANOS_PER_SECOND)
+    }
+
+    // ---- coverage box fixtures -------------------------------------------------
+
+    const COVERAGE_TEST_FLOOR_ATTEMPT: f64 = 0.98;
+
+    /// An engine report with the given coverages and gaps; every field the
+    /// renderer reads is named by the caller, the rest are neutral.
+    fn coverage_engine(
+        attempt: Option<CoverageFraction>,
+        measurement: Option<CoverageFraction>,
+        longest_gap: Option<Gap>,
+        reset_gaps: Vec<Gap>,
+    ) -> crate::coverage::CoverageReport {
+        crate::coverage::CoverageReport {
+            expected_opportunities: Some(288),
+            attempted_opportunities: 256,
+            successful_observations: 256,
+            started_without_terminal_result: 0,
+            attempt_coverage: attempt,
+            measurement_coverage: measurement,
+            longest_no_attempt_gap: longest_gap,
+            longest_no_observation_gap: None,
+            reset_spanning_gaps: reset_gaps,
+            most_recent_timer_run: None,
+            most_recent_successful_observation: None,
+            severe: false,
+        }
+    }
+
+    fn gap_6m() -> Gap {
+        let start = UtcTimestamp::from_unix_nanos(0);
+        Gap {
+            start,
+            end: UtcTimestamp::from_unix_nanos(360 * NANOS_PER_SECOND),
+        }
+    }
+
+    fn coverage_account(
+        name: &str,
+        engine: crate::coverage::CoverageReport,
+        failures: crate::report::coverage::CoverageFailureTally,
+        resets_in_gaps: Vec<crate::report::CoverageReset>,
+        configured: bool,
+    ) -> crate::report::CoverageAccount {
+        crate::report::CoverageAccount {
+            name: crate::logging::LogicalName::new(name.to_string()),
+            engine,
+            failures,
+            resets_in_gaps,
+            legacy_evidence_present: false,
+            configured,
+            provenance: crate::report::ProvenanceNode::new(
+                [] as [crate::domain::provenance::EvidenceId; 0],
+                [] as [crate::domain::provenance::WitnessId; 0],
+                crate::domain::provenance::QuerySemantics::new("coverage", "test"),
+                1,
+                1,
+                crate::report::ValueArithmetic::Count,
+            ),
+        }
+    }
+
+    fn coverage_report(
+        accounts: Vec<crate::report::CoverageAccount>,
+        threshold: crate::report::CoverageThreshold,
+    ) -> CoverageReport {
+        let at = UtcTimestamp::from_unix_nanos(0);
+        CoverageReport::new(
+            crate::report::ReportMetadata::new(
+                at,
+                at,
+                crate::report::LedgerGeneration::new(1),
+                None,
+            ),
+            at,
+            at,
+            false,
+            threshold,
+            accounts,
+        )
+    }
+
+    fn floors_met(attempt: f64, measurement: f64) -> crate::report::CoverageThreshold {
+        crate::report::CoverageThreshold {
+            attempt_floor: crate::config::CoverageFloor::new(attempt).unwrap(),
+            measurement_floor: crate::config::CoverageFloor::new(measurement).unwrap(),
+            met: true,
+            breaches: Vec::new(),
+        }
+    }
+
+    fn attempt_breach(name: &str, coverage: CoverageFraction) -> crate::report::CoverageBreach {
+        crate::report::CoverageBreach {
+            account: crate::logging::LogicalName::new(name.to_string()),
+            dimension: crate::report::CoverageBreachDimension::Attempt,
+            coverage,
+            floor: crate::config::CoverageFloor::new(COVERAGE_TEST_FLOOR_ATTEMPT).unwrap(),
+        }
     }
 
     #[test]
@@ -2993,5 +3225,333 @@ mod tests {
                 "used {used_ppm} ppm must tint the row {expected_escape:?}: {coloured}"
             );
         }
+    }
+
+    // ---- the coverage box ------------------------------------------------------
+
+    /// The bead's approved figure: two configured accounts and one retired
+    /// ledger row, at the plain style's 80 columns. The retired row is not a
+    /// table row; it renders on the one dim "not in config" line with its
+    /// last observed date. The findings sit indented under their own row,
+    /// joined by " · " while the joined line fits. The footer is the
+    /// threshold verdict's next action, and the per-account breaches stay in
+    /// the findings rather than repeating there.
+    #[test]
+    fn the_coverage_box_renders_the_approved_figure() {
+        let below_floor = CoverageFraction::new(889, 1_000).unwrap();
+        let reset = crate::report::CoverageReset {
+            at: UtcTimestamp::from_unix_nanos(0),
+            window_length: MonotonicDuration::from_seconds(3_600),
+        };
+        let primary = coverage_account(
+            "primary",
+            coverage_engine(
+                Some(below_floor),
+                Some(CoverageFraction::new(1, 1).unwrap()),
+                Some(gap_6m()),
+                vec![gap_6m(), gap_6m(), gap_6m()],
+            ),
+            crate::report::coverage::CoverageFailureTally::default(),
+            vec![reset, reset, reset],
+            true,
+        );
+        let gmail = coverage_account(
+            "gmail",
+            coverage_engine(
+                Some(CoverageFraction::new(1, 1).unwrap()),
+                Some(CoverageFraction::new(766, 1_000).unwrap()),
+                Some(gap_6m()),
+                vec![gap_6m(), gap_6m(), gap_6m()],
+            ),
+            crate::report::coverage::CoverageFailureTally {
+                rate_limited: 45,
+                authentication: 14,
+                ..Default::default()
+            },
+            vec![reset, reset, reset],
+            true,
+        );
+        let retired_at = UtcTimestamp::parse_rfc3339("2026-09-04T12:00:00Z").unwrap();
+        let mut retired_engine = coverage_engine(
+            Some(CoverageFraction::new(1, 1).unwrap()),
+            Some(CoverageFraction::new(1, 1).unwrap()),
+            None,
+            Vec::new(),
+        );
+        retired_engine.most_recent_successful_observation = Some(retired_at);
+        let retired = coverage_account(
+            "primary-2026-09-04",
+            retired_engine,
+            crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
+            false,
+        );
+        let mut threshold = floors_met(0.98, 0.75);
+        threshold.met = false;
+        threshold.breaches = vec![attempt_breach("primary", below_floor)];
+
+        let report = coverage_report(vec![primary, gmail, retired], threshold);
+        let rendered = render_coverage_report(&report, "24h", Style::plain());
+        let expected = [
+            "┌─ coverage · last 24h ────────────────────────────────────────────────────────┐",
+            "│                                                                              │",
+            "│  account  attempts  measurements  longest gap  resets unobserved             │",
+            "│  ───────────────────────────────────────────────────────────────             │",
+            "│  primary  88.9%     100.0%        6m           3                             │",
+            "│         attempt coverage below the 98% floor                                 │",
+            "│         3 resets without an observation in the surrounding gaps              │",
+            "│  gmail    100.0%    76.6%         6m           3                             │",
+            "│         45 attempts were rate limited · 14 attempts required authentication  │",
+            "│         3 resets without an observation in the surrounding gaps              │",
+            "│                                                                              │",
+            "│  not in config: primary-2026-09-04 (last observed 2026-09-04)                │",
+            "│  next: run coverage again once the floor condition changes                   │",
+            "└──────────────────────────────────────────────────────────────────────────────┘",
+        ]
+        .join("\n");
+        assert_eq!(rendered, expected);
+        for line in rendered.lines() {
+            assert_eq!(line.chars().count(), 80, "{line}");
+        }
+    }
+
+    /// With no retired ledger row the "not in config" line is absent: a
+    /// healthy ledger says nothing about accounts it does not have. With no
+    /// breach either, the footer is absent with it.
+    #[test]
+    fn the_coverage_box_names_no_unconfigured_line_without_retired_rows() {
+        let primary = coverage_account(
+            "primary",
+            coverage_engine(
+                Some(CoverageFraction::new(1, 1).unwrap()),
+                Some(CoverageFraction::new(1, 1).unwrap()),
+                Some(gap_6m()),
+                Vec::new(),
+            ),
+            crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
+            true,
+        );
+        let report = coverage_report(vec![primary], floors_met(0.98, 0.95));
+        let rendered = render_coverage_report(&report, "24h", Style::plain());
+        assert!(
+            !rendered.contains("not in config"),
+            "no retired rows, no unconfigured line: {rendered}"
+        );
+        assert!(
+            !rendered.contains("next: run coverage again"),
+            "no breach, no footer: {rendered}"
+        );
+        for line in rendered.lines() {
+            assert_eq!(line.chars().count(), 80, "{line}");
+        }
+    }
+
+    /// An account with zero attempts prints "none" in both percentage
+    /// columns: the policy owed nothing, so there is no coverage number to
+    /// show and no zero to mistake for a measurement. Its one finding sits
+    /// under its row.
+    #[test]
+    fn the_coverage_box_prints_none_for_an_account_with_no_attempts() {
+        let quiet_engine = crate::coverage::CoverageReport {
+            expected_opportunities: Some(0),
+            attempted_opportunities: 0,
+            successful_observations: 0,
+            started_without_terminal_result: 0,
+            attempt_coverage: None,
+            measurement_coverage: None,
+            longest_no_attempt_gap: Some(gap_6m()),
+            longest_no_observation_gap: None,
+            reset_spanning_gaps: vec![gap_6m()],
+            most_recent_timer_run: None,
+            most_recent_successful_observation: None,
+            severe: true,
+        };
+        let quiet = coverage_account(
+            "quiet",
+            quiet_engine,
+            crate::report::coverage::CoverageFailureTally::default(),
+            vec![crate::report::CoverageReset {
+                at: UtcTimestamp::from_unix_nanos(0),
+                window_length: MonotonicDuration::from_seconds(18_000),
+            }],
+            true,
+        );
+        let report = coverage_report(vec![quiet], floors_met(0.98, 0.95));
+        let rendered = render_coverage_report(&report, "24h", Style::plain());
+        let expected = [
+            "┌─ coverage · last 24h ────────────────────────────────────────────────────────┐",
+            "│                                                                              │",
+            "│  account  attempts  measurements  longest gap  resets unobserved             │",
+            "│  ───────────────────────────────────────────────────────────────             │",
+            "│  quiet    none      none          6m           1                             │",
+            "│         one 5h reset without an observation in the surrounding gap           │",
+            "└──────────────────────────────────────────────────────────────────────────────┘",
+        ]
+        .join("\n");
+        assert_eq!(rendered, expected);
+    }
+
+    /// The join boundary: two findings whose joined line lands exactly on the
+    /// content budget share one line, and one character over it they keep
+    /// one line each. The planted negative is the over-budget pair: a join
+    /// that ignored the width would push the rail out.
+    #[test]
+    fn findings_join_up_to_the_width_budget_and_not_past_it() {
+        let joined = coverage_finding_lines(vec!["a".repeat(30), "b".repeat(34)], 7, 74);
+        assert_eq!(
+            joined,
+            vec![format!(
+                "{}{} · {}",
+                " ".repeat(7),
+                "a".repeat(30),
+                "b".repeat(34)
+            )]
+        );
+        let split = coverage_finding_lines(vec!["a".repeat(31), "b".repeat(34)], 7, 74);
+        assert_eq!(
+            split,
+            vec![
+                format!("{}{}", " ".repeat(7), "a".repeat(31)),
+                format!("{}{}", " ".repeat(7), "b".repeat(34))
+            ]
+        );
+    }
+
+    /// Three short unconfigured names share one line; segments too wide for
+    /// the remaining width wrap to a second line at a name boundary, aligned
+    /// under the first name.
+    #[test]
+    fn the_unconfigured_line_wraps_at_name_boundaries() {
+        let named = |name: &str| {
+            let mut engine = coverage_engine(
+                Some(CoverageFraction::new(1, 1).unwrap()),
+                Some(CoverageFraction::new(1, 1).unwrap()),
+                None,
+                Vec::new(),
+            );
+            engine.most_recent_successful_observation =
+                Some(UtcTimestamp::parse_rfc3339("2026-09-01T00:00:00Z").unwrap());
+            coverage_account(name, engine, Default::default(), Vec::new(), false)
+        };
+        let bare = |name: &str| {
+            coverage_account(
+                name,
+                coverage_engine(
+                    Some(CoverageFraction::new(1, 1).unwrap()),
+                    Some(CoverageFraction::new(1, 1).unwrap()),
+                    None,
+                    Vec::new(),
+                ),
+                Default::default(),
+                Vec::new(),
+                false,
+            )
+        };
+        let short = [bare("alpha"), bare("beta"), bare("gamma")];
+        let refs: Vec<&crate::report::CoverageAccount> = short.iter().collect();
+        let one_line = coverage_not_in_config_lines(&refs, 74);
+        assert_eq!(one_line.len(), 1, "{one_line:?}");
+        assert_eq!(one_line[0], "not in config: alpha, beta, gamma");
+        let dated = [named("a"), named("b"), named("c")];
+        let dated_refs: Vec<&crate::report::CoverageAccount> = dated.iter().collect();
+        let wrapped = coverage_not_in_config_lines(&dated_refs, 74);
+        assert_eq!(wrapped.len(), 2, "{wrapped:?}");
+        assert_eq!(
+            wrapped[0],
+            "not in config: a (last observed 2026-09-01), b (last observed 2026-09-01)"
+        );
+        assert_eq!(wrapped[1], "               c (last observed 2026-09-01)");
+        assert!(wrapped.iter().all(|line| line.len() <= 74), "{wrapped:?}");
+    }
+
+    /// The footer is derived from the unchanged threshold message: a report
+    /// whose message names breaches gets the one next action, carrying no
+    /// breach text the message already carries; a report with no breach gets
+    /// no footer. Pinned on three fixture shapes: a breach, a met verdict,
+    /// and a zero-attempt account the verdict refuses to judge.
+    #[test]
+    fn the_footer_is_derived_from_the_threshold_message() {
+        let below_floor = CoverageFraction::new(889, 1_000).unwrap();
+        let breached = {
+            let primary = coverage_account(
+                "primary",
+                coverage_engine(
+                    Some(below_floor),
+                    Some(CoverageFraction::new(1, 1).unwrap()),
+                    Some(gap_6m()),
+                    Vec::new(),
+                ),
+                crate::report::coverage::CoverageFailureTally::default(),
+                Vec::new(),
+                true,
+            );
+            let mut threshold = floors_met(0.98, 0.95);
+            threshold.met = false;
+            threshold.breaches = vec![attempt_breach("primary", below_floor)];
+            coverage_report(vec![primary], threshold)
+        };
+        let message = render_coverage_threshold_message(&breached);
+        assert!(message.starts_with("primary attempt coverage"), "{message}");
+        let footer = coverage_footer_lines(&breached);
+        assert_eq!(
+            footer,
+            vec!["next: run coverage again once the floor condition changes"]
+        );
+        assert!(
+            !footer[0].contains("primary") && !footer[0].contains("88.9"),
+            "the footer repeats no breach text: {footer:?}"
+        );
+
+        let met = {
+            let primary = coverage_account(
+                "primary",
+                coverage_engine(
+                    Some(CoverageFraction::new(1, 1).unwrap()),
+                    Some(CoverageFraction::new(1, 1).unwrap()),
+                    Some(gap_6m()),
+                    Vec::new(),
+                ),
+                crate::report::coverage::CoverageFailureTally::default(),
+                Vec::new(),
+                true,
+            );
+            coverage_report(vec![primary], floors_met(0.98, 0.95))
+        };
+        assert_eq!(
+            render_coverage_threshold_message(&met),
+            "no threshold breach was recorded"
+        );
+        assert!(coverage_footer_lines(&met).is_empty());
+
+        let zero = {
+            let quiet_engine = crate::coverage::CoverageReport {
+                expected_opportunities: Some(0),
+                attempted_opportunities: 0,
+                successful_observations: 0,
+                started_without_terminal_result: 0,
+                attempt_coverage: None,
+                measurement_coverage: None,
+                longest_no_attempt_gap: Some(gap_6m()),
+                longest_no_observation_gap: None,
+                reset_spanning_gaps: Vec::new(),
+                most_recent_timer_run: None,
+                most_recent_successful_observation: None,
+                severe: false,
+            };
+            let quiet = coverage_account(
+                "quiet",
+                quiet_engine,
+                crate::report::coverage::CoverageFailureTally::default(),
+                Vec::new(),
+                true,
+            );
+            coverage_report(vec![quiet], floors_met(0.98, 0.95))
+        };
+        assert_eq!(
+            render_coverage_threshold_message(&zero),
+            "no threshold breach was recorded"
+        );
+        assert!(coverage_footer_lines(&zero).is_empty());
     }
 }

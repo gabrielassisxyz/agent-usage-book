@@ -8,6 +8,7 @@
 //! precision policy, plus freshness where the value is a meter reading. A bare scalar
 //! cannot reach a user-visible surface because no helper here accepts one.
 
+pub mod boxed;
 pub mod export_jsonl;
 pub mod json;
 pub mod local_time;
