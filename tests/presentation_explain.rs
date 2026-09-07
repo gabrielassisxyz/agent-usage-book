@@ -19,6 +19,7 @@ use agent_usage_book::domain::tokens::{
 use agent_usage_book::domain::window::{WindowScope, WindowSeverity};
 use agent_usage_book::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
 use agent_usage_book::logging::{LogicalName, RunId};
+use agent_usage_book::presentation::Style;
 use agent_usage_book::presentation::json::{
     spend_json, spend_json_with_explain, status_json, status_json_with_explain,
     validate_spend_report_json, validate_status_report_json,
@@ -169,6 +170,7 @@ fn meter_explain_names_legacy_and_limits_contracts() {
             UtcTimestamp::from_unix_nanos(2_000),
             test_envelope(),
             ExplainMode::Summary,
+            Style::plain(),
         );
         assert!(rendered.contains(&format!("provider contract: {contract}")));
     }
@@ -315,6 +317,7 @@ fn integration_explain_summary_renders_all_ten_design_elements() {
         UtcTimestamp::from_unix_nanos(2000),
         test_envelope(),
         ExplainMode::Summary,
+        Style::plain(),
     );
     assert!(
         status_text.contains("arithmetic: converted from quota_fraction to credits"),
@@ -461,9 +464,9 @@ fn unit_explain_adds_no_computation_to_ordinary_path() {
     let status_rep = seed_status_report();
     let now = UtcTimestamp::from_unix_nanos(2000);
     let env = test_envelope();
-    let base_status_text = render_status_report(&status_rep, now, env);
+    let base_status_text = render_status_report(&status_rep, now, env, Style::plain());
     let off_status_text =
-        render_status_report_with_explain(&status_rep, now, env, ExplainMode::Off);
+        render_status_report_with_explain(&status_rep, now, env, ExplainMode::Off, Style::plain());
     assert_eq!(base_status_text, off_status_text);
     assert!(!base_status_text.contains("explain:"));
     assert!(!off_status_text.contains("explain:"));
