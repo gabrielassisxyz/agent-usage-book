@@ -31,7 +31,7 @@ use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, ProviderObservedAt, ReceivedAt, UtcTimestamp,
 };
 use crate::domain::window::{
-    ModelId, NominalWindowDuration, ReportedResolution, WindowResetState, WindowScope,
+    GroupName, ModelId, NominalWindowDuration, ReportedResolution, WindowResetState, WindowScope,
     WindowSeverity,
 };
 use crate::store::account::AccountId;
@@ -219,7 +219,7 @@ fn successful_observation_from_document(value: &Value) -> Result<SuccessfulObser
     })
 }
 
-fn window_from_document(value: &Value) -> Result<ProjectedWindow, String> {
+pub(crate) fn window_from_document(value: &Value) -> Result<ProjectedWindow, String> {
     let object = as_object(value, "window")?;
     let scope = match required_str(object, "scope_kind")? {
         "account_wide" => {
@@ -231,6 +231,12 @@ fn window_from_document(value: &Value) -> Result<ProjectedWindow, String> {
         "model_specific" => {
             let model = required_str(object, "scoped_model")?;
             WindowScope::ModelSpecific(ModelId::new(model.to_string()))
+        }
+        // The group's display name travels in the scoped_model slot, the
+        // same encoding the store writes (migration 0035, `aub-n8yx`).
+        "model_group" => {
+            let group = required_str(object, "scoped_model")?;
+            WindowScope::ModelGroup(GroupName::new(group.to_string()))
         }
         other => return Err(format!("unknown scope kind {other:?}")),
     };
@@ -396,6 +402,12 @@ pub fn applicable_windows<'a>(
             (WindowScope::ModelSpecific(window_model), Some(selected)) => {
                 window_model.as_str() == selected
             }
+            // A quota group constrains the models inside it, and the window
+            // identity cannot name them, so a group window joins only the
+            // unselected reading (`aub-n8yx`): with a selector, the group's
+            // budget is not this model's own constraint.
+            (WindowScope::ModelGroup(_), None) => true,
+            (WindowScope::ModelGroup(_), Some(_)) => false,
         })
         .collect()
 }

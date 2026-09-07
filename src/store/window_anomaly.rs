@@ -147,6 +147,13 @@ fn scope_columns(scope: &WindowScope) -> (&'static str, Option<&str>) {
     match scope {
         WindowScope::AccountWide => ("account_wide", None),
         WindowScope::ModelSpecific(model) => ("model_specific", Some(model.as_str())),
+        // The group's display name travels in the scoped_model column, the
+        // same slot every scope-bearing table shares. The anomaly,
+        // exclusion and set-change tables' CHECKs (0029-0031) still refuse
+        // the model_group kind: `detect_and_persist` holds group windows
+        // out below, so no row carrying it is written until those tables
+        // widen.
+        WindowScope::ModelGroup(group) => ("model_group", Some(group.as_str())),
     }
 }
 
@@ -589,6 +596,15 @@ pub fn detect_and_persist(
     };
 
     for current_window in current_windows {
+        // A quota-group window (`aub-n8yx`) is held out of both loops: the
+        // anomaly, exclusion and set-change tables' scope CHECKs (0029-0031)
+        // still refuse the model_group kind, and an anomaly found but
+        // unpersistable would abort the observation's own persistence.
+        // Widening those tables is future work; until then a group window
+        // is evidence the detector does not classify.
+        if matches!(current_window.scope, WindowScope::ModelGroup(_)) {
+            continue;
+        }
         match previous_windows
             .iter()
             .find(|previous_window| identity_matches(previous_window, current_window))

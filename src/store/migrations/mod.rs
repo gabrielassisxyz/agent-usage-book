@@ -126,6 +126,9 @@ pub(crate) mod migration_0033;
 #[path = "0034_ollama_reset_grid.rs"]
 pub(crate) mod migration_0034;
 
+#[path = "0035_antigravity_group_scopes.rs"]
+mod migration_0035;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -166,5 +169,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0032::migration(),
         migration_0033::migration(),
         migration_0034::migration(),
+        migration_0035::migration(),
     ]
 }

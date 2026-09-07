@@ -238,6 +238,11 @@ pub fn classify_window_set_change(
         (WindowScopeKind::ModelSpecific, WindowPresenceChange::Disappeared) => {
             Some(WindowSetChangeKind::MissingModelSpecificWindow)
         }
+        // A provider quota group (`aub-n8yx`) is neither: no set-change
+        // decision exists for a group appearing or disappearing yet, so the
+        // event is not classified rather than guessed into one of the two
+        // kinds the store knows.
+        (WindowScopeKind::ModelGroup, _) => None,
         (WindowScopeKind::AccountWide, WindowPresenceChange::Disappeared)
         | (WindowScopeKind::ModelSpecific, WindowPresenceChange::Appeared) => None,
     }

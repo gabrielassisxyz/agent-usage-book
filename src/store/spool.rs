@@ -37,8 +37,8 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use crate::domain::time::UtcTimestamp;
 use crate::domain::window::{
-    MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, WindowResetState, WindowScope,
-    WindowSemanticKey,
+    GroupName, MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, WindowResetState,
+    WindowScope, WindowSemanticKey,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -359,6 +359,11 @@ fn pending_window_from_window(window: &MeterWindow) -> PendingWindow {
         WindowScope::AccountWide => ("account_wide".to_owned(), None),
         WindowScope::ModelSpecific(model) => {
             ("model_specific".to_owned(), Some(model.as_str().to_owned()))
+        }
+        // The scoped_model column carries the group's display name under the
+        // model_group kind (migration 0035), the same slot the store writes.
+        WindowScope::ModelGroup(group) => {
+            ("model_group".to_owned(), Some(group.as_str().to_owned()))
         }
     };
     let reset_grid = match window.reset_state() {
@@ -962,6 +967,7 @@ fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
     let scope = match (window.scope_kind.as_str(), &window.scoped_model) {
         ("account_wide", None) => WindowScope::AccountWide,
         ("model_specific", Some(model)) => WindowScope::ModelSpecific(ModelId::new(model.clone())),
+        ("model_group", Some(group)) => WindowScope::ModelGroup(GroupName::new(group.clone())),
         (kind, model) => {
             return Err(format!(
                 "inconsistent window scope: kind {kind:?} with model {model:?}"

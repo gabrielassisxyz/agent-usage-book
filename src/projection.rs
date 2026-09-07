@@ -309,6 +309,9 @@ fn scope_kind_sql(scope: &WindowScope) -> &'static str {
     match scope {
         WindowScope::AccountWide => "account_wide",
         WindowScope::ModelSpecific(_) => "model_specific",
+        // The store's spelling for a provider quota group (migration 0035,
+        // `aub-n8yx`); the projection document mirrors the store's encoding.
+        WindowScope::ModelGroup(_) => "model_group",
     }
 }
 
@@ -316,6 +319,9 @@ fn scoped_model(scope: &WindowScope) -> Option<String> {
     match scope {
         WindowScope::AccountWide => None,
         WindowScope::ModelSpecific(model) => Some(model.as_str().to_owned()),
+        // The group's display name travels in the scoped_model slot, the one
+        // free-text slot the store row has.
+        WindowScope::ModelGroup(group) => Some(group.as_str().to_owned()),
     }
 }
 
@@ -885,5 +891,34 @@ mod tests {
         let text = wide.to_json().to_string();
         assert!(text.contains("\"scope_kind\":\"account_wide\""));
         assert!(text.contains("\"scoped_model\":null"));
+    }
+
+    /// A quota-group window serializes the group kind with the group's
+    /// display name in the scoped_model slot, the same encoding the store
+    /// row has (`aub-n8yx`); the reader decodes it back into the typed
+    /// scope, so publication and read agree in both directions.
+    #[test]
+    fn a_group_scoped_window_round_trips_its_scope_through_the_document() {
+        let group = ProjectedWindow {
+            semantic_key: "5h".to_string(),
+            scope: WindowScope::ModelGroup(crate::domain::window::GroupName::new(
+                "Gemini Models".to_string(),
+            )),
+            ..window("5h", 85_528, None)
+        };
+        let text = group.to_json().to_string();
+        assert!(text.contains("\"scope_kind\":\"model_group\""));
+        assert!(text.contains("\"scoped_model\":\"Gemini Models\""));
+
+        let object: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let decoded = crate::projection::reader::window_from_document(&object)
+            .expect("the group window must decode");
+        assert_eq!(decoded.semantic_key, "5h");
+        assert_eq!(
+            decoded.scope,
+            WindowScope::ModelGroup(crate::domain::window::GroupName::new(
+                "Gemini Models".to_string()
+            ))
+        );
     }
 }

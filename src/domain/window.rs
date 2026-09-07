@@ -45,11 +45,34 @@ impl ModelId {
     }
 }
 
+/// A provider quota group's display name, the scope of one shared budget
+/// across several models (`aub-n8yx`: Antigravity's "Gemini Models" and
+/// "Claude and GPT models" groups).
+///
+/// Distinct from [`ModelId`] on purpose: a group name is not a model, and a
+/// window scoped to a group must never match `--model` selection, which is
+/// exactly what folding it into [`ModelId`] would allow.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct GroupName(String);
+
+impl GroupName {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// The scope kind a provider reports for a quota constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WindowScopeKind {
     AccountWide,
     ModelSpecific,
+    /// A provider quota group: one budget shared by a set of models the
+    /// window identity itself cannot enumerate (`aub-n8yx`).
+    ModelGroup,
 }
 
 /// Which models a quota constraint can constrain.
@@ -57,6 +80,11 @@ pub enum WindowScopeKind {
 pub enum WindowScope {
     AccountWide,
     ModelSpecific(ModelId),
+    /// One provider quota group's shared budget, identified by the group's
+    /// display name (`aub-n8yx`). The group constrains the models inside it,
+    /// but the window identity alone cannot name them, so per-model
+    /// selection ([`WindowScope::constrains`]) never claims a group window.
+    ModelGroup(GroupName),
 }
 
 impl WindowScope {
@@ -64,13 +92,22 @@ impl WindowScope {
         match self {
             Self::AccountWide => WindowScopeKind::AccountWide,
             Self::ModelSpecific(_) => WindowScopeKind::ModelSpecific,
+            Self::ModelGroup(_) => WindowScopeKind::ModelGroup,
         }
     }
 
     pub fn scoped_model(&self) -> Option<&ModelId> {
         match self {
-            Self::AccountWide => None,
+            Self::AccountWide | Self::ModelGroup(_) => None,
             Self::ModelSpecific(model) => Some(model),
+        }
+    }
+
+    /// The quota group this window belongs to, when it is group-scoped.
+    pub fn group_name(&self) -> Option<&GroupName> {
+        match self {
+            Self::ModelGroup(group) => Some(group),
+            Self::AccountWide | Self::ModelSpecific(_) => None,
         }
     }
 
@@ -78,6 +115,12 @@ impl WindowScope {
         match self {
             Self::AccountWide => true,
             Self::ModelSpecific(scoped_model) => scoped_model == model,
+            // A group constrains the models inside it, but which models
+            // those are lives in the provider's group description, not in
+            // the window identity, so no per-model reading may claim one.
+            // A model-group window is read by its scope (the status grid's
+            // sub-block), never by model selection.
+            Self::ModelGroup(_) => false,
         }
     }
 }
@@ -548,6 +591,31 @@ mod tests {
                 .semantic_key()
                 .as_str(),
             "account"
+        );
+    }
+
+    /// A model-group window constrains no model: its membership lives in the
+    /// provider's group description, not in the window identity, so a
+    /// per-model reading must not claim it (`aub-n8yx`). The negative: a
+    /// naive implementation reusing the model scope would match by name and
+    /// report a group budget as one model's own.
+    #[test]
+    fn a_group_window_never_constrains_a_model() {
+        let scope = WindowScope::ModelGroup(GroupName::new("Gemini Models"));
+        assert!(!scope.constrains(&ModelId::new("gemini-pro")));
+        assert!(!scope.constrains(&ModelId::new("Gemini Models")));
+        assert_eq!(scope.kind(), WindowScopeKind::ModelGroup);
+        assert_eq!(scope.scoped_model(), None);
+        assert_eq!(
+            scope.group_name().map(GroupName::as_str),
+            Some("Gemini Models")
+        );
+
+        // Account-wide and model-specific carry no group.
+        assert_eq!(WindowScope::AccountWide.group_name(), None);
+        assert_eq!(
+            WindowScope::ModelSpecific(ModelId::new("gemini-3-pro")).group_name(),
+            None
         );
     }
 

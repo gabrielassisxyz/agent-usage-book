@@ -26,8 +26,8 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
-    ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, ResetGridId,
-    WindowScope, WindowSemanticKey, WindowSeverity,
+    GroupName, ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
+    ResetGridId, WindowScope, WindowSemanticKey, WindowSeverity,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -460,6 +460,11 @@ pub fn insert_window_with_facts(
     let (scope_kind, scoped_model) = match &window.scope {
         WindowScope::AccountWide => ("account_wide", None),
         WindowScope::ModelSpecific(model) => ("model_specific", Some(model.as_str())),
+        // The scoped_model column carries the group's display name under the
+        // model_group kind: the meter_window CHECK widened for it in
+        // migration 0035 names the column as the one free-text slot the row
+        // has, and no other column may be invented without a schema change.
+        WindowScope::ModelGroup(group) => ("model_group", Some(group.as_str())),
     };
     let reset_state_sql = match &window.resets_at {
         crate::domain::window::WindowResetState::Known(_) => "known",
@@ -534,6 +539,9 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
     let scope = match (scope_kind.as_str(), scoped_model) {
         ("account_wide", None) => WindowScope::AccountWide,
         ("model_specific", Some(model)) => WindowScope::ModelSpecific(ModelId::new(model)),
+        // The group's display name travels in the scoped_model column
+        // (migration 0035), exactly as `insert_window_with_facts` writes it.
+        ("model_group", Some(group)) => WindowScope::ModelGroup(GroupName::new(group)),
         (kind, model) => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 3, // scope_kind, by position in SELECT_WINDOW_COLUMNS
@@ -1804,5 +1812,59 @@ mod tests {
             [observation_row.value()],
         ).unwrap_err();
         assert!(err_known_with_grid.to_string().contains("CHECK"));
+    }
+
+    /// A quota-group window round-trips the store path: written through
+    /// `insert_window_with_facts`, read back through
+    /// `windows_by_observation`, the group's display name travelling in the
+    /// `scoped_model` column under the `model_group` kind (`aub-n8yx`). The
+    /// negative: a naive mapping onto `ModelSpecific` would read the group
+    /// name back as a model, and `--model` selection would then match it.
+    #[test]
+    fn a_model_group_window_round_trips_its_scope() {
+        let (_scratch, conn, _run, account, _snapshot, attempt) = fixture();
+        let evidence_id =
+            insert_response_evidence(&conn, &evidence(attempt)).expect("the evidence must insert");
+        let observation_row = insert_observation(
+            &conn,
+            &observation(
+                attempt,
+                evidence_id,
+                account,
+                "google-antigravity-subscription-v1",
+                "fp-group-1",
+            ),
+        )
+        .expect("the observation must insert");
+
+        let group_window = NewMeterWindow {
+            observation_id: observation_row,
+            semantic_key: WindowSemanticKey::new("5h"),
+            scope: WindowScope::ModelGroup(GroupName::new("Gemini Models")),
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(85_528).unwrap()),
+            reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(1).unwrap())
+                .unwrap(),
+            quantization: QuantizationSemantics::Unknown,
+            resets_at: crate::domain::window::WindowResetState::Known(
+                UtcTimestamp::from_unix_nanos(1_788_725_516_000_000_000),
+            ),
+            nominal_duration: NominalWindowDuration::from_nanos(18_000 * 1_000_000_000),
+        };
+        insert_window(&conn, &group_window).expect("the group window must insert");
+
+        let read = windows_by_observation(&conn, observation_row)
+            .expect("the windows must read")
+            .pop()
+            .expect("the group window must exist");
+        assert_eq!(read.semantic_key.as_str(), "5h");
+        assert_eq!(
+            read.scope,
+            WindowScope::ModelGroup(GroupName::new("Gemini Models"))
+        );
+        assert_eq!(
+            read.scope.kind(),
+            crate::domain::window::WindowScopeKind::ModelGroup
+        );
+        assert_eq!(read.scope.scoped_model(), None, "a group is not a model");
     }
 }
