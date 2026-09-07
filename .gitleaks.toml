@@ -1,0 +1,24 @@
+# The gitleaks configuration this repository's pre-commit secret scan reads
+# (`.githooks/pre-commit` runs `gitleaks protect --staged`). Everything not
+# allowlisted here is scanned under gitleaks' default rules; an entry below
+# narrows one rule on one path, never widens the scan.
+
+[extend]
+# No extension sources: the default embedded rules stay in force.
+
+[allowlist]
+description = "Known-fake provider fixtures committed on purpose"
+paths = [
+    # The Codex meter adapter's credential fixture: a hand-built auth.json
+    # whose id_token is a deliberately fake JWT (fake signature, fixture
+    # email). The shape-only jwt rule cannot tell a committed fake from a
+    # leaked real token, and the fixture's whole point is that a test can
+    # grep for these bytes and prove they never reach persisted evidence.
+    '''tests/fixtures/meter/codex/auth-fixture\.json''',
+]
+regexes = [
+    # The one fake token the fixture above carries, pinned here so a real
+    # JWT pasted into that file still fails the scan: the allowlist is for
+    # this exact fake, not for anything jwt-shaped in that directory.
+    '''eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9\.eyJlbWFpbCI6ImZpeHR1cmUtYWNjb3VudEBleGFtcGxlLnRlc3Qi''',
+]
