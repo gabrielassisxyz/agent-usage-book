@@ -98,9 +98,11 @@ case_steps() {
 }
 
 case_assertions() {
-    # Step 1: config resolves the seeded file; state.dir shows the file source.
+    # Step 1: config resolves the seeded file; the boxed listing (aub-34ik)
+    # prints the state section's dir key with the file source.
     assert_exit 0 1
-    assert_stdout_contains 1 "state.dir"
+    assert_stdout_contains 1 "│  state"
+    assert_stdout_contains 1 "│    dir"
     assert_stdout_contains 1 "file"
 
     # Step 2: nothing has been sampled yet, so no projection has ever been
