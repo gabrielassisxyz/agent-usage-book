@@ -122,6 +122,40 @@ source `default`, never a value that looks like it came from a file. It also
 never prints a credential value, only the fact and source of the key that
 names one.
 
+An account's `credential` table takes one of three kinds:
+
+```toml
+[[accounts]]
+name = "work-primary"
+provider = "anthropic"
+credential = { kind = "file", path = "~/.config/provider/creds.json" }
+
+[[accounts]]
+name = "research"
+provider = "anthropic"
+credential = { kind = "env", name = "OPENCODE_SESSION_COOKIE" }
+
+[[accounts]]
+name = "transcript-only"
+provider = "codex"
+```
+
+The `file` kind reads the credential file at `path`; the `env` kind reads the
+environment variable at `name` and uses its value as the credential material.
+An account with no `credential` table, or `kind = "none"`, reads its meter
+from the transcript. A credential that is missing, unreadable or empty is an
+authentication-required outcome naming the account and the source, never a
+crash, and the material is never printed, logged or persisted; the context id
+stored with each attempt identifies the credential revision without exposing
+its bytes and changes when the value is replaced.
+
+For scheduled runs, note that the sampler runs from `aub-sample.service`,
+which has no shell: a variable exported in an interactive profile does not
+reach it. Give the service an `EnvironmentFile=` of its own (for example
+`~/.config/aub/env`, mode 0600, one `NAME=value` line per secret; systemd
+does not read `export` lines) and wire it into the unit with
+`EnvironmentFile=%h/.config/aub/env`.
+
 ## `aub export`
 
 **Answers:** which usage did each session or run consume, as a versioned

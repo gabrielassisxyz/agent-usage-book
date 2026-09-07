@@ -351,7 +351,7 @@ impl AccountExclusivityPolicy {
 }
 
 /// A configured account. `credential_kind`/`credential_detail` are a loose pass-through
-/// of the file's `credential` table (`kind`, plus its `ref` or `path`): the typed,
+/// of the file's `credential` table (`kind`, plus its `ref`, `path` or `name`): the typed,
 /// validated credential model belongs to `aub-eun.1`, which consumes this section.
 #[derive(Debug, Clone)]
 pub struct AccountConfig {
@@ -490,6 +490,7 @@ const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible
 const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential", "exclusivity_policy"];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
+const CREDENTIAL_ENV_KEYS: &[&str] = &["kind", "name"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
@@ -611,9 +612,15 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
                         "accounts[].credential",
                         file_display,
                     )?,
+                    Some("env") => check_keys(
+                        cred,
+                        CREDENTIAL_ENV_KEYS,
+                        "accounts[].credential",
+                        file_display,
+                    )?,
                     // An unrecognized or absent `kind` is left to aub-eun.1's
                     // credential resolution to reject; this bead only owns the
-                    // shape of the two kinds it already knows about.
+                    // shape of the three kinds it already knows about.
                     _ => {}
                 }
             }
@@ -1419,7 +1426,11 @@ pub fn resolve(
                             .unwrap_or_default()
                             .to_string(),
                         credential_detail: credential
-                            .and_then(|c| c.get("ref").or_else(|| c.get("path")))
+                            .and_then(|c| {
+                                c.get("ref")
+                                    .or_else(|| c.get("path"))
+                                    .or_else(|| c.get("name"))
+                            })
                             .and_then(toml::Value::as_str)
                             .unwrap_or_default()
                             .to_string(),
@@ -1898,6 +1909,57 @@ provider = "provider-a"
 credential = { kind = "unknown-future-kind", anything = "goes" }
 "#;
         assert!(resolve_with(Overrides::new(), plain_env(), Some(file)).is_ok());
+    }
+
+    #[test]
+    fn an_env_credential_table_resolves_to_the_variable_name() {
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "env", name = "AUB_TEST_TOKEN" }
+"#;
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.accounts[0].credential_kind, "env");
+        assert_eq!(config.accounts[0].credential_detail, "AUB_TEST_TOKEN");
+    }
+
+    #[test]
+    fn an_env_credential_table_with_an_unknown_key_is_rejected() {
+        // The planted negative: an `env` table carrying a `path` key must be
+        // rejected the same way a `file` table carrying `name` would be. A
+        // resolver that accepted any key set would silently read the wrong
+        // variable when an operator renamed a key instead of moving it.
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "env", name = "AUB_TEST_TOKEN", path = "elsewhere" }
+"#;
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(
+            err.to_string().contains("accounts[].credential.path"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn an_env_credential_with_an_empty_name_parses_but_fails_at_resolution() {
+        // The shape is valid TOML and a valid credential table, so the config
+        // layer accepts it and credential resolution is what names the account
+        // and the key `name` as the missing piece.
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "env", name = "" }
+"#;
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        let err = crate::auth::CredentialSource::from_account(&config.accounts[0]).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("work-primary"), "{message}");
+        assert!(message.contains("'name'"), "{message}");
     }
 
     #[test]

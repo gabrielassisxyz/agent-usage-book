@@ -77,7 +77,7 @@ use crate::domain::time::{Clock, MonotonicDuration, ProviderObservedAt, UtcTimes
 use crate::domain::window::{MeterWindow, QuantizationSemantics, WindowScope};
 use crate::error::Error;
 use crate::meter::adapter::{
-    CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter, ProviderObservation,
+    CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter, ProviderObservation, Reading,
 };
 use crate::meter::anthropic::AnthropicReading;
 use crate::meter::due::{
@@ -133,6 +133,26 @@ impl MeteredReading for AnthropicReading {
 
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         Some(&self.provider_contract_id)
+    }
+}
+
+impl MeteredReading for Reading {
+    fn windows(&self) -> &[MeterWindow] {
+        match self {
+            Reading::Anthropic(reading) => &reading.windows,
+        }
+    }
+
+    fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
+        match self {
+            Reading::Anthropic(reading) => reading.provider_observed_at,
+        }
+    }
+
+    fn provider_contract_id(&self) -> Option<&ProviderContractId> {
+        match self {
+            Reading::Anthropic(reading) => Some(&reading.provider_contract_id),
+        }
     }
 }
 
