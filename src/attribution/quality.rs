@@ -157,6 +157,15 @@ impl AttributionQualityFloor {
     }
 }
 
+impl std::fmt::Display for AttributionQualityFloor {
+    /// Renders the floor as the bare fraction `aub config` prints (aub-ukh5):
+    /// `0.80` as written in TOML, never a percentage or a parts-per-million
+    /// count, so the row reads in the unit the operator configured.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_f64())
+    }
+}
+
 /// The per-evidence-class token counts for one token kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EvidenceClassBreakdown {

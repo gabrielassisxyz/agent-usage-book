@@ -96,6 +96,13 @@ impl CanRunHeadroomBound {
     }
 }
 
+impl std::fmt::Display for CanRunHeadroomBound {
+    /// Renders the stable name `aub config` prints (aub-ukh5).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// The `AMPLE` multiple over the upper task reference (`aub-jsq`, 2026-08-25:
 /// `2.0`, unmeasured). At `2.0`, after one task at its upper reference cost
 /// there is still room for another comparable one; below that the advisory is
@@ -112,6 +119,13 @@ impl AmpleMarginMultiple {
 
     pub fn get(self) -> f64 {
         self.0
+    }
+}
+
+impl std::fmt::Display for AmpleMarginMultiple {
+    /// Renders the multiple as the bare number `aub config` prints (aub-ukh5).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 

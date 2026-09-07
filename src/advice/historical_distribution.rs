@@ -92,6 +92,13 @@ impl Percentile {
     }
 }
 
+impl std::fmt::Display for Percentile {
+    /// Renders the whole number `aub config` prints (aub-ukh5).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// The algorithm used to read one quantile off a sorted sample. Exhaustive
 /// with no wildcard arm: a second method is a deliberate modeling decision
 /// to add here, never a silent default for an unrecognized configured
@@ -119,6 +126,13 @@ impl QuantileMethod {
             "nearest-rank" => Some(Self::NearestRank),
             _ => None,
         }
+    }
+}
+
+impl std::fmt::Display for QuantileMethod {
+    /// Renders the stable name `aub config` prints (aub-ukh5).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
