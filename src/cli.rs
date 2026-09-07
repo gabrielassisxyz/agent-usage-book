@@ -98,6 +98,7 @@ aub_command_enum! {
     CalibrationFixture,
     CanRun,
     Calibrate,
+    Account,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -126,7 +127,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 26] = [
+    pub const ALL: [Self; 27] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -153,6 +154,7 @@ impl Command {
         Self::CalibrationFixture,
         Self::CanRun,
         Self::Calibrate,
+        Self::Account,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -585,6 +587,24 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Account => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "account prints one operational result or a plain listing",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "account derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "account takes PROVIDER OLD NEW positionally, not the shared selector",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "account takes no model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "account prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -618,6 +638,7 @@ impl Command {
             Command::CalibrationFixture => "__calibration-fixture",
             Command::CanRun => "can-run",
             Command::Calibrate => "calibrate",
+            Command::Account => "account",
         }
     }
 
@@ -679,6 +700,9 @@ impl Command {
             Command::Calibrate => Some(
                 "record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence",
             ),
+            Command::Account => Some(
+                "list configured accounts and rename one across every table that stores its name as text",
+            ),
         }
     }
 
@@ -730,6 +754,9 @@ impl Command {
             ),
             Command::Calibrate => Some(
                 "what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?",
+            ),
+            Command::Account => Some(
+                "which accounts has the ledger recorded, and how do I rename one without losing its history?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -809,6 +836,7 @@ impl Command {
             Command::CanRun => {
                 Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
             }
+            Command::Account => Some("list | rename PROVIDER OLD NEW"),
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -1131,6 +1159,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::CalibrationFixture => calibration_fixture_command(&RealClock::new(), &invocation),
         Command::CanRun => can_run_command(&RealClock::new(), level, &invocation),
         Command::Calibrate => calibrate_command(&RealClock::new(), &invocation),
+        Command::Account => account_command(&RealClock::new(), &invocation),
     }
 }
 
@@ -1374,6 +1403,7 @@ pub(crate) fn sample_command(
             request: crate::meter::adapter::MeterRequest {
                 model: None,
                 workspace_id: acc.opencode_workspace.clone(),
+                local_home: acc.codex_home.clone(),
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
@@ -1859,6 +1889,7 @@ pub(crate) fn now_command(
             request: crate::meter::adapter::MeterRequest {
                 model: None,
                 workspace_id: acc.opencode_workspace.clone(),
+                local_home: acc.codex_home.clone(),
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
@@ -5023,6 +5054,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             request: crate::meter::adapter::MeterRequest {
                 model: None,
                 workspace_id: account_config.opencode_workspace.clone(),
+                local_home: account_config.codex_home.clone(),
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
@@ -7266,6 +7298,122 @@ fn task_overhead_window(rest: &[String], now: UtcTimestamp) -> Result<SpendWindo
     SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)
 }
 
+/// `aub account`: `list` every recorded account row, or `rename` one's
+/// logical name across every table that stores it as text (aub-yi5e).
+fn account_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let subcommand = invocation.rest.first().map(String::as_str);
+    match subcommand {
+        Some("list") => account_list_command(clock),
+        Some("rename") => account_rename_command(clock, invocation),
+        other => Err(Error::Usage(format!(
+            "account requires a subcommand (list | rename), got {other:?}"
+        ))),
+    }
+}
+
+/// Resolves the configuration the same way every other command does. `account`
+/// needs it for the one refusal only the CLI can check (the config still
+/// naming the account being renamed) and for `list`'s configured/not-in-config
+/// column, neither of which the store layer has the configuration to answer.
+fn account_load_config() -> Result<crate::config::Config, Error> {
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    Ok(config)
+}
+
+/// `aub account list`: one line per `account` row (id, provider, name, first
+/// and last observation, and whether the current configuration still names
+/// it), so a retired row this bead's rename left behind stays visible rather
+/// than silently dropping out of view.
+fn account_list_command(clock: &impl Clock) -> Result<(), Error> {
+    let config = account_load_config()?;
+    let conn = open_ledger(clock)?;
+    let accounts = crate::store::account::all_accounts(&conn)?;
+    if accounts.is_empty() {
+        println!("no accounts recorded; run aub sample or aub ingest first");
+        return Ok(());
+    }
+    for account in &accounts {
+        let configured = config
+            .accounts
+            .iter()
+            .any(|a| a.provider == account.provider_key() && a.name == account.logical_name());
+        let status = if configured {
+            "configured"
+        } else {
+            "not in config"
+        };
+        println!(
+            "{} {} {} {} {} {status}",
+            account.id().value(),
+            account.provider_key(),
+            account.logical_name(),
+            account.first_observed_at().unix_nanos(),
+            account.last_observed_at().unix_nanos(),
+        );
+    }
+    Ok(())
+}
+
+/// `aub account rename PROVIDER OLD NEW`: the one refusal only the CLI can
+/// check (the configuration still naming `OLD`) before handing off to
+/// [`crate::store::account::rename_account`] for the other three, so a
+/// running timer can never be pointed at a name the ledger no longer has.
+fn account_rename_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let rest = &invocation.rest;
+    let usage = "account rename requires PROVIDER OLD NEW";
+    let provider = rest
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Usage(usage.to_string()))?;
+    let old_name = rest
+        .get(2)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Usage(usage.to_string()))?;
+    let new_name = rest
+        .get(3)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Usage(usage.to_string()))?;
+    if rest.len() > 4 {
+        return Err(Error::Usage(format!(
+            "{usage}, got {} extra argument(s)",
+            rest.len() - 4
+        )));
+    }
+
+    let config = account_load_config()?;
+    if config
+        .accounts
+        .iter()
+        .any(|a| a.provider == provider && a.name == old_name)
+    {
+        return Err(Error::Usage(format!(
+            "the configuration still names '{old_name}' for provider '{provider}'; rename the config entry first, then run this command"
+        )));
+    }
+
+    let mut conn = open_ledger(clock)?;
+    let account_id = crate::store::account::rename_account(
+        &mut conn,
+        provider,
+        old_name,
+        new_name,
+        clock.now(),
+    )?;
+    println!(
+        "account rename: {provider} '{old_name}' -> '{new_name}' (account {})",
+        account_id.value()
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -8401,6 +8549,110 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
                     "expected bare form naming, got {msg}"
                 );
             }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    /// `aub account` with no subcommand, and with an unknown one, are both
+    /// usage errors naming the two it accepts, never a silent no-op.
+    #[test]
+    fn account_requires_a_known_subcommand() {
+        let inv = Invocation {
+            command: Command::Account,
+            format: OutputFormat::Text,
+            verbosity: 0,
+            explain: ExplainMode::Off,
+            account: None,
+            model: None,
+            no_color: false,
+            rest: vec![],
+        };
+        match account_command(&RealClock::new(), &inv) {
+            Err(Error::Usage(msg)) => assert!(
+                msg.contains("list | rename"),
+                "expected the subcommand list named, got {msg}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+
+        let inv = Invocation {
+            rest: vec!["bogus".to_string()],
+            ..inv
+        };
+        match account_command(&RealClock::new(), &inv) {
+            Err(Error::Usage(msg)) => assert!(
+                msg.contains("bogus"),
+                "expected the unknown subcommand named, got {msg}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    /// `aub account rename` refuses before ever touching the ledger when it is
+    /// missing a positional argument: the planted negative is a call with only
+    /// two of the three (PROVIDER OLD), one short of NEW.
+    #[test]
+    fn account_rename_requires_provider_old_and_new() {
+        let base = Invocation {
+            command: Command::Account,
+            format: OutputFormat::Text,
+            verbosity: 0,
+            explain: ExplainMode::Off,
+            account: None,
+            model: None,
+            no_color: false,
+            rest: vec!["rename".to_string()],
+        };
+        match account_rename_command(&RealClock::new(), &base) {
+            Err(Error::Usage(msg)) => assert!(
+                msg.contains("PROVIDER OLD NEW"),
+                "expected the missing positionals named, got {msg}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+
+        let two_of_three = Invocation {
+            rest: vec![
+                "rename".to_string(),
+                "anthropic".to_string(),
+                "max".to_string(),
+            ],
+            ..base
+        };
+        match account_rename_command(&RealClock::new(), &two_of_three) {
+            Err(Error::Usage(msg)) => assert!(
+                msg.contains("PROVIDER OLD NEW"),
+                "expected the missing NEW named, got {msg}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    /// A fourth positional argument is refused rather than silently ignored:
+    /// a typo in the command line must be visible, not swallowed.
+    #[test]
+    fn account_rename_refuses_a_trailing_extra_argument() {
+        let inv = Invocation {
+            command: Command::Account,
+            format: OutputFormat::Text,
+            verbosity: 0,
+            explain: ExplainMode::Off,
+            account: None,
+            model: None,
+            no_color: false,
+            rest: vec![
+                "rename".to_string(),
+                "anthropic".to_string(),
+                "max".to_string(),
+                "primary".to_string(),
+                "extra".to_string(),
+            ],
+        };
+        match account_rename_command(&RealClock::new(), &inv) {
+            Err(Error::Usage(msg)) => assert!(
+                msg.contains("PROVIDER OLD NEW"),
+                "expected the trailing extra argument refused, got {msg}"
+            ),
             other => panic!("expected Error::Usage, got {other:?}"),
         }
     }

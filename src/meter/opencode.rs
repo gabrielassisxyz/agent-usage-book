@@ -724,6 +724,7 @@ mod tests {
         let request = MeterRequest {
             model: None,
             workspace_id: Some(FIXTURE_WORKSPACE_ID.to_string()),
+            local_home: None,
         };
         adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),
@@ -933,6 +934,7 @@ mod tests {
         let request = MeterRequest {
             model: None,
             workspace_id: Some("wrk_unused".to_string()),
+            local_home: None,
         };
         let _ = adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),
@@ -956,6 +958,7 @@ mod tests {
         let request = MeterRequest {
             model: None,
             workspace_id: None,
+            local_home: None,
         };
         let captured = adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),

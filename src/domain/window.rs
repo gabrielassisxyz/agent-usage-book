@@ -145,6 +145,36 @@ impl NominalWindowDuration {
     }
 }
 
+/// A fixed reset grid a provider's window boundaries are computed against,
+/// when the provider's own response carries no reset instant.
+///
+/// Named rather than folded into a bare timestamp so a future provider that
+/// also lacks a reported reset instant gets its own grid identity instead of
+/// silently sharing this one: two providers computing resets from unrelated
+/// grids must never compare as the same evidence source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum ResetGridId {
+    /// The Ollama Cloud grid (`aub-ud17`): a 5-hour session boundary aligned
+    /// to the Unix epoch, and a 7-day weekly boundary offset 4 days from it.
+    OllamaCloudV1,
+}
+
+impl ResetGridId {
+    /// The stable database and JSON spelling. One definition here.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::OllamaCloudV1 => "ollama-cloud-v1",
+        }
+    }
+
+    pub fn from_code(code: &str) -> Option<Self> {
+        match code {
+            "ollama-cloud-v1" => Some(Self::OllamaCloudV1),
+            _ => None,
+        }
+    }
+}
+
 /// The provider-reported reset state of a quota window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum WindowResetState {
@@ -152,12 +182,19 @@ pub enum WindowResetState {
     Known(UtcTimestamp),
     /// The window has not started yet (idle window with no activity since last reset).
     NotStarted,
+    /// A reset instant this system computed from a fixed provider grid,
+    /// because the provider's response carries no reset instant of its own
+    /// (`aub-ud17`). Kept distinct from `Known` so the anomaly detector never
+    /// treats a grid recomputation as a provider-reported reset event, and so
+    /// persistence can tell the two evidence sources apart later.
+    Scheduled { at: UtcTimestamp, grid: ResetGridId },
 }
 
 impl WindowResetState {
     pub fn instant(self) -> Option<UtcTimestamp> {
         match self {
             Self::Known(ts) => Some(ts),
+            Self::Scheduled { at, .. } => Some(at),
             Self::NotStarted => None,
         }
     }
@@ -166,8 +203,11 @@ impl WindowResetState {
         matches!(self, Self::NotStarted)
     }
 
+    /// True for `Known` and for `Scheduled`: both carry a reset instant this
+    /// system can measure against, and the freshness ladder (`aub-ud17`)
+    /// treats a computed grid instant exactly like a provider-reported one.
     pub fn is_known(self) -> bool {
-        matches!(self, Self::Known(_))
+        matches!(self, Self::Known(_) | Self::Scheduled { .. })
     }
 }
 
@@ -319,6 +359,7 @@ impl MeterWindow {
     pub fn is_active_at(&self, now: UtcTimestamp) -> bool {
         match self.resets_at {
             WindowResetState::Known(reset) => now < reset,
+            WindowResetState::Scheduled { at, .. } => now < at,
             WindowResetState::NotStarted => false,
         }
     }
@@ -687,5 +728,47 @@ mod tests {
         assert!(!idle_window.is_active_at(UtcTimestamp::from_unix_nanos(100_000)));
         assert_eq!(idle_window.resets_at(), None);
         assert_eq!(idle_window.reset_state(), WindowResetState::NotStarted);
+    }
+
+    #[test]
+    fn reset_grid_id_round_trips_its_stable_spelling() {
+        assert_eq!(ResetGridId::OllamaCloudV1.as_str(), "ollama-cloud-v1");
+        assert_eq!(
+            ResetGridId::from_code("ollama-cloud-v1"),
+            Some(ResetGridId::OllamaCloudV1)
+        );
+        assert_eq!(ResetGridId::from_code("not-a-grid"), None);
+    }
+
+    /// A `Scheduled` reset carries an instant and counts as known, exactly
+    /// like a provider-reported `Known` reset: the freshness ladder and the
+    /// active-window check must not distinguish a computed grid boundary from
+    /// a provider-reported one (`aub-ud17`).
+    #[test]
+    fn scheduled_reset_state_behaves_like_known_for_instant_and_activity() {
+        let scheduled = WindowResetState::Scheduled {
+            at: UtcTimestamp::from_unix_nanos(1_000),
+            grid: ResetGridId::OllamaCloudV1,
+        };
+
+        assert_eq!(
+            scheduled.instant(),
+            Some(UtcTimestamp::from_unix_nanos(1_000))
+        );
+        assert!(scheduled.is_known());
+        assert!(!scheduled.is_not_started());
+
+        let window = MeterWindow::new(
+            WindowSemanticKey::new("session"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(163_000).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Unknown,
+            scheduled,
+            NominalWindowDuration::from_nanos(18_000 * 1_000_000_000),
+        );
+        assert!(window.is_active());
+        assert!(window.is_active_at(UtcTimestamp::from_unix_nanos(999)));
+        assert!(!window.is_active_at(UtcTimestamp::from_unix_nanos(1_000)));
     }
 }

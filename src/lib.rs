@@ -28,6 +28,7 @@ pub mod evidence;
 pub mod ingest;
 pub mod legacy_calibration;
 pub mod legacy_meter;
+pub mod local_source;
 pub mod logging;
 pub mod meter;
 pub mod presentation;

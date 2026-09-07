@@ -441,6 +441,7 @@ fn pending_bundle_json(attempt_id: i64, bundle: &TerminalMeterBundle) -> String 
             reported_resolution_ppm: window.reported_resolution().as_ppm().get() as i64,
             quantization: "rounded_to_nearest".into(),
             resets_at_nanos: window.resets_at().map(|t| t.unix_nanos()),
+            reset_grid: None,
             nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
             is_active: window.is_active(),
             severity: window.severity().as_str().into(),

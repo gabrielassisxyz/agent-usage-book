@@ -19,6 +19,7 @@ fn account(path: &str) -> AccountConfig {
         credential_detail: path.to_string(),
         exclusivity_policy: AccountExclusivityPolicy::ForbidPassive,
         opencode_workspace: None,
+        codex_home: None,
     }
 }
 

@@ -111,7 +111,7 @@ quantity, documented here with its reason for exclusion:
 ### Provenance and window descriptors (`provenance.rs`, `window.rs`)
 - `Digest`, `EvidenceId`, `CostModelId`, `WindowCalibrationId`, `RateCardId`, `WitnessId`, `DerivationId`: provenance identifiers.
 - `QuerySemantics`, `ProvenanceManifest`, `Derived`: compound provenance aggregates and wrappers.
-- `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `WindowResetState`, `WindowSeverity`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs.
+- `WindowSemanticKey`, `ModelId`, `WindowScopeKind`, `WindowScope`, `ReportedResolution`, `QuantizationSemantics`, `WindowResetState`, `ResetGridId`, `WindowSeverity`, `NominalWindowDuration`, `MeterWindow`, `CreditHeadroomSelection`: window specification enums and composite structs. `ResetGridId` names the fixed grid a `WindowResetState::Scheduled` instant was computed from (`aub-ud17`), not a measured quantity.
 
 ### Window anomaly classification (`window_anomaly.rs`)
 - `WindowAnomalyKind`: tag enum naming which of the two evidence-problem classes a consecutive-window comparison found (a percentage decrease without a legitimate reset, or an unexpected reset-timestamp change), not a measured quantity; `as_str`/`from_code` are the stable database spelling, not a formatting trait.

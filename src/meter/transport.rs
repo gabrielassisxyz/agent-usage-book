@@ -11,6 +11,7 @@
 //! On budget expiry, all unfinished requests return [`FailureClass::TotalBudgetExpired`].
 
 use std::io::Read;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use crate::domain::failure::{FailureClass, HttpStatusClass};
@@ -74,6 +75,55 @@ impl RequestTimeoutConfig {
     }
 }
 
+/// The local-file source variant on the transport request (`aub-cg6k`).
+///
+/// A file-backed provider meter has no HTTP request to make, but its adapter
+/// still owns no filesystem: its bytes cross the same [`HttpTransport`] port
+/// an HTTP request takes, so evidence capture and the test transport seam
+/// keep working unchanged. The real transport serves a local-file request
+/// from disk; the synthetic transport in tests serves a fixture. On a
+/// request carrying `local_file`, `url` and `method` are inert.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalFile {
+    /// The file to read; or, when [`LocalFile::newest_glob`] is set, the
+    /// directory whose matching files are searched.
+    pub path: PathBuf,
+    /// When set: read the newest file matching this glob under `path`,
+    /// recursively, by modification time, instead of `path` itself. The glob
+    /// matches file names with `*` and `?`, never directory names. This is
+    /// the one generic file-source primitive the transport owns; which
+    /// pattern and which directory a provider needs stays with its adapter.
+    pub newest_glob: Option<String>,
+}
+
+impl LocalFile {
+    /// Reads exactly the named file.
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            newest_glob: None,
+        }
+    }
+
+    /// Reads the newest file matching `pattern` under `path`, recursively,
+    /// by modification time. Ties on modification time resolve to the
+    /// lexicographically greatest path, so the selection is deterministic.
+    pub fn with_newest_glob(path: impl Into<PathBuf>, pattern: impl Into<String>) -> Self {
+        Self {
+            path: path.into(),
+            newest_glob: Some(pattern.into()),
+        }
+    }
+}
+
+/// Response headers through which the local-file arm reports which file it
+/// served and when the provider last wrote it. They ride the ordinary header
+/// list because [`HttpResponse`] is shared with the HTTP arms; the evidence
+/// capsule deliberately excludes headers, so an adapter that needs these two
+/// facts inside its capsule copies them into the body it captures.
+pub const LOCAL_FILE_PATH_HEADER: &str = "x-aub-local-file-path";
+pub const LOCAL_FILE_MTIME_HEADER: &str = "x-aub-local-file-mtime-nanos";
+
 /// An outgoing HTTP request definition.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpRequest {
@@ -89,6 +139,10 @@ pub struct HttpRequest {
     /// its sign-in page, aub-8hu3) sets `false`, so the 3xx arrives here as
     /// the response it is instead of as the redirect target's 200.
     pub follow_redirects: bool,
+    /// The local file this request reads instead of the URL (`aub-cg6k`).
+    /// `None` on every request the HTTP constructors build; `Some` makes
+    /// `url` and `method` inert and the local-file arm serves the bytes.
+    pub local_file: Option<LocalFile>,
 }
 
 impl HttpRequest {
@@ -100,6 +154,7 @@ impl HttpRequest {
             body: None,
             timeouts,
             follow_redirects: true,
+            local_file: None,
         }
     }
 
@@ -111,6 +166,41 @@ impl HttpRequest {
             body: Some(body),
             timeouts,
             follow_redirects: true,
+            local_file: None,
+        }
+    }
+
+    /// A request whose bytes the real transport reads from disk and a
+    /// synthetic transport serves from a fixture, through the same port an
+    /// HTTP request takes (`aub-cg6k`).
+    pub fn local_file(path: impl Into<PathBuf>, timeouts: RequestTimeoutConfig) -> Self {
+        Self {
+            url: String::new(),
+            method: HttpMethod::Get,
+            headers: Vec::new(),
+            body: None,
+            timeouts,
+            follow_redirects: true,
+            local_file: Some(LocalFile::new(path)),
+        }
+    }
+
+    /// The newest-matching form of the local-file read: the transport
+    /// resolves the newest file matching `pattern` under `path`, recursively,
+    /// by modification time, and serves that file's bytes (`aub-cg6k`).
+    pub fn newest_local_file(
+        path: impl Into<PathBuf>,
+        pattern: impl Into<String>,
+        timeouts: RequestTimeoutConfig,
+    ) -> Self {
+        Self {
+            url: String::new(),
+            method: HttpMethod::Get,
+            headers: Vec::new(),
+            body: None,
+            timeouts,
+            follow_redirects: true,
+            local_file: Some(LocalFile::with_newest_glob(path, pattern)),
         }
     }
 
@@ -230,6 +320,9 @@ impl HttpTransport for BlockingTransport {
         budget: &CommandBudget,
         clock: &impl Clock,
     ) -> Result<HttpResponse, FailureClass> {
+        if let Some(local) = &request.local_file {
+            return crate::local_source::serve_local_file(local, budget, clock);
+        }
         execute_single(request, budget, clock)
     }
 }
@@ -883,5 +976,156 @@ mod tests {
         server
             .join()
             .expect("the scripted server serves its script and returns");
+    }
+
+    /// The real local-file arm serves the named file's bytes from disk and
+    /// reports the resolved path and the file's modification time through the
+    /// response headers, the facts the evidence capsule records.
+    #[test]
+    fn the_local_file_arm_reads_the_named_file_from_disk() {
+        let clock = RealClock::new();
+        let scratch = test_support::StateDir::new();
+        let file = scratch.path().join("rollout-example.jsonl");
+        test_support::scratch_files::write(&file, b"{\"payload\":{\"rate_limits\":{}}}");
+        test_support::scratch_files::pin_mtime(&file, 1_788_646_100);
+
+        let request = HttpRequest::local_file(&file, timeouts(50, 50, Some(50)));
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
+        let response = BlockingTransport
+            .send(&request, &budget, &clock)
+            .expect("an existing file reads through the local-file arm");
+
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"{\"payload\":{\"rate_limits\":{}}}");
+        assert_eq!(
+            response.header(LOCAL_FILE_PATH_HEADER),
+            Some(file.to_str().unwrap())
+        );
+        assert_eq!(
+            response.header(LOCAL_FILE_MTIME_HEADER),
+            Some("1788646100000000000")
+        );
+    }
+
+    /// A source that names nothing to read is the no-evidence class, never a
+    /// fabricated empty answer: the same class an empty provider body takes.
+    #[test]
+    fn a_local_file_that_names_nothing_is_malformed_body() {
+        let clock = RealClock::new();
+        let scratch = test_support::StateDir::new();
+        let request = HttpRequest::local_file(
+            scratch.path().join("absent.jsonl"),
+            timeouts(50, 50, Some(50)),
+        );
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
+        let result = BlockingTransport.send(&request, &budget, &clock);
+        assert_eq!(
+            result,
+            Err(FailureClass::MalformedBody),
+            "a missing file must come back as the no-evidence class"
+        );
+    }
+
+    /// The newest-glob arm resolves the newest file under the directory by
+    /// modification time, across nested dated subdirectories, with each
+    /// file's mtime pinned explicitly so the answer cannot depend on file
+    /// creation order or filesystem timestamp granularity.
+    #[test]
+    fn the_newest_glob_arm_resolves_the_newest_file_across_dated_subdirectories() {
+        let clock = RealClock::new();
+        let scratch = test_support::StateDir::new();
+        let sessions = scratch.path().join("sessions");
+        let set_mtime = |path: &std::path::Path, seconds: u64| {
+            test_support::scratch_files::pin_mtime(path, seconds);
+        };
+        for (subdir, marker) in [
+            ("2026/07/04", "oldest"),
+            ("2026/08/20", "middle"),
+            ("2026/09/05", "newest"),
+        ] {
+            let dir = sessions.join(subdir);
+            test_support::scratch_files::create_dir_all(&dir);
+            test_support::scratch_files::write(&dir.join("rollout-session.jsonl"), marker);
+        }
+        set_mtime(
+            &sessions.join("2026/07/04/rollout-session.jsonl"),
+            1_700_000_000,
+        );
+        set_mtime(
+            &sessions.join("2026/08/20/rollout-session.jsonl"),
+            1_800_000_000,
+        );
+        set_mtime(
+            &sessions.join("2026/09/05/rollout-session.jsonl"),
+            1_900_000_000,
+        );
+
+        let request = HttpRequest::newest_local_file(
+            &sessions,
+            "rollout-*.jsonl",
+            timeouts(50, 50, Some(50)),
+        );
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
+        let response = BlockingTransport
+            .send(&request, &budget, &clock)
+            .expect("a tree with matches resolves the newest");
+
+        assert_eq!(response.body(), b"newest");
+        assert!(
+            response
+                .header(LOCAL_FILE_PATH_HEADER)
+                .unwrap()
+                .contains("2026/09/05")
+        );
+        assert_eq!(
+            response.header(LOCAL_FILE_MTIME_HEADER),
+            Some("1900000000000000000")
+        );
+    }
+
+    /// The glob matches file names only, and a tree with no readable match
+    /// leaves the caller its no-evidence class rather than an empty answer.
+    #[test]
+    fn the_newest_glob_arm_skips_non_matching_names_and_reports_no_evidence_when_none_match() {
+        let clock = RealClock::new();
+        let scratch = test_support::StateDir::new();
+        let sessions = scratch.path().join("sessions");
+        test_support::scratch_files::create_dir_all(&sessions.join("2026/09/05"));
+        test_support::scratch_files::write(
+            &sessions.join("2026/09/05/thoughts.log"),
+            "not a rollout",
+        );
+
+        let request = HttpRequest::newest_local_file(
+            &sessions,
+            "rollout-*.jsonl",
+            timeouts(50, 50, Some(50)),
+        );
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
+        let result = BlockingTransport.send(&request, &budget, &clock);
+        assert_eq!(
+            result,
+            Err(FailureClass::MalformedBody),
+            "a tree with no matching file must come back as the no-evidence class"
+        );
+    }
+
+    /// A local-file read clipped to an expired command budget is refused
+    /// before the disk is touched, like every other request the port takes.
+    #[test]
+    fn the_local_file_arm_honours_an_expired_command_budget() {
+        let mut clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000_000_000));
+        let scratch = test_support::StateDir::new();
+        let file = scratch.path().join("rollout-example.jsonl");
+        test_support::scratch_files::write(&file, "bytes");
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(100), &clock);
+        clock.advance(MonotonicDuration::from_millis(150));
+        let request = HttpRequest::local_file(&file, timeouts(50, 50, Some(50)));
+        let result = BlockingTransport.send(&request, &budget, &clock);
+        assert_eq!(
+            result,
+            Err(FailureClass::TotalBudgetExpired),
+            "an expired budget must refuse the read before the disk is touched"
+        );
     }
 }

@@ -7,8 +7,10 @@
 
 pub mod adapter;
 pub mod anthropic;
+pub mod codex;
 pub mod due;
 pub mod evidence;
+pub mod ollama;
 pub mod opencode;
 pub mod retry;
 pub mod sampler;

@@ -348,6 +348,7 @@ fn sample_bundle(attempt_id: i64) -> PendingTerminalBundle {
             reported_resolution_ppm: 1_000,
             quantization: "exact".to_string(),
             resets_at_nanos: Some(2_000_000_000),
+            reset_grid: None,
             nominal_duration_nanos: 18_000_000_000_000,
             is_active: true,
             severity: "normal".to_string(),

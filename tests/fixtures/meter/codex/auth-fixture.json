@@ -1,0 +1,9 @@
+{
+  "auth_mode": "chatgpt",
+  "tokens": {
+    "id_token": "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6ImZpeHR1cmUtYWNjb3VudEBleGFtcGxlLnRlc3QiLCJlbWFpbF92ZXJpZmllZCI6dHJ1ZSwiaHR0cHM6Ly9hcGkub3BlbmFpLmNvbS9hdXRoIjp7ImNoYXRncHRfcGxhbl90eXBlIjoicGx1cyJ9fQ.Zml4dHVyZS1zaWduYXR1cmUtbm90LWEtcmVhbC1zZWNyZXQ",
+    "access_token": "fixture-access-token-not-a-real-secret",
+    "refresh_token": "fixture-refresh-token-not-a-real-secret"
+  },
+  "last_refresh": "2026-09-05T22:00:00.000Z"
+}

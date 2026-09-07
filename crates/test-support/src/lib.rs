@@ -21,6 +21,7 @@ pub mod fixture;
 pub mod log_events;
 pub mod rng;
 pub mod sanitization;
+pub mod scratch_files;
 pub mod state_dir;
 pub mod synthetic_server;
 

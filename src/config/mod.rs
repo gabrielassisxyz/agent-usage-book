@@ -385,6 +385,11 @@ pub struct AccountConfig {
     /// accepts one explicitly with `-workspace`; here it is account
     /// configuration, validated at resolve time.
     pub opencode_workspace: Option<String>,
+    /// The Codex home directory a `provider = "codex"` account's meter reads
+    /// its evidence from (`aub-cg6k`). Optional: a Codex account can be
+    /// transcript-only, with no meter home at all, and no other provider has
+    /// a local source, so a `codex_home` on any other provider is rejected.
+    pub codex_home: Option<PathBuf>,
 }
 
 impl AccountConfig {
@@ -518,6 +523,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "credential",
     "exclusivity_policy",
     "opencode_workspace",
+    "codex_home",
 ];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
@@ -1468,6 +1474,38 @@ pub fn resolve(
                         .get("opencode_workspace")
                         .and_then(toml::Value::as_str)
                         .map(str::to_string);
+                    let codex_home = match entry.get("codex_home") {
+                        Some(val) => {
+                            let raw = val.as_str().ok_or_else(|| {
+                                Error::Usage("accounts[].codex_home must be a string".to_string())
+                            })?;
+                            if raw.trim().is_empty() {
+                                return Err(Error::Usage(
+                                    "accounts[].codex_home must not be empty".to_string(),
+                                ));
+                            }
+                            // The key names one provider's source, so it
+                            // belongs only to a provider = "codex" account; a
+                            // Codex account without one is transcript-only,
+                            // which stays legal.
+                            if entry.get("provider").and_then(toml::Value::as_str) != Some("codex")
+                            {
+                                return Err(Error::Usage(format!(
+                                    "accounts[].codex_home belongs to a provider = \"codex\" account; account '{}' has provider '{}'",
+                                    entry
+                                        .get("name")
+                                        .and_then(toml::Value::as_str)
+                                        .unwrap_or_default(),
+                                    entry
+                                        .get("provider")
+                                        .and_then(toml::Value::as_str)
+                                        .unwrap_or_default(),
+                                )));
+                            }
+                            Some(PathBuf::from(raw))
+                        }
+                        None => None,
+                    };
                     Ok(AccountConfig {
                         name: entry
                             .get("name")
@@ -1495,6 +1533,7 @@ pub fn resolve(
                             .to_string(),
                         exclusivity_policy,
                         opencode_workspace,
+                        codex_home,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()
@@ -1745,6 +1784,11 @@ fn push_account_provenance_rows(
         // browser; it is not credential material, so it prints like the rest.
         if let Some(workspace) = &account.opencode_workspace {
             entry.push((format!("{base}.opencode_workspace"), workspace.clone()));
+        }
+        // The optional meter home prints only when set, like every other
+        // optional field in this output: an unset key is never invented.
+        if let Some(home) = &account.codex_home {
+            entry.push((format!("{base}.codex_home"), home.display().to_string()));
         }
         entry.sort();
         for (key, value) in entry {
@@ -2698,6 +2742,76 @@ exclusivity = "permit_passive"
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
         assert!(err.to_string().contains("exclusivity"), "{err}");
+    }
+
+    /// The codex meter home key resolves as a path on a codex account and
+    /// reaches the provenance rows only when set (aub-cg6k).
+    #[test]
+    fn codex_home_resolves_and_prints_only_when_set() {
+        let file = r#"
+[[accounts]]
+name = "codex-primary"
+provider = "codex"
+codex_home = "/home/user/.codex"
+"#;
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.accounts[0]
+                .codex_home
+                .as_ref()
+                .map(|home| home.display().to_string()),
+            Some("/home/user/.codex".to_string())
+        );
+        let rows = config.provenance_rows(&provenance);
+        let home = rows
+            .iter()
+            .find(|row| row.key == "accounts[0].codex_home")
+            .expect("the set home prints as its own row");
+        assert_eq!(home.value, "/home/user/.codex");
+
+        // A codex account without one is transcript-only, legal, and prints
+        // no row for a key nobody set.
+        let transcript_only = "[[accounts]]\nname = \"work\"\nprovider = \"codex\"\n";
+        let (config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), Some(transcript_only)).unwrap();
+        assert!(config.accounts[0].codex_home.is_none());
+        assert!(
+            config
+                .provenance_rows(&provenance)
+                .iter()
+                .all(|row| row.key != "accounts[0].codex_home")
+        );
+    }
+
+    /// A `codex_home` belongs only to a provider = "codex" account: the key
+    /// names one provider's source, so any other provider carrying it is a
+    /// usage error naming the account (aub-cg6k).
+    #[test]
+    fn codex_home_on_a_non_codex_provider_is_rejected() {
+        let file = r#"
+[[accounts]]
+name = "work"
+provider = "anthropic"
+codex_home = "/home/user/.codex"
+"#;
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        let message = err.to_string();
+        assert!(message.contains("codex_home"), "{message}");
+        assert!(message.contains("work"), "{message}");
+    }
+
+    /// A non-string or empty `codex_home` is a usage error naming the key,
+    /// never a silently degenerate path.
+    #[test]
+    fn codex_home_refuses_non_string_and_empty_values() {
+        let garbage = "[[accounts]]\nname = \"work\"\nprovider = \"codex\"\ncodex_home = 3\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
+        assert!(err.to_string().contains("codex_home"), "{err}");
+
+        let empty = "[[accounts]]\nname = \"work\"\nprovider = \"codex\"\ncodex_home = \"  \"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(empty)).unwrap_err();
+        assert!(err.to_string().contains("codex_home"), "{err}");
     }
 
     // --- aub-ukh5: aligned key, value and source rows ---------------------------

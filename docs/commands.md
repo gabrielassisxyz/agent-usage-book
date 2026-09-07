@@ -318,3 +318,21 @@ could not persist or operate at all. A caller that wants the ordinary
 live-source exit classes instead asks for them explicitly with
 `--require-success`, which still records the same evidence first.
 
+## `aub account`
+
+**Answers:** which accounts has the ledger recorded, and how do I rename one
+without losing its history?
+
+**Refuses:** to re-key a row. `rename` changes only the text a `(provider,
+name)` pair spells; the account id `list` prints and every evidence row keys
+on is untouched, so a rename can never sever an observation from its history.
+It also refuses to run while the configuration still names the old value,
+because a running timer or hook resolves accounts by that exact pair and
+would otherwise keep sampling under a name the ledger no longer has, refuses
+a new name already taken by another row for the same provider, and refuses
+while the sampler holds a live lease on the old name, naming the holder,
+rather than racing an attempt already in flight against it. When the name
+being retired is one an older row already holds (a name reused after a
+config change), rename that older row out of the way first; nothing here
+deletes a row, so both stay in `list` under their own names.
+
