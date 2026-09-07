@@ -25,6 +25,8 @@ use crate::domain::failure::{AuthReason, FailureClass};
 use crate::domain::ids::{MeterSemanticsId, ProviderContractId};
 use crate::domain::time::{Clock, MeasurementBasis};
 use crate::domain::window::ModelId;
+use crate::error::Error;
+use crate::meter::anthropic::{AnthropicAdapter, AnthropicReading};
 use crate::meter::evidence::CapturedProviderResponse;
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 
@@ -283,6 +285,145 @@ pub trait ProviderAdapter {
     }
 }
 
+/// The provider keys [`adapter_for`] can dispatch on, in dispatch order.
+///
+/// Defined once and read everywhere a supported-provider list is rendered:
+/// the unsupported-provider error joins this table, so a hand-maintained
+/// copy of the list is the defect this constant exists to prevent.
+pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic"];
+
+/// Endpoint overrides the caller resolved from the environment, handed across
+/// the boundary as data.
+///
+/// The meter never reads the environment itself: the caller reads
+/// configuration and resolves credentials the same way, and passes the
+/// resolved overrides in, the same handoff shape as [`CredentialHandle`].
+/// `None` for a provider keeps that adapter's own default endpoint.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EndpointConfig {
+    /// Overrides the Anthropic usage endpoint URL (`AUB_ANTHROPIC_ENDPOINT`).
+    pub anthropic: Option<String>,
+}
+
+/// The orchestrator-facing reading of whichever adapter the dispatch chose.
+///
+/// One variant per adapter reading, so the batch pipeline stays generic over
+/// [`AnyAdapter`] and never names a concrete adapter either. The
+/// persistence-shaped surface ([`crate::meter::sampler::MeteredReading`]) is
+/// implemented beside the orchestrator, like every adapter reading's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reading {
+    Anthropic(AnthropicReading),
+}
+
+/// The adapter choice the dispatch made, delegating [`ProviderAdapter`] to
+/// the variant it holds.
+///
+/// The orchestrator and its batch types are generic over the adapter type,
+/// and [`ProviderAdapter`] is not object-safe (an associated [`Reading`] type
+/// and a `declarations()` constructor), so the dynamic choice is this closed
+/// enum rather than a trait object. Adding an adapter is one arm in
+/// [`adapter_for`], one variant here, and the delegation arms beside them.
+pub enum AnyAdapter {
+    Anthropic(AnthropicAdapter),
+}
+
+impl ProviderAdapter for AnyAdapter {
+    type Reading = Reading;
+
+    fn declarations(&self) -> AdapterDeclarations {
+        match self {
+            AnyAdapter::Anthropic(adapter) => adapter.declarations(),
+        }
+    }
+
+    fn observe(
+        &self,
+        credential: &CredentialHandle,
+        request: &MeterRequest,
+        transport: &impl HttpTransport,
+        clock: &impl Clock,
+    ) -> ProviderObservation<Reading> {
+        match self {
+            AnyAdapter::Anthropic(adapter) => map_observation(
+                adapter.observe(credential, request, transport, clock),
+                Reading::Anthropic,
+            ),
+        }
+    }
+
+    fn observe_with_evidence(
+        &self,
+        credential: &CredentialHandle,
+        request: &MeterRequest,
+        transport: &impl HttpTransport,
+        clock: &impl Clock,
+    ) -> CapturedProviderResponse<Reading> {
+        match self {
+            AnyAdapter::Anthropic(adapter) => {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
+                    observation: map_observation(captured.observation, Reading::Anthropic),
+                    evidence: captured.evidence,
+                    failed_body: captured.failed_body,
+                }
+            }
+        }
+    }
+}
+
+/// Relabels one observation's measured value while its failure arms pass
+/// through unchanged: the dispatch exists at the adapter choice, not inside
+/// the observation's arms.
+fn map_observation<T, U>(
+    observation: ProviderObservation<T>,
+    relabel: impl FnOnce(T) -> U,
+) -> ProviderObservation<U> {
+    match observation {
+        ProviderObservation::Measured(reading) => ProviderObservation::Measured(relabel(reading)),
+        ProviderObservation::AuthRequired(reason) => ProviderObservation::AuthRequired(reason),
+        ProviderObservation::Unreachable(class) => ProviderObservation::Unreachable(class),
+    }
+}
+
+/// The one place a provider string becomes an adapter.
+///
+/// The commands call this instead of comparing provider strings themselves,
+/// so the choice lives with the adapters it chooses between. The account name
+/// travels in only for the unsupported-provider error's message: this module
+/// cannot name the configuration types (rule `07`), so the account crosses as
+/// a string the same way the resolved credential does.
+pub fn adapter_for(
+    provider: &str,
+    account: &str,
+    endpoint_overrides: &EndpointConfig,
+) -> Result<AnyAdapter, Error> {
+    match provider {
+        "anthropic" => {
+            let endpoint = endpoint_overrides
+                .anthropic
+                .as_deref()
+                .unwrap_or(AnthropicAdapter::DEFAULT_ENDPOINT);
+            Ok(AnyAdapter::Anthropic(AnthropicAdapter::with_endpoint(
+                endpoint,
+            )))
+        }
+        unsupported => Err(unsupported_provider_error(unsupported, account)),
+    }
+}
+
+/// The unsupported-provider error, with the supported list joined from
+/// [`SUPPORTED_PROVIDERS`] so the message and the dispatch arms cannot drift
+/// apart.
+fn unsupported_provider_error(provider: &str, account: &str) -> Error {
+    Error::Usage(format!(
+        "unsupported provider '{}' for account '{}' (supported: {})",
+        provider,
+        account,
+        SUPPORTED_PROVIDERS.join(", "),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,5 +497,62 @@ mod tests {
         let rendered = format!("{handle:?}");
         assert!(!rendered.contains("sk-super-secret"));
         assert!(rendered.contains("REDACTED"));
+    }
+
+    #[test]
+    fn adapter_for_dispatches_the_anthropic_arm_to_its_default_endpoint() {
+        let adapter = adapter_for("anthropic", "work-primary", &EndpointConfig::default())
+            .expect("anthropic is in the supported table");
+        match adapter {
+            AnyAdapter::Anthropic(anthropic) => {
+                assert_eq!(anthropic.endpoint_url(), AnthropicAdapter::DEFAULT_ENDPOINT);
+            }
+        }
+        assert!(SUPPORTED_PROVIDERS.contains(&"anthropic"));
+    }
+
+    /// The endpoint override the caller resolved crosses into the chosen
+    /// adapter; the default holds only when the override is absent.
+    #[test]
+    fn adapter_for_honours_the_resolved_endpoint_override() {
+        let overrides = EndpointConfig {
+            anthropic: Some("http://127.0.0.1:9".to_string()),
+        };
+        let adapter = adapter_for("anthropic", "work-primary", &overrides)
+            .expect("anthropic is in the supported table");
+        match adapter {
+            AnyAdapter::Anthropic(anthropic) => {
+                assert_eq!(anthropic.endpoint_url(), "http://127.0.0.1:9");
+            }
+        }
+    }
+
+    /// The negative: an unsupported provider yields the usage error that
+    /// names the account and the list joined from the constant, never a
+    /// hand-written provider list.
+    #[test]
+    fn adapter_for_unsupported_names_account_and_joined_supported_table() {
+        let error = match adapter_for("nope", "work-primary", &EndpointConfig::default()) {
+            Ok(_) => panic!("nope is not in the supported table"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic)"
+        );
+        assert!(matches!(error, Error::Usage(_)));
+    }
+
+    /// AnyAdapter stands where the orchestrator's generic parameter stands,
+    /// so it must satisfy exactly the bounds `run<A>` states.
+    #[test]
+    fn any_adapter_satisfies_the_bounds_the_orchestrator_requires() {
+        fn assert_orchestrator_bounds<A>()
+        where
+            A: ProviderAdapter + Sync,
+            A::Reading: crate::meter::sampler::MeteredReading + Send,
+        {
+        }
+        assert_orchestrator_bounds::<AnyAdapter>();
     }
 }
