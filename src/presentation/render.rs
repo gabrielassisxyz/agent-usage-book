@@ -298,7 +298,12 @@ fn meter_account_lines(
                 Freshness::Fresh { observed, .. } => {
                     style.paint(style.tone(observed.value().as_ppm()), &reading)
                 }
-                Freshness::Stale { .. } | Freshness::AuthRequired { .. } => reading,
+                // Two arms rather than one alternation: boundary rule 10 reads
+                // a `Freshness::X { .. }` that is not directly followed by
+                // `=>` as a construction, and the first half of an
+                // alternation is followed by `|`.
+                Freshness::Stale { .. } => reading,
+                Freshness::AuthRequired { .. } => reading,
             };
             format!("aub {} {}", account.account.as_str(), reading)
         })
