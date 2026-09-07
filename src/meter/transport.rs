@@ -328,11 +328,15 @@ fn serve_local_file(
         return Err(FailureClass::TotalBudgetExpired);
     }
     let (path, modified) = match &local.newest_glob {
-        Some(pattern) => newest_matching_file(&local.path, pattern)
-            .ok_or(FailureClass::MalformedBody)?,
+        Some(pattern) => {
+            newest_matching_file(&local.path, pattern).ok_or(FailureClass::MalformedBody)?
+        }
         None => {
-            let metadata = std::fs::metadata(&local.path).map_err(|_| FailureClass::MalformedBody)?;
-            let modified = metadata.modified().map_err(|_| FailureClass::MalformedBody)?;
+            let metadata =
+                std::fs::metadata(&local.path).map_err(|_| FailureClass::MalformedBody)?;
+            let modified = metadata
+                .modified()
+                .map_err(|_| FailureClass::MalformedBody)?;
             (local.path.clone(), modified)
         }
     };
@@ -343,7 +347,10 @@ fn serve_local_file(
     Ok(HttpResponse {
         status: 200,
         headers: vec![
-            (LOCAL_FILE_PATH_HEADER.to_string(), path.display().to_string()),
+            (
+                LOCAL_FILE_PATH_HEADER.to_string(),
+                path.display().to_string(),
+            ),
             (
                 LOCAL_FILE_MTIME_HEADER.to_string(),
                 system_time_to_unix_nanos(modified)
@@ -1034,7 +1041,10 @@ mod tests {
 
         assert_eq!(response.status(), 200);
         assert_eq!(response.body(), b"{\"payload\":{\"rate_limits\":{}}}");
-        assert_eq!(response.header(LOCAL_FILE_PATH_HEADER), Some(file.to_str().unwrap()));
+        assert_eq!(
+            response.header(LOCAL_FILE_PATH_HEADER),
+            Some(file.to_str().unwrap())
+        );
         assert_eq!(
             response.header(LOCAL_FILE_MTIME_HEADER),
             Some("1788646100000000000")
@@ -1047,8 +1057,10 @@ mod tests {
     fn a_local_file_that_names_nothing_is_malformed_body() {
         let clock = RealClock::new();
         let scratch = test_support::StateDir::new();
-        let request =
-            HttpRequest::local_file(scratch.path().join("absent.jsonl"), timeouts(50, 50, Some(50)));
+        let request = HttpRequest::local_file(
+            scratch.path().join("absent.jsonl"),
+            timeouts(50, 50, Some(50)),
+        );
         let budget = CommandBudget::new(MonotonicDuration::from_millis(200), &clock);
         let result = BlockingTransport.send(&request, &budget, &clock);
         assert_eq!(
@@ -1084,9 +1096,18 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("rollout-session.jsonl"), marker).unwrap();
         }
-        set_mtime(&sessions.join("2026/07/04/rollout-session.jsonl"), 1_700_000_000);
-        set_mtime(&sessions.join("2026/08/20/rollout-session.jsonl"), 1_800_000_000);
-        set_mtime(&sessions.join("2026/09/05/rollout-session.jsonl"), 1_900_000_000);
+        set_mtime(
+            &sessions.join("2026/07/04/rollout-session.jsonl"),
+            1_700_000_000,
+        );
+        set_mtime(
+            &sessions.join("2026/08/20/rollout-session.jsonl"),
+            1_800_000_000,
+        );
+        set_mtime(
+            &sessions.join("2026/09/05/rollout-session.jsonl"),
+            1_900_000_000,
+        );
 
         let request = HttpRequest::newest_local_file(
             &sessions,
@@ -1099,10 +1120,12 @@ mod tests {
             .expect("a tree with matches resolves the newest");
 
         assert_eq!(response.body(), b"newest");
-        assert!(response
-            .header(LOCAL_FILE_PATH_HEADER)
-            .unwrap()
-            .contains("2026/09/05"));
+        assert!(
+            response
+                .header(LOCAL_FILE_PATH_HEADER)
+                .unwrap()
+                .contains("2026/09/05")
+        );
         assert_eq!(
             response.header(LOCAL_FILE_MTIME_HEADER),
             Some("1900000000000000000")
