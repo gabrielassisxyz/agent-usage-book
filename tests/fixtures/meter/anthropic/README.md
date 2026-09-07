@@ -15,6 +15,11 @@ All fixtures in this directory are vetted to ensure:
 - `valid-success.json`: Normal subscription usage response with 5h and 7d windows.
 - `limits-success.json`: The limits contract with required session and weekly-all constraints,
   one model-scoped weekly constraint, and matching named-block calibration values.
+- `weekly-scoped-object.json`: The live limits shape whose model-scoped weekly constraint carries
+  `scope.model` as an object (`display_name` plus a nullable `id`), sanitized from the retained
+  response evidence of 2026-09-06.
+- `weekly-scoped-model-unidentified.json`: The same live shape with the display name absent and
+  the `id` null, the planted negative for the scoped model identity rule.
 - `zero-percentage.json`: Unused quota (0.0% utilization).
 - `multiple-windows.json`: Account-wide 5h/7d windows plus multiple model-specific windows (`seven_day_sonnet`, `seven_day_opus`).
 - `model-specific.json`: Model-specific weekly window (`seven_day_sonnet`).

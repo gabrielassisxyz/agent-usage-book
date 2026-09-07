@@ -3,17 +3,29 @@
 # records both the not-started five-hour window and the active seven-day window,
 # and updates the projection so `aub status` renders the account with no window
 # in progress. Rebuilding the projection from the ledger reconstructs the state.
+#
+# A second account takes its credential from an environment variable
+# (aub-e2uz): the variable resolves in `aub config`, one `aub now` against the
+# stub provider succeeds with it, and the state directory retains no trace of
+# the value the variable carried.
 
 CASE_ID="022-sample-idle-five-hour"
-CASE_DESCRIPTION="aub sample persists a not-started window without error, status renders no window in progress, and rebuild reconstructs the projection."
+CASE_DESCRIPTION="aub sample persists a not-started window without error, status renders no window in progress, an env credential resolves end to end, and state retains no credential material."
 
 SERVER_PID=""
 PORT=""
+ENV_MATERIAL=""
 
 case_preconditions() {
     require_command "$AUB_BIN"
     require_command sqlite3
     require_command python3
+
+    # Distinctive on purpose: a one-character value like the credential the
+    # kind was designed for cannot anchor a leak grep, since a stray letter
+    # matches schema text in the ledger that carries no credential. This value
+    # is what the grep step hunts for, so it must match nothing but a leak.
+    ENV_MATERIAL="env-material-never-persist-4b1f"
 
     mkdir -p "$STATE_DIR/home" "$STATE_DIR/creds"
     echo '{"accessToken":"test-token"}' > "$STATE_DIR/creds/token.json"
@@ -25,6 +37,11 @@ state.dir = "$STATE_DIR"
 name = "work-primary"
 provider = "anthropic"
 credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
+
+[[accounts]]
+name = "env-primary"
+provider = "anthropic"
+credential = { kind = "env", name = "AUB_TEST_TOKEN" }
 CFG_EOF
 
     python3 -c "
@@ -102,6 +119,34 @@ case_steps() {
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
         "$AUB_BIN" status
+
+    # 7. The env credential resolves in `aub config`: the table is accepted and
+    #    the account is part of the resolved configuration.
+    step "config-resolves-env-credential" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_STATE_DIR=$STATE_DIR" \
+        "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
+        "AUB_TEST_TOKEN=$ENV_MATERIAL" \
+        "$AUB_BIN" config
+
+    # 8. One `aub now` for the env-credential account against the stub
+    #    provider: the variable's value is the credential material the request
+    #    goes out with, and the attempt succeeds.
+    step "now-env-credential" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_STATE_DIR=$STATE_DIR" \
+        "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
+        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:$PORT" \
+        "AUB_TEST_TOKEN=$ENV_MATERIAL" \
+        "$AUB_BIN" now --account env-primary
+
+    # 9. The value the variable carried is nowhere in the state directory: not
+    #    in the ledger, the spool, the projection, or any diagnostic the run
+    #    retained. The grep exits 1 (leak) when it finds the value, and this
+    #    step's assertion demands exit 0.
+    step "state-has-no-credential-material" bash -c \
+        'if grep -rqF -- "$1" "$2"; then echo "credential material found in state"; exit 1; fi' \
+        _ "$ENV_MATERIAL" "$STATE_DIR"
 }
 
 case_assertions() {
@@ -134,4 +179,15 @@ case_assertions() {
     # Step 6: status after rebuild still shows no window in progress
     assert_exit 0 6
     assert_stdout_contains 6 "aub work-primary 100% left · no window in progress"
+
+    # Step 7: the env credential table resolved without error
+    assert_exit 0 7
+    assert_stdout_contains 7 "accounts"
+
+    # Step 8: now with the env credential succeeded against the stub provider
+    assert_exit 0 8
+    assert_stdout_contains 8 "aub env-primary"
+
+    # Step 9: the variable's value left no trace in the state directory
+    assert_exit 0 9
 }

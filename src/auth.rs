@@ -15,18 +15,25 @@
 use std::io;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
 use crate::config::AccountConfig;
 use crate::domain::ids::CredentialContextId;
 use crate::error::Error;
 
 /// The typed credential-source model, interpreted from the config's loose
 /// `credential` table. Only the kinds the first release's providers need
-/// (aub-86g): an explicit credential file, or no credential at all (Codex
-/// reads its meter from the transcript).
+/// (aub-86g, aub-e2uz): an explicit credential file, an environment variable,
+/// or no credential at all (Codex reads its meter from the transcript).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CredentialSource {
     /// A credential file at an explicit path.
     File { path: PathBuf },
+    /// The value of an environment variable. The operator keeps the OpenCode
+    /// session cookie exported by hand (aub-r7k0), the way every other secret
+    /// on the machine is kept; the variable name is configuration and the
+    /// value is never logged or persisted.
+    Env { name: String },
     /// No credential: the provider's meter is read from its transcript.
     None,
 }
@@ -61,8 +68,20 @@ impl CredentialSource {
                     Ok(CredentialSource::File { path })
                 }
             }
+            "env" => {
+                if account.credential_detail.is_empty() {
+                    Err(Error::Usage(format!(
+                        "account '{}': credential kind 'env' requires a variable name in key 'name'",
+                        account.name
+                    )))
+                } else {
+                    Ok(CredentialSource::Env {
+                        name: account.credential_detail.clone(),
+                    })
+                }
+            }
             other => Err(Error::Usage(format!(
-                "account '{}': unsupported credential kind '{}' (supported kinds: file, none)",
+                "account '{}': unsupported credential kind '{}' (supported kinds: env, file, none)",
                 account.name, other
             ))),
         }
@@ -130,8 +149,9 @@ impl std::fmt::Debug for ResolvedCredential {
     }
 }
 
-/// The filesystem surface credential resolution reads through, so tests can
-/// inject a fake instead of touching the real home directory.
+/// The filesystem and environment surface credential resolution reads through,
+/// so tests can inject a fake instead of touching the real home directory or
+/// the process environment.
 ///
 /// Modification times are reported as nanoseconds since the Unix epoch, never
 /// as a wall-clock instant type: the epoch conversion belongs to the clock
@@ -140,9 +160,13 @@ impl std::fmt::Debug for ResolvedCredential {
 pub trait CredentialFs {
     fn read_to_string(&self, path: &Path) -> io::Result<String>;
     fn modified_nanos(&self, path: &Path) -> io::Result<u128>;
+    /// The value of an environment variable, or `None` when it is unset. A
+    /// non-Unicode value counts as unset: credential material is interpreted
+    /// as text, and a value that cannot be is not usable material.
+    fn var(&self, name: &str) -> Option<String>;
 }
 
-/// The real filesystem.
+/// The real filesystem and process environment.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RealFs;
 
@@ -154,6 +178,10 @@ impl CredentialFs for RealFs {
     fn modified_nanos(&self, path: &Path) -> io::Result<u128> {
         let modified = std::fs::metadata(path)?.modified()?;
         Ok(crate::domain::time::unix_nanos(modified))
+    }
+
+    fn var(&self, name: &str) -> Option<String> {
+        std::env::var(name).ok()
     }
 }
 
@@ -203,7 +231,50 @@ pub fn resolve(
                 context_id,
             })
         }
+        CredentialSource::Env { name } => {
+            // The error text names the variable, never its value: an unset or
+            // empty variable is the same AuthRequired outcome an empty file
+            // gives, and a diagnostic that echoed the value would leak the
+            // credential into whatever captured the error.
+            let value = fs.var(&name).ok_or_else(|| {
+                Error::AuthRequired(format!(
+                    "account '{}': environment variable '{}' is not set",
+                    account.name, name
+                ))
+            })?;
+            if value.trim().is_empty() {
+                return Err(Error::AuthRequired(format!(
+                    "account '{}': environment variable '{}' is empty",
+                    account.name, name
+                )));
+            }
+            // There is no mtime for an environment variable, so the revision is
+            // the value itself, digested: SHA-256 truncated to 16 hex chars
+            // changes when the value changes (clearing a sticky auth conclusion
+            // the way a replaced file does) and reveals nothing usable. The
+            // variable name prefixes the digest the same way the path prefixes
+            // a file context id, so two sources resolve distinct ids.
+            let context_id = CredentialContextId::new(format!(
+                "env:{}:{}",
+                name,
+                sha256_hex_16(value.as_bytes())
+            ));
+            Ok(ResolvedCredential {
+                material: Secret::new(AuthMaterial::new(value)),
+                context_id,
+            })
+        }
     }
+}
+
+/// The first 16 hex characters of the SHA-256 digest of `bytes`.
+fn sha256_hex_16(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    digest
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// The path as an error message should name it: the file name at default
@@ -225,11 +296,17 @@ mod tests {
     use crate::error::ExitClass;
     use std::collections::BTreeMap;
 
-    struct FakeFs(BTreeMap<PathBuf, (String, u128)>);
+    struct FakeFs {
+        files: BTreeMap<PathBuf, (String, u128)>,
+        vars: BTreeMap<String, String>,
+    }
 
     impl FakeFs {
         fn new() -> Self {
-            Self(BTreeMap::new())
+            Self {
+                files: BTreeMap::new(),
+                vars: BTreeMap::new(),
+            }
         }
 
         fn file(
@@ -238,24 +315,34 @@ mod tests {
             content: impl Into<String>,
             modified_nanos: u128,
         ) -> Self {
-            self.0.insert(path.into(), (content.into(), modified_nanos));
+            self.files
+                .insert(path.into(), (content.into(), modified_nanos));
+            self
+        }
+
+        fn var(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
+            self.vars.insert(name.into(), value.into());
             self
         }
     }
 
     impl CredentialFs for FakeFs {
         fn read_to_string(&self, path: &Path) -> io::Result<String> {
-            self.0
+            self.files
                 .get(path)
                 .map(|(content, _)| content.clone())
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
         }
 
         fn modified_nanos(&self, path: &Path) -> io::Result<u128> {
-            self.0
+            self.files
                 .get(path)
                 .map(|(_, modified_nanos)| *modified_nanos)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "no such file"))
+        }
+
+        fn var(&self, name: &str) -> Option<String> {
+            self.vars.get(name).cloned()
         }
     }
 
@@ -311,6 +398,7 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("primary"), "{message}");
         assert!(message.contains("profile"), "{message}");
+        assert!(message.contains("env, file, none"), "{message}");
         assert_eq!(err.exit_class(), ExitClass::Usage);
     }
 
@@ -423,6 +511,121 @@ mod tests {
         let second = resolve(
             &account("primary", "file", "creds-b.json"),
             &FakeFs::new().file("creds-b.json", "token-b", at(1_000)),
+            false,
+        )
+        .unwrap();
+
+        assert_ne!(first.context_id, second.context_id);
+    }
+
+    // --- the env credential kind (aub-e2uz) ---------------------------------
+
+    #[test]
+    fn env_kind_resolves_to_material_and_context_id() {
+        let fs = FakeFs::new().var("AUB_TEST_TOKEN", "abc");
+        let resolved = resolve(&account("primary", "env", "AUB_TEST_TOKEN"), &fs, false).unwrap();
+
+        assert_eq!(resolved.material.into_inner().as_str(), "abc");
+        // SHA-256("abc") truncated to 16 hex characters, prefixed by the
+        // variable name the way a file id is prefixed by its path.
+        assert_eq!(
+            resolved.context_id.as_str(),
+            "env:AUB_TEST_TOKEN:ba7816bf8f01cfea"
+        );
+    }
+
+    #[test]
+    fn env_kind_without_a_name_fails_explicitly() {
+        let err = resolve(&account("primary", "env", ""), &FakeFs::new(), false).unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("primary"), "{message}");
+        assert!(message.contains("'name'"), "{message}");
+        assert_eq!(err.exit_class(), ExitClass::Usage);
+    }
+
+    #[test]
+    fn unset_env_variable_fails_with_auth_required_naming_the_variable() {
+        let err = resolve(
+            &account("primary", "env", "AUB_TEST_TOKEN"),
+            &FakeFs::new(),
+            false,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("primary"), "{message}");
+        assert!(message.contains("AUB_TEST_TOKEN"), "{message}");
+        assert_eq!(err.exit_class(), ExitClass::AuthRequired);
+    }
+
+    #[test]
+    fn empty_env_variable_fails_with_auth_required_naming_the_variable() {
+        // Whitespace-only counts as empty the way a whitespace-only file does;
+        // the outcome and the error shape must agree with the file kind.
+        let err = resolve(
+            &account("primary", "env", "AUB_TEST_TOKEN"),
+            &FakeFs::new().var("AUB_TEST_TOKEN", "  "),
+            false,
+        )
+        .unwrap_err();
+
+        let message = err.to_string();
+        assert!(message.contains("primary"), "{message}");
+        assert!(message.contains("AUB_TEST_TOKEN"), "{message}");
+        assert!(message.contains("empty"), "{message}");
+        assert_eq!(err.exit_class(), ExitClass::AuthRequired);
+    }
+
+    #[test]
+    fn env_context_id_differs_when_the_value_changes() {
+        let before = resolve(
+            &account("primary", "env", "AUB_TEST_TOKEN"),
+            &FakeFs::new().var("AUB_TEST_TOKEN", "abc"),
+            false,
+        )
+        .unwrap();
+        let after = resolve(
+            &account("primary", "env", "AUB_TEST_TOKEN"),
+            &FakeFs::new().var("AUB_TEST_TOKEN", "abd"),
+            false,
+        )
+        .unwrap();
+
+        assert_ne!(before.context_id, after.context_id);
+    }
+
+    #[test]
+    fn env_context_id_is_stable_across_two_resolutions() {
+        let fs = FakeFs::new().var("AUB_TEST_TOKEN", "abc");
+        let first = resolve(&account("primary", "env", "AUB_TEST_TOKEN"), &fs, false).unwrap();
+        let second = resolve(&account("primary", "env", "AUB_TEST_TOKEN"), &fs, false).unwrap();
+
+        assert_eq!(first.context_id, second.context_id);
+    }
+
+    #[test]
+    fn env_context_id_contains_no_substring_of_the_value() {
+        let fs = FakeFs::new().var("AUB_TEST_TOKEN", "abc");
+        let resolved = resolve(&account("primary", "env", "AUB_TEST_TOKEN"), &fs, false).unwrap();
+
+        // The test greps the id for the value: a digest that leaked a
+        // recognizable fragment of its input would defeat the whole point of
+        // persisting the id.
+        assert!(!resolved.context_id.as_str().contains("abc"));
+    }
+
+    #[test]
+    fn env_context_id_differs_across_distinct_variables_with_one_value() {
+        let first = resolve(
+            &account("primary", "env", "AUB_TEST_TOKEN"),
+            &FakeFs::new().var("AUB_TEST_TOKEN", "shared"),
+            false,
+        )
+        .unwrap();
+        let second = resolve(
+            &account("primary", "env", "AUB_OTHER_TOKEN"),
+            &FakeFs::new().var("AUB_OTHER_TOKEN", "shared"),
             false,
         )
         .unwrap();
