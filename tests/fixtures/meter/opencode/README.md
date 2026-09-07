@@ -2,41 +2,50 @@
 
 Synthetic page fixtures for the OpenCode Go workspace-page meter adapter
 (`aub-8hu3`). The OpenCode Go usage meter has no public endpoint: the
-authoritative surface is the workspace page `https://opencode.ai/workspace/<id>/go`
-as seen in a signed-in browser, and the usage meters live in the page's
-embedded initial state script (the reference,
-`https://ai.rud.is/posts/2026-06-06-opencode-go-usage/`, documents the field
-names: per window `percent` (integer 0..100) and `reset_in_sec`, for
-`rolling`, `weekly` and `monthly`, plus `plan` and `fetched_at`).
+authoritative surface is the workspace page
+`https://opencode.ai/workspace/<id>/go` as seen in a signed-in browser, and
+the usage meters live in the page's **rendered markup**, not in an embedded
+JSON blob. The real contract comes from the reference tool
+(`git.sr.ht/~hrbrmstr/opencode-go-usage`, branch `batman`, `usage/usage.go`
+and `usage/usage_test.go`), which parses the same HTML a browser renders.
 
 ## Provenance
 
-Every fixture here is **reconstructed, not captured**: the session cookie was
-not available on the machine that wrote them, so no live page could be
-fetched. Each file states its own synthetic status in its visible text. No
-cookie, token, key, email, session identifier or account identifier appears
-in any of them, and each parses clean against the shared forbidden-pattern
-list (`docs/forbidden-patterns.txt`). A sanitized live capture joins them as
-its own fixture when the reviewer's cookie exists.
+`valid.html` and `malformed-state.html` reproduce the shape of the reference
+tool's own committed sample page (`usage/usage_test.go`'s fixture): three
+`usage-item` blocks with figures 0 / 35.5 / 64.8 percent and resets `5 hours
+0 minutes` / `4 days 10 hours` / `7 days 5 hours`. This is the tool's own
+test fixture, not a captured live page. No sanitized live capture is present
+here: the session cookie was not available on the machine that wrote these
+fixtures, so no live workspace page could be fetched. No cookie, token, key,
+email, session identifier or account identifier appears in any of them, and
+each parses clean against the shared forbidden-pattern list
+(`docs/forbidden-patterns.txt`).
 
 ## Parser contract
 
-The adapter keys the page-state script by the literal marker string
-`reset_in_sec`: a `<script>` element whose text contains it carries the store
-state, and the parser extracts the brace-balanced JSON object from that
-element's text. The marker is one of the exact field names the reference
-documents for the store state, and the only one distinctive enough not to
-appear elsewhere in the component tree's markup.
+The adapter keys the page on the literal marker string
+`data-slot="usage-item"`: one `<div>` carrying that attribute per usage
+window. Inside it: `<span data-slot="usage-label">` names the window
+(`5-hour Usage`, `Weekly Usage`, `Monthly Usage`, matched by substring to
+`rolling`, `weekly`, `monthly`); a `role="progressbar"` element's
+`aria-valuenow` attribute carries the percent as a decimal with one place;
+and `<span data-slot="reset-time">` carries `Resets in <N days> <N hours>
+<N minutes> <N seconds>` (any subset of those units), with React comment
+markers (`<!--$-->`, `<!--/-->`) stripped before parsing. A page with no
+`data-slot="usage-item"` element anywhere is schema drift.
 
 ## Catalog of Fixtures
 
-- `valid.html`: the three usage windows in the embedded state script, plus
-  `plan` and `fetched_at`; parses to three `MeterWindow` rows.
+- `valid.html`: the three usage windows in the rendered markup; parses to
+  three `MeterWindow` rows at 0 / 35.5 / 64.8 percent.
 - `login-redirect.html`: the sign-in body the workspace request is redirected
   to when the session cookie is invalid or expired; the adapter classifies
   the redirect response itself, so this body pairs with a 302 status in the
-  synthetic server.
-- `no-state-marker.html`: the page shape without any state script; parses to
-  `FailureClass::SchemaDrift`, never a silent zero.
-- `malformed-state.html`: the state script present but its JSON truncated;
-  parses to `FailureClass::MalformedBody`.
+  synthetic server and its content is never parsed.
+- `no-state-marker.html`: the page shape with no `usage-item` element at
+  all; parses to `FailureClass::SchemaDrift`, never a silent zero.
+- `malformed-state.html`: three items present, but the weekly item's
+  `aria-valuenow` is the text `not-a-number`; parses to
+  `FailureClass::MalformedBody`, with the sanitized raw-percent/reset-text
+  evidence still retained since the markup itself read structurally fine.

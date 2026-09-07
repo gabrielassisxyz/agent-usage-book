@@ -35,8 +35,9 @@ use agent_usage_book::store::sampling_policy_snapshot::{
 /// The fixture under test, shared with the unit cases and the e2e run.
 const FIXTURE_VALID: &str = include_str!("fixtures/meter/opencode/valid.html");
 
-/// Distinctive on purpose, so a grep matches nothing but a leak.
-const FIXTURE_COOKIE: &str = "auth=fixture-session-cookie-9f2c-not-a-real-value";
+/// Distinctive on purpose, so a grep matches nothing but a leak. The bare
+/// cookie value, matching the credential material the adapter receives.
+const FIXTURE_COOKIE: &str = "fixture-session-cookie-9f2c-not-a-real-value";
 
 struct TestDb {
     path: PathBuf,
@@ -201,23 +202,23 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
     let stored = evidence_by_row_id(&conn, evidence_id)
         .expect("the evidence must read")
         .expect("the evidence must exist");
-    // The raw provider facts ride in the capsule exactly as the reference
-    // documents them, so the derived instants stay auditable beside them.
-    for field in ["\"percent\":23", "\"percent\":41", "\"percent\":7"] {
+    // The raw provider facts ride in the capsule exactly as the markup
+    // stated them, so the derived instants stay auditable beside them.
+    for field in [
+        "\"percent\":\"0\"",
+        "\"percent\":\"35.5\"",
+        "\"percent\":\"64.8\"",
+    ] {
         assert!(
             stored.evidence_capsule.contains(field),
             "the raw {field} lexeme must persist: {}",
             stored.evidence_capsule
         );
     }
-    for field in [
-        "\"reset_in_sec\":3612",
-        "\"reset_in_sec\":302931",
-        "\"reset_in_sec\":1814211",
-    ] {
+    for field in ["5 hours 0 minutes", "4 days 10 hours", "7 days 5 hours"] {
         assert!(
             stored.evidence_capsule.contains(field),
-            "the raw {field} lexeme must persist: {}",
+            "the raw reset text {field} must persist: {}",
             stored.evidence_capsule
         );
     }

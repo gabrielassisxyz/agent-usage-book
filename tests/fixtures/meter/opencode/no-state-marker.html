@@ -2,16 +2,15 @@
 <html lang="en">
   <head>
     <meta charset="utf-8">
-    <title>Workspace page without the state script (fixture)</title>
+    <title>Workspace page without any usage item (fixture)</title>
   </head>
   <body>
     <main>
       <h1>Workspace usage</h1>
       <p>Synthetic fixture for the aub OpenCode Go meter adapter (aub-8hu3):
-      a page in the shape of the workspace surface with no embedded initial
-      state script. No script element carries the reset_in_sec marker, so the
-      parser has nothing to key on and must report schema drift instead of a
-      silent zero.</p>
+      a page in the shape of the workspace surface with no usage-item block
+      anywhere in the markup, so the parser has nothing to key on and must
+      report schema drift instead of a silent zero.</p>
     </main>
     <script>
       window.env = {"featureFlags":{"workspaceV2":true}};

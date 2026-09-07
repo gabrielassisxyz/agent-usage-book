@@ -21,8 +21,9 @@ case_preconditions() {
 
     # The opencode account's session-cookie material: distinctive on purpose,
     # so the state-directory leak grep matches nothing but a leak, and free
-    # of every shared forbidden pattern.
-    OPENCODE_COOKIE_MATERIAL="auth=fixture-session-cookie-9f2c-not-a-real-value"
+    # of every shared forbidden pattern. This is the bare cookie value the
+    # operator exports; the adapter builds the `auth=<value>` header itself.
+    OPENCODE_COOKIE_MATERIAL="fixture-session-cookie-9f2c-not-a-real-value"
 
     cat > "$STATE_DIR/aub.toml" <<CFG_EOF
 state.dir = "$STATE_DIR"
@@ -196,16 +197,16 @@ case_assertions() {
     assert_exit 0 8
     assert_stdout_contains 8 "sample: account=go-primary outcome=success"
 
-    # Step 9: the three windows persist at the fixture's integer percents
+    # Step 9: the three windows persist at the fixture's decimal percents
     assert_exit 0 9
-    assert_stdout_contains 9 "monthly,70000,known"
-    assert_stdout_contains 9 "rolling,230000,known"
-    assert_stdout_contains 9 "weekly,410000,known"
+    assert_stdout_contains 9 "monthly,648000,known"
+    assert_stdout_contains 9 "rolling,0,known"
+    assert_stdout_contains 9 "weekly,355000,known"
 
     # Step 10: status prints the go-primary block; the limiting window is
-    # the weekly one (59% left, 7d)
+    # the monthly one (35.2% left, 30d)
     assert_exit 0 10
-    assert_stdout_contains 10 "aub go-primary 59% left"
+    assert_stdout_contains 10 "aub go-primary 35.2% left"
 
     # Step 11: the cookie material never persisted
     assert_exit 0 11

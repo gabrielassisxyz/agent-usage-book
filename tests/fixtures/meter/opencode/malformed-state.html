@@ -1,19 +1,2 @@
-<!doctype html>
-<html lang="en">
-  <head>
-    <meta charset="utf-8">
-    <title>Workspace page with a malformed state script (fixture)</title>
-  </head>
-  <body>
-    <main>
-      <h1>Workspace usage</h1>
-      <p>Synthetic fixture for the aub OpenCode Go meter adapter (aub-8hu3):
-      the state script is present and keyed on by its marker, but the JSON it
-      embeds is truncated mid-value, so the parse fails instead of yielding a
-      partial reading.</p>
-    </main>
-    <script>
-      {"rolling":{"percent":23,"reset_in_sec":3612,"status":"ok"},"weekly":{"percent":41,"reset_in
-    </script>
-  </body>
-</html>
+<html><head><script>liteSubscriptionID:"sub_123"</script></head><body>
+<div data-slot="usage"><div data-slot="usage-item"><div data-slot="usage-header"><span data-slot="usage-label">5-hour Usage</span><span data-slot="usage-value"><!--$-->0<!--/-->%</span></div><div data-slot="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="5-hour Usage" aria-valuenow="0"><div data-slot="progress-bar" style="width: 0%;"></div></div><span data-slot="reset-time"><!--$-->Resets in<!--/--> <!--$-->5 hours 0 minutes<!--/--></span><!--$--><!--/--></div><div data-slot="usage-item"><div data-slot="usage-header"><span data-slot="usage-label">Weekly Usage</span><span data-slot="usage-value"><!--$-->not-a-number<!--/-->%</span></div><div data-slot="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Weekly Usage" aria-valuenow="not-a-number"><div data-slot="progress-bar" style="width: 0%;"></div></div><span data-slot="reset-time"><!--$-->Resets in<!--/--> <!--$-->4 days 10 hours<!--/--></span></div><div data-slot="usage-item"><div data-slot="usage-header"><span data-slot="usage-label">Monthly Usage</span><span data-slot="usage-value"><!--$-->64.8<!--/-->%</span></div><div data-slot="progress" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-label="Monthly Usage" aria-valuenow="64.8"><div data-slot="progress-bar" style="width: 64.8%;"></div></div><span data-slot="reset-time"><!--$-->Resets in<!--/--> <!--$-->7 days 5 hours<!--/--></span></div></div></body></html>

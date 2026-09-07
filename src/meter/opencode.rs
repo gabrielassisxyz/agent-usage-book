@@ -2,19 +2,27 @@
 //!
 //! The OpenCode Go usage meter has no public endpoint: the authoritative
 //! surface is the workspace page (`GET https://opencode.ai/workspace/<id>/go`)
-//! as seen in a signed-in browser, and the usage meters live in the page's
-//! embedded initial state script. This adapter fetches that page with the
-//! session cookie the caller resolved (an `env` credential whose value is the
-//! `Cookie:` header value verbatim), reads the three usage windows from the
-//! state script, and answers with a typed reading. The reference documenting
-//! the shape is `https://ai.rud.is/posts/2026-06-06-opencode-go-usage/`; its
-//! per-window fields are `percent` (integer 0..100) and `reset_in_sec`, for
-//! `rolling`, `weekly` and `monthly`, plus `plan` and `fetched_at`.
+//! as seen in a signed-in browser. The page renders its usage meters as
+//! markup, not as an embedded JSON blob: the reference tool
+//! (`git.sr.ht/~hrbrmstr/opencode-go-usage`, `usage/usage.go`) parses the
+//! rendered HTML rather than any script payload, and this adapter follows
+//! the same contract. This adapter fetches that page with the session
+//! cookie the caller resolved (an `env` credential whose value is the bare
+//! `auth` cookie value), reads the three usage windows from the markup, and
+//! answers with a typed reading.
+//!
+//! One `<div data-slot="usage-item">` exists per window. Inside it: a
+//! `<span data-slot="usage-label">` naming the window (`5-hour Usage`,
+//! `Weekly Usage`, `Monthly Usage`); a `role="progressbar"` element whose
+//! `aria-valuenow` attribute carries the percent as a decimal with one
+//! place; and a `<span data-slot="reset-time">` whose text, once its React
+//! comment markers are stripped, reads `Resets in <N days> <N hours>
+//! <N minutes> <N seconds>` in any subset of those units.
 //!
 //! The request never follows a redirect: the provider answers an expired
 //! session by redirecting to its sign-in page, so the redirect response is
 //! the authentication signal and arrives here unfollowed (the transport's
-//! `without_redirects`). A page whose state script is absent is
+//! `without_redirects`). A page with no `data-slot="usage-item"` element is
 //! [`FailureClass::SchemaDrift`], never a silent zero.
 //!
 //! May not depend on:
@@ -44,11 +52,10 @@ use crate::meter::evidence::{
 };
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse, RequestTimeoutConfig};
 
-/// The page-state marker the parser keys on: the literal field name that only
-/// the embedded initial state script carries, one of the field names the
-/// reference documents for the store state. A page with no script element
-/// containing this marker has no readable state, and is schema drift.
-pub const STATE_MARKER: &str = "reset_in_sec";
+/// The page-state marker the parser keys on: the literal attribute pair that
+/// opens every usage-window block. A page with no element carrying it has no
+/// usage meters to read, and is schema drift.
+pub const STATE_MARKER: &str = "data-slot=\"usage-item\"";
 
 /// The provider base the workspace page hangs from. The full page URL is
 /// `{DEFAULT_PAGE_BASE}/workspace/<id>/go`; the id is account configuration
@@ -56,13 +63,14 @@ pub const STATE_MARKER: &str = "reset_in_sec";
 pub const DEFAULT_PAGE_BASE: &str = "https://opencode.ai";
 
 /// The one cookie-header credential: the reference's client authenticates
-/// with a session cookie named `auth`, and the operator exports the whole
-/// `Cookie:` header value by hand (decided in `aub-r7k0`).
+/// with a session cookie named `auth`, and the operator exports the bare
+/// cookie value by hand (decided in `aub-r7k0`); the adapter builds the
+/// `auth=<value>` header pair itself.
 pub const COOKIE_HEADER: &str = "Cookie";
 
 /// The typed success reading produced by [`OpenCodeAdapter`]: one row per
-/// usage window the state script carries, with the reset anchored at the
-/// instant the page was received.
+/// usage window the page carries, with the reset anchored at the instant the
+/// page was received.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenCodeReading {
     pub windows: Vec<MeterWindow>,
@@ -104,10 +112,9 @@ impl OpenCodeAdapter {
         Self {
             endpoint_override,
             declarations: AdapterDeclarations::new(
-                // The page documents no provider measurement time:
-                // `fetched_at` is the page generation stamp, so the reading's
-                // basis is the local receive instant, the same anchor the
-                // reset arithmetic uses.
+                // The page documents no provider measurement time: the
+                // reading's basis is the local receive instant, the same
+                // anchor the reset arithmetic uses.
                 MeasurementBasis::LocallyReceived,
                 ProviderContractId::new(Self::DEFAULT_CONTRACT_ID),
                 MeterSemanticsId::new(Self::DEFAULT_SEMANTICS_ID),
@@ -135,80 +142,192 @@ impl OpenCodeAdapter {
         self.endpoint_override.as_deref()
     }
 }
-/// The integer percent to parts-per-million step: the provider reports whole
-/// percentages, so one percent is exactly 10 000 ppm.
-const PPM_PER_PERCENT: i64 = 10_000;
 
-/// Extracts the state JSON object from a workspace page body: the first
-/// `<script>` element whose text carries [`STATE_MARKER`], and within it the
-/// brace-balanced JSON object starting at the first `{`. A page with no such
-/// script is [`FailureClass::SchemaDrift`]; a marked script with no
-/// extractable object is [`FailureClass::MalformedBody`].
-fn extract_state_json(body: &[u8]) -> Result<String, FailureClass> {
+/// The one-decimal percent to parts-per-million step: the provider reports
+/// the percent to one decimal place, so one tenth of a percent is exactly
+/// 1 000 ppm.
+const PPM_PER_PERCENT: f64 = 10_000.0;
+
+/// Splits a workspace page body on [`STATE_MARKER`] and returns the inner
+/// markup of each `<div data-slot="usage-item">…</div>` block, in document
+/// order. A page with no such element has nothing to read and is
+/// [`FailureClass::SchemaDrift`].
+fn extract_item_blocks(body: &[u8]) -> Result<Vec<&str>, FailureClass> {
     let text = std::str::from_utf8(body).map_err(|_| FailureClass::MalformedBody)?;
-    for script in script_elements(text) {
-        if script.contains(STATE_MARKER) {
-            return extract_json_object(script).ok_or(FailureClass::MalformedBody);
-        }
+    let mut items = Vec::new();
+    let mut search_from = 0usize;
+    while let Some(marker_offset) = text[search_from..].find(STATE_MARKER) {
+        let marker_pos = search_from + marker_offset;
+        let tag_start = text[..marker_pos]
+            .rfind("<div")
+            .ok_or(FailureClass::MalformedBody)?;
+        let tag_end = text[tag_start..]
+            .find('>')
+            .map(|offset| tag_start + offset + 1)
+            .ok_or(FailureClass::MalformedBody)?;
+        let inner_len = balanced_div_end(&text[tag_end..]).ok_or(FailureClass::MalformedBody)?;
+        items.push(&text[tag_end..tag_end + inner_len]);
+        search_from = tag_end + inner_len;
     }
-    Err(FailureClass::SchemaDrift)
+    if items.is_empty() {
+        return Err(FailureClass::SchemaDrift);
+    }
+    Ok(items)
 }
 
-/// Yields the text between every `<script ...>` opening tag and its matching
-/// `</script>`, in document order. The scan is delimiter-based rather than a
-/// HTML parse on purpose: the reference's client does the same, and the
-/// state script is the only element this contract reads.
-fn script_elements(text: &str) -> impl Iterator<Item = &str> {
-    let mut rest = text;
-    std::iter::from_fn(move || {
-        let opening = rest.find("<script")?;
-        let after_tag = rest[opening..].find('>')? + opening + 1;
-        let closing = rest[after_tag..].find("</script>")? + after_tag;
-        let script = &rest[after_tag..closing];
-        rest = &rest[closing + "</script>".len()..];
-        Some(script)
-    })
-}
-
-/// Extracts the brace-balanced JSON object from `script`, starting at the
-/// first `{` and respecting double-quoted strings, so a brace inside a state
-/// string never ends the object early.
-fn extract_json_object(script: &str) -> Option<String> {
-    let start = script.find('{')?;
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (offset, character) in script[start..].char_indices() {
-        if in_string {
-            if escaped {
-                escaped = false;
-            } else if character == '\\' {
-                escaped = true;
-            } else if character == '"' {
-                in_string = false;
+/// Finds the byte offset, within `text`, of the `</div>` that closes the
+/// div whose content `text` begins at (depth already 1 for that div), by
+/// tracking every nested `<div` opening against every `</div>` closing.
+/// Only bare `<div` opening tags are counted, which matches the reference
+/// fixture's markup and every fixture this adapter reads.
+fn balanced_div_end(text: &str) -> Option<usize> {
+    let mut depth = 1i32;
+    for (offset, _) in text.char_indices() {
+        if text[offset..].starts_with("<div") {
+            depth += 1;
+        } else if text[offset..].starts_with("</div>") {
+            depth -= 1;
+            if depth == 0 {
+                return Some(offset);
             }
-            continue;
-        }
-        match character {
-            '"' => in_string = true,
-            '{' => depth += 1,
-            '}' => {
-                depth = depth.checked_sub(1)?;
-                if depth == 0 {
-                    return Some(script[start..=start + offset].to_string());
-                }
-            }
-            _ => {}
         }
     }
     None
 }
 
-/// Parses the state JSON object a workspace page carries into the reading's
-/// windows, keyed by the reference's field names. Every required window must
-/// be present with an integer percent in 0..=100 and a non-negative integer
-/// `reset_in_sec`, and every reset is anchored at the instant the page was
-/// received: the provider states the interval, `aub` states the anchor.
+/// Extracts the text between the opening tag of the first
+/// `<span data-slot="$slot">…` in `block` and its next `</span>`. The
+/// reset-time span nests only comment markers, never another `<span>`, so
+/// the next `</span>` is always the matching close. Returns `None` when the
+/// span itself is absent, which is a structural read failure distinct from
+/// a value that is present but unusable.
+fn span_text<'a>(block: &'a str, slot: &str) -> Option<&'a str> {
+    let needle = format!("data-slot=\"{slot}\"");
+    let marker_pos = block.find(&needle)?;
+    let tag_end = block[marker_pos..].find('>').map(|o| marker_pos + o + 1)?;
+    let close = block[tag_end..].find("</span>").map(|o| tag_end + o)?;
+    Some(&block[tag_end..close])
+}
+
+/// Extracts the value of `attribute="…"` from `block`. Returns `None` when
+/// the attribute itself is absent.
+fn attribute_value<'a>(block: &'a str, attribute: &str) -> Option<&'a str> {
+    let needle = format!("{attribute}=\"");
+    let start = block.find(&needle).map(|o| o + needle.len())?;
+    let end = block[start..].find('"').map(|o| start + o)?;
+    Some(&block[start..end])
+}
+
+/// Strips every `<…>` span (both real tags and the React `<!--$-->` /
+/// `<!--/-->` comment markers) out of `text`, leaving the plain reader-
+/// visible text behind.
+fn strip_tags(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut inside = false;
+    for character in text.chars() {
+        match character {
+            '<' => inside = true,
+            '>' => inside = false,
+            _ if !inside => out.push(character),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Parses `Resets in <N days> <N hours> <N minutes> <N seconds>` (any subset
+/// of those four units, in that order) into a total second count. The
+/// leading "Resets in" label is case-insensitively stripped first, and the
+/// React comment markers around it are already gone by the time this runs
+/// (the caller strips tags before calling this).
+fn parse_reset_seconds(text: &str) -> Option<i64> {
+    let lower = text.to_ascii_lowercase();
+    let stripped = lower
+        .strip_prefix("resets in")
+        .map(|rest| &text[text.len() - rest.len()..])
+        .unwrap_or(text);
+    let tokens: Vec<&str> = stripped.split_whitespace().collect();
+    if tokens.is_empty() || !tokens.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut total = 0i64;
+    for pair in tokens.chunks_exact(2) {
+        let amount: i64 = pair[0].parse().ok()?;
+        let unit_seconds = match pair[1].trim_end_matches(',').to_ascii_lowercase().as_str() {
+            "day" | "days" => 24 * 3600,
+            "hour" | "hours" => 3600,
+            "minute" | "minutes" => 60,
+            "second" | "seconds" => 1,
+            _ => return None,
+        };
+        total = total.checked_add(amount.checked_mul(unit_seconds)?)?;
+    }
+    Some(total)
+}
+
+/// The raw fields one usage-item block contributes, extracted structurally
+/// (the span and attribute exist) but not yet validated semantically (the
+/// percent may not parse as a number, the reset text may not parse as a
+/// duration). Building this struct can fail only when the markup itself is
+/// missing a required element; a present-but-unusable value survives into
+/// this struct as text, so it can still ride into the evidence capsule.
+struct RawWindowItem {
+    key: WindowKind,
+    percent_text: String,
+    reset_text: String,
+}
+
+/// Reads the structural fields out of one `usage-item` block: the label
+/// (used only to identify which window this is), the `aria-valuenow`
+/// attribute text, and the reset-time span text with its tags stripped. A
+/// label that matches none of the three known windows yields `None`, and
+/// the item is skipped rather than treated as an error, matching the
+/// reference tool's own label-driven mapping.
+fn read_raw_item(block: &str) -> Result<Option<RawWindowItem>, FailureClass> {
+    let label = span_text(block, "usage-label").ok_or(FailureClass::MalformedBody)?;
+    let Some(key) = WindowKind::from_label(label) else {
+        return Ok(None);
+    };
+    let percent_text =
+        attribute_value(block, "aria-valuenow").ok_or(FailureClass::MalformedBody)?;
+    let reset_span = span_text(block, "reset-time").ok_or(FailureClass::MalformedBody)?;
+    let reset_text = strip_tags(reset_span);
+    Ok(Some(RawWindowItem {
+        key,
+        percent_text: percent_text.to_string(),
+        reset_text,
+    }))
+}
+
+/// Builds the raw-evidence JSON object from every recognized item on the
+/// page: one entry per matched window, carrying the still-unvalidated
+/// `percent` and `reset_text` strings exactly as read from the markup. This
+/// is the object the evidence capsule is captured from, and the object
+/// [`parse_state`] later re-reads to derive the typed windows, so the
+/// retained evidence is exactly what the reading was derived from.
+fn build_raw_state(body: &[u8]) -> Result<serde_json::Value, FailureClass> {
+    let blocks = extract_item_blocks(body)?;
+    let mut object = serde_json::Map::new();
+    for block in blocks {
+        if let Some(item) = read_raw_item(block)? {
+            object.insert(
+                item.key.semantic_key().as_str().to_string(),
+                serde_json::json!({
+                    "percent": item.percent_text,
+                    "reset_text": item.reset_text,
+                }),
+            );
+        }
+    }
+    Ok(serde_json::Value::Object(object))
+}
+
+/// Parses the raw-evidence JSON object (as re-read from the capsule) into
+/// the reading's windows. Every required window must be present, with a
+/// percent that parses as a decimal in `0.0..=100.0` and a reset text that
+/// parses as a duration; every reset is anchored at the instant the page
+/// was received: the provider states the interval, `aub` states the
+/// anchor.
 fn parse_state(
     root: &serde_json::Value,
     received_at: UtcTimestamp,
@@ -220,13 +339,10 @@ fn parse_state(
     Ok(windows)
 }
 
-/// The three usage windows the reference documents, each with its semantic
-/// key and the nominal length this adapter stores for it. The reference post
-/// documents no rolling length, so rolling stores the one length the
-/// reference names anywhere (its tool's page labels the rolling meter
-/// "5-hour Usage") and reads the bead's measured-between-resets refinement
-/// once calibration observes it; the two calendar windows are the bead's own
-/// 7-day and 30-day decisions.
+/// The three usage windows the page's `usage-label` text distinguishes,
+/// each with its semantic key and the nominal length this adapter stores
+/// for it: rolling matches the page's own "5-hour Usage" label, and the two
+/// calendar windows are the bead's 7-day and 30-day decisions.
 #[derive(Debug, Clone, Copy)]
 enum WindowKind {
     Rolling,
@@ -235,6 +351,22 @@ enum WindowKind {
 }
 
 impl WindowKind {
+    /// Maps a `usage-label` text to the window it names, matching the
+    /// reference tool's own substring rule: a label containing `5-hour`,
+    /// `Weekly` or `Monthly` names that window; anything else is not one of
+    /// the three required windows.
+    fn from_label(label: &str) -> Option<Self> {
+        if label.contains("5-hour") {
+            Some(Self::Rolling)
+        } else if label.contains("Weekly") {
+            Some(Self::Weekly)
+        } else if label.contains("Monthly") {
+            Some(Self::Monthly)
+        } else {
+            None
+        }
+    }
+
     fn semantic_key(self) -> WindowSemanticKey {
         WindowSemanticKey::new(match self {
             WindowKind::Rolling => "rolling",
@@ -252,19 +384,9 @@ impl WindowKind {
         NominalWindowDuration::from_nanos(seconds * 1_000_000_000)
     }
 
-    /// The quantization each window's percent carries: the two calendar
-    /// windows are exact at the provider's integer-percent resolution; the
-    /// rolling window's length is provisional until measured, and its
-    /// quantization states that honest `Unknown` rather than claiming exact.
-    fn quantization(self) -> QuantizationSemantics {
-        match self {
-            WindowKind::Rolling => QuantizationSemantics::Unknown,
-            WindowKind::Weekly | WindowKind::Monthly => QuantizationSemantics::Exact,
-        }
-    }
-
-    /// Parses one window object from the state root: the raw fields, the
-    /// percent-to-ppm step, and the reset anchored at the receive instant.
+    /// Parses one window object from the raw-evidence root: the still-raw
+    /// `percent` and `reset_text` strings, validated and converted into the
+    /// typed window.
     fn parse_window(
         self,
         root: &serde_json::Value,
@@ -275,50 +397,52 @@ impl WindowKind {
             .get(key.as_str())
             .and_then(|value| value.as_object())
             .ok_or(FailureClass::MissingRequiredField)?;
-        let percent = object
+        let percent_text = object
             .get("percent")
-            .ok_or(FailureClass::MissingRequiredField)?
-            .as_i64()
+            .and_then(|value| value.as_str())
             .ok_or(FailureClass::MalformedBody)?;
-        if !(0..=100).contains(&percent) {
+        let percent: f64 = percent_text
+            .parse()
+            .map_err(|_| FailureClass::MalformedBody)?;
+        if !(0.0..=100.0).contains(&percent) {
             return Err(FailureClass::MalformedBody);
         }
-        let reset_in_sec = object
-            .get("reset_in_sec")
-            .ok_or(FailureClass::MissingRequiredField)?
-            .as_i64()
+        let reset_text = object
+            .get("reset_text")
+            .and_then(|value| value.as_str())
             .ok_or(FailureClass::MalformedBody)?;
-        if reset_in_sec < 0 {
-            return Err(FailureClass::MalformedBody);
-        }
+        let reset_in_sec = parse_reset_seconds(reset_text).ok_or(FailureClass::MalformedBody)?;
         let reset_nanos = reset_in_sec
             .checked_mul(1_000_000_000)
             .and_then(|nanos| received_at.unix_nanos().checked_add(nanos))
             .ok_or(FailureClass::MalformedBody)?;
-        let percent_ppm = percent
-            .checked_mul(PPM_PER_PERCENT)
-            .and_then(|ppm| i32::try_from(ppm).ok())
-            .and_then(QuotaFractionPpm::new)
+        // `percent` is already validated into `0.0..=100.0` above, so the
+        // rounded ppm value is always within `QuotaFractionPpm`'s domain;
+        // the fallible constructor is still the boundary that proves it.
+        let percent_ppm = QuotaFractionPpm::new((percent * PPM_PER_PERCENT).round() as i32)
             .ok_or(FailureClass::MalformedBody)?;
         Ok(MeterWindow::new(
             key,
             WindowScope::AccountWide,
             QuotaUsed::new(percent_ppm),
-            integer_percent_resolution(),
-            self.quantization(),
+            decimal_percent_resolution(),
+            QuantizationSemantics::Exact,
             UtcTimestamp::from_unix_nanos(reset_nanos),
             self.nominal_duration(),
         ))
     }
 }
 
-/// The reported resolution of an integer percent: one percent, 10 000 ppm.
-fn integer_percent_resolution() -> ReportedResolution {
-    // 10 000 ppm is one whole percent, statically inside the fraction's
+/// The reported resolution of a one-decimal percent: one tenth of a
+/// percent, 1 000 ppm.
+fn decimal_percent_resolution() -> ReportedResolution {
+    // 1 000 ppm is one tenth of a percent, statically inside the fraction's
     // domain and non-zero, so both constructors' refusals are unreachable
     // for this constant.
-    ReportedResolution::new(QuotaFractionPpm::new(10_000).expect("one percent is a valid fraction"))
-        .expect("one percent is a non-zero resolution")
+    ReportedResolution::new(
+        QuotaFractionPpm::new(1_000).expect("one tenth of a percent is a valid fraction"),
+    )
+    .expect("one tenth of a percent is a non-zero resolution")
 }
 
 impl ProviderAdapter for OpenCodeAdapter {
@@ -346,7 +470,7 @@ impl ProviderAdapter for OpenCodeAdapter {
         transport: &impl HttpTransport,
         clock: &impl Clock,
     ) -> CapturedProviderResponse<Self::Reading> {
-        // The credential is the `Cookie:` header value verbatim, decided in
+        // The credential is the bare `auth` cookie value, decided in
         // `aub-r7k0`: no trimming, no reinterpretation, and an empty material
         // is an expired credential rather than an unauthenticated request.
         let material = credential.expose();
@@ -370,7 +494,11 @@ impl ProviderAdapter for OpenCodeAdapter {
             Some(MonotonicDuration::from_seconds(15)),
         );
         let req = HttpRequest::get(&page_url, timeouts)
-            .with_header(COOKIE_HEADER, material.to_string())
+            // The `auth` cookie name is the reference client's own name for
+            // this session cookie; the credential material is the bare
+            // cookie value, and the header carries the name and the value
+            // together.
+            .with_header(COOKIE_HEADER, format!("auth={material}"))
             .with_header("Accept", "text/html")
             .with_header("User-Agent", "agent-usage-book/0.1.0")
             // The redirect is the authentication signal: an expired session
@@ -387,10 +515,10 @@ impl ProviderAdapter for OpenCodeAdapter {
                 );
             }
         };
-        // The anchor for every `reset_in_sec` derivation: the instant the
-        // page arrived. The provider states the interval, `aub` states the
-        // anchor, and the capsule keeps the raw seconds beside the derived
-        // instants so the arithmetic stays auditable.
+        // The anchor for every reset derivation: the instant the page
+        // arrived. The provider states the interval, `aub` states the
+        // anchor, and the capsule keeps the raw percent and reset text
+        // beside the derived instants so the arithmetic stays auditable.
         let received_at = clock.now();
         let (observation, evidence) = match response.status() {
             200 => reading_from_response(&response, received_at, material),
@@ -438,9 +566,9 @@ impl ProviderAdapter for OpenCodeAdapter {
                 None,
             ),
         };
-        // On a parse failure the sanitized state body rides along for the
-        // bounded failure store (`aub-2r3`); on every other outcome there is
-        // no failed body to keep.
+        // On a parse failure the sanitized raw-state body rides along for
+        // the bounded failure store (`aub-2r3`); on every other outcome
+        // there is no failed body to keep.
         let failed_body = match &observation {
             ProviderObservation::Unreachable(
                 FailureClass::MalformedBody | FailureClass::MissingRequiredField,
@@ -461,10 +589,12 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 }
 
-/// Reads one successful workspace response: the state JSON is extracted and
-/// sanitized into the evidence capsule first, then the windows are parsed
-/// from the capsule's own quota subtree, so the retained evidence is exactly
-/// what the reading was derived from.
+/// Reads one successful workspace response: the raw-state object is built
+/// from the markup and sanitized into the evidence capsule first, then the
+/// windows are parsed from the capsule's own quota subtree, so the retained
+/// evidence is exactly what the reading was derived from. A page with no
+/// `usage-item` element never reaches the capsule at all: it is schema
+/// drift with nothing to retain.
 fn reading_from_response(
     response: &HttpResponse,
     received_at: UtcTimestamp,
@@ -473,7 +603,7 @@ fn reading_from_response(
     ProviderObservation<OpenCodeReading>,
     Option<JsonEvidenceCapsule>,
 ) {
-    let state = match extract_state_json(response.body()) {
+    let raw_state = match build_raw_state(response.body()) {
         Ok(state) => state,
         Err(FailureClass::SchemaDrift) => {
             return (
@@ -486,7 +616,8 @@ fn reading_from_response(
         }
     };
     let sensitive = SensitiveResponseMaterial::new([cookie_material]);
-    let evidence = capture_json_body(state.as_bytes(), &sensitive);
+    let raw_state_bytes = serde_json::to_vec(&raw_state).expect("a JSON value always serializes");
+    let evidence = capture_json_body(&raw_state_bytes, &sensitive);
     let quota = match quota_response_from_capsule(evidence.serialized()) {
         Ok(quota) => quota,
         Err(_) => {
@@ -528,10 +659,11 @@ mod tests {
         "/tests/fixtures/meter/opencode/malformed-state.html"
     ));
 
-    /// The fixture cookie string: distinctive on purpose, so the leak grep
-    /// over the capsule matches nothing but a leak, and free of every shared
-    /// forbidden pattern (no credential-shaped prefix, no at sign, no path).
-    const FIXTURE_COOKIE: &str = "auth=fixture-session-cookie-9f2c-not-a-real-value";
+    /// The fixture credential material: the bare cookie value the adapter
+    /// receives, distinctive on purpose so the leak grep over the capsule
+    /// matches nothing but a leak, and free of every shared forbidden
+    /// pattern (no credential-shaped prefix, no at sign, no path).
+    const FIXTURE_COOKIE: &str = "fixture-session-cookie-9f2c-not-a-real-value";
     /// The workspace id the request-shape case serves, matching the
     /// reference's own id shape.
     const FIXTURE_WORKSPACE_ID: &str = "wrk_2345ABCDEFGHJKLMNOPQRSTuvwx";
@@ -602,19 +734,20 @@ mod tests {
     }
 
     /// Case 01: the valid page parses to the three required windows, each
-    /// carrying the fixture's percent as its exact parts-per-million value.
+    /// carrying the fixture's decimal percent as its exact parts-per-million
+    /// value at one-tenth-of-a-percent resolution.
     #[test]
-    fn case_01_valid_page_yields_three_windows_at_integer_percent_resolution() {
+    fn case_01_valid_page_yields_three_windows_at_decimal_percent_resolution() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
         let captured = observing(&transport);
         let ProviderObservation::Measured(reading) = captured.observation else {
             panic!("the valid fixture must measure: {:?}", captured.observation);
         };
         assert_eq!(reading.windows.len(), 3);
-        for (key, percent, reset_in_sec) in [
-            ("rolling", 23, 3612),
-            ("weekly", 41, 302931),
-            ("monthly", 7, 1814211),
+        for (key, percent_ppm, reset_in_sec) in [
+            ("rolling", 0, 18_000),
+            ("weekly", 355_000, 381_600),
+            ("monthly", 648_000, 622_800),
         ] {
             let window = reading
                 .windows
@@ -623,10 +756,11 @@ mod tests {
                 .unwrap_or_else(|| panic!("the {key} window must be present"));
             assert_eq!(
                 window.quota_used().as_ppm().get(),
-                percent * 10_000,
-                "the {key} percent converts to ppm by the integer-percent step"
+                percent_ppm,
+                "the {key} decimal percent converts to ppm by the one-tenth-percent step"
             );
-            assert_eq!(window.reported_resolution().as_ppm().get(), 10_000);
+            assert_eq!(window.reported_resolution().as_ppm().get(), 1_000);
+            assert_eq!(window.quantization(), QuantizationSemantics::Exact);
             // The reset anchor: the receive instant is the fake clock's
             // 1_000_000_000, so each reset is exactly reset_in_sec later,
             // with literal instants the derivation can be audited against.
@@ -638,19 +772,6 @@ mod tests {
             );
             assert!(window.reset_state().is_known());
         }
-        // The two calendar windows are exact; the rolling window's length is
-        // provisional until measured, so its quantization stays Unknown.
-        let quantization = |key: &str| {
-            reading
-                .windows
-                .iter()
-                .find(|window| window.semantic_key().as_str() == key)
-                .unwrap()
-                .quantization()
-        };
-        assert_eq!(quantization("weekly"), QuantizationSemantics::Exact);
-        assert_eq!(quantization("monthly"), QuantizationSemantics::Exact);
-        assert_eq!(quantization("rolling"), QuantizationSemantics::Unknown);
         assert!(
             captured.evidence.is_some(),
             "a measured page keeps its capsule"
@@ -678,10 +799,11 @@ mod tests {
         );
     }
 
-    /// Case 03: a page with no state script is schema drift, never a silent
-    /// zero and never a malformed-body claim about a body that parsed.
+    /// Case 03: a page with no `usage-item` element is schema drift, never a
+    /// silent zero and never a malformed-body claim about a body that
+    /// otherwise parsed.
     #[test]
-    fn case_03_page_without_the_state_marker_is_schema_drift() {
+    fn case_03_page_without_the_usage_item_marker_is_schema_drift() {
         let transport = SyntheticTransport::serving(FIXTURE_NO_MARKER.as_bytes());
         let captured = observing(&transport);
         assert_eq!(
@@ -691,10 +813,11 @@ mod tests {
         assert!(captured.evidence.is_none());
     }
 
-    /// Case 04: a marked script whose JSON is truncated is a parse failure.
-    /// A truncated object never brace-balances, so there is no state object
-    /// to capture and no capsule rides along; the retained-body path is the
-    /// planted negative below, where the state parses but a window fails.
+    /// Case 04: a page whose items read structurally (label, attribute and
+    /// reset span all present) but whose weekly `aria-valuenow` is not a
+    /// number is the parse failure class. Because the markup itself was
+    /// readable, the sanitized raw-percent/reset-text evidence still rides
+    /// along for the bounded failure store, and it never carries the cookie.
     #[test]
     fn case_04_malformed_state_is_the_parse_failure_class() {
         let transport = SyntheticTransport::serving(FIXTURE_MALFORMED.as_bytes());
@@ -704,29 +827,12 @@ mod tests {
             ProviderObservation::Unreachable(FailureClass::MalformedBody)
         );
         assert!(
-            captured.evidence.is_none() && captured.failed_body.is_none(),
-            "a state that never brace-balances has nothing to retain"
-        );
-    }
-
-    /// A state object that parses as JSON but carries an unusable window
-    /// field fails the parse with the sanitized state body retained for the
-    /// bounded failure store (`aub-2r3`).
-    #[test]
-    fn a_state_that_parses_but_fails_the_window_parse_keeps_the_sanitized_body() {
-        let bad_percent = br#"<html><body><script>{"rolling":{"percent":23,"reset_in_sec":3612,"status":"ok"},"weekly":{"percent":141,"reset_in_sec":302931,"status":"ok"},"monthly":{"percent":7,"reset_in_sec":1814211,"status":"ok"},"plan":"Go"}</script></body></html>"#;
-        let transport = SyntheticTransport::serving(bad_percent);
-        let captured = observing(&transport);
-        assert_eq!(
-            captured.observation,
-            ProviderObservation::Unreachable(FailureClass::MalformedBody)
+            captured.evidence.is_some(),
+            "a structurally readable page keeps its raw evidence even when a value fails"
         );
         let failed_body = captured
             .failed_body
-            .expect("the sanitized state body rides along on the failure");
-        let state: serde_json::Value =
-            serde_json::from_slice(&failed_body).expect("the retained body is still valid JSON");
-        assert_eq!(state.get("plan"), Some(&serde_json::json!("Go")));
+            .expect("the sanitized raw-state body rides along on the failure");
         assert!(
             !String::from_utf8_lossy(&failed_body).contains(FIXTURE_COOKIE),
             "the retained body never carries the cookie material"
@@ -761,30 +867,27 @@ mod tests {
     }
 
     /// The protection the capsule contract names is the sanitizer being fed
-    /// the credential material: a page that echoes the session value in an
-    /// innocuous field must still yield a capsule without it.
+    /// the credential material: a page whose reset-time text echoes the
+    /// session value must still yield a capsule without it.
     #[test]
     fn the_sanitizer_removes_the_cookie_even_when_the_page_echoes_it() {
-        let echoed = "<html><body><script>{\"rolling\":{\"percent\":23,\"reset_in_sec\":3612,\"status\":\"ok\"},\"weekly\":{\"percent\":41,\"reset_in_sec\":302931,\"status\":\"ok\"},\"monthly\":{\"percent\":7,\"reset_in_sec\":1814211,\"status\":\"ok\"},\"plan\":\"Go\",\"session_id\":\"".to_string()
-            + FIXTURE_COOKIE
-            + "\"}</script></body></html>";
+        let echoed = FIXTURE_VALID.replace("5 hours 0 minutes", FIXTURE_COOKIE);
         let transport = SyntheticTransport::serving(echoed.as_bytes());
         let captured = observing(&transport);
-        let ProviderObservation::Measured(_) = captured.observation else {
-            panic!(
-                "the echoed page must still measure: {:?}",
-                captured.observation
-            );
-        };
-        let serialized = captured
-            .evidence
-            .as_ref()
-            .expect("a measured page captures a capsule")
-            .serialized()
-            .to_string();
+        // The echoed reset text no longer parses as a duration, so this page
+        // fails to measure; the sanitizer's job is that the failure's
+        // retained evidence still excludes the cookie, which is exactly the
+        // property this case checks.
+        assert_eq!(
+            captured.observation,
+            ProviderObservation::Unreachable(FailureClass::MalformedBody)
+        );
+        let failed_body = captured
+            .failed_body
+            .expect("the raw-state body still rides along on a value-parse failure");
         assert!(
-            !serialized.contains(FIXTURE_COOKIE),
-            "the echoed session value must be sanitized out of the capsule"
+            !String::from_utf8_lossy(&failed_body).contains(FIXTURE_COOKIE),
+            "the echoed session value must be sanitized out of the retained evidence"
         );
     }
 
@@ -804,7 +907,11 @@ mod tests {
         for (name, value) in &request.headers {
             if name.eq_ignore_ascii_case(COOKIE_HEADER) {
                 cookie_headers += 1;
-                assert_eq!(value, FIXTURE_COOKIE, "the material goes out verbatim");
+                assert_eq!(
+                    *value,
+                    format!("auth={FIXTURE_COOKIE}"),
+                    "the material goes out under the auth cookie name"
+                );
             } else {
                 assert!(
                     !value.contains(FIXTURE_COOKIE),
@@ -866,11 +973,11 @@ mod tests {
         );
     }
 
-    /// The evidence capsule carries the raw state the reading came from, and
-    /// never the cookie material: the serialized capsule is grepped for the
-    /// fixture cookie string, which must match nothing.
+    /// The evidence capsule carries the raw percent and reset text per
+    /// window, and never the cookie material: the serialized capsule is
+    /// grepped for the fixture cookie string, which must match nothing.
     #[test]
-    fn the_capsule_holds_the_raw_state_and_never_the_cookie() {
+    fn the_capsule_holds_the_raw_percent_and_reset_text_and_never_the_cookie() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
         let captured = observing(&transport);
         let capsule = captured
@@ -883,70 +990,90 @@ mod tests {
             "the cookie material must never enter the capsule"
         );
         // The raw provider facts ride along per window: the capsule's quota
-        // subtree is the state object, so every percent and reset_in_sec is
-        // readable in it, keeping the derived instants auditable.
+        // subtree is the raw-state object, so every percent and reset_text
+        // is readable in it, keeping the derived instants auditable.
         let quota = quota_response_from_capsule(serialized).expect("the capsule holds the state");
-        for (key, percent, reset_in_sec) in [
-            ("rolling", 23, 3612),
-            ("weekly", 41, 302931),
-            ("monthly", 7, 1814211),
+        for (key, percent, reset_text) in [
+            ("rolling", "0", "Resets in 5 hours 0 minutes"),
+            ("weekly", "35.5", "Resets in 4 days 10 hours"),
+            ("monthly", "64.8", "Resets in 7 days 5 hours"),
         ] {
             let window = quota.get(key).expect("the raw window object");
             assert_eq!(window.get("percent"), Some(&serde_json::json!(percent)));
             assert_eq!(
-                window.get("reset_in_sec"),
-                Some(&serde_json::json!(reset_in_sec))
+                window.get("reset_text"),
+                Some(&serde_json::json!(reset_text))
             );
         }
-        // The `plan` and `fetched_at` fields the reference documents survive
-        // into the capsule too, though the reading derives nothing from them.
-        assert_eq!(quota.get("plan"), Some(&serde_json::json!("Go")));
-        assert!(quota.get("fetched_at").is_some());
     }
 
-    /// The parse contract over planted negatives: a wrong percent value, a
-    /// fractional percent, and a missing window each fail the parse instead
-    /// of yielding a partial reading.
+    /// The parse contract over planted negatives: an out-of-range percent, a
+    /// missing window, and a reset text with no parseable unit each fail the
+    /// parse instead of yielding a partial reading.
     #[test]
     fn planted_negatives_fail_the_parse() {
         let received_at = UtcTimestamp::from_unix_nanos(1_000_000_000);
-        let parse_windows = |state: &str| {
-            let root: serde_json::Value = serde_json::from_str(state).unwrap();
-            parse_state(&root, received_at)
-        };
+        let parse_windows = |state: &serde_json::Value| parse_state(state, received_at);
+        let window = |percent: &str, reset_text: &str| serde_json::json!({"percent": percent, "reset_text": reset_text});
         // Percent out of range: the provider's field is 0..=100.
-        let out_of_range = r#"{"rolling":{"percent":101,"reset_in_sec":10},"weekly":{"percent":1,"reset_in_sec":10},"monthly":{"percent":1,"reset_in_sec":10}}"#;
+        let out_of_range = serde_json::json!({
+            "rolling": window("101", "Resets in 10 seconds"),
+            "weekly": window("1", "Resets in 10 seconds"),
+            "monthly": window("1", "Resets in 10 seconds"),
+        });
         assert_eq!(
-            parse_windows(out_of_range),
+            parse_windows(&out_of_range),
             Err(FailureClass::MalformedBody)
         );
-        // Fractional percent: the contract's integer percent, not a float.
-        let fractional = r#"{"rolling":{"percent":1.5,"reset_in_sec":10},"weekly":{"percent":1,"reset_in_sec":10},"monthly":{"percent":1,"reset_in_sec":10}}"#;
-        assert_eq!(parse_windows(fractional), Err(FailureClass::MalformedBody));
         // A missing required window: refused, never defaulted to zero.
-        let missing = r#"{"rolling":{"percent":1,"reset_in_sec":10},"weekly":{"percent":1,"reset_in_sec":10}}"#;
+        let missing = serde_json::json!({
+            "rolling": window("1", "Resets in 10 seconds"),
+            "weekly": window("1", "Resets in 10 seconds"),
+        });
         assert_eq!(
-            parse_windows(missing),
+            parse_windows(&missing),
             Err(FailureClass::MissingRequiredField)
         );
-        // Negative reset interval: nonsense, refused.
-        let negative_reset = r#"{"rolling":{"percent":1,"reset_in_sec":-1},"weekly":{"percent":1,"reset_in_sec":10},"monthly":{"percent":1,"reset_in_sec":10}}"#;
+        // A reset text with no recognized unit: refused, never a zero reset.
+        let unrecognized_unit = serde_json::json!({
+            "rolling": window("1", "Resets in 10 fortnights"),
+            "weekly": window("1", "Resets in 10 seconds"),
+            "monthly": window("1", "Resets in 10 seconds"),
+        });
         assert_eq!(
-            parse_windows(negative_reset),
+            parse_windows(&unrecognized_unit),
             Err(FailureClass::MalformedBody)
         );
     }
 
-    /// A state string containing a brace inside a quoted value never ends
-    /// the JSON object early: the brace matcher respects strings.
+    /// `parse_reset_seconds` sums every subset of the four units the
+    /// reference documents, in the order the page renders them.
     #[test]
-    fn the_brace_matcher_respects_quoted_braces() {
-        let script = r#" prefix {"plan":"brace } inside","rolling":{"percent":1,"reset_in_sec":2},"weekly":{"percent":3,"reset_in_sec":4},"monthly":{"percent":5,"reset_in_sec":6}} trailing"#;
-        let extracted = extract_json_object(script).expect("the object extracts whole");
-        let parsed: serde_json::Value = serde_json::from_str(&extracted).expect("valid JSON");
+    fn parse_reset_seconds_sums_every_unit_subset() {
         assert_eq!(
-            parsed.get("plan"),
-            Some(&serde_json::json!("brace } inside"))
+            parse_reset_seconds("Resets in 5 hours 0 minutes"),
+            Some(18_000)
         );
+        assert_eq!(
+            parse_reset_seconds("Resets in 4 days 10 hours"),
+            Some(381_600)
+        );
+        assert_eq!(
+            parse_reset_seconds("Resets in 7 days 5 hours"),
+            Some(622_800)
+        );
+        assert_eq!(parse_reset_seconds("Resets in 45 seconds"), Some(45));
+        assert_eq!(parse_reset_seconds("Resets in"), None);
+    }
+
+    /// `strip_tags` removes both real tags and the React comment markers,
+    /// leaving the reader-visible text exactly as rendered.
+    #[test]
+    fn strip_tags_removes_comment_markers_and_real_tags() {
+        assert_eq!(
+            strip_tags("<!--$-->Resets in<!--/--> <!--$-->4 days 10 hours<!--/-->"),
+            "Resets in 4 days 10 hours"
+        );
+        assert_eq!(strip_tags("<b>bold</b> plain"), "bold plain");
     }
 }
