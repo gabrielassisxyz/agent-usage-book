@@ -6,6 +6,7 @@ use std::path::Path;
 
 use agent_usage_book::domain::time::{Clock, ClockSkewEnvelope, FakeClock, MonotonicDuration};
 use agent_usage_book::logging::LogicalName;
+use agent_usage_book::presentation::Style;
 use agent_usage_book::presentation::render::{
     ExplainMode, render_status_report_with_explain, render_window_duration,
 };
@@ -150,6 +151,7 @@ fn render(report: &StatusReport) -> String {
         clock.now(),
         ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60)),
         ExplainMode::Off,
+        Style::plain(),
     )
 }
 
@@ -409,6 +411,7 @@ fn projection_missing() {
         agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(NOW_NANOS),
         ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60)),
         ExplainMode::Summary,
+        Style::plain(),
     );
     assert_eq!(with_reason, "aub ? · projection not found");
 }
@@ -565,6 +568,7 @@ fn scoped_weekly_limit_is_the_tightest_status_value_and_is_explainable() {
         clock.now(),
         ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60)),
         ExplainMode::Summary,
+        Style::plain(),
     );
     assert!(explained.contains("provider contract: anthropic-oauth-usage-limits-v1"));
     assert!(explained.contains("is_active=true, severity=critical"));

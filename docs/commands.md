@@ -29,6 +29,14 @@ only for an argument-parsing failure; a stale reading, an auth-required
 account, or a missing projection are answers, not errors, and all render with
 exit 0 so a status bar never treats degraded output as process failure.
 
+Text output goes through one style layer (`src/presentation/style.rs`), which
+also answers `--no-color` where every other command refuses it. Colour is on
+only when stdout is a terminal, `NO_COLOR` is unset or empty, and
+`--no-color` was not passed; `--format json` is never styled. A fresh reading
+is tinted by its remaining fraction, green at or above half the window, yellow
+below half, red below a fifth, while the words stay the freshness answer, so
+the text is never colour-dependent.
+
 ## `aub now`
 
 **Answers:** how much quota does each configured account have right now?

@@ -12,6 +12,7 @@ pub mod export_jsonl;
 pub mod json;
 pub mod precision;
 pub mod render;
+pub mod style;
 pub mod vocabulary;
 
 pub use json::{
@@ -37,4 +38,5 @@ pub use render::{
     render_spend_report_with_explain, render_stale_reason, render_status_report,
     render_status_report_with_explain, render_total,
 };
+pub use style::Style;
 pub use vocabulary::{Qualification, coverage_term, quality_term};

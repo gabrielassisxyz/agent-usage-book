@@ -20,6 +20,7 @@ use crate::domain::window::NominalWindowDuration;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, Derivation, RequiredFact};
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
+use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
     ActiveActivityState, CoverageReport, LivenessGap, NowReport, ProvenanceGraph, SpendGroup,
@@ -132,8 +133,9 @@ pub fn render_status_report(
     report: &StatusReport,
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
+    style: Style,
 ) -> String {
-    render_status_report_with_explain(report, now, envelope, ExplainMode::Off)
+    render_status_report_with_explain(report, now, envelope, ExplainMode::Off, style)
 }
 
 /// Renders a status report, optionally including the explain block.
@@ -142,6 +144,7 @@ pub fn render_status_report_with_explain(
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
     explain: ExplainMode,
+    style: Style,
 ) -> String {
     // A projection the status path could not read is the design's degraded
     // form: the question mark, with a compact reason where the output mode
@@ -157,7 +160,7 @@ pub fn render_status_report_with_explain(
         }
         return line;
     }
-    let lines = meter_account_lines(&report.accounts, now, envelope);
+    let lines = meter_account_lines(&report.accounts, now, envelope, style);
     let mut rendered = join_report_with_explain(lines, &report.provenance, explain);
     if explain != ExplainMode::Off {
         let meter_explain = render_meter_explain(&report.accounts, explain);
@@ -253,7 +256,10 @@ pub fn render_now_report_with_explain(
     envelope: ClockSkewEnvelope,
     explain: ExplainMode,
 ) -> String {
-    let mut lines = meter_account_lines(&report.accounts, now, envelope);
+    // The now command keeps today's rendering byte for byte in every mode: its
+    // dispatch is another change's edit surface, so it passes the plain style
+    // until its own change threads a measured one through.
+    let mut lines = meter_account_lines(&report.accounts, now, envelope, Style::plain());
     if let Some(activity_line) = render_activity_line(&report.activity) {
         lines.push(activity_line);
     }
@@ -296,6 +302,7 @@ fn meter_account_lines(
     accounts: &[crate::report::MeterAccount],
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
+    style: Style,
 ) -> Vec<String> {
     accounts
         .iter()
@@ -311,6 +318,22 @@ fn meter_account_lines(
                     .as_ref()
                     .map(LimitingWindowDisplay::from),
             );
+            // A fresh reading carries a remaining fraction, so its tone is the
+            // account's state at a glance. Stale and auth-required readings
+            // have no fraction to tone and keep their text as the whole
+            // answer; the words never change either way, because freshness is
+            // conveyed in text and never by colour alone.
+            let reading = match &account.reading {
+                Freshness::Fresh { observed, .. } => {
+                    style.paint(style.tone(observed.value().as_ppm()), &reading)
+                }
+                // Two arms rather than one alternation: boundary rule 10 reads
+                // a `Freshness::X { .. }` that is not directly followed by
+                // `=>` as a construction, and the first half of an
+                // alternation is followed by `|`.
+                Freshness::Stale { .. } => reading,
+                Freshness::AuthRequired { .. } => reading,
+            };
             format!("aub {} {}", account.account.as_str(), reading)
         })
         .collect()
@@ -2319,7 +2342,7 @@ mod tests {
             crate::report::ProjectionReadState::Read,
         );
 
-        let rendered = render_status_report(&report, now, envelope);
+        let rendered = render_status_report(&report, now, envelope, Style::plain());
         assert!(
             rendered.contains("aub work-a 38% left · 5h"),
             "fresh fragment missing from rendering: {rendered}"
@@ -2385,7 +2408,87 @@ mod tests {
             crate::report::ProjectionReadState::Read,
         );
 
-        let rendered = render_status_report(&report, now, envelope);
+        let rendered = render_status_report(&report, now, envelope, Style::plain());
         assert_eq!(rendered, "aub work-primary 38% left · 5h");
+    }
+
+    /// The style reaches the account lines: a fresh reading is tinted by its
+    /// tone with the words unchanged, and the readings with no remaining
+    /// fraction to tone (stale, auth-required) stay uncoloured. The negative
+    /// is the plain style, whose output is byte-identical to the text alone.
+    #[test]
+    fn a_coloured_style_tints_the_fresh_reading_and_leaves_the_others_plain() {
+        use crate::domain::attempt::AttemptId;
+        use crate::domain::freshness::Observed;
+        use crate::domain::quota::{QuotaFractionPpm, QuotaRemaining};
+        use crate::domain::time::{MeasurementBasis, ReceivedAt, UtcTimestamp};
+        use crate::logging::LogicalName;
+        use crate::report::{LedgerGeneration, MeterAccount, ReportMetadata, StatusReport};
+
+        let now = UtcTimestamp::from_unix_nanos(1_000_000_000_000);
+        let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
+        let metadata = ReportMetadata::new(now, now, LedgerGeneration::new(0), None);
+        let received = UtcTimestamp::from_unix_nanos(now.unix_nanos() - 41 * NANOS_PER_SECOND);
+        let observed = |ppm: i32| {
+            Observed::new(
+                QuotaRemaining::new(QuotaFractionPpm::new(ppm).unwrap()),
+                None,
+                ReceivedAt::new(received),
+                MeasurementBasis::LocallyReceived,
+            )
+        };
+        let fresh = MeterAccount::new(
+            LogicalName::new("work-primary"),
+            Freshness::Fresh {
+                observed: observed(380_000),
+                latest_attempt: AttemptId::new(1),
+            },
+        );
+        let stale = MeterAccount::new(
+            LogicalName::new("research"),
+            Freshness::Stale {
+                last_good: Some(observed(380_000).clone()),
+                reason: crate::domain::freshness::StaleReason::AgeExceeded,
+                latest_attempt: AttemptId::new(2),
+            },
+        );
+        let auth = MeterAccount::new(
+            LogicalName::new("legacy"),
+            Freshness::<QuotaRemaining>::AuthRequired {
+                last_good: None,
+                latest_attempt: AttemptId::new(3),
+            },
+        );
+        let report = StatusReport::new(
+            metadata,
+            vec![fresh, stale, auth],
+            vec![],
+            crate::report::ProjectionReadState::Read,
+        );
+
+        let coloured = render_status_report(&report, now, envelope, Style::new(true, false, false));
+        // The fresh line is wrapped in its tone's 24-bit foreground escape and
+        // closed by the reset, with the text itself unchanged.
+        assert!(
+            coloured.contains("aub work-primary \x1b[38;2;224;175;104m38% left\x1b[0m"),
+            "the fresh reading must carry its tone escape: {coloured}"
+        );
+        // The stale and auth lines carry no escape at all.
+        assert!(
+            coloured.contains("aub research ~38% · stale 41s · age exceeded")
+                && !coloured.contains("research \x1b"),
+            "the stale line must stay uncoloured: {coloured}"
+        );
+        assert!(
+            coloured.contains("aub legacy auth!") && !coloured.contains("legacy \x1b"),
+            "the auth line must stay uncoloured: {coloured}"
+        );
+
+        // The negative: the plain style is byte-transparent, so the same
+        // report renders exactly the unstyled text.
+        assert_eq!(
+            render_status_report(&report, now, envelope, Style::plain()),
+            "aub work-primary 38% left\naub research ~38% · stale 41s · age exceeded\naub legacy auth!"
+        );
     }
 }

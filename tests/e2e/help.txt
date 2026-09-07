@@ -26,7 +26,6 @@ commands:
 
 status:
   answers: how much quota does each configured account have left?
-  refuses: --no-color (status prints no color)
   format: text | json
 
 spend:
