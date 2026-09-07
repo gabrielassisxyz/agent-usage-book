@@ -82,6 +82,13 @@ pub struct HttpRequest {
     pub headers: Vec<(String, String)>,
     pub body: Option<Vec<u8>>,
     pub timeouts: RequestTimeoutConfig,
+    /// Whether the driver may follow a redirect response itself. The default
+    /// constructors set `true`, which leaves every existing caller's behaviour
+    /// unchanged. A provider contract that reads meaning from a redirect (the
+    /// OpenCode workspace page answers an expired session with a redirect to
+    /// its sign-in page, aub-8hu3) sets `false`, so the 3xx arrives here as
+    /// the response it is instead of as the redirect target's 200.
+    pub follow_redirects: bool,
 }
 
 impl HttpRequest {
@@ -92,6 +99,7 @@ impl HttpRequest {
             headers: Vec::new(),
             body: None,
             timeouts,
+            follow_redirects: true,
         }
     }
 
@@ -102,11 +110,19 @@ impl HttpRequest {
             headers: Vec::new(),
             body: Some(body),
             timeouts,
+            follow_redirects: true,
         }
     }
 
     pub fn with_header(mut self, name: impl Into<String>, value: impl Into<String>) -> Self {
         self.headers.push((name.into(), value.into()));
+        self
+    }
+
+    /// Delivers redirect responses unfollowed: a 3xx arrives as the response
+    /// the provider sent, so an adapter that classifies redirects can see one.
+    pub fn without_redirects(mut self) -> Self {
+        self.follow_redirects = false;
         self
     }
 }
@@ -254,6 +270,10 @@ fn execute_single_with_resolver(
     let mut agent_builder = ureq::AgentBuilder::new()
         .timeout_connect(connect_dur)
         .timeout_read(read_dur);
+
+    if !request.follow_redirects {
+        agent_builder = agent_builder.redirects(0);
+    }
 
     if let Some(resolve) = resolver {
         agent_builder = agent_builder.resolver(resolve);
@@ -776,5 +796,92 @@ mod tests {
             Err(FailureClass::ConnectTimeout),
             "the port must classify a refused connection through execute_single"
         );
+    }
+
+    /// A scripted HTTP server: each entry is written verbatim to one accepted
+    /// connection, in order, and the thread returns once the script is spent.
+    /// A test may therefore join the handle: the accept count is bounded by the
+    /// script, and the read timeout keeps a peer that connects and never sends
+    /// from wedging the exchange.
+    fn scripted_server(responses: Vec<String>) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener
+                    .accept()
+                    .expect("the client connects while the script has entries");
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+                let _ = stream.write_all(response.as_bytes());
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+            }
+        });
+        (port, handle)
+    }
+
+    fn http_response(status_line: &str, location: Option<&str>, body: &str) -> String {
+        let mut response = format!(
+            "HTTP/1.1 {status_line}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some(location) = location {
+            response.push_str(&format!("Location: {location}\r\n"));
+        }
+        response.push_str("\r\n");
+        response.push_str(body);
+        response
+    }
+
+    /// The default request follows a redirect through to the target's answer,
+    /// which is the behaviour every pre-existing caller relies on. Two script
+    /// entries serve the two requests the follow makes.
+    #[test]
+    fn the_default_request_follows_a_redirect_to_its_target() {
+        let clock = RealClock::new();
+        let (port, server) = scripted_server(vec![
+            http_response("302 Found", Some("/auth/authorize"), ""),
+            http_response("200 OK", None, "ok"),
+        ]);
+        let request = HttpRequest::get(
+            format!("http://127.0.0.1:{port}/workspace/wrk_1/go"),
+            timeouts(1000, 1000, Some(1000)),
+        );
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(2000), &clock);
+        let response = BlockingTransport
+            .send(&request, &budget, &clock)
+            .expect("the followed redirect reaches the target answer");
+        assert_eq!(response.status(), 200);
+        assert_eq!(response.body(), b"ok");
+        server
+            .join()
+            .expect("the scripted server serves its script and returns");
+    }
+
+    /// A request built with [`HttpRequest::without_redirects`] receives the
+    /// redirect response itself, so an adapter that reads meaning from a 3xx
+    /// (the opencode sign-in redirect, aub-8hu3) sees the provider's answer
+    /// rather than the sign-in page's 200.
+    #[test]
+    fn a_request_without_redirects_receives_the_redirect_itself() {
+        let clock = RealClock::new();
+        let (port, server) = scripted_server(vec![http_response(
+            "302 Found",
+            Some("/auth/authorize"),
+            "",
+        )]);
+        let request = HttpRequest::get(
+            format!("http://127.0.0.1:{port}/workspace/wrk_1/go"),
+            timeouts(1000, 1000, Some(1000)),
+        )
+        .without_redirects();
+        let budget = CommandBudget::new(MonotonicDuration::from_millis(2000), &clock);
+        let response = BlockingTransport
+            .send(&request, &budget, &clock)
+            .expect("the unfollowed redirect is a real response");
+        assert_eq!(response.status(), 302);
+        assert_eq!(response.header("location"), Some("/auth/authorize"));
+        server
+            .join()
+            .expect("the scripted server serves its script and returns");
     }
 }
