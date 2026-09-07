@@ -1171,6 +1171,7 @@ fn registry_with_a_synthetic_rewrite() -> Vec<Migration> {
     migrations.push(Migration {
         version: next_version,
         rewrites_irreplaceable: true,
+        rebuilds_referenced_table: false,
         apply: synthetic_rewrite_apply,
     });
     migrations

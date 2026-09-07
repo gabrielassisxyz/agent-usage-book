@@ -75,6 +75,16 @@ pub struct Migration {
     /// A rewrite refuses to start without a verified backup at the current
     /// schema version.
     pub rewrites_irreplaceable: bool,
+    /// Whether the step rebuilds a table other tables reference (a new table,
+    /// the rows copied across, the old table dropped, the new one renamed into
+    /// place), which is the only way SQLite changes a constraint on an
+    /// existing column. Dropping a referenced table under `foreign_keys = ON`
+    /// counts every child row as a deferred violation that the rename never
+    /// clears, so the commit fails; the runner therefore switches foreign
+    /// keys off around such a step, exactly as SQLite's ALTER TABLE guide
+    /// prescribes, and refuses to commit unless `PRAGMA foreign_key_check`
+    /// comes back empty afterwards (`aub-leed`).
+    pub rebuilds_referenced_table: bool,
     /// The step itself, run inside the migration's transaction.
     pub apply: fn(&rusqlite::Connection) -> Result<(), Error>,
 }
@@ -217,6 +227,42 @@ pub fn run_migrations(
             continue;
         }
 
+        // `PRAGMA foreign_keys` is a no-op inside a transaction, so a rebuild
+        // step switches enforcement off before the lock is taken and back on
+        // after the step, whichever way it ended.
+        if migration.rebuilds_referenced_table {
+            conn.pragma_update(None, "foreign_keys", "OFF")
+                .map_err(|e| store_error("cannot switch foreign keys off for a rebuild", e))?;
+        }
+        let stepped = apply_one(conn, migration, backup, clock);
+        if migration.rebuilds_referenced_table {
+            conn.pragma_update(None, "foreign_keys", "ON")
+                .map_err(|e| {
+                    store_error("cannot switch foreign keys back on after a rebuild", e)
+                })?;
+        }
+        if stepped? {
+            current = migration.version;
+            applied.push(migration.version);
+        }
+    }
+
+    Ok(MigrationSummary {
+        applied,
+        version: current,
+    })
+}
+
+/// Runs one pending migration in its own exclusive transaction. Returns
+/// `Ok(false)` when another process applied the version while this one waited
+/// for the lock, `Ok(true)` once the step and its version record committed.
+fn apply_one(
+    conn: &mut rusqlite::Connection,
+    migration: &Migration,
+    backup: Option<&dyn VerifiedBackup>,
+    clock: &dyn Clock,
+) -> Result<bool, Error> {
+    {
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Exclusive)
             .map_err(|e| store_error("cannot take the migration lock", e))?;
@@ -227,7 +273,7 @@ pub fn run_migrations(
             // process waited for the lock. Nothing to do; the transaction is
             // dropped uncommitted.
             drop(tx);
-            continue;
+            return Ok(false);
         }
 
         if migration.rewrites_irreplaceable {
@@ -262,17 +308,25 @@ pub fn run_migrations(
         )
         .map_err(|e| store_error("cannot record the applied migration", e))?;
 
+        if migration.rebuilds_referenced_table {
+            let dangling: i64 = tx
+                .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                    row.get(0)
+                })
+                .map_err(|e| store_error("cannot check foreign keys after a rebuild", e))?;
+            if dangling > 0 {
+                drop(tx);
+                return Err(Error::Store(format!(
+                    "migration to version {} left {dangling} dangling foreign key reference(s); rolled back",
+                    migration.version
+                )));
+            }
+        }
+
         tx.commit()
             .map_err(|e| store_error("cannot commit the migration", e))?;
-
-        current = migration.version;
-        applied.push(migration.version);
     }
-
-    Ok(MigrationSummary {
-        applied,
-        version: current,
-    })
+    Ok(true)
 }
 
 /// Drill fixture: records a schema version past every version `migrations`
@@ -367,6 +421,7 @@ mod tests {
         Migration {
             version,
             rewrites_irreplaceable: rewrites,
+            rebuilds_referenced_table: false,
             apply,
         }
     }

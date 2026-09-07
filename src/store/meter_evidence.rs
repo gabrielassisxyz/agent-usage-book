@@ -1688,21 +1688,69 @@ mod tests {
             [observation_row.value()],
         )
         .unwrap();
+        // The live ledger holds hundreds of `not_started` rows beside the
+        // `known` ones (aub-leed); a migration validated only against `known`
+        // rows passed and then rolled back against the real table.
+        conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos
+            ) VALUES (?1, 'weekly_all', 'account_wide', NULL, 0, 10000, 'exact', NULL, 'not_started', 604800000000000)",
+            [observation_row.value()],
+        )
+        .unwrap();
 
         run_migrations(&mut conn, &all_migrations, None, &clock)
             .expect("migration 34 must apply cleanly to existing database");
 
-        // The pre-migration row reads back exactly as it did before: still
-        // `known`, with no grid.
+        // Every pre-migration row reads back exactly as it did before: the
+        // `known` one still known, the `not_started` one still without an
+        // instant, neither with a grid.
         let read_before = windows_by_observation(&conn, observation_row)
             .expect("must read windows by observation");
-        assert_eq!(read_before.len(), 1);
+        assert_eq!(read_before.len(), 2);
         assert_eq!(
             read_before[0].resets_at,
             crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(
                 500_000_000
             ))
         );
+        assert_eq!(
+            read_before[1].resets_at,
+            crate::domain::window::WindowResetState::NotStarted
+        );
+        assert_eq!(read_before[1].semantic_key.as_str(), "weekly_all");
+
+        // The rebuild left the four referencing tables pointing at the name
+        // `meter_window`, and no foreign key dangles.
+        let referrers: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND sql LIKE '%REFERENCES meter_window%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            referrers, 4,
+            "every child table still references meter_window by name"
+        );
+        let renamed_referrers: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE sql LIKE '%meter_window_0034%'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            renamed_referrers, 0,
+            "nothing references the rebuild's transient name"
+        );
+        let dangling: i64 = conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(dangling, 0, "no foreign key dangles after the rebuild");
 
         // A freshly written `Scheduled` window round-trips its grid.
         let scheduled_window = NewMeterWindow {
@@ -1723,7 +1771,7 @@ mod tests {
 
         let read_after =
             windows_by_observation(&conn, observation_row).expect("must read windows after insert");
-        assert_eq!(read_after.len(), 2);
+        assert_eq!(read_after.len(), 3);
         let read_scheduled = read_after
             .iter()
             .find(|w| w.semantic_key.as_str() == "weekly")

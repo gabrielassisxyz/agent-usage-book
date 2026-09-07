@@ -214,6 +214,7 @@ mod tests {
         extended.push(Migration {
             version: next_version,
             rewrites_irreplaceable: false,
+            rebuilds_referenced_table: false,
             apply: harmless_step,
         });
 

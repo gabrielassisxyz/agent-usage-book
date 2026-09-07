@@ -33,6 +33,7 @@ pub fn migration() -> Migration {
     Migration {
         version: VERSION,
         rewrites_irreplaceable: false,
+        rebuilds_referenced_table: false,
         apply,
     }
 }

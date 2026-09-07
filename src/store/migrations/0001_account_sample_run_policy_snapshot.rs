@@ -55,6 +55,7 @@ pub fn migration() -> Migration {
     Migration {
         version: 1,
         rewrites_irreplaceable: false,
+        rebuilds_referenced_table: false,
         apply,
     }
 }
