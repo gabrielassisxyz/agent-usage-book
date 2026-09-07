@@ -331,7 +331,7 @@ fn status_window_rows(
             (Some(selected), Some(model)) => model.as_str() == selected,
         })
         .collect();
-    ordered.sort_by(|left, right| status_window_order(left).cmp(&status_window_order(right)));
+    ordered.sort_by_key(|window| status_window_order(window));
 
     let cached_note = if dim_block {
         account
