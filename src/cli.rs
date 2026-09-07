@@ -3256,6 +3256,12 @@ fn projection_accounts(
                                     scope: window.scope.clone(),
                                     is_active: window.is_active,
                                     severity: window.severity.clone(),
+                                    rate: crate::report::burn_rate::live_burn_rate(
+                                        window.quota_used_ppm,
+                                        window.resets_at,
+                                        window.nominal_duration_nanos,
+                                        clock.now(),
+                                    ),
                                 })
                                 .collect(),
                         })

@@ -187,12 +187,21 @@ fn render_meter_explain(accounts: &[crate::report::MeterAccount], explain: Expla
             explanation.provider_contract_id.as_str()
         ));
         for window in &explanation.windows {
-            lines.push(format!(
+            let mut line = format!(
                 "  window {}: is_active={}, severity={}",
                 window.semantic_key,
                 window.is_active,
                 window.severity.as_str()
-            ));
+            );
+            // Every window carries its own live rate under `--explain=full`;
+            // the summary mode keeps the provider facts alone.
+            if explain == ExplainMode::Full {
+                let rate = window
+                    .rate
+                    .map_or_else(|| "none".to_string(), |rate| rate.to_string());
+                line.push_str(&format!(", burn rate={rate}"));
+            }
+            lines.push(line);
         }
         // `--explain=full` names the observation instants the limiting
         // window's burn rate was derived from: the current observation

@@ -152,6 +152,7 @@ fn meter_explain_names_legacy_and_limits_contracts() {
                 scope: WindowScope::AccountWide,
                 is_active: true,
                 severity: WindowSeverity::new("normal"),
+                rate: None,
             }],
         })
     };
@@ -189,12 +190,22 @@ fn explain_full_names_the_burn_rate_and_its_observation_instant() {
     )
     .with_meter_explanation(MeterExplanation {
         provider_contract_id: ProviderContractId::new("anthropic-oauth-usage-limits-v1"),
-        windows: vec![MeterWindowExplanation {
-            semantic_key: "session".to_string(),
-            scope: WindowScope::AccountWide,
-            is_active: true,
-            severity: WindowSeverity::new("normal"),
-        }],
+        windows: vec![
+            MeterWindowExplanation {
+                semantic_key: "session".to_string(),
+                scope: WindowScope::AccountWide,
+                is_active: true,
+                severity: WindowSeverity::new("normal"),
+                rate: BurnRate::from_window(400_000, Some(0.2)),
+            },
+            MeterWindowExplanation {
+                semantic_key: "weekly_all".to_string(),
+                scope: WindowScope::AccountWide,
+                is_active: false,
+                severity: WindowSeverity::new("normal"),
+                rate: BurnRate::from_window(250_000, Some(0.5)),
+            },
+        ],
     })
     .with_burn_rate(WindowBurnRate {
         rate: BurnRate::from_window(400_000, Some(0.2)),
@@ -218,6 +229,14 @@ fn explain_full_names_the_burn_rate_and_its_observation_instant() {
         full.contains("burn rate: 2.00x, from observation received_at=1234"),
         "explain=full names the rate and the instant it was read from: {full}"
     );
+    assert!(
+        full.contains("window session: is_active=true, severity=normal, burn rate=2.00x"),
+        "explain=full names the limiting window's own rate on its line: {full}"
+    );
+    assert!(
+        full.contains("window weekly_all: is_active=false, severity=normal, burn rate=0.50x"),
+        "explain=full names every window's rate, not only the limiting one: {full}"
+    );
 
     let summary = render_status_report_with_explain(
         &report,
@@ -226,8 +245,13 @@ fn explain_full_names_the_burn_rate_and_its_observation_instant() {
         ExplainMode::Summary,
     );
     assert!(
-        !summary.contains("burn rate:"),
-        "the burn-rate line is a full-explain detail, not a summary one: {summary}"
+        !summary.contains("burn rate"),
+        "the burn-rate lines are a full-explain detail, not a summary one: {summary}"
+    );
+    assert!(
+        summary.contains("window weekly_all: is_active=false, severity=normal\n")
+            || summary.ends_with("window weekly_all: is_active=false, severity=normal"),
+        "the summary window line keeps its provider facts alone: {summary}"
     );
 }
 

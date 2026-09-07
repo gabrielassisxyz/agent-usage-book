@@ -193,6 +193,10 @@ pub struct MeterWindowExplanation {
     pub scope: WindowScope,
     pub is_active: bool,
     pub severity: WindowSeverity,
+    /// This window's live burn rate, derived at status time from the same
+    /// observation; `None` when the window has not started, has capped, or
+    /// too little of it has elapsed to divide by.
+    pub rate: Option<BurnRate>,
 }
 
 /// The window behind a reading: its scope and the nominal length the design's

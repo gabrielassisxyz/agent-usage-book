@@ -554,6 +554,7 @@ fn scoped_weekly_limit_is_the_tightest_status_value_and_is_explainable() {
             scope: scoped.scope,
             is_active: scoped.is_active,
             severity: scoped.severity,
+            rate: None,
         }],
     });
     let report = report_with(vec![account], ProjectionReadState::Read);
