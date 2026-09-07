@@ -34,7 +34,10 @@ use crate::transcripts::TranscriptDriftReport;
 
 /// The schema version. Bump this when the JSON shape changes; the contract tests
 /// below pin the exact shape, so a field added without bumping this fails them.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// v3: `aub status --format json` carries every quota window under
+/// `accounts[].windows[]`, not only the limiting one.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// An error during JSON contract validation or deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -443,7 +446,48 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
         validate_explain_object(explain_obj)?;
     }
     validate_freshness_accounts(obj)?;
+    validate_status_windows(obj)?;
     Ok(parsed)
+}
+
+/// Every `accounts[].windows[]` entry (schema v3) carries the full set of
+/// window fields, so a consumer never has to guess whether one is absent
+/// because it was zero or because it was dropped.
+fn validate_status_windows(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), JsonContractError> {
+    const WINDOW_FIELDS: [&str; 8] = [
+        "semantic_key",
+        "scope",
+        "quota_used_ppm",
+        "resets_at_nanos",
+        "nominal_duration_nanos",
+        "burn_rate",
+        "capped_at",
+        "observation_freshness",
+    ];
+    let Some(accounts) = obj.get("accounts").and_then(serde_json::Value::as_array) else {
+        return Ok(());
+    };
+    for account in accounts {
+        let Some(windows) = account.get("windows") else {
+            continue;
+        };
+        let windows = windows
+            .as_array()
+            .ok_or(JsonContractError::MissingField("accounts[].windows"))?;
+        for window in windows {
+            let window = window
+                .as_object()
+                .ok_or(JsonContractError::MissingField("accounts[].windows[]"))?;
+            for &field in &WINDOW_FIELDS {
+                if !window.contains_key(field) {
+                    return Err(JsonContractError::MissingField(field));
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Validates that a now report JSON string strictly conforms to the current schema version.
@@ -2533,7 +2577,65 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
             limit.nominal_duration.as_nanos()
         ));
     }
+    // Every quota window behind the reading, not only the limiting one (schema
+    // v3). Carried only when a successful observation stood behind the reading,
+    // by the field's absence otherwise, the same convention `included_scopes`
+    // uses. `aub now` builds no window list, so its document is unchanged.
+    if !account.windows.is_empty() {
+        let windows = account
+            .windows
+            .iter()
+            .map(status_window_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push(format!("\"windows\":[{windows}]"));
+    }
     format!("{{{}}}", fields.join(","))
+}
+
+/// One `accounts[].windows[]` entry: the provider's stored inputs for the
+/// window, the report-time burn rate, the cap-freeze instant and the freshness
+/// of the observation it was read from.
+fn status_window_json(window: &crate::report::StatusWindow) -> String {
+    let scope_part = match &window.scope {
+        WindowScope::AccountWide => "\"scope\":\"account_wide\"".to_string(),
+        WindowScope::ModelSpecific(model) => {
+            format!(
+                "\"scope\":\"model\",\"model\":{}",
+                json_string(model.as_str())
+            )
+        }
+    };
+    let resets_at = match window.reset_state.instant() {
+        Some(instant) => instant.unix_nanos().to_string(),
+        None => "null".to_string(),
+    };
+    let burn_rate = window.rate.map_or_else(
+        || "null".to_string(),
+        |rate| json_string(&rate.as_decimal_string()),
+    );
+    let capped_at = window.capped_at.map_or_else(
+        || "null".to_string(),
+        |instant| instant.unix_nanos().to_string(),
+    );
+    format!(
+        "{{\"semantic_key\":{},{scope_part},\"quota_used_ppm\":{},\"resets_at_nanos\":{resets_at},\"nominal_duration_nanos\":{},\"burn_rate\":{burn_rate},\"capped_at\":{capped_at},\"observation_freshness\":{}}}",
+        json_string(&window.semantic_key),
+        window.quota_used.as_ppm().get(),
+        window.nominal_duration.as_nanos(),
+        json_string(freshness_kind_label(window.observation.kind())),
+    )
+}
+
+/// The `fresh | stale | auth_required` label for a window's observation
+/// freshness.
+fn freshness_kind_label(kind: crate::domain::freshness::FreshnessKind) -> &'static str {
+    use crate::domain::freshness::FreshnessKind;
+    match kind {
+        FreshnessKind::Fresh => "fresh",
+        FreshnessKind::Stale => "stale",
+        FreshnessKind::AuthRequired => "auth_required",
+    }
 }
 
 /// Serializes coverage and evidence quality as two separate, independently readable
@@ -3110,7 +3212,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "command": "spend",
                 "error": {
                     "code": "INVALID_USAGE",
@@ -3126,7 +3228,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 2,
+                "schema": 3,
                 "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
             })
         );
