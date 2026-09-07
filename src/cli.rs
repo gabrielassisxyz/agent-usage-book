@@ -17,6 +17,7 @@ use crate::domain::time::{
 use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, Quantity, RunId};
 pub use crate::presentation::ExplainMode;
+use crate::presentation::Style;
 use crate::presentation::json::{
     calibrate_activate_json, calibrate_compare_json, calibrate_history_json, calibrate_show_json,
     coverage_json, now_json_with_explain, spend_json_with_explain, status_json_with_explain,
@@ -167,9 +168,9 @@ impl Command {
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Accepted,
                 model: FlagSupport::Accepted,
-                no_color: FlagSupport::Rejected {
-                    reason: "status prints no color",
-                },
+                // Status renders through the style layer, which `--no-color`
+                // turns off; it is the one command that accepts the flag.
+                no_color: FlagSupport::Accepted,
                 verbosity: FlagSupport::Accepted,
             },
             Command::Spend => FlagPolicy {
@@ -851,7 +852,8 @@ pub struct Invocation {
     /// `--model`. Status accepts it and scopes the rendered windows to it.
     pub model: Option<String>,
     /// Whether `--no-color` was asked for, when the command's policy accepts it.
-    /// No command accepts it yet, so this is always `false` in practice.
+    /// Status accepts it and renders plain; every other command still refuses
+    /// it, so this is `false` everywhere else in practice.
     pub no_color: bool,
     pub rest: Vec<String>,
 }
@@ -1091,6 +1093,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
                 level,
                 invocation.format,
                 invocation.explain,
+                invocation.no_color,
                 invocation.account.as_deref(),
                 invocation.model.as_deref(),
             )
@@ -3074,6 +3077,7 @@ fn status(
     level: Level,
     format: OutputFormat,
     explain: ExplainMode,
+    no_color: bool,
     account_selector: Option<&str>,
     model_selector: Option<&str>,
 ) -> Result<(), Error> {
@@ -3162,15 +3166,22 @@ fn status(
     let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
     let report = StatusReport::new(metadata, accounts, vec![], projection_state);
     match format {
-        OutputFormat::Text => println!(
-            "{}",
-            render_status_report_with_explain(
-                &report,
-                timestamp,
-                status_clock_skew_envelope(),
-                explain
-            )
-        ),
+        OutputFormat::Text => {
+            // The style layer owns the colour decision from the terminal, the
+            // environment and the flag; JSON never carries styling, so the
+            // style is constructed on the text arm only.
+            let style = Style::detect(no_color);
+            println!(
+                "{}",
+                render_status_report_with_explain(
+                    &report,
+                    timestamp,
+                    status_clock_skew_envelope(),
+                    explain,
+                    style
+                )
+            );
+        }
         OutputFormat::Json => println!("{}", status_json_with_explain(&report, run, explain)),
     }
     Ok(())
@@ -7639,8 +7650,9 @@ mod tests {
 
     /// `--no-color` is a parsed token for every command, and the parser honours
     /// the policy: a rejection emits the policy's reason, an acceptance lands as
-    /// the invocation's no_color. No command accepts it yet, so the rejection
-    /// arm is the one that fires.
+    /// the invocation's no_color. Status is the one command that accepts it,
+    /// because its rendering goes through the style layer that the flag turns
+    /// off; every other command still takes the rejection arm.
     #[test]
     fn the_parser_honours_the_no_color_policy_for_every_command() {
         for command in Command::ALL {
@@ -7687,10 +7699,19 @@ mod tests {
                 "{command:?} help must state its question"
             );
             let refused_flags = command.refused_flags();
-            assert!(
-                !refused_flags.is_empty(),
-                "{command:?} help has no refusal boundary"
-            );
+            if refused_flags.is_empty() {
+                // A command whose policy accepts every shared flag has no
+                // refusal line to state, and status is the one such command:
+                // it accepts --no-color to turn the style layer off, and its
+                // refusal boundary is behavioural, stated in docs/commands.md.
+                // Any other command arriving here has grown an all-accepting
+                // policy and must state its refusal boundary somewhere.
+                assert_eq!(
+                    command,
+                    Command::Status,
+                    "{command:?} help has no refusal boundary"
+                );
+            }
             for refused in refused_flags {
                 assert!(
                     help.contains(&refused),
