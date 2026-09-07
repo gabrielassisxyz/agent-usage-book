@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use crate::config::EnvSource;
 use crate::domain::time::{
     Clock, ClockSkewEnvelope, MonotonicDuration, RealClock, UtcDate, UtcTimestamp,
 };
@@ -18,6 +19,9 @@ use crate::error::Error;
 use crate::logging::{DiagnosticEvent, DiagnosticLogger, Level, LogicalName, Quantity, RunId};
 pub use crate::presentation::ExplainMode;
 use crate::presentation::Style;
+use crate::presentation::boxed::{
+    boxed_blank, boxed_body, boxed_bottom, boxed_content_area, boxed_top, boxed_width,
+};
 use crate::presentation::json::{
     calibrate_activate_json, calibrate_compare_json, calibrate_history_json, calibrate_show_json,
     coverage_json, now_json_with_explain, spend_json_with_explain, status_json_with_explain,
@@ -2954,12 +2958,465 @@ fn parse_date(value: &str) -> Result<UtcDate, Error> {
         .ok_or_else(|| Error::Usage(format!("--since must be YYYY-MM-DD, got {value}")))
 }
 
-/// `aub config`: prints every resolved key with its value and the source that
-/// won it, in three aligned columns with one blank line between sections
-/// (aub-ukh5). The `accounts` and `transcripts` sections expand one row per
-/// element and field; a credential prints as `file:<path>`, `env:<NAME>` or
-/// `none` from its kind and reference, never the material, so no byte of any
-/// credential file can reach this output. `--set key=value` is the
+/// Displays a path with `~` for the resolver's injected home (aub-34ik):
+/// display-only, prefix only, with a `/` boundary so `/tmp/aub-homeless/x`
+/// under home `/tmp/aub-home` prints unchanged. Mirrors the resolver's own
+/// home-relative display but enforces the boundary the resolver's error
+/// display does not need.
+fn config_boxed_display_path(path: &str, home: &str) -> String {
+    if path == home {
+        return "~".to_string();
+    }
+    if let Some(rest) = path.strip_prefix(home)
+        && rest.starts_with('/')
+    {
+        return format!("~{rest}");
+    }
+    path.to_string()
+}
+
+/// Applies the same `~` substitution to one rendered config value
+/// (aub-34ik): plain paths substitute directly, `file:<path>` credential
+/// references substitute past the `file:` prefix, and every other value
+/// (durations, counts, `env:<NAME>`, `none`) prints unchanged.
+fn config_boxed_tilde_value(value: &str, home: &str) -> String {
+    if let Some(path) = value.strip_prefix("file:") {
+        return format!("file:{}", config_boxed_display_path(path, home));
+    }
+    config_boxed_display_path(value, home)
+}
+
+/// Paints one source label for the boxed config (aub-34ik): `default` in
+/// dim, `file`, `override` and `environment` in body, so the keys the
+/// operator set stand out from the ones they did not. Under
+/// [`Style::plain`] this is the label unchanged.
+fn config_boxed_paint_source(source: crate::config::ConfigSource, style: Style) -> String {
+    let label = source.label();
+    if label == "default" {
+        style.paint(style.dim(), label)
+    } else {
+        style.paint(style.body(), label)
+    }
+}
+
+/// Fits one boxed value into a budget of `budget` characters (aub-34ik):
+/// values past the budget truncate with `…`, the way aub-ukh5 does. Widths
+/// count characters, never bytes.
+fn config_boxed_fit_value(value: &str, budget: usize) -> String {
+    if value.chars().count() <= budget {
+        value.to_string()
+    } else {
+        let kept: String = value.chars().take(budget.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+/// One scalar-like boxed section's rows in resolver order (aub-34ik).
+fn config_boxed_section_fields<'a>(
+    fields: &'a [crate::config::ConfigBoxedProvenanceField],
+    section: &str,
+) -> Vec<&'a crate::config::ConfigBoxedProvenanceField> {
+    fields
+        .iter()
+        .filter(|field| field.section == section)
+        .collect()
+}
+
+/// The per-section key column width (aub-34ik): the section's longest key
+/// plus two, so a long key in `task_distribution` does not push `backup`
+/// apart. Array sections (`accounts`, `transcripts`) lay out their own
+/// columns and do not contribute here.
+fn config_boxed_section_key_width(
+    fields: &[crate::config::ConfigBoxedProvenanceField],
+    section: &str,
+) -> usize {
+    fields
+        .iter()
+        .filter(|field| field.section == section)
+        .map(|field| field.key.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2
+}
+
+/// Whether a boxed section uses the scalar key/value/source row shape
+/// (aub-34ik): everything except the two array sections with their own
+/// multi-column lines.
+fn config_boxed_is_scalar_section(section: &str) -> bool {
+    section != "accounts" && section != "transcripts"
+}
+
+/// The value column's single offset for the whole box (aub-34ik): the
+/// widest scalar key column plus two across sections, so the eye reads one
+/// vertical line of values.
+fn config_boxed_global_key_width(fields: &[crate::config::ConfigBoxedProvenanceField]) -> usize {
+    let mut sections = std::collections::BTreeSet::new();
+    for field in fields {
+        if config_boxed_is_scalar_section(&field.section) {
+            sections.insert(field.section.clone());
+        }
+    }
+    sections
+        .iter()
+        .map(|section| config_boxed_section_key_width(fields, section))
+        .max()
+        .unwrap_or(4)
+}
+
+/// One scalar boxed row (aub-34ik): two-space indent, the key padded to the
+/// box-wide offset, the tilde-substituted value truncated to the room left
+/// before the right-aligned source.
+fn config_boxed_scalar_line(
+    key: &str,
+    value: &str,
+    source: crate::config::ConfigSource,
+    global_key_width: usize,
+    area: usize,
+    home: &str,
+    style: Style,
+) -> String {
+    let source_label = source.label();
+    let value_tilde = config_boxed_tilde_value(value, home);
+    let budget = area
+        .saturating_sub(2 + global_key_width + source_label.chars().count() + 2)
+        .max(1);
+    let value_fit = config_boxed_fit_value(&value_tilde, budget);
+    let key_len = key.chars().count();
+    let key_pad = global_key_width.saturating_sub(key_len);
+    let spaces = area.saturating_sub(
+        2 + global_key_width + value_fit.chars().count() + source_label.chars().count(),
+    );
+    format!(
+        "  {key}{}{value_fit}{}{}",
+        " ".repeat(key_pad),
+        " ".repeat(spaces),
+        config_boxed_paint_source(source, style),
+    )
+}
+
+/// One account's main boxed line (aub-34ik): `name  provider  credential
+/// source`, with the source right-aligned at the box edge and the
+/// credential truncated with `…` to the room left. Widths span the whole
+/// accounts section so the credential column starts at one offset.
+fn config_boxed_account_line(
+    name: &str,
+    provider: &str,
+    credential: &str,
+    source: crate::config::ConfigSource,
+    name_width: usize,
+    provider_width: usize,
+    area: usize,
+    home: &str,
+    style: Style,
+) -> String {
+    let source_label = source.label();
+    let credential_tilde = config_boxed_tilde_value(credential, home);
+    let budget = area
+        .saturating_sub(2 + name_width + provider_width + source_label.chars().count() + 2)
+        .max(1);
+    let credential_fit = config_boxed_fit_value(&credential_tilde, budget);
+    let spaces = area.saturating_sub(
+        2 + name_width
+            + provider_width
+            + credential_fit.chars().count()
+            + source_label.chars().count(),
+    );
+    format!(
+        "  {name}{}{provider}{}{credential_fit}{}{}",
+        " ".repeat(name_width.saturating_sub(name.chars().count())),
+        " ".repeat(provider_width.saturating_sub(provider.chars().count())),
+        " ".repeat(spaces),
+        config_boxed_paint_source(source, style),
+    )
+}
+
+/// One transcript source's main boxed line (aub-34ik): `name  format  root
+/// source`, with the source right-aligned and the root truncated with `…`
+/// to the room left. An unset format prints as `-` so the columns hold.
+fn config_boxed_transcript_line(
+    name: &str,
+    format: Option<&str>,
+    root: &str,
+    source: crate::config::ConfigSource,
+    name_width: usize,
+    format_width: usize,
+    area: usize,
+    home: &str,
+    style: Style,
+) -> String {
+    let source_label = source.label();
+    let shown_format = format.unwrap_or("-");
+    let root_tilde = config_boxed_tilde_value(root, home);
+    let budget = area
+        .saturating_sub(2 + name_width + format_width + source_label.chars().count() + 2)
+        .max(1);
+    let root_fit = config_boxed_fit_value(&root_tilde, budget);
+    let spaces = area.saturating_sub(
+        2 + name_width + format_width + root_fit.chars().count() + source_label.chars().count(),
+    );
+    format!(
+        "  {name}{}{shown_format}{}{root_fit}{}{}",
+        " ".repeat(name_width.saturating_sub(name.chars().count())),
+        " ".repeat(format_width.saturating_sub(shown_format.chars().count())),
+        " ".repeat(spaces),
+        config_boxed_paint_source(source, style),
+    )
+}
+
+/// The full boxed `aub config` text (aub-34ik): one box titled with the
+/// config file path, one block per section with the section name as its
+/// bold title and the keys under it without the section prefix. Scalar
+/// sections share one value offset box-wide; `accounts` prints one line per
+/// account and `transcripts` one line per source, each with its source
+/// right-aligned. Display-only `~` substitution applies to the title and to
+/// every path value.
+fn config_boxed_render(
+    config: &crate::config::Config,
+    provenance: &crate::config::Provenance,
+    file_path: &str,
+    home: &str,
+    style: Style,
+) -> String {
+    config_boxed_render_with_width(
+        config,
+        provenance,
+        file_path,
+        home,
+        style,
+        boxed_width(&style),
+    )
+}
+
+/// The width-parameterized core behind [`config_boxed_render`], split out
+/// so the 100-column layout is testable without a pty to measure: the
+/// style decides the paint, the width decides the rails.
+fn config_boxed_render_with_width(
+    config: &crate::config::Config,
+    provenance: &crate::config::Provenance,
+    file_path: &str,
+    home: &str,
+    style: Style,
+    width: usize,
+) -> String {
+    let area = boxed_content_area(width);
+    let title = format!("config · {}", config_boxed_display_path(file_path, home));
+    let fields = config.boxed_provenance_fields(provenance);
+    let mut sections: Vec<String> = Vec::new();
+    for field in &fields {
+        if !sections.contains(&field.section) {
+            sections.push(field.section.clone());
+        }
+    }
+    let global_key_width = config_boxed_global_key_width(&fields);
+    let (account_name_width, account_provider_width) = {
+        let names = fields
+            .iter()
+            .filter(|field| field.section == "accounts" && field.key == "name")
+            .map(|field| field.value.chars().count());
+        let providers = fields
+            .iter()
+            .filter(|field| field.section == "accounts" && field.key == "provider")
+            .map(|field| field.value.chars().count());
+        (
+            names.max().unwrap_or(0) + 2,
+            providers.max().unwrap_or(0) + 2,
+        )
+    };
+    let (transcript_name_width, transcript_format_width) = {
+        let names = fields
+            .iter()
+            .filter(|field| field.section == "transcripts" && field.key == "name")
+            .map(|field| field.value.chars().count());
+        let formats = fields
+            .iter()
+            .filter(|field| field.section == "transcripts" && field.key == "format")
+            .map(|field| field.value.chars().count())
+            .chain(std::iter::once(1));
+        (names.max().unwrap_or(0) + 2, formats.max().unwrap_or(0) + 2)
+    };
+    let mut lines = vec![boxed_top(&title, width), boxed_blank(width)];
+    for (section_index, section) in sections.iter().enumerate() {
+        lines.push(boxed_body(&style.paint(style.bold(), section), width));
+        if section == "accounts" {
+            let mut indexes: Vec<usize> = fields
+                .iter()
+                .filter(|field| field.section == "accounts")
+                .filter_map(|field| field.index)
+                .collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            for index in indexes {
+                let by_key = |key: &str| {
+                    fields.iter().find(|field| {
+                        field.section == "accounts"
+                            && field.index == Some(index)
+                            && field.key == key
+                    })
+                };
+                let name = by_key("name")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("");
+                let provider = by_key("provider")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("");
+                let credential = by_key("credential")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("none");
+                let source = by_key("name")
+                    .or_else(|| by_key("provider"))
+                    .or_else(|| by_key("credential"))
+                    .map(|field| field.source)
+                    .unwrap_or(crate::config::ConfigSource::Default);
+                lines.push(boxed_body(
+                    &config_boxed_account_line(
+                        name,
+                        provider,
+                        credential,
+                        source,
+                        account_name_width,
+                        account_provider_width,
+                        area,
+                        home,
+                        style,
+                    ),
+                    width,
+                ));
+                if let Some(policy) = by_key("exclusivity_policy")
+                    && policy.value != "forbid_passive"
+                {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(
+                                style.dim(),
+                                &format!("exclusivity_policy {}", policy.value)
+                            )
+                        ),
+                        width,
+                    ));
+                }
+                if let Some(workspace) = by_key("opencode_workspace") {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(
+                                style.dim(),
+                                &format!("opencode_workspace {}", workspace.value)
+                            )
+                        ),
+                        width,
+                    ));
+                }
+                if let Some(codex_home) = by_key("codex_home") {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(
+                                style.dim(),
+                                &format!(
+                                    "codex_home {}",
+                                    config_boxed_tilde_value(&codex_home.value, home)
+                                )
+                            )
+                        ),
+                        width,
+                    ));
+                }
+            }
+        } else if section == "transcripts" {
+            let mut indexes: Vec<usize> = fields
+                .iter()
+                .filter(|field| field.section == "transcripts")
+                .filter_map(|field| field.index)
+                .collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            for index in indexes {
+                let by_key = |key: &str| {
+                    fields.iter().find(|field| {
+                        field.section == "transcripts"
+                            && field.index == Some(index)
+                            && field.key == key
+                    })
+                };
+                let name = by_key("name")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("");
+                let format = by_key("format").map(|field| field.value.as_str());
+                let root = by_key("root")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("");
+                let source = by_key("name")
+                    .or_else(|| by_key("root"))
+                    .map(|field| field.source)
+                    .unwrap_or(crate::config::ConfigSource::Default);
+                lines.push(boxed_body(
+                    &config_boxed_transcript_line(
+                        name,
+                        format,
+                        root,
+                        source,
+                        transcript_name_width,
+                        transcript_format_width,
+                        area,
+                        home,
+                        style,
+                    ),
+                    width,
+                ));
+                if let Some(pattern) = by_key("pattern")
+                    && !pattern.value.is_empty()
+                {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(style.dim(), &format!("pattern {}", pattern.value))
+                        ),
+                        width,
+                    ));
+                }
+                if let Some(evidence) = by_key("usage_evidence") {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(style.dim(), &format!("usage_evidence {}", evidence.value))
+                        ),
+                        width,
+                    ));
+                }
+            }
+        } else {
+            for field in config_boxed_section_fields(&fields, section) {
+                lines.push(boxed_body(
+                    &config_boxed_scalar_line(
+                        &field.key,
+                        &field.value,
+                        field.source,
+                        global_key_width,
+                        area,
+                        home,
+                        style,
+                    ),
+                    width,
+                ));
+            }
+        }
+        if section_index + 1 < sections.len() {
+            lines.push(boxed_blank(width));
+        }
+    }
+    lines.push(boxed_bottom(width));
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+/// `aub config`: one box titled with the config file path, one block per
+/// section with the section name as its title and the keys under it without
+/// the section prefix (aub-34ik). Arrays (`accounts`, `transcripts`) print
+/// one line per element; a credential prints as `file:<path>`, `env:<NAME>`
+/// or `none` from its kind and reference, never the material, so no byte of
+/// any credential file can reach this output. `--set key=value` is the
 /// command-line override, shown with source `override`; repeatable.
 /// `--config-file PATH` overrides where the config file itself is read from
 /// (this one setting cannot be sourced from the file it names).
@@ -2993,7 +3450,14 @@ fn config_command(args: impl Iterator<Item = OsString>) -> Result<(), Error> {
 
     let (config, provenance) =
         crate::config::resolve(&overrides, &env, file_contents.as_deref(), &file_path)?;
-    print!("{}", config.render_provenance(&provenance));
+    let home = env
+        .get("HOME")
+        .unwrap_or_else(|| "/nonexistent".to_string());
+    let style = Style::detect(false);
+    print!(
+        "{}",
+        config_boxed_render(&config, &provenance, &file_path, &home, style)
+    );
     Ok(())
 }
 
@@ -8257,6 +8721,320 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             credential.value, "file:/secret/path/to/credential.json",
             "the credential row prints kind and path"
         );
+    }
+
+    /// The boxed config fixture (aub-34ik): the two-account golden TOML from
+    /// aub-ukh5, with one default-policy account and one permit-policy
+    /// account so the array line shapes diverge on purpose.
+    const CONFIG_BOXED_GOLDEN_TOML: &str = r#"
+[backup]
+review_after = "36h"
+destination = "/tmp/aub-golden/backups"
+
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "file", path = "/tmp/aub-golden/creds-primary.json" }
+
+[[accounts]]
+name = "work-secondary"
+provider = "provider-b"
+credential = { kind = "env", name = "AUB_GOLDEN_TOKEN" }
+exclusivity_policy = "permit_passive"
+
+[[transcripts]]
+name = "cli-a"
+root = "/tmp/aub-golden/cli-a"
+pattern = "**/*.jsonl"
+format = "claude-code"
+
+[[transcripts]]
+name = "cli-b"
+root = "/tmp/aub-golden/cli-b"
+pattern = "**/*.md"
+format = "codex"
+usage_evidence = "measured"
+"#;
+
+    fn config_boxed_fixture() -> (
+        crate::config::Config,
+        crate::config::Provenance,
+        FakeEnv,
+        String,
+    ) {
+        let home = "/home/synthetic-user";
+        let env = FakeEnv::new().set("HOME", home);
+        let file_path = format!("{home}/.config/aub/config.toml");
+        let (config, provenance) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &env,
+            Some(CONFIG_BOXED_GOLDEN_TOML),
+            "/test/aub.toml",
+        )
+        .unwrap();
+        (config, provenance, env, file_path)
+    }
+
+    /// Home substitution is prefix-only with a slash boundary (aub-34ik):
+    /// a value under the injected home prints with `~`, and a value that
+    /// merely starts with the same characters prints unchanged. The planted
+    /// negative is the homeless path: a prefix check without the boundary
+    /// would render it as `~less/x`.
+    #[test]
+    fn config_boxed_home_substitution_is_prefix_only() {
+        assert_eq!(
+            config_boxed_display_path("/tmp/aub-home/.claude/x", "/tmp/aub-home"),
+            "~/.claude/x"
+        );
+        assert_eq!(
+            config_boxed_display_path("/tmp/aub-homeless/x", "/tmp/aub-home"),
+            "/tmp/aub-homeless/x"
+        );
+        assert_eq!(
+            config_boxed_display_path("/tmp/aub-home", "/tmp/aub-home"),
+            "~"
+        );
+        assert_eq!(
+            config_boxed_tilde_value("file:/tmp/aub-home/.claude/creds.json", "/tmp/aub-home"),
+            "file:~/.claude/creds.json"
+        );
+        assert_eq!(
+            config_boxed_tilde_value("file:/tmp/aub-homeless/x", "/tmp/aub-home"),
+            "file:/tmp/aub-homeless/x"
+        );
+        assert_eq!(config_boxed_tilde_value("5m", "/tmp/aub-home"), "5m");
+        assert_eq!(
+            config_boxed_tilde_value("env:AUB_TOKEN", "/tmp/aub-home"),
+            "env:AUB_TOKEN"
+        );
+    }
+
+    /// Per-section key width (aub-34ik): the longest key in
+    /// `task_distribution` sets the box-wide value offset, and a short
+    /// section like `backup` pads out to it rather than starting its values
+    /// earlier. The negative is a layout that pads `backup` to its own
+    /// longest key only, which would start its values left of the sampling
+    /// rows.
+    #[test]
+    fn config_boxed_value_column_starts_at_one_offset_box_wide() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let backup = text
+            .lines()
+            .find(|line| line.contains("destination") && line.contains("/tmp/aub-golden/backups"))
+            .expect("the backup destination row");
+        let sampling = text
+            .lines()
+            .find(|line| line.contains("max_concurrent_requests"))
+            .expect("the longest sampling key row");
+        let value_at =
+            |line: &str, marker: &str| line.find(marker).expect("the value must be on its row");
+        assert_eq!(
+            value_at(backup, "/tmp/aub-golden/backups"),
+            value_at(sampling, "2"),
+            "backup values start where the widest section starts them: {backup:?} vs {sampling:?}"
+        );
+    }
+
+    /// Array line shapes (aub-34ik): the default-policy account prints one
+    /// line, the permit-policy account prints its main line plus a second
+    /// dim line naming the policy. The negative is a renderer that always
+    /// prints the policy line, which would double the default account.
+    #[test]
+    fn config_boxed_account_policy_line_only_when_non_default() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let primary: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("work-primary"))
+            .collect();
+        assert_eq!(
+            primary.len(),
+            1,
+            "default policy prints one line: {primary:?}"
+        );
+        assert!(
+            text.lines().all(|line| !line.contains("forbid_passive")),
+            "the default policy prints nowhere, not even as a second line"
+        );
+        let secondary: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("work-secondary") || line.contains("permit_passive"))
+            .collect();
+        assert_eq!(
+            secondary.len(),
+            2,
+            "non-default policy prints the account plus its policy line: {secondary:?}"
+        );
+        assert!(
+            secondary[1].contains("permit_passive"),
+            "the second line names the policy: {:?}",
+            secondary[1]
+        );
+    }
+
+    /// Every resolver key appears exactly once without its section prefix
+    /// (aub-34ik): the test walks `Provenance::entries()` and finds each
+    /// key's last segment in the boxed output, while no dotted key survives.
+    #[test]
+    fn config_boxed_every_resolver_key_appears_once_without_prefix() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let entries: Vec<(String, crate::config::ConfigSource)> = provenance
+            .entries()
+            .map(|(key, source)| (key.to_string(), source))
+            .collect();
+        assert!(!entries.is_empty());
+        for (key, _) in &entries {
+            let last = key.rsplit('.').next().unwrap_or(key.as_str());
+            assert!(
+                text.contains(last),
+                "the boxed output must contain the last segment {last:?} of {key:?}"
+            );
+        }
+        for (key, _) in &entries {
+            if key.contains('.') {
+                assert!(
+                    !text.contains(key.as_str()),
+                    "no dotted key survives the boxed layout: {key:?}"
+                );
+            }
+        }
+    }
+
+    /// A `--set` override lands in its section with source `override`
+    /// (aub-34ik): the freshness block shows `meter  5m  override`.
+    #[test]
+    fn config_boxed_set_override_shows_in_its_section() {
+        let home = "/home/synthetic-user";
+        let env = FakeEnv::new().set("HOME", home);
+        let file_path = format!("{home}/.config/aub/config.toml");
+        let overrides = crate::config::Overrides::new().set("freshness.meter", "5m");
+        let (config, provenance) = crate::config::resolve(
+            &overrides,
+            &env,
+            Some(CONFIG_BOXED_GOLDEN_TOML),
+            "/test/aub.toml",
+        )
+        .unwrap();
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let freshness_at = text.find("freshness").expect("a freshness section");
+        let row = text
+            .lines()
+            .find(|line| line.contains("meter") && line.contains("5m") && line.contains("override"))
+            .expect("the override row names key, value and source");
+        let row_at = text.find(row).expect("the row is in the output");
+        assert!(
+            row_at > freshness_at,
+            "the override row sits under its section: {row:?}"
+        );
+    }
+
+    /// Credential material never reaches the boxed output (aub-34ik, from
+    /// aub-ukh5): the marker file's contents are absent while the row still
+    /// names the credential kind.
+    #[test]
+    fn config_boxed_rendered_output_contains_no_byte_of_any_credential_file() {
+        let marker = "aub-34ik-marker-never-printed-4d7e";
+        let path = std::env::temp_dir().join(format!("aub-34ik-cred-{}.json", std::process::id()));
+        std::fs::write(&path, format!("{{\"token\": \"{marker}\"}}")).unwrap();
+        let file = format!(
+            "[[accounts]]\nname = \"work\"\nprovider = \"provider-a\"\ncredential = {{ kind = \"file\", path = {:?} }}\n",
+            path.to_string_lossy()
+        );
+        let home = "/home/synthetic-user";
+        let env = FakeEnv::new().set("HOME", home);
+        let (config, provenance) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &env,
+            Some(&file),
+            "/test/aub.toml",
+        )
+        .unwrap();
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            "/test/aub.toml",
+            home,
+            crate::presentation::Style::plain(),
+        );
+        std::fs::remove_file(&path).ok();
+        assert!(
+            text.contains("work") && text.contains("file:"),
+            "the row names the account and the credential kind: {text:?}"
+        );
+        assert!(
+            !text.contains(marker),
+            "no byte of the credential file reaches the output: {text:?}"
+        );
+    }
+
+    #[test]
+    fn config_boxed_golden_two_account_fixture_at_80_columns() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let expected = include_str!("../tests/fixtures/presentation/config_boxed_80.txt");
+        assert_eq!(text, expected);
+    }
+
+    /// The same fixture under a 100-column pty (aub-34ik): a wider box
+    /// with the same rows in the same order.
+    #[test]
+    fn config_boxed_same_fixture_at_100_columns_is_wider_with_same_rows() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let plain = crate::presentation::Style::plain();
+        let text100 =
+            config_boxed_render_with_width(&config, &provenance, &file_path, home, plain, 100);
+        let expected = include_str!("../tests/fixtures/presentation/config_boxed_100.txt");
+        assert_eq!(text100, expected);
+        let text80 = config_boxed_render(&config, &provenance, &file_path, home, plain);
+        assert_eq!(
+            text100.lines().count(),
+            text80.lines().count(),
+            "a wider box keeps the same rows"
+        );
+        for line in text100.lines() {
+            assert_eq!(
+                line.chars().count(),
+                100,
+                "every wide-box line fills its rails: {line:?}"
+            );
+        }
     }
 
     /// The status contract's shape (PLAN.md sections 16.2 and 43 workflow 4):

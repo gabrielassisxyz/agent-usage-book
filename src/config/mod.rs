@@ -1632,6 +1632,19 @@ pub struct ConfigProvenanceRow {
     pub source: ConfigSource,
 }
 
+/// One boxed `aub config` field (aub-34ik): the same resolved row as
+/// [`ConfigProvenanceRow`] but with the section and the array element index
+/// as fields rather than embedded in a dotted string, so the boxed layout
+/// groups by section without parsing key text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigBoxedProvenanceField {
+    pub section: String,
+    pub key: String,
+    pub index: Option<usize>,
+    pub value: String,
+    pub source: ConfigSource,
+}
+
 /// The value column's total width cap (aub-ukh5): the column is the longest
 /// rendered value plus the 2-space gap, capped here. Longer values are
 /// truncated with `…` by [`fit_provenance_value`].
@@ -1695,6 +1708,29 @@ impl Config {
         render_provenance_rows(&self.provenance_rows(provenance))
     }
 
+    /// Every boxed field `aub config` prints (aub-34ik): the same rows as
+    /// [`Config::provenance_rows`] but with the section and the array element
+    /// index as fields rather than a dotted string, so the boxed layout in
+    /// `crate::cli` groups by section without parsing key text. Order follows
+    /// `provenance.entries()`, which is today's alphabetical section order.
+    pub fn boxed_provenance_fields(
+        &self,
+        provenance: &Provenance,
+    ) -> Vec<ConfigBoxedProvenanceField> {
+        let mut fields = Vec::new();
+        for row in self.provenance_rows(provenance) {
+            let (section, key, index) = split_boxed_provenance_key(&row.key);
+            fields.push(ConfigBoxedProvenanceField {
+                section,
+                key,
+                index,
+                value: row.value,
+                source: row.source,
+            });
+        }
+        fields
+    }
+
     /// The rendered value for one scalar provenance key, or `None` for an
     /// unset optional the output skips. Values render through each typed
     /// quantity's `Display` (durations via [`format_config_duration`], the
@@ -1754,6 +1790,27 @@ impl Config {
         };
         Some(value)
     }
+}
+
+/// Splits one dotted provenance key into its boxed section, its key without
+/// the section prefix, and its array element index (aub-34ik). Scalars carry
+/// no index; `accounts[2].name` carries section `accounts`, key `name` and
+/// index 2; alias rows (`projects.<path>`) carry the path remainder as the
+/// key with no index, split only on the first dot so a path containing dots
+/// stays whole.
+fn split_boxed_provenance_key(dotted: &str) -> (String, String, Option<usize>) {
+    let (head, tail) = match dotted.split_once('.') {
+        Some((head, tail)) => (head, tail),
+        None => return (dotted.to_string(), String::new(), None),
+    };
+    if let Some(bracket) = head.find('[')
+        && head.ends_with(']')
+    {
+        let section = head[..bracket].to_string();
+        let index = head[bracket + 1..head.len() - 1].parse::<usize>().ok();
+        return (section, tail.to_string(), index);
+    }
+    (head.to_string(), tail.to_string(), None)
 }
 
 /// One account's expanded rows (aub-ukh5): name, provider, credential and
@@ -2812,6 +2869,59 @@ codex_home = "/home/user/.codex"
         let empty = "[[accounts]]\nname = \"work\"\nprovider = \"codex\"\ncodex_home = \"  \"\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(empty)).unwrap_err();
         assert!(err.to_string().contains("codex_home"), "{err}");
+    }
+
+    // --- aub-34ik: boxed fields carry section and index --------------------------
+
+    /// The dotted key splits into section, key and index (aub-34ik): scalars
+    /// carry no index, array elements carry theirs, and an alias path with
+    /// dots inside stays whole by splitting only on the first dot. The
+    /// negative is the dotted alias path: splitting on every dot would tear
+    /// a path remainder into pieces.
+    #[test]
+    fn boxed_key_split_carries_section_key_and_index() {
+        assert_eq!(
+            split_boxed_provenance_key("sampling.default_interval"),
+            ("sampling".to_string(), "default_interval".to_string(), None)
+        );
+        assert_eq!(
+            split_boxed_provenance_key("accounts[2].name"),
+            ("accounts".to_string(), "name".to_string(), Some(2))
+        );
+        assert_eq!(
+            split_boxed_provenance_key("transcripts[0].root"),
+            ("transcripts".to_string(), "root".to_string(), Some(0))
+        );
+        assert_eq!(
+            split_boxed_provenance_key("projects./home/u.ser/work"),
+            ("projects".to_string(), "/home/u.ser/work".to_string(), None)
+        );
+    }
+
+    /// The boxed fields cover the same rows with section and index attached
+    /// (aub-34ik): every provenance row reaches the boxed layout exactly
+    /// once, so the layout cannot drop or duplicate a key.
+    #[test]
+    fn boxed_fields_cover_every_provenance_row_exactly_once() {
+        let file = "[[accounts]]\nname = \"work\"\nprovider = \"provider-a\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        let rows = config.provenance_rows(&provenance);
+        let fields = config.boxed_provenance_fields(&provenance);
+        assert_eq!(fields.len(), rows.len());
+        for row in &rows {
+            let matches = fields
+                .iter()
+                .filter(|field| {
+                    let dotted = match field.index {
+                        Some(index) => format!("{}[{index}].{}", field.section, field.key),
+                        None if field.key.is_empty() => field.section.clone(),
+                        None => format!("{}.{}", field.section, field.key),
+                    };
+                    dotted == row.key && field.value == row.value && field.source == row.source
+                })
+                .count();
+            assert_eq!(matches, 1, "one boxed field rebuilds {row:?}");
+        }
     }
 
     // --- aub-ukh5: aligned key, value and source rows ---------------------------
