@@ -91,9 +91,14 @@ pub struct WindowReading {
 /// True when the window's previously reported boundary had already been
 /// reached by the time the current reading was taken, i.e. a reset was due
 /// between the two readings.
+///
+/// Reads the reset state through [`WindowResetState::instant`], which treats
+/// `Known` and `Scheduled` alike: both carry an instant this check can
+/// compare against, and only the caller (`classify_window_transition`)
+/// decides whether a `Scheduled` window's transition is worth reporting.
 fn reset_due(previous_reset: WindowResetState, current_observed_at: UtcTimestamp) -> bool {
-    match previous_reset {
-        WindowResetState::Known(instant) => {
+    match previous_reset.instant() {
+        Some(instant) => {
             current_observed_at
                 >= UtcTimestamp::from_unix_nanos(
                     instant
@@ -101,40 +106,50 @@ fn reset_due(previous_reset: WindowResetState, current_observed_at: UtcTimestamp
                         .saturating_sub(RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS),
                 )
         }
-        WindowResetState::NotStarted => false,
+        None => false,
     }
 }
 
-/// True when the reset state moved forward: a known instant followed by a
-/// later known instant, a known instant followed by idle, or idle followed
-/// by a freshly known instant. Idle-to-idle carries no forward motion.
+/// True when the reset state moved forward: an instant followed by a later
+/// instant, an instant followed by idle, or idle followed by a freshly known
+/// instant. Idle-to-idle carries no forward motion.
 fn reset_advanced(previous_reset: WindowResetState, current_reset: WindowResetState) -> bool {
-    match (previous_reset, current_reset) {
-        (WindowResetState::Known(old), WindowResetState::Known(new)) => {
+    match (previous_reset.instant(), current_reset.instant()) {
+        (Some(old), Some(new)) => {
             new.unix_nanos()
                 >= old
                     .unix_nanos()
                     .saturating_add(RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS)
         }
-        (WindowResetState::Known(_), WindowResetState::NotStarted)
-        | (WindowResetState::NotStarted, WindowResetState::Known(_)) => true,
-        (WindowResetState::NotStarted, WindowResetState::NotStarted) => false,
+        (Some(_), None) | (None, Some(_)) => true,
+        (None, None) => false,
     }
 }
 
 /// Whether two reset states differ by enough to represent a material window
-/// transition. Known instants inside the jitter envelope describe the same
+/// transition. Instants inside the jitter envelope describe the same
 /// boundary; changes to or from `NotStarted` remain material.
 fn reset_changed(previous_reset: WindowResetState, current_reset: WindowResetState) -> bool {
-    match (previous_reset, current_reset) {
-        (WindowResetState::Known(old), WindowResetState::Known(new)) => {
+    match (previous_reset.instant(), current_reset.instant()) {
+        (Some(old), Some(new)) => {
             old.unix_nanos().abs_diff(new.unix_nanos())
                 >= RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS as u64
         }
-        (WindowResetState::NotStarted, WindowResetState::NotStarted) => false,
-        (WindowResetState::Known(_), WindowResetState::NotStarted)
-        | (WindowResetState::NotStarted, WindowResetState::Known(_)) => true,
+        (None, None) => false,
+        (Some(_), None) | (None, Some(_)) => true,
     }
+}
+
+/// True when either side of the transition is a computed grid reset rather
+/// than a provider-reported one. `classify_window_transition` uses this to
+/// keep a `Scheduled` window's own recomputation, every observation, from
+/// ever being reported as [`WindowAnomalyKind::UnexpectedResetTimestampChange`]
+/// (`aub-ud17`): the grid is this system's own arithmetic, not provider
+/// evidence, so a change in the computed instant is never a provider event
+/// worth flagging.
+fn either_is_scheduled(previous_reset: WindowResetState, current_reset: WindowResetState) -> bool {
+    matches!(previous_reset, WindowResetState::Scheduled { .. })
+        || matches!(current_reset, WindowResetState::Scheduled { .. })
 }
 
 /// Classifies the transition from `previous` to `current` for one window
@@ -165,7 +180,10 @@ pub fn classify_window_transition(
         } else {
             Some(WindowAnomalyKind::PercentageDecreaseWithoutReset)
         }
-    } else if reset_changed && !legitimate_reset {
+    } else if reset_changed
+        && !legitimate_reset
+        && !either_is_scheduled(previous.resets_at, current.resets_at)
+    {
         Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
     } else {
         None
@@ -286,6 +304,33 @@ mod tests {
             classify_window_transition(previous, current),
             Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
         );
+    }
+
+    /// The planted negative for `aub-ud17`: the identical instant movement as
+    /// [`unexpected_reset_timestamp_change_is_classified`], differing only in
+    /// that both readings are `Scheduled` rather than `Known`. A grid
+    /// recomputation between two observations is this system's own
+    /// arithmetic, not a provider event, so it must never surface as
+    /// [`WindowAnomalyKind::UnexpectedResetTimestampChange`].
+    #[test]
+    fn scheduled_reset_instant_change_is_never_an_unexpected_reset_change() {
+        let previous = reading(
+            300_000,
+            WindowResetState::Scheduled {
+                at: UtcTimestamp::from_unix_nanos(10_000_000_000),
+                grid: crate::domain::window::ResetGridId::OllamaCloudV1,
+            },
+            500,
+        );
+        let current = reading(
+            300_000,
+            WindowResetState::Scheduled {
+                at: UtcTimestamp::from_unix_nanos(13_000_000_000),
+                grid: crate::domain::window::ResetGridId::OllamaCloudV1,
+            },
+            600,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
     }
 
     /// Regression: the provider returned this production pair with unchanged

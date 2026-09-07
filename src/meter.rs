@@ -10,6 +10,7 @@ pub mod anthropic;
 pub mod codex;
 pub mod due;
 pub mod evidence;
+pub mod ollama;
 pub mod retry;
 pub mod sampler;
 #[cfg(test)]

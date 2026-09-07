@@ -26,8 +26,8 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
-    ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
-    WindowSemanticKey, WindowSeverity,
+    ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, ResetGridId,
+    WindowScope, WindowSemanticKey, WindowSeverity,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -429,9 +429,9 @@ pub fn observation_by_row_id(
 const INSERT_WINDOW: &str = "
 INSERT INTO meter_window (
     observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
-    reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos,
-    is_active, severity
-) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12) RETURNING id";
+    reported_resolution_ppm, quantization, resets_at, reset_state, reset_grid,
+    nominal_duration_nanos, is_active, severity
+) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) RETURNING id";
 
 /// Writes one provider-reported quota constraint, stored exactly as the
 /// provider expressed it. No derived remaining value is computed here.
@@ -464,6 +464,12 @@ pub fn insert_window_with_facts(
     let reset_state_sql = match &window.resets_at {
         crate::domain::window::WindowResetState::Known(_) => "known",
         crate::domain::window::WindowResetState::NotStarted => "not_started",
+        crate::domain::window::WindowResetState::Scheduled { .. } => "scheduled",
+    };
+    let reset_grid_sql = match &window.resets_at {
+        crate::domain::window::WindowResetState::Scheduled { grid, .. } => Some(grid.as_str()),
+        crate::domain::window::WindowResetState::Known(_)
+        | crate::domain::window::WindowResetState::NotStarted => None,
     };
     conn.query_row(
         INSERT_WINDOW,
@@ -477,6 +483,7 @@ pub fn insert_window_with_facts(
             quantization_sql::as_sql(window.quantization),
             window.resets_at.instant().map(|ts| ts.unix_nanos()),
             reset_state_sql,
+            reset_grid_sql,
             window.nominal_duration.as_nanos() as i64,
             is_active as i64,
             severity.as_str(),
@@ -518,8 +525,8 @@ pub mod quantization_sql {
 
 const SELECT_WINDOW_COLUMNS: &str = "
     id, observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
-    reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos,
-    is_active, severity";
+    reported_resolution_ppm, quantization, resets_at, reset_state, reset_grid,
+    nominal_duration_nanos, is_active, severity";
 
 fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow> {
     let scope_kind: String = row.get("scope_kind")?;
@@ -546,20 +553,37 @@ fn row_to_window(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredMeterWindow>
         )
     })?;
     let reset_state_str: String = row.get("reset_state")?;
+    let reset_grid_str: Option<String> = row.get("reset_grid")?;
     let resets_at = match (
         reset_state_str.as_str(),
         row.get::<_, Option<i64>>("resets_at")?,
+        reset_grid_str,
     ) {
-        ("known", Some(nanos)) => {
+        ("known", Some(nanos), None) => {
             crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos))
         }
-        ("not_started", None) => crate::domain::window::WindowResetState::NotStarted,
-        (state, instant) => {
+        ("not_started", None, None) => crate::domain::window::WindowResetState::NotStarted,
+        ("scheduled", Some(nanos), Some(grid_code)) => {
+            let grid = ResetGridId::from_code(&grid_code).ok_or_else(|| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10, // reset_grid, by position in SELECT_WINDOW_COLUMNS
+                    rusqlite::types::Type::Text,
+                    Box::new(crate::error::Error::Store(format!(
+                        "unknown reset grid stored in the database: {grid_code:?}"
+                    ))),
+                )
+            })?;
+            crate::domain::window::WindowResetState::Scheduled {
+                at: UtcTimestamp::from_unix_nanos(nanos),
+                grid,
+            }
+        }
+        (state, instant, grid) => {
             return Err(rusqlite::Error::FromSqlConversionFailure(
                 9, // reset_state, by position in SELECT_WINDOW_COLUMNS
                 rusqlite::types::Type::Text,
                 Box::new(crate::error::Error::Store(format!(
-                    "inconsistent reset state row in the database: state {state:?} with instant {instant:?}"
+                    "inconsistent reset state row in the database: state {state:?} with instant {instant:?} and grid {grid:?}"
                 ))),
             ));
         }
@@ -1577,5 +1601,160 @@ mod tests {
             [observation_row.value()],
         ).unwrap_err();
         assert!(err_not_started_instant.to_string().contains("CHECK"));
+    }
+
+    /// `aub-ud17`'s round trip, in both directions: a pre-migration `known`
+    /// row (schema 33, no `reset_grid` column at all) still reads back
+    /// unchanged after migration 34 applies, and a freshly written
+    /// `scheduled` row round-trips its grid identity through the same store
+    /// path. The CHECK constraint's two new negatives (a `scheduled` row
+    /// missing its grid, and a `known` row carrying one it must not have) are
+    /// each exercised so the constraint text is proven to fire, not merely
+    /// present.
+    #[test]
+    fn scheduled_reset_state_round_trips_and_pre_migration_rows_are_unaffected() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("test.db");
+        let policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).expect("open db");
+
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(0));
+        let all_migrations = registry();
+        // Migrate up to version 33 (before migration 34).
+        run_migrations(&mut conn, &all_migrations[..33], None, &clock)
+            .expect("migrations up to 33 must succeed");
+
+        let account = observe_account(
+            &conn,
+            "ollama",
+            "test-account",
+            UtcTimestamp::from_unix_nanos(10_000),
+        )
+        .expect("fixture account must insert");
+        let run = start_sample_run(
+            &conn,
+            Trigger::Manual,
+            UtcTimestamp::from_unix_nanos(10_000),
+            "test",
+        )
+        .expect("fixture sample run must insert");
+        let snapshot = resolve_policy_snapshot(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(10_000),
+            &POLICY,
+        )
+        .expect("fixture policy snapshot must insert");
+        let attempt = start_meter_attempt(
+            &conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "ollama".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(20_000),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(19_000),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "ollama-cloud-usage-v1".into(),
+                meter_semantics_id: "ollama-cloud-subscription-v1".into(),
+            },
+        )
+        .expect("fixture attempt must start");
+        let evidence_row =
+            insert_response_evidence(&conn, &evidence(attempt)).expect("insert evidence");
+        let observation_row = insert_observation(
+            &conn,
+            &observation(
+                attempt,
+                evidence_row,
+                account,
+                "ollama-cloud-subscription-v1",
+                "fp-1",
+            ),
+        )
+        .expect("insert observation");
+
+        // A pre-migration row in schema 33's shape: no `reset_grid` column
+        // exists yet, so the insert cannot name one.
+        conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, reset_state, nominal_duration_nanos
+            ) VALUES (?1, 'session', 'account_wide', NULL, 163000, 10000, 'exact', 500000000, 'known', 18000000000000)",
+            [observation_row.value()],
+        )
+        .unwrap();
+
+        run_migrations(&mut conn, &all_migrations, None, &clock)
+            .expect("migration 34 must apply cleanly to existing database");
+
+        // The pre-migration row reads back exactly as it did before: still
+        // `known`, with no grid.
+        let read_before = windows_by_observation(&conn, observation_row)
+            .expect("must read windows by observation");
+        assert_eq!(read_before.len(), 1);
+        assert_eq!(
+            read_before[0].resets_at,
+            crate::domain::window::WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                500_000_000
+            ))
+        );
+
+        // A freshly written `Scheduled` window round-trips its grid.
+        let scheduled_window = NewMeterWindow {
+            observation_id: observation_row,
+            semantic_key: WindowSemanticKey::new("weekly"),
+            scope: WindowScope::AccountWide,
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(406_000).unwrap()),
+            reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+                .unwrap(),
+            quantization: QuantizationSemantics::Unknown,
+            resets_at: crate::domain::window::WindowResetState::Scheduled {
+                at: UtcTimestamp::from_unix_nanos(1_788_739_200_000_000_000),
+                grid: ResetGridId::OllamaCloudV1,
+            },
+            nominal_duration: NominalWindowDuration::from_nanos(604_800 * 1_000_000_000),
+        };
+        insert_window(&conn, &scheduled_window).expect("scheduled window must insert");
+
+        let read_after =
+            windows_by_observation(&conn, observation_row).expect("must read windows after insert");
+        assert_eq!(read_after.len(), 2);
+        let read_scheduled = read_after
+            .iter()
+            .find(|w| w.semantic_key.as_str() == "weekly")
+            .expect("weekly window must be present");
+        assert_eq!(
+            read_scheduled.resets_at,
+            crate::domain::window::WindowResetState::Scheduled {
+                at: UtcTimestamp::from_unix_nanos(1_788_739_200_000_000_000),
+                grid: ResetGridId::OllamaCloudV1,
+            }
+        );
+
+        // CHECK constraint rejects a `scheduled` row with no grid.
+        let err_scheduled_without_grid = conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, reset_state, reset_grid, nominal_duration_nanos
+            ) VALUES (?1, 'bad_scheduled', 'account_wide', NULL, 0, 10000, 'exact', 1000, 'scheduled', NULL, 1000)",
+            [observation_row.value()],
+        ).unwrap_err();
+        assert!(err_scheduled_without_grid.to_string().contains("CHECK"));
+
+        // CHECK constraint rejects a `known` row that carries a grid it must
+        // not have.
+        let err_known_with_grid = conn.execute(
+            "INSERT INTO meter_window (
+                observation_id, semantic_key, scope_kind, scoped_model, quota_used_ppm,
+                reported_resolution_ppm, quantization, resets_at, reset_state, reset_grid, nominal_duration_nanos
+            ) VALUES (?1, 'bad_known', 'account_wide', NULL, 0, 10000, 'exact', 1000, 'known', 'ollama-cloud-v1', 1000)",
+            [observation_row.value()],
+        ).unwrap_err();
+        assert!(err_known_with_grid.to_string().contains("CHECK"));
     }
 }

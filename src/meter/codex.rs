@@ -681,7 +681,9 @@ mod tests {
             WindowResetState::Known(resets_at) => {
                 assert_eq!(resets_at.unix_nanos(), 1_788_650_033_000_000_000)
             }
-            WindowResetState::NotStarted => panic!("primary carries a known reset"),
+            other @ (WindowResetState::NotStarted | WindowResetState::Scheduled { .. }) => {
+                panic!("primary carries a known reset, got {other:?}")
+            }
         }
 
         let secondary = &reading.windows[1];
@@ -696,7 +698,9 @@ mod tests {
             WindowResetState::Known(resets_at) => {
                 assert_eq!(resets_at.unix_nanos(), 1_789_174_263_000_000_000)
             }
-            WindowResetState::NotStarted => panic!("secondary carries a known reset"),
+            other @ (WindowResetState::NotStarted | WindowResetState::Scheduled { .. }) => {
+                panic!("secondary carries a known reset, got {other:?}")
+            }
         }
 
         // The reading's measurement time is the provider-written file's
@@ -880,7 +884,9 @@ mod tests {
             WindowResetState::Known(resets_at) => {
                 assert_eq!(resets_at.unix_nanos(), 1_788_650_033_000_000_000)
             }
-            WindowResetState::NotStarted => panic!("the newest window carries a known reset"),
+            other @ (WindowResetState::NotStarted | WindowResetState::Scheduled { .. }) => {
+                panic!("the newest window carries a known reset, got {other:?}")
+            }
         }
     }
 

@@ -85,6 +85,7 @@ use crate::meter::due::{
     self, AttemptHistoryEntry, DueBasisRef, DueDecision, DueInputs, DuePolicy,
 };
 use crate::meter::evidence::CapturedProviderResponse;
+use crate::meter::ollama::OllamaReading;
 use crate::meter::retry::attempt_outcome_of;
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 use crate::projection::Publication;
@@ -151,11 +152,22 @@ impl MeteredReading for CodexReading {
     }
 }
 
+impl MeteredReading for OllamaReading {
+    fn windows(&self) -> &[MeterWindow] {
+        &self.windows
+    }
+
+    fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
+        None
+    }
+}
+
 impl MeteredReading for Reading {
     fn windows(&self) -> &[MeterWindow] {
         match self {
             Reading::Anthropic(reading) => &reading.windows,
             Reading::Codex(reading) => &reading.windows,
+            Reading::Ollama(reading) => &reading.windows,
         }
     }
 
@@ -163,6 +175,7 @@ impl MeteredReading for Reading {
         match self {
             Reading::Anthropic(reading) => reading.provider_observed_at,
             Reading::Codex(reading) => reading.provider_observed_at,
+            Reading::Ollama(reading) => reading.provider_observed_at(),
         }
     }
 
@@ -170,6 +183,7 @@ impl MeteredReading for Reading {
         match self {
             Reading::Anthropic(reading) => Some(&reading.provider_contract_id),
             Reading::Codex(reading) => Some(&reading.provider_contract_id),
+            Reading::Ollama(_) => None,
         }
     }
 }
@@ -986,6 +1000,9 @@ fn normalized_fingerprint(
             match window.reset_state() {
                 crate::domain::window::WindowResetState::Known(ts) => ts.unix_nanos().to_string(),
                 crate::domain::window::WindowResetState::NotStarted => "not_started".to_string(),
+                crate::domain::window::WindowResetState::Scheduled { at, grid } => {
+                    format!("scheduled:{}:{}", at.unix_nanos(), grid.as_str())
+                }
             },
             window.nominal_duration().as_nanos(),
             window.is_active(),
