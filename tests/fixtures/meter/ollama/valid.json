@@ -1,0 +1,17 @@
+{
+  "limits": {
+    "session": {
+      "usage": 0.163,
+      "models": [
+        {"name": "deepseek-v4-pro:0813", "request_count": 7}
+      ]
+    },
+    "weekly": {
+      "usage": 0.406,
+      "models": [
+        {"name": "deepseek-v4-pro:0813", "request_count": 70}
+      ]
+    }
+  },
+  "activity": {"cost": "0.00000", "models": []}
+}

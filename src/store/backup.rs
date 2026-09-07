@@ -307,6 +307,7 @@ mod tests {
                 reported_resolution_ppm: 10_000,
                 quantization: quantization_sql::as_sql(QuantizationSemantics::Exact).to_owned(),
                 resets_at_nanos: Some(5_000),
+                reset_grid: None,
                 nominal_duration_nanos: 18_000_000_000_000,
                 is_active: true,
                 severity: "unknown".into(),

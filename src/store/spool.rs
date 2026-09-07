@@ -115,6 +115,12 @@ pub struct PendingWindow {
     pub reported_resolution_ppm: i64,
     pub quantization: String,
     pub resets_at_nanos: Option<i64>,
+    /// The reset grid a `Scheduled` window's instant was computed from
+    /// (`aub-ud17`); `None` for `Known` and `NotStarted`. Carried through the
+    /// spool so a crash between the response parse and the SQLite commit
+    /// cannot replay a `Scheduled` window as a plain `Known` one and hand the
+    /// anomaly detector a provider-reported reset that was never reported.
+    pub reset_grid: Option<String>,
     pub nominal_duration_nanos: i64,
     pub is_active: bool,
     pub severity: String,
@@ -170,6 +176,7 @@ impl PendingWindow {
             "reported_resolution_ppm": self.reported_resolution_ppm,
             "quantization": self.quantization,
             "resets_at_nanos": self.resets_at_nanos,
+            "reset_grid": self.reset_grid,
             "nominal_duration_nanos": self.nominal_duration_nanos,
             "is_active": self.is_active,
             "severity": self.severity,
@@ -185,6 +192,7 @@ impl PendingWindow {
             reported_resolution_ppm: required_i64(value, "reported_resolution_ppm")?,
             quantization: required_str(value, "quantization")?,
             resets_at_nanos: optional_i64(value, "resets_at_nanos")?,
+            reset_grid: optional_str(value, "reset_grid"),
             nominal_duration_nanos: required_i64(value, "nominal_duration_nanos")?,
             is_active: value
                 .get("is_active")
@@ -353,6 +361,10 @@ fn pending_window_from_window(window: &MeterWindow) -> PendingWindow {
             ("model_specific".to_owned(), Some(model.as_str().to_owned()))
         }
     };
+    let reset_grid = match window.reset_state() {
+        WindowResetState::Scheduled { grid, .. } => Some(grid.as_str().to_owned()),
+        WindowResetState::Known(_) | WindowResetState::NotStarted => None,
+    };
     PendingWindow {
         semantic_key: window.semantic_key().as_str().to_owned(),
         scope_kind,
@@ -361,6 +373,7 @@ fn pending_window_from_window(window: &MeterWindow) -> PendingWindow {
         reported_resolution_ppm: i64::from(window.reported_resolution().as_ppm().get()),
         quantization: quantization_sql::as_sql(window.quantization()).to_owned(),
         resets_at_nanos: window.reset_state().instant().map(|ts| ts.unix_nanos()),
+        reset_grid,
         nominal_duration_nanos: window.nominal_duration().as_nanos() as i64,
         is_active: window.is_active(),
         severity: window.severity().as_str().to_owned(),
@@ -977,9 +990,22 @@ fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
         quota_used,
         reported_resolution,
         quantization,
-        match window.resets_at_nanos {
-            Some(nanos) => WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos)),
-            None => WindowResetState::NotStarted,
+        match (window.resets_at_nanos, &window.reset_grid) {
+            (Some(nanos), Some(grid_code)) => {
+                let grid = crate::domain::window::ResetGridId::from_code(grid_code)
+                    .ok_or_else(|| format!("unknown reset grid {grid_code:?}"))?;
+                WindowResetState::Scheduled {
+                    at: UtcTimestamp::from_unix_nanos(nanos),
+                    grid,
+                }
+            }
+            (Some(nanos), None) => WindowResetState::Known(UtcTimestamp::from_unix_nanos(nanos)),
+            (None, None) => WindowResetState::NotStarted,
+            (None, Some(grid_code)) => {
+                return Err(format!(
+                    "reset grid {grid_code:?} recorded without a reset instant"
+                ));
+            }
         },
         NominalWindowDuration::from_nanos(window.nominal_duration_nanos as u64),
         window.is_active,
@@ -1112,6 +1138,7 @@ mod tests {
                 )
                 .to_owned(),
                 resets_at_nanos: Some(5_000),
+                reset_grid: None,
                 nominal_duration_nanos: 18_000_000_000_000,
                 is_active: true,
                 severity: "unknown".into(),
@@ -1201,6 +1228,7 @@ mod tests {
             reported_resolution_ppm: 10_000,
             quantization: "rounded_to_nearest".to_owned(),
             resets_at_nanos: Some(6_000),
+            reset_grid: None,
             nominal_duration_nanos: 604_800_000_000_000,
             is_active: true,
             severity: "warning".to_owned(),
