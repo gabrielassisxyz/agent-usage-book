@@ -968,6 +968,9 @@ fn normalized_fingerprint(
             match window.reset_state() {
                 crate::domain::window::WindowResetState::Known(ts) => ts.unix_nanos().to_string(),
                 crate::domain::window::WindowResetState::NotStarted => "not_started".to_string(),
+                crate::domain::window::WindowResetState::Scheduled { at, grid } => {
+                    format!("scheduled:{}:{}", at.unix_nanos(), grid.as_str())
+                }
             },
             window.nominal_duration().as_nanos(),
             window.is_active(),
