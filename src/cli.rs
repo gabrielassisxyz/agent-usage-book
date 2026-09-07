@@ -1353,17 +1353,13 @@ pub(crate) fn sample_command(
             policy_algorithm_version: "v1".to_string(),
         };
 
-        let adapter = if acc.provider == "anthropic" {
-            let endpoint = std::env::var("AUB_ANTHROPIC_ENDPOINT").unwrap_or_else(|_| {
-                crate::meter::anthropic::AnthropicAdapter::DEFAULT_ENDPOINT.to_string()
-            });
-            crate::meter::anthropic::AnthropicAdapter::with_endpoint(endpoint)
-        } else {
-            return Err(Error::Usage(format!(
-                "unsupported provider '{}' for account '{}' (supported: anthropic)",
-                acc.provider, acc.name
-            )));
-        };
+        let adapter = crate::meter::adapter::adapter_for(
+            &acc.provider,
+            &acc.name,
+            &crate::meter::adapter::EndpointConfig {
+                anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+            },
+        )?;
 
         batch_accounts.push(crate::meter::sampler::BatchAccount {
             name: crate::store::sampling_lease::AccountName::new(&acc.name),
@@ -1838,17 +1834,13 @@ pub(crate) fn now_command(
             policy_algorithm_version: "v1".to_string(),
         };
 
-        let adapter = if acc.provider == "anthropic" {
-            let endpoint = std::env::var("AUB_ANTHROPIC_ENDPOINT").unwrap_or_else(|_| {
-                crate::meter::anthropic::AnthropicAdapter::DEFAULT_ENDPOINT.to_string()
-            });
-            crate::meter::anthropic::AnthropicAdapter::with_endpoint(endpoint)
-        } else {
-            return Err(Error::Usage(format!(
-                "unsupported provider '{}' for account '{}' (supported: anthropic)",
-                acc.provider, acc.name
-            )));
-        };
+        let adapter = crate::meter::adapter::adapter_for(
+            &acc.provider,
+            &acc.name,
+            &crate::meter::adapter::EndpointConfig {
+                anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+            },
+        )?;
 
         batch_accounts.push(crate::meter::sampler::BatchAccount {
             name: crate::store::sampling_lease::AccountName::new(&acc.name),
@@ -4966,17 +4958,13 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
-        let adapter = if account_config.provider == "anthropic" {
-            let endpoint = std::env::var("AUB_ANTHROPIC_ENDPOINT").unwrap_or_else(|_| {
-                crate::meter::anthropic::AnthropicAdapter::DEFAULT_ENDPOINT.to_string()
-            });
-            crate::meter::anthropic::AnthropicAdapter::with_endpoint(endpoint)
-        } else {
-            return Err(Error::Usage(format!(
-                "unsupported provider '{}' for account '{}' (supported: anthropic)",
-                account_config.provider, account_config.name
-            )));
-        };
+        let adapter = crate::meter::adapter::adapter_for(
+            &account_config.provider,
+            &account_config.name,
+            &crate::meter::adapter::EndpointConfig {
+                anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+            },
+        )?;
         let batch_accounts = vec![crate::meter::sampler::BatchAccount {
             name: crate::store::sampling_lease::AccountName::new(&account_config.name),
             provider_key: account_config.provider.clone(),
