@@ -814,16 +814,11 @@ mod tests {
         let home = scratch.path().join("codex-home");
         let sessions = home.join("sessions");
         let pin_mtime = |path: &std::path::Path, seconds: u64| {
-            std::fs::File::options()
-                .write(true)
-                .open(path)
-                .unwrap()
-                .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(seconds))
-                .unwrap();
+            test_support::scratch_files::pin_mtime(path, seconds);
         };
         let write_rollout = |subdir: &str, used_percent: f64, resets_at: i64| {
             let dir = sessions.join(subdir);
-            std::fs::create_dir_all(&dir).unwrap();
+            test_support::scratch_files::create_dir_all(&dir);
             let line = serde_json::json!({
                 "timestamp": "2026-09-05T22:08:20.572Z",
                 "type": "event_msg",
@@ -845,7 +840,7 @@ mod tests {
                 },
             });
             let path = dir.join("rollout-session.jsonl");
-            std::fs::write(&path, serde_json::to_string(&line).unwrap()).unwrap();
+            test_support::scratch_files::write(&path, serde_json::to_string(&line).unwrap());
             path
         };
         write_rollout("2026/07/04", 5.0, 1_783_221_436);
@@ -896,7 +891,7 @@ mod tests {
     fn case_07_home_with_no_rollout_reports_no_evidence() {
         let scratch = test_support::StateDir::new();
         let home = scratch.path().join("codex-home");
-        std::fs::create_dir_all(home.join("sessions/2026/09/05")).unwrap();
+        test_support::scratch_files::create_dir_all(&home.join("sessions/2026/09/05"));
 
         let adapter = test_adapter();
         let clock = test_clock();

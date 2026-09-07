@@ -6,7 +6,7 @@
 # token it contains is a fake from the committed sanitized fixture, and the
 # case asserts no byte of it reaches the evidence capsule.
 
-CASE_ID="031-sample-codex"
+CASE_ID="032-sample-codex"
 CASE_DESCRIPTION="aub sample reads the Codex rate limits from the newest local rollout for a codex account, records two windows, and never persists the credential token."
 
 LEDGER_DB=""
