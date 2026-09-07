@@ -7,7 +7,7 @@
 //! would put a non-model string into `ModelId` and let `--model` selection
 //! match it. The decision is `WindowScope::ModelGroup(GroupName)`, stored as
 //! `scope_kind = 'model_group'` with the group's display name in the
-//! `scoped_model` column — the one free-text slot the row already has.
+//! `scoped_model` column, the one free-text slot the row already has.
 //!
 //! WHY this rebuilds the table instead of dropping and re-adding a column
 //! (the same reasoning `aub-leed` recorded for 0034): the scope CHECKs were
@@ -23,8 +23,8 @@
 //! copy keeps every `id`, so the four referencing tables resolve against
 //! the rebuilt table.
 //!
-//! The down step exists for the same reason the up step does — proving the
-//! widened schema round-trips — and refuses loudly when any `model_group`
+//! The down step exists for the same reason the up step does, proving the
+//! widened schema round-trips, and refuses loudly when any `model_group`
 //! row exists: the rows are irreplaceable evidence and are never rewritten
 //! to make an undo fit. It is deliberately not part of the registry
 //! (migrations are forward-only); tests exercise it directly.
@@ -255,7 +255,7 @@ mod tests {
 
     /// The minimal foreign-key chain one `meter_window` row needs: one
     /// account, one sample run, one policy snapshot, one attempt, one
-    /// evidence row, one observation — so `PRAGMA foreign_key_check` has
+    /// evidence row, one observation, so `PRAGMA foreign_key_check` has
     /// something honest to answer about.
     fn seed_reference_chain(conn: &rusqlite::Connection) {
         conn.execute_batch(
@@ -333,7 +333,7 @@ mod tests {
     }
 
     /// Up applies to a ledger holding rows of every shape the live table
-    /// has — both scopes, all three reset states — and every row survives
+    /// has, both scopes and all three reset states, and every row survives
     /// unchanged, with the four referencing tables still naming
     /// `meter_window` and no foreign key dangling.
     #[test]
