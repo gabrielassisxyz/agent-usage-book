@@ -3211,6 +3211,25 @@ fn projection_accounts(
                 clock,
             );
             {
+                let burn_rate = reading.limiting_window.as_ref().and_then(|limit| {
+                    let observation = projected
+                        .and_then(|account| account.last_successful_observation.as_ref())?;
+                    Some(crate::report::WindowBurnRate {
+                        rate: crate::report::burn_rate::live_burn_rate(
+                            limit.used_ppm,
+                            limit.reset_state,
+                            limit.nominal_duration,
+                            clock.now(),
+                        ),
+                        // The freeze instant is the received_at of the first
+                        // capped observation in the current cycle, which lives
+                        // only in the store; the status path reads the
+                        // projection's latest observation alone, so it has no
+                        // series to find it in and reports no freeze.
+                        capped_at: None,
+                        derived_from: observation.received_at,
+                    })
+                });
                 let account = MeterAccount::from_projection(
                     LogicalName::new(account.name.clone()),
                     reading.freshness,
@@ -3224,6 +3243,10 @@ fn projection_accounts(
                     reading.included_scopes,
                     model_selector.map(crate::domain::window::ModelId::new),
                 );
+                let account = match burn_rate {
+                    Some(burn_rate) => account.with_burn_rate(burn_rate),
+                    None => account,
+                };
                 match projected.and_then(|account| account.last_successful_observation.as_ref()) {
                     Some(success) => {
                         account.with_meter_explanation(crate::report::MeterExplanation {
@@ -3236,6 +3259,12 @@ fn projection_accounts(
                                     scope: window.scope.clone(),
                                     is_active: window.is_active,
                                     severity: window.severity.clone(),
+                                    rate: crate::report::burn_rate::live_burn_rate(
+                                        window.quota_used_ppm,
+                                        window.resets_at,
+                                        window.nominal_duration_nanos,
+                                        clock.now(),
+                                    ),
                                 })
                                 .collect(),
                         })

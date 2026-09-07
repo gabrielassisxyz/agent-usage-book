@@ -2515,8 +2515,21 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
                 json_string(model.as_str())
             ),
         };
+        let (burn_rate, capped_at) = match &account.burn_rate {
+            Some(burn) => (
+                burn.rate.map_or_else(
+                    || "null".to_string(),
+                    |rate| json_string(&rate.as_decimal_string()),
+                ),
+                burn.capped_at.map_or_else(
+                    || "null".to_string(),
+                    |instant| instant.unix_nanos().to_string(),
+                ),
+            ),
+            None => ("null".to_string(), "null".to_string()),
+        };
         fields.push(format!(
-            "\"limiting_window\":{{{scope_part},\"nominal_duration_nanos\":{}}}",
+            "\"limiting_window\":{{{scope_part},\"nominal_duration_nanos\":{},\"burn_rate\":{burn_rate},\"capped_at\":{capped_at}}}",
             limit.nominal_duration.as_nanos()
         ));
     }

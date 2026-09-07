@@ -53,6 +53,18 @@ formatting trait.
 one concrete currency, since the absence of an impl does not vary by which currency instantiates
 the type parameter.
 
+## Derived ratios with a deliberate `Display`
+
+`BurnRate` (`burn_rate.rs`) is a unitless checked ratio: a window's quota-used fraction divided by
+the fraction of the window that has elapsed. It has private representation, a checked public
+constructor rejecting negative and non-finite candidates, and no `Default` (covered by
+`domain_quantities_no_default.rs`). It carries its own `Display` (`Nx`, and `<0.01x` for a rate in
+the open interval `(0, 0.005)`), which is the exception the `no free-standing Display` rule allows
+where a value is complete without coverage, freshness or precision context (the same carve-out
+`Money<Usd>` documents at aub-rif.4). A ratio of two fractions needs none of that context to be
+read, so `Display` here is the rendering rather than an escape from a presentation helper; the
+deviation is exercised by the module's own `display_*` tests, not by a compile-fail fixture.
+
 ## Coefficient types and conversion witnesses
 
 Construction is `pub(crate)`, restricted to this crate (see `src/domain/credits.rs`). Each has its

@@ -418,6 +418,9 @@ pub struct LimitingWindowRef {
     pub scope: WindowScope,
     pub nominal_duration: NominalWindowDuration,
     pub reset_state: WindowResetState,
+    /// The provider's reported used fraction for this window, the numerator of
+    /// its burn rate.
+    pub used_ppm: QuotaUsed,
 }
 
 /// Computes one account's status reading from its projected state.
@@ -471,6 +474,7 @@ pub fn account_reading(
                 scope: limit.scope.clone(),
                 nominal_duration: limit.nominal_duration_nanos,
                 reset_state: limit.resets_at,
+                used_ppm: limit.quota_used_ppm,
             });
         }
     }

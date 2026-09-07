@@ -9,6 +9,7 @@ pub mod models;
 pub mod provenance;
 
 pub mod activity;
+pub mod burn_rate;
 pub mod calibrate;
 pub mod can_run;
 pub mod can_run_evidence;
@@ -39,7 +40,8 @@ pub use models::{
     SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
     SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, StatusReport,
     TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
-    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowEquivalentDerivation, WindowEquivalentValue,
+    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowBurnRate, WindowEquivalentDerivation,
+    WindowEquivalentValue,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

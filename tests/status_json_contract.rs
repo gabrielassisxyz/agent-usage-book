@@ -3,6 +3,7 @@
 //! per account, and the degraded and selector documents carry their facts.
 
 use agent_usage_book::domain::attempt::AttemptId;
+use agent_usage_book::domain::burn_rate::BurnRate;
 use agent_usage_book::domain::freshness::{Freshness, Observed};
 use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaRemaining};
 use agent_usage_book::domain::time::{MeasurementBasis, ReceivedAt, UtcTimestamp};
@@ -13,7 +14,7 @@ use agent_usage_book::logging::{LogicalName, RunId};
 use agent_usage_book::presentation::json::{status_json_with_explain, validate_status_report_json};
 use agent_usage_book::presentation::render::ExplainMode;
 use agent_usage_book::report::{
-    LimitingWindow, MeterAccount, ProjectionReadState, ReportMetadata, StatusReport,
+    LimitingWindow, MeterAccount, ProjectionReadState, ReportMetadata, StatusReport, WindowBurnRate,
 };
 
 fn run() -> RunId {
@@ -195,6 +196,43 @@ fn the_selector_document_identifies_model_scopes_and_the_limit() {
     assert_eq!(
         account["limiting_window"]["nominal_duration_nanos"],
         7 * 86_400_000_000_000i64
+    );
+}
+
+/// The limiting window carries the derived burn rate as a decimal string. The
+/// status path has no observation series to find a freeze instant in, so
+/// `capped_at` is null and the rate is the live one.
+#[test]
+fn the_limiting_window_carries_the_burn_rate_and_a_null_cap() {
+    let account = MeterAccount::from_projection(
+        LogicalName::new("primary"),
+        Freshness::Fresh {
+            observed: observed(600_000),
+            latest_attempt: AttemptId::new(1),
+        },
+        Some(LimitingWindow {
+            scope: WindowScope::AccountWide,
+            nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(2_000)),
+        }),
+        vec![WindowScope::AccountWide],
+        None,
+    )
+    .with_burn_rate(WindowBurnRate {
+        rate: BurnRate::from_window(400_000, Some(0.2)),
+        capped_at: None,
+        derived_from: UtcTimestamp::from_unix_nanos(1_000),
+    });
+    let report = StatusReport::new(metadata(), vec![account], vec![], ProjectionReadState::Read);
+    let document = status_json_with_explain(&report, run(), ExplainMode::Off);
+    validate_status_report_json(&document).expect("the document must validate");
+
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    let limiting = &parsed["accounts"][0]["limiting_window"];
+    assert_eq!(limiting["burn_rate"], "2.000000");
+    assert!(
+        limiting["capped_at"].is_null(),
+        "the status path reports no freeze instant"
     );
 }
 

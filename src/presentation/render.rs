@@ -163,7 +163,7 @@ pub fn render_status_report_with_explain(
     let lines = meter_account_lines(&report.accounts, now, envelope, style);
     let mut rendered = join_report_with_explain(lines, &report.provenance, explain);
     if explain != ExplainMode::Off {
-        let meter_explain = render_meter_explain(&report.accounts);
+        let meter_explain = render_meter_explain(&report.accounts, explain);
         if !meter_explain.is_empty() {
             if !rendered.is_empty() {
                 rendered.push_str("\n\n");
@@ -178,7 +178,7 @@ pub fn render_status_report_with_explain(
 /// projection. The ordinary status value remains derived from all applicable
 /// windows; these lines make the provider's inputs auditable without changing
 /// that selection rule.
-fn render_meter_explain(accounts: &[crate::report::MeterAccount]) -> String {
+fn render_meter_explain(accounts: &[crate::report::MeterAccount], explain: ExplainMode) -> String {
     let mut lines = Vec::new();
     for account in accounts {
         let Some(explanation) = &account.meter_explanation else {
@@ -190,12 +190,41 @@ fn render_meter_explain(accounts: &[crate::report::MeterAccount]) -> String {
             explanation.provider_contract_id.as_str()
         ));
         for window in &explanation.windows {
-            lines.push(format!(
+            let mut line = format!(
                 "  window {}: is_active={}, severity={}",
                 window.semantic_key,
                 window.is_active,
                 window.severity.as_str()
+            );
+            // Every window carries its own live rate under `--explain=full`;
+            // the summary mode keeps the provider facts alone.
+            if explain == ExplainMode::Full {
+                let rate = window
+                    .rate
+                    .map_or_else(|| "none".to_string(), |rate| rate.to_string());
+                line.push_str(&format!(", burn rate={rate}"));
+            }
+            lines.push(line);
+        }
+        // `--explain=full` names the observation instants the limiting
+        // window's burn rate was derived from: the current observation
+        // always, and the freeze observation when the window has capped.
+        if explain == ExplainMode::Full
+            && let Some(burn) = &account.burn_rate
+        {
+            let rate = burn
+                .rate
+                .map_or_else(|| "none".to_string(), |rate| rate.to_string());
+            lines.push(format!(
+                "  burn rate: {rate}, from observation received_at={}",
+                burn.derived_from.unix_nanos()
             ));
+            if let Some(capped_at) = burn.capped_at {
+                lines.push(format!(
+                    "  burn rate frozen at cap, observed received_at={}",
+                    capped_at.unix_nanos()
+                ));
+            }
         }
     }
     if lines.is_empty() {
