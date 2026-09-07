@@ -2537,12 +2537,14 @@ pub fn freshness_json(account: &str, freshness: &Freshness<QuotaRemaining>) -> S
     )
 }
 
-/// The label of one window scope in the JSON contract: account-wide windows
-/// and model-scoped ones are distinguishable without parsing a window list.
+/// The label of one window scope in the JSON contract: account-wide windows,
+/// model-scoped ones and provider quota groups are distinguishable without
+/// parsing a window list.
 fn window_scope_label(scope: &WindowScope) -> String {
     match scope {
         WindowScope::AccountWide => "account_wide".to_string(),
         WindowScope::ModelSpecific(model) => format!("model:{}", model.as_str()),
+        WindowScope::ModelGroup(group) => format!("group:{}", group.as_str()),
     }
 }
 
@@ -2580,6 +2582,10 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
             WindowScope::ModelSpecific(model) => format!(
                 "\"scope\":\"model\",\"model\":{}",
                 json_string(model.as_str())
+            ),
+            WindowScope::ModelGroup(group) => format!(
+                "\"scope\":{{\"kind\":\"model_group\",\"group\":{}}}",
+                json_string(group.as_str())
             ),
         };
         let (burn_rate, capped_at) = match &account.burn_rate {
@@ -2628,6 +2634,13 @@ fn status_window_json(window: &crate::report::StatusWindow) -> String {
                 json_string(model.as_str())
             )
         }
+        // A provider quota group's scope object (`aub-n8yx`): the kind and
+        // the group's display name, the two facts a consumer needs to read
+        // the sub-block the renderer prints beneath the account.
+        WindowScope::ModelGroup(group) => format!(
+            "\"scope\":{{\"kind\":\"model_group\",\"group\":{}}}",
+            json_string(group.as_str())
+        ),
     };
     let resets_at = match window.reset_state.instant() {
         Some(instant) => instant.unix_nanos().to_string(),

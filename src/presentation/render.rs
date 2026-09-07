@@ -316,6 +316,10 @@ fn status_account_body(
 
 /// The window rows of one account, ordered 5-hour window, then the weekly
 /// account-wide window, then model-scoped windows by model display name.
+/// Provider quota groups (`aub-n8yx`) are not rows of that flat list: each
+/// group renders as its own sub-block, one dim group-name line over the
+/// group's windows in nominal-length order, beneath the account's plain
+/// rows.
 fn status_window_rows(
     account: &crate::report::MeterAccount,
     now: UtcTimestamp,
@@ -324,17 +328,31 @@ fn status_window_rows(
     dim_block: bool,
 ) -> Vec<String> {
     // A `--model` selector narrows the grid to the account-wide windows and
-    // the chosen model's own, the same set the reading was computed over.
+    // the chosen model's own, the same set the reading was computed over;
+    // a quota group constrains a set of models the window identity cannot
+    // name, so its sub-block joins the grid only without a selector.
     let selected = account.selected_model.as_ref().map(|model| model.as_str());
-    let mut ordered: Vec<&crate::report::StatusWindow> = account
-        .windows
-        .iter()
-        .filter(|window| match (selected, window.scope.scoped_model()) {
+    let mut plain: Vec<&crate::report::StatusWindow> = Vec::new();
+    let mut groups: Vec<(
+        &crate::domain::window::GroupName,
+        Vec<&crate::report::StatusWindow>,
+    )> = Vec::new();
+    for window in &account.windows {
+        if let Some(group) = window.scope.group_name() {
+            if selected.is_none() {
+                match groups.last_mut() {
+                    Some((seen, windows)) if *seen == group => windows.push(window),
+                    _ => groups.push((group, vec![window])),
+                }
+            }
+        } else if match (selected, window.scope.scoped_model()) {
             (None, _) | (_, None) => true,
             (Some(selected), Some(model)) => model.as_str() == selected,
-        })
-        .collect();
-    ordered.sort_by_key(|window| status_window_order(window));
+        } {
+            plain.push(window);
+        }
+    }
+    plain.sort_by_key(|window| status_window_order(window));
 
     let cached_note = if dim_block {
         account
@@ -345,10 +363,43 @@ fn status_window_rows(
         None
     };
 
-    ordered
+    let mut rows: Vec<String> = plain
         .into_iter()
         .map(|window| status_window_row(window, style, dim_block, cached_note.as_deref()))
-        .collect()
+        .collect();
+    for (group, windows) in &groups {
+        rows.push(status_group_line(group, style, dim_block));
+        let mut ordered = windows.clone();
+        ordered.sort_by_key(|window| window.nominal_duration.as_nanos());
+        for window in ordered {
+            rows.push(status_window_row(
+                window,
+                style,
+                dim_block,
+                cached_note.as_deref(),
+            ));
+        }
+    }
+    rows
+}
+
+/// The dim group-name line a quota-group sub-block starts with, at the same
+/// indent a window row carries so the block stays aligned.
+fn status_group_line(
+    group: &crate::domain::window::GroupName,
+    style: Style,
+    dim_block: bool,
+) -> String {
+    let name_style = if dim_block {
+        style.dimmer()
+    } else {
+        style.dim()
+    };
+    format!(
+        "{indent}{name}",
+        indent = " ".repeat(STATUS_ROW_INDENT),
+        name = style.paint(name_style, group.as_str())
+    )
 }
 
 /// The sort key placing account-wide windows first (shortest nominal length
@@ -3042,6 +3093,112 @@ mod tests {
         assert_eq!(bar.chars().count(), 30);
         assert_eq!(bar.chars().filter(|c| *c == '\u{2501}').count(), 19);
         assert!(window_rows[0].contains(" 62% "));
+    }
+
+    /// A quota-group account renders one dim sub-block line per group with
+    /// the group's window rows beneath it, in the order the provider
+    /// reported the groups and shortest nominal length first within one
+    /// (`aub-n8yx`). The negative: the group line is not a window row, so
+    /// the bar/percent grid cannot count it as one, and a `--model`
+    /// selector hides the group sub-blocks the same way it hides other
+    /// models' windows.
+    #[test]
+    fn quota_groups_render_as_sub_blocks_beneath_the_account() {
+        use crate::domain::window::{GroupName, WindowResetState, WindowScope};
+        use crate::logging::LogicalName;
+        use crate::report::MeterAccount;
+
+        let group_window = |key: &str, group: &str, used_ppm: i32, nominal_seconds: i64| {
+            status_window(
+                key,
+                WindowScope::ModelGroup(GroupName::new(group.to_string())),
+                used_ppm,
+                nominal_seconds,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                    now().unix_nanos() + 3 * 3_600 * NANOS_PER_SECOND,
+                )),
+            )
+        };
+        let agy = MeterAccount::from_projection(
+            LogicalName::new("agy"),
+            Freshness::Fresh {
+                observed: observed(930_000, UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                latest_attempt: crate::domain::attempt::AttemptId::new(1),
+            },
+            None,
+            vec![],
+            None,
+        )
+        .with_provider("agy")
+        .with_windows(vec![
+            group_window("weekly", "Gemini Models", 935_441, 7 * 86_400),
+            group_window("5h", "Gemini Models", 85_528, 5 * 3_600),
+            group_window("weekly", "Claude and GPT models", 1_000_000, 7 * 86_400),
+            group_window("5h", "Claude and GPT models", 0, 5 * 3_600),
+        ]);
+
+        let rendered =
+            render_status_report(&grid_report(vec![agy]), now(), envelope(), Style::plain());
+        let lines: Vec<&str> = rendered.lines().collect();
+        let group_lines: Vec<&str> = lines
+            .iter()
+            .filter(|line| {
+                line.starts_with("    ") && !line.contains('\u{2501}') && !line.contains('%')
+            })
+            .map(|line| line.as_ref())
+            .collect();
+        assert_eq!(
+            group_lines,
+            vec!["    Gemini Models", "    Claude and GPT models"],
+            "one dim line per group, in first-seen order: {:?}",
+            group_lines
+        );
+
+        // Beneath each group line, the group's two window rows, 5h first.
+        let all_lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+        let gemini_index = all_lines
+            .iter()
+            .position(|line| line.contains("Gemini Models"))
+            .unwrap();
+        assert!(all_lines[gemini_index + 1].contains("5h"));
+        assert!(all_lines[gemini_index + 2].contains("week"));
+        let thirdp_index = all_lines
+            .iter()
+            .position(|line| line.contains("Claude and GPT models"))
+            .unwrap();
+        assert!(all_lines[thirdp_index + 1].contains("5h"));
+        assert!(all_lines[thirdp_index + 2].contains("week"));
+
+        // The group rows are ordinary grid rows: label column, bar, percent.
+        let group_row = &all_lines[gemini_index + 1];
+        assert_eq!(&group_row[..4], "    ");
+        assert!(group_row.contains('\u{2501}'));
+
+        // The negative: under a --model selector the group sub-blocks are
+        // not the selected model's own windows, so they do not join the grid
+        // (the same set the reading is computed over).
+        let selected = MeterAccount::from_projection(
+            LogicalName::new("agy"),
+            Freshness::Fresh {
+                observed: observed(930_000, UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                latest_attempt: crate::domain::attempt::AttemptId::new(1),
+            },
+            None,
+            vec![],
+            Some(crate::domain::window::ModelId::new("gemini-pro")),
+        )
+        .with_provider("agy")
+        .with_windows(vec![group_window("5h", "Gemini Models", 85_528, 5 * 3_600)]);
+        let rendered_selected = render_status_report(
+            &grid_report(vec![selected]),
+            now(),
+            envelope(),
+            Style::plain(),
+        );
+        assert!(
+            !rendered_selected.contains("Gemini Models"),
+            "a selected model's grid shows no group sub-block: {rendered_selected}"
+        );
     }
 
     /// A stale account dims the whole block and every row's trailing column

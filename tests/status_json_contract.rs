@@ -399,3 +399,71 @@ fn the_validator_refuses_an_unknown_projection_state() {
         "the refusal names the field: {error}"
     );
 }
+
+/// A provider quota group's window serializes its scope as an object
+/// (`aub-n8yx`): `{"kind":"model_group","group":"<display name>"}`, the two
+/// facts a consumer needs to read the sub-block the renderer prints beneath
+/// the account. The limiting window, when it is a group window, carries the
+/// same object, and `included_scopes` names the group with the flat
+/// `group:<name>` label the model scopes' `model:<name>` parallels. The
+/// planted negative: a naive reuse of the model scope would put the group
+/// name in `model`, which a consumer reads as one model's own budget.
+#[test]
+fn a_model_group_window_serializes_its_scope_object() {
+    use agent_usage_book::domain::burn_rate::BurnRate;
+    use agent_usage_book::domain::quota::QuotaUsed;
+    use agent_usage_book::domain::window::GroupName;
+    use agent_usage_book::report::StatusWindow;
+
+    let fresh = Freshness::Fresh {
+        observed: observed(380_000),
+        latest_attempt: AttemptId::new(1),
+    };
+    let group_window = StatusWindow {
+        semantic_key: "5h".to_string(),
+        scope: WindowScope::ModelGroup(GroupName::new("Gemini Models".to_string())),
+        quota_used: QuotaUsed::new(QuotaFractionPpm::new(85_528).unwrap()),
+        reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
+        nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+        rate: BurnRate::from_window(85_528, Some(0.5)),
+        capped_at: None,
+        observation: fresh.clone(),
+    };
+    let account = MeterAccount::from_projection(
+        LogicalName::new("agy"),
+        fresh,
+        Some(LimitingWindow {
+            scope: WindowScope::ModelGroup(GroupName::new("Gemini Models".to_string())),
+            nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
+        }),
+        vec![
+            WindowScope::AccountWide,
+            WindowScope::ModelGroup(GroupName::new("Gemini Models".to_string())),
+        ],
+        None,
+    )
+    .with_windows(vec![group_window]);
+
+    let report = StatusReport::new(metadata(), vec![account], vec![], ProjectionReadState::Read);
+    let document = status_json_with_explain(&report, run(), ExplainMode::Off);
+    validate_status_report_json(&document).expect("the group-scope document must validate");
+
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    let window = &parsed["accounts"][0]["windows"][0];
+    assert_eq!(window["scope"]["kind"], "model_group");
+    assert_eq!(window["scope"]["group"], "Gemini Models");
+    assert_eq!(window["quota_used_ppm"], 85_528);
+
+    let limiting = &parsed["accounts"][0]["limiting_window"];
+    assert_eq!(limiting["scope"]["kind"], "model_group");
+    assert_eq!(limiting["scope"]["group"], "Gemini Models");
+
+    let scopes: Vec<&str> = parsed["accounts"][0]["included_scopes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|scope| scope.as_str().unwrap())
+        .collect();
+    assert_eq!(scopes, vec!["account_wide", "group:Gemini Models"]);
+}
