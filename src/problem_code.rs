@@ -33,6 +33,7 @@ pub enum ProblemCode {
     RateLimited,
     MalformedBody,
     MissingRequiredField,
+    SchemaDrift,
     // AuthReason.
     CredentialExpired,
     CredentialRejected,
@@ -71,6 +72,7 @@ impl ProblemCode {
             ProblemCode::RateLimited => "RATE_LIMITED",
             ProblemCode::MalformedBody => "MALFORMED_BODY",
             ProblemCode::MissingRequiredField => "MISSING_REQUIRED_FIELD",
+            ProblemCode::SchemaDrift => "SCHEMA_DRIFT",
             ProblemCode::CredentialExpired => "CREDENTIAL_EXPIRED",
             ProblemCode::CredentialRejected => "CREDENTIAL_REJECTED",
             ProblemCode::ProviderDeclaredExpiry => "PROVIDER_DECLARED_EXPIRY",
@@ -93,7 +95,7 @@ impl ProblemCode {
     }
 
     /// One instance of every code, for the enumeration and documentation tests.
-    pub fn all() -> [ProblemCode; 27] {
+    pub fn all() -> [ProblemCode; 28] {
         [
             ProblemCode::DnsFailure,
             ProblemCode::ConnectTimeout,
@@ -104,6 +106,7 @@ impl ProblemCode {
             ProblemCode::RateLimited,
             ProblemCode::MalformedBody,
             ProblemCode::MissingRequiredField,
+            ProblemCode::SchemaDrift,
             ProblemCode::CredentialExpired,
             ProblemCode::CredentialRejected,
             ProblemCode::ProviderDeclaredExpiry,
@@ -152,6 +155,7 @@ impl From<ProblemCode> for ExitClass {
             | ProblemCode::RateLimited
             | ProblemCode::MalformedBody
             | ProblemCode::MissingRequiredField
+            | ProblemCode::SchemaDrift
             | ProblemCode::MalformedProviderResponse
             | ProblemCode::RemoteSourceUnavailable => ExitClass::RemoteUnavailable,
             ProblemCode::CredentialExpired
@@ -205,6 +209,7 @@ impl From<FailureClass> for ProblemCode {
             FailureClass::RateLimited { .. } => ProblemCode::RateLimited,
             FailureClass::MalformedBody => ProblemCode::MalformedBody,
             FailureClass::MissingRequiredField => ProblemCode::MissingRequiredField,
+            FailureClass::SchemaDrift => ProblemCode::SchemaDrift,
         }
     }
 }
@@ -241,7 +246,7 @@ mod tests {
     use crate::domain::failure::HttpStatusClass;
     use std::collections::BTreeSet;
 
-    fn all_failure_classes() -> [FailureClass; 9] {
+    fn all_failure_classes() -> [FailureClass; 10] {
         [
             FailureClass::DnsFailure,
             FailureClass::ConnectTimeout,
@@ -252,6 +257,7 @@ mod tests {
             FailureClass::RateLimited { retry_after: None },
             FailureClass::MalformedBody,
             FailureClass::MissingRequiredField,
+            FailureClass::SchemaDrift,
         ]
     }
 
@@ -309,7 +315,7 @@ mod tests {
     /// fails the run.
     #[test]
     fn enumeration_names_every_code_exactly_once() {
-        const EXPECTED: [&str; 27] = [
+        const EXPECTED: [&str; 28] = [
             "DNS_FAILURE",
             "CONNECT_TIMEOUT",
             "READ_TIMEOUT",
@@ -319,6 +325,7 @@ mod tests {
             "RATE_LIMITED",
             "MALFORMED_BODY",
             "MISSING_REQUIRED_FIELD",
+            "SCHEMA_DRIFT",
             "CREDENTIAL_EXPIRED",
             "CREDENTIAL_REJECTED",
             "PROVIDER_DECLARED_EXPIRY",

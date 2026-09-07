@@ -242,7 +242,8 @@ pub fn next_due_after(result: &AttemptResult, ordinary_cadence: MonotonicDuratio
             | FailureClass::TotalBudgetExpired
             | FailureClass::HttpStatus(_)
             | FailureClass::MalformedBody
-            | FailureClass::MissingRequiredField,
+            | FailureClass::MissingRequiredField
+            | FailureClass::SchemaDrift,
         ) => None,
     };
     let postpone = retry_after
@@ -270,7 +271,8 @@ fn retry_postponement(entry: &AttemptHistoryEntry) -> Option<UtcTimestamp> {
             | FailureClass::TotalBudgetExpired
             | FailureClass::HttpStatus(_)
             | FailureClass::MalformedBody
-            | FailureClass::MissingRequiredField,
+            | FailureClass::MissingRequiredField
+            | FailureClass::SchemaDrift,
         ) => None,
     }
 }
