@@ -28,6 +28,7 @@ use crate::domain::window::ModelId;
 use crate::error::Error;
 use crate::meter::anthropic::{AnthropicAdapter, AnthropicReading};
 use crate::meter::evidence::CapturedProviderResponse;
+use crate::meter::ollama::{OllamaAdapter, OllamaReading};
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 
 /// The authentication material an adapter authenticates a request with.
@@ -290,7 +291,7 @@ pub trait ProviderAdapter {
 /// Defined once and read everywhere a supported-provider list is rendered:
 /// the unsupported-provider error joins this table, so a hand-maintained
 /// copy of the list is the defect this constant exists to prevent.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "ollama"];
 
 /// Endpoint overrides the caller resolved from the environment, handed across
 /// the boundary as data.
@@ -314,6 +315,7 @@ pub struct EndpointConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reading {
     Anthropic(AnthropicReading),
+    Ollama(OllamaReading),
 }
 
 /// The adapter choice the dispatch made, delegating [`ProviderAdapter`] to
@@ -326,6 +328,7 @@ pub enum Reading {
 /// [`adapter_for`], one variant here, and the delegation arms beside them.
 pub enum AnyAdapter {
     Anthropic(AnthropicAdapter),
+    Ollama(OllamaAdapter),
 }
 
 impl ProviderAdapter for AnyAdapter {
@@ -334,6 +337,7 @@ impl ProviderAdapter for AnyAdapter {
     fn declarations(&self) -> AdapterDeclarations {
         match self {
             AnyAdapter::Anthropic(adapter) => adapter.declarations(),
+            AnyAdapter::Ollama(adapter) => adapter.declarations(),
         }
     }
 
@@ -348,6 +352,10 @@ impl ProviderAdapter for AnyAdapter {
             AnyAdapter::Anthropic(adapter) => map_observation(
                 adapter.observe(credential, request, transport, clock),
                 Reading::Anthropic,
+            ),
+            AnyAdapter::Ollama(adapter) => map_observation(
+                adapter.observe(credential, request, transport, clock),
+                Reading::Ollama,
             ),
         }
     }
@@ -364,6 +372,14 @@ impl ProviderAdapter for AnyAdapter {
                 let captured = adapter.observe_with_evidence(credential, request, transport, clock);
                 CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::Anthropic),
+                    evidence: captured.evidence,
+                    failed_body: captured.failed_body,
+                }
+            }
+            AnyAdapter::Ollama(adapter) => {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
+                    observation: map_observation(captured.observation, Reading::Ollama),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
                 }
@@ -408,6 +424,7 @@ pub fn adapter_for(
                 endpoint,
             )))
         }
+        "ollama" => Ok(AnyAdapter::Ollama(OllamaAdapter::new())),
         unsupported => Err(unsupported_provider_error(unsupported, account)),
     }
 }
@@ -507,6 +524,7 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), AnthropicAdapter::DEFAULT_ENDPOINT);
             }
+            AnyAdapter::Ollama(_) => panic!("expected the anthropic arm"),
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"anthropic"));
     }
@@ -524,7 +542,26 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), "http://127.0.0.1:9");
             }
+            AnyAdapter::Ollama(_) => panic!("expected the anthropic arm"),
         }
+    }
+
+    /// `aub-ud17`: the ollama arm dispatches to its default endpoint, the
+    /// same shape the anthropic dispatch test above proves.
+    #[test]
+    fn adapter_for_dispatches_the_ollama_arm_to_its_default_endpoint() {
+        let adapter = adapter_for("ollama", "work-k1", &EndpointConfig::default())
+            .expect("ollama is in the supported table");
+        match adapter {
+            AnyAdapter::Ollama(ollama) => {
+                assert_eq!(
+                    ollama.endpoint_url(),
+                    crate::meter::ollama::OllamaAdapter::DEFAULT_ENDPOINT
+                );
+            }
+            AnyAdapter::Anthropic(_) => panic!("expected the ollama arm"),
+        }
+        assert!(SUPPORTED_PROVIDERS.contains(&"ollama"));
     }
 
     /// The negative: an unsupported provider yields the usage error that
@@ -538,7 +575,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic)"
+            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic, ollama)"
         );
         assert!(matches!(error, Error::Usage(_)));
     }

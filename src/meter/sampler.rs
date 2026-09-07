@@ -84,6 +84,7 @@ use crate::meter::due::{
     self, AttemptHistoryEntry, DueBasisRef, DueDecision, DueInputs, DuePolicy,
 };
 use crate::meter::evidence::CapturedProviderResponse;
+use crate::meter::ollama::OllamaReading;
 use crate::meter::retry::attempt_outcome_of;
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 use crate::projection::Publication;
@@ -136,22 +137,35 @@ impl MeteredReading for AnthropicReading {
     }
 }
 
+impl MeteredReading for OllamaReading {
+    fn windows(&self) -> &[MeterWindow] {
+        &self.windows
+    }
+
+    fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
+        None
+    }
+}
+
 impl MeteredReading for Reading {
     fn windows(&self) -> &[MeterWindow] {
         match self {
             Reading::Anthropic(reading) => &reading.windows,
+            Reading::Ollama(reading) => &reading.windows,
         }
     }
 
     fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
         match self {
             Reading::Anthropic(reading) => reading.provider_observed_at,
+            Reading::Ollama(reading) => reading.provider_observed_at(),
         }
     }
 
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         match self {
             Reading::Anthropic(reading) => Some(&reading.provider_contract_id),
+            Reading::Ollama(_) => None,
         }
     }
 }
