@@ -52,6 +52,13 @@ pub enum FailureClass {
     },
     MalformedBody,
     MissingRequiredField,
+    /// The source answered with a structure that no longer matches the shape
+    /// this adapter parses (aub-8hu3, for the OpenCode workspace page: the
+    /// page-state script the parser keys on is gone). Distinct from
+    /// `MalformedBody`, which means the bytes themselves were unreadable: a
+    /// drifted schema is readable text wearing an unexpected shape, and the
+    /// remediation is a parser correction rather than a retry.
+    SchemaDrift,
 }
 
 /// Maps every [`FailureClass`] variant into exactly one [`StaleReason`]. Total, with no
@@ -66,9 +73,9 @@ pub fn to_stale_reason(class: FailureClass) -> StaleReason {
         | FailureClass::TotalBudgetExpired
         | FailureClass::HttpStatus(_) => StaleReason::SourceUnreachable(class),
         FailureClass::RateLimited { .. } => StaleReason::RateLimited,
-        FailureClass::MalformedBody | FailureClass::MissingRequiredField => {
-            StaleReason::MalformedProviderResponse
-        }
+        FailureClass::MalformedBody
+        | FailureClass::MissingRequiredField
+        | FailureClass::SchemaDrift => StaleReason::MalformedProviderResponse,
     }
 }
 

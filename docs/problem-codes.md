@@ -21,6 +21,7 @@ without a row here, fails the build.
 | RATE_LIMITED | RemoteUnavailable | The provider rate-limited the request |
 | MALFORMED_BODY | RemoteUnavailable | The provider body could not be parsed |
 | MISSING_REQUIRED_FIELD | RemoteUnavailable | The provider body parsed but lacked a required field |
+| SCHEMA_DRIFT | RemoteUnavailable | The provider source no longer carries the structure this adapter parses |
 | CREDENTIAL_EXPIRED | AuthRequired | The configured credential is expired |
 | CREDENTIAL_REJECTED | AuthRequired | The provider rejected the configured credential |
 | PROVIDER_DECLARED_EXPIRY | AuthRequired | The provider declared the credential's authentication expired |

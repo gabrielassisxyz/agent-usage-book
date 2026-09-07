@@ -166,6 +166,7 @@ impl MeteredReading for Reading {
     fn windows(&self) -> &[MeterWindow] {
         match self {
             Reading::Anthropic(reading) => &reading.windows,
+            Reading::OpenCode(reading) => &reading.windows,
             Reading::Codex(reading) => &reading.windows,
             Reading::Ollama(reading) => &reading.windows,
         }
@@ -174,6 +175,7 @@ impl MeteredReading for Reading {
     fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
         match self {
             Reading::Anthropic(reading) => reading.provider_observed_at,
+            Reading::OpenCode(reading) => reading.provider_observed_at,
             Reading::Codex(reading) => reading.provider_observed_at,
             Reading::Ollama(reading) => reading.provider_observed_at(),
         }
@@ -182,6 +184,7 @@ impl MeteredReading for Reading {
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         match self {
             Reading::Anthropic(reading) => Some(&reading.provider_contract_id),
+            Reading::OpenCode(reading) => Some(&reading.provider_contract_id),
             Reading::Codex(reading) => Some(&reading.provider_contract_id),
             Reading::Ollama(_) => None,
         }
