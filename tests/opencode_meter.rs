@@ -207,8 +207,8 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
     // stated them, so the derived instants stay auditable beside them.
     for field in [
         "\"percent\":\"0\"",
-        "\"percent\":\"35.5\"",
-        "\"percent\":\"64.8\"",
+        "\"percent\":\"1.1\"",
+        "\"percent\":\"2.1\"",
     ] {
         assert!(
             stored.evidence_capsule.contains(field),
@@ -216,7 +216,7 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
             stored.evidence_capsule
         );
     }
-    for field in ["5 hours 0 minutes", "4 days 10 hours", "7 days 5 hours"] {
+    for field in ["5 hours 0 minutes", "6 days 8 hours", "27 days 8 hours"] {
         assert!(
             stored.evidence_capsule.contains(field),
             "the raw reset text {field} must persist: {}",

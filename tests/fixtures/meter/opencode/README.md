@@ -11,16 +11,27 @@ and `usage/usage_test.go`), which parses the same HTML a browser renders.
 
 ## Provenance
 
-`valid.html` and `malformed-state.html` reproduce the shape of the reference
-tool's own committed sample page (`usage/usage_test.go`'s fixture): three
-`usage-item` blocks with figures 0 / 35.5 / 64.8 percent and resets `5 hours
-0 minutes` / `4 days 10 hours` / `7 days 5 hours`. This is the tool's own
-test fixture, not a captured live page. No sanitized live capture is present
-here: the session cookie was not available on the machine that wrote these
-fixtures, so no live workspace page could be fetched. No cookie, token, key,
-email, session identifier or account identifier appears in any of them, and
-each parses clean against the shared forbidden-pattern list
-(`docs/forbidden-patterns.txt`).
+`valid.html` is a sanitized capture of the live workspace page, fetched on
+2026-09-07 with the operator's session cookie while the account was being
+configured (`aub-s6e4`). The workspace id, the account email, the Stripe
+customer, payment-method and subscription ids, the referral code and the
+server-action ids were replaced with zeros or neutral words; nothing else was
+changed, so the fixture carries the page's real hydration script, header,
+navigation and the collapsed "Show details" blocks beside the weekly and
+monthly items. It parses to 0 / 1.1 / 2.1 percent with resets `5 hours 0
+minutes` / `6 days 8 hours` / `27 days 8 hours`. The reset text is
+hour-granular on the real page while the hydration script carries the exact
+`resetInSec`; the parser reads the markup, as the reference tool does.
+
+`malformed-state.html` reproduces the shape of the reference tool's own
+committed sample page (`usage/usage_test.go`'s fixture): three `usage-item`
+blocks with figures 0 / 35.5 / 64.8 percent and resets `5 hours 0 minutes` /
+`4 days 10 hours` / `7 days 5 hours`, with the weekly percent broken on
+purpose. Before the live capture, `valid.html` was that same shape; the
+reference fixture shape survives here so a page the tool itself parses still
+has a case. No cookie, token, key, email, session identifier or account
+identifier appears in any of them, and each parses clean against the shared
+forbidden-pattern list (`docs/forbidden-patterns.txt`).
 
 ## Parser contract
 
@@ -37,8 +48,8 @@ markers (`<!--$-->`, `<!--/-->`) stripped before parsing. A page with no
 
 ## Catalog of Fixtures
 
-- `valid.html`: the three usage windows in the rendered markup; parses to
-  three `MeterWindow` rows at 0 / 35.5 / 64.8 percent.
+- `valid.html`: the sanitized live page, three usage windows in the rendered
+  markup; parses to three `MeterWindow` rows at 0 / 1.1 / 2.1 percent.
 - `login-redirect.html`: the sign-in body the workspace request is redirected
   to when the session cookie is invalid or expired; the adapter classifies
   the redirect response itself, so this body pairs with a 302 status in the

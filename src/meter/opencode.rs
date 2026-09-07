@@ -747,8 +747,8 @@ mod tests {
         assert_eq!(reading.windows.len(), 3);
         for (key, percent_ppm, reset_in_sec) in [
             ("rolling", 0, 18_000),
-            ("weekly", 355_000, 381_600),
-            ("monthly", 648_000, 622_800),
+            ("weekly", 11_000, 547_200),
+            ("monthly", 21_000, 2_361_600),
         ] {
             let window = reading
                 .windows
@@ -998,8 +998,8 @@ mod tests {
         let quota = quota_response_from_capsule(serialized).expect("the capsule holds the state");
         for (key, percent, reset_text) in [
             ("rolling", "0", "Resets in 5 hours 0 minutes"),
-            ("weekly", "35.5", "Resets in 4 days 10 hours"),
-            ("monthly", "64.8", "Resets in 7 days 5 hours"),
+            ("weekly", "1.1", "Resets in 6 days 8 hours"),
+            ("monthly", "2.1", "Resets in 27 days 8 hours"),
         ] {
             let window = quota.get(key).expect("the raw window object");
             assert_eq!(window.get("percent"), Some(&serde_json::json!(percent)));

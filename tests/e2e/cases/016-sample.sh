@@ -199,12 +199,12 @@ case_assertions() {
 
     # Step 9: the three windows persist at the fixture's decimal percents
     assert_exit 0 9
-    assert_stdout_contains 9 "monthly,648000,known"
+    assert_stdout_contains 9 "monthly,21000,known"
     assert_stdout_contains 9 "rolling,0,known"
-    assert_stdout_contains 9 "weekly,355000,known"
+    assert_stdout_contains 9 "weekly,11000,known"
 
     # Step 10: status prints the go-primary block; the limiting window is
-    # the monthly one (35.2% left, 30d)
+    # the monthly one (97.9% left, 30d)
     assert_exit 0 10
     assert_stdout_contains 10 "go-primary  opencode"
 
