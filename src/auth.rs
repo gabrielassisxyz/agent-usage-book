@@ -353,6 +353,7 @@ mod tests {
             credential_kind: kind.to_string(),
             credential_detail: detail.to_string(),
             exclusivity_policy: AccountExclusivityPolicy::ForbidPassive,
+            opencode_workspace: None,
         }
     }
 

@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <title>Workspace page with a malformed state script (fixture)</title>
+  </head>
+  <body>
+    <main>
+      <h1>Workspace usage</h1>
+      <p>Synthetic fixture for the aub OpenCode Go meter adapter (aub-8hu3):
+      the state script is present and keyed on by its marker, but the JSON it
+      embeds is truncated mid-value, so the parse fails instead of yielding a
+      partial reading.</p>
+    </main>
+    <script>
+      {"rolling":{"percent":23,"reset_in_sec":3612,"status":"ok"},"weekly":{"percent":41,"reset_in
+    </script>
+  </body>
+</html>

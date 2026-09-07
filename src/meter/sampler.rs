@@ -140,18 +140,21 @@ impl MeteredReading for Reading {
     fn windows(&self) -> &[MeterWindow] {
         match self {
             Reading::Anthropic(reading) => &reading.windows,
+            Reading::OpenCode(reading) => &reading.windows,
         }
     }
 
     fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
         match self {
             Reading::Anthropic(reading) => reading.provider_observed_at,
+            Reading::OpenCode(reading) => reading.provider_observed_at,
         }
     }
 
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         match self {
             Reading::Anthropic(reading) => Some(&reading.provider_contract_id),
+            Reading::OpenCode(reading) => Some(&reading.provider_contract_id),
         }
     }
 }

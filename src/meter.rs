@@ -9,6 +9,7 @@ pub mod adapter;
 pub mod anthropic;
 pub mod due;
 pub mod evidence;
+pub mod opencode;
 pub mod retry;
 pub mod sampler;
 #[cfg(test)]

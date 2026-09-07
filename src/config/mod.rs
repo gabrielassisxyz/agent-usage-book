@@ -379,6 +379,12 @@ pub struct AccountConfig {
     pub credential_kind: String,
     pub credential_detail: String,
     pub exclusivity_policy: AccountExclusivityPolicy,
+    /// The OpenCode workspace id (`wrk_...`) a `provider = "opencode"`
+    /// account reads its usage meter from (aub-8hu3). The reference's client
+    /// lists the ids from `https://opencode.ai/workspace` when signed in, and
+    /// accepts one explicitly with `-workspace`; here it is account
+    /// configuration, validated at resolve time.
+    pub opencode_workspace: Option<String>,
 }
 
 impl AccountConfig {
@@ -506,7 +512,13 @@ const TASK_DISTRIBUTION_KEYS: &[&str] = &[
 ];
 const CAN_RUN_KEYS: &[&str] = &["labels", "ample_margin_multiple", "headroom_bound"];
 const RECONCILIATION_KEYS: &[&str] = &["residual_window", "residual_min_eligible"];
-const ACCOUNT_KEYS: &[&str] = &["name", "provider", "credential", "exclusivity_policy"];
+const ACCOUNT_KEYS: &[&str] = &[
+    "name",
+    "provider",
+    "credential",
+    "exclusivity_policy",
+    "opencode_workspace",
+];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const CREDENTIAL_ENV_KEYS: &[&str] = &["kind", "name"];
@@ -528,6 +540,27 @@ fn missing_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
         "missing required configuration key {key:?}; set it in {file_display}"
     ))
+}
+
+/// The per-account key requirements each provider's adapter contract carries
+/// (aub-8hu3): a `provider = "opencode"` account reads its usage meter from
+/// the workspace page of one workspace id, so the account is invalid without
+/// `opencode_workspace`, naming the key. A provider with no per-account keys
+/// passes unchanged.
+fn validate_account_provider_keys(account: &AccountConfig) -> Result<(), Error> {
+    if account.provider == "opencode"
+        && account
+            .opencode_workspace
+            .as_deref()
+            .map(str::trim)
+            .is_none_or(str::is_empty)
+    {
+        return Err(Error::Usage(format!(
+            "account {:?}: provider \"opencode\" requires the key \"opencode_workspace\" (the workspace id from the workspace listing page), and none is set",
+            account.name
+        )));
+    }
+    Ok(())
 }
 
 /// Renders a config file path for error messages with the home directory
@@ -1431,6 +1464,10 @@ pub fn resolve(
                         }
                         None => AccountExclusivityPolicy::ForbidPassive,
                     };
+                    let opencode_workspace = entry
+                        .get("opencode_workspace")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string);
                     Ok(AccountConfig {
                         name: entry
                             .get("name")
@@ -1457,12 +1494,16 @@ pub fn resolve(
                             .unwrap_or_default()
                             .to_string(),
                         exclusivity_policy,
+                        opencode_workspace,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()
         })
         .transpose()?
         .unwrap_or_default();
+    for account in &accounts {
+        validate_account_provider_keys(account)?;
+    }
     if !accounts.is_empty() {
         provenance.set("accounts", ConfigSource::File);
     }
@@ -1700,6 +1741,11 @@ fn push_account_provenance_rows(
             (format!("{base}.name"), account.name.clone()),
             (format!("{base}.provider"), account.provider.clone()),
         ];
+        // A workspace id names a surface the operator already has in the
+        // browser; it is not credential material, so it prints like the rest.
+        if let Some(workspace) = &account.opencode_workspace {
+            entry.push((format!("{base}.opencode_workspace"), workspace.clone()));
+        }
         entry.sort();
         for (key, value) in entry {
             rows.push(ConfigProvenanceRow { key, value, source });
@@ -2956,5 +3002,81 @@ transcripts[1].usage_evidence         measured                                 f
             !text.contains(marker),
             "no byte of the credential file reaches the output: {text:?}"
         );
+    }
+
+    // --- the opencode_workspace account key (aub-8hu3) -----------------------
+
+    fn config_with_account(account_body: &str) -> Result<(Config, Provenance), Error> {
+        let file = format!("{account_body}\n");
+        resolve_with(Overrides::new(), plain_env(), Some(file.as_str()))
+    }
+
+    fn opencode_account(workspace_line: &str) -> String {
+        format!(
+            "[[accounts]]\nname = \"go-primary\"\nprovider = \"opencode\"\ncredential = {{ kind = \"env\", name = \"OPENCODE_SESSION_COOKIE\" }}\n{workspace_line}"
+        )
+    }
+
+    /// The key present: it parses onto the account and renders in the config
+    /// provenance rows under its own name.
+    #[test]
+    fn an_opencode_workspace_key_parses_onto_the_account() {
+        let (config, _) = config_with_account(&opencode_account(
+            "opencode_workspace = \"wrk_2345ABCDEFGHJKLMNOPQRSTuvwx\"",
+        ))
+        .unwrap();
+        assert_eq!(
+            config.accounts[0].opencode_workspace.as_deref(),
+            Some("wrk_2345ABCDEFGHJKLMNOPQRSTuvwx")
+        );
+    }
+
+    /// The negative the bead names: a `provider = "opencode"` account without
+    /// the key fails config validation naming the key.
+    #[test]
+    fn an_opencode_account_without_the_workspace_key_fails_naming_the_key() {
+        let error = config_with_account(&opencode_account("")).unwrap_err();
+        assert!(
+            error.to_string().contains("opencode_workspace"),
+            "the error must name the key: {error}"
+        );
+    }
+
+    /// An empty or blank workspace id is as good as an absent one: the
+    /// account would read a page no id names.
+    #[test]
+    fn an_empty_opencode_workspace_fails_naming_the_key() {
+        let error =
+            config_with_account(&opencode_account("opencode_workspace = \"\"")).unwrap_err();
+        assert!(
+            error.to_string().contains("opencode_workspace"),
+            "the error must name the key: {error}"
+        );
+    }
+
+    /// A non-opencode account has no workspace requirement: the key stays
+    /// optional for every other provider.
+    #[test]
+    fn a_non_opencode_account_does_not_require_the_workspace_key() {
+        let file = "[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = { kind = \"file\", path = \"/creds/token.json\" }\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.accounts[0].provider, "anthropic");
+        assert!(config.accounts[0].opencode_workspace.is_none());
+    }
+
+    /// The key renders in the expanded account rows, in key order with the
+    /// rest (aub-ukh5).
+    #[test]
+    fn the_workspace_id_renders_in_the_account_provenance_rows() {
+        let (config, provenance) = config_with_account(&opencode_account(
+            "opencode_workspace = \"wrk_2345ABCDEFGHJKLMNOPQRSTuvwx\"",
+        ))
+        .unwrap();
+        let rendered = config
+            .provenance_rows(&provenance)
+            .into_iter()
+            .find(|row| row.key == "accounts[0].opencode_workspace")
+            .expect("the workspace row must render");
+        assert_eq!(rendered.value, "wrk_2345ABCDEFGHJKLMNOPQRSTuvwx");
     }
 }
