@@ -176,6 +176,7 @@ mod tests {
         extended.push(crate::store::migrate::Migration {
             version: next_version,
             rewrites_irreplaceable: false,
+            rebuilds_referenced_table: false,
             apply: harmless_step,
         });
 

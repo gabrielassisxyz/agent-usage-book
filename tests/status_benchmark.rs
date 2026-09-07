@@ -214,6 +214,7 @@ fn hold_migration(database_path: &Path) -> thread::JoinHandle<()> {
         migrations.push(Migration {
             version: migrations.last().unwrap().version + 1,
             rewrites_irreplaceable: false,
+            rebuilds_referenced_table: false,
             apply: hold_benchmark_migration_lock,
         });
         run_migrations(
