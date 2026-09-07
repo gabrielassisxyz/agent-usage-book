@@ -366,6 +366,7 @@ fn drill_bundle(attempt_id: i64, request_started_at_nanos: i64) -> PendingTermin
             )
             .to_owned(),
             resets_at_nanos: Some(request_started_at_nanos + 5_000),
+            reset_grid: None,
             nominal_duration_nanos: 18_000_000_000_000,
             is_active: true,
             severity: "unknown".into(),

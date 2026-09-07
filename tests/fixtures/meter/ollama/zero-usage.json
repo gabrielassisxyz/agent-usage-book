@@ -1,0 +1,7 @@
+{
+  "limits": {
+    "session": {"usage": 0, "models": []},
+    "weekly": {"usage": 0, "models": []}
+  },
+  "activity": {"cost": "0.00000", "models": []}
+}

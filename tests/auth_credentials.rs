@@ -18,6 +18,7 @@ fn account(path: &str) -> AccountConfig {
         credential_kind: "file".to_string(),
         credential_detail: path.to_string(),
         exclusivity_policy: AccountExclusivityPolicy::ForbidPassive,
+        codex_home: None,
     }
 }
 

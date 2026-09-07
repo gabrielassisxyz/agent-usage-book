@@ -27,7 +27,9 @@ use crate::domain::time::{Clock, MeasurementBasis};
 use crate::domain::window::ModelId;
 use crate::error::Error;
 use crate::meter::anthropic::{AnthropicAdapter, AnthropicReading};
+use crate::meter::codex::{CodexAdapter, CodexReading};
 use crate::meter::evidence::CapturedProviderResponse;
+use crate::meter::ollama::{OllamaAdapter, OllamaReading};
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
 
 /// The authentication material an adapter authenticates a request with.
@@ -98,6 +100,13 @@ pub struct MeterRequest {
     /// model-specific query; `None` means every window the contract exposes.
     /// The adapter contract suite (section 34.8) exercises both forms.
     pub model: Option<ModelId>,
+    /// The provider home directory a file-backed meter reads its evidence
+    /// from, resolved by the caller from the account's own configuration
+    /// (`aub-cg6k`). This is the meter request's local source: the adapter
+    /// turns it into local-file transport requests and never resolves a path
+    /// of its own. `None` on every network meter, and no HTTP adapter reads
+    /// it, so the HTTP adapters' shape is unchanged.
+    pub local_home: Option<std::path::PathBuf>,
 }
 
 /// One provider-defined constraint kind an adapter requires in a successful
@@ -290,7 +299,7 @@ pub trait ProviderAdapter {
 /// Defined once and read everywhere a supported-provider list is rendered:
 /// the unsupported-provider error joins this table, so a hand-maintained
 /// copy of the list is the defect this constant exists to prevent.
-pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic"];
+pub const SUPPORTED_PROVIDERS: &[&str] = &["anthropic", "codex", "ollama"];
 
 /// Endpoint overrides the caller resolved from the environment, handed across
 /// the boundary as data.
@@ -314,6 +323,8 @@ pub struct EndpointConfig {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Reading {
     Anthropic(AnthropicReading),
+    Codex(CodexReading),
+    Ollama(OllamaReading),
 }
 
 /// The adapter choice the dispatch made, delegating [`ProviderAdapter`] to
@@ -326,6 +337,8 @@ pub enum Reading {
 /// [`adapter_for`], one variant here, and the delegation arms beside them.
 pub enum AnyAdapter {
     Anthropic(AnthropicAdapter),
+    Codex(CodexAdapter),
+    Ollama(OllamaAdapter),
 }
 
 impl ProviderAdapter for AnyAdapter {
@@ -334,6 +347,8 @@ impl ProviderAdapter for AnyAdapter {
     fn declarations(&self) -> AdapterDeclarations {
         match self {
             AnyAdapter::Anthropic(adapter) => adapter.declarations(),
+            AnyAdapter::Codex(adapter) => adapter.declarations(),
+            AnyAdapter::Ollama(adapter) => adapter.declarations(),
         }
     }
 
@@ -348,6 +363,14 @@ impl ProviderAdapter for AnyAdapter {
             AnyAdapter::Anthropic(adapter) => map_observation(
                 adapter.observe(credential, request, transport, clock),
                 Reading::Anthropic,
+            ),
+            AnyAdapter::Codex(adapter) => map_observation(
+                adapter.observe(credential, request, transport, clock),
+                Reading::Codex,
+            ),
+            AnyAdapter::Ollama(adapter) => map_observation(
+                adapter.observe(credential, request, transport, clock),
+                Reading::Ollama,
             ),
         }
     }
@@ -364,6 +387,22 @@ impl ProviderAdapter for AnyAdapter {
                 let captured = adapter.observe_with_evidence(credential, request, transport, clock);
                 CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::Anthropic),
+                    evidence: captured.evidence,
+                    failed_body: captured.failed_body,
+                }
+            }
+            AnyAdapter::Codex(adapter) => {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
+                    observation: map_observation(captured.observation, Reading::Codex),
+                    evidence: captured.evidence,
+                    failed_body: captured.failed_body,
+                }
+            }
+            AnyAdapter::Ollama(adapter) => {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
+                    observation: map_observation(captured.observation, Reading::Ollama),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
                 }
@@ -408,6 +447,8 @@ pub fn adapter_for(
                 endpoint,
             )))
         }
+        "codex" => Ok(AnyAdapter::Codex(CodexAdapter::new())),
+        "ollama" => Ok(AnyAdapter::Ollama(OllamaAdapter::new())),
         unsupported => Err(unsupported_provider_error(unsupported, account)),
     }
 }
@@ -507,6 +548,8 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), AnthropicAdapter::DEFAULT_ENDPOINT);
             }
+            AnyAdapter::Codex(_) => panic!("dispatch chose the codex arm for anthropic"),
+            AnyAdapter::Ollama(_) => panic!("expected the anthropic arm"),
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"anthropic"));
     }
@@ -524,7 +567,54 @@ mod tests {
             AnyAdapter::Anthropic(anthropic) => {
                 assert_eq!(anthropic.endpoint_url(), "http://127.0.0.1:9");
             }
+            AnyAdapter::Codex(_) => panic!("dispatch chose the codex arm for anthropic"),
+            AnyAdapter::Ollama(_) => panic!("expected the anthropic arm"),
         }
+    }
+
+    /// The codex arm dispatches to the rollout adapter and its declarations
+    /// name the contract the bead fixed, reachable without a provider call.
+    #[test]
+    fn adapter_for_dispatches_the_codex_arm_to_the_rollout_adapter() {
+        let adapter = adapter_for("codex", "codex-primary", &EndpointConfig::default())
+            .expect("codex is in the supported table");
+        match adapter {
+            AnyAdapter::Codex(codex) => {
+                let declarations = codex.declarations();
+                assert_eq!(
+                    declarations.provider_contract_id.as_str(),
+                    "openai-codex-rollout-rate-limits-v1"
+                );
+                assert_eq!(
+                    declarations.meter_semantics_id.as_str(),
+                    "openai-chatgpt-subscription-v1"
+                );
+                assert!(declarations.required_window_kinds.contains("primary"));
+                assert!(declarations.required_window_kinds.contains("secondary"));
+            }
+            AnyAdapter::Anthropic(_) | AnyAdapter::Ollama(_) => {
+                panic!("dispatch chose another arm for codex")
+            }
+        }
+        assert!(SUPPORTED_PROVIDERS.contains(&"codex"));
+    }
+
+    /// `aub-ud17`: the ollama arm dispatches to its default endpoint, the
+    /// same shape the anthropic dispatch test above proves.
+    #[test]
+    fn adapter_for_dispatches_the_ollama_arm_to_its_default_endpoint() {
+        let adapter = adapter_for("ollama", "work-k1", &EndpointConfig::default())
+            .expect("ollama is in the supported table");
+        match adapter {
+            AnyAdapter::Ollama(ollama) => {
+                assert_eq!(
+                    ollama.endpoint_url(),
+                    crate::meter::ollama::OllamaAdapter::DEFAULT_ENDPOINT
+                );
+            }
+            AnyAdapter::Anthropic(_) | AnyAdapter::Codex(_) => panic!("expected the ollama arm"),
+        }
+        assert!(SUPPORTED_PROVIDERS.contains(&"ollama"));
     }
 
     /// The negative: an unsupported provider yields the usage error that
@@ -538,7 +628,7 @@ mod tests {
         };
         assert_eq!(
             error.to_string(),
-            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic)"
+            "unsupported provider 'nope' for account 'work-primary' (supported: anthropic, codex, ollama)"
         );
         assert!(matches!(error, Error::Usage(_)));
     }

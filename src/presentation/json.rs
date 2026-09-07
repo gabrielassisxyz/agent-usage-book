@@ -1420,6 +1420,29 @@ fn coverage_timestamp_json(timestamp: Option<crate::domain::time::UtcTimestamp>)
     }
 }
 
+/// Serializes a window's reset state under the JSON conventions this module
+/// uses everywhere else: nanosecond timestamps, no ISO strings (`aub-ud17`).
+/// `kind` distinguishes a provider-reported `known` instant from a
+/// grid-`scheduled` one, which additionally carries the `grid` that computed
+/// it; `not_started` carries neither.
+pub fn window_reset_state_json(state: crate::domain::window::WindowResetState) -> String {
+    match state {
+        crate::domain::window::WindowResetState::Known(at) => {
+            format!("{{\"kind\":\"known\",\"at\":{}}}", at.unix_nanos())
+        }
+        crate::domain::window::WindowResetState::NotStarted => {
+            "{\"kind\":\"not_started\"}".to_string()
+        }
+        crate::domain::window::WindowResetState::Scheduled { at, grid } => {
+            format!(
+                "{{\"kind\":\"scheduled\",\"at\":{},\"grid\":{}}}",
+                at.unix_nanos(),
+                json_string(grid.as_str())
+            )
+        }
+    }
+}
+
 fn coverage_account_json(account: &crate::report::CoverageAccount) -> String {
     let engine = &account.engine;
     let policy_unknown = engine.expected_opportunities.is_none();
@@ -2853,6 +2876,36 @@ mod tests {
 
     fn remaining(ppm: u32) -> QuotaRemaining {
         QuotaRemaining::new(QuotaFractionPpm::new(ppm as i32).unwrap())
+    }
+
+    /// The golden rendering of a `Scheduled` reset state (`aub-ud17`): the
+    /// grid it was computed from travels with it, distinguishing it from a
+    /// provider-reported `known` instant at the JSON layer too.
+    #[test]
+    fn window_reset_state_json_renders_a_scheduled_reset_with_its_grid() {
+        let rendered =
+            window_reset_state_json(crate::domain::window::WindowResetState::Scheduled {
+                at: UtcTimestamp::from_unix_nanos(1_788_732_000_000_000_000),
+                grid: crate::domain::window::ResetGridId::OllamaCloudV1,
+            });
+        assert_eq!(
+            rendered,
+            "{\"kind\":\"scheduled\",\"at\":1788732000000000000,\"grid\":\"ollama-cloud-v1\"}"
+        );
+    }
+
+    #[test]
+    fn window_reset_state_json_renders_known_and_not_started() {
+        assert_eq!(
+            window_reset_state_json(crate::domain::window::WindowResetState::Known(
+                UtcTimestamp::from_unix_nanos(5_000)
+            )),
+            "{\"kind\":\"known\",\"at\":5000}"
+        );
+        assert_eq!(
+            window_reset_state_json(crate::domain::window::WindowResetState::NotStarted),
+            "{\"kind\":\"not_started\"}"
+        );
     }
 
     fn observed(ppm: u32) -> Observed<QuotaRemaining> {
