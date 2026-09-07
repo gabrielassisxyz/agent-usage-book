@@ -87,19 +87,20 @@ case_steps() {
 
 case_assertions() {
     assert_exit 0 1
-    assert_stdout_contains 1 "aub work-primary 38% left · 5h"
+    assert_stdout_contains 1 "  work-primary  provider-a"
+    assert_stdout_contains 1 "62%"
 
     assert_exit 0 2
-    assert_stdout_contains 2 "aub work-primary ~38% · stale 14m · age exceeded"
+    assert_stdout_contains 2 "cached 14m ago · age exceeded"
 
     assert_exit 0 3
-    assert_stdout_contains 3 "aub work-primary auth!"
+    assert_stdout_contains 3 "    auth!"
 
     assert_exit 0 4
-    assert_stdout_contains 4 "aub work-primary ? · stale · no successful sample"
+    assert_stdout_contains 4 "? · stale · no successful sample"
 
     assert_exit 0 5
-    assert_stdout_contains 5 "aub work-primary ~38% · stale 9m · collector interrupted"
+    assert_stdout_contains 5 "cached 9m ago · collector interrupted"
 
     assert_exit 0 6
     assert_stdout_equals_declared_missing 6

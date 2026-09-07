@@ -42,19 +42,20 @@ case_steps() {
     # Step 1: a pty with NO_COLOR unset, the one mode colour is on in. The pty
     # runs with -opost so the relay carries the child's own line endings
     # rather than the line discipline's, and script -e returns the child's own
-    # exit status, which script without it always replaces with zero.
+    # exit status, which script without it always replaces with zero. The pty
+    # is pinned to 80 columns so the grid's width-relative layout is stable.
     step "colour under pty" \
         env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        script -q -e -c "stty -opost; '$AUB_BIN' status" /dev/null
+        script -q -e -c "stty -opost cols 80 rows 24; '$AUB_BIN' status" /dev/null
 
-    # Steps 2 and 3: the two plain forms under the same pty, one by flag and
-    # one by environment.
+    # Steps 2 and 3: the two plain forms under the same 80-column pty, one by
+    # flag and one by environment.
     step "plain by flag under pty" \
         env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        script -q -e -c "stty -opost; '$AUB_BIN' status --no-color" /dev/null
+        script -q -e -c "stty -opost cols 80 rows 24; '$AUB_BIN' status --no-color" /dev/null
     step "plain by environment under pty" \
         env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "NO_COLOR=1" \
-        script -q -e -c "stty -opost; '$AUB_BIN' status" /dev/null
+        script -q -e -c "stty -opost cols 80 rows 24; '$AUB_BIN' status" /dev/null
 
     # Step 4: a pipe, with the real exit status visible to the runner because
     # the step's argv is the aub invocation itself.
@@ -76,22 +77,34 @@ case_steps() {
     step "json plain by environment under pty" \
         env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "NO_COLOR=1" \
         script -q -e -c "stty -opost; '$AUB_BIN' status --format json" /dev/null
+
+    # Step 9: the grid header right-aligns the timestamp to the terminal width.
+    # Under a 100-column pty its last visible column is 100; under a pipe the
+    # layout falls back to 80.
+    step "header under a 100-column pty" \
+        env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG_FILE" "NO_COLOR=1" \
+        script -q -e -c "stty -opost cols 100 rows 24; '$AUB_BIN' status" /dev/null
 }
 
 case_assertions() {
     # Every status invocation exits zero, whatever the mode. The script steps
     # report the child's own status through -e.
-    for n in 1 2 3 4 5 6 7 8; do
+    for n in 1 2 3 4 5 6 7 8 9; do
         assert_exit 0 "$n"
     done
 
-    # Colour under a pty: a 24-bit foreground escape is present, it tints the
-    # fresh reading, and the account line still names the account. The words
-    # underneath the tint are pinned by the render tests; here the pty is
-    # what is under test.
+    # Colour under a pty: a 24-bit foreground escape is present, the seeded
+    # fresh window (620000 ppm used, 62%) is toned yellow, and the account
+    # block still names the account. The words underneath the tint are pinned
+    # by the render tests; here the pty is what is under test.
     assert_stdout_contains 1 "$ESCAPE_PREFIX"
-    assert_stdout_contains 1 "${YELLOW_ESCAPE}38% left"
-    assert_stdout_contains 1 "aub work-primary"
+    assert_stdout_contains 1 "$YELLOW_ESCAPE"
+    assert_stdout_contains 1 "work-primary"
+
+    # The grid header's timestamp ends on the terminal's last column: 100
+    # under the 100-column pty, 80 under the pipe.
+    assert_header_last_column 9 100
+    assert_header_last_column 4 80
 
     # The two plain pty forms and the two pipe forms carry no escape at all.
     for n in 2 3 4 5; do
@@ -119,6 +132,24 @@ assert_stdout_lacks() {
         CASE_FAILED=1
     else
         record_assertion "assert_stdout_lacks step $step" "$label" "absent" "pass"
+    fi
+}
+
+# assert_header_last_column STEP WIDTH: the first stdout line (the QUOTA
+# header) has exactly WIDTH visible columns, so the right-aligned timestamp
+# ends on the terminal's last column. Carriage returns the pty relay adds and
+# any colour escapes are stripped before counting.
+assert_header_last_column() {
+    local step="$1" width="$2"
+    local line
+    line="$(head -n 1 "$(step_dir "$step")/stdout.bin" \
+        | sed $'s/\x1b\\[[0-9;]*m//g; s/\r$//')"
+    local observed="${#line}"
+    if [ "$observed" -eq "$width" ]; then
+        record_assertion "assert_header_last_column step $step" "$width" "$observed" "pass"
+    else
+        record_assertion "assert_header_last_column step $step" "$width" "$observed" "fail"
+        CASE_FAILED=1
     fi
 }
 
