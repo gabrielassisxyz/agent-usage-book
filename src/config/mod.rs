@@ -19,8 +19,9 @@
 //!       -> non-identifying platform default
 //! ```
 //!
-//! `aub config` (`crate::cli`) prints every resolved key with the source that won,
-//! using exactly the four labels above: `flag`, `environment`, `file`, `default`.
+//! `aub config` (`crate::cli`) prints every resolved key with its value and
+//! the source that won, using exactly the four labels below: `override`,
+//! `environment`, `file`, `default`.
 //!
 //! Scope, stated rather than left implicit: the four scalar sections (`state`,
 //! `sampling`, `freshness`, `coverage`) plus the doctor review horizons
@@ -51,7 +52,7 @@ use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
 
 pub use aliases::AliasTable;
-pub use duration::parse_duration;
+pub use duration::{format_config_duration, parse_duration};
 
 /// Where a resolved value came from, in the order that decides a tie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -64,9 +65,11 @@ pub enum ConfigSource {
 
 impl ConfigSource {
     /// The one of the four stable labels `aub config` prints for this source.
+    /// A `--set key=value` command-line override prints as `override` (aub-ukh5):
+    /// the row answers what the operator forced, not which flag spelling did it.
     pub fn label(self) -> &'static str {
         match self {
-            ConfigSource::Flag => "flag",
+            ConfigSource::Flag => "override",
             ConfigSource::Environment => "environment",
             ConfigSource::File => "file",
             ConfigSource::Default => "default",
@@ -172,6 +175,15 @@ impl CoverageFloor {
     /// same unit as the coverages it judges.
     pub fn as_ppm(self) -> u32 {
         (self.0 * 1_000_000.0).round().clamp(0.0, 1_000_000.0) as u32
+    }
+}
+
+impl std::fmt::Display for CoverageFloor {
+    /// Renders the floor as the bare fraction `aub config` prints (aub-ukh5):
+    /// `0.98` as written in TOML, never a percentage or a parts-per-million
+    /// count, so the row reads in the unit the operator configured.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
     }
 }
 
@@ -347,6 +359,13 @@ impl AccountExclusivityPolicy {
             Self::PermitPassive => true,
             Self::ForbidPassive => false,
         }
+    }
+}
+
+impl std::fmt::Display for AccountExclusivityPolicy {
+    /// Renders the stable name `aub config` prints (aub-ukh5).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1376,6 +1395,9 @@ pub fn resolve(
                 .ok_or_else(|| missing_key_error("tracker.kind", &file_display))?;
             let path = t.get("path").and_then(toml::Value::as_str).unwrap_or("");
             provenance.set("tracker.kind", ConfigSource::File);
+            // Tracked alongside the kind (aub-ukh5): `aub config` prints every
+            // key the resolver knows, and the tracker path is one of them.
+            provenance.set("tracker.path", ConfigSource::File);
             Some(TrackerConfig {
                 kind: kind.to_string(),
                 path: PathBuf::from(path),
@@ -1519,6 +1541,308 @@ pub fn resolve(
         },
         provenance,
     ))
+}
+
+/// One printed `aub config` row (aub-ukh5): the dotted key, the resolved value
+/// already rendered to text, and the source that won for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigProvenanceRow {
+    pub key: String,
+    pub value: String,
+    pub source: ConfigSource,
+}
+
+/// The value column's total width cap (aub-ukh5): the column is the longest
+/// rendered value plus the 2-space gap, capped here. Longer values are
+/// truncated with `…` by [`fit_provenance_value`].
+const PROVENANCE_VALUE_COLUMN_CAP: usize = 48;
+
+impl Config {
+    /// Every row `aub config` prints (aub-ukh5): one per scalar the resolver
+    /// knows, with its rendered value and winning source, plus the array
+    /// sections expanded one row per element and field
+    /// (`accounts[0].name`, `transcripts[1].root`, ...). The heterogeneous
+    /// section buckets (`accounts`, `transcripts`, `projects`,
+    /// `repositories`) never appear as rows themselves: their entries do.
+    ///
+    /// Rows follow `provenance.entries()` order, which is today's printed
+    /// order, so rows stay sorted as today inside every section. An absent
+    /// optional (`attribution.quality_floor`, `backup.destination`,
+    /// `drill.result`, `valuation.default_rate_book`, an unset transcript
+    /// `format`) has no row: there is no value to print.
+    pub fn provenance_rows(&self, provenance: &Provenance) -> Vec<ConfigProvenanceRow> {
+        let mut rows = Vec::new();
+        for (key, source) in provenance.entries() {
+            match key {
+                "accounts" => push_account_provenance_rows(&mut rows, &self.accounts, source),
+                "transcripts" => {
+                    push_transcript_provenance_rows(&mut rows, &self.transcripts, source);
+                }
+                "projects" => {
+                    push_alias_provenance_rows(&mut rows, "projects", &self.projects, source)
+                }
+                "repositories" => {
+                    push_alias_provenance_rows(
+                        &mut rows,
+                        "repositories",
+                        &self.repositories,
+                        source,
+                    );
+                }
+                _ => {
+                    // A provenance key this match does not name is a key
+                    // `resolve` learned without this rendering following it;
+                    // the golden test pins every current key, so a new one
+                    // fails there until its row is added here.
+                    if let Some(value) = self.scalar_provenance_value(key) {
+                        rows.push(ConfigProvenanceRow {
+                            key: key.to_string(),
+                            value,
+                            source,
+                        });
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// The full `aub config` text (aub-ukh5): three aligned columns (key,
+    /// value, source) with the key column sized to the longest key plus the
+    /// 2-space gap, one blank line between sections, no headers. Every
+    /// non-blank line starts its source at the same offset.
+    pub fn render_provenance(&self, provenance: &Provenance) -> String {
+        render_provenance_rows(&self.provenance_rows(provenance))
+    }
+
+    /// The rendered value for one scalar provenance key, or `None` for an
+    /// unset optional the output skips. Values render through each typed
+    /// quantity's `Display` (durations via [`format_config_duration`], the
+    /// domain quantity that deliberately carries no `Display` of its own);
+    /// paths render verbatim.
+    fn scalar_provenance_value(&self, key: &str) -> Option<String> {
+        let value = match key {
+            "state.dir" => self.state.dir.display().to_string(),
+            "sampling.scheduler_tick" => format_config_duration(self.sampling.scheduler_tick),
+            "sampling.default_interval" => format_config_duration(self.sampling.default_interval),
+            "sampling.reset_edge_lead" => format_config_duration(self.sampling.reset_edge_lead),
+            "sampling.request_timeout" => format_config_duration(self.sampling.request_timeout),
+            "sampling.busy_timeout" => format_config_duration(self.sampling.busy_timeout),
+            "sampling.command_budget" => format_config_duration(self.sampling.command_budget),
+            "sampling.max_concurrent_requests" => self.sampling.max_concurrent_requests.to_string(),
+            "ingest.max_batch_events" => self.ingest.max_batch_events.to_string(),
+            "ingest.max_batch_files" => self.ingest.max_batch_files.to_string(),
+            "ingest.max_batch_seconds" => format_config_duration(self.ingest.max_batch_seconds),
+            "freshness.meter" => format_config_duration(self.freshness.meter),
+            "coverage.attempt_floor" => self.coverage.attempt_floor.to_string(),
+            "coverage.measurement_floor" => self.coverage.measurement_floor.to_string(),
+            "attribution.recent_window" => format_config_duration(self.attribution.recent_window),
+            "attribution.quality_floor" => self.attribution.quality_floor?.to_string(),
+            "task_distribution.central_low" => self.task_distribution.central_low.to_string(),
+            "task_distribution.central_high" => self.task_distribution.central_high.to_string(),
+            "task_distribution.upper" => self.task_distribution.upper.to_string(),
+            "task_distribution.min_samples" => self.task_distribution.min_samples.to_string(),
+            "task_distribution.quantile_method" => {
+                self.task_distribution.quantile_method.to_string()
+            }
+            "task_distribution.attribution_floor" => {
+                self.task_distribution.attribution_floor.to_string()
+            }
+            "can_run.labels" => self.can_run.labels_enabled.to_string(),
+            "can_run.ample_margin_multiple" => self.can_run.ample_margin_multiple.to_string(),
+            "can_run.headroom_bound" => self.can_run.headroom_bound.to_string(),
+            "reconciliation.residual_window" => {
+                format_config_duration(self.reconciliation.residual_window)
+            }
+            "reconciliation.residual_min_eligible" => {
+                self.reconciliation.residual_min_eligible.to_string()
+            }
+            "backup.review_after" => format_config_duration(self.backup.review_after),
+            "backup.destination" => self.backup.destination.as_ref()?.display().to_string(),
+            "drill.max_age" => format_config_duration(self.drill.max_age),
+            "drill.result" => self.drill.result.as_ref()?.display().to_string(),
+            "adapter_semantics.max_comparison_age" => {
+                format_config_duration(self.adapter_semantics.max_comparison_age)
+            }
+            "doctor.meter_anomaly_horizon" => {
+                format_config_duration(self.doctor.meter_anomaly_horizon)
+            }
+            "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
+            "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
+            "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
+            _ => return None,
+        };
+        Some(value)
+    }
+}
+
+/// One account's expanded rows (aub-ukh5): name, provider, credential and
+/// exclusivity policy, in key order. The credential renders as `file:<path>`,
+/// `env:<NAME>` or `none` from its kind and reference only: the material is
+/// never read here, so no byte of any credential file can reach the output
+/// through this path.
+fn push_account_provenance_rows(
+    rows: &mut Vec<ConfigProvenanceRow>,
+    accounts: &[AccountConfig],
+    source: ConfigSource,
+) {
+    for (index, account) in accounts.iter().enumerate() {
+        let base = format!("accounts[{index}]");
+        let mut entry = vec![
+            (
+                format!("{base}.credential"),
+                render_account_credential(&account.credential_kind, &account.credential_detail),
+            ),
+            (
+                format!("{base}.exclusivity_policy"),
+                account.exclusivity_policy.to_string(),
+            ),
+            (format!("{base}.name"), account.name.clone()),
+            (format!("{base}.provider"), account.provider.clone()),
+        ];
+        entry.sort();
+        for (key, value) in entry {
+            rows.push(ConfigProvenanceRow { key, value, source });
+        }
+    }
+}
+
+/// Renders one account credential reference without touching the material
+/// (aub-ukh5): the kind and the path, variable name or profile reference it
+/// names, never the secret itself.
+fn render_account_credential(kind: &str, detail: &str) -> String {
+    if kind == "none" || (kind.is_empty() && detail.is_empty()) {
+        "none".to_string()
+    } else if kind.is_empty() {
+        detail.to_string()
+    } else if detail.is_empty() {
+        format!("{kind}:")
+    } else {
+        format!("{kind}:{detail}")
+    }
+}
+
+/// One transcript source's expanded rows (aub-ukh5): name, root, pattern and
+/// whichever optional fields are set, in key order.
+fn push_transcript_provenance_rows(
+    rows: &mut Vec<ConfigProvenanceRow>,
+    transcripts: &[TranscriptConfig],
+    source: ConfigSource,
+) {
+    for (index, transcript) in transcripts.iter().enumerate() {
+        let base = format!("transcripts[{index}]");
+        let mut entry = vec![
+            (format!("{base}.name"), transcript.name.clone()),
+            (
+                format!("{base}.root"),
+                transcript.root.display().to_string(),
+            ),
+            (format!("{base}.pattern"), transcript.pattern.clone()),
+        ];
+        if let Some(format) = &transcript.format {
+            entry.push((format!("{base}.format"), format.clone()));
+        }
+        if let Some(evidence) = &transcript.usage_evidence {
+            entry.push((format!("{base}.usage_evidence"), evidence.clone()));
+        }
+        entry.sort();
+        for (key, value) in entry {
+            rows.push(ConfigProvenanceRow { key, value, source });
+        }
+    }
+}
+
+/// One alias table's expanded rows (aub-ukh5): `section.<path>` to the
+/// logical name it maps to, in path order.
+fn push_alias_provenance_rows(
+    rows: &mut Vec<ConfigProvenanceRow>,
+    section: &str,
+    table: &AliasTable,
+    source: ConfigSource,
+) {
+    for (path, name) in table.entries() {
+        rows.push(ConfigProvenanceRow {
+            key: format!("{section}.{path}"),
+            value: name.to_string(),
+            source,
+        });
+    }
+}
+
+/// The key column width (aub-ukh5): the longest key plus the 2-space gap, so
+/// the value column starts at one offset on every row.
+fn provenance_key_width(rows: &[ConfigProvenanceRow]) -> usize {
+    rows.iter()
+        .map(|row| row.key.chars().count())
+        .max()
+        .unwrap_or(0)
+        + 2
+}
+
+/// The value column width (aub-ukh5): the longest rendered value plus the
+/// 2-space gap, capped at [`PROVENANCE_VALUE_COLUMN_CAP`].
+fn provenance_value_width(rows: &[ConfigProvenanceRow]) -> usize {
+    let longest = rows
+        .iter()
+        .map(|row| row.value.chars().count())
+        .max()
+        .unwrap_or(0);
+    (longest + 2).min(PROVENANCE_VALUE_COLUMN_CAP)
+}
+
+/// Fits one rendered value into a value column of `column_width`: values past
+/// the column's content budget (its width minus the 2-space gap) are
+/// truncated with `…`. Widths count characters, never bytes, so the source
+/// column that follows still starts at one offset.
+fn fit_provenance_value(value: &str, column_width: usize) -> String {
+    let budget = column_width.saturating_sub(2);
+    if value.chars().count() <= budget {
+        value.to_string()
+    } else {
+        let kept: String = value.chars().take(budget.saturating_sub(1)).collect();
+        format!("{kept}…")
+    }
+}
+
+/// Pads text with spaces to exactly `width` characters, counting characters
+/// rather than bytes so a multibyte tail (the `…` truncation marker) cannot
+/// shift the column that follows.
+fn pad_provenance_column(text: &str, width: usize) -> String {
+    let len = text.chars().count();
+    if len >= width {
+        text.to_string()
+    } else {
+        format!("{text}{}", " ".repeat(width - len))
+    }
+}
+
+/// Renders already-built rows (aub-ukh5): sections are the first key segment
+/// (up to the first `.` or `[`), rows keep their incoming order inside a
+/// section, sections are separated by one blank line, and there are no
+/// headers. Every non-blank line starts its source at the same offset.
+fn render_provenance_rows(rows: &[ConfigProvenanceRow]) -> String {
+    if rows.is_empty() {
+        return String::new();
+    }
+    let key_width = provenance_key_width(rows);
+    let value_width = provenance_value_width(rows);
+    let mut out = String::new();
+    let mut current_section: Option<&str> = None;
+    for row in rows {
+        let section = row.key.split(['.', '[']).next().unwrap_or(row.key.as_str());
+        if current_section.is_some_and(|current| current != section) {
+            out.push('\n');
+        }
+        current_section = Some(section);
+        out.push_str(&pad_provenance_column(&row.key, key_width));
+        out.push_str(&pad_provenance_column(
+            &fit_provenance_value(&row.value, value_width),
+            value_width,
+        ));
+        out.push_str(row.source.label());
+        out.push('\n');
+    }
+    out
 }
 
 /// Reads one alias section (`projects` or `repositories`) from the file into a
@@ -2328,5 +2652,309 @@ exclusivity = "permit_passive"
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
         assert!(err.to_string().contains("exclusivity"), "{err}");
+    }
+
+    // --- aub-ukh5: aligned key, value and source rows ---------------------------
+
+    fn provenance_row(key: &str, value: &str) -> ConfigProvenanceRow {
+        ConfigProvenanceRow {
+            key: key.to_string(),
+            value: value.to_string(),
+            source: ConfigSource::Default,
+        }
+    }
+
+    #[test]
+    fn key_column_width_is_the_longest_key_plus_two() {
+        let ten = "a".repeat(10);
+        let rows = vec![provenance_row(&ten, "1s")];
+        assert_eq!(provenance_key_width(&rows), 12);
+
+        let thirty_two = "b".repeat(32);
+        let rows = vec![provenance_row(&thirty_two, "1s")];
+        assert_eq!(provenance_key_width(&rows), 34);
+
+        let forty = "c".repeat(40);
+        let rows = vec![provenance_row(&forty, "1s")];
+        assert_eq!(provenance_key_width(&rows), 42);
+    }
+
+    #[test]
+    fn a_short_key_does_not_shrink_the_column_below_the_longest() {
+        // The planted negative: a width taken from any row but the longest
+        // (here the first) would misalign the longest key's source.
+        let rows = vec![
+            provenance_row("state.dir", "/x"),
+            provenance_row("reconciliation.residual_min_eligible", "5"),
+        ];
+        assert_eq!(
+            provenance_key_width(&rows),
+            "reconciliation.residual_min_eligible".len() + 2
+        );
+    }
+
+    #[test]
+    fn value_column_width_is_the_longest_value_plus_two_capped_at_48() {
+        let rows = vec![provenance_row("state.dir", "short")];
+        assert_eq!(provenance_value_width(&rows), "short".len() + 2);
+
+        let long = "v".repeat(60);
+        let rows = vec![provenance_row("state.dir", &long)];
+        assert_eq!(provenance_value_width(&rows), 48);
+    }
+
+    #[test]
+    fn values_past_the_cap_truncate_with_an_ellipsis() {
+        let long = "v".repeat(60);
+        let fitted = fit_provenance_value(&long, 48);
+        assert_eq!(fitted.chars().count(), 46, "{fitted}");
+        assert!(fitted.ends_with('…'), "{fitted}");
+        assert_eq!(&fitted[..45], &long[..45], "{fitted}");
+
+        let short = "12m";
+        assert_eq!(fit_provenance_value(short, 48), "12m");
+    }
+
+    #[test]
+    fn padding_counts_characters_never_bytes() {
+        // A truncated value ends in `…` (three bytes, one character): the
+        // column that follows must still start at the same offset.
+        let padded = pad_provenance_column("12m", 8);
+        assert_eq!(padded, "12m     ");
+        let padded = pad_provenance_column("ab…", 8);
+        assert_eq!(padded.chars().count(), 8, "{padded}");
+        assert!(padded.ends_with("     "), "{padded}");
+    }
+
+    #[test]
+    fn credential_renders_kind_and_reference_for_file_env_and_none() {
+        assert_eq!(
+            render_account_credential("file", "/creds/max.json"),
+            "file:/creds/max.json"
+        );
+        assert_eq!(
+            render_account_credential("env", "AUB_TOKEN"),
+            "env:AUB_TOKEN"
+        );
+        assert_eq!(render_account_credential("none", ""), "none");
+        assert_eq!(render_account_credential("", ""), "none");
+    }
+
+    #[test]
+    fn credential_rendering_never_reads_the_material() {
+        // A legacy kind the typed model no longer accepts still renders as
+        // its kind and reference: the loose pass-through keeps resolving,
+        // and only the reference (never file contents) reaches the row.
+        assert_eq!(
+            render_account_credential("profile", "work-primary"),
+            "profile:work-primary"
+        );
+    }
+
+    #[test]
+    fn a_command_line_override_row_carries_the_override_source() {
+        let overrides = Overrides::new().set("freshness.meter", "5m");
+        let (config, provenance) = resolve_with(overrides, plain_env(), None).unwrap();
+        let rows = config.provenance_rows(&provenance);
+        let row = rows
+            .iter()
+            .find(|row| row.key == "freshness.meter")
+            .expect("every resolved scalar has a row");
+        assert_eq!(row.value, "5m");
+        assert_eq!(row.source, ConfigSource::Flag);
+        assert_eq!(row.source.label(), "override");
+    }
+
+    #[test]
+    fn every_non_blank_line_starts_its_source_at_one_offset() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        let text = config.render_provenance(&provenance);
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines.is_empty());
+        let key_width = provenance_key_width(&config.provenance_rows(&provenance));
+        let value_width = provenance_value_width(&config.provenance_rows(&provenance));
+        let offset = key_width + value_width;
+        for line in &lines {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let source = &line[offset..];
+            assert!(
+                ["override", "environment", "file", "default"].contains(&source),
+                "line does not start its source at offset {offset}: {line:?}"
+            );
+        }
+        // The planted negative: the longest key must hold its source at the
+        // same offset, which a fixed 32-character column would break.
+        let long = lines
+            .iter()
+            .find(|line| line.starts_with("sampling.max_concurrent_requests"))
+            .expect("the long key is printed");
+        assert_eq!(&long[offset..], "default", "{long:?}");
+    }
+
+    #[test]
+    fn sections_are_separated_by_one_blank_line_with_no_headers() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        let text = config.render_provenance(&provenance);
+        assert!(!text.starts_with('\n'), "no leading blank line");
+        assert!(!text.contains("\n\n\n"), "never two blank lines: {text:?}");
+        let sections = text.split("\n\n").count();
+        assert!(sections > 5, "sections are separated: {text:?}");
+        // One blank line separates sampling from the next section.
+        let sampling_block = text
+            .split("\n\n")
+            .find(|block| block.contains("sampling.scheduler_tick"))
+            .expect("a sampling section");
+        assert!(
+            sampling_block
+                .lines()
+                .all(|line| line.starts_with("sampling.")),
+            "one section per block: {sampling_block:?}"
+        );
+    }
+
+    /// The golden rendering (aub-ukh5): two accounts, two transcript sources
+    /// and one `[backup]` key, fixing the exact text including the blank
+    /// lines between sections. Paths stay short on purpose so no value hits
+    /// the 48-character truncation cap here; truncation is pinned by its own
+    /// unit test above instead.
+    const GOLDEN_TOML: &str = r#"
+[backup]
+review_after = "36h"
+destination = "/tmp/aub-golden/backups"
+
+[[accounts]]
+name = "work-primary"
+provider = "provider-a"
+credential = { kind = "file", path = "/tmp/aub-golden/creds-primary.json" }
+
+[[accounts]]
+name = "work-secondary"
+provider = "provider-b"
+credential = { kind = "env", name = "AUB_GOLDEN_TOKEN" }
+exclusivity_policy = "permit_passive"
+
+[[transcripts]]
+name = "cli-a"
+root = "/tmp/aub-golden/cli-a"
+pattern = "**/*.jsonl"
+format = "claude-code"
+
+[[transcripts]]
+name = "cli-b"
+root = "/tmp/aub-golden/cli-b"
+pattern = "**/*.md"
+format = "codex"
+usage_evidence = "measured"
+"#;
+
+    #[test]
+    fn golden_config_rendering_with_two_accounts_and_two_transcript_sources() {
+        let (config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), Some(GOLDEN_TOML)).unwrap();
+        let text = config.render_provenance(&provenance);
+        // Frozen against the real binary's output for this fixture and
+        // verified line by line: key column 38, value column 43, one blank
+        // line between sections, sources at one offset.
+        const EXPECTED: &str = r#"accounts[0].credential                file:/tmp/aub-golden/creds-primary.json  file
+accounts[0].exclusivity_policy        forbid_passive                           file
+accounts[0].name                      work-primary                             file
+accounts[0].provider                  provider-a                               file
+accounts[1].credential                env:AUB_GOLDEN_TOKEN                     file
+accounts[1].exclusivity_policy        permit_passive                           file
+accounts[1].name                      work-secondary                           file
+accounts[1].provider                  provider-b                               file
+
+adapter_semantics.max_comparison_age  30d                                      default
+
+attribution.recent_window             30d                                      default
+
+backup.destination                    /tmp/aub-golden/backups                  file
+backup.review_after                   36h                                      file
+
+can_run.ample_margin_multiple         2                                        default
+can_run.headroom_bound                low                                      default
+can_run.labels                        true                                     default
+
+coverage.attempt_floor                0.98                                     default
+coverage.measurement_floor            0.95                                     default
+
+doctor.meter_anomaly_horizon          15m                                      default
+
+drill.max_age                         30d                                      default
+
+freshness.meter                       12m                                      default
+
+ingest.max_batch_events               5000                                     default
+ingest.max_batch_files                200                                      default
+ingest.max_batch_seconds              2s                                       default
+
+reconciliation.residual_min_eligible  5                                        default
+reconciliation.residual_window        30d                                      default
+
+sampling.busy_timeout                 10s                                      default
+sampling.command_budget               8s                                       default
+sampling.default_interval             5m                                       default
+sampling.max_concurrent_requests      2                                        default
+sampling.request_timeout              5s                                       default
+sampling.reset_edge_lead              2m                                       default
+sampling.scheduler_tick               1m                                       default
+
+state.dir                             /home/synthetic-user/.local/state/aub    default
+
+task_distribution.attribution_floor   0.8                                      default
+task_distribution.central_high        75                                       default
+task_distribution.central_low         25                                       default
+task_distribution.min_samples         12                                       default
+task_distribution.quantile_method     nearest-rank                             default
+task_distribution.upper               90                                       default
+
+transcripts[0].format                 claude-code                              file
+transcripts[0].name                   cli-a                                    file
+transcripts[0].pattern                **/*.jsonl                               file
+transcripts[0].root                   /tmp/aub-golden/cli-a                    file
+transcripts[1].format                 codex                                    file
+transcripts[1].name                   cli-b                                    file
+transcripts[1].pattern                **/*.md                                  file
+transcripts[1].root                   /tmp/aub-golden/cli-b                    file
+transcripts[1].usage_evidence         measured                                 file
+"#;
+        assert_eq!(text, EXPECTED);
+    }
+
+    #[test]
+    fn rendered_output_contains_no_byte_of_any_credential_file() {
+        // A real credential file holding a marker string, referenced by the
+        // fixture config: the row prints the path, and the marker (the file's
+        // contents, which resolution never reads) must not appear.
+        let marker = "aub-ukh5-marker-never-printed-9f3c";
+        let path = std::env::temp_dir().join(format!("aub-ukh5-cred-{}.json", std::process::id()));
+        std::fs::write(&path, format!("{{\"token\": \"{marker}\"}}")).unwrap();
+        let file = format!(
+            "[[accounts]]\nname = \"work\"\nprovider = \"provider-a\"\ncredential = {{ kind = \"file\", path = {:?} }}\n",
+            path.to_string_lossy()
+        );
+        let (config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), Some(&file)).unwrap();
+        let text = config.render_provenance(&provenance);
+        std::fs::remove_file(&path).ok();
+        // The temp path is long enough to hit the value column's truncation
+        // cap, so this asserts the surviving prefix rather than the full
+        // path; the full path form is pinned by the golden test's short
+        // paths instead.
+        let credential = config
+            .provenance_rows(&provenance)
+            .into_iter()
+            .find(|row| row.key == "accounts[0].credential")
+            .expect("one credential row per account");
+        assert!(
+            credential.value.starts_with("file:"),
+            "the row names the credential kind: {text:?}"
+        );
+        assert!(
+            !text.contains(marker),
+            "no byte of the credential file reaches the output: {text:?}"
+        );
     }
 }

@@ -2908,13 +2908,15 @@ fn parse_date(value: &str) -> Result<UtcDate, Error> {
         .ok_or_else(|| Error::Usage(format!("--since must be YYYY-MM-DD, got {value}")))
 }
 
-/// `aub config`: prints every resolved key with the source that won it. Never prints
-/// a raw value from the `accounts` section: that section's provenance is reported as
-/// one bucket (`accounts`, source `file` once any account is configured), never
-/// key-by-key, so a credential's file path or profile reference never reaches this
-/// output. `--set key=value` is the command-line override; repeatable. `--config-file
-/// PATH` overrides where the config file itself is read from (this one setting cannot
-/// be sourced from the file it names).
+/// `aub config`: prints every resolved key with its value and the source that
+/// won it, in three aligned columns with one blank line between sections
+/// (aub-ukh5). The `accounts` and `transcripts` sections expand one row per
+/// element and field; a credential prints as `file:<path>`, `env:<NAME>` or
+/// `none` from its kind and reference, never the material, so no byte of any
+/// credential file can reach this output. `--set key=value` is the
+/// command-line override, shown with source `override`; repeatable.
+/// `--config-file PATH` overrides where the config file itself is read from
+/// (this one setting cannot be sourced from the file it names).
 fn config_command(args: impl Iterator<Item = OsString>) -> Result<(), Error> {
     let mut overrides = crate::config::Overrides::new();
     let mut config_file_flag: Option<String> = None;
@@ -2943,11 +2945,9 @@ fn config_command(args: impl Iterator<Item = OsString>) -> Result<(), Error> {
     let file_path = resolve_config_file_path(config_file_flag.as_deref(), &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
 
-    let (_config, provenance) =
+    let (config, provenance) =
         crate::config::resolve(&overrides, &env, file_contents.as_deref(), &file_path)?;
-    for (key, source) in provenance.entries() {
-        println!("{key:<32} {}", source.label());
-    }
+    print!("{}", config.render_provenance(&provenance));
     Ok(())
 }
 
@@ -7992,13 +7992,12 @@ mod tests {
         );
     }
 
-    /// `aub config`'s output never names a credential's file path or profile
-    /// reference: an account's provenance is reported as the one bucket key
-    /// `accounts`, never key-by-key, so the account's own `credential_detail`
-    /// (whatever kind of secret-adjacent reference it holds) has no key of its own to
-    /// be printed under.
+    /// `aub config` prints one row per account field (aub-ukh5): the
+    /// credential row carries the kind and the path it names
+    /// (`file:<path>`), and the section bucket (`accounts`) never appears as
+    /// a row of its own.
     #[test]
-    fn config_provenance_never_exposes_a_credential_detail_as_its_own_key() {
+    fn config_rows_print_credential_kind_and_path_not_a_section_bucket() {
         let file = r#"
 [[accounts]]
 name = "work-primary"
@@ -8020,17 +8019,20 @@ credential = { kind = "file", path = "/secret/path/to/credential.json" }
             config.accounts[0].credential_detail,
             "/secret/path/to/credential.json"
         );
-        // ... but no provenance key printed by `aub config` names it or carries it:
-        // the only key covering accounts is the one bucket key "accounts" itself.
-        for (key, _source) in provenance.entries() {
-            assert!(
-                !key.contains("credential"),
-                "a provenance key names credential material: {key}"
-            );
-        }
+        // ... and the printed rows name its kind and path, never a bare bucket:
+        // the only rows covering accounts are the per-field `accounts[0].*` rows.
+        let rows = config.provenance_rows(&provenance);
+        assert!(
+            rows.iter().all(|row| row.key != "accounts"),
+            "the accounts bucket must not appear as its own row"
+        );
+        let credential = rows
+            .iter()
+            .find(|row| row.key == "accounts[0].credential")
+            .expect("one credential row per account");
         assert_eq!(
-            provenance.get("accounts"),
-            Some(crate::config::ConfigSource::File)
+            credential.value, "file:/secret/path/to/credential.json",
+            "the credential row prints kind and path"
         );
     }
 

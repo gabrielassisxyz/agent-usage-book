@@ -115,12 +115,25 @@ or an API-list-price conversion for a number it cannot justify.
 
 ## `aub config`
 
-**Answers:** which configuration key resolved from where?
+**Answers:** which configuration key resolved to which value, and from where?
+
+Three aligned columns (key, resolved value, source), one blank line between
+sections, array sections expanded one row per element and field:
+
+    sampling.default_interval             5m                     default
+    sampling.max_concurrent_requests      2                      default
+
+    accounts[0].credential                file:/home/user/.claude/.credentials.json  file
+    accounts[0].name                      work                              file
+
+Column widths follow the rows: the key column fits the longest key, the value
+column fits the longest value up to 48 characters (longer values end in `…`).
+A `--set key=value` override prints with source `override`.
 
 **Refuses:** to invent a value for a key nobody set. An unset key prints with
 source `default`, never a value that looks like it came from a file. It also
-never prints a credential value, only the fact and source of the key that
-names one.
+never prints credential material, only the kind and reference (`file:<path>`,
+`env:<NAME>`, `none`) of the key that names one.
 
 An account's `credential` table takes one of three kinds:
 

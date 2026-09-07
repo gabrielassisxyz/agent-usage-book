@@ -45,6 +45,29 @@ fn split_unit(raw: &str) -> Option<(&str, &str, u64)> {
     Some((&raw[..split_at], &raw[split_at..], multiplier))
 }
 
+/// Renders a resolved duration for `aub config` (aub-ukh5): the largest whole
+/// unit that divides it exactly (`12m`, `48h` renders as `2d`, `90s` stays
+/// `90s`), so the printed value is exact rather than truncated to a smaller
+/// unit the way an age display would. A named function rather than a
+/// `Display` impl: `MonotonicDuration` is a domain quantity and the quantity
+/// inventory forbids it a free-standing `Display`, so rendering stays a
+/// call-site choice here instead.
+pub fn format_config_duration(duration: MonotonicDuration) -> String {
+    const NANOS_PER_SECOND: u64 = 1_000_000_000;
+    let nanos = duration.as_nanos();
+    if nanos >= 86_400 * NANOS_PER_SECOND && nanos.is_multiple_of(86_400 * NANOS_PER_SECOND) {
+        format!("{}d", nanos / (86_400 * NANOS_PER_SECOND))
+    } else if nanos >= 3_600 * NANOS_PER_SECOND && nanos.is_multiple_of(3_600 * NANOS_PER_SECOND) {
+        format!("{}h", nanos / (3_600 * NANOS_PER_SECOND))
+    } else if nanos >= 60 * NANOS_PER_SECOND && nanos.is_multiple_of(60 * NANOS_PER_SECOND) {
+        format!("{}m", nanos / (60 * NANOS_PER_SECOND))
+    } else if nanos.is_multiple_of(NANOS_PER_SECOND) {
+        format!("{}s", nanos / NANOS_PER_SECOND)
+    } else {
+        format!("{nanos}ns")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -83,5 +106,42 @@ mod tests {
     #[test]
     fn rejects_an_empty_string() {
         assert!(parse_duration("").is_err());
+    }
+
+    #[test]
+    fn config_durations_render_in_the_largest_exact_unit() {
+        assert_eq!(
+            format_config_duration(parse_duration("12m").unwrap()),
+            "12m"
+        );
+        assert_eq!(format_config_duration(parse_duration("5s").unwrap()), "5s");
+        assert_eq!(
+            format_config_duration(parse_duration("120s").unwrap()),
+            "2m"
+        );
+        assert_eq!(
+            format_config_duration(parse_duration("90s").unwrap()),
+            "90s"
+        );
+        assert_eq!(
+            format_config_duration(parse_duration("30d").unwrap()),
+            "30d"
+        );
+        assert_eq!(
+            format_config_duration(MonotonicDuration::from_seconds(0)),
+            "0s"
+        );
+    }
+
+    #[test]
+    fn config_duration_rendering_is_exact_never_truncated() {
+        // 48h is exactly 2d, so the largest exact unit wins; 90s has no
+        // exact minute form, so it stays seconds rather than losing 30s to
+        // a truncated minute rendering.
+        assert_eq!(format_config_duration(parse_duration("48h").unwrap()), "2d");
+        assert_eq!(
+            format_config_duration(parse_duration("90s").unwrap()),
+            "90s"
+        );
     }
 }
