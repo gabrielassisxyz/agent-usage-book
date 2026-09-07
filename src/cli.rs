@@ -1395,6 +1395,7 @@ pub(crate) fn sample_command(
             &crate::meter::adapter::EndpointConfig {
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
                 opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
+                codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
             },
         )?;
 
@@ -1408,6 +1409,10 @@ pub(crate) fn sample_command(
                 model: None,
                 workspace_id: acc.opencode_workspace.clone(),
                 local_home: acc.codex_home.clone(),
+                codex_sessions_owned: acc
+                    .codex_home
+                    .as_ref()
+                    .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
@@ -1881,6 +1886,7 @@ pub(crate) fn now_command(
             &crate::meter::adapter::EndpointConfig {
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
                 opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
+                codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
             },
         )?;
 
@@ -1894,6 +1900,10 @@ pub(crate) fn now_command(
                 model: None,
                 workspace_id: acc.opencode_workspace.clone(),
                 local_home: acc.codex_home.clone(),
+                codex_sessions_owned: acc
+                    .codex_home
+                    .as_ref()
+                    .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
@@ -5525,6 +5535,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             &crate::meter::adapter::EndpointConfig {
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
                 opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
+                codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
             },
         )?;
         let batch_accounts = vec![crate::meter::sampler::BatchAccount {
@@ -5537,6 +5548,10 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 model: None,
                 workspace_id: account_config.opencode_workspace.clone(),
                 local_home: account_config.codex_home.clone(),
+                codex_sessions_owned: account_config
+                    .codex_home
+                    .as_ref()
+                    .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,

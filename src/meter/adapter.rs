@@ -113,6 +113,15 @@ pub struct MeterRequest {
     /// of its own. `None` on every network meter, and no HTTP adapter reads
     /// it, so the HTTP adapters' shape is unchanged.
     pub local_home: Option<std::path::PathBuf>,
+    /// Whether `<local_home>/sessions` is a real directory owned by this home
+    /// (`aub-er47`). Resolved by the caller, which owns filesystem access the
+    /// adapter must not take (rule `17`): the Codex adapter takes the rollout
+    /// path only when this is true and the live-endpoint path otherwise, so
+    /// two homes sharing one sessions tree never report one rollout under two
+    /// names. Ignored by every other adapter. `false` is the safe default: a
+    /// rollout read without ownership proof is the defect this flag exists to
+    /// end, so an unresolved flag takes the endpoint path.
+    pub codex_sessions_owned: bool,
 }
 
 /// One provider-defined constraint kind an adapter requires in a successful
@@ -324,6 +333,11 @@ pub struct EndpointConfig {
     /// workspace id itself is account configuration, not an environment
     /// override, and travels in [`MeterRequest::workspace_id`].
     pub opencode: Option<String>,
+    /// Overrides the Codex usage endpoint URL (`AUB_CODEX_ENDPOINT`): the
+    /// full usage address the adapter reads for a home that does not own its
+    /// sessions tree, so a synthetic server can stand in for
+    /// `https://chatgpt.com/backend-api/wham/usage` in end-to-end runs.
+    pub codex: Option<String>,
 }
 
 /// The orchestrator-facing reading of whichever adapter the dispatch chose.
@@ -492,7 +506,13 @@ pub fn adapter_for(
         "opencode" => Ok(AnyAdapter::OpenCode(OpenCodeAdapter::new(
             endpoint_overrides.opencode.clone(),
         ))),
-        "codex" => Ok(AnyAdapter::Codex(CodexAdapter::new())),
+        "codex" => {
+            let endpoint = endpoint_overrides
+                .codex
+                .as_deref()
+                .unwrap_or(CodexAdapter::DEFAULT_ENDPOINT);
+            Ok(AnyAdapter::Codex(CodexAdapter::with_endpoint(endpoint)))
+        }
         "ollama" => Ok(AnyAdapter::Ollama(OllamaAdapter::new())),
         "agy" => Ok(AnyAdapter::Agy(AgyAdapter::new())),
         unsupported => Err(unsupported_provider_error(unsupported, account)),
@@ -611,6 +631,7 @@ mod tests {
         let overrides = EndpointConfig {
             anthropic: Some("http://127.0.0.1:9".to_string()),
             opencode: None,
+            codex: None,
         };
         let adapter = adapter_for("anthropic", "work-primary", &overrides)
             .expect("anthropic is in the supported table");
@@ -647,6 +668,7 @@ mod tests {
         let overrides = EndpointConfig {
             anthropic: None,
             opencode: Some("http://127.0.0.1:9/workspace/wrk_x/go".to_string()),
+            codex: None,
         };
         let adapter = adapter_for("opencode", "go-primary", &overrides)
             .expect("opencode is in the supported table");
@@ -686,6 +708,10 @@ mod tests {
                 );
                 assert!(declarations.required_window_kinds.contains("primary"));
                 assert!(declarations.required_window_kinds.contains("secondary"));
+                assert_eq!(
+                    codex.endpoint_url(),
+                    crate::meter::codex::CodexAdapter::DEFAULT_ENDPOINT
+                );
             }
             AnyAdapter::Anthropic(_)
             | AnyAdapter::Ollama(_)
@@ -695,6 +721,34 @@ mod tests {
             }
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"codex"));
+    }
+
+    /// The codex endpoint override the caller resolved crosses into the
+    /// chosen adapter; the default holds only when the override is absent
+    /// (aub-er47: the end-to-end endpoint case serves a stub through this).
+    #[test]
+    fn adapter_for_honours_the_resolved_codex_endpoint_override() {
+        let overrides = EndpointConfig {
+            anthropic: None,
+            opencode: None,
+            codex: Some("http://127.0.0.1:9/backend-api/wham/usage".to_string()),
+        };
+        let adapter = adapter_for("codex", "codex-primary", &overrides)
+            .expect("codex is in the supported table");
+        match adapter {
+            AnyAdapter::Codex(codex) => {
+                assert_eq!(
+                    codex.endpoint_url(),
+                    "http://127.0.0.1:9/backend-api/wham/usage"
+                );
+            }
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::OpenCode(_)
+            | AnyAdapter::Agy(_) => {
+                panic!("dispatch chose another arm for codex")
+            }
+        }
     }
 
     /// `aub-ud17`: the ollama arm dispatches to its default endpoint, the

@@ -23,6 +23,23 @@ pub fn create_dir_all(path: &Path) {
     fs::create_dir_all(path).expect("scratch directory must be creatable");
 }
 
+/// Links `link` at a directory entry pointing at `target`, without following
+/// anything: the link itself is created even when the target does not exist.
+///
+/// A meter test that needs a symlinked sessions tree (aub-er47) stages it
+/// through here for the same reason every other scratch writer lives here:
+/// boundary rule 17 reads the meter module's source as text, so spelling a
+/// symlink call inside `src/meter/` fails the gate even in test code.
+pub fn symlink(target: &Path, link: &Path) {
+    if let Some(parent) = link.parent() {
+        fs::create_dir_all(parent).expect("scratch parent directories must be creatable");
+    }
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).expect("scratch symlink must be creatable");
+    #[cfg(not(unix))]
+    panic!("scratch symlinks are only staged on unix");
+}
+
 /// Pins the modification time of an existing file to `unix_seconds`, so a
 /// test's ordering by mtime never depends on creation order or on the
 /// filesystem's timestamp granularity.
