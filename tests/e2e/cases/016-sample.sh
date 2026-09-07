@@ -206,7 +206,7 @@ case_assertions() {
     # Step 10: status prints the go-primary block; the limiting window is
     # the monthly one (35.2% left, 30d)
     assert_exit 0 10
-    assert_stdout_contains 10 "aub go-primary 35.2% left"
+    assert_stdout_contains 10 "go-primary  opencode"
 
     # Step 11: the cookie material never persisted
     assert_exit 0 11

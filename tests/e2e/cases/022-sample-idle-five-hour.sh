@@ -167,7 +167,8 @@ case_assertions() {
 
     # Step 3: status shows no window in progress
     assert_exit 0 3
-    assert_stdout_contains 3 "aub work-primary 100% left · no window in progress"
+    assert_stdout_contains 3 "work-primary  anthropic"
+    assert_stdout_contains 3 "not started"
 
     # Step 4: rm -f exits 0
     assert_exit 0 4
@@ -178,7 +179,8 @@ case_assertions() {
 
     # Step 6: status after rebuild still shows no window in progress
     assert_exit 0 6
-    assert_stdout_contains 6 "aub work-primary 100% left · no window in progress"
+    assert_stdout_contains 6 "work-primary  anthropic"
+    assert_stdout_contains 6 "not started"
 
     # Step 7: the env credential table resolved without error
     assert_exit 0 7

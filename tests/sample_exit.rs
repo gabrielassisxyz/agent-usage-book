@@ -463,9 +463,11 @@ fn sample_and_status_idle_five_hour_window_stores_observation_and_renders_no_win
         status_code, 0,
         "status must succeed; stderr: {status_stderr}"
     );
+    // The grouped grid (aub-qc1m) renders the idle five-hour window as its
+    // own row with no reset instant, in place of the old one-line form.
     assert!(
-        status_stdout.contains("100% left · no window in progress"),
-        "status stdout must contain '100% left · no window in progress', got: {status_stdout}"
+        status_stdout.contains("work-primary  anthropic") && status_stdout.contains("not started"),
+        "status stdout must show the account block with a not-started window, got: {status_stdout}"
     );
 }
 
