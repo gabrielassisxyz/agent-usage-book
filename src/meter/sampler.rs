@@ -80,6 +80,7 @@ use crate::meter::adapter::{
     CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter, ProviderObservation, Reading,
 };
 use crate::meter::anthropic::AnthropicReading;
+use crate::meter::codex::CodexReading;
 use crate::meter::due::{
     self, AttemptHistoryEntry, DueBasisRef, DueDecision, DueInputs, DuePolicy,
 };
@@ -137,6 +138,20 @@ impl MeteredReading for AnthropicReading {
     }
 }
 
+impl MeteredReading for CodexReading {
+    fn windows(&self) -> &[MeterWindow] {
+        &self.windows
+    }
+
+    fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
+        self.provider_observed_at
+    }
+
+    fn provider_contract_id(&self) -> Option<&ProviderContractId> {
+        Some(&self.provider_contract_id)
+    }
+}
+
 impl MeteredReading for OllamaReading {
     fn windows(&self) -> &[MeterWindow] {
         &self.windows
@@ -151,6 +166,7 @@ impl MeteredReading for Reading {
     fn windows(&self) -> &[MeterWindow] {
         match self {
             Reading::Anthropic(reading) => &reading.windows,
+            Reading::Codex(reading) => &reading.windows,
             Reading::Ollama(reading) => &reading.windows,
         }
     }
@@ -158,6 +174,7 @@ impl MeteredReading for Reading {
     fn provider_observed_at(&self) -> Option<ProviderObservedAt> {
         match self {
             Reading::Anthropic(reading) => reading.provider_observed_at,
+            Reading::Codex(reading) => reading.provider_observed_at,
             Reading::Ollama(reading) => reading.provider_observed_at(),
         }
     }
@@ -165,6 +182,7 @@ impl MeteredReading for Reading {
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         match self {
             Reading::Anthropic(reading) => Some(&reading.provider_contract_id),
+            Reading::Codex(reading) => Some(&reading.provider_contract_id),
             Reading::Ollama(_) => None,
         }
     }
