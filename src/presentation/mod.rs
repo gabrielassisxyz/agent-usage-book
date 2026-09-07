@@ -10,6 +10,7 @@
 
 pub mod export_jsonl;
 pub mod json;
+pub mod local_time;
 pub mod precision;
 pub mod render;
 pub mod style;
