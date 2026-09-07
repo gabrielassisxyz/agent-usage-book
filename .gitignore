@@ -53,3 +53,6 @@
 # stay next to the code they cite. Nothing in it belongs in this project's history. No
 # trailing slash, for the reason the private-boundary block above spells out.
 /beads_compliance_audit
+
+# Reference clones for comparison work, never committed (onWatch on 2026-09-07).
+_cloned/
