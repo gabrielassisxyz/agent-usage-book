@@ -603,6 +603,38 @@ mod tests {
         assert!(matches!(unknown_model[0].scope, WindowScope::AccountWide));
     }
 
+    /// A quota-group window joins the unselected reading and is excluded
+    /// under a model selector, the same composition the account-wide and
+    /// model-specific scopes follow (`aub-n8yx`). The negative: a naive
+    /// reuse of the account-wide arm would report a group budget as part of
+    /// a specific model's own reading.
+    #[test]
+    fn a_group_window_joins_the_unselected_reading_only() {
+        let group_window = ProjectedWindow {
+            semantic_key: "5h".to_string(),
+            scope: WindowScope::ModelGroup(crate::domain::window::GroupName::new(
+                "Gemini Models".to_string(),
+            )),
+            ..window(85_528, None)
+        };
+        let windows = vec![window(300_000, None), group_window];
+
+        let unselected = applicable_windows(&windows, None);
+        assert_eq!(
+            unselected.len(),
+            2,
+            "without a selector every window applies, groups included"
+        );
+
+        let selected = applicable_windows(&windows, Some("gemini-pro"));
+        assert_eq!(
+            selected.len(),
+            1,
+            "a group budget is not the selected model's own constraint"
+        );
+        assert!(matches!(selected[0].scope, WindowScope::AccountWide));
+    }
+
     /// The limiting window is the applicable window with the least remaining
     /// quota, and the reading value is that window's remaining fraction.
     #[test]
