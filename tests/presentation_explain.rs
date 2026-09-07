@@ -226,6 +226,7 @@ fn explain_full_names_the_burn_rate_and_its_observation_instant() {
         UtcTimestamp::from_unix_nanos(2_000),
         test_envelope(),
         ExplainMode::Full,
+        Style::plain(),
     );
     assert!(
         full.contains("burn rate: 2.00x, from observation received_at=1234"),
@@ -245,6 +246,7 @@ fn explain_full_names_the_burn_rate_and_its_observation_instant() {
         UtcTimestamp::from_unix_nanos(2_000),
         test_envelope(),
         ExplainMode::Summary,
+        Style::plain(),
     );
     assert!(
         !summary.contains("burn rate"),
