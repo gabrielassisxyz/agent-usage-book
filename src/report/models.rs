@@ -18,7 +18,7 @@ use crate::domain::ids::{NativeRunId, ProviderContractId};
 use crate::domain::interval::Interval;
 use crate::domain::money::Usd;
 use crate::domain::provenance::{CostModelId, DerivationId, RateCardId, WindowCalibrationId};
-use crate::domain::quota::{PercentagePoints, QuotaRemaining};
+use crate::domain::quota::{PercentagePoints, QuotaRemaining, QuotaUsed};
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::domain::window::{
@@ -131,6 +131,14 @@ pub struct MeterAccount {
     /// a projection observation with a window that has a `Known` reset. Absent
     /// for a reading with no window context.
     pub burn_rate: Option<WindowBurnRate>,
+    /// Every provider window behind this account's last successful observation,
+    /// as the grouped-grid `aub status` renderer needs them: one grid row per
+    /// entry, with the window's stored inputs, its report-time burn rate and
+    /// the freshness of the observation it was read from. Empty for `aub now`,
+    /// which does not render a per-window grid, and for a reading with no
+    /// successful observation behind it. The limiting window is *derived* from
+    /// this list (`limiting_status_window`), never stored beside it.
+    pub windows: Vec<StatusWindow>,
 }
 
 impl MeterAccount {
@@ -143,6 +151,7 @@ impl MeterAccount {
             selected_model: None,
             meter_explanation: None,
             burn_rate: None,
+            windows: Vec::new(),
         }
     }
 
@@ -163,6 +172,7 @@ impl MeterAccount {
             selected_model,
             meter_explanation: None,
             burn_rate: None,
+            windows: Vec::new(),
         }
     }
 
@@ -171,11 +181,78 @@ impl MeterAccount {
         self
     }
 
+    /// Attaches the per-window grid the grouped-grid `aub status` renderer
+    /// consumes. The windows arrive in provider order; the renderer sorts each
+    /// account's rows itself.
+    pub fn with_windows(mut self, windows: Vec<StatusWindow>) -> Self {
+        self.windows = windows;
+        self
+    }
+
+    /// The window this account is most constrained by, derived from
+    /// [`Self::windows`] rather than read from a field stored beside it: the
+    /// active window with the highest quota used, a not-started window only
+    /// when it is the only one. `None` when the account has no windows.
+    ///
+    /// This is the status grid's own selection. It matches the projection
+    /// reader's limiting-window rule (least remaining == most used) but is
+    /// computed here so the grid and its limiting row cannot disagree.
+    pub fn limiting_status_window(&self) -> Option<&StatusWindow> {
+        self.windows
+            .iter()
+            .max_by_key(|window| window.limiting_rank())
+    }
+
     /// Attaches the limiting window's burn rate. A reading with no window
     /// context keeps the [`MeterAccount::new`] default of `None`.
     pub fn with_burn_rate(mut self, burn_rate: WindowBurnRate) -> Self {
         self.burn_rate = Some(burn_rate);
         self
+    }
+}
+
+/// One provider quota window as the grouped-grid `aub status` renderer needs
+/// it: the provider's stored inputs for the window, the burn rate derived for
+/// it at report time, the cap-freeze instant when one is known, and the
+/// freshness of the observation the window was read from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusWindow {
+    /// The provider's own key for the window (`five_hour`, `weekly_all`, a
+    /// scoped `weekly_scoped_<model>`), used only for row ordering and never
+    /// shown verbatim.
+    pub semantic_key: String,
+    pub scope: WindowScope,
+    /// Quota consumed, parts per million of the window's cap. The grid's bar
+    /// and percent are quota *used*, so this is rendered directly, not
+    /// complemented.
+    pub quota_used: QuotaUsed,
+    pub reset_state: WindowResetState,
+    pub nominal_duration: NominalWindowDuration,
+    /// The burn rate derived for this window at report time, or `None` when it
+    /// has not started, has already capped, or too little of it has elapsed to
+    /// divide by.
+    pub rate: Option<BurnRate>,
+    /// The instant this window first reached its cap in the current reset
+    /// cycle, when a series was available to find it in. The status path reads
+    /// the projection's latest observation alone, so this is `None` today.
+    pub capped_at: Option<UtcTimestamp>,
+    /// The freshness of the account observation this window was read from.
+    /// Every window of one account shares it; it travels per-window so a row
+    /// renderer never has to reach back to the account.
+    pub observation: Freshness<QuotaRemaining>,
+}
+
+impl StatusWindow {
+    /// The sort key that picks the limiting window: an active, started window
+    /// ranks by quota used (higher == more constrained); a not-started window
+    /// ranks below every started one so it only wins when it is alone.
+    fn limiting_rank(&self) -> u32 {
+        if self.reset_state.is_not_started() {
+            0
+        } else {
+            // +1 so a started window at 0 used still outranks a not-started one.
+            self.quota_used.as_ppm().get().saturating_add(1)
+        }
     }
 }
 
@@ -2084,5 +2161,106 @@ mod tests {
                 "the exception for {owner} states no reason"
             );
         }
+    }
+
+    fn status_window(key: &str, scope: WindowScope, used_ppm: i32) -> StatusWindow {
+        StatusWindow {
+            semantic_key: key.to_string(),
+            scope,
+            quota_used: crate::domain::quota::QuotaUsed::new(
+                QuotaFractionPpm::new(used_ppm).unwrap(),
+            ),
+            reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000)),
+            nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+            rate: None,
+            capped_at: None,
+            observation: Freshness::Fresh {
+                observed: crate::domain::freshness::Observed::new(
+                    remaining(400_000),
+                    None,
+                    crate::domain::time::ReceivedAt::new(UtcTimestamp::from_unix_nanos(1_000)),
+                    crate::domain::time::MeasurementBasis::ProviderObserved,
+                ),
+                latest_attempt: AttemptId::new(1),
+            },
+        }
+    }
+
+    /// The limiting window is the started window with the highest quota used,
+    /// derived from the list. The planted negative: a not-started window at a
+    /// nominal 0% used must not outrank a started window that has consumed
+    /// more, and a bare `max_by_key` on `quota_used` alone would pick wrong
+    /// when the not-started window sorts first.
+    #[test]
+    fn limiting_status_window_is_the_most_used_started_window() {
+        let account = MeterAccount::new(
+            LogicalName::new("primary"),
+            Freshness::Fresh {
+                observed: crate::domain::freshness::Observed::new(
+                    remaining(400_000),
+                    None,
+                    crate::domain::time::ReceivedAt::new(UtcTimestamp::from_unix_nanos(1_000)),
+                    crate::domain::time::MeasurementBasis::ProviderObserved,
+                ),
+                latest_attempt: AttemptId::new(1),
+            },
+        )
+        .with_windows(vec![
+            status_window("five_hour", WindowScope::AccountWide, 620_000),
+            status_window(
+                "weekly_scoped_fable",
+                WindowScope::ModelSpecific(ModelId::new("fable".to_string())),
+                810_000,
+            ),
+            {
+                let mut idle = status_window("weekly_all", WindowScope::AccountWide, 0);
+                idle.reset_state = WindowResetState::NotStarted;
+                idle
+            },
+        ]);
+
+        assert_eq!(
+            account
+                .limiting_status_window()
+                .map(|w| w.semantic_key.as_str()),
+            Some("weekly_scoped_fable"),
+        );
+
+        // With only a not-started window, it is the limit because it is alone.
+        let idle_only = MeterAccount::new(
+            LogicalName::new("primary"),
+            Freshness::Fresh {
+                observed: crate::domain::freshness::Observed::new(
+                    remaining(1_000_000),
+                    None,
+                    crate::domain::time::ReceivedAt::new(UtcTimestamp::from_unix_nanos(1_000)),
+                    crate::domain::time::MeasurementBasis::ProviderObserved,
+                ),
+                latest_attempt: AttemptId::new(1),
+            },
+        )
+        .with_windows(vec![{
+            let mut idle = status_window("weekly_all", WindowScope::AccountWide, 0);
+            idle.reset_state = WindowResetState::NotStarted;
+            idle
+        }]);
+        assert_eq!(
+            idle_only
+                .limiting_status_window()
+                .map(|w| w.semantic_key.as_str()),
+            Some("weekly_all"),
+        );
+
+        assert!(
+            MeterAccount::new(
+                LogicalName::new("primary"),
+                Freshness::AuthRequired {
+                    last_good: None,
+                    latest_attempt: AttemptId::new(1),
+                },
+            )
+            .limiting_status_window()
+            .is_none(),
+        );
     }
 }
