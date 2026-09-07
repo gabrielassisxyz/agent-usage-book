@@ -7,6 +7,7 @@
 
 pub mod attempt;
 pub mod authoritative_comparison;
+pub mod burn_rate;
 pub mod credits;
 pub mod failure;
 pub mod freshness;
