@@ -2,7 +2,7 @@
 //!
 //! The rest of this binary is deliberately UTC-only: a reading's age must not
 //! depend on which clock was handy. The status grid is the one exception the
-//! operator asked for, and only for *display* — a reset instant and the report
+//! operator asked for, and only for display. A reset instant and the report
 //! header read far better as "Wed 11:00" in the timezone the person is sitting
 //! in than as a UTC clock they have to shift in their head. JSON stays UTC.
 //!

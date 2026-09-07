@@ -3234,6 +3234,7 @@ fn projection_accounts(
                 // the reading was computed under; it rides onto each grid row
                 // so a row renderer never reaches back to the account.
                 let observation_freshness = reading.freshness.clone();
+                let provider = account.provider.clone();
                 let account = MeterAccount::from_projection(
                     LogicalName::new(account.name.clone()),
                     reading.freshness,
@@ -3246,7 +3247,8 @@ fn projection_accounts(
                         }),
                     reading.included_scopes,
                     model_selector.map(crate::domain::window::ModelId::new),
-                );
+                )
+                .with_provider(provider);
                 let account = match burn_rate {
                     Some(burn_rate) => account.with_burn_rate(burn_rate),
                     None => account,

@@ -139,6 +139,12 @@ pub struct MeterAccount {
     /// successful observation behind it. The limiting window is *derived* from
     /// this list (`limiting_status_window`), never stored beside it.
     pub windows: Vec<StatusWindow>,
+    /// The provider this account is configured under (`anthropic`, `openai`,
+    /// ...), the key the grouped-grid `aub status` renderer groups blocks by
+    /// and, until an adapter reports `observed_plan`, the plan label it prints
+    /// under the account name. `None` for `aub now` and for reports assembled
+    /// without configuration.
+    pub provider: Option<String>,
 }
 
 impl MeterAccount {
@@ -152,6 +158,7 @@ impl MeterAccount {
             meter_explanation: None,
             burn_rate: None,
             windows: Vec::new(),
+            provider: None,
         }
     }
 
@@ -173,6 +180,7 @@ impl MeterAccount {
             meter_explanation: None,
             burn_rate: None,
             windows: Vec::new(),
+            provider: None,
         }
     }
 
@@ -186,6 +194,13 @@ impl MeterAccount {
     /// account's rows itself.
     pub fn with_windows(mut self, windows: Vec<StatusWindow>) -> Self {
         self.windows = windows;
+        self
+    }
+
+    /// Names the provider this account is configured under, for the status
+    /// renderer's provider grouping.
+    pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
+        self.provider = Some(provider.into());
         self
     }
 
