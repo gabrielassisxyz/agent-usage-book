@@ -34,10 +34,13 @@
 //! 4. **Ordinary cadence**: the account's interval expired since the previous
 //!    due instant. An account with no history at all is due.
 //! 5. **Rate-limit postponement**: if the most recent result was rate limited
-//!    with a `Retry-After` longer than the remaining cadence, the computed
-//!    due instant is clamped up to the postponement's end, honoring the
-//!    provider's instruction for every reason - a reset edge waited out is
-//!    caught by the post-reset confirmation once the reset passes.
+//!    with a `Retry-After`, the due instant is the refusal's instant plus the
+//!    delay capped by the policy's ceiling, when that lies past the cadence
+//!    boundary: the provider's instruction holds the account for every tick
+//!    until the instant, not only for the remainder of the current cadence,
+//!    and the interval after it resumes the ordinary grid from the
+//!    postponement's end. A reset edge waited out is caught by the post-reset
+//!    confirmation once the reset passes.
 //!
 //! The decision is a pure function of its inputs. Nothing here reads a clock,
 //! a file, or a database: the caller assembles the history from the store and
@@ -88,6 +91,10 @@ pub struct DuePolicy {
     /// How close to a known reset the sampler starts demanding pre-reset
     /// evidence (the configured edge lead).
     pub reset_edge_lead: MonotonicDuration,
+    /// The longest `Retry-After` the decision honours past a refusal
+    /// (aub-6w85). A delay above the ceiling is clamped to it, so a broken
+    /// or malicious header cannot silence an account for a day.
+    pub retry_after_cap: MonotonicDuration,
 }
 
 /// Which prior fact the decision was based on, at the domain level. The store
@@ -195,7 +202,11 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
         }
     }
 
-    // Rule 4: the ordinary interval expired since the previous due instant.
+    // Rule 4: the ordinary interval expired since the previous due instant,
+    // unless the most recent result's capped Retry-After holds the account
+    // past that boundary - the postponement governs the due instant itself,
+    // not only the not-yet report, so a lockout outlasting the cadence costs
+    // one refused attempt and not one per tick.
     let Some(entry) = last else {
         return DueDecision::Due {
             due_at: inputs.now,
@@ -206,32 +217,34 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
     let cadence_due_at = UtcTimestamp::from_unix_nanos(
         entry.due_at.unix_nanos() + inputs.policy.ordinary_cadence.as_nanos() as i64,
     );
-    if now >= cadence_due_at.unix_nanos() {
-        return DueDecision::Due {
-            due_at: cadence_due_at,
-            reason: DueReason::OrdinaryCadence,
-            basis: Some(AttemptHistoryEntry::basis(entry)),
-        };
-    }
-
-    // Rule 5: not yet due - the next due instant is the cadence boundary,
-    // clamped up by a Retry-After the most recent result carries.
-    let next_due_at = retry_postponement(entry)
+    let effective_due_at = retry_postponement(entry, inputs.policy.retry_after_cap)
         .filter(|postponed_until| postponed_until.unix_nanos() > cadence_due_at.unix_nanos())
         .unwrap_or(cadence_due_at);
-    DueDecision::NotYet {
-        next_due_at,
+    if now < effective_due_at.unix_nanos() {
+        return DueDecision::NotYet {
+            next_due_at: effective_due_at,
+            reason: DueReason::OrdinaryCadence,
+        };
+    }
+    DueDecision::Due {
+        due_at: effective_due_at,
         reason: DueReason::OrdinaryCadence,
+        basis: Some(AttemptHistoryEntry::basis(entry)),
     }
 }
 
 /// The instant the next attempt is owed after one result, reconstructible
 /// from the result plus the policy snapshot alone (PLAN.md 14.5): a
-/// `Retry-After` postpones by its own value when it exceeds the remaining
-/// cadence, and every other outcome resumes the ordinary cadence from the
-/// attempt's finish. This is the function coverage relies on to tell a
-/// deliberately postponed interval from a missed one.
-pub fn next_due_after(result: &AttemptResult, ordinary_cadence: MonotonicDuration) -> UtcTimestamp {
+/// `Retry-After` postpones by its own value capped at the policy ceiling,
+/// and never below the ordinary cadence, while every other outcome resumes
+/// the ordinary cadence from the attempt's finish. This is the function
+/// coverage relies on to tell a deliberately postponed interval from a
+/// missed one.
+pub fn next_due_after(
+    result: &AttemptResult,
+    ordinary_cadence: MonotonicDuration,
+    retry_after_cap: MonotonicDuration,
+) -> UtcTimestamp {
     let retry_after = match result.outcome() {
         AttemptOutcome::Unreachable(FailureClass::RateLimited { retry_after }) => retry_after,
         AttemptOutcome::Success | AttemptOutcome::AuthRequired => None,
@@ -246,21 +259,24 @@ pub fn next_due_after(result: &AttemptResult, ordinary_cadence: MonotonicDuratio
             | FailureClass::SchemaDrift,
         ) => None,
     };
-    let postpone = retry_after
+    let capped = retry_after.map(|delay| delay.min(retry_after_cap));
+    let postpone = capped
         .map(|delay| delay.as_nanos())
         .unwrap_or(0)
         .max(ordinary_cadence.as_nanos());
     UtcTimestamp::from_unix_nanos(result.finished_at().unix_nanos() + postpone as i64)
 }
 
-/// The instant a rate-limited result holds the account until, when it does.
-fn retry_postponement(entry: &AttemptHistoryEntry) -> Option<UtcTimestamp> {
+/// The instant a rate-limited result holds the account until, when it does:
+/// the refusal's finish plus its `Retry-After` capped at the policy ceiling,
+/// so a header cannot hold the account longer than the operator allowed.
+fn retry_postponement(entry: &AttemptHistoryEntry, cap: MonotonicDuration) -> Option<UtcTimestamp> {
     let result = entry.result.as_ref()?;
     match result.outcome() {
         AttemptOutcome::Unreachable(FailureClass::RateLimited { retry_after }) => {
             let delay = retry_after?;
             Some(UtcTimestamp::from_unix_nanos(
-                result.finished_at().unix_nanos() + delay.as_nanos() as i64,
+                result.finished_at().unix_nanos() + delay.min(cap).as_nanos() as i64,
             ))
         }
         AttemptOutcome::Success | AttemptOutcome::AuthRequired => None,
@@ -285,9 +301,14 @@ mod tests {
     const MINUTE: i64 = 60_000_000_000;
 
     fn policy(cadence_secs: u64, edge_lead_secs: u64) -> DuePolicy {
+        policy_with_cap(cadence_secs, edge_lead_secs, 3600)
+    }
+
+    fn policy_with_cap(cadence_secs: u64, edge_lead_secs: u64, cap_secs: u64) -> DuePolicy {
         DuePolicy {
             ordinary_cadence: MonotonicDuration::from_seconds(cadence_secs),
             reset_edge_lead: MonotonicDuration::from_seconds(edge_lead_secs),
+            retry_after_cap: MonotonicDuration::from_seconds(cap_secs),
         }
     }
 
@@ -574,6 +595,152 @@ mod tests {
         );
     }
 
+    // Rule 5, capped side: a header past the ceiling is clamped to it, so a
+    // broken or malicious header cannot silence an account for a day. An
+    // implementation that trusted the header verbatim would wait 7200s here.
+    #[test]
+    fn a_retry_after_above_the_cap_is_clamped_to_the_cap() {
+        let last = rate_limited_entry(0, Some(7200)); // 2 h Retry-After
+        let inputs = DueInputs {
+            policy: policy_with_cap(300, 120, 3600),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(MINUTE),
+            forced: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(3600 * 1_000_000_000),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    // Rule 5, uncapped side: a header below the ceiling passes through whole.
+    // The near-identical positive that pairs with the clamp above, differing
+    // only in which side of the ceiling the delay sits on.
+    #[test]
+    fn a_retry_after_below_the_cap_passes_through_uncapped() {
+        let last = rate_limited_entry(0, Some(1800)); // 30 min Retry-After
+        let inputs = DueInputs {
+            policy: policy_with_cap(300, 120, 3600),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(MINUTE),
+            forced: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(1800 * 1_000_000_000),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    // The scheduler's shape, at due.rs level: the entry the sampler builds
+    // (a persisted due instant and a reconstructed result) after a one-hour
+    // lockout. Every 300 s tick until the header's instant reports not-yet
+    // with the same next due instant, the cadence boundary long past; the
+    // tick at the instant itself is due, and the grid resumes from the
+    // postponement's end rather than collapsing into a catch-up storm.
+    #[test]
+    fn an_hour_lockout_holds_every_tick_until_the_header_s_instant() {
+        let lockout_policy = policy(300, 120); // 5 min cadence, 1 h cap
+        // The entry as the sampler rebuilds it from the store: due at t=0,
+        // refused seconds later with Retry-After: 3600.
+        let refused = rate_limited_entry_finished_at(0, 1_000_000_000, Some(3600));
+        let next_due = UtcTimestamp::from_unix_nanos(3601 * 1_000_000_000);
+
+        // Eleven ticks inside the lockout, on the 300 s cadence grid.
+        for tick in 1..=11i64 {
+            let now = UtcTimestamp::from_unix_nanos(tick * 5 * MINUTE);
+            let inputs = DueInputs {
+                policy: lockout_policy,
+                history: vec![refused.clone()],
+                known_resets: vec![],
+                now,
+                forced: false,
+            };
+            assert_eq!(
+                evaluate(&inputs),
+                DueDecision::NotYet {
+                    next_due_at: next_due,
+                    reason: DueReason::OrdinaryCadence,
+                },
+                "tick at {}s must hold until the header's instant",
+                now.unix_nanos()
+            );
+        }
+
+        // The tick after the header's instant is due, at the postponement's
+        // end: the grid resumes there, so the next cadence boundary is one
+        // interval later, not one per elapsed tick.
+        let inputs = DueInputs {
+            policy: lockout_policy,
+            history: vec![refused],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(3601 * 1_000_000_000),
+            forced: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(3601 * 1_000_000_000),
+                reason: DueReason::OrdinaryCadence,
+                basis: Some(DueBasisRef::Result(AttemptId::new(0))),
+            }
+        );
+    }
+
+    // A reset that has already passed fires the post-reset confirmation even
+    // though the most recent result's Retry-After is still holding: a reading
+    // at a reset edge is worth one refused attempt.
+    #[test]
+    fn a_passed_reset_inside_the_postponement_still_fires() {
+        let last = rate_limited_entry(0, Some(3600));
+        let reset = UtcTimestamp::from_unix_nanos(MINUTE);
+        let inputs = DueInputs {
+            policy: policy(300, 120),
+            history: vec![last],
+            known_resets: vec![reset],
+            now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
+            forced: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::Due {
+                due_at: reset,
+                reason: DueReason::PostResetConfirmation,
+                basis: Some(DueBasisRef::Result(AttemptId::new(0))),
+            }
+        );
+    }
+
+    // A reset approaching within the edge lead fires the reset-edge sample
+    // inside the postponement, for the same reason.
+    #[test]
+    fn a_reset_edge_inside_the_postponement_still_fires() {
+        let last = rate_limited_entry(0, Some(3600));
+        let reset = UtcTimestamp::from_unix_nanos(3 * MINUTE);
+        let inputs = DueInputs {
+            policy: policy(300, 120), // 2 min edge lead
+            history: vec![last],
+            known_resets: vec![reset],
+            now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
+            forced: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(MINUTE),
+                reason: DueReason::ResetEdge,
+                basis: Some(DueBasisRef::Result(AttemptId::new(0))),
+            }
+        );
+    }
+
     #[test]
     fn ordinary_cadence_keeps_its_grid_after_a_late_attempt() {
         let inputs = DueInputs {
@@ -705,20 +872,22 @@ mod tests {
 
     proptest::proptest! {
         /// The next-due instant after a result is a pure function of the
-        /// result and the policy's ordinary cadence alone (PLAN.md 14.5): it
-        /// must match the documented postponement formula independently
-        /// computed here, and recomputing it from the same two inputs at a
-        /// later time (simulating a reconstruction from a persisted attempt
-        /// plus its policy snapshot, rather than a value cached at decision
-        /// time) must reproduce exactly the same instant.
+        /// result and the policy's ordinary cadence and cap alone (PLAN.md
+        /// 14.5): it must match the documented postponement formula
+        /// independently computed here, and recomputing it from the same
+        /// inputs at a later time (simulating a reconstruction from a
+        /// persisted attempt plus its policy snapshot, rather than a value
+        /// cached at decision time) must reproduce exactly the same instant.
         #[test]
         fn next_due_after_reconstructs_deterministically_from_result_and_policy(
             finished_secs in 0i64..10_000_000,
             cadence_secs in 1u64..100_000,
+            cap_secs in 0u64..100_000,
             retry_after_secs in proptest::option::of(0u64..100_000),
         ) {
             let finished_at = UtcTimestamp::from_unix_nanos(finished_secs * 1_000_000_000);
             let cadence = MonotonicDuration::from_seconds(cadence_secs);
+            let cap = MonotonicDuration::from_seconds(cap_secs);
             let retry_after = retry_after_secs.map(MonotonicDuration::from_seconds);
             let result = AttemptResult::new(
                 AttemptId::new(1),
@@ -728,7 +897,7 @@ mod tests {
             );
 
             let postpone_nanos = retry_after
-                .map(MonotonicDuration::as_nanos)
+                .map(|delay| delay.min(cap).as_nanos())
                 .unwrap_or(0)
                 .max(cadence.as_nanos());
             let expected = UtcTimestamp::from_unix_nanos(finished_at.unix_nanos() + postpone_nanos as i64);
@@ -736,8 +905,8 @@ mod tests {
             // Two independent reconstructions from the same (result, policy)
             // pair, as two different callers would perform at two different
             // times, must agree with each other and with the formula.
-            let first = next_due_after(&result, cadence);
-            let second = next_due_after(&result, cadence);
+            let first = next_due_after(&result, cadence, cap);
+            let second = next_due_after(&result, cadence, cap);
             prop_assert_eq!(first, expected);
             prop_assert_eq!(first, second);
         }
@@ -748,10 +917,12 @@ mod tests {
         fn next_due_after_non_rate_limited_outcome_resumes_ordinary_cadence(
             finished_secs in 0i64..10_000_000,
             cadence_secs in 1u64..100_000,
+            cap_secs in 0u64..100_000,
             outcome_choice in 0u8..3,
         ) {
             let finished_at = UtcTimestamp::from_unix_nanos(finished_secs * 1_000_000_000);
             let cadence = MonotonicDuration::from_seconds(cadence_secs);
+            let cap = MonotonicDuration::from_seconds(cap_secs);
             let outcome = match outcome_choice {
                 0 => AttemptOutcome::Success,
                 1 => AttemptOutcome::AuthRequired,
@@ -767,7 +938,7 @@ mod tests {
             let expected = UtcTimestamp::from_unix_nanos(
                 finished_at.unix_nanos() + cadence.as_nanos() as i64,
             );
-            prop_assert_eq!(next_due_after(&result, cadence), expected);
+            prop_assert_eq!(next_due_after(&result, cadence, cap), expected);
         }
     }
 }

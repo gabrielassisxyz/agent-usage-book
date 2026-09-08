@@ -209,6 +209,13 @@ pub struct SamplingConfig {
     /// unbounded number of simultaneous connections; the default is small
     /// because only a few accounts exist today.
     pub max_concurrent_requests: usize,
+    /// The longest a provider's `Retry-After` may hold an account past its
+    /// refusal (aub-6w85). The Anthropic usage endpoint locks a token out for
+    /// one hour and says so in the header; honouring the header verbatim
+    /// would let a malicious or broken one silence an account for a day, so
+    /// a delay above this ceiling is clamped to it. `0s` disables honouring
+    /// beyond the ordinary cadence, which is the rollback.
+    pub retry_after_cap: MonotonicDuration,
 }
 
 /// The transcript ingest batch policy (PLAN.md section 11.2: "Transcript ingest
@@ -502,6 +509,7 @@ const SAMPLING_KEYS: &[&str] = &[
     "busy_timeout",
     "command_budget",
     "max_concurrent_requests",
+    "retry_after_cap",
 ];
 const INGEST_KEYS: &[&str] = &["max_batch_events", "max_batch_files", "max_batch_seconds"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
@@ -1131,6 +1139,15 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        retry_after_cap: resolve_duration(
+            "sampling.retry_after_cap",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "retry_after_cap"),
+            Some("3600s"),
+            &file_display,
+            &mut provenance,
+        )?,
     };
 
     let freshness = FreshnessConfig {
@@ -1746,6 +1763,7 @@ impl Config {
             "sampling.busy_timeout" => format_config_duration(self.sampling.busy_timeout),
             "sampling.command_budget" => format_config_duration(self.sampling.command_budget),
             "sampling.max_concurrent_requests" => self.sampling.max_concurrent_requests.to_string(),
+            "sampling.retry_after_cap" => format_config_duration(self.sampling.retry_after_cap),
             "ingest.max_batch_events" => self.ingest.max_batch_events.to_string(),
             "ingest.max_batch_files" => self.ingest.max_batch_files.to_string(),
             "ingest.max_batch_seconds" => format_config_duration(self.ingest.max_batch_seconds),
@@ -3169,6 +3187,7 @@ sampling.default_interval             5m                                       d
 sampling.max_concurrent_requests      2                                        default
 sampling.request_timeout              5s                                       default
 sampling.reset_edge_lead              2m                                       default
+sampling.retry_after_cap              1h                                       default
 sampling.scheduler_tick               1m                                       default
 
 state.dir                             /home/synthetic-user/.local/state/aub    default

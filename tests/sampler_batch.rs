@@ -124,6 +124,7 @@ fn batch_account(name: &str, endpoint: String) -> BatchAccount<AnthropicAdapter>
             policy_algorithm_version: "v1".to_string(),
         },
         reset_edge_lead: MonotonicDuration::from_seconds(120),
+        retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: false,
         adapter_version: AdapterVersion::new("adapter-integration-v1"),
     }

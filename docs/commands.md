@@ -202,6 +202,7 @@ without the section prefix (the full box for a two-account config):
 │    max_concurrent_requests  2                                       default  │
 │    request_timeout          5s                                      default  │
 │    reset_edge_lead          2m                                      default  │
+│    retry_after_cap          1h                                      default  │
 │    scheduler_tick           1m                                      default  │
 │                                                                              │
 │  state                                                                       │

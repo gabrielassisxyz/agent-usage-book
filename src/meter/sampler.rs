@@ -224,6 +224,10 @@ pub struct BatchAccount<A> {
     /// Configuration resolves it; the policy snapshot records the same value
     /// in its own string form.
     pub reset_edge_lead: MonotonicDuration,
+    /// The longest `Retry-After` the due decision honours past a refusal
+    /// (aub-6w85). Configuration resolves it; the policy snapshot records
+    /// the same rule in its own string form.
+    pub retry_after_cap: MonotonicDuration,
     /// An explicit operator or hook request: due regardless of history.
     pub forced: bool,
     /// Which adapter build produced the reading, persisted on the
@@ -541,6 +545,7 @@ where
             policy: DuePolicy {
                 ordinary_cadence: account.policy.ordinary_cadence,
                 reset_edge_lead: account.reset_edge_lead,
+                retry_after_cap: account.retry_after_cap,
             },
             history,
             known_resets: snapshot.known_resets,
@@ -1141,6 +1146,9 @@ mod tests {
         ServerError,
         /// A body that is not JSON, so the adapter records a malformed body.
         Malformed,
+        /// A 429 with a `Retry-After` of this many seconds, so the adapter
+        /// records a rate limit carrying the header (aub-6w85).
+        RateLimited(u64),
     }
 
     /// The test transport: per-account scripts keyed off the request URL,
@@ -1232,6 +1240,11 @@ mod tests {
                     headers: Vec::new(),
                     body: b"boom".to_vec(),
                 }),
+                Some(ScriptedOutcome::RateLimited(retry_after_secs)) => Ok(HttpResponse {
+                    status: 429,
+                    headers: vec![("retry-after".to_string(), retry_after_secs.to_string())],
+                    body: b"rate limited".to_vec(),
+                }),
                 Some(ScriptedOutcome::Malformed) => Ok(HttpResponse {
                     status: 200,
                     headers: Vec::new(),
@@ -1300,6 +1313,7 @@ mod tests {
                 policy_algorithm_version: "v1".to_string(),
             },
             reset_edge_lead: MonotonicDuration::from_seconds(120),
+            retry_after_cap: MonotonicDuration::from_seconds(3600),
             forced: false,
             adapter_version: AdapterVersion::new("adapter-test-v1"),
         }
@@ -1649,6 +1663,96 @@ mod tests {
         assert_eq!(
             second.workers_spawned, 1,
             "only the due account gets a worker"
+        );
+    }
+
+    /// The lockout path end to end, over the entry the sampler actually
+    /// builds from the store (aub-6w85): a first batch refused with
+    /// `Retry-After: 3600` holds the account across the ticks whose cadence
+    /// boundary has already passed, until the header's instant, and the next
+    /// batch after it samples again. An implementation that consulted the
+    /// postponement only before the cadence boundary would re-attempt every
+    /// 300 s here, which is the shape the production ledger recorded eleven
+    /// times in a row.
+    #[test]
+    fn a_rate_limited_lockout_holds_across_ticks_until_the_header_s_instant() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        transport.script("locked", ScriptedOutcome::RateLimited(3600));
+        let account = batch_account("locked");
+        let repository = Repository::new(&database_path, policy());
+
+        let run_batch = |accounts: &[BatchAccount<AnthropicAdapter>]| {
+            SamplingOrchestrator {
+                repository: &repository,
+                transport: &transport,
+                clock: &clock,
+                trigger: Trigger::Timer,
+                configuration_fingerprint: "fixture".to_string(),
+                holder: LeaseHolder::new("test-holder"),
+                lease_ttl: MonotonicDuration::from_seconds(30),
+                command_budget: MonotonicDuration::from_seconds(30),
+                max_concurrent_requests: 2,
+            }
+            .run(accounts)
+            .expect("the batch must run")
+        };
+
+        // First batch: no history, so the account is due, and the scripted
+        // transport refuses it with the header. This refusal is the only
+        // request of the lockout.
+        let first = run_batch(std::slice::from_ref(&account));
+        let first_sampled = sampled(&first.accounts[0]);
+        assert_eq!(
+            first_sampled.outcome,
+            AttemptOutcome::Unreachable(FailureClass::RateLimited {
+                retry_after: Some(MonotonicDuration::from_seconds(3600)),
+            })
+        );
+        let finished_at = repository
+            .attempt_result(first_sampled.attempt_id)
+            .expect("the result read must succeed")
+            .expect("the refused attempt has a terminal result")
+            .finished_at();
+        assert_eq!(transport.calls("locked"), 1);
+
+        // Second batch one cadence later: the cadence boundary has passed,
+        // but the header holds until finish + 3600 s, so the account is not
+        // due and no request goes out.
+        clock.advance(MonotonicDuration::from_seconds(300));
+        let second = run_batch(std::slice::from_ref(&account));
+        match &second.accounts[0].disposition {
+            AccountDisposition::NotYet { next_due_at } => assert_eq!(
+                next_due_at.unix_nanos(),
+                finished_at.unix_nanos() + 3_600_000_000_000i64,
+                "the next due instant is the refusal's finish plus the capped header"
+            ),
+            other @ (AccountDisposition::DueLookupFailed { .. }
+            | AccountDisposition::LeaseHeld { .. }
+            | AccountDisposition::EligibilityFailed { .. }
+            | AccountDisposition::Sampled(_)
+            | AccountDisposition::PersistFailed { .. }
+            | AccountDisposition::Spooled { .. }) => {
+                panic!("the lockout must hold the account, got {other:?}")
+            }
+        }
+        assert_eq!(
+            transport.calls("locked"),
+            1,
+            "a tick inside the lockout issues no request"
+        );
+
+        // The batch after the header's instant samples again: one refused
+        // attempt per lockout, never one per tick.
+        clock.advance(MonotonicDuration::from_seconds(3301));
+        transport.script("locked", ScriptedOutcome::Success);
+        let third = run_batch(std::slice::from_ref(&account));
+        assert_eq!(sampled(&third.accounts[0]).outcome, AttemptOutcome::Success);
+        assert_eq!(
+            transport.calls("locked"),
+            2,
+            "the lockout ends with one further attempt, not a catch-up series"
         );
     }
 

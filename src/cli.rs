@@ -1384,7 +1384,10 @@ pub(crate) fn sample_command(
                 "lead-{}s",
                 config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
             ),
-            retry_backoff_policy: "none".to_string(),
+            retry_backoff_policy: format!(
+                "retry-after-capped-{}s",
+                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
+            ),
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
@@ -1416,6 +1419,7 @@ pub(crate) fn sample_command(
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
+            retry_after_cap: config.sampling.retry_after_cap,
             forced,
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
@@ -1875,7 +1879,10 @@ pub(crate) fn now_command(
                 "lead-{}s",
                 config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
             ),
-            retry_backoff_policy: "none".to_string(),
+            retry_backoff_policy: format!(
+                "retry-after-capped-{}s",
+                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
+            ),
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
@@ -1907,6 +1914,7 @@ pub(crate) fn now_command(
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
+            retry_after_cap: config.sampling.retry_after_cap,
             forced: true,
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
@@ -5525,7 +5533,10 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 "lead-{}s",
                 config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
             ),
-            retry_backoff_policy: "none".to_string(),
+            retry_backoff_policy: format!(
+                "retry-after-capped-{}s",
+                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
+            ),
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
@@ -5555,6 +5566,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             },
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
+            retry_after_cap: config.sampling.retry_after_cap,
             forced: true,
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
