@@ -128,13 +128,16 @@ httpd.serve_forever()
 }
 
 case_steps() {
-    # Steps 1 through 10: ten consecutive forced samples of the unchanging
-    # page. Every tick re-derives each window's reset as received_at plus the
-    # same rendered remaining time, so the stored instant moves forward by
-    # exactly the gap between the two observations, well inside the declared
-    # one-hour precision plus that gap.
+    # Each tick waits four seconds before sampling, on purpose: the sampling
+    # process is fast against a local stub, so back-to-back ticks re-derive
+    # resets only fractions of a second apart and the fixed 2 s provider-jitter
+    # envelope would absorb the drift with no declaration at all. Four seconds
+    # of gap puts the drift past the fixed envelope - the declared precision is
+    # what has to absorb it - while staying far inside that precision plus the
+    # gap, which is the tolerance aub-w1a0 declares.
     local tick
     for tick in 01 02 03 04 05 06 07 08 09 10; do
+        sleep 4
         step "tick-$tick-opencode-sample" env \
             "HOME=$STATE_DIR/home" \
             "AUB_STATE_DIR=$STATE_DIR" \
