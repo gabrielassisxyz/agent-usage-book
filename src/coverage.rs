@@ -166,6 +166,17 @@ pub struct CoverageReport {
     pub severe: bool,
 }
 
+/// A no-attempt interval counts as a sampling hole only when it exceeds the
+/// ordinary cadence in force at the reset by more than this tolerance.
+/// Shorter intervals are the sampling grid working as designed, with a
+/// reset-edge attempt just before the reset and one just after.
+const HOLE_TOLERANCE: MonotonicDuration = MonotonicDuration::from_seconds(60);
+
+/// Reset instants this close together are one reset: consecutive observations
+/// report the same quota reset a second apart, and each variant must not
+/// count on its own.
+const RESET_DEDUP_WINDOW: MonotonicDuration = MonotonicDuration::from_seconds(5);
+
 /// A postponement interval: the span a `Retry-After` instruction covers, during which
 /// the provider asked not to be called and no opportunity was owed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -213,7 +224,7 @@ pub fn compute(inputs: &CoverageInputs) -> CoverageReport {
 
     let no_attempt_gaps = gaps(start, end, &attempt_times);
     let no_observation_gaps = gaps(start, end, &observation_times);
-    let reset_spanning_gaps = reset_spanning_gaps(&resets, &no_attempt_gaps);
+    let reset_spanning_gaps = reset_spanning_gaps(&resets, &no_attempt_gaps, &snapshots);
     let severe = !reset_spanning_gaps.is_empty();
 
     // The measurement denominator is terminal attempts, not started attempts: an
@@ -360,13 +371,59 @@ fn longest_gap(gaps: &[Gap]) -> Option<Gap> {
     gaps.iter().max_by_key(|g| g.duration()).copied()
 }
 
-/// The no-attempt gaps that contain a known quota reset.
-fn reset_spanning_gaps(resets: &[ResetRecord], no_attempt_gaps: &[Gap]) -> Vec<Gap> {
+/// The no-attempt gaps that contain a known quota reset inside a real sampling
+/// hole: the gap's length exceeds the ordinary cadence in force at the reset
+/// by more than the tolerance. A reset with edge attempts seconds away sits
+/// in a short gap and is not counted. The `longest gap` columns keep the
+/// unthresholded definition, which is the right one for them.
+fn reset_spanning_gaps(
+    resets: &[ResetRecord],
+    no_attempt_gaps: &[Gap],
+    snapshots: &[PolicySnapshot],
+) -> Vec<Gap> {
+    let resets = dedup_resets(resets);
     no_attempt_gaps
         .iter()
-        .filter(|g| resets.iter().any(|r| g.spans(r.at)))
+        .filter(|g| {
+            resets
+                .iter()
+                .any(|r| g.spans(r.at) && is_sampling_hole(g, r.at, snapshots))
+        })
         .copied()
         .collect()
+}
+
+/// True when the gap is longer than the ordinary cadence in force at `at`
+/// plus the tolerance. An unknown cadence is not a hole: without a policy
+/// the engine cannot say the interval is longer than ordinary, and a number
+/// it cannot justify is not printed.
+fn is_sampling_hole(gap: &Gap, at: UtcTimestamp, snapshots: &[PolicySnapshot]) -> bool {
+    match cadence_at(snapshots, at) {
+        Some(cadence) => gap.duration().as_nanos() > cadence.as_nanos() + HOLE_TOLERANCE.as_nanos(),
+        None => false,
+    }
+}
+
+/// Collapse reset instants within the dedup window of each other into one,
+/// keeping the earliest of each cluster. The input may arrive in any order;
+/// the output is sorted.
+fn dedup_resets(resets: &[ResetRecord]) -> Vec<ResetRecord> {
+    let mut sorted = resets.to_vec();
+    sorted.sort_by_key(|r| r.at);
+    let mut out: Vec<ResetRecord> = Vec::with_capacity(sorted.len());
+    for reset in sorted {
+        let duplicate = match out.last() {
+            Some(last) => {
+                (reset.at.unix_nanos() - last.at.unix_nanos()) as u64
+                    <= RESET_DEDUP_WINDOW.as_nanos()
+            }
+            None => false,
+        };
+        if !duplicate {
+            out.push(reset);
+        }
+    }
+    out
 }
 
 /// Renders the report as plain text, one fact per line. A no-attempt gap is reported
@@ -638,6 +695,78 @@ mod tests {
         let report = compute(&report_inputs);
         assert!(report.severe, "a reset-spanning gap must be severe");
         assert_eq!(report.reset_spanning_gaps.len(), 1);
+    }
+
+    /// A reset with a reset-edge attempt 120 s before and one 4 s after, at a
+    /// 300 s cadence, is not counted: the containing gap is shorter than the
+    /// cadence plus tolerance, so the grid worked as designed.
+    #[test]
+    fn a_reset_with_edge_attempts_either_side_is_not_unobserved() {
+        let reset = 1_000;
+        let mut report_inputs = inputs(
+            0,
+            3_600,
+            vec![snapshot(0, 300)],
+            vec![
+                attempt(reset - 120, Some(success_result(reset - 120))),
+                attempt(reset + 4, Some(success_result(reset + 4))),
+            ],
+            vec![],
+        );
+        report_inputs.resets = vec![ResetRecord { at: ts(reset) }];
+        let report = compute(&report_inputs);
+        assert!(
+            report.reset_spanning_gaps.is_empty(),
+            "a reset between edge attempts must not count: {:?}",
+            report.reset_spanning_gaps
+        );
+        assert!(!report.severe, "no hole means not severe");
+    }
+
+    /// A reset inside a 45-minute interval with no attempt is counted: the
+    /// containing gap far exceeds the 300 s cadence plus tolerance.
+    #[test]
+    fn a_reset_inside_a_45_minute_silence_is_unobserved() {
+        let mut report_inputs = inputs(
+            0,
+            3_600,
+            vec![snapshot(0, 300)],
+            vec![
+                attempt(300, Some(success_result(300))),
+                attempt(3_000, Some(success_result(3_000))),
+            ],
+            vec![],
+        );
+        report_inputs.resets = vec![ResetRecord { at: ts(1_500) }];
+        let report = compute(&report_inputs);
+        assert_eq!(report.reset_spanning_gaps.len(), 1);
+        assert!(report.severe, "a reset inside a hole must be severe");
+    }
+
+    /// Two reset instants one second apart count as one reset: consecutive
+    /// observations report the same quota reset twice. The variants straddle
+    /// an attempt here, so without dedup each would claim its own long gap.
+    #[test]
+    fn two_reset_instants_one_second_apart_count_as_one_reset() {
+        let mut report_inputs = inputs(
+            0,
+            7_200,
+            vec![snapshot(0, 300)],
+            vec![
+                attempt(0, Some(success_result(0))),
+                attempt(1_000, Some(success_result(1_000))),
+                attempt(4_600, Some(success_result(4_600))),
+            ],
+            vec![],
+        );
+        report_inputs.resets = vec![ResetRecord { at: ts(999) }, ResetRecord { at: ts(1_000) }];
+        let report = compute(&report_inputs);
+        assert_eq!(
+            report.reset_spanning_gaps.len(),
+            1,
+            "one logical reset must count once: {:?}",
+            report.reset_spanning_gaps
+        );
     }
 
     /// A cadence change mid-interval produces a denominator that follows the

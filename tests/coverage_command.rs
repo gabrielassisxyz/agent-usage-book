@@ -408,7 +408,7 @@ fn the_two_worked_examples_render() {
         "│              28 attempts were rate limited                                   │",
         "│              4 attempts hit an unreachable provider                          │",
         "│              4 attempts started without a terminal result                    │",
-        "│              one 5h reset without an observation in the surrounding gap      │",
+        "│              one 5h reset inside a sampling hole                             │",
         "│                                                                              │",
         "│  next: run coverage again once the floor condition changes                   │",
         "└──────────────────────────────────────────────────────────────────────────────┘",
