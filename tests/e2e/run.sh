@@ -614,21 +614,27 @@ resolve_case_id() {
 # share a leading number. New cases are named <bead-id>-<kebab-name>.sh and a
 # bead id is unique, so the number rule only polices the numbered set: a pair
 # already on main is grandfathered, a newly added file that reuses a number is
-# refused. Off a checkout with no main ref the grandfather set is empty, which
-# is the state the --self-test scratch directory runs in.
+# refused. Off a checkout with no main ref the number rule is skipped, since an
+# empty grandfather set would refuse every legacy pair; the id rule always runs.
 check_case_naming() {
     local bad=0 f base id num
     declare -A id_owner num_owner on_main
 
-    local ref
-    for ref in main origin/main; do
+    # origin/main before main: a linked worktree's local main is whatever the main checkout
+    # last pulled, while origin/main is what the last fetch saw. With neither ref (a depth-one
+    # pull_request checkout) the number rule is skipped rather than applied to an empty
+    # grandfather set, which would refuse every legacy pair already on main.
+    local ref have_main=0
+    for ref in origin/main main; do
         if git -C "$REPO_ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+            have_main=1
             while IFS= read -r base; do
                 [ -n "$base" ] && on_main["$(basename "$base")"]=1
             done < <(git -C "$REPO_ROOT" ls-tree -r --name-only "$ref" -- "$CASES_DIR" 2>/dev/null)
             break
         fi
     done
+    [ "$have_main" = 1 ] || echo "consistency: no main ref in this checkout, the case-number rule is skipped" >&2
 
     while IFS= read -r -d '' f; do
         base="$(basename "$f")"
@@ -640,6 +646,7 @@ check_case_naming() {
             id_owner["$id"]="$base"
         fi
 
+        [ "$have_main" = 1 ] || continue
         case "$base" in
             [0-9]*-*)
                 num="${base%%-*}"
@@ -974,6 +981,35 @@ self_test_duplicate_case() {
         rm -rf "$tmp"
         return 1
     fi
+
+    # The grandfather path needs a repo whose main already holds a numbered pair: the pair
+    # passes, a third numbered file reusing the number is refused, and the id rule still runs.
+    local repo
+    repo="$tmp/repo"
+    git init -q -b main "$repo"
+    cases="$repo/tests/e2e/cases"
+    mkdir -p "$cases"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/050-a.sh"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/050-b.sh"
+    git -C "$repo" add -A
+    git -C "$repo" -c user.email=t@example.test -c user.name=t commit -q -m "pair on main"
+    if ! (REPO_ROOT="$repo" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency >/dev/null 2>&1); then
+        echo "self-test: a numbered pair already on main was refused" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    printf '# case\ncase_steps() { :; }\n' >"$cases/050-c.sh"
+    if out="$(REPO_ROOT="$repo" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+        echo "self-test: a new file reusing a number already on main was accepted" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *050-c.sh*) : ;;
+        *) echo "self-test: the refusal did not name the new file: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
 
     rm -rf "$tmp"
     echo "self-test: duplicate case detection ok"
