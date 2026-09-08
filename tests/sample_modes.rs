@@ -135,6 +135,7 @@ fn if_due_records_supplied_marker_while_making_no_network_request() {
         retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: true,
         adapter_version: AdapterVersion::new("0.1.0"),
+        credential_refresh_classification: None,
     }];
     let orchestrator = SamplingOrchestrator {
         repository: &repo,
@@ -197,6 +198,7 @@ fn if_due_records_supplied_marker_while_making_no_network_request() {
         retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: false, // --if-due
         adapter_version: AdapterVersion::new("0.1.0"),
+        credential_refresh_classification: None,
     }];
 
     let orchestrator_if_due = SamplingOrchestrator {
@@ -276,6 +278,7 @@ fn lease_loss_preserves_marker_without_calling_transport() {
         retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: true,
         adapter_version: AdapterVersion::new("0.1.0"),
+        credential_refresh_classification: None,
     }];
 
     let orchestrator = SamplingOrchestrator {
@@ -404,6 +407,7 @@ fn flag_matrix_proves_attempt_start_persisted_before_any_request() {
             retry_after_cap: MonotonicDuration::from_seconds(3600),
             forced,
             adapter_version: AdapterVersion::new("0.1.0"),
+            credential_refresh_classification: None,
         }];
 
         let orchestrator = SamplingOrchestrator {

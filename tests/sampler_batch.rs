@@ -127,6 +127,7 @@ fn batch_account(name: &str, endpoint: String) -> BatchAccount<AnthropicAdapter>
         retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: false,
         adapter_version: AdapterVersion::new("adapter-integration-v1"),
+        credential_refresh_classification: None,
     }
 }
 

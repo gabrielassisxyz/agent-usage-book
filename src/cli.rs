@@ -1167,6 +1167,198 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     }
 }
 
+/// The production OAuth token endpoint for the Anthropic credential refresh
+/// (aub-79gp). It owns the transport wiring that `crate::auth::credentials_lock`
+/// is forbidden to reach for (boundary rule 12 keeps `ureq` in the transport
+/// module). `AUB_ANTHROPIC_TOKEN_ENDPOINT` overrides the URL so an end-to-end
+/// run can stand a synthetic server in for `console.anthropic.com`.
+struct AnthropicTokenEndpoint {
+    url: String,
+}
+
+impl AnthropicTokenEndpoint {
+    fn from_env() -> Self {
+        Self {
+            url: std::env::var("AUB_ANTHROPIC_TOKEN_ENDPOINT").unwrap_or_else(|_| {
+                crate::auth::credentials_lock::DEFAULT_TOKEN_ENDPOINT.to_string()
+            }),
+        }
+    }
+}
+
+impl crate::auth::credentials_lock::OAuthRefreshEndpoint for AnthropicTokenEndpoint {
+    fn exchange(
+        &self,
+        refresh_token: &str,
+    ) -> Result<
+        crate::auth::credentials_lock::RotatedTokens,
+        crate::auth::credentials_lock::RefreshEndpointError,
+    > {
+        use crate::auth::credentials_lock::RefreshEndpointError;
+        use crate::meter::adapter::HttpTransport;
+        use crate::meter::transport::{
+            BlockingTransport, CommandBudget, HttpRequest, RequestTimeoutConfig,
+        };
+
+        let payload = serde_json::json!({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": crate::auth::credentials_lock::CLAUDE_CODE_OAUTH_CLIENT_ID,
+        });
+        let body = serde_json::to_vec(&payload)
+            .map_err(|error| RefreshEndpointError::Transport(error.to_string()))?;
+        let timeouts = RequestTimeoutConfig::new(
+            MonotonicDuration::from_seconds(5),
+            MonotonicDuration::from_seconds(10),
+            Some(MonotonicDuration::from_seconds(15)),
+        );
+        let request = HttpRequest::post(&self.url, body, timeouts)
+            .with_header("Content-Type", "application/json")
+            .with_header("Accept", "application/json")
+            .with_header("User-Agent", "agent-usage-book/0.1.0");
+        let clock = RealClock::new();
+        let budget = CommandBudget::new(MonotonicDuration::from_seconds(30), &clock);
+        let response = BlockingTransport
+            .send(&request, &budget, &clock)
+            .map_err(|failure| RefreshEndpointError::Transport(format!("{failure:?}")))?;
+
+        let status = response.status();
+        let text = response.body_as_str().unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(text).ok();
+
+        if status == 200 {
+            let value = parsed.ok_or(RefreshEndpointError::MalformedResponse)?;
+            let field = |name: &str| value.get(name).and_then(serde_json::Value::as_str);
+            let access_token =
+                field("access_token").ok_or(RefreshEndpointError::MalformedResponse)?;
+            let new_refresh =
+                field("refresh_token").ok_or(RefreshEndpointError::MalformedResponse)?;
+            let expires_in_secs = value
+                .get("expires_in")
+                .and_then(serde_json::Value::as_i64)
+                .ok_or(RefreshEndpointError::MalformedResponse)?;
+            return Ok(crate::auth::credentials_lock::RotatedTokens {
+                access_token: access_token.to_string(),
+                refresh_token: new_refresh.to_string(),
+                expires_in_secs,
+            });
+        }
+
+        let is_invalid_grant = parsed
+            .as_ref()
+            .and_then(|value| value.get("error").and_then(serde_json::Value::as_str))
+            .is_some_and(|error| error == "invalid_grant");
+        if is_invalid_grant {
+            Err(RefreshEndpointError::InvalidGrant)
+        } else {
+            Err(RefreshEndpointError::HttpStatus(status))
+        }
+    }
+}
+
+/// The outcome of a pre-flight Anthropic OAuth token refresh for one account
+/// (aub-79gp): the classification a subsequent failed attempt should carry, and
+/// whether the account must be dropped from this run because its on-disk pair
+/// is now dead.
+struct PreflightRefresh {
+    classification: Option<String>,
+    skip_account: bool,
+}
+
+impl PreflightRefresh {
+    fn inert() -> Self {
+        Self {
+            classification: None,
+            skip_account: false,
+        }
+    }
+}
+
+/// Renews an expired Anthropic OAuth access token in `account`'s credential
+/// file before the account is sampled, so an expired token costs one refresh
+/// rather than a run of `auth_required` attempts (aub-79gp). A no-op for every
+/// non-Anthropic account, for a non-`file` credential, and when
+/// `anthropic.refresh = false`.
+fn preflight_anthropic_refresh(
+    account: &crate::config::AccountConfig,
+    config: &crate::config::Config,
+    clock: &impl Clock,
+    verbose: bool,
+) -> PreflightRefresh {
+    use crate::auth::credentials_lock::{
+        self, CLASSIFICATION_TOKEN_REFRESHED, LockWait, RefreshOutcome,
+    };
+
+    if !config.anthropic.refresh || account.provider != "anthropic" {
+        return PreflightRefresh::inert();
+    }
+    let path = match crate::auth::CredentialSource::from_account(account) {
+        Ok(crate::auth::CredentialSource::File { path }) => path,
+        Ok(crate::auth::CredentialSource::Env { .. })
+        | Ok(crate::auth::CredentialSource::None)
+        | Err(_) => return PreflightRefresh::inert(),
+    };
+
+    let now_unix_millis = clock.now().unix_nanos() / 1_000_000;
+    let endpoint = AnthropicTokenEndpoint::from_env();
+    let outcome = credentials_lock::refresh_if_expired(
+        &path,
+        now_unix_millis,
+        credentials_lock::DEFAULT_EXPIRY_LEAD,
+        &endpoint,
+        LockWait::default(),
+    );
+
+    match &outcome {
+        RefreshOutcome::Refreshed => {
+            if verbose {
+                eprintln!(
+                    "aub: {CLASSIFICATION_TOKEN_REFRESHED}: renewed the expired Anthropic OAuth token for account '{}'",
+                    account.name
+                );
+            }
+        }
+        RefreshOutcome::Rejected => eprintln!(
+            "aub: the Anthropic OAuth token endpoint rejected the stored refresh token for account '{}'; re-authenticate the profile with Claude Code",
+            account.name
+        ),
+        RefreshOutcome::PersistFailed(detail) => {
+            eprintln!(
+                "aub: renewed the Anthropic OAuth token for account '{}' but could not write it back ({detail}); the on-disk pair is now dead and this account is not being sampled until an operator re-authenticates the profile",
+                account.name
+            );
+            return PreflightRefresh {
+                classification: outcome.attempt_classification().map(str::to_string),
+                skip_account: true,
+            };
+        }
+        RefreshOutcome::LockBusy => {
+            if verbose {
+                eprintln!(
+                    "aub: {}'s .credentials.lock stayed held; sampling with the stored token",
+                    account.name
+                );
+            }
+        }
+        RefreshOutcome::EndpointUnreachable(detail) => {
+            if verbose {
+                eprintln!(
+                    "aub: could not reach the Anthropic OAuth token endpoint for account '{}' ({detail}); sampling with the stored token",
+                    account.name
+                );
+            }
+        }
+        RefreshOutcome::NotNeeded
+        | RefreshOutcome::AlreadyFreshOnDisk
+        | RefreshOutcome::FileUnreadable(_) => {}
+    }
+
+    PreflightRefresh {
+        classification: outcome.attempt_classification().map(str::to_string),
+        skip_account: false,
+    }
+}
+
 /// `aub sample`: observe provider endpoints for due or selected accounts,
 /// recording session markers and evidence.
 pub(crate) fn sample_command(
@@ -1372,6 +1564,10 @@ pub(crate) fn sample_command(
 
     let mut batch_accounts = Vec::new();
     for acc in &target_accounts {
+        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
+        if refresh.skip_account {
+            continue;
+        }
         let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
         let credential_handle =
             crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
@@ -1424,6 +1620,7 @@ pub(crate) fn sample_command(
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
             ),
+            credential_refresh_classification: refresh.classification,
         });
     }
 
@@ -1867,6 +2064,10 @@ pub(crate) fn now_command(
 
     let mut batch_accounts = Vec::new();
     for acc in &target_accounts {
+        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
+        if refresh.skip_account {
+            continue;
+        }
         let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
         let credential_handle =
             crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
@@ -1919,6 +2120,7 @@ pub(crate) fn now_command(
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
             ),
+            credential_refresh_classification: refresh.classification,
         });
     }
 
@@ -5513,7 +5715,12 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
     crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
 
-    if !cached {
+    let anthropic_refresh = if cached {
+        PreflightRefresh::inert()
+    } else {
+        preflight_anthropic_refresh(account_config, &config, clock, invocation.verbosity > 0)
+    };
+    if !cached && !anthropic_refresh.skip_account {
         // Default: perform and persist one fresh meter sample for the
         // requested account first, the same sampler path `aub sample
         // --account` uses, before reading anything back.
@@ -5571,6 +5778,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
             ),
+            credential_refresh_classification: anthropic_refresh.classification,
         }];
         let orchestrator = crate::meter::sampler::SamplingOrchestrator {
             repository: &repo,

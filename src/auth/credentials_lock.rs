@@ -44,8 +44,9 @@ pub const DEFAULT_TOKEN_ENDPOINT: &str = "https://console.anthropic.com/v1/oauth
 /// minutes matches onWatch's one-hour lead scaled to how often `aub` samples.
 pub const DEFAULT_EXPIRY_LEAD: Duration = Duration::from_secs(5 * 60);
 
-/// The `sanitized_error_classification` an attempt records when a refresh
-/// rotated the token before it sampled.
+/// The diagnostic word for an attempt whose token a refresh rotated before it
+/// sampled. Surfaced on stderr, not written to the failure-classification
+/// column: the attempt it precedes succeeds.
 pub const CLASSIFICATION_TOKEN_REFRESHED: &str = "token_refreshed";
 /// The classification when `.credentials.lock` stayed held for the whole
 /// bounded wait and no refresh was attempted.
@@ -141,18 +142,21 @@ pub enum RefreshOutcome {
 }
 
 impl RefreshOutcome {
-    /// The `sanitized_error_classification` this outcome contributes to the
-    /// sampling attempt, or `None` when the attempt's own outcome classifies
-    /// it. `EndpointUnreachable`, `NotNeeded`, `AlreadyFreshOnDisk` and
-    /// `FileUnreadable` add nothing: the attempt that follows records its own
-    /// reason.
+    /// The `sanitized_error_classification` this outcome gives the *failed*
+    /// sampling attempt it precedes, or `None` when the attempt's own outcome
+    /// classifies it. `Refreshed` returns `None`: the attempt that follows a
+    /// successful refresh succeeds and carries no failure classification (the
+    /// refresh is surfaced as a `token_refreshed` diagnostic instead, because
+    /// this column's contract is why a failed attempt failed). `NotNeeded`,
+    /// `AlreadyFreshOnDisk`, `EndpointUnreachable` and `FileUnreadable` add
+    /// nothing: the attempt that follows records its own reason.
     pub fn attempt_classification(&self) -> Option<&'static str> {
         match self {
-            RefreshOutcome::Refreshed => Some(CLASSIFICATION_TOKEN_REFRESHED),
             RefreshOutcome::LockBusy => Some(CLASSIFICATION_LOCK_BUSY),
             RefreshOutcome::Rejected => Some(CLASSIFICATION_REFRESH_REJECTED),
             RefreshOutcome::PersistFailed(_) => Some(CLASSIFICATION_REFRESH_PERSIST_FAILED),
-            RefreshOutcome::NotNeeded
+            RefreshOutcome::Refreshed
+            | RefreshOutcome::NotNeeded
             | RefreshOutcome::AlreadyFreshOnDisk
             | RefreshOutcome::EndpointUnreachable(_)
             | RefreshOutcome::FileUnreadable(_) => None,
