@@ -176,7 +176,48 @@ fn build_template_at(final_path: &Path) {
             final_path.display()
         )
     });
+    // Published read-only, and this is a correctness guard rather than tidiness. The cache key
+    // is the commit, so every build of a dirty working tree shares one entry: a momentary bug
+    // that writes into the template poisons an entry that outlives the fix, and every later
+    // copy carries those rows. That happened on 2026-09-08 - a cached template ended a run with
+    // account=2 and ingest_quarantine=5, and seven converted integration binaries went red on
+    // rows they never inserted, with a failure count that moved between runs because it
+    // depended on which test copied first. Read-only makes the write fail loudly at the moment
+    // it happens instead of silently, and `template()` rebuilds any entry it finds writable.
+    set_readonly(final_path);
     fsync_dir(dir);
+}
+
+/// Marks a published template read-only. Best effort: a filesystem that cannot represent it
+/// leaves the guard in `template()` as the remaining defence.
+fn set_readonly(path: &Path) {
+    if let Ok(meta) = fs::metadata(path) {
+        let mut perms = meta.permissions();
+        perms.set_readonly(true);
+        let _ = fs::set_permissions(path, perms);
+    }
+}
+
+/// Whether a cached template was published by this code. A writable file was either written by
+/// something that had no business writing to it, or predates the read-only publish; either way
+/// its contents are not trustworthy and it is cheaper to rebuild it than to reason about it.
+fn is_published_readonly(path: &Path) -> bool {
+    fs::metadata(path)
+        .map(|m| m.permissions().readonly())
+        .unwrap_or(false)
+}
+
+/// Makes `path` a template this code published: builds it when absent, and REBUILDS it when it
+/// is present but writable. A writable entry was either written by something with no business
+/// writing to it or predates the read-only publish, and in both cases its rows are not
+/// trustworthy. Factored out of `template()` so the rebuild decision has a test: a `OnceLock`
+/// resolves once per process and cannot be exercised twice.
+fn ensure_template_at(path: &Path) {
+    if path.exists() && is_published_readonly(path) {
+        return;
+    }
+    remove_db_family(path);
+    build_template_at(path);
 }
 
 /// The cached template for this process, built on first use if the cross-process
@@ -187,9 +228,7 @@ fn template() -> &'static Path {
     TEMPLATE
         .get_or_init(|| {
             let path = cached_template_path();
-            if !path.exists() {
-                build_template_at(&path);
-            }
+            ensure_template_at(&path);
             path
         })
         .as_path()
@@ -203,6 +242,16 @@ pub fn copy_migrated(dest: &Path) {
             dest.display()
         )
     });
+    // `fs::copy` carries the source's permission bits, and the template is published read-only,
+    // so without this every fixture would receive a database it cannot write to.
+    if let Ok(meta) = fs::metadata(dest) {
+        let mut perms = meta.permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(dest, perms).unwrap_or_else(|e| {
+            panic!("the copied database must be writable at {}: {e}", dest.display())
+        });
+    }
 }
 
 /// A read-write connection to a fresh migrated database at `dest`, under `policy`.
@@ -280,10 +329,69 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The guard that would have caught the failure this rule exists for. On 2026-09-08 a
+    /// cached template finished a run holding account=2 and ingest_quarantine=5, and seven
+    /// converted integration binaries went red on rows they had never inserted, because the
+    /// cache key is the commit and a dirty working tree reuses one entry across builds. A
+    /// poisoned entry must be rebuilt, not read.
+    #[test]
+    fn a_writable_cache_entry_is_rebuilt_rather_than_trusted() {
+        let dir = scratch_dir("poisoned");
+        let path = dir.join("template.db");
+
+        ensure_template_at(&path);
+        assert!(
+            is_published_readonly(&path),
+            "a freshly published template must be read-only"
+        );
+
+        // Poison it exactly as a stray write would: make it writable and insert a row.
+        let mut perms = fs::metadata(&path).expect("stat").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(&path, perms).expect("the entry must become writable");
+        {
+            let conn = open(&path, AccessMode::ReadWrite, &template_policy())
+                .expect("the poisoned entry must open");
+            conn.execute(
+                "INSERT INTO account \
+                 (logical_name, provider_key, first_observed_at, last_observed_at) \
+                 VALUES ('poison', 'p', 1, 1)",
+                [],
+            )
+            .expect("the poison row must insert");
+        }
+
+        ensure_template_at(&path);
+
+        assert!(
+            is_published_readonly(&path),
+            "the rebuilt template must be read-only again"
+        );
+        let dest = dir.join("copy.db");
+        let conn = open_migrated_from(&path, &dest);
+        let rows: i64 = conn
+            .query_row("SELECT count(*) FROM account", [], |r| r.get(0))
+            .expect("the rebuilt copy must be queryable");
+        assert_eq!(
+            rows, 0,
+            "a rebuilt template must carry no rows from the entry it replaced"
+        );
+
+        drop(conn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// Opens a fresh copy of an explicit template path (the production
     /// `open_migrated` goes through the process cache).
     fn open_migrated_from(template_path: &Path, dest: &Path) -> rusqlite::Connection {
         fs::copy(template_path, dest).expect("the template must be copyable");
+        // The template is published read-only and `fs::copy` carries its mode, so the copy has
+        // to be made writable exactly as `copy_migrated` does it.
+        let mut perms = fs::metadata(dest).expect("the copy must stat").permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        fs::set_permissions(dest, perms).expect("the copy must become writable");
         open(dest, AccessMode::ReadWrite, &template_policy()).expect("the copy must open")
     }
 
@@ -320,7 +428,9 @@ mod tests {
                     if len == 0 {
                         continue;
                     }
-                    let conn = open(&probe_path, AccessMode::ReadWrite, &template_policy())
+                    // Read-only: a published template is read-only on disk, and the watcher
+                    // only reads its schema version.
+                    let conn = open(&probe_path, AccessMode::ReadOnly, &template_policy())
                         .expect("a published, non-empty template must open as a database");
                     assert_eq!(
                         recorded_schema_version(&conn).ok(),
