@@ -76,6 +76,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         adapter_semantics_comparison_age(ctx),
         last_sample_tick(ctx),
         sampling_failure_counts(ctx),
+        meter_error_classifications(ctx),
     ]
 }
 
@@ -132,6 +133,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::AdapterSemanticsComparisonAge => "store::adapter_semantics_validation",
         CheckName::LastSampleTick => "store::sample_tick",
         CheckName::SamplingFailureCounts => "store::sampling_failure_counts",
+        CheckName::MeterErrorClassifications => "store::meter_attempt",
     }
 }
 
@@ -186,6 +188,9 @@ fn condition_of(name: CheckName) -> &'static str {
         CheckName::LastSampleTick => "the last aub sample invocation succeeded",
         CheckName::SamplingFailureCounts => {
             "no persist-failed or due-lookup-failed sampler disposition has ever been recorded"
+        }
+        CheckName::MeterErrorClassifications => {
+            "every failed attempt in the recent window carries the provider error              classification the sampler stored for it"
         }
     }
 }
@@ -1095,6 +1100,87 @@ fn sampling_failure_counts(ctx: &DoctorContext) -> CheckOutcome {
         }
     };
     outcome(CheckName::SamplingFailureCounts, status)
+}
+
+/// The window every provider error classification is listed over: one day of
+/// attempts, the span an operator is asking "why did these fail" about
+/// (aub-rfot's own context query).
+const ERROR_CLASSIFICATION_LOOKBACK_NANOS: i64 = 24 * 60 * 60 * 1_000_000_000;
+
+/// The provider error classifications the window's failed attempts stored,
+/// per account (`aub-rfot`). A listing, never a failure: a rate limit or a
+/// rejected credential is normal operation, and what this check exists to
+/// say is which classification dominated, so the ledger answers "why did a
+/// day of attempts fail" without a hand query. Rows written before the
+/// column was populated read as `unclassified`, past and present alike.
+fn meter_error_classifications(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => {
+                let start = UtcTimestamp::from_unix_nanos(
+                    ctx.timestamp
+                        .unix_nanos()
+                        .saturating_sub(ERROR_CLASSIFICATION_LOOKBACK_NANOS),
+                );
+                match crate::store::meter_attempt::error_classifications_between(
+                    conn,
+                    start,
+                    ctx.timestamp,
+                ) {
+                    Err(error) => CheckStatus::Fail(format!(
+                        "cannot read the meter error classifications: {error}"
+                    )),
+                    Ok(rows) if rows.is_empty() => CheckStatus::Pass,
+                    Ok(rows) => {
+                        let accounts = crate::store::account::all_accounts(conn)
+                            .map(|accounts| {
+                                accounts
+                                    .into_iter()
+                                    .map(|account| {
+                                        (account.id(), account.logical_name().to_string())
+                                    })
+                                    .collect::<std::collections::BTreeMap<_, _>>()
+                            })
+                            .unwrap_or_default();
+                        let detail = rows
+                            .iter()
+                            .map(|row| {
+                                let name = accounts
+                                    .get(&row.account_id)
+                                    .map(String::as_str)
+                                    .unwrap_or("<deleted account>");
+                                let parts = row
+                                    .classifications
+                                    .iter()
+                                    .map(|(stored, count)| {
+                                        format!(
+                                            "{} (count={count})",
+                                            crate::store::meter_attempt::
+                                                error_classification_column::classification_of(
+                                                    stored
+                                                )
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join(", ");
+                                format!("{name}: {parts}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("; ");
+                        CheckStatus::PassWithDetail(format!(
+                            "provider error classifications in the last 24h: {detail}"
+                        ))
+                    }
+                }
+            }
+        }
+    };
+    outcome(CheckName::MeterErrorClassifications, status)
 }
 
 #[cfg(test)]

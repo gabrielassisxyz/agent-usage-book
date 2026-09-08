@@ -51,6 +51,7 @@ pub enum CheckName {
     AdapterSemanticsComparisonAge,
     LastSampleTick,
     SamplingFailureCounts,
+    MeterErrorClassifications,
 }
 
 impl CheckName {
@@ -62,8 +63,10 @@ impl CheckName {
     /// last-tick marker (`crate::store::sample_tick`) existed for a check to read,
     /// and [`Self::SamplingFailureCounts`] added by `aub-b0w6` once the durable
     /// per-reason failure counter (`crate::store::sampling_failure_counts`)
-    /// existed for a check to read.
-    pub const EXPECTED: [CheckName; 22] = [
+    /// existed for a check to read, and [`Self::MeterErrorClassifications`]
+    /// added by `aub-rfot` once the failed attempts' sanitized error
+    /// classification column was populated for a check to read.
+    pub const EXPECTED: [CheckName; 23] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -86,6 +89,7 @@ impl CheckName {
         Self::AdapterSemanticsComparisonAge,
         Self::LastSampleTick,
         Self::SamplingFailureCounts,
+        Self::MeterErrorClassifications,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -113,6 +117,7 @@ impl CheckName {
             Self::AdapterSemanticsComparisonAge => "adapter-semantics-comparison-age",
             Self::LastSampleTick => "last-sample-tick",
             Self::SamplingFailureCounts => "sampling-failure-counts",
+            Self::MeterErrorClassifications => "meter-error-classifications",
         }
     }
 }

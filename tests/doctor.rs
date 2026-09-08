@@ -820,6 +820,193 @@ fn check_fails_sampling_failure_counts_and_names_the_recurring_reason() {
     );
 }
 
+// --- aub-rfot: the provider error classifications a day of failures stored ---
+
+/// Seeds one account, one sample run, one policy snapshot, one attempt and
+/// one terminal result, with the outcome and stored classification the
+/// caller names. The direct-SQL shape the clock-skew test established: the
+/// check under test reads through the same store functions production
+/// reads, and the seed is the minimal row set those functions join.
+fn seed_failed_attempt_with_classification(
+    conn: &rusqlite::Connection,
+    account_name: &str,
+    attempt_id: i64,
+    started_at: UtcTimestamp,
+    outcome_sql: &str,
+    failure_class_sql: Option<&str>,
+    classification: Option<&str>,
+) {
+    conn.execute(
+        "INSERT INTO account (id, logical_name, provider_key, first_observed_at, last_observed_at)
+         VALUES (?1, ?2, 'anthropic', ?3, ?3)
+         ON CONFLICT(id) DO NOTHING",
+        rusqlite::params![attempt_id, account_name, started_at.unix_nanos()],
+    )
+    .expect("insert account");
+    conn.execute(
+        "INSERT INTO sample_run (id, trigger, started_at, aub_version, configuration_fingerprint)
+         VALUES (?1, 'manual', ?2, '0.1.0', 'cfg')",
+        rusqlite::params![attempt_id, started_at.unix_nanos()],
+    )
+    .expect("insert sample_run");
+    conn.execute(
+        "INSERT INTO sampling_policy_snapshot (
+            id, account_id, effective_at, ordinary_cadence_nanos, freshness_horizon_nanos,
+            reset_edge_policy, retry_backoff_policy, command_budget_nanos, policy_algorithm_version
+         ) VALUES (?1, ?2, ?3, 60000000000, 300000000000, 'none', 'none', 1000000000, 'v1')",
+        rusqlite::params![attempt_id, attempt_id, started_at.unix_nanos()],
+    )
+    .expect("insert policy");
+    conn.execute(
+        "INSERT INTO meter_attempt (
+            id, run_id, account_id, provider, request_started_at, policy_snapshot_id,
+            due_at, due_reason, provider_contract_id, meter_semantics_id
+         ) VALUES (?1, ?1, ?2, 'anthropic', ?3, ?1, ?3, 'ordinary_cadence', 'contract-1', 'meter-1')",
+        rusqlite::params![attempt_id, attempt_id, started_at.unix_nanos()],
+    )
+    .expect("insert meter_attempt");
+    conn.execute(
+        "INSERT INTO meter_attempt_result (
+            attempt_id, completed_at, elapsed_nanos, outcome, failure_class,
+            retry_after_nanos, sanitized_error_classification, retry_index, clock_anomaly
+         ) VALUES (?1, ?2, 1000, ?3, ?4, ?5, ?6, NULL, 0)",
+        rusqlite::params![
+            attempt_id,
+            started_at.unix_nanos() + 1_000,
+            outcome_sql,
+            failure_class_sql,
+            if failure_class_sql == Some("rate_limited") {
+                60000000000i64
+            } else {
+                0
+            },
+            classification
+        ],
+    )
+    .expect("insert meter_attempt_result");
+}
+
+#[test]
+fn meter_error_classifications_lists_the_classifications_seen_per_account() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let now = ts(1_700_000_000);
+    let started = ts(1_700_000_000 - 1_000);
+    seed_failed_attempt_with_classification(
+        &conn,
+        "gmail",
+        1,
+        started,
+        "unreachable",
+        Some("rate_limited"),
+        Some("rate_limit_error: Rate limit exceeded. Please retry later."),
+    );
+    seed_failed_attempt_with_classification(
+        &conn,
+        "bianca",
+        2,
+        started,
+        "auth_required",
+        None,
+        Some("authentication_error: Invalid authentication token provided."),
+    );
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::MeterErrorClassifications)
+        .expect("MeterErrorClassifications present");
+    assert!(
+        matches!(
+            outcome.status,
+            CheckStatus::PassWithDetail(ref detail)
+                if detail.contains("gmail: rate_limit_error (count=1)")
+                    && detail.contains("bianca: authentication_error (count=1)")
+        ),
+        "{:?}",
+        outcome.status
+    );
+}
+
+/// A NULL classification is the older rows' shape: it reads as
+/// `unclassified` rather than disappearing from the listing.
+#[test]
+fn meter_error_classifications_names_a_null_classification_unclassified() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let now = ts(1_700_000_000);
+    let started = ts(1_700_000_000 - 1_000);
+    seed_failed_attempt_with_classification(
+        &conn,
+        "gmail",
+        1,
+        started,
+        "unreachable",
+        Some("rate_limited"),
+        None,
+    );
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::MeterErrorClassifications)
+        .expect("MeterErrorClassifications present");
+    assert!(
+        matches!(
+            outcome.status,
+            CheckStatus::PassWithDetail(ref detail)
+                if detail.contains("gmail: unclassified (count=1)")
+        ),
+        "{:?}",
+        outcome.status
+    );
+}
+
+/// A success row is never listed: the check says why attempts failed, not
+/// that some succeeded.
+#[test]
+fn meter_error_classifications_lists_nothing_for_a_window_of_successes() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let now = ts(1_700_000_000);
+    let started = ts(1_700_000_000 - 1_000);
+    seed_failed_attempt_with_classification(&conn, "gmail", 1, started, "success", None, None);
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::MeterErrorClassifications)
+        .expect("MeterErrorClassifications present");
+    assert_eq!(outcome.status, CheckStatus::Pass);
+}
+
 #[test]
 fn owned_checks_have_correct_owner_module() {
     let state = StateDir::new();
