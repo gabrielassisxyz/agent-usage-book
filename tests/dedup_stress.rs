@@ -39,9 +39,7 @@ use agent_usage_book::evidence::{
 use agent_usage_book::ingest::{IngestOptions, IngestReport, run as run_ingest_with_sink};
 use agent_usage_book::report::spend::{SpendWindow, assemble, assemble_canonical};
 use agent_usage_book::report::{SpendGrouping, SpendReport};
-use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
+use agent_usage_book::store::connection::PragmaPolicy;
 use agent_usage_book::store::retention::{RebuildGroup, delete_rebuildable};
 use agent_usage_book::store::usage_occurrence::heuristic_rebuild_required;
 use agent_usage_book::transcripts::NormalizedUsageEvent;
@@ -82,15 +80,9 @@ fn migrated_conn(db_path: &Path) -> rusqlite::Connection {
     let policy = PragmaPolicy {
         busy_timeout: MonotonicDuration::from_millis(5000),
     };
-    let mut conn = open(db_path, AccessMode::ReadWrite, &policy).expect("db must open");
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-    )
-    .expect("migrations must apply");
-    conn
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    test_support::open_migrated(db_path, &policy)
 }
 
 fn single_source_config(name: &str, root: &Path, format: &str) -> Config {

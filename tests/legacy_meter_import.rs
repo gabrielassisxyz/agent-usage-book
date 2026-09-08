@@ -1,18 +1,14 @@
 //! Integration tests for legacy meter series import (aub-fon.1, PLAN.md sections 12.6, 32, 33).
 
 use agent_usage_book::config::CoverageFloor;
-use agent_usage_book::domain::time::{
-    FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
-};
+use agent_usage_book::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use agent_usage_book::legacy_meter::read_source;
 use agent_usage_book::presentation::{Style, render_coverage_report};
 use agent_usage_book::report::coverage::{
     AccountIdentity, CoverageFloors, CoverageSelector, assemble as assemble_coverage,
 };
-use agent_usage_book::store::connection::{AccessMode, LEDGER_DATABASE_FILE, PragmaPolicy, open};
+use agent_usage_book::store::connection::{LEDGER_DATABASE_FILE, PragmaPolicy};
 use agent_usage_book::store::legacy_meter_import::import;
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::{account, meter_attempt, meter_evidence, sample_run};
 use rusqlite::Connection;
 use test_support::StateDir;
@@ -22,15 +18,9 @@ fn open_migrated_ledger(state: &StateDir) -> Connection {
     let policy = PragmaPolicy {
         busy_timeout: MonotonicDuration::from_millis(1000),
     };
-    let mut conn = open(&path, AccessMode::ReadWrite, &policy).expect("scratch ledger must open");
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-    )
-    .expect("scratch ledger must migrate");
-    conn
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    test_support::open_migrated(&path, &policy)
 }
 
 fn sample_legacy_jsonl_20_rows() -> &'static str {

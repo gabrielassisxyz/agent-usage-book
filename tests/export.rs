@@ -12,15 +12,13 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::domain::ids::{NativeRunId, NativeSessionId, SourceNamespace};
-use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
+use agent_usage_book::domain::time::{MonotonicDuration, UtcTimestamp};
 use agent_usage_book::presentation::export_jsonl::export_jsonl;
 use agent_usage_book::report::export::assemble;
 use agent_usage_book::sessions::resolver::{ProjectKey, RepositoryKey};
-use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
+use agent_usage_book::store::connection::PragmaPolicy;
 use agent_usage_book::store::export::ExportKey;
 use agent_usage_book::store::ingest_quarantine::{NewQuarantineItem, record_quarantine};
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::session::{NewSession, insert_session};
 use agent_usage_book::store::usage_component::{NewUsageComponent, insert_component};
 use agent_usage_book::store::usage_event::{EventId, NewUsageEvent, insert_event};
@@ -45,15 +43,9 @@ impl TestDb {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(5000),
         };
-        let mut conn = open(&self.path, AccessMode::ReadWrite, &policy).unwrap();
-        run_migrations(
-            &mut conn,
-            &registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
-        conn
+        // The schema comes from the cross-process template cache (aub-yr9c)
+        // instead of a per-fixture migration replay.
+        test_support::open_migrated(&self.path, &policy)
     }
 }
 

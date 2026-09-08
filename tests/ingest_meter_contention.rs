@@ -93,14 +93,9 @@ struct Fixture {
 fn fixture(tag: &str, busy_ms: u64) -> Fixture {
     let scratch = ScratchDir::new(tag);
     let database_path = scratch.path().join("ledger.db");
-    let mut conn = open(&database_path, AccessMode::ReadWrite, &policy(busy_ms)).unwrap();
-    run_migrations(
-        &mut conn,
-        &agent_usage_book::store::migrations::registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-    )
-    .unwrap();
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    let conn = test_support::open_migrated(&database_path, &policy(busy_ms));
     let account_id = agent_usage_book::store::account::observe_account(
         &conn,
         "anthropic",
@@ -1090,14 +1085,9 @@ format = "claude-code"
     .expect("resolve test config");
 
     let db_path = scratch.path().join("ledger.db");
-    let mut conn = open(&db_path, AccessMode::ReadWrite, &policy(5_000)).unwrap();
-    run_migrations(
-        &mut conn,
-        &agent_usage_book::store::migrations::registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-    )
-    .unwrap();
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    let mut conn = test_support::open_migrated(&db_path, &policy(5_000));
 
     let clock = TickingClock::new(MonotonicDuration::from_millis(1_100));
     let mut batches = Vec::new();

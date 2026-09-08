@@ -20,9 +20,7 @@ use agent_usage_book::meter::adapter::{CredentialHandle, HttpTransport, MeterReq
 use agent_usage_book::meter::anthropic::AnthropicAdapter;
 use agent_usage_book::meter::sampler::{AccountDisposition, BatchAccount, SamplingOrchestrator};
 use agent_usage_book::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
-use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
+use agent_usage_book::store::connection::PragmaPolicy;
 use agent_usage_book::store::repository::Repository;
 use agent_usage_book::store::sample_run::Trigger;
 use agent_usage_book::store::sampling_lease::{AccountName, LeaseHolder};
@@ -96,14 +94,9 @@ fn fixture_repo(db_path: &Path) -> Repository {
     let pragma = PragmaPolicy {
         busy_timeout: MonotonicDuration::from_millis(500),
     };
-    let mut conn = open(db_path, AccessMode::ReadWrite, &pragma).unwrap();
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-    )
-    .unwrap();
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    drop(test_support::open_migrated(db_path, &pragma));
     Repository::new(db_path, pragma)
 }
 

@@ -19,6 +19,7 @@ pub mod clock;
 pub mod evidence;
 pub mod fixture;
 pub mod log_events;
+pub mod migrated_schema;
 pub mod rng;
 pub mod sanitization;
 pub mod scratch_files;
@@ -33,6 +34,7 @@ pub use evidence::{
 };
 pub use fixture::{fixture_path, load_fixture};
 pub use log_events::{LogEvent, assert_event};
+pub use migrated_schema::{copy_migrated, open_migrated};
 pub use rng::{Rng, Seed, check_property};
 pub use sanitization::{FORBIDDEN_PATTERNS, matched_patterns};
 pub use state_dir::StateDir;

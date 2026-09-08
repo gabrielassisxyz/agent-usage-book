@@ -30,7 +30,6 @@ use agent_usage_book::store::ledger_generation::{self, Generation};
 use agent_usage_book::store::meter_attempt::{
     DueReason, MeterAttemptRowId, NewMeterAttempt, NewMeterAttemptResult,
 };
-use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::repository::{
     NewMeterInterpretation, Repository, TerminalMeterBundle,
 };
@@ -87,14 +86,9 @@ fn policy() -> PragmaPolicy {
 fn fixture(tag: &str) -> Fixture {
     let scratch = ScratchDir::new(tag);
     let database_path = scratch.path().join("ledger.db");
-    let mut conn = open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
-    run_migrations(
-        &mut conn,
-        &agent_usage_book::store::migrations::registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-    )
-    .unwrap();
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    let conn = test_support::open_migrated(&database_path, &policy());
     let account_id = agent_usage_book::store::account::observe_account(
         &conn,
         "anthropic",
