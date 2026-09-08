@@ -132,6 +132,7 @@ fn if_due_records_supplied_marker_while_making_no_network_request() {
         request: MeterRequest::default(),
         policy: test_policy(),
         reset_edge_lead: MonotonicDuration::from_seconds(60),
+        retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: true,
         adapter_version: AdapterVersion::new("0.1.0"),
     }];
@@ -193,6 +194,7 @@ fn if_due_records_supplied_marker_while_making_no_network_request() {
         request: MeterRequest::default(),
         policy: test_policy(),
         reset_edge_lead: MonotonicDuration::from_seconds(60),
+        retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: false, // --if-due
         adapter_version: AdapterVersion::new("0.1.0"),
     }];
@@ -271,6 +273,7 @@ fn lease_loss_preserves_marker_without_calling_transport() {
         request: MeterRequest::default(),
         policy: test_policy(),
         reset_edge_lead: MonotonicDuration::from_seconds(60),
+        retry_after_cap: MonotonicDuration::from_seconds(3600),
         forced: true,
         adapter_version: AdapterVersion::new("0.1.0"),
     }];
@@ -398,6 +401,7 @@ fn flag_matrix_proves_attempt_start_persisted_before_any_request() {
             request: MeterRequest::default(),
             policy: test_policy(),
             reset_edge_lead: MonotonicDuration::from_seconds(60),
+            retry_after_cap: MonotonicDuration::from_seconds(3600),
             forced,
             adapter_version: AdapterVersion::new("0.1.0"),
         }];
