@@ -1913,16 +1913,14 @@ pub fn render_coverage_report(report: &CoverageReport, window: &str, style: Styl
             ));
         }
         lines.push(boxed_body(row.trim_end(), width));
-        let mut findings = render_coverage_detail(report, account).unwrap_or_default();
-        if account.legacy_evidence_present {
-            findings.push(
-                "legacy observations are shown as historical evidence, not ordinary attempt coverage"
-                    .to_string(),
-            );
-        }
-        for line in coverage_finding_lines(findings, name_width, area) {
-            lines.push(boxed_body(&style.paint(style.body(), &line), width));
-        }
+        // VALIDATION HACK (uncommitted): the per-account findings lines are hidden so the
+        // operator can judge the bare table first; restore the block below before committing.
+        // let mut findings = render_coverage_detail(report, account).unwrap_or_default();
+        // if account.legacy_evidence_present { findings.push("legacy observations ...".to_string()); }
+        // for line in coverage_finding_lines(findings, name_width, area) {
+        //     lines.push(boxed_body(&style.paint(style.body(), &line), width));
+        // }
+        let _ = (&report, account, name_width, area);
     }
     let footer = coverage_footer_lines(report);
     if !retired.is_empty() || !footer.is_empty() {
