@@ -92,14 +92,17 @@ fn assert_build_succeeds(dir: &Path, shared_target: &Path, label: &str) {
 /// one baked into the binary. What is built is the `build-script-probe` fixture, a
 /// package of a few lines whose `build` key points at this repository's real
 /// `build.rs`, so every assertion below exercises the script the crate actually ships.
-/// Cargo's dep-info fingerprint compares the build script's source mtimes, not its
-/// content, so the two checkouts must carry identical `build.rs` mtimes or the second
-/// build recompiles the script and the defect never fires. The sequence is: build A
-/// (compiling the script with A's manifest dir baked in, under the old `env!`
-/// implementation), remove A so that baked path goes stale, build B. The old
-/// implementation reuses A's binary, fails to read A's `rust-toolchain.toml`, and
-/// panics blaming B's own correct file; the run-time `CARGO_MANIFEST_DIR` makes the
-/// cached binary read B's file.
+/// Cargo records the build script's source as an absolute path and reuses the cached
+/// binary while that recorded file exists with a matching mtime, so the two checkouts
+/// carry identical `build.rs` mtimes and differ only by path. The sequence is: build
+/// A, remove A, build B twice, then C and D in parallel. Removing A deletes the
+/// source cargo recorded for the cached binary, so B recompiles the script instead of
+/// reusing A's binary; C and D then reuse B's cached binary across checkout paths,
+/// which is the sharing this guard relies on. Under the old `env!` implementation the
+/// cached binary bakes the compiling checkout's manifest directory and ignores its
+/// runtime environment, so the direct run of the cached binary below exposes it;
+/// reading `CARGO_MANIFEST_DIR` at run time makes the cached binary serve whichever
+/// checkout runs it.
 ///
 /// The fixture is staged inside each `git worktree add --detach HEAD` checkout at the
 /// same relative path it occupies in this repository, so its
@@ -160,8 +163,9 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
         .set_times(std::fs::FileTimes::new().set_modified(a_modified))
         .expect("B/build.rs times must be settable");
 
-    // With the old implementation this build reuses A's binary, fails to read A's
-    // rust-toolchain.toml, and panics blaming B's own correct file.
+    // Removing A deleted the script source cargo recorded, so this build recompiles
+    // the script rather than reusing A's binary. C and D below are the builds that
+    // reuse a cached binary across checkout paths.
     assert_build_succeeds(&probe_dir(&b), &shared, "B (after A removed)");
     assert_build_succeeds(&probe_dir(&b), &shared, "B (again)");
 
