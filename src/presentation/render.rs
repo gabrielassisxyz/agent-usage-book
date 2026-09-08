@@ -1788,9 +1788,17 @@ fn render_coverage_detail(
             )
         ));
     }
-    for (group, count) in account.failures.nonzero() {
-        let noun = if count == 1 { "attempt" } else { "attempts" };
-        lines.push(format!("{count} {noun} {}", group.phrase()));
+    for failure in &account.error_classifications {
+        let noun = if failure.count == 1 {
+            "attempt"
+        } else {
+            "attempts"
+        };
+        lines.push(format!(
+            "{count} {noun} refused with {classification}",
+            count = failure.count,
+            classification = failure.classification
+        ));
     }
     if interrupted {
         let noun = if engine.started_without_terminal_result == 1 {
@@ -2598,6 +2606,7 @@ mod tests {
             name: crate::logging::LogicalName::new(name.to_string()),
             engine,
             failures,
+            error_classifications: Vec::new(),
             resets_in_gaps,
             legacy_evidence_present: false,
             configured,

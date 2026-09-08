@@ -470,6 +470,7 @@ fn coverage_case() -> SeededCommand {
             severe: false,
         },
         failures: CoverageFailureTally::default(),
+        error_classifications: Vec::new(),
         resets_in_gaps: Vec::new(),
         legacy_evidence_present: false,
         configured: true,

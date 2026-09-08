@@ -71,7 +71,10 @@ use sha2::{Digest, Sha256};
 
 use crate::domain::attempt::DueReason as DecisionDueReason;
 use crate::domain::attempt::{AttemptId, AttemptOutcome, AttemptStarted};
-use crate::domain::failure::FailureClass;
+use crate::domain::failure::{
+    CREDENTIAL_UNAVAILABLE_CLASSIFICATION, FailureClass, ProviderErrorReport,
+    provider_error_classification,
+};
 use crate::domain::ids::{AdapterVersion, ProviderContractId};
 use crate::domain::time::{Clock, MonotonicDuration, ProviderObservedAt, UtcTimestamp};
 use crate::domain::window::{MeterWindow, QuantizationSemantics, WindowScope};
@@ -93,7 +96,7 @@ use crate::projection::Publication;
 use crate::store::account::AccountId;
 use crate::store::meter_attempt::{
     DueBasis, DueReason as StoredDueReason, MeterAttemptRowId, NewMeterAttempt,
-    NewMeterAttemptResult,
+    NewMeterAttemptResult, error_classification_column,
 };
 use crate::store::meter_evidence::NewMeterResponseEvidence;
 use crate::store::repository::{NewMeterInterpretation, Repository, TerminalMeterBundle};
@@ -815,7 +818,10 @@ where
                     completed_at: received_at,
                     elapsed,
                     outcome,
-                    sanitized_error_classification: None,
+                    sanitized_error_classification: Some(stored_error_classification(
+                        outcome,
+                        captured.failed_error.as_ref(),
+                    )),
                     retry_index: None,
                     clock_anomaly: false,
                 };
@@ -960,6 +966,25 @@ fn row_id_of(attempt_id: AttemptId) -> Result<MeterAttemptRowId, Error> {
                 attempt_id.value()
             ))
         })
+}
+
+/// The `sanitized_error_classification` value a failed attempt stores. The
+/// adapter's report stands when it supplied one (a response arrived and the
+/// provider named the failure); otherwise the classification is derived from
+/// the attempt outcome, because a failure with no provider word must still
+/// record why it failed rather than a NULL. A success never reaches here.
+fn stored_error_classification(
+    outcome: AttemptOutcome,
+    failed_error: Option<&ProviderErrorReport>,
+) -> String {
+    match failed_error {
+        Some(report) => error_classification_column::encode(report),
+        None => match outcome {
+            AttemptOutcome::AuthRequired => CREDENTIAL_UNAVAILABLE_CLASSIFICATION.to_owned(),
+            AttemptOutcome::Unreachable(class) => provider_error_classification(class).to_owned(),
+            AttemptOutcome::Success => String::new(),
+        },
+    }
 }
 
 /// The due decision's reason, in the store's spelling of the same four-value

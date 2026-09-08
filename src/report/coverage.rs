@@ -22,8 +22,9 @@ use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
 use crate::logging::LogicalName;
 use crate::report::models::{
-    CoverageAccount, CoverageBreach, CoverageBreachDimension, CoverageReport, CoverageReset,
-    CoverageThreshold, IngestionGeneration, LedgerGeneration, ReportMetadata,
+    CoverageAccount, CoverageBreach, CoverageBreachDimension, CoverageErrorClassification,
+    CoverageReport, CoverageReset, CoverageThreshold, IngestionGeneration, LedgerGeneration,
+    ReportMetadata,
 };
 use crate::report::provenance::{ProvenanceNode, ValueArithmetic};
 use crate::store::{
@@ -267,6 +268,38 @@ pub fn assemble(
                 .map(|terminal| terminal.outcome),
         );
 
+        // The provider error classifications the interval's failed attempts
+        // stored, counted per classification with the decoded classification
+        // part of each stored value. Largest count first, so the detail block
+        // leads with the failure that dominated the interval; ties break on
+        // the classification's own order, which keeps the report stable.
+        let mut classification_counts: std::collections::BTreeMap<String, u64> =
+            std::collections::BTreeMap::new();
+        for attempt in attempts
+            .iter()
+            .filter_map(|attempt| attempt.terminal.as_ref())
+        {
+            if let Some(stored) = &attempt.error_classification {
+                let classification =
+                    meter_attempt::error_classification_column::classification_of(stored);
+                *classification_counts
+                    .entry(classification.to_owned())
+                    .or_insert(0) += 1;
+            }
+        }
+        let mut error_classifications: Vec<CoverageErrorClassification> = classification_counts
+            .into_iter()
+            .map(|(classification, count)| CoverageErrorClassification {
+                classification,
+                count,
+            })
+            .collect();
+        error_classifications.sort_by(|a, b| {
+            b.count
+                .cmp(&a.count)
+                .then_with(|| a.classification.cmp(&b.classification))
+        });
+
         // The resets that actually fell inside a no-attempt gap, each with the
         // window length the detail block names. A reset outside every gap is
         // not a lost peak and is deliberately left out.
@@ -305,6 +338,7 @@ pub fn assemble(
             name: LogicalName::new(recorded.logical_name().to_string()),
             engine,
             failures,
+            error_classifications,
             resets_in_gaps,
             legacy_evidence_present: legacy_observations > 0,
             configured: is_configured,

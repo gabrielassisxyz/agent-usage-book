@@ -197,6 +197,52 @@ pub mod failure_class_sql {
     }
 }
 
+/// The `sanitized_error_classification` column's value for a failed attempt:
+/// the classification, and the sanitized message beside it in the same value
+/// when the provider supplied one. The schema carries one nullable column for
+/// both facts (migration 0008; `aub-rfot` allows no schema change), so the
+/// message rides after a separator the classification is normalized never to
+/// contain, and decoding recovers both fields exactly.
+///
+/// A NULL stays the older rows' shape and reads as `unclassified`.
+pub mod error_classification_column {
+    /// The unclassified spelling a reader gives a NULL column: every row
+    /// written before this column was populated.
+    pub const UNCLASSIFIED: &str = "unclassified";
+
+    const SEPARATOR: &str = ": ";
+
+    /// The stored value for one failed attempt's report: the classification
+    /// alone when the message is empty, classification and message joined by
+    /// the separator otherwise.
+    pub fn encode(report: &crate::domain::failure::ProviderErrorReport) -> String {
+        if report.message.is_empty() {
+            report.classification.clone()
+        } else {
+            format!("{}{}{}", report.classification, SEPARATOR, report.message)
+        }
+    }
+
+    /// The classification part of a stored value: everything before the first
+    /// separator, or the whole value when no separator is present. The
+    /// classification is normalized against characters that could form the
+    /// separator, so the split is exact for every value `encode` wrote.
+    pub fn classification_of(stored: &str) -> &str {
+        stored
+            .split_once(SEPARATOR)
+            .map_or(stored, |(class, _)| class)
+    }
+
+    /// The message part of a stored value, or the empty string when the
+    /// value carries the classification alone.
+    pub fn message_of(stored: &str) -> &str {
+        stored
+            .split_once(SEPARATOR)
+            .map(|(_, message)| message)
+            .unwrap_or("")
+    }
+}
+
 pub(crate) fn attempt_outcome_as_sql(outcome: &AttemptOutcome) -> &'static str {
     match outcome {
         AttemptOutcome::Success => "success",
@@ -554,6 +600,11 @@ pub struct AttemptTerminalOutcome {
     pub finished_at: UtcTimestamp,
     pub outcome: AttemptOutcome,
     pub retry_after: Option<MonotonicDuration>,
+    /// The stored classification and sanitized message of the failure, as
+    /// written. `None` for a success and for the older rows that predate the
+    /// column being populated; readers give a `None` the `unclassified`
+    /// spelling.
+    pub error_classification: Option<String>,
 }
 
 /// Every attempt of one account started in `[start, end)`, oldest first, each
@@ -570,7 +621,8 @@ pub fn attempts_with_outcomes_for_account_between(
     let mut statement = conn
         .prepare(
             "SELECT ma.request_started_at, mar.completed_at, mar.outcome,
-                    mar.failure_class, mar.retry_after_nanos
+                    mar.failure_class, mar.retry_after_nanos,
+                    mar.sanitized_error_classification
              FROM meter_attempt ma
              LEFT JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
              WHERE ma.account_id = ?1
@@ -611,6 +663,7 @@ pub fn attempts_with_outcomes_for_account_between(
                             outcome,
                             retry_after: retry_after_nanos
                                 .map(|nanos| MonotonicDuration::from_nanos(nanos as u64)),
+                            error_classification: row.get(5)?,
                         })
                     }
                 };
@@ -671,6 +724,66 @@ pub fn count_clock_anomalies_since(
         |row| row.get(0),
     )
     .map_err(|e| Error::Store(format!("cannot count clock anomalies: {e}")))
+}
+
+/// One account's failed attempts by stored error classification over
+/// `[start, end)`, oldest classification first, largest count last. The
+/// doctor's per-account read of why a day of attempts failed (`aub-rfot`):
+/// every classification the window's failed attempts stored, with the count
+/// of each. A NULL classification (an older row) reads as the
+/// `unclassified` spelling, so the past is visible without being rewritten.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccountErrorClassifications {
+    pub account_id: crate::store::account::AccountId,
+    /// `(classification, failed attempt count)`, ordered by classification
+    /// for a deterministic report.
+    pub classifications: Vec<(String, u64)>,
+}
+
+pub fn error_classifications_between(
+    conn: &rusqlite::Connection,
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+) -> Result<Vec<AccountErrorClassifications>, Error> {
+    let mut statement = conn
+        .prepare(
+            "SELECT ma.account_id, mar.sanitized_error_classification, count(*)
+             FROM meter_attempt ma
+             JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
+             WHERE ma.request_started_at >= ?1 AND ma.request_started_at < ?2
+               AND mar.outcome <> 'success'
+             GROUP BY ma.account_id, mar.sanitized_error_classification
+             ORDER BY ma.account_id, mar.sanitized_error_classification",
+        )
+        .map_err(|e| Error::Store(format!("cannot read error classifications: {e}")))?;
+    let rows = statement
+        .query_map(params![start.unix_nanos(), end.unix_nanos()], |row| {
+            let account_id = crate::store::account::AccountId::new(row.get::<_, i64>(0)?);
+            let classification: Option<String> = row.get(1)?;
+            let count: i64 = row.get(2)?;
+            Ok((
+                account_id,
+                classification
+                    .unwrap_or_else(|| error_classification_column::UNCLASSIFIED.to_owned()),
+                count as u64,
+            ))
+        })
+        .map_err(|e| Error::Store(format!("cannot read error classifications: {e}")))?;
+    let mut grouped: Vec<AccountErrorClassifications> = Vec::new();
+    for entry in rows {
+        let (account_id, classification, count) =
+            entry.map_err(|e| Error::Store(format!("cannot read error classifications: {e}")))?;
+        match grouped.last_mut() {
+            Some(grouped_row) if grouped_row.account_id == account_id => {
+                grouped_row.classifications.push((classification, count));
+            }
+            _ => grouped.push(AccountErrorClassifications {
+                account_id,
+                classifications: vec![(classification, count)],
+            }),
+        }
+    }
+    Ok(grouped)
 }
 
 #[cfg(test)]

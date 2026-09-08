@@ -11,6 +11,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use sha2::{Digest, Sha256};
 
+use crate::domain::failure::{
+    FailureClass, ProviderErrorReport, bound_error_message, normalize_error_classification,
+    provider_error_classification, sanitize_provider_error_text,
+};
 use crate::meter::adapter::ProviderObservation;
 use crate::meter::transport::HttpResponse;
 
@@ -40,6 +44,21 @@ impl SensitiveResponseMaterial {
     fn contains_known_secret(&self, value: &str) -> bool {
         self.values.iter().any(|secret| value.contains(secret))
     }
+
+    /// Replaces every known-secret occurrence in free provider text with
+    /// `[REDACTED]`. Error messages are not structured JSON the sanitizer can
+    /// walk by field, so the values the caller registered as sensitive (its
+    /// own credential, the account identifier it sent) are removed by direct
+    /// substitution before the domain sanitizer's token heuristics run.
+    pub fn redact_known_secrets(&self, text: &str) -> String {
+        let mut redacted = text.to_string();
+        for secret in &self.values {
+            if !secret.is_empty() {
+                redacted = redacted.replace(secret.as_str(), "[REDACTED]");
+            }
+        }
+        redacted
+    }
 }
 
 /// A canonical, sanitized response capsule ready for durable persistence.
@@ -53,11 +72,19 @@ pub struct JsonEvidenceCapsule {
 
 /// One adapter result with the response evidence kept separate from its
 /// semantic interpretation. Pre-response failures have no evidence capsule.
+///
+/// `failed_error` is what the provider said about a failed response: the
+/// sanitized classification and message the attempt result stores, composed
+/// by the adapter exactly when a response arrived and the observation is a
+/// failure. Pre-response failures (a transport error, an unreadable
+/// credential) carry `None` and the sampler derives the classification from
+/// the failure class instead, because there is no provider word to store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapturedProviderResponse<T> {
     pub observation: ProviderObservation<T>,
     pub evidence: Option<JsonEvidenceCapsule>,
     pub failed_body: Option<Vec<u8>>,
+    pub failed_error: Option<ProviderErrorReport>,
 }
 
 impl<T> CapturedProviderResponse<T> {
@@ -66,8 +93,96 @@ impl<T> CapturedProviderResponse<T> {
             observation,
             evidence: None,
             failed_body: None,
+            failed_error: None,
         }
     }
+}
+
+/// Reads the provider's own error classification and message from a failed
+/// response body: the `error.type` and `error.message` fields, with a
+/// top-level `message` as the fallback shape one provider's 401 already
+/// uses. A body that is not JSON with either shape yields nothing, and the
+/// caller's fallback stands.
+fn parse_provider_error_body(body: &[u8]) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_slice::<serde_json::Value>(body) else {
+        return (None, None);
+    };
+    let error = value.get("error");
+    let classification = error
+        .and_then(|error| error.get("type"))
+        .and_then(|kind| kind.as_str())
+        .map(str::to_owned);
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(|message| message.as_str())
+        .or_else(|| value.get("message").and_then(|message| message.as_str()))
+        .map(str::to_owned);
+    (classification, message)
+}
+
+/// Composes the sanitized error report a failed response stores: the body's
+/// own `error.type` classification when one was parsed and it survives
+/// sanitization, else the caller's fallback (the `http_<status>` spelling
+/// for a status-bearing failure, the failure-class spelling otherwise), and
+/// the body's error message with the caller's known-secret material removed
+/// before the token heuristics run. Both fields are bounded, so a provider
+/// echoing something absurd can neither inflate the column nor smuggle a
+/// forbidden pattern past the sanitizer by classifying it as a type.
+pub fn provider_error_report_from_body(
+    body: &[u8],
+    fallback_classification: impl Into<String>,
+    sensitive: &SensitiveResponseMaterial,
+) -> ProviderErrorReport {
+    let (raw_classification, raw_message) = parse_provider_error_body(body);
+    let classification = raw_classification
+        .map(|raw| normalize_error_classification(&raw))
+        .filter(|normalized| {
+            !normalized.is_empty() && sanitize_provider_error_text(normalized) == *normalized
+        })
+        .unwrap_or_else(|| fallback_classification.into());
+    let redacted = sensitive.redact_known_secrets(raw_message.as_deref().unwrap_or(""));
+    let message = bound_error_message(&sanitize_provider_error_text(&redacted));
+    ProviderErrorReport {
+        classification,
+        message,
+    }
+}
+
+/// The error report for one classified observation over a received response:
+/// `Some` for every failure arm, `None` for a measurement. The fallback
+/// classification follows the observation: a parse-shaped failure (the body
+/// arrived but could not be read as a reading) is named by its failure
+/// class, not by the HTTP status that carried it; every other failure keeps
+/// the status spelling, which is the honest fallback while the body's own
+/// word is unavailable.
+pub fn error_report_for_observation<T>(
+    observation: &ProviderObservation<T>,
+    body: &[u8],
+    status: u16,
+    sensitive: &SensitiveResponseMaterial,
+) -> Option<ProviderErrorReport> {
+    let class = match observation {
+        ProviderObservation::Measured(_) => return None,
+        ProviderObservation::AuthRequired(_) => None,
+        ProviderObservation::Unreachable(class) => Some(*class),
+    };
+    let fallback = match class {
+        // A failure named by its class, not by the status that carried it:
+        // the transport classes (which can arrive when a response was already
+        // in flight) and the parse-shaped classes (where the status was a
+        // success and the reading was not).
+        Some(
+            class @ (FailureClass::DnsFailure
+            | FailureClass::ConnectTimeout
+            | FailureClass::ReadTimeout
+            | FailureClass::TotalBudgetExpired
+            | FailureClass::MalformedBody
+            | FailureClass::MissingRequiredField
+            | FailureClass::SchemaDrift),
+        ) => provider_error_classification(class).to_owned(),
+        Some(_) | None => format!("http_{status}"),
+    };
+    Some(provider_error_report_from_body(body, fallback, sensitive))
 }
 
 impl JsonEvidenceCapsule {

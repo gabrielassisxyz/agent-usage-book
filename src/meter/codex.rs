@@ -86,7 +86,7 @@ use crate::meter::adapter::{
 };
 use crate::meter::evidence::{
     CapturedProviderResponse, JsonEvidenceCapsule, SensitiveResponseMaterial, capture_json_body,
-    quota_response_from_capsule,
+    error_report_for_observation, quota_response_from_capsule,
 };
 use crate::meter::transport::{
     CommandBudget, HttpRequest, HttpResponse, LOCAL_FILE_MTIME_HEADER, LOCAL_FILE_PATH_HEADER,
@@ -700,6 +700,7 @@ impl CodexAdapter {
                     ),
                     evidence: Some(evidence),
                     failed_body: None,
+                    failed_error: None,
                 };
             }
         };
@@ -714,6 +715,7 @@ impl CodexAdapter {
                     observation: ProviderObservation::Unreachable(failure),
                     evidence: Some(evidence),
                     failed_body: None,
+                    failed_error: None,
                 };
             }
         };
@@ -756,6 +758,11 @@ impl CodexAdapter {
             observation,
             evidence: Some(evidence),
             failed_body,
+            // A rollout is a local file, not a provider error response: the
+            // parse-shaped failures here have no provider word to store, and
+            // the sampler derives their classification from the failure
+            // class.
+            failed_error: None,
         }
     }
 
@@ -874,10 +881,17 @@ impl CodexAdapter {
             | ProviderObservation::AuthRequired(_)
             | ProviderObservation::Unreachable(_) => None,
         };
+        let failed_error = error_report_for_observation(
+            &observation,
+            response.body(),
+            response.status(),
+            &sensitive,
+        );
         CapturedProviderResponse {
             observation,
             evidence,
             failed_body,
+            failed_error,
         }
     }
 

@@ -98,6 +98,91 @@ pub enum AuthReason {
     ProviderDeclaredExpiry,
 }
 
+/// What the provider said about a failed request, reduced to the two facts a
+/// `meter_attempt_result` row stores and nothing else: a classification and a
+/// message, both sanitized. Never a body: the body policy (`aub-2r3`) retains
+/// raw responses only where a parse failed, so this report is all that
+/// survives for a failed attempt the parsers understood enough to classify.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderErrorReport {
+    /// The sanitized classification: the response body's own `error.type`
+    /// when one was parsed and survived sanitization, else a fallback the
+    /// caller derives from what it knows (the HTTP status, the transport
+    /// failure class). Normalized to the characters the stored spelling of
+    /// this vocabulary uses throughout (`rate_limit_error`, `http_429`).
+    pub classification: String,
+    /// The sanitized error message, credential-free: the provider's own
+    /// words with every credential-shaped and forbidden-pattern-bearing
+    /// token redacted. Empty when the provider supplied nothing readable.
+    pub message: String,
+}
+
+/// The fallback classification for a failure the provider never named: the
+/// transport-level spelling of the shared failure class. The HTTP-bearing
+/// classes fall back to their status spellings at the adapter, which knows
+/// the exact status; this mapping covers what survives when no response did.
+/// `tls` has no arm because the transport taxonomy cannot yet distinguish a
+/// TLS handshake failure from any other failed connect; a `FailureClass`
+/// variant for it would introduce the spelling here, not before.
+pub fn provider_error_classification(class: FailureClass) -> &'static str {
+    match class {
+        FailureClass::DnsFailure => "dns",
+        FailureClass::ConnectTimeout => "connect",
+        FailureClass::ReadTimeout => "timeout",
+        FailureClass::TotalBudgetExpired => "budget_expired_before_request",
+        FailureClass::HttpStatus(HttpStatusClass::ClientError) => "http_client_error",
+        FailureClass::HttpStatus(HttpStatusClass::ServerError) => "http_server_error",
+        FailureClass::RateLimited { .. } => "http_429",
+        FailureClass::MalformedBody => "malformed_body",
+        FailureClass::MissingRequiredField => "missing_required_field",
+        FailureClass::SchemaDrift => "schema_drift",
+    }
+}
+
+/// The fallback classification for an authentication failure raised before
+/// any exchange with the provider happened (a credential that could not be
+/// read or parsed at all). Distinct from `authentication_error`, which is a
+/// provider body's own word for a rejected credential.
+pub const CREDENTIAL_UNAVAILABLE_CLASSIFICATION: &str = "credential_error";
+
+/// Normalizes a provider-supplied error classification to the stored
+/// vocabulary's shape: lowercase, with every character outside the spelling
+/// the existing classifications use mapped to an underscore. The result is
+/// guaranteed never to contain the stored-value separator (`": "`), so the
+/// classification part of a stored value is always recoverable exactly.
+pub fn normalize_error_classification(raw: &str) -> String {
+    let mut normalized: String = raw
+        .to_lowercase()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-' || c == '.' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    normalized.truncate(ERROR_CLASSIFICATION_MAX_CHARS);
+    normalized
+}
+
+/// The most characters a stored classification may carry: a generous bound
+/// over every spelling the vocabulary actually uses, so a provider echoing
+/// something absurd under `error.type` cannot inflate the column.
+const ERROR_CLASSIFICATION_MAX_CHARS: usize = 128;
+
+/// The most characters a stored error message may carry: a diagnostic
+/// excerpt, not a retained body. Bounded by length here because this is the
+/// one place provider prose enters durable storage unaccompanied by the
+/// count-bounded capsule machinery (`aub-2r3`).
+const ERROR_MESSAGE_MAX_CHARS: usize = 512;
+
+/// Bounds a sanitized message to the length the column's reader should ever
+/// have to scan, at a character boundary.
+pub fn bound_error_message(sanitized: &str) -> String {
+    sanitized.chars().take(ERROR_MESSAGE_MAX_CHARS).collect()
+}
+
 /// Case-insensitive labels that precede credential material in provider error text.
 /// Matched against a whitespace-delimited token, so `"Authorization: Bearer xyz"`
 /// yields three tokens and this list only needs to recognize each label token itself,
@@ -111,6 +196,35 @@ const CREDENTIAL_LABEL_TOKENS: [&str; 6] = [
     "apikey=",
 ];
 
+/// The credential field-name and identity patterns that must never survive
+/// into stored provider error text, read from the one list every scan shares
+/// (`docs/forbidden-patterns.txt`): the section below the binary-scan marker.
+/// A pattern added there protects stored error messages with the same edit
+/// that protects the four scans the file already feeds; this module keeps no
+/// private copy of the list.
+const FORBIDDEN_PATTERN_LIST: &str = include_str!("../../docs/forbidden-patterns.txt");
+const BINARY_SCAN_SECTION_MARKER: &str = "# === binary-scan patterns end here ===";
+
+/// The identity and field-name patterns below the binary-scan marker, parsed
+/// once. Lines are matched verbatim (the list's trailing-space convention is
+/// preserved), with comments and blanks skipped.
+fn forbidden_identity_patterns() -> &'static [&'static str] {
+    static PATTERNS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    PATTERNS.get_or_init(|| {
+        let section = FORBIDDEN_PATTERN_LIST
+            .split_once(BINARY_SCAN_SECTION_MARKER)
+            .map(|(_, rest)| rest)
+            .unwrap_or(FORBIDDEN_PATTERN_LIST);
+        section
+            .lines()
+            .filter(|line| {
+                let trimmed = line.trim();
+                !trimmed.is_empty() && !trimmed.starts_with('#')
+            })
+            .collect()
+    })
+}
+
 /// A bare token is treated as credential-shaped once it is long enough, and made only
 /// of characters a token or key commonly uses, that leaving it in place is a bigger
 /// risk than redacting an occasional long non-secret.
@@ -120,12 +234,16 @@ const BARE_SECRET_MIN_LENGTH: usize = 20;
 /// failure classification: sanitizes at the one boundary where provider text enters
 /// this module, rather than trusting every future call site to remember to redact.
 ///
-/// Two heuristics, applied per whitespace-delimited token: a token matching a known
+/// Three heuristics, applied per whitespace-delimited token: a token matching a known
 /// credential label (`Authorization:`, `Bearer`, `api_key=`, ...) is redacted outright
-/// as a cheap first path, and a token containing a run of characters long enough and
-/// shaped enough to plausibly be a secret is redacted even under a label nobody
-/// enumerated (`token=`, `x-api-key:`, or any other `label=SECRET`/`label:SECRET`
-/// shape), since the run check does not depend on recognizing the label at all.
+/// as a cheap first path; a token carrying any identity or field-name pattern from
+/// the shared forbidden-pattern list is redacted, so a provider message naming a
+/// credential field (`x-api-key`, `access_token`) or an account-identifier shape
+/// (anything carrying `@`) can never be stored; and a token containing a run of
+/// characters long enough and shaped enough to plausibly be a secret is redacted
+/// even under a label nobody enumerated (`token=`, `x-api-key:`, or any other
+/// `label=SECRET`/`label:SECRET` shape), since the run check does not depend on
+/// recognizing the label at all.
 pub fn sanitize_provider_error_text(raw: &str) -> String {
     raw.split_whitespace()
         .map(redact_token)
@@ -138,7 +256,10 @@ fn redact_token(word: &str) -> String {
     let is_labeled = CREDENTIAL_LABEL_TOKENS
         .iter()
         .any(|label| lower.starts_with(label));
-    if is_labeled || looks_like_a_bare_secret(word) {
+    let carries_forbidden_pattern = forbidden_identity_patterns()
+        .iter()
+        .any(|pattern| lower.contains(pattern));
+    if is_labeled || carries_forbidden_pattern || looks_like_a_bare_secret(word) {
         "[REDACTED]".to_string()
     } else {
         word.to_string()
@@ -393,5 +514,101 @@ mod tests {
                 "sanitized text still contains the seeded secret: {sanitized:?}"
             );
         }
+    }
+
+    /// The planted negative for the forbidden-pattern extension: a message
+    /// naming a credential field the label list never enumerated survives the
+    /// label check and the bare-secret check, and only the forbidden-pattern
+    /// scan catches it. This is the exact leak shape a provider 401 uses
+    /// ("invalid x-api-key"), so the pattern list, not the label list, is
+    /// what must hold here.
+    #[test]
+    fn sanitizer_redacts_a_credential_field_name_the_label_list_never_enumerated() {
+        let raw = "invalid x-api-key provided for account user@example.com";
+        let sanitized = sanitize_provider_error_text(raw);
+        assert!(
+            !sanitized.contains("api-key"),
+            "sanitized text still names the credential field: {sanitized:?}"
+        );
+        assert!(
+            !sanitized.contains('@'),
+            "sanitized text still carries the account-identifier shape: {sanitized:?}"
+        );
+        assert!(
+            sanitized.contains("provided"),
+            "ordinary words survive: {sanitized:?}"
+        );
+    }
+
+    /// A provider classification is normalized to the stored vocabulary's
+    /// shape, and the normalization can never introduce the stored-value
+    /// separator: whatever punctuation the provider used, decoding a stored
+    /// value splits at the first ": " and lands on the classification.
+    #[test]
+    fn a_provider_classification_normalizes_to_the_stored_vocabulary_shape() {
+        assert_eq!(
+            normalize_error_classification("Rate Limit Error"),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            normalize_error_classification("invalid_grant"),
+            "invalid_grant",
+            "an already-normalized classification passes through unchanged"
+        );
+        let weird = normalize_error_classification("auth: secret@type");
+        assert!(!weird.contains(": "), "{weird:?}");
+        assert!(!weird.contains('@'), "{weird:?}");
+    }
+
+    /// The failure classes that can arise with no response at all map to the
+    /// transport-level spellings the bead's acceptance criteria name. The
+    /// HTTP-bearing classes fall back at the adapter, which knows the exact
+    /// status, so they are absent here on purpose.
+    #[test]
+    fn responseless_failure_classes_map_to_their_transport_spellings() {
+        use crate::domain::time::MonotonicDuration;
+        assert_eq!(
+            provider_error_classification(FailureClass::DnsFailure),
+            "dns"
+        );
+        assert_eq!(
+            provider_error_classification(FailureClass::ConnectTimeout),
+            "connect"
+        );
+        assert_eq!(
+            provider_error_classification(FailureClass::ReadTimeout),
+            "timeout"
+        );
+        assert_eq!(
+            provider_error_classification(FailureClass::TotalBudgetExpired),
+            "budget_expired_before_request"
+        );
+        assert_eq!(
+            provider_error_classification(FailureClass::RateLimited {
+                retry_after: Some(MonotonicDuration::from_seconds(60))
+            }),
+            "http_429",
+            "a rate limit with no adapter report falls back to its status spelling"
+        );
+    }
+
+    /// A stored message is a diagnostic excerpt, not a retained body: the
+    /// bound caps the length at a character boundary without ever panicking
+    /// on multi-byte input.
+    #[test]
+    fn a_message_bound_truncates_at_a_character_boundary() {
+        let long = "é".repeat(ERROR_MESSAGE_MAX_CHARS + 10);
+        let bounded = bound_error_message(&long);
+        assert_eq!(bounded.chars().count(), ERROR_MESSAGE_MAX_CHARS);
+        // One character past the bound: the truncation lands between the two
+        // multi-byte characters, taking the first whole rather than cutting
+        // its bytes.
+        let multibyte_cut = bound_error_message(&format!(
+            "{}{}",
+            "a".repeat(ERROR_MESSAGE_MAX_CHARS - 1),
+            "éé"
+        ));
+        assert_eq!(multibyte_cut.chars().count(), ERROR_MESSAGE_MAX_CHARS);
+        assert!(multibyte_cut.ends_with('é'), "{multibyte_cut:?}");
     }
 }

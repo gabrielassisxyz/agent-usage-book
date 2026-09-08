@@ -429,6 +429,7 @@ impl ProviderAdapter for AnyAdapter {
                     observation: map_observation(captured.observation, Reading::Anthropic),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
+                    failed_error: captured.failed_error,
                 }
             }
             AnyAdapter::OpenCode(adapter) => {
@@ -437,6 +438,7 @@ impl ProviderAdapter for AnyAdapter {
                     observation: map_observation(captured.observation, Reading::OpenCode),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
+                    failed_error: captured.failed_error,
                 }
             }
             AnyAdapter::Codex(adapter) => {
@@ -445,6 +447,7 @@ impl ProviderAdapter for AnyAdapter {
                     observation: map_observation(captured.observation, Reading::Codex),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
+                    failed_error: captured.failed_error,
                 }
             }
             AnyAdapter::Ollama(adapter) => {
@@ -453,6 +456,7 @@ impl ProviderAdapter for AnyAdapter {
                     observation: map_observation(captured.observation, Reading::Ollama),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
+                    failed_error: captured.failed_error,
                 }
             }
             AnyAdapter::Agy(adapter) => {
@@ -461,6 +465,7 @@ impl ProviderAdapter for AnyAdapter {
                     observation: map_observation(captured.observation, Reading::Agy),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
+                    failed_error: captured.failed_error,
                 }
             }
         }

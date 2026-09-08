@@ -48,7 +48,7 @@ use crate::meter::adapter::{
 };
 use crate::meter::evidence::{
     CapturedProviderResponse, JsonEvidenceCapsule, SensitiveResponseMaterial, capture_json_body,
-    quota_response_from_capsule,
+    error_report_for_observation, quota_response_from_capsule,
 };
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse, RequestTimeoutConfig};
 
@@ -581,10 +581,17 @@ impl ProviderAdapter for OpenCodeAdapter {
             | ProviderObservation::AuthRequired(_)
             | ProviderObservation::Unreachable(_) => None,
         };
+        let failed_error = error_report_for_observation(
+            &observation,
+            response.body(),
+            response.status(),
+            &SensitiveResponseMaterial::new([material]),
+        );
         CapturedProviderResponse {
             observation,
             evidence,
             failed_body,
+            failed_error,
         }
     }
 }

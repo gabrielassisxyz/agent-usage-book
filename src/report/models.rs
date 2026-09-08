@@ -910,6 +910,11 @@ pub struct CoverageAccount {
     /// Terminal failures grouped by the four classes PLAN.md section 15
     /// distinguishes in measurement coverage.
     pub failures: crate::report::coverage::CoverageFailureTally,
+    /// The provider error classifications the interval's failed attempts
+    /// stored, each with its count, largest count first. This is what the
+    /// detail block names when it says why the attempts failed; a failure
+    /// whose row predates the classification column reads as `unclassified`.
+    pub error_classifications: Vec<CoverageErrorClassification>,
     /// The known quota resets that fell inside a no-attempt gap, each with the
     /// nominal length of the window that reported it.
     pub resets_in_gaps: Vec<CoverageReset>,
@@ -921,6 +926,14 @@ pub struct CoverageAccount {
     pub configured: bool,
     /// The provenance node for this account's coverage quantities.
     pub provenance: ProvenanceNode,
+}
+
+/// One stored provider error classification and the number of the account's
+/// failed attempts that carried it in the interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverageErrorClassification {
+    pub classification: String,
+    pub count: u64,
 }
 
 /// A known quota reset that fell inside a no-attempt gap, with the nominal
@@ -1403,6 +1416,7 @@ mod tests {
                     severe: false,
                 },
                 failures: crate::report::coverage::CoverageFailureTally::default(),
+                error_classifications: Vec::new(),
                 resets_in_gaps: Vec::new(),
                 legacy_evidence_present: false,
                 configured: true,

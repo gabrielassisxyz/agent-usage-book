@@ -37,7 +37,7 @@ use crate::meter::adapter::{
 };
 use crate::meter::evidence::{
     CapturedProviderResponse, SensitiveResponseMaterial, capture_json_body, capture_json_response,
-    quota_response_from_capsule,
+    error_report_for_observation, quota_response_from_capsule,
 };
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse, RequestTimeoutConfig};
 
@@ -902,10 +902,17 @@ impl ProviderAdapter for AnthropicAdapter {
             | ProviderObservation::Unreachable(_) => None,
         };
 
+        let failed_error = error_report_for_observation(
+            &observation,
+            response.body(),
+            response.status(),
+            &sensitive,
+        );
         CapturedProviderResponse {
             observation,
             evidence: Some(evidence),
             failed_body,
+            failed_error,
         }
     }
 }
