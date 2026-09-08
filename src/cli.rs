@@ -9,6 +9,8 @@
 
 use std::ffi::OsString;
 use std::io;
+use std::io::Read as _;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::config::EnvSource;
@@ -103,6 +105,7 @@ aub_command_enum! {
     CanRun,
     Calibrate,
     Account,
+    Statusline,
 }
 
 /// Whether a command accepts a shared flag, and the reason it does not when it
@@ -131,7 +134,7 @@ impl Command {
     /// this array against [`Command::DECLARED_VARIANTS`], which the enum's own
     /// declaration derives, so a variant that joins the enum without joining this
     /// array fails a test that names it.
-    pub const ALL: [Self; 27] = [
+    pub const ALL: [Self; 28] = [
         Self::Status,
         Self::Spend,
         Self::Config,
@@ -159,6 +162,7 @@ impl Command {
         Self::CanRun,
         Self::Calibrate,
         Self::Account,
+        Self::Statusline,
     ];
 
     /// The shared-flag policy for this command: which global flags it accepts
@@ -609,6 +613,24 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
+            Command::Statusline => FlagPolicy {
+                format: FlagSupport::Rejected {
+                    reason: "statusline passes its input through unchanged",
+                },
+                explain: FlagSupport::Rejected {
+                    reason: "statusline derives no quantity",
+                },
+                account: FlagSupport::Rejected {
+                    reason: "statusline attributes by the profile the session was launched in, never by a flag",
+                },
+                model: FlagSupport::Rejected {
+                    reason: "statusline takes no model",
+                },
+                no_color: FlagSupport::Rejected {
+                    reason: "statusline prints no color",
+                },
+                verbosity: FlagSupport::Accepted,
+            },
         }
     }
 
@@ -643,6 +665,7 @@ impl Command {
             Command::CanRun => "can-run",
             Command::Calibrate => "calibrate",
             Command::Account => "account",
+            Command::Statusline => "statusline",
         }
     }
 
@@ -707,6 +730,9 @@ impl Command {
             Command::Account => Some(
                 "list configured accounts and rename one across every table that stores its name as text",
             ),
+            Command::Statusline => Some(
+                "pass the Claude Code status-line payload through unchanged, recording its rate-limit windows per account",
+            ),
         }
     }
 
@@ -761,6 +787,9 @@ impl Command {
             ),
             Command::Account => Some(
                 "which accounts has the ledger recorded, and how do I rename one without losing its history?",
+            ),
+            Command::Statusline => Some(
+                "what did the status line's payload say each account's meter windows were, without the renderer knowing?",
             ),
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
@@ -841,6 +870,7 @@ impl Command {
                 Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
             }
             Command::Account => Some("list | rename PROVIDER OLD NEW"),
+            Command::Statusline => None,
             Command::Status
             | Command::LoggingFixture
             | Command::StateCheck
@@ -1164,6 +1194,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         Command::CanRun => can_run_command(&RealClock::new(), level, &invocation),
         Command::Calibrate => calibrate_command(&RealClock::new(), &invocation),
         Command::Account => account_command(&RealClock::new(), &invocation),
+        Command::Statusline => statusline_command(&RealClock::new(), &invocation),
     }
 }
 
@@ -7835,6 +7866,42 @@ fn account_load_config() -> Result<crate::config::Config, Error> {
         &file_path,
     )?;
     Ok(config)
+}
+
+/// `aub statusline`: the tee the Claude Code status line pipes its payload
+/// through, ahead of the existing renderer.
+///
+/// The contract is the one the status line makes unavoidable: read stdin
+/// once, write the same bytes to stdout unchanged, and never fail. Every
+/// problem on aub's own side (no profile in the environment, no matching
+/// configured account, an unparsable payload, an unwritable state directory,
+/// a missing or broken config) is swallowed with the payload already on its
+/// way out, so the status line renders exactly as it did before this verb
+/// existed and the exit code is 0 in every case.
+fn statusline_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    reject_positionals(invocation)?;
+    let mut payload = Vec::new();
+    // A stdin read that fails leaves nothing to pass through or record; the
+    // status line still gets an empty stream, which is what it would have
+    // got without this verb in the pipeline.
+    if io::stdin().read_to_end(&mut payload).is_err() {
+        return Ok(());
+    }
+    // Pass through before recording: the renderer reads the pipe and renders
+    // while the tee's own bookkeeping happens behind it, and a renderer that
+    // hangs up early (a broken pipe) must not stop the record.
+    let _ = io::stdout().write_all(&payload);
+    let _ = io::stdout().flush();
+
+    // The profile names the account; the config names the accounts. Both
+    // failing means nothing is recorded, which is the honest outcome: this
+    // tee attributes by what the environment named, never by a guess.
+    let profile = std::env::var("SHALLOW_PROFILE").ok();
+    let config = account_load_config().ok();
+    if let (Some(profile), Some(config)) = (profile, config) {
+        let _ = crate::statusline::record(&config, Some(&profile), &payload, clock.now());
+    }
+    Ok(())
 }
 
 /// `aub account list`: one line per `account` row (id, provider, name, first

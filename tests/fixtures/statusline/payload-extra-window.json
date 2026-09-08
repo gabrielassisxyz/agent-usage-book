@@ -1,0 +1,9 @@
+{
+  "session_id": "8cd9c60a-e10a-4d44-857e-6b2b931b4d9d",
+  "cwd": "/tmp/worktree/project",
+  "rate_limits": {
+    "five_hour": {"used_percentage": 40, "resets_at": "1786834200"},
+    "seven_day": {"used_percentage": 12, "resets_at": "1786920000"},
+    "seven_day_opus": {"used_percentage": 9, "resets_at": "1786920001"}
+  }
+}
