@@ -127,9 +127,8 @@ mod tests {
     };
     use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
     use crate::domain::tokens::{CacheReadTokens, CacheWriteTokens, InputTokens, OutputTokens};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+    use crate::store::connection::PragmaPolicy;
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -158,20 +157,8 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.0.join("segment-test.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .unwrap();
-        run_migrations(
-            &mut conn,
-            &registry(),
-            None,
-            &crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
-        conn
+
+        crate::store::test_schema::open_migrated(&scratch.0.join("segment-test.db"), &policy)
     }
 
     fn usage(input: u64) -> KnownTokenVector {

@@ -607,7 +607,7 @@ mod tests {
 
     use crate::domain::time::FakeClock;
     use crate::domain::window::QuantizationSemantics;
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::connection::PragmaPolicy;
     use crate::store::meter_evidence::{measurement_basis_sql, quantization_sql};
     use crate::store::spool::{PendingTerminalBundle, PendingWindow, spool_pending};
 
@@ -650,14 +650,7 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let _conn = crate::store::test_schema::open_migrated(&db_path, &policy);
         scratch
     }
 

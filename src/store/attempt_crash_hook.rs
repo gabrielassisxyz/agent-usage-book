@@ -928,15 +928,12 @@ mod tests {
         let timeout = MonotonicDuration::from_seconds(5);
 
         // Seed attempt start and pending spool file directly
-        let mut conn = open(
+        let conn = crate::store::test_schema::open_migrated(
             &db_path,
-            AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: timeout,
             },
-        )
-        .unwrap();
-        run_migrations(&mut conn, &registry(), None, &clock).unwrap();
+        );
         let account =
             observe_account(&conn, "fixture-provider", "fixture-account", clock.now()).unwrap();
         let run = start_sample_run(&conn, Trigger::Manual, clock.now(), "test").unwrap();

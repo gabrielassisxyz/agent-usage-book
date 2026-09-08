@@ -2174,8 +2174,8 @@ mod tests {
     use crate::calibration::activation::{ActivationActor, ActivationPolicy, ActivationRequest};
     use crate::calibration::contamination::ContaminationVerdict;
     use crate::domain::credits::Credits;
-    use crate::domain::time::{FakeClock, MonotonicDuration};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::domain::time::MonotonicDuration;
+    use crate::store::connection::PragmaPolicy;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -2210,19 +2210,10 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
+        let conn = crate::store::test_schema::open_migrated(
             &scratch.path().join("calibration.db"),
-            AccessMode::ReadWrite,
             &policy,
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        );
         (scratch, conn)
     }
 

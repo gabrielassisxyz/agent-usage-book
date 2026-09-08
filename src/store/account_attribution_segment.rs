@@ -316,9 +316,8 @@ mod tests {
         AccountMarkerBoundary, AccountSegmentationInputs, AccountUsageEvent, segment,
     };
     use crate::domain::tokens::{CacheReadTokens, CacheWriteTokens, InputTokens, OutputTokens};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+    use crate::store::connection::PragmaPolicy;
+
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -347,20 +346,11 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
+
+        crate::store::test_schema::open_migrated(
             &scratch.0.join("account-segment-test.db"),
-            AccessMode::ReadWrite,
             &policy,
         )
-        .unwrap();
-        run_migrations(
-            &mut conn,
-            &registry(),
-            None,
-            &crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
-        conn
     }
 
     fn usage(input: u64) -> KnownTokenVector {

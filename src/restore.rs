@@ -601,14 +601,8 @@ mod tests {
     /// first, because `open` creates the file, never its parent directory.
     fn migrated_state_dir(state_dir: &Path) -> rusqlite::Connection {
         ensure_dir_mode_0700(state_dir).unwrap();
-        let mut conn = open(
-            &state_dir.join(LEDGER_DATABASE_FILE),
-            AccessMode::ReadWrite,
-            &policy(),
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(&mut conn, &registry(), None, &clock_at(0)).unwrap();
-        conn
+
+        crate::store::test_schema::open_migrated(&state_dir.join(LEDGER_DATABASE_FILE), &policy())
     }
 
     /// Seeds one fixture account and one started attempt, and returns the

@@ -1173,8 +1173,7 @@ mod tests {
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use crate::store::ledger_generation;
     use crate::store::meter_attempt;
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+
     use crate::store::spool::{drain_pending, pending_file_path};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -1360,14 +1359,7 @@ mod tests {
     fn fixture_database() -> (StateDir, PathBuf) {
         let scratch = StateDir::new();
         let database_path = scratch.path().join("sampler.db");
-        let mut conn = open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
-        run_migrations(
-            &mut conn,
-            &registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-        )
-        .unwrap();
+        let conn = crate::store::test_schema::open_migrated(&database_path, &policy());
         drop(conn);
         (scratch, database_path)
     }

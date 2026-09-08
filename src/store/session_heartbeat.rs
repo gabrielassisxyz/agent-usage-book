@@ -147,8 +147,8 @@ pub fn latest_heartbeat(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::time::FakeClock;
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+
+    use crate::store::connection::PragmaPolicy;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -184,14 +184,7 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let conn = crate::store::test_schema::open_migrated(&db_path, &policy);
         (scratch, conn)
     }
 

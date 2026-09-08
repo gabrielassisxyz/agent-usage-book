@@ -1217,9 +1217,7 @@ mod tests {
     use rusqlite::Connection;
 
     use crate::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+    use crate::store::connection::PragmaPolicy;
 
     // --- helpers ------------------------------------------------------------
 
@@ -1241,16 +1239,8 @@ mod tests {
             let policy = PragmaPolicy {
                 busy_timeout: MonotonicDuration::from_millis(5000),
             };
-            let mut conn =
-                open(&self.0, AccessMode::ReadWrite, &policy).expect("test database must open");
-            run_migrations(
-                &mut conn,
-                &registry(),
-                None,
-                &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-            )
-            .expect("test migrations must apply");
-            conn
+
+            crate::store::test_schema::open_migrated(&self.0, &policy)
         }
     }
 

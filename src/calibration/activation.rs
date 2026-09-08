@@ -475,7 +475,7 @@ mod tests {
     use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
     use crate::domain::provenance::{CostModelId, WindowCalibrationId};
     use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
-    use crate::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
+    use crate::domain::time::{MonotonicDuration, UtcTimestamp};
     use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowSemanticKey};
     use crate::store::calibration::{
         CalibrationExperiment, CalibrationScope, CoefficientUncertainty, EvidenceDigest,
@@ -483,7 +483,7 @@ mod tests {
         activation_events_for, insert_experiment, insert_result, load_active_at,
         publish_provisional,
     };
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::connection::PragmaPolicy;
     use crate::store::cost_model::{ProviderKey, ValidityInterval};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -519,19 +519,10 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
+        let conn = crate::store::test_schema::open_migrated(
             &scratch.path().join("activation.db"),
-            AccessMode::ReadWrite,
             &policy,
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        );
         (scratch, conn)
     }
 

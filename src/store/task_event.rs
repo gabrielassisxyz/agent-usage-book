@@ -223,7 +223,7 @@ fn insert_quarantine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
+    use crate::domain::time::{MonotonicDuration, UtcTimestamp};
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -256,21 +256,12 @@ mod tests {
 
     fn fixture_connection() -> (ScratchDir, rusqlite::Connection) {
         let scratch = ScratchDir::new();
-        let mut connection = open(
+        let connection = crate::store::test_schema::open_migrated(
             &scratch.path().join("state.db"),
-            AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: MonotonicDuration::from_millis(1_000),
             },
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut connection,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        );
         (scratch, connection)
     }
 

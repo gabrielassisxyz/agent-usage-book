@@ -58,6 +58,8 @@ pub mod spool;
 pub mod startup;
 pub mod task_event;
 pub mod task_identity;
+#[cfg(test)]
+pub mod test_schema;
 pub mod transcript_file;
 pub mod usage_component;
 pub mod usage_event;

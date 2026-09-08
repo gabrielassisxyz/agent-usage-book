@@ -891,13 +891,12 @@ pub fn refuse_activation_for_contaminated_run(
 mod tests {
     use super::*;
     use crate::domain::provenance::CostModelId;
-    use crate::domain::time::{FakeClock, MonotonicDuration};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::domain::time::MonotonicDuration;
+    use crate::store::connection::PragmaPolicy;
     use crate::store::cost_model::{
         anthropic_claude_messages_incomplete_v1, anthropic_claude_messages_v1,
     };
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -929,21 +928,12 @@ mod tests {
 
     fn migrated() -> (ScratchDir, Connection) {
         let scratch = ScratchDir::new();
-        let mut conn = open(
+        let conn = crate::store::test_schema::open_migrated(
             &scratch.path().join("controlled.db"),
-            AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: MonotonicDuration::from_millis(1_000),
             },
-        )
-        .expect("scratch database must open");
-        run_migrations(
-            &mut conn,
-            &registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-        )
-        .expect("migrations must run");
+        );
         (scratch, conn)
     }
 

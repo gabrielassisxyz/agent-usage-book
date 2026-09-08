@@ -270,10 +270,9 @@ pub fn legacy_observation_count_between(
 mod tests {
     use super::*;
     use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
-    use crate::domain::time::FakeClock;
+
     use crate::legacy_meter::LegacyWindow;
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+
     use crate::store::sample_run::count_sample_runs;
 
     fn source() -> ParsedLegacyMeterSource {
@@ -342,17 +341,13 @@ mod tests {
     fn import_is_idempotent_and_preserves_legacy_provenance() {
         let scratch = ScratchDir::new();
         let db_path = scratch.path().join("legacy-import.db");
-        let mut conn = crate::store::connection::open(
+        let mut conn = crate::store::test_schema::open_migrated(
             &db_path,
-            crate::store::connection::AccessMode::ReadWrite,
             &crate::store::connection::PragmaPolicy {
                 busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1_000),
             },
-        )
-        .expect("scratch database must open");
+        );
         let imported_at = UtcTimestamp::from_unix_nanos(1_000);
-        run_migrations(&mut conn, &registry(), None, &FakeClock::new(imported_at))
-            .expect("fixture migrations must apply");
 
         let first = import(&mut conn, &source(), "backup-verified-1", imported_at)
             .expect("first import must succeed");

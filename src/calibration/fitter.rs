@@ -1337,20 +1337,11 @@ mod tests {
         let policy = crate::store::connection::PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = crate::store::connection::open(
+        let conn = crate::store::test_schema::open_migrated(
             &scratch.path().join("calibration.db"),
-            crate::store::connection::AccessMode::ReadWrite,
             &policy,
-        )
-        .unwrap();
+        );
         let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(10_000_000_000));
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &clock,
-        )
-        .unwrap();
 
         let experiment = test_experiment("exp-crit-6");
         crate::store::calibration::insert_experiment(&conn, &experiment).unwrap();

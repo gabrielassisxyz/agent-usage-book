@@ -15,20 +15,18 @@ use rusqlite::Connection;
 
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
-use crate::domain::time::{FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp};
+use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use crate::domain::window::{
     NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowResetState,
     WindowScope, WindowSemanticKey,
 };
 use crate::store::account::observe_account;
-use crate::store::connection::{AccessMode, PragmaPolicy, open};
+use crate::store::connection::PragmaPolicy;
 use crate::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
 use crate::store::meter_evidence::{
     NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
     insert_response_evidence, insert_window,
 };
-use crate::store::migrate::run_migrations;
-use crate::store::migrations::registry;
 use crate::store::sample_run::{Trigger, start_sample_run};
 use crate::store::sampling_policy_snapshot::{ResolvedSamplingPolicy, resolve_policy_snapshot};
 
@@ -64,21 +62,12 @@ impl Drop for CalibrateCliTestLedgerDir {
 /// connection over a temp file, running the idempotent migrations.
 pub fn open_calibrate_cli_test_ledger() -> (CalibrateCliTestLedgerDir, Connection) {
     let scratch = CalibrateCliTestLedgerDir::new();
-    let mut conn = open(
+    let conn = crate::store::test_schema::open_migrated(
         &scratch.path().join("calibrate.db"),
-        AccessMode::ReadWrite,
         &PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1_000),
         },
-    )
-    .expect("scratch database must open");
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-    )
-    .expect("migrations must run");
+    );
     (scratch, conn)
 }
 

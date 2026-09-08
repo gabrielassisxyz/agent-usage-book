@@ -262,9 +262,8 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
 mod tests {
     use super::*;
     use crate::domain::rate_card::parse_rate_micros;
-    use crate::domain::time::FakeClock;
-    use crate::store::connection::{AccessMode, PragmaPolicy};
-    use crate::store::migrate::run_migrations;
+
+    use crate::store::connection::PragmaPolicy;
 
     /// A fresh scratch directory under the system temp dir, removed on drop.
     /// A file database rather than `:memory:`: the connection policy requires
@@ -292,21 +291,12 @@ mod tests {
     /// The scratch must outlive the connection, so both travel together.
     fn open_migrated() -> (ScratchDir, rusqlite::Connection) {
         let scratch = ScratchDir::new();
-        let mut conn = crate::store::connection::open(
+        let conn = crate::store::test_schema::open_migrated(
             &scratch.path().join("rate-card.db"),
-            AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1_000),
             },
-        )
-        .expect("scratch database must open");
-        run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-        )
-        .expect("migrations must run");
+        );
         (scratch, conn)
     }
 

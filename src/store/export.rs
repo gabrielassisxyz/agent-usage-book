@@ -298,9 +298,9 @@ fn push_sorted_unique(target: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::time::{FakeClock, MonotonicDuration};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::migrate::run_migrations;
+    use crate::domain::time::MonotonicDuration;
+    use crate::store::connection::PragmaPolicy;
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -335,19 +335,8 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.path().join("export.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .unwrap();
-        run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let conn =
+            crate::store::test_schema::open_migrated(&scratch.path().join("export.db"), &policy);
         (scratch, conn)
     }
 

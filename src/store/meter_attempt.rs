@@ -790,9 +790,8 @@ pub fn error_classifications_between(
 mod tests {
     use super::*;
     use crate::store::account::{AccountId, observe_account};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+    use crate::store::connection::PragmaPolicy;
+
     use crate::store::sample_run::{SampleRunId, Trigger, start_sample_run};
     use crate::store::sampling_policy_snapshot::{
         ResolvedSamplingPolicy, SamplingPolicySnapshotId, resolve_policy_snapshot,
@@ -849,16 +848,10 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.path().join("meter.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .expect("fixture connection must open");
-        let clock_at =
+        let conn =
+            crate::store::test_schema::open_migrated(&scratch.path().join("meter.db"), &policy);
+        let _clock_at =
             |nanos: i64| crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
-        run_migrations(&mut conn, &registry(), None, &clock_at(9_000))
-            .expect("fixture migrations must apply");
         let account = observe_account(
             &conn,
             "test-provider",
@@ -1186,13 +1179,12 @@ mod coverage_query_tests {
     use super::*;
     use crate::domain::failure::FailureClass;
     use crate::store::account::AccountId;
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::connection::PragmaPolicy;
     use crate::store::meter_attempt::{
         DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
         start_meter_attempt,
     };
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+
     use crate::store::sample_run::{SampleRunId, Trigger, start_sample_run};
     use crate::store::sampling_policy_snapshot::{
         ResolvedSamplingPolicy, SamplingPolicySnapshotId, resolve_policy_snapshot,
@@ -1246,16 +1238,10 @@ mod coverage_query_tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.path().join("meter.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .expect("fixture connection must open");
-        let clock_at =
+        let conn =
+            crate::store::test_schema::open_migrated(&scratch.path().join("meter.db"), &policy);
+        let _clock_at =
             |nanos: i64| crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
-        run_migrations(&mut conn, &registry(), None, &clock_at(9_000))
-            .expect("fixture migrations must apply");
         let account = crate::store::account::observe_account(
             &conn,
             "test-provider",

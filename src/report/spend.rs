@@ -1130,9 +1130,9 @@ mod tests {
     use crate::domain::interval::Interval;
     use crate::domain::provenance::WindowCalibrationId;
     use crate::domain::quota::PercentagePoints;
-    use crate::domain::time::{FakeClock, MonotonicDuration};
+    use crate::domain::time::MonotonicDuration;
     use crate::sessions::{ProjectKey, RepositoryKey};
-    use crate::store::connection::{AccessMode, PragmaPolicy};
+    use crate::store::connection::PragmaPolicy;
     use crate::store::session::{NewSession, insert_session};
     use crate::store::usage_component::insert_components;
     use crate::store::usage_event::{NewUsageEvent, insert_event};
@@ -1191,21 +1191,12 @@ mod tests {
 
     fn canonical_conn(tag: &str) -> (PathBuf, rusqlite::Connection) {
         let root = scratch(tag);
-        let mut conn = crate::store::connection::open(
+        let conn = crate::store::test_schema::open_migrated(
             &root.join("ledger.db"),
-            AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: MonotonicDuration::from_millis(100),
             },
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        );
         (root, conn)
     }
 

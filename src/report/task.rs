@@ -346,9 +346,9 @@ mod tests {
     use super::*;
     use crate::attribution::{TrackerEventReader, TrackerEventRecord};
     use crate::domain::ids::{NativeSessionId, NativeTaskId, SourceNamespace};
-    use crate::domain::time::{FakeClock, MonotonicDuration, UtcDate};
+    use crate::domain::time::{MonotonicDuration, UtcDate};
     use crate::sessions::{ProjectKey, RepositoryKey};
-    use crate::store::connection::{AccessMode, PragmaPolicy};
+    use crate::store::connection::PragmaPolicy;
     use crate::store::session::{NewSession, insert_session};
     use crate::store::usage_component::insert_components;
     use crate::store::usage_event::{NewUsageEvent, insert_event};
@@ -366,22 +366,13 @@ mod tests {
 
     fn open_test_ledger(tag: &str) -> rusqlite::Connection {
         let root = scratch(tag);
-        let mut conn = crate::store::connection::open(
+
+        crate::store::test_schema::open_migrated(
             &root.join("ledger.db"),
-            AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: MonotonicDuration::from_millis(100),
             },
         )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
-        conn
     }
 
     fn seed_session(conn: &rusqlite::Connection, name: &str, run: Option<&str>) {

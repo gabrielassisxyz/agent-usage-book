@@ -214,7 +214,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::domain::time::{FakeClock, UtcTimestamp};
     use crate::domain::window::QuantizationSemantics;
     use crate::store::meter_evidence::{measurement_basis_sql, quantization_sql};
     use crate::store::spool::{PendingTerminalBundle, PendingWindow, spool_pending};
@@ -249,19 +248,7 @@ mod tests {
         let policy = crate::store::connection::PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = crate::store::connection::open(
-            path,
-            crate::store::connection::AccessMode::ReadWrite,
-            &policy,
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let _conn = crate::store::test_schema::open_migrated(path, &policy);
     }
 
     /// A structurally valid bundle whose account and attempt do not exist,

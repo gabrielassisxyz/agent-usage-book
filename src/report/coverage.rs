@@ -497,12 +497,11 @@ mod tests {
     use crate::config::CoverageFloor;
     use crate::coverage::CoverageFraction;
     use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
-    use crate::domain::time::{FakeClock, MeasurementBasis, MonotonicDuration};
-    use crate::store::connection::{self, AccessMode, PragmaPolicy};
+    use crate::domain::time::{MeasurementBasis, MonotonicDuration};
+    use crate::store::connection::{self, PragmaPolicy};
     use crate::store::meter_attempt::{self, DueReason, NewMeterAttempt, NewMeterAttemptResult};
     use crate::store::meter_evidence::{self, NewMeterObservation, NewMeterResponseEvidence};
-    use crate::store::migrate;
-    use crate::store::migrations;
+
     use crate::store::sample_run::{self, Trigger};
     use crate::store::sampling_policy_snapshot::{self, ResolvedSamplingPolicy};
     use test_support::StateDir;
@@ -512,16 +511,8 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = connection::open(&path, AccessMode::ReadWrite, &policy)
-            .expect("scratch ledger must open");
-        migrate::run_migrations(
-            &mut conn,
-            &migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .expect("scratch ledger must migrate");
-        conn
+
+        crate::store::test_schema::open_migrated(&path, &policy)
     }
 
     fn test_policy(cadence_secs: u64) -> ResolvedSamplingPolicy {

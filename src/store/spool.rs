@@ -1105,20 +1105,8 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.path().join("spool-test.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
-        conn
+
+        crate::store::test_schema::open_migrated(&scratch.path().join("spool-test.db"), &policy)
     }
 
     /// A minimal but fully valid bundle, one window, ready to spool.

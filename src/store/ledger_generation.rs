@@ -127,14 +127,7 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(busy_millis),
         };
-        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
-        run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let conn = crate::store::test_schema::open_migrated(&db_path, &policy);
         (scratch, conn)
     }
 
@@ -161,14 +154,7 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(5000),
         };
-        let mut bootstrap = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
-        run_migrations(
-            &mut bootstrap,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let bootstrap = crate::store::test_schema::open_migrated(&db_path, &policy);
         drop(bootstrap);
 
         let first = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();

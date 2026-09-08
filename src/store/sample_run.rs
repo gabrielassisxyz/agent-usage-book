@@ -187,7 +187,7 @@ pub fn timer_run_times_between(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::connection::PragmaPolicy;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -223,14 +223,7 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-        )
-        .unwrap();
+        let conn = crate::store::test_schema::open_migrated(&db_path, &policy);
         (scratch, conn)
     }
 
@@ -278,9 +271,8 @@ mod tests {
 mod coverage_query_tests {
     use super::*;
     use crate::domain::time::{MonotonicDuration, UtcTimestamp};
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+    use crate::store::connection::PragmaPolicy;
+
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -319,16 +311,10 @@ mod coverage_query_tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.path().join("meter.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .expect("fixture connection must open");
-        let clock_at =
+        let conn =
+            crate::store::test_schema::open_migrated(&scratch.path().join("meter.db"), &policy);
+        let _clock_at =
             |nanos: i64| crate::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
-        run_migrations(&mut conn, &registry(), None, &clock_at(0))
-            .expect("fixture migrations must apply");
 
         for (trigger, at) in [
             (Trigger::Timer, 1_000),

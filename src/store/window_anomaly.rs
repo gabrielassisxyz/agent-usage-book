@@ -760,14 +760,13 @@ mod tests {
         WindowResetState, WindowSemanticKey,
     };
     use crate::store::account::observe_account;
-    use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::connection::PragmaPolicy;
     use crate::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
     use crate::store::meter_evidence::{
         NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
         insert_response_evidence, insert_window, observation_by_row_id,
     };
-    use crate::store::migrate::run_migrations;
-    use crate::store::migrations::registry;
+
     use crate::store::sample_run::{Trigger, start_sample_run};
     use crate::store::sampling_policy_snapshot::{ResolvedSamplingPolicy, resolve_policy_snapshot};
     use std::path::{Path, PathBuf};
@@ -821,15 +820,9 @@ mod tests {
         let policy = PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1000),
         };
-        let mut conn = open(
-            &scratch.path().join("meter.db"),
-            AccessMode::ReadWrite,
-            &policy,
-        )
-        .expect("fixture connection must open");
-        let clock_at = |nanos: i64| FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
-        run_migrations(&mut conn, &registry(), None, &clock_at(9_000))
-            .expect("fixture migrations must apply");
+        let conn =
+            crate::store::test_schema::open_migrated(&scratch.path().join("meter.db"), &policy);
+        let _clock_at = |nanos: i64| FakeClock::new(UtcTimestamp::from_unix_nanos(nanos));
         let account = observe_account(
             &conn,
             "test-provider",

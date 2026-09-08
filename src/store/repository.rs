@@ -671,14 +671,7 @@ mod tests {
     fn fixture() -> Fixture {
         let scratch = ScratchDir::new();
         let database_path = scratch.path().join("repository.db");
-        let mut conn = connection::open(&database_path, AccessMode::ReadWrite, &policy()).unwrap();
-        crate::store::migrate::run_migrations(
-            &mut conn,
-            &crate::store::migrations::registry(),
-            None,
-            &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
-        )
-        .unwrap();
+        let conn = crate::store::test_schema::open_migrated(&database_path, &policy());
         let account_id = crate::store::account::observe_account(
             &conn,
             "anthropic",
