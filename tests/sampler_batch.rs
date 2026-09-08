@@ -36,8 +36,6 @@ use agent_usage_book::store::meter_attempt::{
 use agent_usage_book::store::meter_evidence::{
     count_meter_observations, newest_observation_for_account, windows_by_observation,
 };
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::repository::Repository;
 use agent_usage_book::store::sample_run::{Trigger, count_sample_runs, sample_run_by_id};
 use agent_usage_book::store::sampling_lease::{AccountName, LeaseHolder};
@@ -93,17 +91,9 @@ fn busy_policy() -> PragmaPolicy {
 fn fixture_repository(tag: &str) -> (ScratchDir, Repository) {
     let scratch = ScratchDir::new(tag);
     let database_path = scratch.path().join("ledger.db");
-    let mut conn = open(&database_path, AccessMode::ReadWrite, &busy_policy()).unwrap();
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &agent_usage_book::domain::time::FakeClock::new(
-            agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(1_000),
-        ),
-    )
-    .unwrap();
-    drop(conn);
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    drop(test_support::open_migrated(&database_path, &busy_policy()));
     (scratch, Repository::new(&database_path, busy_policy()))
 }
 

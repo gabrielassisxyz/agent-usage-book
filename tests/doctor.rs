@@ -11,7 +11,7 @@ use agent_usage_book::domain::failure::FailureClass;
 use agent_usage_book::domain::time::{Clock, FakeClock, MonotonicDuration, UtcTimestamp};
 use agent_usage_book::meter::adapter::HttpTransport;
 use agent_usage_book::meter::transport::{CommandBudget, HttpRequest, HttpResponse};
-use agent_usage_book::store::{connection, migrate, migrations};
+use agent_usage_book::store::connection;
 use test_support::StateDir;
 
 fn ts(seconds: i64) -> UtcTimestamp {
@@ -23,16 +23,14 @@ fn open_ledger(state_dir: &Path) -> rusqlite::Connection {
     let policy = connection::PragmaPolicy {
         busy_timeout: MonotonicDuration::from_millis(500),
     };
-    let mut conn = connection::open(&path, connection::AccessMode::ReadWrite, &policy)
-        .expect("scratch ledger must open");
-    migrate::run_migrations(
-        &mut conn,
-        &migrations::registry(),
-        None,
-        &FakeClock::new(ts(0)),
-    )
-    .expect("scratch ledger must migrate");
-    conn
+    // Several tests call this twice on one path to reopen a ledger they have
+    // already seeded, so the template copy (aub-yr9c) is only for the first,
+    // creating call; a reopen must not clobber the rows already there.
+    if path.exists() {
+        return connection::open(&path, connection::AccessMode::ReadWrite, &policy)
+            .expect("an existing scratch ledger must reopen");
+    }
+    test_support::open_migrated(&path, &policy)
 }
 
 fn test_config(state_dir: &Path) -> Config {

@@ -302,9 +302,7 @@ fn fixture_store() -> (
 ) {
     use agent_usage_book::domain::time::UtcTimestamp;
     use agent_usage_book::store::account::observe_account;
-    use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
-    use agent_usage_book::store::migrate::run_migrations;
-    use agent_usage_book::store::migrations::registry;
+    use agent_usage_book::store::connection::PragmaPolicy;
     use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
     use agent_usage_book::store::sampling_policy_snapshot::{
         ResolvedSamplingPolicy, resolve_policy_snapshot,
@@ -320,21 +318,14 @@ fn fixture_store() -> (
     };
 
     let scratch = ScratchDir::new("synthetic-server-store");
-    let mut connection = open(
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    let connection = test_support::open_migrated(
         &scratch.path().join("state.db"),
-        AccessMode::ReadWrite,
         &PragmaPolicy {
             busy_timeout: MonotonicDuration::from_millis(1_000),
         },
-    )
-    .unwrap();
-    run_migrations(
-        &mut connection,
-        &registry(),
-        None,
-        &agent_usage_book::domain::time::FakeClock::new(UtcTimestamp::from_unix_nanos(9_000)),
-    )
-    .unwrap();
+    );
     let account = observe_account(
         &connection,
         "synthetic",

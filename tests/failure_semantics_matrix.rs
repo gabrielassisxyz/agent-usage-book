@@ -66,7 +66,7 @@ use agent_usage_book::error::ExitClass;
 use agent_usage_book::evidence::{CoverageCompleteness, Derivation, EvidenceQuality};
 use agent_usage_book::store::account::observe_account;
 use agent_usage_book::store::calibration::PlanTier;
-use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
+use agent_usage_book::store::connection::PragmaPolicy;
 use agent_usage_book::store::cost_model::{
     anthropic_claude_messages_incomplete_v1, anthropic_claude_messages_v1,
 };
@@ -74,8 +74,6 @@ use agent_usage_book::store::ingest_quarantine::{
     NewQuarantineItem, count_quarantined_records, load_all_quarantine, record_quarantine,
 };
 use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
 use agent_usage_book::store::sampling_policy_snapshot::{
     ResolvedSamplingPolicy, resolve_policy_snapshot,
@@ -233,15 +231,9 @@ fn init_ledger(state_dir: &Path) -> rusqlite::Connection {
     let policy = PragmaPolicy {
         busy_timeout: MonotonicDuration::from_millis(1000),
     };
-    let mut conn = open(&db_path, AccessMode::ReadWrite, &policy).expect("open test ledger");
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-    )
-    .expect("migrate test ledger");
-    conn
+    // The schema comes from the cross-process template cache (aub-yr9c) instead
+    // of a per-fixture migration replay.
+    test_support::open_migrated(&db_path, &policy)
 }
 
 const FIXTURE_POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
