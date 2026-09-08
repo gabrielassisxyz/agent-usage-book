@@ -6,3 +6,13 @@ publish = false
 description = "Test-only helpers shared by every suite in agent-usage-book"
 
 [dependencies]
+# The migrated-schema cache (aub-yr9c) builds the real schema by replaying this
+# crate's own migration registry once and hands every test process a file copy,
+# so it needs the library's `store::migrate`, `store::migrations` and
+# `build_info` surface. This is a dev-dependency cycle: `agent-usage-book`
+# dev-depends on `test-support`, and cargo permits the back-edge because it only
+# binds when building `agent-usage-book`'s own tests, never its library.
+agent-usage-book = { path = "../.." }
+# The cache returns an open `rusqlite::Connection`; pinned to the same version
+# the library takes so the type is identical across the boundary.
+rusqlite = { version = "0.32", features = ["bundled"] }
