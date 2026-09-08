@@ -125,7 +125,17 @@ fn seed_attempt(
             completed_at: finished,
             elapsed: MonotonicDuration::from_millis(100),
             outcome,
-            sanitized_error_classification: None,
+            // The classification a real day of failures would store: the
+            // provider's own word for the refusal, classification alone
+            // when the fixture carries no message. A success stores none.
+            sanitized_error_classification: match &outcome {
+                AttemptOutcome::Success => None,
+                AttemptOutcome::AuthRequired => Some("authentication_error".to_owned()),
+                AttemptOutcome::Unreachable(class) => Some(
+                    agent_usage_book::domain::failure::provider_error_classification(*class)
+                        .to_owned(),
+                ),
+            },
             retry_index: None,
             clock_anomaly: false,
         },
@@ -404,9 +414,9 @@ fn the_two_worked_examples_render() {
         "│  work-primary  99.3%     98.6%         9m           0                        │",
         "│  research      98.9%     71.5%         2h 11m       1                        │",
         "│              measurement coverage below the 95% floor                        │",
-        "│              41 attempts required authentication                             │",
-        "│              28 attempts were rate limited                                   │",
-        "│              4 attempts hit an unreachable provider                          │",
+        "│              41 attempts refused with authentication_error                   │",
+        "│              28 attempts refused with http_429                               │",
+        "│              4 attempts refused with http_server_error                       │",
         "│              4 attempts started without a terminal result                    │",
         "│              one 5h reset without an observation in the surrounding gap      │",
         "│                                                                              │",

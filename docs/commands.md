@@ -399,7 +399,13 @@ attempts observe?
 
 One box: a row per configured account, that account's findings indented
 under its own row, the ledger's retired accounts on one `not in config`
-line, and the threshold verdict's next action as the footer.
+line, and the threshold verdict's next action as the footer. Each finding
+names the provider error classification the interval's failed attempts
+stored, largest count first (`1 attempt refused with rate_limit_error`);
+the classification is what the provider itself said about the refusal,
+sanitized, and the full stored value, message included, is on the attempt
+result row in the ledger. Rows written before the classification column
+was populated read as `unclassified`.
 
 ```
 ┌─ coverage · last 24h ────────────────────────────────────────────────────────┐
@@ -410,7 +416,8 @@ line, and the threshold verdict's next action as the footer.
 │         attempt coverage below the 98% floor                                 │
 │         3 resets without an observation in the surrounding gaps              │
 │  gmail    100.0%    76.6%         6m           3                             │
-│         45 attempts were rate limited · 14 attempts required authentication  │
+│         45 attempts refused with rate_limit_error                            │
+│         14 attempts refused with authentication_error                        │
 │         3 resets without an observation in the surrounding gaps              │
 │                                                                              │
 │  not in config: primary-2026-09-04 (last observed 2026-09-04)                │
