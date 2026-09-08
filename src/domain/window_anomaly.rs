@@ -26,7 +26,7 @@
 
 use crate::domain::quota::QuotaUsed;
 use crate::domain::time::UtcTimestamp;
-use crate::domain::window::{WindowResetState, WindowScopeKind};
+use crate::domain::window::{ResetPrecision, WindowResetState, WindowScopeKind};
 
 /// Provider-reported `resets_at` jitter envelope, sized from the measured
 /// distribution rather than from one sample.
@@ -78,14 +78,16 @@ impl WindowAnomalyKind {
 }
 
 /// One window reading, reduced to exactly what reset-semantics comparison
-/// needs: the reported used fraction, the reported reset state, and the
-/// instant this reading was taken at (the observation's measurement basis
-/// instant, not the window's own reset instant).
+/// needs: the reported used fraction, the reported reset state, the instant
+/// this reading was taken at (the observation's measurement basis instant,
+/// not the window's own reset instant), and the reset precision the
+/// producing adapter declared for this window, when it declares one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WindowReading {
     pub quota_used: QuotaUsed,
     pub resets_at: WindowResetState,
     pub observed_at: UtcTimestamp,
+    pub reset_precision: Option<ResetPrecision>,
 }
 
 /// True when the window's previously reported boundary had already been
@@ -127,16 +129,53 @@ fn reset_advanced(previous_reset: WindowResetState, current_reset: WindowResetSt
 }
 
 /// Whether two reset states differ by enough to represent a material window
-/// transition. Instants inside the jitter envelope describe the same
-/// boundary; changes to or from `NotStarted` remain material.
-fn reset_changed(previous_reset: WindowResetState, current_reset: WindowResetState) -> bool {
+/// transition. Instants inside `tolerance_nanos` describe the same boundary;
+/// changes to or from `NotStarted` remain material.
+fn reset_changed(
+    previous_reset: WindowResetState,
+    current_reset: WindowResetState,
+    tolerance_nanos: i64,
+) -> bool {
     match (previous_reset.instant(), current_reset.instant()) {
         (Some(old), Some(new)) => {
-            old.unix_nanos().abs_diff(new.unix_nanos())
-                >= RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS as u64
+            old.unix_nanos().abs_diff(new.unix_nanos()) >= tolerance_nanos as u64
         }
         (None, None) => false,
         (Some(_), None) | (None, Some(_)) => true,
+    }
+}
+
+/// The largest instant difference two readings' `Known` resets can show and
+/// still describe one unchanged provider boundary, for this pair.
+///
+/// The floor is always the fixed provider-jitter envelope: a sub-second
+/// reported-instant wobble is the same boundary no matter what either
+/// adapter declares. A pair whose readings agree on a declared reset
+/// precision (`aub-w1a0`) widens the tolerance by that precision plus the
+/// interval between the two observations: the opencode page derives each
+/// reset from hour-granular text, so consecutive derived instants drift by
+/// the sampling interval and jump by up to one declared precision at the
+/// text's own hour tick, none of which is a provider event. Only a
+/// declaration both sides carry widens anything - one side's declaration
+/// alone says nothing about the surface the other side was read from.
+fn same_reset_tolerance_nanos(previous: &WindowReading, current: &WindowReading) -> i64 {
+    let declared = match (previous.reset_precision, current.reset_precision) {
+        (Some(previous_precision), Some(current_precision))
+            if previous_precision == current_precision =>
+        {
+            Some(previous_precision.as_nanos())
+        }
+        _ => None,
+    };
+    match declared {
+        Some(precision_nanos) => {
+            let gap_nanos = current
+                .observed_at
+                .unix_nanos()
+                .saturating_sub(previous.observed_at.unix_nanos());
+            RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS.max(precision_nanos.saturating_add(gap_nanos))
+        }
+        None => RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS,
     }
 }
 
@@ -167,7 +206,8 @@ pub fn classify_window_transition(
     previous: WindowReading,
     current: WindowReading,
 ) -> Option<WindowAnomalyKind> {
-    let reset_changed = reset_changed(previous.resets_at, current.resets_at);
+    let tolerance_nanos = same_reset_tolerance_nanos(&previous, &current);
+    let reset_changed = reset_changed(previous.resets_at, current.resets_at, tolerance_nanos);
     let legitimate_reset = reset_changed
         && reset_due(previous.resets_at, current.observed_at)
         && reset_advanced(previous.resets_at, current.resets_at);
@@ -259,10 +299,20 @@ mod tests {
     }
 
     fn reading(used_ppm: i32, resets_at: WindowResetState, observed_at: i64) -> WindowReading {
+        reading_with_precision(used_ppm, resets_at, observed_at, None)
+    }
+
+    fn reading_with_precision(
+        used_ppm: i32,
+        resets_at: WindowResetState,
+        observed_at: i64,
+        reset_precision: Option<ResetPrecision>,
+    ) -> WindowReading {
         WindowReading {
             quota_used: used(used_ppm),
             resets_at,
             observed_at: UtcTimestamp::from_unix_nanos(observed_at),
+            reset_precision,
         }
     }
 

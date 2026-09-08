@@ -355,6 +355,7 @@ fn drill_bundle(attempt_id: i64, request_started_at_nanos: i64) -> PendingTermin
         provider_contract_id: "endpoint-schema-v3".into(),
         meter_semantics_id: "account-5h-v2".into(),
         normalized_fingerprint: format!("drill-fp-{attempt_id}"),
+        reset_precision_nanos: None,
         windows: vec![PendingWindow {
             semantic_key: "five_hour".into(),
             scope_kind: "account_wide".into(),

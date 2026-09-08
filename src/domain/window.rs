@@ -188,6 +188,44 @@ impl NominalWindowDuration {
     }
 }
 
+/// The reset-instant precision an adapter declares for the resets it reports
+/// or derives: the granularity of the provider surface the instant was read
+/// from (`aub-w1a0`).
+///
+/// The opencode workspace page derives each reset from a rendered text that
+/// floors the remaining time to whole hours, so the same provider boundary
+/// re-derived between two observations can differ by up to this precision
+/// plus the interval between the observations without the provider having
+/// moved anything. An adapter whose reset comes from an exact provider field
+/// declares nothing and keeps the fixed jitter envelope alone.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct ResetPrecision(i64);
+
+impl ResetPrecision {
+    /// A precision from a whole-second count. `None` for zero: a precision
+    /// of zero is the absence of a declaration, never a tolerance of zero.
+    /// `None` also for a count that cannot survive the nanoseconds
+    /// multiplication.
+    pub fn from_seconds(seconds: u64) -> Option<Self> {
+        if seconds == 0 {
+            return None;
+        }
+        let nanos = i64::try_from(seconds).ok()?.checked_mul(1_000_000_000)?;
+        Some(Self(nanos))
+    }
+
+    /// A precision from a nanosecond count, as persisted. `None` for zero or
+    /// negative, which no precision is.
+    pub fn from_nanos(nanos: i64) -> Option<Self> {
+        (nanos > 0).then_some(Self(nanos))
+    }
+
+    /// The declared precision, in nanoseconds.
+    pub fn as_nanos(self) -> i64 {
+        self.0
+    }
+}
+
 /// A fixed reset grid a provider's window boundaries are computed against,
 /// when the provider's own response carries no reset instant.
 ///

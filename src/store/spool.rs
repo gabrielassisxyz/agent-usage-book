@@ -37,8 +37,8 @@ use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use crate::domain::time::UtcTimestamp;
 use crate::domain::window::{
-    GroupName, MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, WindowResetState,
-    WindowScope, WindowSemanticKey,
+    GroupName, MeterWindow, ModelId, NominalWindowDuration, ReportedResolution, ResetPrecision,
+    WindowResetState, WindowScope, WindowSemanticKey,
 };
 use crate::error::Error;
 use crate::store::account::AccountId;
@@ -162,6 +162,11 @@ pub struct PendingTerminalBundle {
     pub provider_contract_id: String,
     pub meter_semantics_id: String,
     pub normalized_fingerprint: String,
+    /// The reset precision the producing adapter declared, in nanoseconds
+    /// (`aub-w1a0`); `None` when the adapter declares none or when the record
+    /// was spooled by a binary older than the declaration, so a pre-existing
+    /// spool file drains exactly as it did before.
+    pub reset_precision_nanos: Option<i64>,
 
     pub windows: Vec<PendingWindow>,
 }
@@ -233,6 +238,7 @@ impl PendingTerminalBundle {
             "provider_contract_id": self.provider_contract_id,
             "meter_semantics_id": self.meter_semantics_id,
             "normalized_fingerprint": self.normalized_fingerprint,
+            "reset_precision_nanos": self.reset_precision_nanos,
             "windows": self.windows.iter().map(PendingWindow::to_json).collect::<Vec<_>>(),
         });
         value.to_string()
@@ -287,6 +293,7 @@ impl PendingTerminalBundle {
             provider_contract_id: required_str(&value, "provider_contract_id")?,
             meter_semantics_id: required_str(&value, "meter_semantics_id")?,
             normalized_fingerprint: required_str(&value, "normalized_fingerprint")?,
+            reset_precision_nanos: optional_i64(&value, "reset_precision_nanos")?,
             windows,
         })
     }
@@ -344,6 +351,9 @@ impl PendingTerminalBundle {
             provider_contract_id: interpretation.provider_contract_id.as_str().to_owned(),
             meter_semantics_id: interpretation.meter_semantics_id.as_str().to_owned(),
             normalized_fingerprint: interpretation.normalized_fingerprint.clone(),
+            reset_precision_nanos: bundle
+                .reset_precision()
+                .map(|precision| precision.as_nanos()),
             windows: bundle
                 .windows()
                 .iter()
@@ -959,8 +969,19 @@ fn reconstruct(bundle: &PendingTerminalBundle) -> Result<TerminalMeterBundle, St
         .map(reconstruct_window)
         .collect::<Result<Vec<_>, _>>()?;
 
+    let reset_precision = match bundle.reset_precision_nanos {
+        // A precision the record carries survives the round trip; its absence
+        // (an old record, or an adapter that declares none) reconstructs the
+        // bundle exactly as it was committed.
+        None => None,
+        Some(nanos) => Some(
+            ResetPrecision::from_nanos(nanos)
+                .ok_or_else(|| format!("reset_precision_nanos {nanos} is not positive"))?,
+        ),
+    };
     TerminalMeterBundle::new(result, evidence, interpretation, windows)
         .map_err(|error| error.to_string())
+        .map(|committed| committed.with_reset_precision(reset_precision))
 }
 
 fn reconstruct_window(window: &PendingWindow) -> Result<MeterWindow, String> {
@@ -1133,6 +1154,7 @@ mod tests {
             provider_contract_id: "contract-v1".into(),
             meter_semantics_id: "semantics-v1".into(),
             normalized_fingerprint: "fp-1".into(),
+            reset_precision_nanos: None,
             windows: vec![PendingWindow {
                 semantic_key: "five_hour".into(),
                 scope_kind: "account_wide".into(),

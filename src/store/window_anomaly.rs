@@ -31,7 +31,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 
 use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, UtcTimestamp};
-use crate::domain::window::{ModelId, WindowScope};
+use crate::domain::window::{ModelId, ResetPrecision, WindowScope};
 use crate::domain::window_anomaly::{
     WindowAnomalyKind, WindowPresenceChange, WindowReading, WindowSetChangeKind,
     classify_window_set_change, classify_window_transition,
@@ -572,6 +572,7 @@ pub fn detect_and_persist(
     current_observation: &StoredMeterObservation,
     current_windows: &[StoredMeterWindow],
     detected_at: UtcTimestamp,
+    reset_precision: Option<ResetPrecision>,
 ) -> Result<DetectionOutcome, Error> {
     let mut outcome = DetectionOutcome::default();
 
@@ -617,11 +618,18 @@ pub fn detect_and_persist(
                     quota_used: previous_window.quota_used,
                     resets_at: previous_window.resets_at,
                     observed_at: previous_instant,
+                    // The pair is stamped with the current observation's own
+                    // adapter declaration (`aub-w1a0`): the producing adapter
+                    // is the same one for both readings, and the declaration
+                    // is not persisted per row, so the current commit's
+                    // bundle carries it for the pair.
+                    reset_precision,
                 };
                 let current_reading = WindowReading {
                     quota_used: current_window.quota_used,
                     resets_at: current_window.resets_at,
                     observed_at: current_instant,
+                    reset_precision,
                 };
                 if let Some(kind) = classify_window_transition(previous_reading, current_reading) {
                     let detail = format!(
@@ -946,6 +954,7 @@ mod tests {
             &observation,
             &[window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .expect("detection must run");
         assert!(outcome.anomalies.is_empty());
@@ -972,6 +981,7 @@ mod tests {
             &first_obs,
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
         assert!(outcome_first.anomalies.is_empty());
@@ -988,6 +998,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
 
@@ -1040,6 +1051,7 @@ mod tests {
             &first_obs,
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
 
@@ -1055,6 +1067,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
 
@@ -1081,6 +1094,7 @@ mod tests {
             &first_obs,
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
 
@@ -1096,6 +1110,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
 
@@ -1122,6 +1137,7 @@ mod tests {
             &first_obs,
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
         let (second_obs, second_window) = record_observation(
@@ -1136,6 +1152,7 @@ mod tests {
             &second_obs,
             std::slice::from_ref(&second_window),
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
         let second_run = detect_and_persist(
@@ -1144,6 +1161,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(41_000),
+            None,
         )
         .unwrap();
 
@@ -1243,6 +1261,7 @@ mod tests {
             &seven_day_observation,
             &[seven_day_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
 
@@ -1262,6 +1281,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
         assert!(outcome.anomalies.is_empty());
@@ -1290,6 +1310,7 @@ mod tests {
             &first_obs,
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
 
@@ -1376,6 +1397,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
         assert!(outcome.anomalies.is_empty());
@@ -1417,6 +1439,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(200_000),
+            None,
         )
         .expect("an out-of-order pair must not panic or fail the CHECK, only be skipped");
 
@@ -1529,6 +1552,7 @@ mod tests {
             &first_obs,
             &first_windows,
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
 
@@ -1632,6 +1656,7 @@ mod tests {
                 &second_obs,
                 &second_windows,
                 UtcTimestamp::from_unix_nanos(40_500),
+                None,
             )
             .unwrap()
         };
@@ -1651,6 +1676,7 @@ mod tests {
             &second_obs,
             &reversed,
             UtcTimestamp::from_unix_nanos(41_000),
+            None,
         )
         .unwrap();
         let mut reordered_kinds: Vec<&str> = reordered_outcome
@@ -1749,6 +1775,7 @@ mod tests {
             &first_obs,
             &first_windows,
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
 
@@ -1766,6 +1793,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
 
@@ -1793,6 +1821,7 @@ mod tests {
             &second_obs,
             &second_windows_again,
             UtcTimestamp::from_unix_nanos(41_000),
+            None,
         )
         .unwrap();
         assert_eq!(rerun.window_set_changes.len(), 2);
@@ -1825,6 +1854,7 @@ mod tests {
             &first_obs,
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
+            None,
         )
         .unwrap();
         let (second_obs, second_window) = record_observation(
@@ -1839,6 +1869,7 @@ mod tests {
             &second_obs,
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
+            None,
         )
         .unwrap();
 

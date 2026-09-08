@@ -14,7 +14,7 @@ use rusqlite::Connection;
 use crate::domain::attempt::{AttemptId, AttemptResult, AttemptStarted};
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
-use crate::domain::window::MeterWindow;
+use crate::domain::window::{MeterWindow, ResetPrecision};
 use crate::error::Error;
 use crate::projection::{self, Publication};
 
@@ -396,6 +396,12 @@ pub struct TerminalMeterBundle {
     evidence: NewMeterResponseEvidence,
     interpretation: NewMeterInterpretation,
     windows: Vec<MeterWindow>,
+    /// The reset precision the producing adapter declared, carried to the
+    /// window-anomaly detector and through the crash spool, never persisted
+    /// as a column: the declaration belongs to the adapter, and the pair a
+    /// detection compares is stamped with the current observation's own
+    /// declaration (`aub-w1a0`). `None` for an adapter that declares nothing.
+    reset_precision: Option<ResetPrecision>,
 }
 
 impl TerminalMeterBundle {
@@ -417,7 +423,20 @@ impl TerminalMeterBundle {
             evidence,
             interpretation,
             windows,
+            reset_precision: None,
         })
+    }
+
+    /// Carries the producing adapter's declared reset precision into the
+    /// commit, so the window-anomaly detector reads it off the bundle rather
+    /// than off a schema column (`aub-w1a0`).
+    pub fn with_reset_precision(mut self, precision: Option<ResetPrecision>) -> Self {
+        self.reset_precision = precision;
+        self
+    }
+
+    pub fn reset_precision(&self) -> Option<ResetPrecision> {
+        self.reset_precision
     }
 
     pub fn result(&self) -> &NewMeterAttemptResult {
@@ -547,6 +566,7 @@ pub(crate) fn commit_terminal_bundle_on_connection(
         &current_observation,
         &current_windows,
         interpretation.received_at,
+        bundle.reset_precision(),
     )?;
 
     // The terminal fact is projection-relevant durable meter state, so its

@@ -299,6 +299,7 @@ mod tests {
             provider_contract_id: "contract-v1".into(),
             meter_semantics_id: "semantics-v1".into(),
             normalized_fingerprint: "fp-1".into(),
+            reset_precision_nanos: None,
             windows: vec![PendingWindow {
                 semantic_key: "five_hour".into(),
                 scope_kind: "account_wide".into(),

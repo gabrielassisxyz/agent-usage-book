@@ -869,6 +869,7 @@ where
             ))
         })?;
         let declarations = item.account.adapter.declarations();
+        let reset_precision = declarations.reset_precision;
         let provider_contract_id = reading
             .provider_contract_id()
             .cloned()
@@ -920,6 +921,7 @@ where
             interpretation,
             reading.windows().to_vec(),
         )
+        .map(|bundle| bundle.with_reset_precision(reset_precision))
     }
 }
 

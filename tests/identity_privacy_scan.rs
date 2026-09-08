@@ -329,6 +329,7 @@ fn a_full_sampling_run_leaves_no_credential_bytes_in_the_database_or_the_spool()
         provider_contract_id: "anthropic-oauth-usage-v1".into(),
         meter_semantics_id: "anthropic-subscription-v1".into(),
         normalized_fingerprint: "fp-identity-privacy-scan-spool".into(),
+        reset_precision_nanos: None,
         windows: Vec::<PendingWindow>::new(),
     };
     let spool_state_dir = scratch.path().join("spool-state");

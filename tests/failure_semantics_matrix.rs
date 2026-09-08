@@ -340,6 +340,7 @@ fn sample_bundle(attempt_id: i64) -> PendingTerminalBundle {
         provider_contract_id: "anthropic".to_string(),
         meter_semantics_id: "anthropic-five-hour-v1".to_string(),
         normalized_fingerprint: "fp-1".to_string(),
+        reset_precision_nanos: None,
         windows: vec![PendingWindow {
             semantic_key: "five_hour".to_string(),
             scope_kind: "account_wide".to_string(),
@@ -1227,11 +1228,13 @@ fn row_23_web_consumption_has_no_transcript() {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(100_000).unwrap()),
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(0),
+        reset_precision: None,
     };
     let current = WindowReading {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(150_000).unwrap()),
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(1_000),
+        reset_precision: None,
     };
     assert_eq!(classify_window_transition(previous, current), None);
 }
@@ -1316,12 +1319,14 @@ fn row_26_meter_percent_decreases_without_reset() {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(500_000).unwrap()),
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(0),
+        reset_precision: None,
     };
     let current = WindowReading {
         // Dropped with no reset state change at all: nothing legitimises it.
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(200_000).unwrap()),
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(1_000),
+        reset_precision: None,
     };
 
     let anomaly = classify_window_transition(previous, current);
@@ -1355,6 +1360,7 @@ fn row_27_reset_timestamp_changes_unexpectedly() {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(500_000).unwrap()),
         resets_at: WindowResetState::Known(ts(10_000_000_000)),
         observed_at: ts(4_000_000_000),
+        reset_precision: None,
     };
     let current = WindowReading {
         // No decrease, but the reset instant moved by 3 s with no boundary
@@ -1363,6 +1369,7 @@ fn row_27_reset_timestamp_changes_unexpectedly() {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(500_000).unwrap()),
         resets_at: WindowResetState::Known(ts(13_000_000_000)),
         observed_at: ts(5_000_000_000),
+        reset_precision: None,
     };
 
     let anomaly = classify_window_transition(previous, current);

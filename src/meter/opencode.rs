@@ -39,8 +39,8 @@ use crate::domain::time::{
     Clock, MeasurementBasis, MonotonicDuration, ProviderObservedAt, UtcTimestamp,
 };
 use crate::domain::window::{
-    MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
-    WindowSemanticKey,
+    MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution, ResetPrecision,
+    WindowScope, WindowSemanticKey,
 };
 use crate::meter::adapter::{
     AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
@@ -107,6 +107,14 @@ impl OpenCodeAdapter {
     pub const DEFAULT_SEMANTICS_ID: &'static str = "opencode-go-subscription-v1";
     pub const REQUIRED_WINDOW_KINDS: &'static [&'static str] = &["rolling", "weekly", "monthly"];
 
+    /// The precision of every reset instant this adapter derives, in seconds:
+    /// the page's rendered reset text floors the remaining time to whole
+    /// hours (`Resets in 6 days 8 hours`), so a re-derived instant is exact
+    /// only to one hour. The classifier consumes this declaration
+    /// (`aub-w1a0`); one hour covers all three windows because all three
+    /// read their reset from the same text renderer.
+    pub const RESET_PRECISION_SECONDS: u64 = 3600;
+
     /// Builds the adapter with an optional full workspace-page URL override.
     pub fn new(endpoint_override: Option<String>) -> Self {
         Self {
@@ -121,7 +129,13 @@ impl OpenCodeAdapter {
             )
             .with_required_window_kinds(RequiredWindowKinds::from_values(
                 Self::REQUIRED_WINDOW_KINDS,
-            )),
+            ))
+            .with_reset_precision(
+                // One hour, statically non-zero, so the constructor's
+                // refusal is unreachable for this constant.
+                ResetPrecision::from_seconds(Self::RESET_PRECISION_SECONDS)
+                    .expect("a one-hour precision is a non-zero second count"),
+            ),
         }
     }
 

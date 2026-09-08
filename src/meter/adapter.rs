@@ -24,7 +24,7 @@
 use crate::domain::failure::{AuthReason, FailureClass};
 use crate::domain::ids::{MeterSemanticsId, ProviderContractId};
 use crate::domain::time::{Clock, MeasurementBasis};
-use crate::domain::window::ModelId;
+use crate::domain::window::{ModelId, ResetPrecision};
 use crate::error::Error;
 use crate::meter::agy::{AgyAdapter, AgyReading};
 use crate::meter::anthropic::{AnthropicAdapter, AnthropicReading};
@@ -215,6 +215,14 @@ pub struct AdapterDeclarations {
     pub meter_semantics_id: MeterSemanticsId,
     /// Provider constraint kinds that must be present for a measured reading.
     pub required_window_kinds: RequiredWindowKinds,
+    /// The precision of every reset instant this adapter reports or derives,
+    /// when the provider surface it reads them from is itself granular
+    /// (`aub-w1a0`). `None` for an adapter whose resets are exact provider
+    /// fields: the transition classifier then holds them to the fixed jitter
+    /// envelope alone. The opencode page's rendered reset text floors the
+    /// remaining time to whole hours, so that adapter declares one hour for
+    /// all three of its windows.
+    pub reset_precision: Option<ResetPrecision>,
 }
 
 impl AdapterDeclarations {
@@ -228,11 +236,21 @@ impl AdapterDeclarations {
             provider_contract_id,
             meter_semantics_id,
             required_window_kinds: RequiredWindowKinds::default(),
+            reset_precision: None,
         }
     }
 
     pub fn with_required_window_kinds(mut self, kinds: RequiredWindowKinds) -> Self {
         self.required_window_kinds = kinds;
+        self
+    }
+
+    /// Declares the precision of every reset instant this adapter reports or
+    /// derives (`aub-w1a0`). A precision is a property of the provider
+    /// surface the reset was read from, so one declaration covers every
+    /// window the adapter reports from that surface.
+    pub fn with_reset_precision(mut self, precision: ResetPrecision) -> Self {
+        self.reset_precision = Some(precision);
         self
     }
 }

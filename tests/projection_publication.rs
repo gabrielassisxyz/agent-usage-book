@@ -433,6 +433,7 @@ fn pending_bundle_json(attempt_id: i64, bundle: &TerminalMeterBundle) -> String 
         provider_contract_id: bundle.interpretation().provider_contract_id.as_str().into(),
         meter_semantics_id: bundle.interpretation().meter_semantics_id.as_str().into(),
         normalized_fingerprint: bundle.interpretation().normalized_fingerprint.clone(),
+        reset_precision_nanos: None,
         windows: vec![PendingWindow {
             semantic_key: window.semantic_key().as_str().into(),
             scope_kind: "account_wide".into(),

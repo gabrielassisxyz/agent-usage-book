@@ -283,6 +283,7 @@ fn make_fixture_bundles(
         provider_contract_id: "fixture-endpoint-schema".into(),
         meter_semantics_id: "fixture-meter-semantics".into(),
         normalized_fingerprint: "fingerprint-v1".into(),
+        reset_precision_nanos: None,
         windows: vec![PendingWindow {
             semantic_key: "five_hour".into(),
             scope_kind: "account_wide".into(),
@@ -853,6 +854,7 @@ fn pending_bundle_for(
         provider_contract_id: "fixture-contract".into(),
         meter_semantics_id: "fixture-semantics".into(),
         normalized_fingerprint: format!("fixture-fp-{attempt_id}"),
+        reset_precision_nanos: None,
         windows: vec![PendingWindow {
             semantic_key: "five_hour".into(),
             scope_kind: "account_wide".into(),
