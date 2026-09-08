@@ -40,6 +40,7 @@ pub mod report;
 pub mod restore;
 pub mod seed_archive;
 pub mod sessions;
+pub mod statusline;
 pub mod store;
 pub mod transcripts;
 pub mod valuation;

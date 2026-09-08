@@ -24,6 +24,7 @@ commands:
   can-run  compare calibrated credit headroom against historical task cost, refusing rather than guessing when evidence is missing
   calibrate record a controlled calibration experiment without a resident process, and fit quota window capacity candidates from qualified observation evidence
   account  list configured accounts and rename one across every table that stores its name as text
+  statusline pass the Claude Code status-line payload through unchanged, recording its rate-limit windows per account
 
 status:
   answers: how much quota does each configured account have left?
@@ -141,5 +142,10 @@ account:
   refuses: --format (account prints one operational result or a plain listing); --explain (account derives no quantity); --account (account takes PROVIDER OLD NEW positionally, not the shared selector); --model (account takes no model); --no-color (account prints no color)
   format: text only: account prints one operational result or a plain listing
   options: list | rename PROVIDER OLD NEW
+
+statusline:
+  answers: what did the status line's payload say each account's meter windows were, without the renderer knowing?
+  refuses: --format (statusline passes its input through unchanged); --explain (statusline derives no quantity); --account (statusline attributes by the profile the session was launched in, never by a flag); --model (statusline takes no model); --no-color (statusline prints no color)
+  format: text only: statusline passes its input through unchanged
 
 aub            prints the version; aub --help prints this
