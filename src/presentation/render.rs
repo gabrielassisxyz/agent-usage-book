@@ -465,16 +465,17 @@ fn status_window_row(
 
 /// The window label, clamped to the 8-cell label column so the grid stays
 /// rigid: a model display name for a model-scoped window (truncated with an
-/// ellipsis when it does not fit), `week` for the weekly account-wide window,
-/// the nominal length otherwise.
+/// ellipsis when it does not fit), `week` for the 7-day account-wide window,
+/// `month` for one of 28 to 31 days, the nominal length otherwise.
 fn status_window_label(window: &crate::report::StatusWindow) -> String {
     if let Some(model) = window.scope.scoped_model() {
         return clamp_label(model.as_str());
     }
-    if window.nominal_duration.as_nanos() >= 24 * 3_600 * 1_000_000_000 {
-        "week".to_string()
-    } else {
-        render_window_duration(window.nominal_duration)
+    let whole_days = window.nominal_duration.as_nanos() / (86_400 * 1_000_000_000);
+    match whole_days {
+        7 => "week".to_string(),
+        28..=31 => "month".to_string(),
+        _ => render_window_duration(window.nominal_duration),
     }
 }
 
@@ -2920,6 +2921,64 @@ mod tests {
         assert_eq!(render_percentage(380_000, Precision::new(2)), "38");
         assert_eq!(render_percentage(385_500, Precision::new(2)), "38.55");
         assert_eq!(render_percentage(1_000_000, Precision::new(2)), "100");
+    }
+
+    /// The account-wide label names the window by what it is: `week` only for
+    /// seven days, `month` for 28 to 31 days, and the rendered length for
+    /// anything else. The planted negative is the 24-hour window: it used to
+    /// read `week` because every window of a day or more did.
+    #[test]
+    fn the_account_wide_label_tells_a_month_from_a_week() {
+        let label = |seconds: i64| status_window_label(&account_wide(0, seconds, seconds));
+        assert_eq!(label(5 * 3_600), "5h");
+        assert_eq!(label(86_400), "1d");
+        assert_eq!(label(7 * 86_400), "week");
+        assert_eq!(label(28 * 86_400), "month");
+        assert_eq!(label(30 * 86_400), "month");
+        assert_eq!(label(31 * 86_400), "month");
+        assert_eq!(label(60 * 86_400), "60d");
+    }
+
+    /// A rendered block holding the opencode shape (5h, weekly, monthly) labels
+    /// the third row `month`, so two rows with different figures never share a
+    /// label.
+    #[test]
+    fn the_status_block_labels_a_thirty_day_window_month() {
+        use crate::logging::LogicalName;
+        use crate::report::MeterAccount;
+
+        let opencode = MeterAccount::from_projection(
+            LogicalName::new("opencode"),
+            Freshness::Fresh {
+                observed: observed(20_000, UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                latest_attempt: crate::domain::attempt::AttemptId::new(1),
+            },
+            None,
+            vec![],
+            None,
+        )
+        .with_provider("opencode")
+        .with_windows(vec![
+            account_wide(0, 5 * 3_600, 3 * 3_600),
+            account_wide(10_000, 7 * 86_400, 4 * 86_400),
+            account_wide(20_000, 30 * 86_400, 20 * 86_400),
+        ]);
+
+        let rendered = render_status_report(
+            &grid_report(vec![opencode]),
+            now(),
+            envelope(),
+            Style::plain(),
+        );
+        let window_rows: Vec<&str> = rendered
+            .lines()
+            .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
+            .collect();
+        assert_eq!(window_rows.len(), 3, "{rendered}");
+        assert!(window_rows[0].contains("5h  "), "{:?}", window_rows[0]);
+        assert!(window_rows[1].contains("week"), "{:?}", window_rows[1]);
+        assert!(window_rows[2].contains("month"), "{:?}", window_rows[2]);
+        assert!(!window_rows[2].contains("week"), "{:?}", window_rows[2]);
     }
 
     fn status_window(
