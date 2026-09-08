@@ -1179,6 +1179,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Barrier;
+    use std::sync::Condvar;
     use test_support::StateDir;
 
     /// A clock shared between the orchestrator and the scripted transport, so
@@ -1226,6 +1227,14 @@ mod tests {
         RateLimited(u64),
     }
 
+    /// Barrier state for one generation of the scripted transport's
+    /// rendezvous. Scoped to this test double on purpose: a package-level
+    /// helper with an obvious name would collide with sibling lanes.
+    struct ScriptedRendezvousState {
+        arrived: usize,
+        generation: u64,
+    }
+
     /// The test transport: per-account scripts keyed off the request URL,
     /// in-flight and completion counters for the concurrency and thread
     /// lifetime assertions, and a hook for advancing the shared clock inside
@@ -1239,6 +1248,13 @@ mod tests {
         in_flight: AtomicUsize,
         max_in_flight: AtomicUsize,
         completed_sends: AtomicUsize,
+        /// How many workers must enter the rendezvous before any is
+        /// released. One means no waiting: a lone request proceeds at once,
+        /// so tests that never overlap pay nothing. The two tests that assert
+        /// overlap set this to their bound.
+        rendezvous_expected: AtomicUsize,
+        rendezvous_state: Mutex<ScriptedRendezvousState>,
+        rendezvous_gate: Condvar,
     }
 
     impl ScriptedTransport {
@@ -1251,6 +1267,12 @@ mod tests {
                 in_flight: AtomicUsize::new(0),
                 max_in_flight: AtomicUsize::new(0),
                 completed_sends: AtomicUsize::new(0),
+                rendezvous_expected: AtomicUsize::new(1),
+                rendezvous_state: Mutex::new(ScriptedRendezvousState {
+                    arrived: 0,
+                    generation: 0,
+                }),
+                rendezvous_gate: Condvar::new(),
             }
         }
 
@@ -1272,6 +1294,62 @@ mod tests {
 
         fn max_in_flight(&self) -> usize {
             self.max_in_flight.load(Ordering::Relaxed)
+        }
+
+        /// Arm the rendezvous for the tests that assert overlap: `send`
+        /// blocks until this many workers have entered. Every other test
+        /// keeps the default of one and pays no wait at all.
+        fn set_rendezvous(&self, expected: usize) {
+            self.rendezvous_expected.store(expected, Ordering::SeqCst);
+        }
+
+        /// Hold this request until the expected number of workers have
+        /// entered, so overlap is certain rather than likely. A reusable
+        /// generation barrier: each wave of concurrent sends meets and
+        /// releases together, and a later wave starts from zero. Times out
+        /// instead of hanging, naming how many arrived against how many were
+        /// expected, so a future change to the bound fails readably.
+        fn rendezvous(&self) {
+            let expected = self.rendezvous_expected.load(Ordering::SeqCst);
+            if expected <= 1 {
+                return;
+            }
+            let mut state = self
+                .rendezvous_state
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner);
+            let generation = state.generation;
+            state.arrived += 1;
+            if state.arrived >= expected {
+                state.arrived = 0;
+                state.generation = state.generation.wrapping_add(1);
+                self.rendezvous_gate.notify_all();
+                return;
+            }
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            loop {
+                let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+                if remaining.is_zero() {
+                    panic!(
+                        "scripted transport rendezvous timed out: {} of {} workers arrived",
+                        state.arrived, expected
+                    );
+                }
+                let (guard, timed_out) = self
+                    .rendezvous_gate
+                    .wait_timeout(state, remaining)
+                    .unwrap_or_else(PoisonError::into_inner);
+                state = guard;
+                if state.generation != generation {
+                    return;
+                }
+                if timed_out.timed_out() {
+                    panic!(
+                        "scripted transport rendezvous timed out: {} of {} workers arrived",
+                        state.arrived, expected
+                    );
+                }
+            }
         }
     }
 
@@ -1302,7 +1380,10 @@ mod tests {
             if let Some(duration) = *self.advance_per_request.lock().unwrap() {
                 self.clock.advance(duration);
             }
-            std::thread::sleep(std::time::Duration::from_millis(20));
+            // No fixed sleep: overlap between concurrent sends comes from the
+            // rendezvous below, which releases only once the expected number
+            // of workers have entered.
+            self.rendezvous();
             let outcome = self.scripts.lock().unwrap().get(&tag).cloned();
             let result = match outcome {
                 Some(ScriptedOutcome::Unauthorized) => Ok(HttpResponse {
@@ -1678,6 +1759,11 @@ mod tests {
         let (_scratch_dir, database_path) = fixture_database();
         let transport = ScriptedTransport::new(SharedClock::new());
         let clock = transport.clock.clone();
+        // Two workers must meet inside send: with instant sends a run that
+        // returned while its threads were still going could still read a
+        // full completion count by luck, so the rendezvous keeps the race
+        // the assertion is about.
+        transport.set_rendezvous(2);
         let accounts: Vec<BatchAccount<AnthropicAdapter>> = (0..4)
             .map(|index| batch_account(&format!("outlives{index}")))
             .collect();
@@ -1895,6 +1981,10 @@ mod tests {
         let (_scratch_dir, database_path) = fixture_database();
         let transport = ScriptedTransport::new(SharedClock::new());
         let clock = transport.clock.clone();
+        // The bound of two is reached because the two workers meet in send:
+        // the first arrival waits for the second, so max_in_flight of two
+        // is certain rather than likely.
+        transport.set_rendezvous(2);
         let accounts: Vec<BatchAccount<AnthropicAdapter>> = (0..4)
             .map(|index| batch_account(&format!("bound{index}")))
             .collect();
