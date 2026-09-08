@@ -834,4 +834,40 @@ mod tests {
         assert_eq!(report.message, "");
         assert!(matched_patterns(&report.classification).is_empty());
     }
+
+    /// Case 08 (aub-rfot): a provider that echoes the credential back in its
+    /// own error message stores the message with the credential already
+    /// removed. The credential is registered as known-sensitive material at
+    /// the adapter, so the substitution happens before the token heuristics
+    /// run, and the stored message is clean against the forbidden-pattern
+    /// list. This is the case the fixture bodies cannot exercise: a real
+    /// 401 message quoting your own credential is exactly the leak shape
+    /// the storage rule exists for.
+    #[test]
+    fn case_08_a_401_echoing_the_credential_stores_it_redacted() {
+        let adapter = test_adapter();
+        let credential = test_credential();
+        let body = format!(
+            r#"{{"error":{{"type":"authentication_error","message":"Invalid credential Bearer {} supplied"}}}}"#,
+            credential.expose(),
+        );
+        let transport = MockTransport::ok(401, body.into_bytes());
+        let captured = adapter.observe_with_evidence(
+            &credential,
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 401 response stores the provider's error report");
+        assert_eq!(report.classification, "authentication_error");
+        assert!(
+            !report.message.contains(credential.expose()),
+            "the stored message carries the credential: {:?}",
+            report.message
+        );
+        assert!(matched_patterns(&report.message).is_empty());
+    }
 }
