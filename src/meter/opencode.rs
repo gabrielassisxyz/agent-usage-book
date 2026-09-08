@@ -898,12 +898,12 @@ mod tests {
     fn the_declarations_carry_the_one_hour_reset_precision() {
         let adapter = OpenCodeAdapter::new(None);
         let declarations = adapter.declarations();
+        // The literal, not the constant: the value is the pin. A test that
+        // reads the declaration back through the constant it was written from
+        // would pass for any constant the constructor happened to carry.
         assert_eq!(
             declarations.reset_precision,
-            Some(
-                ResetPrecision::from_seconds(OpenCodeAdapter::RESET_PRECISION_SECONDS)
-                    .expect("the declared second count is non-zero")
-            ),
+            Some(ResetPrecision::from_seconds(3_600).expect("one hour is a non-zero second count")),
             "the declared precision must be the one-hour surface granularity"
         );
         for kind in ["rolling", "weekly", "monthly"] {
