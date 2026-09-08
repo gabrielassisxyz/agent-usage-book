@@ -1813,15 +1813,11 @@ fn render_coverage_detail(
             .max();
         match (engine.reset_spanning_gaps.len(), window_length) {
             (1, Some(length)) if length.as_nanos() > 0 => lines.push(format!(
-                "one {} reset without an observation in the surrounding gap",
+                "one {} reset inside a sampling hole",
                 render_coverage_duration(length)
             )),
-            (1, _) => {
-                lines.push("one reset without an observation in the surrounding gap".to_string())
-            }
-            (count, _) => lines.push(format!(
-                "{count} resets without an observation in the surrounding gaps"
-            )),
+            (1, _) => lines.push("one reset inside a sampling hole".to_string()),
+            (count, _) => lines.push(format!("{count} resets inside a sampling hole")),
         }
     }
     Some(lines)
@@ -3457,10 +3453,10 @@ mod tests {
             "│  ───────────────────────────────────────────────────────────────             │",
             "│  primary  88.9%     100.0%        6m           3                             │",
             "│         attempt coverage below the 98% floor                                 │",
-            "│         3 resets without an observation in the surrounding gaps              │",
+            "│         3 resets inside a sampling hole                                      │",
             "│  gmail    100.0%    76.6%         6m           3                             │",
             "│         45 attempts were rate limited · 14 attempts required authentication  │",
-            "│         3 resets without an observation in the surrounding gaps              │",
+            "│         3 resets inside a sampling hole                                      │",
             "│                                                                              │",
             "│  not in config: primary-2026-09-04 (last observed 2026-09-04)                │",
             "│  next: run coverage again once the floor condition changes                   │",
@@ -3543,7 +3539,7 @@ mod tests {
             "│  account  attempts  measurements  longest gap  resets unobserved             │",
             "│  ───────────────────────────────────────────────────────────────             │",
             "│  quiet    none      none          6m           1                             │",
-            "│         one 5h reset without an observation in the surrounding gap           │",
+            "│         one 5h reset inside a sampling hole                                  │",
             "└──────────────────────────────────────────────────────────────────────────────┘",
         ]
         .join("\n");
