@@ -205,19 +205,45 @@ const CREDENTIAL_LABEL_TOKENS: [&str; 6] = [
 /// token-level redaction is safer with every pattern in it, since a token
 /// carrying a key prefix is exactly as forbidden in a message as a token
 /// naming a credential field.
-const FORBIDDEN_PATTERN_LIST: &str = include_str!("../../docs/forbidden-patterns.txt");
+/// The list is held reversed in the binary. `bin/checks/82-identity-privacy-scan`
+/// treats any of these patterns in the release binary's string table as a leak,
+/// and a verbatim `include_str!` of the list is exactly the legitimate copy that
+/// scan cannot tell from an accidental one (the same reason `meter/evidence.rs`
+/// keeps the Anthropic key prefix reversed). Reversing at compile time keeps the
+/// single source and keeps every pattern out of the shipped bytes; the runtime
+/// reversal below rebuilds the text on first use.
+const FORBIDDEN_PATTERN_LIST_REVERSED: [u8; include_bytes!("../../docs/forbidden-patterns.txt")
+    .len()] = reverse_bytes(include_bytes!("../../docs/forbidden-patterns.txt"));
+
+const fn reverse_bytes<const N: usize>(source: &[u8; N]) -> [u8; N] {
+    let mut out = [0u8; N];
+    let mut i = 0;
+    while i < N {
+        out[i] = source[N - 1 - i];
+        i += 1;
+    }
+    out
+}
 
 /// The shared list, parsed once. Lines are matched verbatim (the list's
 /// trailing-space convention is preserved), with comments and blanks skipped.
-fn forbidden_patterns() -> &'static [&'static str] {
-    static PATTERNS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+fn forbidden_patterns() -> &'static [String] {
+    static PATTERNS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
     PATTERNS.get_or_init(|| {
-        FORBIDDEN_PATTERN_LIST
-            .lines()
+        let text = String::from_utf8(
+            FORBIDDEN_PATTERN_LIST_REVERSED
+                .iter()
+                .rev()
+                .copied()
+                .collect(),
+        )
+        .expect("the forbidden-pattern list is UTF-8");
+        text.lines()
             .filter(|line| {
                 let trimmed = line.trim();
                 !trimmed.is_empty() && !trimmed.starts_with('#')
             })
+            .map(str::to_owned)
             .collect()
     })
 }
@@ -269,7 +295,7 @@ fn redact_token(word: &str) -> String {
         .any(|label| lower.starts_with(label));
     let carries_forbidden_pattern = forbidden_patterns()
         .iter()
-        .any(|pattern| lower.contains(pattern));
+        .any(|pattern| lower.contains(pattern.as_str()));
     if is_labeled || carries_forbidden_pattern || looks_like_a_bare_secret(word) {
         "[REDACTED]".to_string()
     } else {

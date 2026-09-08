@@ -93,8 +93,8 @@ case_steps() {
             sqlite3 "$1" "
                 INSERT INTO meter_attempt (id, run_id, account_id, provider, request_started_at, policy_snapshot_id, due_at, due_reason, provider_contract_id, meter_semantics_id)
                 VALUES ($ATTEMPT_ID, 1, 2, '\''provider-a'\'', $START_NS, 2, $START_NS, '\''ordinary_cadence'\'', '\''schema-v1'\'', '\''sem-v1'\'');
-                INSERT INTO meter_attempt_result (attempt_id, completed_at, elapsed_nanos, outcome, clock_anomaly)
-                VALUES ($ATTEMPT_ID, $FINISH_NS, 30000000000, '\''auth_required'\'', 0);
+                INSERT INTO meter_attempt_result (attempt_id, completed_at, elapsed_nanos, outcome, clock_anomaly, sanitized_error_classification)
+                VALUES ($ATTEMPT_ID, $FINISH_NS, 30000000000, '\''auth_required'\'', 0, '\''authentication_error'\'');
             "
         done
     ' _ "$LEDGER_DB"
@@ -125,7 +125,7 @@ case_assertions() {
     assert_stdout_contains 4 "dead-scheduler"
     assert_stdout_contains 4 "cred-failing"
     assert_stdout_contains 4 "attempt coverage below the 98% floor"
-    assert_stdout_contains 4 "24 attempts required authentication"
+    assert_stdout_contains 4 "24 attempts refused with authentication_error"
     assert_stdout_contains 4 "next: run coverage again once the floor condition changes"
     assert_stderr_contains 4 "is below the 98% floor"
     assert_stderr_contains 4 "dead-scheduler"
@@ -144,7 +144,7 @@ case_assertions() {
     # Step 6: account selector isolates cred-failing
     assert_exit 7 6
     assert_stdout_contains 6 "cred-failing"
-    assert_stdout_contains 6 "24 attempts required authentication"
+    assert_stdout_contains 6 "24 attempts refused with authentication_error"
     if grep -qF "dead-scheduler" "$(step_dir 6)/stdout.txt"; then
         record_assertion "account selector excludes unselected account" "absent" "present" "fail"
         CASE_FAILED=1

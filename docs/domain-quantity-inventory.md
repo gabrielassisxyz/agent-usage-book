@@ -103,6 +103,7 @@ quantity, documented here with its reason for exclusion:
 - `AttemptId`: monotonic sequence identifier for sampling attempts.
 - `AttemptOutcome`, `AttemptStarted`, `AttemptResult`: attempt lifecycle state enums.
 - `HttpStatusClass`, `FailureClass`, `AuthReason`: categorized failure classifications.
+- `ProviderErrorReport` (`failure.rs`): the classification and sanitized message a failed provider response carried, stored beside the attempt result (`aub-rfot`); a record of what the provider said, not a measured quantity.
 - `DueReason` (`attempt.rs`): tag enum for why an account was due for an attempt (`aub-me5.3`), not a measured quantity.
 
 ### Freshness models (`freshness.rs`)
