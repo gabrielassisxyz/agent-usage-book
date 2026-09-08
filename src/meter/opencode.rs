@@ -889,6 +889,31 @@ mod tests {
         );
     }
 
+    /// The declarations carry the one-hour reset precision (`aub-w1a0`): the
+    /// page's rendered reset text floors the remaining time to whole hours,
+    /// so every reset this adapter derives is exact only to one hour, and
+    /// one declaration covers all three windows because all three read
+    /// their reset from the same text renderer.
+    #[test]
+    fn the_declarations_carry_the_one_hour_reset_precision() {
+        let adapter = OpenCodeAdapter::new(None);
+        let declarations = adapter.declarations();
+        assert_eq!(
+            declarations.reset_precision,
+            Some(
+                ResetPrecision::from_seconds(OpenCodeAdapter::RESET_PRECISION_SECONDS)
+                    .expect("the declared second count is non-zero")
+            ),
+            "the declared precision must be the one-hour surface granularity"
+        );
+        for kind in ["rolling", "weekly", "monthly"] {
+            assert!(
+                declarations.required_window_kinds.contains(kind),
+                "the declared precision covers the {kind} window"
+            );
+        }
+    }
+
     /// The protection the capsule contract names is the sanitizer being fed
     /// the credential material: a page whose reset-time text echoes the
     /// session value must still yield a capsule without it.

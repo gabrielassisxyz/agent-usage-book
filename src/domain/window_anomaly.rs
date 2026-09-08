@@ -451,6 +451,210 @@ mod tests {
         );
     }
 
+    /// The opencode production pair this bead exists for (`aub-w1a0`): two
+    /// observations twenty seconds apart with the same quota used, whose
+    /// hour-granular derived resets drifted apart by 19.688 s because the
+    /// page's reset text floors the remaining time to whole hours. Under the
+    /// adapter's declared one-hour precision plus the twenty-second gap, the
+    /// movement is one unchanged boundary and no anomaly. The instants sit
+    /// about six days eight hours out from the observations, the real shape:
+    /// the boundary is nowhere near due, so nothing but the declared
+    /// tolerance can absorb the movement.
+    #[test]
+    fn opencode_hour_granular_drift_within_declared_precision_is_no_anomaly() {
+        let precision = Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero"));
+        let previous = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_490_445_727)),
+            1_791_151_856_090_445_727,
+            precision,
+        );
+        let current = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_178_385_374)),
+            1_791_151_876_090_445_727,
+            precision,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// The planted negative for the declared precision: the identical
+    /// production pair as
+    /// [`opencode_hour_granular_drift_within_declared_precision_is_no_anomaly`],
+    /// differing only in that neither reading carries a declaration. Without
+    /// one the same 19.688 s movement is far above the fixed 2 s jitter
+    /// envelope and is the unexpected-reset-change anomaly, proving the
+    /// tolerance comes from the adapter's declaration and not from anything
+    /// about the pair itself.
+    #[test]
+    fn the_same_drift_without_a_declared_precision_is_still_an_anomaly() {
+        let previous = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_490_445_727)),
+            1_791_151_856_090_445_727,
+        );
+        let current = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_178_385_374)),
+            1_791_151_876_090_445_727,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+    }
+
+    /// One side declaring the precision widens nothing: the declaration
+    /// describes the surface one reading was derived from, and a reading
+    /// that carries no declaration says nothing about its own surface, so a
+    /// half-declared pair keeps the fixed envelope. Same instants as the
+    /// planted negative, with the declaration only on the current side.
+    #[test]
+    fn a_one_sided_declaration_does_not_widen_the_tolerance() {
+        let previous = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_490_445_727)),
+            1_791_151_856_090_445_727,
+            None,
+        );
+        let current = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_178_385_374)),
+            1_791_151_876_090_445_727,
+            Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero")),
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+    }
+
+    /// The named unit case (`aub-w1a0`): derived resets 3 620 s apart with a
+    /// ten-second gap between the observations. The declared tolerance is
+    /// 3 610 s (one hour of precision plus the gap), so a move of 3 620 s
+    /// exceeds it and stays the unexpected-reset-change anomaly.
+    #[test]
+    fn reset_move_beyond_declared_precision_plus_gap_is_still_an_anomaly() {
+        let precision = Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero"));
+        let previous = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_000_000_000)),
+            1_791_151_856_000_000_000,
+            precision,
+        );
+        let current = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_156_030_000_000_000)),
+            1_791_151_866_000_000_000,
+            precision,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+    }
+
+    /// Boundary of the declared tolerance, at both edges and in literal
+    /// nanos: a movement of exactly precision-plus-gap is material (the
+    /// comparison is `>=`, matching the jitter envelope's own convention),
+    /// and one nanosecond inside it is one unchanged boundary.
+    #[test]
+    fn declared_precision_threshold_is_exclusive() {
+        let precision = Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero"));
+        let gap_nanos: i64 = 10_000_000_000;
+        let tolerance = 3_600_000_000_000i64 + gap_nanos;
+        let base_reset = 1_791_152_410_000_000_000i64;
+        let base_observed = base_reset - 554_400_000_000_000i64;
+        let at_threshold = (
+            reading_with_precision(
+                300_000,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(base_reset)),
+                base_observed,
+                precision,
+            ),
+            reading_with_precision(
+                300_000,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(base_reset + tolerance)),
+                base_observed + gap_nanos,
+                precision,
+            ),
+        );
+        assert_eq!(
+            classify_window_transition(at_threshold.0, at_threshold.1),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+
+        let one_nano_inside = (
+            reading_with_precision(
+                300_000,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(base_reset)),
+                base_observed,
+                precision,
+            ),
+            reading_with_precision(
+                300_000,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(base_reset + tolerance - 1)),
+                base_observed + gap_nanos,
+                precision,
+            ),
+        );
+        assert_eq!(
+            classify_window_transition(one_nano_inside.0, one_nano_inside.1),
+            None
+        );
+    }
+
+    /// The hour-tick jump runs the other way too: the displayed remaining
+    /// time dropping a whole hour moves the derived instant backward by
+    /// up to the precision minus the gap, and a declared precision absorbs
+    /// that direction symmetrically.
+    #[test]
+    fn the_backward_hour_tick_is_absorbed_by_the_declared_precision() {
+        let precision = Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero"));
+        // 3 580 s backward with a twenty-second gap: inside 3 620 s.
+        let previous = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_000_000_000)),
+            1_791_151_876_000_000_000,
+            precision,
+        );
+        let current = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                1_791_152_430_000_000_000 - 3_580_000_000_000,
+            )),
+            1_791_151_896_000_000_000,
+            precision,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// A decrease with the derived reset drifting inside the declared
+    /// tolerance is still the decrease anomaly: the widened tolerance only
+    /// ever says the boundary did not move, and a fall with the boundary
+    /// unmoved is exactly what [`WindowAnomalyKind::PercentageDecreaseWithoutReset`]
+    /// exists to name.
+    #[test]
+    fn a_decrease_inside_the_declared_tolerance_is_still_a_decrease_anomaly() {
+        let precision = Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero"));
+        let previous = reading_with_precision(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_490_445_727)),
+            1_791_151_856_090_445_727,
+            precision,
+        );
+        let current = reading_with_precision(
+            200_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_178_385_374)),
+            1_791_151_876_090_445_727,
+            precision,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::PercentageDecreaseWithoutReset)
+        );
+    }
+
     /// Boundary in literal nanos (`aub-o3zy`): a pair differing by exactly
     /// 2_000_000_000 ns is a material change and, observed well before the
     /// old boundary was due, remains an anomaly. The comparison is `>=`, so

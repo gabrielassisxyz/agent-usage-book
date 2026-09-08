@@ -1236,6 +1236,29 @@ mod tests {
         assert_eq!(parsed, bundle);
     }
 
+    /// A declared reset precision survives the spool round trip exactly
+    /// (`aub-w1a0`): a record spooled by a binary whose adapter declared the
+    /// one-hour precision drains with the same declaration, so a recovered
+    /// bundle classifies with the widened tolerance the live commit used,
+    /// and the flat form stays the exact inverse with a precision present,
+    /// not only with `None`.
+    #[test]
+    fn a_declared_reset_precision_round_trips_through_the_spool_unchanged() {
+        let mut pending = sample_bundle(3);
+        pending.reset_precision_nanos = Some(3_600_000_000_000);
+
+        let json = pending.to_json();
+        let parsed = PendingTerminalBundle::from_json(&json).unwrap();
+        assert_eq!(parsed, pending);
+
+        let reconstructed = reconstruct(&parsed).unwrap();
+        assert_eq!(
+            reconstructed.reset_precision(),
+            Some(ResetPrecision::from_nanos(3_600_000_000_000).expect("one hour is positive")),
+        );
+        assert_eq!(PendingTerminalBundle::from_bundle(&reconstructed), pending);
+    }
+
     /// The flat form a live caller produces (`from_bundle`) must be the exact
     /// inverse of the reconstruction a drain performs, or a bundle spooled now
     /// would commit differently after recovery. The fixture below covers the

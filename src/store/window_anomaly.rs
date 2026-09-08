@@ -745,8 +745,8 @@ mod tests {
     use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
     use crate::domain::time::{FakeClock, MonotonicDuration};
     use crate::domain::window::{
-        NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowResetState,
-        WindowSemanticKey,
+        NominalWindowDuration, QuantizationSemantics, ReportedResolution, ResetPrecision,
+        WindowResetState, WindowSemanticKey,
     };
     use crate::store::account::observe_account;
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
@@ -1117,6 +1117,105 @@ mod tests {
         assert!(outcome.anomalies.is_empty());
         assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
         assert!(all_exclusions(&fx.conn).unwrap().is_empty());
+    }
+
+    /// The opencode-shaped pair this bead exists for (`aub-w1a0`), through
+    /// the persistence path: two observations twenty seconds apart whose
+    /// hour-granular derived resets drifted apart by the sampling interval,
+    /// compared under the adapter's declared one-hour precision. The commit
+    /// persists no anomaly row and no exclusion, and the drift still moves
+    /// both readings forward, so the stored instants stay what the adapter
+    /// derived. The instants sit about six days eight hours out from their
+    /// observations, so nothing but the declaration can absorb the drift.
+    #[test]
+    fn opencode_drift_within_the_declared_precision_persists_no_anomaly() {
+        let fx = fixture();
+        let (first_obs, first_window) = record_observation(
+            &fx,
+            1_791_151_856_090_445_727,
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_490_445_727)),
+        );
+        detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &first_obs,
+            &[first_window],
+            UtcTimestamp::from_unix_nanos(1_791_151_856_090_445_727),
+            None,
+        )
+        .unwrap();
+
+        let (second_obs, second_window) = record_observation(
+            &fx,
+            1_791_151_876_090_445_727,
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_178_385_374)),
+        );
+        let outcome = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &[second_window],
+            UtcTimestamp::from_unix_nanos(1_791_151_876_090_445_727),
+            Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero")),
+        )
+        .unwrap();
+
+        assert!(outcome.anomalies.is_empty());
+        assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
+        assert!(all_exclusions(&fx.conn).unwrap().is_empty());
+    }
+
+    /// The planted negative for the store-level plumbing: the identical
+    /// drift pair as
+    /// [`opencode_drift_within_the_declared_precision_persists_no_anomaly`],
+    /// detected with no declared precision. The same movement exceeds the
+    /// fixed jitter envelope and persists the typed anomaly plus its
+    /// exclusion, proving the precision parameter actually reaches the
+    /// classifier rather than being dropped on the way in.
+    #[test]
+    fn the_same_drift_without_the_declared_precision_persists_the_anomaly() {
+        let fx = fixture();
+        let (first_obs, first_window) = record_observation(
+            &fx,
+            1_791_151_856_090_445_727,
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_410_490_445_727)),
+        );
+        detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &first_obs,
+            &[first_window],
+            UtcTimestamp::from_unix_nanos(1_791_151_856_090_445_727),
+            None,
+        )
+        .unwrap();
+
+        let (second_obs, second_window) = record_observation(
+            &fx,
+            1_791_151_876_090_445_727,
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(1_791_152_430_178_385_374)),
+        );
+        let outcome = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &[second_window],
+            UtcTimestamp::from_unix_nanos(1_791_151_876_090_445_727),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.anomalies.len(), 1);
+        assert_eq!(
+            outcome.anomalies[0].kind,
+            WindowAnomalyKind::UnexpectedResetTimestampChange
+        );
+        assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 1);
+        assert_eq!(all_exclusions(&fx.conn).unwrap().len(), 1);
     }
 
     /// Rerunning detection over the same pair of observations persists
