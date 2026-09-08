@@ -414,11 +414,11 @@ was populated read as `unclassified`.
 │  ───────────────────────────────────────────────────────────────────             │
 │  primary  88.9%     100.0%        6m           3                             │
 │         attempt coverage below the 98% floor                                 │
-│         3 resets without an observation in the surrounding gaps              │
+│         3 resets inside a sampling hole                                      │
 │  gmail    100.0%    76.6%         6m           3                             │
 │         45 attempts refused with rate_limit_error                            │
 │         14 attempts refused with authentication_error                        │
-│         3 resets without an observation in the surrounding gaps              │
+│         3 resets inside a sampling hole                                      │
 │                                                                              │
 │  not in config: primary-2026-09-04 (last observed 2026-09-04)                │
 │  next: run coverage again once the floor condition changes                   │
