@@ -573,6 +573,7 @@ pub fn detect_and_persist(
     current_windows: &[StoredMeterWindow],
     detected_at: UtcTimestamp,
     reset_precision: Option<ResetPrecision>,
+    subset_source: bool,
 ) -> Result<DetectionOutcome, Error> {
     let mut outcome = DetectionOutcome::default();
 
@@ -703,6 +704,16 @@ pub fn detect_and_persist(
             .iter()
             .any(|current_window| identity_matches(previous_window, current_window));
         if still_present {
+            continue;
+        }
+        // A subset source (`aub-gnke`): a window missing from the current
+        // observation was not reported missing by the provider, it was never
+        // looked for - the status line carries whatever it rendered, and an
+        // endpoint window absent from it says nothing about the provider's
+        // window set. The appeared direction stays classified: a window a
+        // subset source newly reports is still a window that started
+        // existing.
+        if subset_source {
             continue;
         }
         if let Some(kind) = classify_window_set_change(
@@ -955,6 +966,7 @@ mod tests {
             &[window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .expect("detection must run");
         assert!(outcome.anomalies.is_empty());
@@ -982,6 +994,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
         assert!(outcome_first.anomalies.is_empty());
@@ -999,6 +1012,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1052,6 +1066,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1068,6 +1083,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1095,6 +1111,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1111,6 +1128,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1143,6 +1161,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(1_791_151_856_090_445_727),
             None,
+            false,
         )
         .unwrap();
 
@@ -1159,6 +1178,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(1_791_151_876_090_445_727),
             Some(ResetPrecision::from_seconds(3600).expect("one hour is non-zero")),
+            false,
         )
         .unwrap();
 
@@ -1190,6 +1210,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(1_791_151_856_090_445_727),
             None,
+            false,
         )
         .unwrap();
 
@@ -1206,6 +1227,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(1_791_151_876_090_445_727),
             None,
+            false,
         )
         .unwrap();
 
@@ -1237,6 +1259,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
         let (second_obs, second_window) = record_observation(
@@ -1252,6 +1275,7 @@ mod tests {
             std::slice::from_ref(&second_window),
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
         let second_run = detect_and_persist(
@@ -1261,6 +1285,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(41_000),
             None,
+            false,
         )
         .unwrap();
 
@@ -1361,6 +1386,7 @@ mod tests {
             &[seven_day_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1381,6 +1407,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
         assert!(outcome.anomalies.is_empty());
@@ -1410,6 +1437,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1497,6 +1525,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
         assert!(outcome.anomalies.is_empty());
@@ -1539,6 +1568,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(200_000),
             None,
+            false,
         )
         .expect("an out-of-order pair must not panic or fail the CHECK, only be skipped");
 
@@ -1652,6 +1682,7 @@ mod tests {
             &first_windows,
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1756,6 +1787,7 @@ mod tests {
                 &second_windows,
                 UtcTimestamp::from_unix_nanos(40_500),
                 None,
+                false,
             )
             .unwrap()
         };
@@ -1776,6 +1808,7 @@ mod tests {
             &reversed,
             UtcTimestamp::from_unix_nanos(41_000),
             None,
+            false,
         )
         .unwrap();
         let mut reordered_kinds: Vec<&str> = reordered_outcome
@@ -1875,6 +1908,7 @@ mod tests {
             &first_windows,
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1893,6 +1927,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1921,6 +1956,7 @@ mod tests {
             &second_windows_again,
             UtcTimestamp::from_unix_nanos(41_000),
             None,
+            false,
         )
         .unwrap();
         assert_eq!(rerun.window_set_changes.len(), 2);
@@ -1954,6 +1990,7 @@ mod tests {
             &[first_window],
             UtcTimestamp::from_unix_nanos(30_500),
             None,
+            false,
         )
         .unwrap();
         let (second_obs, second_window) = record_observation(
@@ -1969,6 +2006,7 @@ mod tests {
             &[second_window],
             UtcTimestamp::from_unix_nanos(40_500),
             None,
+            false,
         )
         .unwrap();
 
@@ -1988,5 +2026,182 @@ mod tests {
                 "the trigger must name the reason: {err}"
             );
         }
+    }
+
+    /// Inserts one observation under the given provider contract, carrying
+    /// exactly the windows named, each an account-wide or model-specific
+    /// window with the given used ppm and a known reset. The generic
+    /// [`record_observation`] helper pins the endpoint contract, and the
+    /// subset-source rule is decided on the contract id, so this test needs
+    /// observations under both contracts.
+    fn record_contract_observation(
+        fixture: &Fixture,
+        received_at_nanos: i64,
+        provider_contract_id: &str,
+        windows: &[(&str, WindowScope, i32)],
+    ) -> (StoredMeterObservation, Vec<StoredMeterWindow>) {
+        let attempt = start_meter_attempt(
+            &fixture.conn,
+            &NewMeterAttempt {
+                run_id: fixture.run,
+                account_id: fixture.account,
+                provider: "anthropic".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(received_at_nanos - 100),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: fixture.snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(received_at_nanos - 200),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: provider_contract_id.into(),
+                meter_semantics_id: "anthropic-subscription-v1".into(),
+            },
+        )
+        .expect("fixture attempt must insert");
+        let evidence_id = insert_response_evidence(
+            &fixture.conn,
+            &NewMeterResponseEvidence {
+                attempt_id: attempt,
+                response_classification: "200".into(),
+                received_at: UtcTimestamp::from_unix_nanos(received_at_nanos),
+                provider_observed_at_original: None,
+                evidence_capsule: r#"{"windows":[{"key":"session"}]}"#.into(),
+                capsule_schema_version: "capsule-v1".into(),
+                sanitizer_version: "sanitizer-v1".into(),
+                capture_truncated: false,
+            },
+        )
+        .expect("fixture evidence must insert");
+        let observation_id = insert_observation(
+            &fixture.conn,
+            &NewMeterObservation {
+                attempt_id: attempt,
+                evidence_id,
+                account_id: fixture.account,
+                provider: "anthropic".into(),
+                provider_observed_at: None,
+                received_at: UtcTimestamp::from_unix_nanos(received_at_nanos),
+                measurement_basis: MeasurementBasis::LocallyReceived,
+                observed_plan: Some("max".into()),
+                observed_tier: Some("pro".into()),
+                adapter_version: AdapterVersion::new("adapter-v1"),
+                provider_contract_id: ProviderContractId::new(provider_contract_id),
+                meter_semantics_id: MeterSemanticsId::new("anthropic-subscription-v1"),
+                normalized_fingerprint: format!("fp-{received_at_nanos}"),
+            },
+        )
+        .expect("fixture observation must insert");
+        for (key, scope, used_ppm) in windows {
+            insert_window(
+                &fixture.conn,
+                &NewMeterWindow {
+                    observation_id,
+                    semantic_key: WindowSemanticKey::new(*key),
+                    scope: scope.clone(),
+                    quota_used: QuotaUsed::new(QuotaFractionPpm::new(*used_ppm).unwrap()),
+                    reported_resolution: ReportedResolution::new(
+                        QuotaFractionPpm::new(10_000).unwrap(),
+                    )
+                    .unwrap(),
+                    quantization: QuantizationSemantics::RoundedToNearest,
+                    resets_at: WindowResetState::Known(UtcTimestamp::from_unix_nanos(100_000)),
+                    nominal_duration: NominalWindowDuration::from_nanos(3_600_000_000_000),
+                },
+            )
+            .expect("fixture window must insert");
+        }
+        let observation = observation_by_row_id(&fixture.conn, observation_id)
+            .expect("observation must read")
+            .expect("observation must exist");
+        let windows =
+            windows_by_observation(&fixture.conn, observation_id).expect("windows must read");
+        (observation, windows)
+    }
+
+    /// The subset-source rule (`aub-gnke`): a status-line observation that
+    /// does not carry the model-scoped window, following an endpoint
+    /// observation that does, records no
+    /// `missing_model_specific_window` set change. The same pair detected
+    /// with the subset flag off does record one, which is what makes the
+    /// flag the only difference and the suppression real.
+    #[test]
+    fn a_statusline_observation_missing_a_model_window_records_no_set_change() {
+        let fx = fixture();
+        let endpoint_contract = "anthropic-oauth-usage-limits-v1";
+        let statusline_contract = "anthropic-statusline-rate-limits-v1";
+
+        let (first_obs, first_windows) = record_contract_observation(
+            &fx,
+            30_500,
+            endpoint_contract,
+            &[
+                ("session", WindowScope::AccountWide, 600_000),
+                ("weekly_all", WindowScope::AccountWide, 700_000),
+                (
+                    "weekly_scoped_opus",
+                    WindowScope::ModelSpecific(ModelId::new("opus")),
+                    100_000,
+                ),
+            ],
+        );
+        detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &first_obs,
+            &first_windows,
+            UtcTimestamp::from_unix_nanos(30_500),
+            None,
+            false,
+        )
+        .unwrap();
+
+        // The status-line observation carries the two windows the status
+        // line rendered and nothing else: the model-scoped window the
+        // endpoint reported is absent from it, not reported missing by the
+        // provider.
+        let (second_obs, second_windows) = record_contract_observation(
+            &fx,
+            40_500,
+            statusline_contract,
+            &[
+                ("session", WindowScope::AccountWide, 610_000),
+                ("weekly_all", WindowScope::AccountWide, 700_000),
+            ],
+        );
+        let suppressed = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &second_windows,
+            UtcTimestamp::from_unix_nanos(40_500),
+            None,
+            true,
+        )
+        .unwrap();
+        assert!(
+            suppressed.window_set_changes.is_empty(),
+            "a subset source reports no disappearance: {:?}",
+            suppressed.window_set_changes
+        );
+        assert_eq!(all_window_set_changes(&fx.conn).unwrap().len(), 0);
+
+        // Control over the same pair: with the subset rule off, the same
+        // disappearance is the set change it always was. Nothing else about
+        // the two observations has changed.
+        let second_windows_again = windows_by_observation(&fx.conn, second_obs.row_id).unwrap();
+        let unsuppressed = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &second_windows_again,
+            UtcTimestamp::from_unix_nanos(40_500),
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(unsuppressed.window_set_changes.len(), 1);
+        assert_eq!(
+            unsuppressed.window_set_changes[0].kind,
+            WindowSetChangeKind::MissingModelSpecificWindow
+        );
     }
 }

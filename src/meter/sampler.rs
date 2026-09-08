@@ -76,7 +76,9 @@ use crate::domain::failure::{
     provider_error_classification,
 };
 use crate::domain::ids::{AdapterVersion, ProviderContractId};
-use crate::domain::time::{Clock, MonotonicDuration, ProviderObservedAt, UtcTimestamp};
+use crate::domain::time::{
+    Clock, MeasurementBasis, MonotonicDuration, ProviderObservedAt, UtcTimestamp,
+};
 use crate::domain::window::{MeterWindow, QuantizationSemantics, WindowScope};
 use crate::error::Error;
 use crate::meter::adapter::{
@@ -126,6 +128,24 @@ pub trait MeteredReading {
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         None
     }
+
+    /// The measurement basis this reading's own source declares, when it
+    /// differs from the adapter's declaration (`aub-gnke`). The Anthropic
+    /// endpoint is received locally - the adapter's declaration - while the
+    /// same adapter's status-line record is provider-observed at the instant
+    /// Claude Code rendered it. `None` keeps the adapter's declaration.
+    fn source_measurement_basis(&self) -> Option<MeasurementBasis> {
+        None
+    }
+
+    /// Whether this reading's window set is a subset of the provider's full
+    /// window set (`aub-gnke`): a window the reading does not carry was not
+    /// reported missing, it was never looked for. The window-set detector
+    /// holds the missing direction for such a source. `false` for every
+    /// source that reports the provider's whole window set.
+    fn window_set_is_subset(&self) -> bool {
+        false
+    }
 }
 
 impl MeteredReading for AnthropicReading {
@@ -139,6 +159,15 @@ impl MeteredReading for AnthropicReading {
 
     fn provider_contract_id(&self) -> Option<&ProviderContractId> {
         Some(&self.provider_contract_id)
+    }
+
+    fn source_measurement_basis(&self) -> Option<MeasurementBasis> {
+        self.is_statusline_sourced()
+            .then_some(MeasurementBasis::ProviderObserved)
+    }
+
+    fn window_set_is_subset(&self) -> bool {
+        self.is_statusline_sourced()
     }
 }
 
@@ -204,6 +233,29 @@ impl MeteredReading for Reading {
             Reading::Codex(reading) => Some(&reading.provider_contract_id),
             Reading::Ollama(_) => None,
             Reading::Agy(_) => None,
+        }
+    }
+
+    fn source_measurement_basis(&self) -> Option<MeasurementBasis> {
+        match self {
+            Reading::Anthropic(reading) => reading.source_measurement_basis(),
+            // OpenCodeReading is not MeteredReading; its windows are read
+            // directly off the struct, and it declares no source basis of
+            // its own.
+            Reading::OpenCode(_) => None,
+            Reading::Codex(reading) => reading.source_measurement_basis(),
+            Reading::Ollama(reading) => reading.source_measurement_basis(),
+            Reading::Agy(reading) => reading.source_measurement_basis(),
+        }
+    }
+
+    fn window_set_is_subset(&self) -> bool {
+        match self {
+            Reading::Anthropic(reading) => reading.window_set_is_subset(),
+            Reading::OpenCode(_) => false,
+            Reading::Codex(reading) => reading.window_set_is_subset(),
+            Reading::Ollama(reading) => reading.window_set_is_subset(),
+            Reading::Agy(reading) => reading.window_set_is_subset(),
         }
     }
 }
@@ -919,7 +971,13 @@ where
                 .provider_observed_at()
                 .map(|observed| observed.as_utc()),
             received_at,
-            measurement_basis: declarations.measurement_basis,
+            // A reading's own source may declare a different basis than the
+            // adapter's declaration does (`aub-gnke`): the Anthropic endpoint
+            // is locally received, its status line provider-observed, and
+            // both flow through this one adapter.
+            measurement_basis: reading
+                .source_measurement_basis()
+                .unwrap_or(declarations.measurement_basis),
             observed_plan: None,
             observed_tier: None,
             adapter_version: item.account.adapter_version.clone(),
@@ -933,7 +991,11 @@ where
             interpretation,
             reading.windows().to_vec(),
         )
-        .map(|bundle| bundle.with_reset_precision(reset_precision))
+        .map(|bundle| {
+            bundle
+                .with_reset_precision(reset_precision)
+                .with_subset_source(reading.window_set_is_subset())
+        })
     }
 }
 

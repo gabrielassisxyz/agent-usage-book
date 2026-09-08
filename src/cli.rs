@@ -1301,6 +1301,54 @@ fn preflight_anthropic_refresh(
     }
 }
 
+/// The meter request one account's sampling batch entry carries: the facts
+/// the caller resolves because the adapter resolves none of them itself
+/// (`aub-cg6k`, `aub-er47`). The status-line record is resolved the same way
+/// (`aub-gnke`): the switch, the state directory and the account's name are
+/// configuration facts, and the adapter chooses between that source and the
+/// endpoint per request.
+fn meter_request_for_account(
+    account: &crate::config::AccountConfig,
+    config: &crate::config::Config,
+) -> crate::meter::adapter::MeterRequest {
+    crate::meter::adapter::MeterRequest {
+        model: None,
+        workspace_id: account.opencode_workspace.clone(),
+        local_home: account.codex_home.clone(),
+        codex_sessions_owned: account
+            .codex_home
+            .as_ref()
+            .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
+        anthropic_statusline: anthropic_statusline_source(account, config),
+    }
+}
+
+/// The status-line record an Anthropic account's meter may read its
+/// freshest observation from, when the feature is on and the account's name
+/// can name a record file. `None` for every other provider and when
+/// `anthropic.statusline` is false: the adapter then reads the endpoint on
+/// every tick, which is the recovery path (`aub-gnke`).
+fn anthropic_statusline_source(
+    account: &crate::config::AccountConfig,
+    config: &crate::config::Config,
+) -> Option<crate::meter::adapter::AnthropicStatuslineSource> {
+    if account.provider != "anthropic" || !config.anthropic.statusline {
+        return None;
+    }
+    // A name that cannot be one file-system component is a file the tee can
+    // never have written (it refuses the same names), so there is no record
+    // to read and the endpoint serves the account.
+    crate::statusline::single_component_stem(&account.name)?;
+    Some(crate::meter::adapter::AnthropicStatuslineSource {
+        record_path: config
+            .state
+            .dir
+            .join(crate::statusline::RECORD_DIR_NAME)
+            .join(format!("{}.jsonl", account.name)),
+        fresh_window: config.sampling.default_interval,
+    })
+}
+
 /// `aub sample`: observe provider endpoints for due or selected accounts,
 /// recording session markers and evidence.
 pub(crate) fn sample_command(
@@ -1546,15 +1594,7 @@ pub(crate) fn sample_command(
             adapter,
             credential: credential_handle,
             credential_context_id,
-            request: crate::meter::adapter::MeterRequest {
-                model: None,
-                workspace_id: acc.opencode_workspace.clone(),
-                local_home: acc.codex_home.clone(),
-                codex_sessions_owned: acc
-                    .codex_home
-                    .as_ref()
-                    .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
-            },
+            request: meter_request_for_account(acc, &config),
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,
@@ -2046,15 +2086,7 @@ pub(crate) fn now_command(
             adapter,
             credential: credential_handle,
             credential_context_id,
-            request: crate::meter::adapter::MeterRequest {
-                model: None,
-                workspace_id: acc.opencode_workspace.clone(),
-                local_home: acc.codex_home.clone(),
-                codex_sessions_owned: acc
-                    .codex_home
-                    .as_ref()
-                    .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
-            },
+            request: meter_request_for_account(acc, &config),
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,
@@ -5704,15 +5736,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             adapter,
             credential: credential_handle,
             credential_context_id,
-            request: crate::meter::adapter::MeterRequest {
-                model: None,
-                workspace_id: account_config.opencode_workspace.clone(),
-                local_home: account_config.codex_home.clone(),
-                codex_sessions_owned: account_config
-                    .codex_home
-                    .as_ref()
-                    .is_some_and(|home| crate::local_source::codex_home_owns_sessions_tree(home)),
-            },
+            request: meter_request_for_account(account_config, &config),
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,

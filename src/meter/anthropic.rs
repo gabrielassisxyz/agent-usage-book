@@ -32,14 +32,16 @@ use crate::domain::window::{
     WindowResetState, WindowScope, WindowSemanticKey, WindowSeverity,
 };
 use crate::meter::adapter::{
-    AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
-    ProviderObservation, RequiredWindowKinds,
+    AdapterDeclarations, AnthropicStatuslineSource, CredentialHandle, HttpTransport, MeterRequest,
+    ProviderAdapter, ProviderObservation, RequiredWindowKinds,
 };
 use crate::meter::evidence::{
     CapturedProviderResponse, SensitiveResponseMaterial, capture_json_body, capture_json_response,
     error_report_for_observation, quota_response_from_capsule,
 };
-use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse, RequestTimeoutConfig};
+use crate::meter::transport::{
+    CommandBudget, HttpRequest, HttpResponse, LOCAL_FILE_PATH_HEADER, RequestTimeoutConfig,
+};
 
 /// Extra usage configuration from an Anthropic response.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,6 +103,16 @@ impl AnthropicReading {
             provider_contract_id: ProviderContractId::new(AnthropicAdapter::DEFAULT_CONTRACT_ID),
         }
     }
+
+    /// True when this reading came from the status-line contract (`aub-gnke`):
+    /// the source whose window set is whatever the status line happened to
+    /// render, so a window the reading does not carry was never reported
+    /// missing by the provider. Drives both the measurement basis and the
+    /// set-change detector's subset rule, which are both properties of the
+    /// source a reading came from rather than of its values.
+    pub fn is_statusline_sourced(&self) -> bool {
+        self.provider_contract_id.as_str() == AnthropicAdapter::STATUSLINE_CONTRACT_ID
+    }
 }
 
 /// The Anthropic OAuth provider adapter.
@@ -121,6 +133,13 @@ impl AnthropicAdapter {
     pub const LEGACY_CONTRACT_ID: &'static str = "anthropic-oauth-usage-v1";
     pub const LIMITS_CONTRACT_ID: &'static str = "anthropic-oauth-usage-limits-v1";
     pub const DEFAULT_CONTRACT_ID: &'static str = Self::LIMITS_CONTRACT_ID;
+    /// The status-line record's contract (`aub-gnke`): the same meter read
+    /// from the line the `aub statusline` tee appended when Claude Code last
+    /// rendered the provider's own figures. A second contract on the same
+    /// adapter and semantics, so `aub status` renders one block per account
+    /// whichever source fed it, and the window-set detector can tell the
+    /// two sources' window sets apart by the observation's contract id.
+    pub const STATUSLINE_CONTRACT_ID: &'static str = "anthropic-statusline-rate-limits-v1";
     pub const DEFAULT_SEMANTICS_ID: &'static str = "anthropic-subscription-v1";
     pub const REQUIRED_WINDOW_KINDS: &'static [&'static str] = &["session", "weekly_all"];
 
@@ -788,6 +807,139 @@ fn parse_retry_after(response: &HttpResponse) -> Option<MonotonicDuration> {
     Some(MonotonicDuration::from_seconds(secs))
 }
 
+/// One status-line record line, reduced to what the reader interprets: the
+/// instant the tee received the render at, the session it came from, and the
+/// windows map exactly as the line carried it. `cwd` is deliberately absent
+/// from this shape and from everything built on it: a path can carry a
+/// project name, and the evidence must not.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StatuslineRecord {
+    received_at: UtcTimestamp,
+    /// The `received_at` spelling as the line carried it, kept for the
+    /// capsule, so the evidence preserves the tee's own rendering rather
+    /// than a re-derivation of it.
+    received_at_raw: String,
+    session_id: String,
+    windows: serde_json::Map<String, serde_json::Value>,
+}
+
+/// The last non-empty line of a record file's bytes, the only line the
+/// reader interprets (`aub-gnke`). The tee appends, so the last line is the
+/// newest render it found worth recording, and the file's growth costs
+/// nothing beyond the one line.
+fn last_record_line(body: &[u8]) -> Option<&[u8]> {
+    let text = std::str::from_utf8(body).ok()?;
+    text.lines()
+        .rev()
+        .find(|line| !line.trim().is_empty())
+        .map(str::as_bytes)
+}
+
+/// Parses one record line into its reading-relevant fields. A line that is
+/// not the shape the tee writes - no `received_at`, no session, no windows
+/// map - yields `None`, and the caller takes the endpoint path: a record
+/// file this adapter cannot interpret is not evidence of anything about the
+/// provider, never a reason to persist a fabricated reading.
+fn parse_statusline_record(line: &[u8]) -> Option<StatuslineRecord> {
+    let value: serde_json::Value = serde_json::from_slice(line).ok()?;
+    let object = value.as_object()?;
+    let received_at_raw = object
+        .get("received_at")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)?;
+    let received_at = UtcTimestamp::parse_rfc3339(&received_at_raw)?;
+    let session_id = object
+        .get("session_id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|session| !session.is_empty())?
+        .to_string();
+    let windows = object
+        .get("windows")
+        .and_then(serde_json::Value::as_object)?
+        .clone();
+    Some(StatuslineRecord {
+        received_at,
+        received_at_raw,
+        session_id,
+        windows,
+    })
+}
+
+/// The record-line window name to shared-vocabulary identity mapping, for
+/// the names this reader knows. The status line spells the same two windows
+/// the endpoint reports as `limits[].kind` by their payload names: the
+/// session window is `five_hour`, the weekly one `seven_day`. Whether the
+/// payload ever carries a model-scoped window is unknown until the tee has
+/// run on a real machine, so nothing else maps - a further name is recorded
+/// in the capsule and maps to no row, rather than guessed into a scope.
+fn statusline_window_identity(
+    name: &str,
+) -> Option<(&'static str, WindowScope, NominalWindowDuration)> {
+    match name {
+        "five_hour" => Some((
+            "session",
+            WindowScope::AccountWide,
+            NominalWindowDuration::from_nanos(5 * 3600 * 1_000_000_000),
+        )),
+        "seven_day" => Some((
+            "weekly_all",
+            WindowScope::AccountWide,
+            NominalWindowDuration::from_nanos(7 * 24 * 3600 * 1_000_000_000),
+        )),
+        _ => None,
+    }
+}
+
+/// Builds one [`MeterWindow`] from a record line's window object, under the
+/// identity its name mapped to. `used_percentage` converts to ppm by the
+/// percent step the endpoint path already uses; `resets_at` is an integer
+/// epoch second per the record shape the tee writes, and a `Known` reset;
+/// null is a window that has not started. Anything else is a window this
+/// reading does not carry, reported as a dropped window rather than guessed
+/// into a value.
+fn statusline_window_from_record(
+    record_name: &str,
+    (key, scope, duration): (&'static str, WindowScope, NominalWindowDuration),
+    object: &serde_json::Map<String, serde_json::Value>,
+) -> Result<MeterWindow, DroppedWindow> {
+    let fragment =
+        serde_json::to_string(&serde_json::Value::Object(object.clone())).unwrap_or_default();
+    let drop = |field: &str| DroppedWindow {
+        semantic_key: WindowSemanticKey::new(record_name),
+        reason: FailureClass::MissingRequiredField,
+        field: field.to_string(),
+        payload_fragment: fragment.clone(),
+    };
+    let percentage = object
+        .get("used_percentage")
+        .and_then(serde_json::Value::as_f64)
+        .ok_or_else(|| drop("used_percentage"))?;
+    let quota_used = QuotaUsed::new(
+        percentage_to_quota(percentage, "used_percentage", &fragment)
+            .map_err(|error| drop(error.field))?,
+    );
+    let resets_at = match object.get("resets_at") {
+        None | Some(serde_json::Value::Null) => WindowResetState::NotStarted,
+        Some(value) => {
+            let epoch = value.as_i64().ok_or_else(|| drop("resets_at"))?;
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                epoch.saturating_mul(1_000_000_000),
+            ))
+        }
+    };
+    let resolution = ReportedResolution::new(QuotaFractionPpm::new(100).unwrap())
+        .expect("100 ppm is a non-zero resolution");
+    Ok(MeterWindow::new(
+        WindowSemanticKey::new(key),
+        scope,
+        quota_used,
+        resolution,
+        QuantizationSemantics::Exact,
+        resets_at,
+        duration,
+    ))
+}
+
 impl ProviderAdapter for AnthropicAdapter {
     type Reading = AnthropicReading;
 
@@ -813,6 +965,149 @@ impl ProviderAdapter for AnthropicAdapter {
         transport: &impl HttpTransport,
         clock: &impl Clock,
     ) -> CapturedProviderResponse<Self::Reading> {
+        // The status-line path runs first because it needs no credential and
+        // sends no request: an account Claude Code is rendering right now is
+        // read for free, on every tick, even while its stored token is past
+        // its expiry. A reading from the line is also the fresher one, so a
+        // credential problem is allowed to surface through the endpoint path
+        // it actually belongs to: when no fresh line exists.
+        if let Some(source) = &request.anthropic_statusline
+            && let Some(captured) = self.observe_statusline(credential, source, transport, clock)
+        {
+            return captured;
+        }
+        self.observe_endpoint(credential, request, transport, clock)
+    }
+}
+
+impl AnthropicAdapter {
+    /// The status-line path (`aub-gnke`): the account's record file read
+    /// through the transport's local-file arm, its last line interpreted
+    /// under the status-line contract. Returns `None` - never a failure
+    /// observation - when the source has no fresh line to read: no file, an
+    /// unreadable file, a last line older than the source's freshness
+    /// window, or a last line that does not parse into the record shape.
+    /// The endpoint attempt that follows records its own evidence; a record
+    /// file this adapter cannot use is not itself evidence of anything about
+    /// the provider, so nothing from it is persisted.
+    fn observe_statusline(
+        &self,
+        credential: &CredentialHandle,
+        source: &AnthropicStatuslineSource,
+        transport: &impl HttpTransport,
+        clock: &impl Clock,
+    ) -> Option<CapturedProviderResponse<AnthropicReading>> {
+        let timeouts = RequestTimeoutConfig::new(
+            MonotonicDuration::from_seconds(5),
+            MonotonicDuration::from_seconds(10),
+            Some(MonotonicDuration::from_seconds(15)),
+        );
+        let request = HttpRequest::local_file(&source.record_path, timeouts);
+        let budget = CommandBudget::new(MonotonicDuration::from_seconds(30), clock);
+        let response = transport.send(&request, &budget, clock).ok()?;
+
+        // Which file was read: the transport reports the resolved path in
+        // its response headers; a transport that names none leaves the path
+        // the request carried, which is the same file when nothing resolved
+        // ahead of the read.
+        let source_path = response
+            .header(LOCAL_FILE_PATH_HEADER)
+            .map_or_else(|| source.record_path.display().to_string(), str::to_string);
+
+        let line = last_record_line(response.body())?;
+        let record = parse_statusline_record(line)?;
+
+        // Freshness: the line counts when its `received_at` lies within the
+        // account's ordinary cadence of the tick, and never ahead of it. An
+        // older line is stale - the endpoint runs - and an instant ahead of
+        // the local clock is the one direction the skew envelope never
+        // excuses (`aub-3o0w`), so a line dated ahead of the tick is
+        // unusable here exactly as a file from the future is there.
+        let now = clock.now();
+        if record.received_at > now {
+            return None;
+        }
+        let age_nanos = now
+            .unix_nanos()
+            .saturating_sub(record.received_at.unix_nanos());
+        let age_nanos = u64::try_from(age_nanos).unwrap_or(u64::MAX);
+        if age_nanos > source.fresh_window.as_nanos() {
+            return None;
+        }
+
+        // The line's windows map into the shared vocabulary by name. A name
+        // this reader does not know maps to nothing: the line's own map
+        // stays in the capsule below, which is where the name is recorded,
+        // and no meter_window row is invented for it.
+        let mut windows = Vec::new();
+        let mut dropped_windows = Vec::new();
+        for (name, value) in &record.windows {
+            let Some(identity) = statusline_window_identity(name) else {
+                continue;
+            };
+            match value.as_object() {
+                Some(object) => match statusline_window_from_record(name, identity, object) {
+                    Ok(window) => windows.push(window),
+                    Err(dropped) => dropped_windows.push(dropped),
+                },
+                None => dropped_windows.push(DroppedWindow {
+                    semantic_key: WindowSemanticKey::new(name),
+                    reason: FailureClass::MissingRequiredField,
+                    field: "windows".to_string(),
+                    payload_fragment: serde_json::to_string(value).unwrap_or_default(),
+                }),
+            }
+        }
+
+        // The composed capture body: the quota-relevant fields the line
+        // carries plus the source facts the read resolved to. Composed from
+        // parsed fields rather than captured raw, which is what keeps `cwd`
+        // - a path that can carry a project name - out of the capsule by
+        // construction, and keeps every window name the line used, known or
+        // not, in the evidence.
+        let capture_body = serde_json::json!({
+            "windows": record.windows,
+            "session_id": record.session_id,
+            "source": {
+                "path": source_path,
+                "received_at": record.received_at_raw,
+            },
+        });
+        let capture_bytes =
+            serde_json::to_vec(&capture_body).expect("a JSON value always serializes");
+        // The credential cannot appear in a record the tee wrote, but the
+        // capture redacts what it is told anyway: the same belt every other
+        // capture path wears.
+        let sensitive = SensitiveResponseMaterial::new([credential.expose()]);
+        let evidence = capture_json_body(&capture_bytes, &sensitive);
+
+        let reading = AnthropicReading {
+            windows,
+            provider_observed_at: Some(ProviderObservedAt::new(record.received_at)),
+            extra_usage: None,
+            dropped_windows,
+            anomalies: Vec::new(),
+            calibration_applicability: CalibrationApplicability::NotEvaluated,
+            provider_contract_id: ProviderContractId::new(Self::STATUSLINE_CONTRACT_ID),
+        };
+        Some(CapturedProviderResponse {
+            observation: ProviderObservation::Measured(reading),
+            evidence: Some(evidence),
+            failed_body: None,
+            failed_error: None,
+        })
+    }
+
+    /// The endpoint path: the OAuth usage endpoint read with the account's
+    /// bearer token, taken whenever the status-line source named no fresh
+    /// line (`aub-gnke`).
+    fn observe_endpoint(
+        &self,
+        credential: &CredentialHandle,
+        request: &MeterRequest,
+        transport: &impl HttpTransport,
+        clock: &impl Clock,
+    ) -> CapturedProviderResponse<AnthropicReading> {
         let token = match extract_bearer_token(credential) {
             Ok(token) => token,
             Err(reason) => {
@@ -921,6 +1216,7 @@ impl ProviderAdapter for AnthropicAdapter {
 mod tests {
     use super::*;
     use crate::domain::time::FakeClock;
+    use crate::meter::sampler::MeteredReading as _;
     use test_support::sanitization::matched_patterns;
 
     struct MockTransport {
@@ -1034,6 +1330,35 @@ mod tests {
                 panic!("expected Measured, got Unreachable({failure:?})")
             }
         }
+    }
+
+    /// The reading-level derivations the status-line contract drives
+    /// (`aub-gnke`): a status-line reading declares the provider-observed
+    /// basis and a subset window set, the endpoint readings keep the
+    /// adapter's locally-received declaration and a full window set. No
+    /// filesystem: the contract id alone decides both.
+    #[test]
+    fn a_statusline_reading_declares_provider_observed_basis_and_a_subset_source() {
+        let statusline = AnthropicReading {
+            windows: Vec::new(),
+            provider_observed_at: None,
+            extra_usage: None,
+            dropped_windows: Vec::new(),
+            anomalies: Vec::new(),
+            calibration_applicability: CalibrationApplicability::NotEvaluated,
+            provider_contract_id: ProviderContractId::new(AnthropicAdapter::STATUSLINE_CONTRACT_ID),
+        };
+        assert!(statusline.is_statusline_sourced());
+        assert_eq!(
+            statusline.source_measurement_basis(),
+            Some(MeasurementBasis::ProviderObserved)
+        );
+        assert!(statusline.window_set_is_subset());
+
+        let endpoint = AnthropicReading::new(Vec::new());
+        assert!(!endpoint.is_statusline_sourced());
+        assert_eq!(endpoint.source_measurement_basis(), None);
+        assert!(!endpoint.window_set_is_subset());
     }
 
     #[test]

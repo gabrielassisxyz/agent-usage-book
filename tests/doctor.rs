@@ -2032,9 +2032,27 @@ fn meter_anomalies_report_recent_health_without_hiding_history() {
     );
 
     let (first_obs, first_windows) = record(30, 600_000, WindowResetState::Known(ts(100)));
-    detect_and_persist(&conn, account, &first_obs, &first_windows, ts(30), None).unwrap();
+    detect_and_persist(
+        &conn,
+        account,
+        &first_obs,
+        &first_windows,
+        ts(30),
+        None,
+        false,
+    )
+    .unwrap();
     let (second_obs, second_windows) = record(40, 400_000, WindowResetState::Known(ts(100)));
-    detect_and_persist(&conn, account, &second_obs, &second_windows, ts(40), None).unwrap();
+    detect_and_persist(
+        &conn,
+        account,
+        &second_obs,
+        &second_windows,
+        ts(40),
+        None,
+        false,
+    )
+    .unwrap();
 
     let ctx_after = DoctorContext {
         config: &config,
@@ -2109,7 +2127,16 @@ fn meter_anomalies_report_recent_health_without_hiding_history() {
     );
 
     let (third_obs, third_windows) = record(950, 200_000, WindowResetState::Known(ts(100)));
-    detect_and_persist(&conn, account, &third_obs, &third_windows, ts(950), None).unwrap();
+    detect_and_persist(
+        &conn,
+        account,
+        &third_obs,
+        &third_windows,
+        ts(950),
+        None,
+        false,
+    )
+    .unwrap();
     let mixed = build_registry(&ctx_historical)
         .into_iter()
         .find(|o| o.name == CheckName::MeterAnomalies)

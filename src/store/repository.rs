@@ -402,6 +402,13 @@ pub struct TerminalMeterBundle {
     /// detection compares is stamped with the current observation's own
     /// declaration (`aub-w1a0`). `None` for an adapter that declares nothing.
     reset_precision: Option<ResetPrecision>,
+    /// Whether this reading's window set is a subset of the provider's full
+    /// window set (`aub-gnke`), carried to the window-set detector for the
+    /// same reason the reset precision is: a property of the source the
+    /// reading came from, decided by the meter layer and never persisted as
+    /// a column. A window missing from a subset-source observation is not a
+    /// set change.
+    subset_source: bool,
 }
 
 impl TerminalMeterBundle {
@@ -424,6 +431,7 @@ impl TerminalMeterBundle {
             interpretation,
             windows,
             reset_precision: None,
+            subset_source: false,
         })
     }
 
@@ -437,6 +445,18 @@ impl TerminalMeterBundle {
 
     pub fn reset_precision(&self) -> Option<ResetPrecision> {
         self.reset_precision
+    }
+
+    /// Whether the reading this bundle commits came from a source whose
+    /// window set is a subset of the provider's full one (`aub-gnke`).
+    pub fn subset_source(&self) -> bool {
+        self.subset_source
+    }
+
+    /// Marks the bundle as committed from a subset source.
+    pub fn with_subset_source(mut self, subset_source: bool) -> Self {
+        self.subset_source = subset_source;
+        self
     }
 
     pub fn result(&self) -> &NewMeterAttemptResult {
@@ -567,6 +587,7 @@ pub(crate) fn commit_terminal_bundle_on_connection(
         &current_windows,
         interpretation.received_at,
         bundle.reset_precision(),
+        bundle.subset_source(),
     )?;
 
     // The terminal fact is projection-relevant durable meter state, so its

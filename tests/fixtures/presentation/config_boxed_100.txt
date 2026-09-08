@@ -10,6 +10,7 @@
 │                                                                                                  │
 │  anthropic                                                                                       │
 │    refresh                  true                                                        default  │
+│    statusline               true                                                        default  │
 │                                                                                                  │
 │  attribution                                                                                     │
 │    recent_window            30d                                                         default  │

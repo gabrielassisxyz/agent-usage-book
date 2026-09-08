@@ -747,6 +747,7 @@ mod tests {
             workspace_id: Some(FIXTURE_WORKSPACE_ID.to_string()),
             local_home: None,
             codex_sessions_owned: false,
+            anthropic_statusline: None,
         };
         adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),
@@ -983,6 +984,7 @@ mod tests {
             workspace_id: Some("wrk_unused".to_string()),
             local_home: None,
             codex_sessions_owned: false,
+            anthropic_statusline: None,
         };
         let _ = adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),
@@ -1008,6 +1010,7 @@ mod tests {
             workspace_id: None,
             local_home: None,
             codex_sessions_owned: false,
+            anthropic_statusline: None,
         };
         let captured = adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),

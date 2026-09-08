@@ -23,7 +23,7 @@
 
 use crate::domain::failure::{AuthReason, FailureClass};
 use crate::domain::ids::{MeterSemanticsId, ProviderContractId};
-use crate::domain::time::{Clock, MeasurementBasis};
+use crate::domain::time::{Clock, MeasurementBasis, MonotonicDuration};
 use crate::domain::window::{ModelId, ResetPrecision};
 use crate::error::Error;
 use crate::meter::agy::{AgyAdapter, AgyReading};
@@ -122,6 +122,30 @@ pub struct MeterRequest {
     /// rollout read without ownership proof is the defect this flag exists to
     /// end, so an unresolved flag takes the endpoint path.
     pub codex_sessions_owned: bool,
+    /// The status-line record an Anthropic account's meter may read its
+    /// freshest observation from (`aub-gnke`). Resolved by the caller from
+    /// `anthropic.statusline`, the state directory and the account's own
+    /// name, the way `codex_sessions_owned` is resolved from the filesystem;
+    /// the adapter chooses between this source and the endpoint per request,
+    /// on the freshness of the record's last line. `None` on every other
+    /// provider and on every adapter but the Anthropic one, and `None` sends
+    /// every tick to the endpoint.
+    pub anthropic_statusline: Option<AnthropicStatuslineSource>,
+}
+
+/// The status-line record source one Anthropic account reads, handed across
+/// the boundary resolved (`aub-gnke`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AnthropicStatuslineSource {
+    /// `<state.dir>/statusline/<account>.jsonl`: the file `aub statusline`
+    /// appends one JSON line per meter change to, and the reader takes its
+    /// last line from.
+    pub record_path: std::path::PathBuf,
+    /// The account's ordinary cadence. A last line whose `received_at` lies
+    /// further back than this before the tick is stale: the endpoint runs
+    /// and the line is ignored. One definition in the sampling policy, read
+    /// here, never a second copy of the cadence inside the adapter.
+    pub fresh_window: MonotonicDuration,
 }
 
 /// One provider-defined constraint kind an adapter requires in a successful

@@ -321,8 +321,10 @@ fn file_stem(session_id: &str) -> String {
 /// The account name as a record file stem, or `None` when the name cannot be
 /// one file-system component (a `/` in it would write outside the record
 /// directory, and the config is the only thing standing between the tee and
-/// that path).
-fn single_component_stem(name: &str) -> Option<&str> {
+/// that path). The reader shares the check (`aub-gnke`): a name that cannot
+/// be a record file name names no record file, so the caller sends the
+/// account to the endpoint instead of building a path outside the directory.
+pub(crate) fn single_component_stem(name: &str) -> Option<&str> {
     if name.is_empty()
         || name == "."
         || name == ".."

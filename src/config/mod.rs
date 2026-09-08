@@ -331,6 +331,15 @@ pub struct AnthropicConfig {
     /// runs only on expiry, never to dodge a rate limit. Set to `false` to
     /// return to read-only behaviour: `aub` then reads whatever is in the file.
     pub refresh: bool,
+    /// Whether the Anthropic meter reads the status-line records the
+    /// `aub statusline` tee appends (`aub-gnke`). When `true` (the default),
+    /// an account whose record file holds a line younger than the ordinary
+    /// cadence is observed from that line and sends no request to the usage
+    /// endpoint; the endpoint runs only when no fresh line exists. Set to
+    /// `false` to make the adapter ignore the files and return to the
+    /// endpoint on every tick; observations already written keep their
+    /// contract id and stay valid.
+    pub statusline: bool,
 }
 
 /// The exclusivity policy for a configured account (`aub-c0b.7`).
@@ -559,7 +568,7 @@ const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
-const ANTHROPIC_KEYS: &[&str] = &["refresh"];
+const ANTHROPIC_KEYS: &[&str] = &["refresh", "statusline"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -1456,6 +1465,15 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        statusline: resolve_bool(
+            "anthropic.statusline",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "anthropic", "statusline"),
+            Some("true"),
+            &file_display,
+            &mut provenance,
+        )?,
     };
 
     let valuation = ValuationConfig {
@@ -1835,6 +1853,7 @@ impl Config {
                 format_config_duration(self.doctor.meter_anomaly_horizon)
             }
             "anthropic.refresh" => self.anthropic.refresh.to_string(),
+            "anthropic.statusline" => self.anthropic.statusline.to_string(),
             "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
             "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
             "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
@@ -3191,6 +3210,7 @@ accounts[1].provider                  provider-b                               f
 adapter_semantics.max_comparison_age  30d                                      default
 
 anthropic.refresh                     true                                     default
+anthropic.statusline                  true                                     default
 
 attribution.recent_window             30d                                      default
 
