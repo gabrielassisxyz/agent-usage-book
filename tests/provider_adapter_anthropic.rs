@@ -131,8 +131,8 @@ fn adapter_semantics_table_names_limits_kinds() {
     let adapter_row = table
         .lines()
         .find(|line| {
-            line.starts_with("| Anthropic (`src/meter/anthropic.rs`",)
-                && !line.starts_with("| Anthropic idle",)
+            line.starts_with("| Anthropic (`src/meter/anthropic.rs`")
+                && !line.starts_with("| Anthropic idle")
         })
         .expect("the Anthropic adapter row must be present");
     for kind in ["session", "weekly_all", "weekly_scoped"] {
