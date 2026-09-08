@@ -228,6 +228,7 @@ pub fn assemble(
                 .map(|snapshot| coverage::PolicySnapshot {
                     effective_at: snapshot.effective_at(),
                     ordinary_cadence: snapshot.policy().ordinary_cadence,
+                    retry_backoff_policy: snapshot.policy().retry_backoff_policy.clone(),
                 })
                 .collect(),
             attempts: attempts

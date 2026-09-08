@@ -16,11 +16,15 @@ use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 ///
 /// The ordinary cadence is the one value the denominator reconstruction reads; the
 /// other resolved fields (freshness horizon, retry backoff, command budget) do not
-/// change how many opportunities a policy owed.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// change how many opportunities a policy owed. The retry backoff string carries
+/// the `Retry-After` ceiling (`retry-after-capped-<n>s`) the scheduler honours,
+/// so the postponement reads the same cap; a `none` or pre-cap shape means
+/// uncapped.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySnapshot {
     pub effective_at: UtcTimestamp,
     pub ordinary_cadence: MonotonicDuration,
+    pub retry_backoff_policy: String,
 }
 
 /// The terminal result of one attempt, reduced to the two facts coverage reads: when
@@ -261,10 +265,36 @@ fn cadence_at(snapshots: &[PolicySnapshot], at: UtcTimestamp) -> Option<Monotoni
         .map(|s| s.ordinary_cadence)
 }
 
+/// The `Retry-After` ceiling in force at `at`, parsed from the
+/// `retry_backoff_policy` snapshot string (`retry-after-capped-<n>s`). `None`
+/// means uncapped: the snapshot records `none` or a pre-cap shape.
+fn retry_after_cap_at(snapshots: &[PolicySnapshot], at: UtcTimestamp) -> Option<MonotonicDuration> {
+    let policy = snapshots
+        .iter()
+        .rev()
+        .find(|s| s.effective_at.unix_nanos() <= at.unix_nanos())?
+        .retry_backoff_policy
+        .as_str();
+    parse_capped_retry_after_policy(policy)
+}
+
+/// Parses the `retry-after-capped-<n>s` snapshot string back into its ceiling.
+/// Anything else (`none`, a pre-cap backoff shape, an unreadable value) is
+/// `None`: uncapped, never a guessed cap.
+fn parse_capped_retry_after_policy(text: &str) -> Option<MonotonicDuration> {
+    let seconds = text
+        .strip_prefix("retry-after-capped-")?
+        .strip_suffix('s')?;
+    let seconds: u64 = seconds.parse().ok()?;
+    Some(MonotonicDuration::from_seconds(seconds))
+}
+
 /// The postponement intervals owed to persisted `Retry-After` instructions. A
 /// postponement exists only when the retry delay exceeds the ordinary cadence in force
 /// at the result's finish: a shorter delay is absorbed by the ordinary cadence and does
-/// not remove an opportunity.
+/// not remove an opportunity. The delay is capped by the ceiling the policy snapshot
+/// covering the finish records, the same rule the scheduler applies, so a header
+/// above the cap postpones only until the cap expires.
 fn postponements(attempts: &[AttemptRecord], snapshots: &[PolicySnapshot]) -> Vec<Postponement> {
     let mut out = Vec::new();
     for attempt in attempts {
@@ -277,13 +307,17 @@ fn postponements(attempts: &[AttemptRecord], snapshots: &[PolicySnapshot]) -> Ve
         let Some(cadence) = cadence_at(snapshots, result.finished_at) else {
             continue;
         };
-        if retry_after.as_nanos() <= cadence.as_nanos() {
+        let effective = match retry_after_cap_at(snapshots, result.finished_at) {
+            Some(cap) => retry_after.min(cap),
+            None => retry_after,
+        };
+        if effective.as_nanos() <= cadence.as_nanos() {
             continue;
         }
         out.push(Postponement {
             start: result.finished_at,
             end: UtcTimestamp::from_unix_nanos(
-                result.finished_at.unix_nanos() + retry_after.as_nanos() as i64,
+                result.finished_at.unix_nanos() + effective.as_nanos() as i64,
             ),
         });
     }
@@ -542,6 +576,26 @@ mod tests {
         PolicySnapshot {
             effective_at: ts(effective_secs),
             ordinary_cadence: cadence(cadence_secs),
+            retry_backoff_policy: "none".to_string(),
+        }
+    }
+
+    fn snapshot_with_capped_retry_after(
+        effective_secs: i64,
+        cadence_secs: u64,
+        cap_secs: u64,
+    ) -> PolicySnapshot {
+        PolicySnapshot {
+            effective_at: ts(effective_secs),
+            ordinary_cadence: cadence(cadence_secs),
+            retry_backoff_policy: format!("retry-after-capped-{cap_secs}s"),
+        }
+    }
+
+    fn retry_after_result(finished_secs: i64, retry_after_secs: u64) -> AttemptResultRecord {
+        AttemptResultRecord {
+            finished_at: ts(finished_secs),
+            retry_after: Some(cadence(retry_after_secs)),
         }
     }
 
@@ -830,6 +884,51 @@ mod tests {
             Vec::new(),
         ));
         assert_eq!(report.expected_opportunities, Some(12));
+    }
+
+    /// A Retry-After above the policy cap postpones only until the cap expires,
+    /// the same rule the scheduler applies: a 7200 s header under a 3600 s cap
+    /// ends at finish + 3600 s, not at finish + 7200 s.
+    #[test]
+    fn a_retry_after_above_the_cap_ends_at_finish_plus_the_cap() {
+        let snapshots = vec![snapshot_with_capped_retry_after(0, 300, 3600)];
+        let attempts = vec![attempt(1_000, Some(retry_after_result(1_000, 7200)))];
+        let postponed = postponements(&attempts, &snapshots);
+        assert_eq!(postponed.len(), 1);
+        assert_eq!(postponed[0].start, ts(1_000));
+        assert_eq!(postponed[0].end, ts(1_000 + 3600));
+    }
+
+    /// The paired case below the cap: an 1800 s header under a 3600 s cap
+    /// passes through whole and ends at finish + 1800 s. An implementation
+    /// that clamped every postponement to the cap would still pass the test
+    /// above and fail this one.
+    #[test]
+    fn a_retry_after_below_the_cap_ends_at_finish_plus_the_header() {
+        let snapshots = vec![snapshot_with_capped_retry_after(0, 300, 3600)];
+        let attempts = vec![attempt(1_000, Some(retry_after_result(1_000, 1800)))];
+        let postponed = postponements(&attempts, &snapshots);
+        assert_eq!(postponed.len(), 1);
+        assert_eq!(postponed[0].start, ts(1_000));
+        assert_eq!(postponed[0].end, ts(1_000 + 1800));
+    }
+
+    /// A snapshot recording no cap lets a long header through whole: the `none`
+    /// and pre-cap shapes predate the ceiling, so the postponement keeps the
+    /// verbatim delay rather than guessing a cap.
+    #[test]
+    fn a_snapshot_without_a_cap_passes_a_long_header_through_whole() {
+        for policy in ["none", "exponential-3", "exponential-2-250ms"] {
+            let snapshots = vec![PolicySnapshot {
+                effective_at: ts(0),
+                ordinary_cadence: cadence(300),
+                retry_backoff_policy: policy.to_string(),
+            }];
+            let attempts = vec![attempt(1_000, Some(retry_after_result(1_000, 7200)))];
+            let postponed = postponements(&attempts, &snapshots);
+            assert_eq!(postponed.len(), 1, "policy {policy:?} must stay uncapped");
+            assert_eq!(postponed[0].end, ts(1_000 + 7200), "policy {policy:?}");
+        }
     }
 
     /// The report names the most recent timer-triggered run and the most recent
