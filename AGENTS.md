@@ -146,6 +146,14 @@ guard refuses when the error code changed, naming both codes, because a changed 
 means the fixture fails for a different reason and blessing it destroys the test; it
 proceeds when the code is unchanged. `--override` is the explicit override.
 
+A new end-to-end case under `tests/e2e/cases/` is named `<bead-id>-<kebab-name>.sh`, for
+example `aub-rfot-sample-error-classification.sh`. A bead id is unique by construction, so
+two lanes working in parallel cannot land two files with the same name or the same run-log
+directory. The existing `NNN-` numbered cases keep their names. `tests/e2e/run.sh
+--check-consistency` refuses a cases directory in which two files resolve to the same case
+id, or in which two of the numbered files share a leading number that was not already on
+`main`.
+
 ## agent-usage-book - This Project
 
 ### What it does
