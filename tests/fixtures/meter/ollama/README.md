@@ -17,4 +17,7 @@ fixture here carries a credential, a session id, or an account identifier of any
 - `missing-weekly.json`: `limits.session` present, `limits.weekly` absent, the planted
   negative for the required-window check.
 - `error-401.json`: a rejected-credential response body, used with an HTTP 401 status.
+- `error-429.json`: a rate-limit response body carrying the provider's own
+  `error.type` classification and message, used with an HTTP 429 status
+  (aub-rfot).
 - `malformed.json`: invalid, truncated JSON.

@@ -196,26 +196,23 @@ const CREDENTIAL_LABEL_TOKENS: [&str; 6] = [
     "apikey=",
 ];
 
-/// The credential field-name and identity patterns that must never survive
-/// into stored provider error text, read from the one list every scan shares
-/// (`docs/forbidden-patterns.txt`): the section below the binary-scan marker.
-/// A pattern added there protects stored error messages with the same edit
-/// that protects the four scans the file already feeds; this module keeps no
-/// private copy of the list.
+/// The credential and identity patterns that must never survive into stored
+/// provider error text, read from the one list every scan shares
+/// (`docs/forbidden-patterns.txt`). A pattern added there protects stored
+/// error messages with the same edit that protects the four scans the file
+/// already feeds; this module keeps no private copy of the list. The
+/// binary-scan marker divides the file only for the binary scan's own scope:
+/// token-level redaction is safer with every pattern in it, since a token
+/// carrying a key prefix is exactly as forbidden in a message as a token
+/// naming a credential field.
 const FORBIDDEN_PATTERN_LIST: &str = include_str!("../../docs/forbidden-patterns.txt");
-const BINARY_SCAN_SECTION_MARKER: &str = "# === binary-scan patterns end here ===";
 
-/// The identity and field-name patterns below the binary-scan marker, parsed
-/// once. Lines are matched verbatim (the list's trailing-space convention is
-/// preserved), with comments and blanks skipped.
-fn forbidden_identity_patterns() -> &'static [&'static str] {
+/// The shared list, parsed once. Lines are matched verbatim (the list's
+/// trailing-space convention is preserved), with comments and blanks skipped.
+fn forbidden_patterns() -> &'static [&'static str] {
     static PATTERNS: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
     PATTERNS.get_or_init(|| {
-        let section = FORBIDDEN_PATTERN_LIST
-            .split_once(BINARY_SCAN_SECTION_MARKER)
-            .map(|(_, rest)| rest)
-            .unwrap_or(FORBIDDEN_PATTERN_LIST);
-        section
+        FORBIDDEN_PATTERN_LIST
             .lines()
             .filter(|line| {
                 let trimmed = line.trim();
@@ -223,6 +220,20 @@ fn forbidden_identity_patterns() -> &'static [&'static str] {
             })
             .collect()
     })
+}
+
+/// True when a normalized provider classification may be stored: non-empty
+/// and free of every forbidden pattern. A classification is a structured
+/// vocabulary token, not message prose, so the free-text sanitizer's
+/// bare-secret heuristic does not apply to it; the vocabulary's own
+/// spellings are runs of exactly the length that heuristic exists to
+/// redact. What must hold instead is the shared forbidden-pattern scan,
+/// the same list the stored value is later audited against.
+pub fn classification_is_storable(normalized: &str) -> bool {
+    !normalized.is_empty()
+        && !forbidden_patterns()
+            .iter()
+            .any(|pattern| normalized.to_lowercase().contains(&pattern.to_lowercase()))
 }
 
 /// A bare token is treated as credential-shaped once it is long enough, and made only
@@ -256,7 +267,7 @@ fn redact_token(word: &str) -> String {
     let is_labeled = CREDENTIAL_LABEL_TOKENS
         .iter()
         .any(|label| lower.starts_with(label));
-    let carries_forbidden_pattern = forbidden_identity_patterns()
+    let carries_forbidden_pattern = forbidden_patterns()
         .iter()
         .any(|pattern| lower.contains(pattern));
     if is_labeled || carries_forbidden_pattern || looks_like_a_bare_secret(word) {

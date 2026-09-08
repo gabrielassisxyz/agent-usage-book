@@ -400,6 +400,7 @@ mod tests {
     use super::*;
     use crate::domain::time::FakeClock;
     use crate::meter::transport::{HttpMethod, HttpResponse};
+    use test_support::sanitization::matched_patterns;
 
     struct MockTransport {
         response: Result<HttpResponse, FailureClass>,
@@ -863,5 +864,58 @@ mod tests {
                 HttpStatusClass::ServerError
             ))
         );
+    }
+
+    /// Case 06 (aub-rfot): a 429 whose body carries no `error.type` (the
+    /// Google shape reports a status code and a message instead) stores the
+    /// status spelling as the classification and the provider's own message,
+    /// sanitized, beside it. The message is the useful half here: it is the
+    /// provider's own words about the refusal.
+    #[test]
+    fn case_06_error_429_without_a_type_stores_the_status_spelling_and_the_message() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(
+            429,
+            br#"{"error":{"code":429,"message":"Quota exceeded for the group.","status":"RESOURCE_EXHAUSTED"}}"#.as_slice(),
+        );
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 429 response stores the provider's error report");
+        assert_eq!(report.classification, "http_429");
+        assert_eq!(report.message, "Quota exceeded for the group.");
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
+    }
+
+    /// Case 07 (aub-rfot): the 401 fixture's own words are stored beside the
+    /// status spelling, and neither field matches a forbidden pattern.
+    #[test]
+    fn case_07_error_401_stores_the_status_spelling_and_the_provider_s_message() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(401, FIXTURE_ERROR_401);
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 401 response stores the provider's error report");
+        assert_eq!(report.classification, "http_401");
+        assert_eq!(
+            report.message,
+            "Request had invalid authentication credentials. Expected OAuth 2 access token, login cookie or other valid authentication credential. See https://developers.google.com/identity/sign-in/web/devconsole-project."
+        );
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
     }
 }

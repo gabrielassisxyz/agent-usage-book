@@ -371,6 +371,7 @@ mod tests {
     use super::*;
     use crate::domain::time::FakeClock;
     use crate::domain::window::WindowScope;
+    use test_support::sanitization::matched_patterns;
 
     struct MockTransport {
         response: Result<HttpResponse, FailureClass>,
@@ -439,6 +440,8 @@ mod tests {
         include_bytes!("../../tests/fixtures/meter/ollama/missing-weekly.json");
     const FIXTURE_ERROR_401: &[u8] =
         include_bytes!("../../tests/fixtures/meter/ollama/error-401.json");
+    const FIXTURE_ERROR_429: &[u8] =
+        include_bytes!("../../tests/fixtures/meter/ollama/error-429.json");
     const FIXTURE_MALFORMED: &[u8] =
         include_bytes!("../../tests/fixtures/meter/ollama/malformed.json");
 
@@ -784,5 +787,51 @@ mod tests {
         assert_eq!(usage_fraction_to_ppm(0.0).unwrap().get(), 0);
         assert_eq!(usage_fraction_to_ppm(1.0).unwrap().get(), 1_000_000);
         assert_eq!(usage_fraction_to_ppm(0.163).unwrap().get(), 163_000);
+    }
+
+    /// Case 06 (aub-rfot): a 429 whose body names the provider's own error
+    /// type stores it as the classification, with the sanitized message
+    /// beside it and neither field matching a forbidden pattern.
+    #[test]
+    fn case_06_error_429_stores_the_provider_s_own_classification() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(429, FIXTURE_ERROR_429);
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 429 response stores the provider's error report");
+        assert_eq!(report.classification, "rate_limit_error");
+        assert_eq!(report.message, "Rate limit exceeded. Please retry later.");
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
+    }
+
+    /// Case 07 (aub-rfot): a 401 whose body carries no `error.type` (the
+    /// Ollama Cloud shape puts a bare string under `error`) stores the status
+    /// spelling as the classification and no message, because no message was
+    /// readable. That is the honest fallback, not a guess at one.
+    #[test]
+    fn case_07_error_401_without_a_parseable_type_stores_the_status_spelling() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(401, FIXTURE_ERROR_401);
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 401 response stores the provider's error report");
+        assert_eq!(report.classification, "http_401");
+        assert_eq!(report.message, "");
+        assert!(matched_patterns(&report.classification).is_empty());
     }
 }

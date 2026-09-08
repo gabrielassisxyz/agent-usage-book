@@ -921,6 +921,7 @@ impl ProviderAdapter for AnthropicAdapter {
 mod tests {
     use super::*;
     use crate::domain::time::FakeClock;
+    use test_support::sanitization::matched_patterns;
 
     struct MockTransport {
         response: Result<HttpResponse, FailureClass>,
@@ -1699,6 +1700,76 @@ mod tests {
         assert_eq!(
             extract_bearer_token(&cred_json_empty).unwrap_err(),
             AuthReason::CredentialExpired
+        );
+    }
+
+    /// Case 19 (aub-rfot): a 429 stores the provider's own error type as the
+    /// classification, with the message sanitized beside it, and neither
+    /// field of the stored report matches a forbidden pattern.
+    #[test]
+    fn case_19_error_429_stores_the_provider_s_own_classification() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(429, FIXTURE_ERROR_429);
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 429 response stores the provider's error report");
+        assert_eq!(report.classification, "rate_limit_error");
+        assert_eq!(
+            report.message,
+            "Rate limit exceeded. Please retry after some time."
+        );
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
+    }
+
+    /// Case 20 (aub-rfot): a 401 stores the body's error type too, and the
+    /// classification a provider that echoes credential material under
+    /// `error.type` supplies cannot smuggle it past the sanitizer: the
+    /// sanitized classification falls back to the status spelling instead.
+    /// That is the planted negative for the classification path.
+    #[test]
+    fn case_20_error_401_stores_the_body_s_type_and_a_secreted_type_falls_back() {
+        let adapter = test_adapter();
+        let transport = MockTransport::ok(401, FIXTURE_ERROR_401_INVALID);
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &transport,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 401 response stores the provider's error report");
+        assert_eq!(report.classification, "authentication_error");
+        assert_eq!(report.message, "Invalid authentication token provided.");
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
+
+        let secreted = MockTransport::ok(
+            401,
+            br#"{"error":{"type":"authorization header missing","message":"bad"}}"#.as_slice(),
+        );
+        let captured = adapter.observe_with_evidence(
+            &test_credential(),
+            &MeterRequest::default(),
+            &secreted,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("the 401 stores a report");
+        assert_eq!(
+            report.classification, "http_401",
+            "a classification the sanitizer must rewrite is not stored; the status fallback is"
         );
     }
 }

@@ -279,7 +279,16 @@ pub fn assemble(
             .iter()
             .filter_map(|attempt| attempt.terminal.as_ref())
         {
-            if let Some(stored) = &attempt.error_classification {
+            if matches!(
+                attempt.outcome,
+                AttemptOutcome::AuthRequired | AttemptOutcome::Unreachable(_)
+            ) {
+                // A NULL is the older rows' shape and reads as `unclassified`,
+                // so the past stays visible without being rewritten.
+                let stored = attempt
+                    .error_classification
+                    .as_deref()
+                    .unwrap_or(meter_attempt::error_classification_column::UNCLASSIFIED);
                 let classification =
                     meter_attempt::error_classification_column::classification_of(stored);
                 *classification_counts
@@ -808,6 +817,118 @@ mod tests {
         assert!(
             report.threshold.met,
             "unconfigured account must not trigger breach"
+        );
+    }
+
+    /// The detail block's findings name the provider error classification
+    /// with its count: the classification part of each stored value is what
+    /// groups, never the message riding beside it, and a NULL reads as
+    /// `unclassified`. The planted negative: two attempts carrying the same
+    /// classification but different messages must count as one finding, so
+    /// a reader that grouped on the whole stored value would print two.
+    #[test]
+    fn the_report_groups_failures_by_their_classification_not_their_message() {
+        let state = StateDir::new();
+        let conn = open_test_ledger(&state);
+        let since = UtcTimestamp::from_unix_nanos(100_000_000_000);
+        let until = UtcTimestamp::from_unix_nanos(200_000_000_000);
+        let run = sample_run::start_sample_run(&conn, Trigger::Timer, since, "test-run")
+            .expect("sample run must insert");
+        let account = account::observe_account(&conn, "anthropic", "throttled", since)
+            .expect("account must insert");
+        let snapshot = sampling_policy_snapshot::resolve_policy_snapshot(
+            &conn,
+            account,
+            since,
+            &test_policy(10),
+        )
+        .expect("policy snapshot must insert");
+
+        let outcomes = [
+            (
+                AttemptOutcome::AuthRequired,
+                Some("authentication_error: Invalid authentication token provided.".to_owned()),
+            ),
+            (
+                AttemptOutcome::AuthRequired,
+                Some("authentication_error: Token rejected.".to_owned()),
+            ),
+            (
+                AttemptOutcome::Unreachable(crate::domain::failure::FailureClass::RateLimited {
+                    retry_after: None,
+                }),
+                Some("rate_limit_error".to_owned()),
+            ),
+            (
+                AttemptOutcome::Unreachable(crate::domain::failure::FailureClass::ReadTimeout),
+                None,
+            ),
+        ];
+        for (index, (outcome, classification)) in outcomes.iter().enumerate() {
+            let started = UtcTimestamp::from_unix_nanos(110_000_000_000 + index as i64 * 1_000);
+            let row = meter_attempt::start_meter_attempt(
+                &conn,
+                &NewMeterAttempt {
+                    run_id: run,
+                    account_id: account,
+                    provider: "anthropic".into(),
+                    request_started_at: started,
+                    credential_context_id: None,
+                    policy_snapshot_id: snapshot,
+                    due_at: started,
+                    due_reason: DueReason::OrdinaryCadence,
+                    due_basis: None,
+                    provider_contract_id: "test-contract".into(),
+                    meter_semantics_id: "test-semantics".into(),
+                },
+            )
+            .expect("attempt must insert");
+            meter_attempt::record_meter_attempt_result(
+                &conn,
+                &NewMeterAttemptResult {
+                    attempt_id: row,
+                    completed_at: UtcTimestamp::from_unix_nanos(started.unix_nanos() + 1_000),
+                    elapsed: MonotonicDuration::from_millis(100),
+                    outcome: *outcome,
+                    sanitized_error_classification: classification.clone(),
+                    retry_index: None,
+                    clock_anomaly: false,
+                },
+            )
+            .expect("attempt result must insert");
+        }
+
+        let selector = CoverageSelector::default();
+        let configured = [AccountIdentity::new("anthropic", "throttled")];
+        let report = assemble(
+            &conn,
+            since,
+            until,
+            &selector,
+            test_floors(),
+            until,
+            &configured,
+        )
+        .expect("report must assemble");
+        assert_eq!(report.accounts.len(), 1);
+        let findings = &report.accounts[0].error_classifications;
+        assert_eq!(
+            *findings,
+            vec![
+                CoverageErrorClassification {
+                    classification: "authentication_error".to_owned(),
+                    count: 2,
+                },
+                CoverageErrorClassification {
+                    classification: "rate_limit_error".to_owned(),
+                    count: 1,
+                },
+                CoverageErrorClassification {
+                    classification: "unclassified".to_owned(),
+                    count: 1,
+                },
+            ],
+            "two same-classification attempts with different messages count once, \n                  largest count first, NULL reading as unclassified"
         );
     }
 }

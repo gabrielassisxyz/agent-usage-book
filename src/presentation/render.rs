@@ -2599,6 +2599,7 @@ mod tests {
         name: &str,
         engine: crate::coverage::CoverageReport,
         failures: crate::report::coverage::CoverageFailureTally,
+        error_classifications: Vec<crate::report::CoverageErrorClassification>,
         resets_in_gaps: Vec<crate::report::CoverageReset>,
         configured: bool,
     ) -> crate::report::CoverageAccount {
@@ -2606,7 +2607,7 @@ mod tests {
             name: crate::logging::LogicalName::new(name.to_string()),
             engine,
             failures,
-            error_classifications: Vec::new(),
+            error_classifications,
             resets_in_gaps,
             legacy_evidence_present: false,
             configured,
@@ -3419,6 +3420,7 @@ mod tests {
                 vec![gap_6m(), gap_6m(), gap_6m()],
             ),
             crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
             vec![reset, reset, reset],
             true,
         );
@@ -3435,6 +3437,16 @@ mod tests {
                 authentication: 14,
                 ..Default::default()
             },
+            vec![
+                crate::report::CoverageErrorClassification {
+                    classification: "rate_limit_error".to_owned(),
+                    count: 45,
+                },
+                crate::report::CoverageErrorClassification {
+                    classification: "authentication_error".to_owned(),
+                    count: 14,
+                },
+            ],
             vec![reset, reset, reset],
             true,
         );
@@ -3450,6 +3462,7 @@ mod tests {
             "primary-2026-09-04",
             retired_engine,
             crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
             Vec::new(),
             false,
         );
@@ -3468,7 +3481,8 @@ mod tests {
             "│         attempt coverage below the 98% floor                                 │",
             "│         3 resets without an observation in the surrounding gaps              │",
             "│  gmail    100.0%    76.6%         6m           3                             │",
-            "│         45 attempts were rate limited · 14 attempts required authentication  │",
+            "│         45 attempts refused with rate_limit_error                            │",
+            "│         14 attempts refused with authentication_error                        │",
             "│         3 resets without an observation in the surrounding gaps              │",
             "│                                                                              │",
             "│  not in config: primary-2026-09-04 (last observed 2026-09-04)                │",
@@ -3496,6 +3510,7 @@ mod tests {
                 Vec::new(),
             ),
             crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
             Vec::new(),
             true,
         );
@@ -3538,6 +3553,7 @@ mod tests {
             "quiet",
             quiet_engine,
             crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
             vec![crate::report::CoverageReset {
                 at: UtcTimestamp::from_unix_nanos(0),
                 window_length: MonotonicDuration::from_seconds(18_000),
@@ -3599,7 +3615,14 @@ mod tests {
             );
             engine.most_recent_successful_observation =
                 Some(UtcTimestamp::parse_rfc3339("2026-09-01T00:00:00Z").unwrap());
-            coverage_account(name, engine, Default::default(), Vec::new(), false)
+            coverage_account(
+                name,
+                engine,
+                Default::default(),
+                Vec::new(),
+                Vec::new(),
+                false,
+            )
         };
         let bare = |name: &str| {
             coverage_account(
@@ -3611,6 +3634,7 @@ mod tests {
                     Vec::new(),
                 ),
                 Default::default(),
+                Vec::new(),
                 Vec::new(),
                 false,
             )
@@ -3651,6 +3675,7 @@ mod tests {
                 ),
                 crate::report::coverage::CoverageFailureTally::default(),
                 Vec::new(),
+                Vec::new(),
                 true,
             );
             let mut threshold = floors_met(0.98, 0.95);
@@ -3681,6 +3706,7 @@ mod tests {
                 ),
                 crate::report::coverage::CoverageFailureTally::default(),
                 Vec::new(),
+                Vec::new(),
                 true,
             );
             coverage_report(vec![primary], floors_met(0.98, 0.95))
@@ -3710,6 +3736,7 @@ mod tests {
                 "quiet",
                 quiet_engine,
                 crate::report::coverage::CoverageFailureTally::default(),
+                Vec::new(),
                 Vec::new(),
                 true,
             );

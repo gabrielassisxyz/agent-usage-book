@@ -1980,7 +1980,7 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 9] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 10] = [
         (
             "IngestSummary",
             "*",
@@ -2036,6 +2036,13 @@ mod tests {
             "unresolved_events",
             "an operational counter describing what the assembly could not attribute, \
              not a measurement it reports; it exists to say the export is incomplete",
+        ),
+        (
+            "CoverageErrorClassification",
+            "*",
+            "operational counters tallying the account's own failed attempts by the \
+             provider classification each stored, not measurements anything reported; \
+             they exist to say why a day of attempts failed",
         ),
     ];
 
@@ -2177,13 +2184,13 @@ mod tests {
         );
     }
 
-    /// The structurally qualified exceptions are exactly the nine documented here,
-    /// each naming the reason it is not an unqualified number. A tenth one cannot
+    /// The structurally qualified exceptions are exactly the ten documented here,
+    /// each naming the reason it is not an unqualified number. An eleventh one cannot
     /// be added without this test being edited, which is the point: the list is a
     /// decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 9);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 10);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),

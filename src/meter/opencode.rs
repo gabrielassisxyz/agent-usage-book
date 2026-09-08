@@ -1089,4 +1089,37 @@ mod tests {
         );
         assert_eq!(strip_tags("<b>bold</b> plain"), "bold plain");
     }
+
+    /// Case 05 (aub-rfot): a 429 over an HTML page stores the status spelling
+    /// as the classification and no message, because an HTML body carries no
+    /// `error.type` or `error.message` to read. That is the honest report for
+    /// a failure the provider did not name in a parseable shape.
+    #[test]
+    fn case_05_error_429_over_an_html_page_stores_the_status_spelling() {
+        let transport = SyntheticTransport::with_status(429, "/", b"<html>slow down</html>");
+        let captured = observing(&transport);
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 429 response stores the provider's error report");
+        assert_eq!(report.classification, "http_429");
+        assert_eq!(report.message, "");
+        assert!(test_support::sanitization::matched_patterns(&report.classification).is_empty());
+    }
+
+    /// Case 06 (aub-rfot): a 401 over an HTML page stores the status spelling
+    /// too. The classification is what coverage and doctor group by; the
+    /// empty message says the provider supplied no readable words.
+    #[test]
+    fn case_06_error_401_over_an_html_page_stores_the_status_spelling() {
+        let transport = SyntheticTransport::with_status(401, "/", b"<html>no</html>");
+        let captured = observing(&transport);
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 401 response stores the provider's error report");
+        assert_eq!(report.classification, "http_401");
+        assert_eq!(report.message, "");
+        assert!(test_support::sanitization::matched_patterns(&report.classification).is_empty());
+    }
 }

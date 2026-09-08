@@ -1060,6 +1060,69 @@ mod tests {
         assert_eq!(stored.retry_index, Some(1));
     }
 
+    /// The classification column round-trips through the store's insert and
+    /// read: the composite value a failed attempt stores (classification and
+    /// message beside each other) comes back byte-identical, and the decode
+    /// recovers the classification alone from it. The planted negative: a
+    /// message-carrying value is not the classification alone, so a reader
+    /// that skipped the decode would count one classification per distinct
+    /// message instead of one per class.
+    #[test]
+    fn the_error_classification_column_round_trips_with_its_message_beside_it() {
+        let (_scratch, conn, run, account, snapshot) = fixture();
+        let row_id = start_meter_attempt(&conn, &attempt_start(run, account, snapshot))
+            .expect("the attempt must insert");
+        let report = crate::domain::failure::ProviderErrorReport {
+            classification: "rate_limit_error".to_owned(),
+            message: "Rate limit exceeded. Please retry after some time.".to_owned(),
+        };
+        let stored_value = error_classification_column::encode(&report);
+        assert!(
+            stored_value.starts_with("rate_limit_error: "),
+            "{stored_value:?}"
+        );
+        record_meter_attempt_result(
+            &conn,
+            &NewMeterAttemptResult {
+                attempt_id: row_id,
+                completed_at: UtcTimestamp::from_unix_nanos(30_000),
+                elapsed: MonotonicDuration::from_millis(10_000),
+                outcome: AttemptOutcome::Unreachable(FailureClass::RateLimited {
+                    retry_after: Some(MonotonicDuration::from_millis(60_000)),
+                }),
+                sanitized_error_classification: Some(stored_value.clone()),
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .expect("the result must insert");
+        let stored = result_by_attempt_id(&conn, row_id)
+            .expect("the read must succeed")
+            .expect("the result must exist");
+        assert_eq!(
+            stored.sanitized_error_classification,
+            Some(stored_value.clone())
+        );
+        assert_eq!(
+            error_classification_column::classification_of(
+                stored.sanitized_error_classification.as_deref().unwrap()
+            ),
+            "rate_limit_error"
+        );
+        assert_eq!(
+            error_classification_column::message_of(
+                stored.sanitized_error_classification.as_deref().unwrap()
+            ),
+            "Rate limit exceeded. Please retry after some time."
+        );
+        // A message-free value reads as the classification alone, both ways.
+        assert_eq!(
+            error_classification_column::classification_of("http_429"),
+            "http_429"
+        );
+        assert_eq!(error_classification_column::message_of("http_429"), "");
+    }
+
     // Over generated attempt sequences, whatever the interleaving, the number
     // of terminal results never exceeds the number of started attempts: a
     // result can only land on an already-started attempt, and a second result

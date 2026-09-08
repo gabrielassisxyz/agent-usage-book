@@ -967,6 +967,7 @@ mod tests {
     use super::*;
     use crate::domain::time::FakeClock;
     use crate::meter::transport::{BlockingTransport, CommandBudget, HttpResponse};
+    use test_support::sanitization::matched_patterns;
 
     use crate::meter::evidence::JsonEvidenceCapsule;
 
@@ -1911,5 +1912,52 @@ mod tests {
         let (failure, evidence) = expect_unreachable(captured);
         assert_eq!(failure, FailureClass::MissingRequiredField);
         assert!(evidence.is_none());
+    }
+
+    /// Case 12 (aub-rfot): a 429 endpoint response whose body names the
+    /// provider's own error type stores it as the classification with the
+    /// sanitized message beside it, and a 401 stores the authentication
+    /// spelling the same way. Neither field of either report matches a
+    /// forbidden pattern, and the rollout path attaches no report at all:
+    /// a local file supplies no provider words to store.
+    #[test]
+    fn case_12_endpoint_failures_store_the_provider_s_classification() {
+        let rate_limited = EndpointTransport::serving(
+            429,
+            br#"{"error":{"type":"rate_limit_error","message":"Rate limit exceeded. Please retry later."}}"#.as_slice(),
+        );
+        let captured = test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_shared_request(),
+            &rate_limited,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 429 response stores the provider's error report");
+        assert_eq!(report.classification, "rate_limit_error");
+        assert_eq!(report.message, "Rate limit exceeded. Please retry later.");
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
+
+        let rejected = EndpointTransport::serving(
+            401,
+            br#"{"error":{"type":"authentication_error","message":"Invalid authentication token provided."}}"#.as_slice(),
+        );
+        let captured = test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_shared_request(),
+            &rejected,
+            &test_clock(),
+        );
+        let report = captured
+            .failed_error
+            .as_ref()
+            .expect("a 401 response stores the provider's error report");
+        assert_eq!(report.classification, "authentication_error");
+        assert_eq!(report.message, "Invalid authentication token provided.");
+        assert!(matched_patterns(&report.classification).is_empty());
+        assert!(matched_patterns(&report.message).is_empty());
     }
 }

@@ -12,8 +12,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use sha2::{Digest, Sha256};
 
 use crate::domain::failure::{
-    FailureClass, ProviderErrorReport, bound_error_message, normalize_error_classification,
-    provider_error_classification, sanitize_provider_error_text,
+    FailureClass, ProviderErrorReport, bound_error_message, classification_is_storable,
+    normalize_error_classification, provider_error_classification, sanitize_provider_error_text,
 };
 use crate::meter::adapter::ProviderObservation;
 use crate::meter::transport::HttpResponse;
@@ -136,9 +136,7 @@ pub fn provider_error_report_from_body(
     let (raw_classification, raw_message) = parse_provider_error_body(body);
     let classification = raw_classification
         .map(|raw| normalize_error_classification(&raw))
-        .filter(|normalized| {
-            !normalized.is_empty() && sanitize_provider_error_text(normalized) == *normalized
-        })
+        .filter(|normalized| classification_is_storable(normalized))
         .unwrap_or_else(|| fallback_classification.into());
     let redacted = sensitive.redact_known_secrets(raw_message.as_deref().unwrap_or(""));
     let message = bound_error_message(&sanitize_provider_error_text(&redacted));

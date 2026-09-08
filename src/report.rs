@@ -33,15 +33,15 @@ pub use can_run_evidence::gather_task_history_group_report;
 pub use models::{
     AccountGroupExplain, AccountMarkerReference, BackupReport, CalibrateReport,
     ClearDiagnosticsReport, CoverageAccount, CoverageBreach, CoverageBreachDimension,
-    CoverageReport, CoverageReset, CoverageThreshold, DoctorReport, ExportReport, IngestReport,
-    IngestSummary, IngestionGeneration, LedgerGeneration, LimitingWindow, MeterAccount,
-    MeterExplanation, MeterReadingProvenance, MeterWindowExplanation, NowReport,
-    ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport, SharePpm, SpendDiagnostic,
-    SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
-    SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, StatusReport, StatusWindow,
-    TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
-    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowBurnRate, WindowEquivalentDerivation,
-    WindowEquivalentValue,
+    CoverageErrorClassification, CoverageReport, CoverageReset, CoverageThreshold, DoctorReport,
+    ExportReport, IngestReport, IngestSummary, IngestionGeneration, LedgerGeneration,
+    LimitingWindow, MeterAccount, MeterExplanation, MeterReadingProvenance, MeterWindowExplanation,
+    NowReport, ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport, SharePpm,
+    SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance,
+    SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport,
+    StatusReport, StatusWindow, TaskIdentityRow, TaskIngestReport, TaskOverheadBucket,
+    TaskOverheadReport, TaskReport, TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowBurnRate,
+    WindowEquivalentDerivation, WindowEquivalentValue,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

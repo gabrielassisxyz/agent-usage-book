@@ -1431,6 +1431,98 @@ mod tests {
         }
     }
 
+    /// Every failed attempt's stored result carries a non-NULL
+    /// `sanitized_error_classification`, and every success carries none:
+    /// the bead's Done-when criterion, proved over the real persist path
+    /// with a real adapter behind the batch. The failures here have no
+    /// provider words to store (the scripted bodies are not JSON error
+    /// shapes), so their classifications are the fallbacks derived from the
+    /// failure path, which is exactly what must appear instead of a NULL.
+    #[test]
+    fn every_failed_attempt_persists_a_non_null_error_classification() {
+        use crate::store::meter_attempt::attempts_with_outcomes_for_account_between;
+
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let accounts: Vec<BatchAccount<AnthropicAdapter>> =
+            ["authfail", "serverfail", "malformedfail"]
+                .iter()
+                .map(|tag| batch_account(tag))
+                .collect();
+        transport.script("authfail", ScriptedOutcome::Unauthorized);
+        transport.script("serverfail", ScriptedOutcome::ServerError);
+        transport.script("malformedfail", ScriptedOutcome::Malformed);
+
+        let repository = Repository::new(&database_path, policy());
+        let report = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 3,
+        }
+        .run(&accounts)
+        .expect("the batch must run");
+
+        let conn = open(&database_path, AccessMode::ReadWrite, &policy())
+            .expect("the fixture ledger must reopen");
+        let window_start = UtcTimestamp::from_unix_nanos(0);
+        let window_end = UtcTimestamp::from_unix_nanos(i64::MAX / 2);
+        let mut classified_failures: Vec<(&str, String)> = Vec::new();
+        for entry in &report.accounts {
+            let name = entry.name.as_str();
+            let account_id = repository
+                .ensure_account("anthropic", name, clock.now())
+                .expect("the account row must exist");
+            let attempts = attempts_with_outcomes_for_account_between(
+                &conn,
+                account_id,
+                window_start,
+                window_end,
+            )
+            .expect("the coverage read must succeed");
+            assert_eq!(attempts.len(), 1, "one attempt per account");
+            let terminal = attempts[0]
+                .terminal
+                .as_ref()
+                .expect("every due attempt has a terminal result");
+            match terminal.outcome {
+                AttemptOutcome::Success => {
+                    assert!(
+                        terminal.error_classification.is_none(),
+                        "a success stores no error classification"
+                    );
+                }
+                AttemptOutcome::AuthRequired | AttemptOutcome::Unreachable(_) => {
+                    let stored = terminal
+                        .error_classification
+                        .as_ref()
+                        .unwrap_or_else(|| {
+                            panic!(
+                                "attempt of account {name} with outcome {:?} stored a NULL classification",
+                                terminal.outcome
+                            )
+                        });
+                    assert!(!stored.is_empty());
+                    classified_failures.push((name, stored.clone()));
+                }
+            }
+        }
+        assert_eq!(
+            classified_failures,
+            vec![
+                ("authfail", "http_401".to_string()),
+                ("serverfail", "http_500".to_string()),
+                ("malformedfail", "malformed_body".to_string()),
+            ]
+        );
+    }
+
     /// No thread outlives the command: every account's send ran to completion
     /// before `run` returned, and the batch reports every spawned worker as
     /// finished. With a slow send, an implementation that returned while its
