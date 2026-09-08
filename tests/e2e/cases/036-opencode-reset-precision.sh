@@ -167,6 +167,18 @@ case_steps() {
 }
 
 case_assertions() {
+    # The two stub transports answer forever by design, so they are stopped
+    # before the assertions read their steps: a server still holding the
+    # runner's stdout would keep the run open after the case is done.
+    if [ -n "${STABLE_STUB_PID:-}" ]; then
+        kill "$STABLE_STUB_PID" 2>/dev/null || true
+        wait "$STABLE_STUB_PID" 2>/dev/null || true
+    fi
+    if [ -n "${MOVED_STUB_PID:-}" ]; then
+        kill "$MOVED_STUB_PID" 2>/dev/null || true
+        wait "$MOVED_STUB_PID" 2>/dev/null || true
+    fi
+
     # Steps 1 through 10 are the ten ticks, in order.
     local n
     for n in 1 2 3 4 5 6 7 8 9 10; do
