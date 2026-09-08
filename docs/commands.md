@@ -161,6 +161,9 @@ without the section prefix (the full box for a two-account config):
 │  adapter_semantics                                                           │
 │    max_comparison_age       30d                                     default  │
 │                                                                              │
+│  anthropic                                                                   │
+│    refresh                  true                                    default  │
+│                                                                              │
 │  attribution                                                                 │
 │    recent_window            30d                                     default  │
 │                                                                              │

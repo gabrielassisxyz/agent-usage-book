@@ -319,6 +319,20 @@ pub struct DoctorConfig {
     pub meter_anomaly_horizon: MonotonicDuration,
 }
 
+/// The Anthropic provider's own options (aub-79gp).
+#[derive(Debug, Clone)]
+pub struct AnthropicConfig {
+    /// Whether `aub` renews an expired Anthropic OAuth access token in place.
+    /// When `true` (the default), a token past its `expiresAt` (or within a
+    /// short lead) is refreshed through the OAuth token endpoint under the
+    /// profile's `.credentials.lock` and the rotated pair is written back
+    /// atomically, so an expired token costs one refresh rather than a run of
+    /// `auth_required` attempts until Claude Code is next used. The refresh
+    /// runs only on expiry, never to dodge a rate limit. Set to `false` to
+    /// return to read-only behaviour: `aub` then reads whatever is in the file.
+    pub refresh: bool,
+}
+
 /// The exclusivity policy for a configured account (`aub-c0b.7`).
 ///
 /// Exhaustive with no wildcard arm: an unrecognized configured value fails
@@ -469,6 +483,7 @@ pub struct Config {
     pub drill: DrillConfig,
     pub adapter_semantics: AdapterSemanticsConfig,
     pub doctor: DoctorConfig,
+    pub anthropic: AnthropicConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
@@ -497,6 +512,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "drill",
     "adapter_semantics",
     "doctor",
+    "anthropic",
     "projects",
     "repositories",
 ];
@@ -543,6 +559,7 @@ const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
+const ANTHROPIC_KEYS: &[&str] = &["refresh"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -657,6 +674,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("doctor").and_then(toml::Value::as_table) {
         check_keys(t, DOCTOR_KEYS, "doctor", file_display)?;
+    }
+    if let Some(t) = table.get("anthropic").and_then(toml::Value::as_table) {
+        check_keys(t, ANTHROPIC_KEYS, "anthropic", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -1426,6 +1446,18 @@ pub fn resolve(
         )?,
     };
 
+    let anthropic = AnthropicConfig {
+        refresh: resolve_bool(
+            "anthropic.refresh",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "anthropic", "refresh"),
+            Some("true"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let valuation = ValuationConfig {
         default_rate_book: file
             .as_ref()
@@ -1633,6 +1665,7 @@ pub fn resolve(
             drill,
             adapter_semantics,
             doctor,
+            anthropic,
             projects,
             repositories,
         },
@@ -1801,6 +1834,7 @@ impl Config {
             "doctor.meter_anomaly_horizon" => {
                 format_config_duration(self.doctor.meter_anomaly_horizon)
             }
+            "anthropic.refresh" => self.anthropic.refresh.to_string(),
             "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
             "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
             "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
@@ -3155,6 +3189,8 @@ accounts[1].name                      work-secondary                           f
 accounts[1].provider                  provider-b                               file
 
 adapter_semantics.max_comparison_age  30d                                      default
+
+anthropic.refresh                     true                                     default
 
 attribution.recent_window             30d                                      default
 

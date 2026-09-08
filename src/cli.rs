@@ -1198,6 +1198,109 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     }
 }
 
+/// The outcome of a pre-flight Anthropic OAuth token refresh for one account
+/// (aub-79gp): the classification a subsequent failed attempt should carry, and
+/// whether the account must be dropped from this run because its on-disk pair
+/// is now dead.
+struct PreflightRefresh {
+    classification: Option<String>,
+    skip_account: bool,
+}
+
+impl PreflightRefresh {
+    fn inert() -> Self {
+        Self {
+            classification: None,
+            skip_account: false,
+        }
+    }
+}
+
+/// Renews an expired Anthropic OAuth access token in `account`'s credential
+/// file before the account is sampled, so an expired token costs one refresh
+/// rather than a run of `auth_required` attempts (aub-79gp). A no-op for every
+/// non-Anthropic account, for a non-`file` credential, and when
+/// `anthropic.refresh = false`.
+fn preflight_anthropic_refresh(
+    account: &crate::config::AccountConfig,
+    config: &crate::config::Config,
+    clock: &impl Clock,
+    verbose: bool,
+) -> PreflightRefresh {
+    use crate::auth::credentials_lock::{
+        self, CLASSIFICATION_TOKEN_REFRESHED, LockWait, RefreshOutcome,
+    };
+
+    if !config.anthropic.refresh || account.provider != "anthropic" {
+        return PreflightRefresh::inert();
+    }
+    let path = match crate::auth::CredentialSource::from_account(account) {
+        Ok(crate::auth::CredentialSource::File { path }) => path,
+        Ok(crate::auth::CredentialSource::Env { .. })
+        | Ok(crate::auth::CredentialSource::None)
+        | Err(_) => return PreflightRefresh::inert(),
+    };
+
+    let now_unix_millis = clock.now().unix_nanos() / 1_000_000;
+    let endpoint = crate::auth::token_endpoint::AnthropicTokenEndpoint::from_env();
+    let outcome = credentials_lock::refresh_if_expired(
+        &path,
+        now_unix_millis,
+        credentials_lock::DEFAULT_EXPIRY_LEAD,
+        &endpoint,
+        LockWait::default(),
+    );
+
+    match &outcome {
+        RefreshOutcome::Refreshed => {
+            if verbose {
+                eprintln!(
+                    "aub: {CLASSIFICATION_TOKEN_REFRESHED}: renewed the expired Anthropic OAuth token for account '{}'",
+                    account.name
+                );
+            }
+        }
+        RefreshOutcome::Rejected => eprintln!(
+            "aub: the Anthropic OAuth token endpoint rejected the stored refresh token for account '{}'; re-authenticate the profile with Claude Code",
+            account.name
+        ),
+        RefreshOutcome::PersistFailed(detail) => {
+            eprintln!(
+                "aub: renewed the Anthropic OAuth token for account '{}' but could not write it back ({detail}); the on-disk pair is now dead and this account is not being sampled until an operator re-authenticates the profile",
+                account.name
+            );
+            return PreflightRefresh {
+                classification: outcome.attempt_classification().map(str::to_string),
+                skip_account: true,
+            };
+        }
+        RefreshOutcome::LockBusy => {
+            if verbose {
+                eprintln!(
+                    "aub: {}'s .credentials.lock stayed held; sampling with the stored token",
+                    account.name
+                );
+            }
+        }
+        RefreshOutcome::EndpointUnreachable(detail) => {
+            if verbose {
+                eprintln!(
+                    "aub: could not reach the Anthropic OAuth token endpoint for account '{}' ({detail}); sampling with the stored token",
+                    account.name
+                );
+            }
+        }
+        RefreshOutcome::NotNeeded
+        | RefreshOutcome::AlreadyFreshOnDisk
+        | RefreshOutcome::FileUnreadable(_) => {}
+    }
+
+    PreflightRefresh {
+        classification: outcome.attempt_classification().map(str::to_string),
+        skip_account: false,
+    }
+}
+
 /// `aub sample`: observe provider endpoints for due or selected accounts,
 /// recording session markers and evidence.
 pub(crate) fn sample_command(
@@ -1403,6 +1506,10 @@ pub(crate) fn sample_command(
 
     let mut batch_accounts = Vec::new();
     for acc in &target_accounts {
+        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
+        if refresh.skip_account {
+            continue;
+        }
         let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
         let credential_handle =
             crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
@@ -1455,6 +1562,7 @@ pub(crate) fn sample_command(
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
             ),
+            credential_refresh_classification: refresh.classification,
         });
     }
 
@@ -1898,6 +2006,10 @@ pub(crate) fn now_command(
 
     let mut batch_accounts = Vec::new();
     for acc in &target_accounts {
+        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
+        if refresh.skip_account {
+            continue;
+        }
         let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
         let credential_handle =
             crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
@@ -1950,6 +2062,7 @@ pub(crate) fn now_command(
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
             ),
+            credential_refresh_classification: refresh.classification,
         });
     }
 
@@ -5544,7 +5657,12 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
     crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
 
-    if !cached {
+    let anthropic_refresh = if cached {
+        PreflightRefresh::inert()
+    } else {
+        preflight_anthropic_refresh(account_config, &config, clock, invocation.verbosity > 0)
+    };
+    if !cached && !anthropic_refresh.skip_account {
         // Default: perform and persist one fresh meter sample for the
         // requested account first, the same sampler path `aub sample
         // --account` uses, before reading anything back.
@@ -5602,6 +5720,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
             ),
+            credential_refresh_classification: anthropic_refresh.classification,
         }];
         let orchestrator = crate::meter::sampler::SamplingOrchestrator {
             repository: &repo,

@@ -234,6 +234,14 @@ pub struct BatchAccount<A> {
     /// interpretation for provenance. An empty version is refused by the
     /// database rather than silently stored.
     pub adapter_version: AdapterVersion,
+    /// The `sanitized_error_classification` a pre-flight Anthropic OAuth token
+    /// refresh contributes to a failed attempt for this account (aub-79gp):
+    /// `refresh_rejected` when the token endpoint rejected the stored refresh
+    /// token, `credential_lock_busy` when `.credentials.lock` stayed held.
+    /// `None` for every non-Anthropic account and for a refresh that changed
+    /// nothing; a successful refresh is not recorded here because the attempt
+    /// it precedes succeeds and carries no failure classification.
+    pub credential_refresh_classification: Option<String>,
 }
 
 /// Runs one batch of accounts through the four sampling stages.
@@ -823,10 +831,14 @@ where
                     completed_at: received_at,
                     elapsed,
                     outcome,
-                    sanitized_error_classification: Some(stored_error_classification(
-                        outcome,
-                        captured.failed_error.as_ref(),
-                    )),
+                    sanitized_error_classification: Some(
+                        item.account
+                            .credential_refresh_classification
+                            .clone()
+                            .unwrap_or_else(|| {
+                                stored_error_classification(outcome, captured.failed_error.as_ref())
+                            }),
+                    ),
                     retry_index: None,
                     clock_anomaly: false,
                 };
@@ -1316,6 +1328,7 @@ mod tests {
             retry_after_cap: MonotonicDuration::from_seconds(3600),
             forced: false,
             adapter_version: AdapterVersion::new("adapter-test-v1"),
+            credential_refresh_classification: None,
         }
     }
 
@@ -1535,6 +1548,68 @@ mod tests {
                 ("malformedfail", "malformed_body".to_string()),
             ]
         );
+    }
+
+    /// A pre-flight token refresh that was rejected overrides the failed
+    /// attempt's classification with its own (aub-79gp): the sample still
+    /// fails auth with the stale token, but the stored reason is
+    /// `refresh_rejected`, not the adapter's `http_401`. The planted negative
+    /// is the account beside it whose refresh classification is `None`: it
+    /// keeps the adapter's `http_401`, so the override is scoped to the
+    /// account that carried a refresh outcome.
+    #[test]
+    fn a_rejected_refresh_classification_overrides_the_failed_attempt_reason() {
+        use crate::store::meter_attempt::attempts_with_outcomes_for_account_between;
+
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let mut refreshed = batch_account("refreshed");
+        refreshed.credential_refresh_classification = Some("refresh_rejected".to_string());
+        let untouched = batch_account("untouched");
+        let accounts = vec![refreshed, untouched];
+        transport.script("refreshed", ScriptedOutcome::Unauthorized);
+        transport.script("untouched", ScriptedOutcome::Unauthorized);
+
+        let repository = Repository::new(&database_path, policy());
+        let report = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 2,
+        }
+        .run(&accounts)
+        .expect("the batch must run");
+
+        let conn = open(&database_path, AccessMode::ReadWrite, &policy())
+            .expect("the fixture ledger must reopen");
+        let classification_for = |name: &str| -> String {
+            let account_id = repository
+                .ensure_account("anthropic", name, clock.now())
+                .expect("the account row must exist");
+            let attempts = attempts_with_outcomes_for_account_between(
+                &conn,
+                account_id,
+                UtcTimestamp::from_unix_nanos(0),
+                UtcTimestamp::from_unix_nanos(i64::MAX / 2),
+            )
+            .expect("the coverage read must succeed");
+            attempts[0]
+                .terminal
+                .as_ref()
+                .expect("a terminal result")
+                .error_classification
+                .clone()
+                .expect("a non-null classification")
+        };
+        let _ = &report;
+        assert_eq!(classification_for("refreshed"), "refresh_rejected");
+        assert_eq!(classification_for("untouched"), "http_401");
     }
 
     /// No thread outlives the command: every account's send ran to completion
