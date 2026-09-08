@@ -572,8 +572,12 @@ fn a_policy_unknown_interval_is_visible_in_both_modes() {
         "the human table must show the unknown policy: {rendered}"
     );
     assert!(
-        rendered.contains("no sampling policy snapshot covers the whole interval"),
-        "the detail block must name the refusal: {rendered}"
+        !rendered.contains("no sampling policy snapshot covers the whole interval"),
+        "the old whole-interval refusal must be gone: {rendered}"
+    );
+    assert!(
+        !rendered.contains("policy known"),
+        "a window with no applicable snapshot renders no partial-span line: {rendered}"
     );
 
     let json = coverage_json(
@@ -759,6 +763,7 @@ fn the_engine_reports_the_worked_example_numbers() {
             .map(|snapshot| coverage::PolicySnapshot {
                 effective_at: snapshot.effective_at(),
                 ordinary_cadence: snapshot.policy().ordinary_cadence,
+                retry_backoff_policy: snapshot.policy().retry_backoff_policy.clone(),
             })
             .collect(),
         attempts: attempts

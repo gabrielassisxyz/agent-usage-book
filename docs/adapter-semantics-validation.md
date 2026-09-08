@@ -56,6 +56,19 @@ adapter refuses the incomplete observation with `MissingRequiredField`, and the
 semantic-validation workflow keeps the resulting finding open until a human records
 a correction. Optional `weekly_scoped` entries may disappear without opening one.
 
+The Anthropic credential is a Claude Code subscription OAuth pair in the profile's
+`.credentials.json`. `aub` refreshes it on expiry only: when the stored access token
+is past `expiresAt` (or within a five-minute lead), `aub` takes the profile's
+`.credentials.lock` with `flock`, re-reads the file under the lock, exchanges the
+rotating refresh token at the OAuth token endpoint, and writes the rotated pair back
+atomically before sampling. It never refreshes to work around a rate limit, and it
+holds no token in memory across ticks. `anthropic.refresh = false` turns this off and
+returns to reading whatever is in the file. `invalid_grant` from the token endpoint
+leaves the file untouched and records the attempt as `auth_required` with
+classification `refresh_rejected`; a write-back that fails after a spent refresh
+token records `refresh_persist_failed` and stops sampling that account until an
+operator re-authenticates the profile.
+
 ## Performing one comparison
 
 1. Pick a recent successful observation for the account. Note its `aub` observation

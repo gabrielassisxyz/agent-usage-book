@@ -161,6 +161,9 @@ without the section prefix (the full box for a two-account config):
 │  adapter_semantics                                                           │
 │    max_comparison_age       30d                                     default  │
 │                                                                              │
+│  anthropic                                                                   │
+│    refresh                  true                                    default  │
+│                                                                              │
 │  attribution                                                                 │
 │    recent_window            30d                                     default  │
 │                                                                              │
@@ -406,7 +409,13 @@ stored, largest count first (`1 attempt refused with rate_limit_error`);
 the classification is what the provider itself said about the refusal,
 sanitized, and the full stored value, message included, is on the attempt
 result row in the ledger. Rows written before the classification column
-was populated read as `unclassified`.
+was populated read as `unclassified`. An account added part-way through the
+window divides attempts made by attempts owed since its first sampling-policy
+snapshot, and the attempts cell names the covered span beside the fraction
+(`98.7% of 12h 46m`); a fully covered window shows the fraction alone. The
+detail block then reads `policy known for 12h 46m of 24h`, and only for a
+partial span. `unknown` is reserved for an account with no applicable
+snapshot anywhere in the window.
 
 ```
 ┌─ coverage · last 24h ────────────────────────────────────────────────────────┐
@@ -437,6 +446,52 @@ by what the ledger recorded, never by asking a provider directly.
 **Refuses:** to import without a verified backup path named first with
 `--backup VERIFIED_ARCHIVE`, and refuses a blanket scan: only the explicitly
 named source is imported, never everything a directory happens to contain.
+
+## `aub statusline`
+
+**Answers:** what did the status line's payload say each account's meter
+windows were, without the renderer knowing?
+
+**Refuses:** to fail the status line, ever, and to attribute by anything but
+the environment. The verb is the tee the Claude Code `statusLine` command
+pipes its payload through: it reads stdin once, writes those exact bytes to
+stdout unchanged, exits 0 in every case, and records the payload's
+rate-limit windows in the background. A missing config, a profile no
+configured anthropic account answers to, malformed JSON, or an unwritable
+state directory all leave the renderer exactly what it would have received
+without this verb in the pipeline, with nothing written.
+
+Attribution reads `SHALLOW_PROFILE` from the environment (the variable the
+caam launcher sets on every session it spawns) and matches it, exactly,
+against a configured `provider = "anthropic"` account. A payload with no
+`SHALLOW_PROFILE`, or with one matching no such account, is passed through
+and not recorded: an account guessed from `$HOME` or a credential file is
+the one attribution this tee will not make.
+
+**The record.** `<state.dir>/statusline/<account>.jsonl`, one JSON object
+per line, appended only when a window's `used_percentage` or `resets_at`
+moved for that session (renders arrive many times per turn; a small
+`session-<id>.last` file per session holds the last recorded state):
+
+```json
+{"received_at":"2026-09-08T02:34:56Z","session_id":"...","cwd":"...","windows":{"five_hour":{"used_percentage":40,"resets_at":1786834200},"seven_day":{"used_percentage":12,"resets_at":1786920000}}}
+```
+
+`received_at` is the tee's own clock (RFC 3339 UTC); `resets_at` lands as an
+integer epoch second whatever form the payload spelled it in. Windows are
+admitted by shape, any object under `rate_limits` carrying a numeric
+`used_percentage`, so a new model-scoped window appears under its own name
+without a release. Nothing else from the payload is kept, the payload itself
+is never written, and the file is append-only; rotation is the reader's
+decision, not the tee's.
+
+**Installation.** The `statusLine` command in `~/.claude/settings.json`
+becomes `aub statusline | ~/.claude/statusline-with-usage.sh`, with an
+absolute path to the binary, since a status line does not source a shell:
+
+```json
+{"type": "command", "command": "/abs/path/to/aub statusline | /abs/path/to/statusline-with-usage.sh"}
+```
 
 ## `aub sample`
 

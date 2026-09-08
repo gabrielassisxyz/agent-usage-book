@@ -17,6 +17,14 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+/// Refreshing an expired Anthropic OAuth access token in place, under the
+/// profile's `.credentials.lock` (aub-79gp). Kept beside credential resolution
+/// because the lock and the atomic write are filesystem work the provider
+/// adapter is forbidden to do (boundary rules 07 and 17); the caller runs it
+/// before `resolve` so the read below sees the rotated pair.
+pub mod credentials_lock;
+pub mod token_endpoint;
+
 use crate::config::AccountConfig;
 use crate::domain::ids::CredentialContextId;
 use crate::error::Error;

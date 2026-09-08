@@ -1247,6 +1247,7 @@ fn row_24_timer_never_ran() {
         policy_snapshots: vec![PolicySnapshot {
             effective_at: ts(0),
             ordinary_cadence: MonotonicDuration::from_seconds(300),
+            retry_backoff_policy: String::new(),
         }],
         attempts: vec![],
         observations: vec![],
@@ -1271,6 +1272,7 @@ fn row_25_timer_ran_provider_failed() {
         policy_snapshots: vec![PolicySnapshot {
             effective_at: ts(0),
             ordinary_cadence: MonotonicDuration::from_seconds(300),
+            retry_backoff_policy: String::new(),
         }],
         // The timer fired and an attempt reached a terminal result every time,
         // but none of them produced a successful observation.

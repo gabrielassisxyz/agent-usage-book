@@ -23,6 +23,7 @@ fn snapshot(effective_secs: i64, cadence_secs: u64) -> PolicySnapshot {
     PolicySnapshot {
         effective_at: ts(effective_secs),
         ordinary_cadence: cadence(cadence_secs),
+        retry_backoff_policy: "none".to_string(),
     }
 }
 
