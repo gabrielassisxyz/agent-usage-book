@@ -23,6 +23,7 @@ use sha2::{Digest, Sha256};
 /// adapter is forbidden to do (boundary rules 07 and 17); the caller runs it
 /// before `resolve` so the read below sees the rotated pair.
 pub mod credentials_lock;
+pub mod token_endpoint;
 
 use crate::config::AccountConfig;
 use crate::domain::ids::CredentialContextId;
