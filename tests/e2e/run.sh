@@ -8,6 +8,13 @@
 # contribute one case file, so the shape here is what keeps their edit surfaces
 # disjoint under a shared tree.
 #
+# A new case file is named <bead-id>-<kebab-name>.sh, for example
+# aub-rfot-sample-error-classification.sh. A bead id is unique by construction, so
+# two lanes working in parallel cannot land two files with the same name. The
+# existing NNN- numbered cases keep their names; --check-consistency refuses a
+# cases directory in which two files resolve to the same case id, or in which two
+# of the numbered files share a leading number that was not already on main.
+#
 # Usage:
 #   tests/e2e/run.sh [--state-dir DIR] [--cases-dir DIR] [--runs-dir DIR]
 #                    [--keep N] [--self-test] [--help]
@@ -590,9 +597,73 @@ refuse_if_operator_state() {
 
 # --- consistency -------------------------------------------------------------
 
+# resolve_case_id CASE_FILE: the id run_case would give this file, without
+# sourcing it. CASE_ID wins when the file sets it literally, otherwise the
+# basename. A case that computes CASE_ID at runtime is not something the naming
+# check can see, and none in this suite does.
+resolve_case_id() {
+    local file="$1" id
+    id="$(sed -n "s/^CASE_ID=[\"']\{0,1\}\([^\"' ]*\).*/\1/p" "$file" | head -n 1)"
+    [ -n "$id" ] && { printf '%s\n' "$id"; return; }
+    basename "$file" .sh
+}
+
+# check_case_naming: two case files collide when run_case would give them the
+# same id (its log directory is $RUN_DIR/cases/$case_id, so one silently
+# overwrites the other), or, among the legacy NNN- numbered files, when they
+# share a leading number. New cases are named <bead-id>-<kebab-name>.sh and a
+# bead id is unique, so the number rule only polices the numbered set: a pair
+# already on main is grandfathered, a newly added file that reuses a number is
+# refused. Off a checkout with no main ref the grandfather set is empty, which
+# is the state the --self-test scratch directory runs in.
+check_case_naming() {
+    local bad=0 f base id num
+    declare -A id_owner num_owner on_main
+
+    local ref
+    for ref in main origin/main; do
+        if git -C "$REPO_ROOT" rev-parse --verify --quiet "$ref" >/dev/null 2>&1; then
+            while IFS= read -r base; do
+                [ -n "$base" ] && on_main["$(basename "$base")"]=1
+            done < <(git -C "$REPO_ROOT" ls-tree -r --name-only "$ref" -- "$CASES_DIR" 2>/dev/null)
+            break
+        fi
+    done
+
+    while IFS= read -r -d '' f; do
+        base="$(basename "$f")"
+        id="$(resolve_case_id "$f")"
+        if [ -n "${id_owner["$id"]:-}" ]; then
+            echo "consistency: case id '$id' is claimed by two files: ${id_owner["$id"]} and $base" >&2
+            bad=1
+        else
+            id_owner["$id"]="$base"
+        fi
+
+        case "$base" in
+            [0-9]*-*)
+                num="${base%%-*}"
+                if [ -n "${num_owner["$num"]:-}" ]; then
+                    if [ -n "${on_main["$base"]:-}" ] && [ -n "${on_main["${num_owner["$num"]}"]:-}" ]; then
+                        : # both numbered files already on main, grandfathered
+                    else
+                        echo "consistency: case number '$num' is used by two files: ${num_owner["$num"]} and $base (new cases are named <bead-id>-<name>.sh)" >&2
+                        bad=1
+                    fi
+                else
+                    num_owner["$num"]="$base"
+                fi
+                ;;
+        esac
+    done < <(find "$CASES_DIR" -maxdepth 1 -type f -name '*.sh' -print0 | sort -z)
+
+    return "$bad"
+}
+
 # check_consistency: every command in the command surface must have a case file
 # that exercises it, so a command cannot ship unexercised. The surface is one
-# command per line in tests/e2e/command-surface.txt.
+# command per line in tests/e2e/command-surface.txt. The case-naming check runs
+# in the same pass: a collision there is as much a broken suite as a missing case.
 check_consistency() {
     local surface="${SURFACE_FILE:-$E2E_DIR/command-surface.txt}"
     [ -f "$surface" ] || die "command surface file not found: $surface"
@@ -608,6 +679,8 @@ check_consistency() {
             missing=1
         fi
     done <"$surface"
+
+    check_case_naming || missing=1
 
     if [ "$missing" -ne 0 ]; then
         echo "consistency: FAILED" >&2
@@ -849,6 +922,63 @@ CASE
     echo "self-test: consistency check ok"
 }
 
+# self_test_duplicate_case: --check-consistency refuses a cases directory in which
+# two files share a leading number or resolve to the same case id, and accepts one
+# where every case is uniquely named. The scratch directories are off any main
+# ref, so the grandfather set is empty and every collision is treated as new.
+self_test_duplicate_case() {
+    local tmp cases surface out
+    tmp="$(mktemp -d)"
+    surface="$tmp/surface.txt"
+    : >"$surface"
+
+    cases="$tmp/numbered"
+    mkdir -p "$cases"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/033-a.sh"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/033-b.sh"
+    if out="$(CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+        echo "self-test: a duplicate case number was accepted" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *033-a.sh*033-b.sh*|*033-b.sh*033-a.sh*) : ;;
+        *) echo "self-test: the duplicate-number message did not name both files: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+
+    cases="$tmp/idclash"
+    mkdir -p "$cases"
+    printf 'CASE_ID=same\ncase_steps() { :; }\n' >"$cases/aub-x-one.sh"
+    printf 'CASE_ID=same\ncase_steps() { :; }\n' >"$cases/aub-x-two.sh"
+    if out="$(CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+        echo "self-test: a duplicate CASE_ID was accepted" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *aub-x-one.sh*aub-x-two.sh*|*aub-x-two.sh*aub-x-one.sh*) : ;;
+        *) echo "self-test: the duplicate-CASE_ID message did not name both files: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+
+    cases="$tmp/clean"
+    mkdir -p "$cases"
+    printf 'CASE_ID=aub-x-alpha\ncase_steps() { :; }\n' >"$cases/aub-x-alpha.sh"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/041-beta.sh"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/042-gamma.sh"
+    if ! (CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency >/dev/null 2>&1); then
+        echo "self-test: a uniquely named cases directory was rejected" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo "self-test: duplicate case detection ok"
+}
+
 # self_test_summary_parseback: summary.json, timeline.txt and manifest.json all
 # describe the same run and agree with each other and with the files on disk.
 self_test_summary_parseback() {
@@ -1060,6 +1190,7 @@ self_test() {
     self_test_pruning || overall=1
     self_test_golden || overall=1
     self_test_consistency || overall=1
+    self_test_duplicate_case || overall=1
     self_test_summary_parseback || overall=1
     self_test_timeout_and_signal || overall=1
     self_test_self_sufficient_build || overall=1
