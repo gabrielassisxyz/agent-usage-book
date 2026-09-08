@@ -8,7 +8,9 @@
 //! The integration test below is the reproduction of the defect this file exists to
 //! guard: a build script compiled for one worktree, cached under a shared
 //! `CARGO_TARGET_DIR`, and handed to another worktree whose manifest directory differs
-//! from the one baked into the binary.
+//! from the one baked into the binary. The crate being built is the
+//! `build-script-probe` fixture, a few lines that use this repository's real
+//! `build.rs`, so the reproduction runs in seconds instead of minutes.
 
 #![allow(dead_code)] // the test crate exercises only the resolution helper; the rest of the build script is compiled for fidelity
 
@@ -86,14 +88,25 @@ fn assert_build_succeeds(dir: &Path, shared_target: &Path, label: &str) {
 }
 
 /// The reproduction: with a shared `CARGO_TARGET_DIR`, a build script compiled for one
-/// worktree is cached and handed to another. Cargo's dep-info fingerprint compares the
-/// build script's source mtimes, not its content, so the two worktrees must carry
-/// identical `build.rs` mtimes or the second build recompiles the script and the
-/// defect never fires. The sequence is: build A (compiling the script with A's manifest
-/// dir baked in, under the old `env!` implementation), remove A so that baked path goes
-/// stale, build B. The old implementation reuses A's binary, fails to read A's
-/// `rust-toolchain.toml`, and panics blaming B's own correct file; the run-time
-/// `CARGO_MANIFEST_DIR` makes the cached binary read B's file.
+/// checkout is cached and handed to another whose manifest directory differs from the
+/// one baked into the binary. What is built is the `build-script-probe` fixture, a
+/// package of a few lines whose `build` key points at this repository's real
+/// `build.rs`, so every assertion below exercises the script the crate actually ships.
+/// Cargo's dep-info fingerprint compares the build script's source mtimes, not its
+/// content, so the two checkouts must carry identical `build.rs` mtimes or the second
+/// build recompiles the script and the defect never fires. The sequence is: build A
+/// (compiling the script with A's manifest dir baked in, under the old `env!`
+/// implementation), remove A so that baked path goes stale, build B. The old
+/// implementation reuses A's binary, fails to read A's `rust-toolchain.toml`, and
+/// panics blaming B's own correct file; the run-time `CARGO_MANIFEST_DIR` makes the
+/// cached binary read B's file.
+///
+/// The fixture is staged inside each `git worktree add --detach HEAD` checkout at the
+/// same relative path it occupies in this repository, so its
+/// `build = "../../../build.rs"` keeps pointing at that checkout's real `build.rs` (a
+/// path to the file, never a copy) and `git rev-parse HEAD` inside the script succeeds
+/// because the probe sits under the checkout's `.git`. The worktrees are required for
+/// exactly that: four plain directories would build with `AUB_GIT_REVISION=unknown`.
 #[test]
 fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
     let repo = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
@@ -116,6 +129,8 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
 
     worktree_add(&repo, &a);
     worktree_add(&repo, &b);
+    stage_probe_fixture(&repo, &a);
+    stage_probe_fixture(&repo, &b);
 
     // The mtime A's build.rs carries at build time is what the dep-info records; B's
     // build.rs must carry exactly that mtime or cargo recompiles the script instead of
@@ -125,7 +140,7 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
         .modified()
         .expect("A/build.rs mtime must be readable");
 
-    assert_build_succeeds(&a, &shared, "A (first)");
+    assert_build_succeeds(&probe_dir(&a), &shared, "A (first)");
 
     // Removing A makes the path baked into the cached build-script binary stale.
     let out = Command::new("git")
@@ -147,8 +162,8 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
 
     // With the old implementation this build reuses A's binary, fails to read A's
     // rust-toolchain.toml, and panics blaming B's own correct file.
-    assert_build_succeeds(&b, &shared, "B (after A removed)");
-    assert_build_succeeds(&b, &shared, "B (again)");
+    assert_build_succeeds(&probe_dir(&b), &shared, "B (after A removed)");
+    assert_build_succeeds(&probe_dir(&b), &shared, "B (again)");
 
     // In parallel: two worktrees building at once against the same shared target
     // directory. Cargo serializes them on its target-directory lock; both must
@@ -159,9 +174,11 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
     guard.paths.push(d.clone());
     worktree_add(&repo, &c);
     worktree_add(&repo, &d);
+    stage_probe_fixture(&repo, &c);
+    stage_probe_fixture(&repo, &d);
     std::thread::scope(|s| {
-        let c_build = s.spawn(|| cargo_build(&c, &shared));
-        let d_build = s.spawn(|| cargo_build(&d, &shared));
+        let c_build = s.spawn(|| cargo_build(&probe_dir(&c), &shared));
+        let d_build = s.spawn(|| cargo_build(&probe_dir(&d), &shared));
         let c_out = c_build.join().expect("C build thread must not panic");
         let d_out = d_build.join().expect("D build thread must not panic");
         assert!(
@@ -206,8 +223,39 @@ fn alternating_worktree_builds_with_a_shared_target_dir_never_fail() {
     std::fs::remove_dir_all(&tmp).expect("temp dir must be removable");
 }
 
+/// The probe package as built: `tests/fixtures/build-script-probe` under the given
+/// checkout, which is what keeps its `build = "../../../build.rs"` pointing at that
+/// checkout's real build script.
+fn probe_dir(checkout: &Path) -> PathBuf {
+    checkout.join("tests/fixtures/build-script-probe")
+}
+
+/// Copies the probe package from the checkout running this test into the given
+/// worktree checkout at the same relative path, so the copy's `build` key resolves to
+/// that checkout's real `build.rs`, and stages that checkout's toolchain file beside
+/// the probe's manifest, which is where the build script reads it from at run time.
+/// Copying from the running checkout rather than relying on what the worktree checked
+/// out keeps the test faithful to the working tree while the fixture itself is edited.
+fn stage_probe_fixture(repo: &Path, checkout: &Path) {
+    let src = repo.join("tests/fixtures/build-script-probe");
+    let dst = probe_dir(checkout);
+    if dst.exists() {
+        std::fs::remove_dir_all(&dst).expect("stale staged probe must be removable");
+    }
+    std::fs::create_dir_all(dst.join("src")).expect("staged probe src dir must be creatable");
+    for file in ["Cargo.toml", "src/main.rs"] {
+        std::fs::copy(src.join(file), dst.join(file))
+            .unwrap_or_else(|_| panic!("staged probe {file} must be copyable"));
+    }
+    std::fs::copy(
+        repo.join("rust-toolchain.toml"),
+        dst.join("rust-toolchain.toml"),
+    )
+    .expect("staged probe toolchain file must be copyable");
+}
+
 /// The compiled build-script binary under a shared target directory. The build
-/// output directory holds several `agent-usage-book-*` entries; the binary is the
+/// output directory holds several `build-script-probe-*` entries; the binary is the
 /// one that carries `build-script-build`.
 fn find_build_script_binary(shared_target: &Path) -> PathBuf {
     let build_dir = shared_target.join("debug/build");
@@ -215,7 +263,7 @@ fn find_build_script_binary(shared_target: &Path) -> PathBuf {
     for entry in std::fs::read_dir(&build_dir).expect("build dir must exist") {
         let entry = entry.expect("build dir must be readable");
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with("agent-usage-book-") {
+        if name.to_string_lossy().starts_with("build-script-probe-") {
             let candidate = entry.path().join("build-script-build");
             if candidate.is_file() {
                 found = Some(candidate);
