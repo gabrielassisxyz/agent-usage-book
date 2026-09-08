@@ -457,6 +457,7 @@ fn coverage_case() -> SeededCommand {
         name: LogicalName::new("research"),
         engine: EngineCoverageReport {
             expected_opportunities: None,
+            policy_covered_span: None,
             attempted_opportunities: 0,
             successful_observations: 0,
             started_without_terminal_result: 0,

@@ -141,10 +141,16 @@ impl Gap {
 /// The coverage report for one account over one interval.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CoverageReport {
-    /// Reconstructed expected opportunities. `None` when any sub-interval has no
-    /// policy snapshot in force, which is reported as `policy_unknown` rather than
-    /// evaluated against a later configuration.
+    /// Reconstructed expected opportunities over the covered span. `None` when
+    /// no policy snapshot applies anywhere in the interval, which is reported
+    /// as `policy_unknown`; the span before the first snapshot owes nothing
+    /// because the account did not exist for aub yet.
     pub expected_opportunities: Option<u64>,
+    /// The span a policy snapshot covers, from the first `effective_at`
+    /// inside or before the interval to its end. `None` exactly when
+    /// `expected_opportunities` is `None`. A covered span shorter than the
+    /// interval means the account was added part-way through the window.
+    pub policy_covered_span: Option<MonotonicDuration>,
     pub attempted_opportunities: u64,
     pub successful_observations: u64,
     /// Started attempts that never acquired a terminal result: collector or process
@@ -217,7 +223,9 @@ pub fn compute(inputs: &CoverageInputs) -> CoverageReport {
         .collect();
 
     let postponements = postponements(&attempts, &snapshots);
-    let expected = expected_opportunities(start, end, &snapshots, &postponements);
+    let expected_and_covered = expected_opportunities(start, end, &snapshots, &postponements);
+    let expected = expected_and_covered.map(|(owed, _)| owed);
+    let policy_covered_span = expected_and_covered.map(|(_, covered)| covered);
 
     let attempted = attempt_times.len() as u64;
     let successful = observation_times.len() as u64;
@@ -238,6 +246,7 @@ pub fn compute(inputs: &CoverageInputs) -> CoverageReport {
 
     CoverageReport {
         expected_opportunities: expected,
+        policy_covered_span,
         attempted_opportunities: attempted,
         successful_observations: successful,
         started_without_terminal_result,
@@ -340,19 +349,33 @@ fn merge_postponements(mut intervals: Vec<Postponement>) -> Vec<Postponement> {
     merged
 }
 
-/// Reconstructs the expected-opportunity denominator from the policy snapshots in
-/// force over `[start, end]`, excluding postponement intervals. `None` when any
-/// sub-interval has no snapshot in force.
+/// Reconstructs the expected-opportunity denominator over the covered span,
+/// from the first snapshot `effective_at` inside or before `[start, end)` to
+/// `end`, excluding postponement intervals. `None` when no snapshot applies
+/// anywhere in the interval. The span before the first snapshot owes nothing:
+/// the account did not exist for aub yet. Slicing at later snapshots and the
+/// postponement arithmetic are unchanged.
 fn expected_opportunities(
     start: UtcTimestamp,
     end: UtcTimestamp,
     snapshots: &[PolicySnapshot],
     postponements: &[Postponement],
-) -> Option<u64> {
-    let mut boundaries = vec![start, end];
+) -> Option<(u64, MonotonicDuration)> {
+    let covered_start = if cadence_at(snapshots, start).is_some() {
+        start
+    } else {
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.effective_at)
+            .filter(|effective| *effective > start && *effective < end)
+            .min()?
+    };
+    let covered_nanos = (end.unix_nanos() - covered_start.unix_nanos()).max(0) as u64;
+    let covered_span = MonotonicDuration::from_nanos(covered_nanos);
+    let mut boundaries = vec![covered_start, end];
     for snapshot in snapshots {
         let effective = snapshot.effective_at;
-        if effective > start && effective < end {
+        if effective > covered_start && effective < end {
             boundaries.push(effective);
         }
     }
@@ -367,7 +390,7 @@ fn expected_opportunities(
         let overlap = postponement_overlap(a, b, postponements);
         total += duration.saturating_sub(overlap) / cadence.as_nanos();
     }
-    Some(total)
+    Some((total, covered_span))
 }
 
 /// The total overlap of `[a, b]` with every postponement interval, in nanoseconds.
@@ -643,6 +666,7 @@ mod tests {
             vec![ObservationRecord { at: ts(300) }],
         ));
         assert_eq!(report.expected_opportunities, None);
+        assert_eq!(report.policy_covered_span, None);
         assert_eq!(report.attempt_coverage, None);
         let rendered = render(&report);
         assert!(
@@ -651,11 +675,11 @@ mod tests {
         );
     }
 
-    /// An interval whose only snapshot becomes effective mid-interval is also
-    /// `policy_unknown`: the head of the interval had no policy in force, and the
-    /// engine refuses to evaluate it against the later configuration.
+    /// An interval whose only snapshot becomes effective mid-interval is
+    /// covered from that snapshot: the head before it owes nothing because
+    /// the account did not exist for aub yet.
     #[test]
-    fn an_interval_with_a_head_before_the_first_snapshot_is_policy_unknown() {
+    fn an_interval_with_a_head_before_the_first_snapshot_covers_from_the_snapshot() {
         let report = compute(&inputs(
             0,
             3_600,
@@ -663,11 +687,45 @@ mod tests {
             vec![],
             vec![],
         ));
-        assert_eq!(report.expected_opportunities, None);
-        assert_eq!(report.attempt_coverage, None);
+        assert_eq!(report.expected_opportunities, Some(6));
+        assert_eq!(
+            report.policy_covered_span,
+            Some(MonotonicDuration::from_seconds(1_800))
+        );
+        assert_eq!(report.attempt_coverage, CoverageFraction::new(0, 6));
         assert!(
-            render(&report).contains("policy unknown"),
-            "the report must name the unknown policy"
+            !render(&report).contains("policy unknown"),
+            "a covered tail must not read as unknown: {}",
+            render(&report)
+        );
+    }
+
+    /// A 24-hour window whose only snapshot is 12 hours old owes 144
+    /// opportunities at a 300 s cadence, all of them attempted.
+    #[test]
+    fn a_window_with_a_snapshot_twelve_hours_old_covers_the_tail() {
+        let attempts: Vec<AttemptRecord> = (0..144)
+            .map(|i| {
+                let at = 43_200 + i * 300;
+                attempt(at, Some(success_result(at)))
+            })
+            .collect();
+        let report = compute(&inputs(
+            0,
+            86_400,
+            vec![snapshot(43_200, 300)],
+            attempts,
+            vec![],
+        ));
+        assert_eq!(report.expected_opportunities, Some(144));
+        assert_eq!(
+            report.policy_covered_span,
+            Some(MonotonicDuration::from_seconds(43_200))
+        );
+        assert_eq!(
+            report.attempt_coverage.unwrap().as_f64(),
+            1.0,
+            "144 attempts against 144 owed must read 100%"
         );
     }
 

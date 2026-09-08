@@ -1716,9 +1716,22 @@ fn coverage_percent_cell(fraction: crate::coverage::CoverageFraction) -> String 
 /// refusal where the engine refused to compute one. A policy the ledger
 /// cannot reconstruct reads as "unknown", never as a number; a policy that
 /// owed nothing reads as "none", because there were no attempts to cover.
-fn coverage_attempts_cell(engine: &crate::coverage::CoverageReport) -> String {
+/// When the covered span is shorter than the window the percentage names it
+/// (`98.7% of 12h 46m`); a fully covered window shows the percentage alone.
+fn coverage_attempts_cell(
+    engine: &crate::coverage::CoverageReport,
+    window: MonotonicDuration,
+) -> String {
     match engine.attempt_coverage {
-        Some(fraction) => coverage_percent_cell(fraction),
+        Some(fraction) => {
+            let percent = coverage_percent_cell(fraction);
+            match engine.policy_covered_span {
+                Some(covered) if covered.as_nanos() < window.as_nanos() => {
+                    format!("{percent} of {}", render_coverage_duration(covered))
+                }
+                _ => percent,
+            }
+        }
         None => match engine.expected_opportunities {
             None => "unknown".to_string(),
             // Nothing was owed: there were no attempts to cover.
@@ -1737,15 +1750,28 @@ fn coverage_measurements_cell(engine: &crate::coverage::CoverageReport) -> Strin
     }
 }
 
+/// The window the coverage report covers, from its own timestamps: the
+/// duration `render_coverage_detail` compares the covered span against to
+/// decide a partial span.
+fn coverage_report_window_duration(report: &CoverageReport) -> MonotonicDuration {
+    MonotonicDuration::from_nanos(
+        (report.until.unix_nanos() - report.since.unix_nanos()).max(0) as u64,
+    )
+}
+
 /// The detail block of one account, when its numbers need explaining: the
 /// floor breaches, the non-zero failure classes largest first, the
 /// interruptions, and the resets lost to blind gaps. A healthy account
 /// renders no block: the table row already carries its numbers. An
 /// unconfigured account renders no block either: it is not a table row, and
 /// its history reaches the operator on the one "not in config" line.
+/// A partially covered window renders its span (`policy known for 12h 46m
+/// of 24h`); a window with no applicable snapshot renders no policy line,
+/// the `unknown` cell already saying it.
 fn render_coverage_detail(
     report: &CoverageReport,
     account: &crate::report::CoverageAccount,
+    window_label: &str,
 ) -> Option<Vec<String>> {
     let engine = &account.engine;
     if !account.configured {
@@ -1760,20 +1786,23 @@ fn render_coverage_detail(
             .measurement_coverage
             .is_some_and(|coverage| coverage.as_f64() < report.threshold.measurement_floor.get());
     let interrupted = engine.started_without_terminal_result > 0;
-    let policy_unknown = engine.expected_opportunities.is_none();
+    let window = coverage_report_window_duration(report);
+    let partial_span = engine
+        .policy_covered_span
+        .is_some_and(|covered| covered.as_nanos() < window.as_nanos());
     let severe = !engine.reset_spanning_gaps.is_empty();
-    if !policy_unknown
-        && !attempt_below_floor
-        && !measurement_below_floor
-        && !interrupted
-        && !severe
+    if !partial_span && !attempt_below_floor && !measurement_below_floor && !interrupted && !severe
     {
         return None;
     }
 
     let mut lines = Vec::new();
-    if policy_unknown {
-        lines.push("no sampling policy snapshot covers the whole interval".to_string());
+    if partial_span {
+        let covered = engine.policy_covered_span.unwrap_or(window);
+        lines.push(format!(
+            "policy known for {} of {window_label}",
+            render_coverage_duration(covered)
+        ));
     } else if attempt_below_floor {
         lines.push(format!(
             "attempt coverage below the {}% floor",
@@ -1870,7 +1899,7 @@ pub fn render_coverage_report(report: &CoverageReport, window: &str, style: Styl
             let engine = &account.engine;
             vec![
                 account.name.as_str().to_string(),
-                coverage_attempts_cell(engine),
+                coverage_attempts_cell(engine, coverage_report_window_duration(report)),
                 coverage_measurements_cell(engine),
                 engine
                     .longest_no_attempt_gap
@@ -1918,7 +1947,7 @@ pub fn render_coverage_report(report: &CoverageReport, window: &str, style: Styl
             ));
         }
         lines.push(boxed_body(row.trim_end(), width));
-        let mut findings = render_coverage_detail(report, account).unwrap_or_default();
+        let mut findings = render_coverage_detail(report, account, window).unwrap_or_default();
         if account.legacy_evidence_present {
             findings.push(
                 "legacy observations are shown as historical evidence, not ordinary attempt coverage"
@@ -2570,6 +2599,7 @@ mod tests {
     ) -> crate::coverage::CoverageReport {
         crate::coverage::CoverageReport {
             expected_opportunities: Some(288),
+            policy_covered_span: Some(MonotonicDuration::from_seconds(86_400)),
             attempted_opportunities: 256,
             successful_observations: 256,
             started_without_terminal_result: 0,
@@ -2624,6 +2654,7 @@ mod tests {
         threshold: crate::report::CoverageThreshold,
     ) -> CoverageReport {
         let at = UtcTimestamp::from_unix_nanos(0);
+        let until = UtcTimestamp::from_unix_nanos(86_400 * NANOS_PER_SECOND);
         CoverageReport::new(
             crate::report::ReportMetadata::new(
                 at,
@@ -2632,7 +2663,7 @@ mod tests {
                 None,
             ),
             at,
-            at,
+            until,
             false,
             threshold,
             accounts,
@@ -3592,6 +3623,7 @@ mod tests {
     fn the_coverage_box_prints_none_for_an_account_with_no_attempts() {
         let quiet_engine = crate::coverage::CoverageReport {
             expected_opportunities: Some(0),
+            policy_covered_span: Some(MonotonicDuration::from_seconds(86_400)),
             attempted_opportunities: 0,
             successful_observations: 0,
             started_without_terminal_result: 0,
@@ -3628,6 +3660,144 @@ mod tests {
         ]
         .join("\n");
         assert_eq!(rendered, expected);
+    }
+
+    /// The attempts cell names the covered span when it is shorter than the
+    /// window (`98.7% of 12h 46m`) and the percentage alone when the policy
+    /// covers the whole window. The planted negative is the full-coverage
+    /// account: a cell that always appended the span would read `98.7% of
+    /// 24h` there.
+    #[test]
+    fn the_attempts_cell_names_the_covered_span_only_when_partial() {
+        let window = MonotonicDuration::from_seconds(86_400);
+        let partial = crate::coverage::CoverageReport {
+            expected_opportunities: Some(154),
+            policy_covered_span: Some(MonotonicDuration::from_seconds(45_960)),
+            attempted_opportunities: 152,
+            successful_observations: 152,
+            started_without_terminal_result: 0,
+            attempt_coverage: CoverageFraction::new(987, 1_000),
+            measurement_coverage: CoverageFraction::new(1, 1),
+            longest_no_attempt_gap: None,
+            longest_no_observation_gap: None,
+            reset_spanning_gaps: Vec::new(),
+            most_recent_timer_run: None,
+            most_recent_successful_observation: None,
+            severe: false,
+        };
+        assert_eq!(coverage_attempts_cell(&partial, window), "98.7% of 12h 46m");
+        let full = crate::coverage::CoverageReport {
+            policy_covered_span: Some(MonotonicDuration::from_seconds(86_400)),
+            ..partial
+        };
+        assert_eq!(coverage_attempts_cell(&full, window), "98.7%");
+    }
+
+    /// A partially covered window explains itself under its row (`policy
+    /// known for 12h 46m of 24h`); a fully covered window and a window with
+    /// no applicable snapshot render no policy line. The planted negative is
+    /// the fully covered account: a finding that appeared for every window
+    /// would sit under a healthy row.
+    #[test]
+    fn the_detail_names_the_partial_span_and_only_then() {
+        let covered = MonotonicDuration::from_seconds(45_960);
+        let partial_engine = crate::coverage::CoverageReport {
+            expected_opportunities: Some(154),
+            policy_covered_span: Some(covered),
+            attempted_opportunities: 152,
+            successful_observations: 152,
+            started_without_terminal_result: 0,
+            attempt_coverage: CoverageFraction::new(987, 1_000),
+            measurement_coverage: CoverageFraction::new(1, 1),
+            longest_no_attempt_gap: None,
+            longest_no_observation_gap: None,
+            reset_spanning_gaps: Vec::new(),
+            most_recent_timer_run: None,
+            most_recent_successful_observation: None,
+            severe: false,
+        };
+        let partial = coverage_account(
+            "gmail",
+            partial_engine,
+            crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let report = coverage_report(vec![partial], floors_met(0.98, 0.95));
+        let findings =
+            render_coverage_detail(&report, &report.accounts[0], "24h").unwrap_or_default();
+        assert!(
+            findings.contains(&"policy known for 12h 46m of 24h".to_string()),
+            "a partial span must name itself: {findings:?}"
+        );
+
+        let full_engine = crate::coverage::CoverageReport {
+            expected_opportunities: Some(288),
+            policy_covered_span: Some(MonotonicDuration::from_seconds(86_400)),
+            attempted_opportunities: 288,
+            successful_observations: 288,
+            started_without_terminal_result: 0,
+            attempt_coverage: CoverageFraction::new(1, 1),
+            measurement_coverage: CoverageFraction::new(1, 1),
+            longest_no_attempt_gap: None,
+            longest_no_observation_gap: None,
+            reset_spanning_gaps: Vec::new(),
+            most_recent_timer_run: None,
+            most_recent_successful_observation: None,
+            severe: false,
+        };
+        let full = coverage_account(
+            "gmail",
+            full_engine,
+            crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let full_report = coverage_report(vec![full], floors_met(0.98, 0.95));
+        let full_findings = render_coverage_detail(&full_report, &full_report.accounts[0], "24h")
+            .unwrap_or_default();
+        assert!(
+            !full_findings
+                .iter()
+                .any(|line| line.contains("policy known")),
+            "a fully covered window renders no policy line: {full_findings:?}"
+        );
+
+        let unknown_engine = crate::coverage::CoverageReport {
+            expected_opportunities: None,
+            policy_covered_span: None,
+            attempted_opportunities: 0,
+            successful_observations: 0,
+            started_without_terminal_result: 0,
+            attempt_coverage: None,
+            measurement_coverage: None,
+            longest_no_attempt_gap: None,
+            longest_no_observation_gap: None,
+            reset_spanning_gaps: Vec::new(),
+            most_recent_timer_run: None,
+            most_recent_successful_observation: None,
+            severe: false,
+        };
+        let unknown = coverage_account(
+            "gmail",
+            unknown_engine,
+            crate::report::coverage::CoverageFailureTally::default(),
+            Vec::new(),
+            Vec::new(),
+            true,
+        );
+        let unknown_report = coverage_report(vec![unknown], floors_met(0.98, 0.95));
+        let unknown_findings =
+            render_coverage_detail(&unknown_report, &unknown_report.accounts[0], "24h")
+                .unwrap_or_default();
+        assert!(
+            !unknown_findings
+                .iter()
+                .any(|line| line.contains("policy known")),
+            "no snapshot means no partial-span line: {unknown_findings:?}"
+        );
     }
 
     /// The join boundary: two findings whose joined line lands exactly on the
@@ -3775,6 +3945,7 @@ mod tests {
         let zero = {
             let quiet_engine = crate::coverage::CoverageReport {
                 expected_opportunities: Some(0),
+                policy_covered_span: Some(MonotonicDuration::from_seconds(86_400)),
                 attempted_opportunities: 0,
                 successful_observations: 0,
                 started_without_terminal_result: 0,

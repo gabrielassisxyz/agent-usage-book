@@ -406,7 +406,13 @@ stored, largest count first (`1 attempt refused with rate_limit_error`);
 the classification is what the provider itself said about the refusal,
 sanitized, and the full stored value, message included, is on the attempt
 result row in the ledger. Rows written before the classification column
-was populated read as `unclassified`.
+was populated read as `unclassified`. An account added part-way through the
+window divides attempts made by attempts owed since its first sampling-policy
+snapshot, and the attempts cell names the covered span beside the fraction
+(`98.7% of 12h 46m`); a fully covered window shows the fraction alone. The
+detail block then reads `policy known for 12h 46m of 24h`, and only for a
+partial span. `unknown` is reserved for an account with no applicable
+snapshot anywhere in the window.
 
 ```
 ┌─ coverage · last 24h ────────────────────────────────────────────────────────┐

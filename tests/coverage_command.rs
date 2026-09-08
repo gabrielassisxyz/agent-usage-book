@@ -572,8 +572,12 @@ fn a_policy_unknown_interval_is_visible_in_both_modes() {
         "the human table must show the unknown policy: {rendered}"
     );
     assert!(
-        rendered.contains("no sampling policy snapshot covers the whole interval"),
-        "the detail block must name the refusal: {rendered}"
+        !rendered.contains("no sampling policy snapshot covers the whole interval"),
+        "the old whole-interval refusal must be gone: {rendered}"
+    );
+    assert!(
+        !rendered.contains("policy known"),
+        "a window with no applicable snapshot renders no partial-span line: {rendered}"
     );
 
     let json = coverage_json(
