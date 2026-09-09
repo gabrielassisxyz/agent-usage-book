@@ -769,9 +769,11 @@ fn can_run_supersession_moves_all_three_consumers_together() {
     // No credential file is created anywhere under this state directory:
     // every command below must succeed without reading one. The spend-only
     // account is named `spend` rather than `work` so its `account=spend`
-    // marker cannot substring-match the `account=work-primary` lines.
+    // marker cannot substring-match the `account=work-primary` lines. The
+    // two accounts name different (equally absent) paths because two logical
+    // accounts must not share one credential source (aub-iwkg).
     let config = format!(
-        "state.dir = \"{}\"\n\n[[accounts]]\nname = \"spend\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token.json\" }}\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token.json\" }}\n\n[task_distribution]\nmin_samples = 3\n\n[[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\npattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n\n[tracker]\nkind = \"local\"\npath = \"{}/tracker\"\n",
+        "state.dir = \"{}\"\n\n[[accounts]]\nname = \"spend\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token.json\" }}\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token-work.json\" }}\n\n[task_distribution]\nmin_samples = 3\n\n[[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\npattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n\n[tracker]\nkind = \"local\"\npath = \"{}/tracker\"\n",
         state.path().display(),
         state.path().display(),
         state.path().display(),

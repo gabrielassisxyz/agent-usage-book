@@ -46,10 +46,12 @@ name = "spend"
 provider = "anthropic"
 credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
 
+# Two logical accounts need two credential sources (aub-iwkg refuses a
+# shared path at configuration time).
 [[accounts]]
 name = "work-primary"
 provider = "anthropic"
-credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
+credential = { kind = "file", path = "$STATE_DIR/creds/token-work.json" }
 
 [task_distribution]
 min_samples = 3

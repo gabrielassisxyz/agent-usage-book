@@ -51,6 +51,10 @@ case_preconditions() {
     mkdir -p "$STATE_DIR/home" "$STATE_DIR/creds" \
         "$STATE_DIR/transcripts/claude-code" "$STATE_DIR/tracker"
     echo '{"accessToken":"test-token"}' > "$STATE_DIR/creds/token.json"
+    # Two logical accounts need two credential sources (aub-iwkg refuses a
+    # shared path at configuration time); the same material under a second
+    # path keeps the stubbed sampling behavior unchanged.
+    echo '{"accessToken":"test-token"}' > "$STATE_DIR/creds/token-stale.json"
 
     cat > "$CONFIG" <<CFG_EOF
 state.dir = "$STATE_DIR"
@@ -63,7 +67,7 @@ credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
 [[accounts]]
 name = "stale-primary"
 provider = "anthropic"
-credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
+credential = { kind = "file", path = "$STATE_DIR/creds/token-stale.json" }
 
 [task_distribution]
 min_samples = 3

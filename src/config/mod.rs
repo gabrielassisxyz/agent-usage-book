@@ -653,6 +653,47 @@ fn validate_account_provider_keys(account: &AccountConfig) -> Result<(), Error> 
     Ok(())
 }
 
+/// Two configured accounts resolving to one credential source (aub-iwkg).
+/// Two logical names reading one credential path receive one subscription's
+/// readings under two names, and a subscription change behind the shared
+/// path refuses under both: the configuration is ambiguous before any
+/// sampling happens, so it fails here as a usage error naming both
+/// accounts, rather than only as a runtime surprise later.
+///
+/// Only `file` and `env` sources with a non-empty detail participate:
+/// credential-less accounts (`none`, or no credential table at all) share
+/// nothing, and an empty detail fails later at credential resolution with
+/// the account named. Comparison is on the exact configured strings; two
+/// spellings of one file (a relative and an absolute path, a symlink and
+/// its target) are not unified here, and the sampler's change detection is
+/// the backstop for those.
+fn validate_distinct_credential_sources(accounts: &[AccountConfig]) -> Result<(), Error> {
+    for (index, first) in accounts.iter().enumerate() {
+        let kind = first.credential_kind.trim();
+        if kind != "file" && kind != "env" {
+            continue;
+        }
+        let detail = first.credential_detail.trim();
+        if detail.is_empty() {
+            continue;
+        }
+        for second in &accounts[index + 1..] {
+            if second.credential_kind.trim() == kind && second.credential_detail.trim() == detail {
+                let source = if kind == "file" {
+                    format!("credential file '{detail}'")
+                } else {
+                    format!("environment variable '{detail}'")
+                };
+                return Err(Error::Usage(format!(
+                    "accounts '{}' and '{}' share one {source}: two logical accounts must not read one credential source; give each account its own source or remove one account",
+                    first.name, second.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Renders a config file path for error messages with the home directory
 /// collapsed to `~`, so a default error never prints an absolute home path
 /// (aub-xus.8). A path outside the home directory is left as it is.
@@ -1761,6 +1802,7 @@ pub fn resolve(
     for account in &accounts {
         validate_account_provider_keys(account)?;
     }
+    validate_distinct_credential_sources(&accounts)?;
     if !accounts.is_empty() {
         provenance.set("accounts", ConfigSource::File);
     }
@@ -2661,6 +2703,80 @@ credential = { kind = "env", name = "" }
         let message = err.to_string();
         assert!(message.contains("work-primary"), "{message}");
         assert!(message.contains("'name'"), "{message}");
+    }
+
+    #[test]
+    fn two_accounts_sharing_one_credential_file_are_a_configuration_error() {
+        // aub-iwkg: two logical names reading one credential path receive
+        // one subscription's readings under two names, so the configuration
+        // fails here, naming both accounts, rather than as a runtime
+        // surprise later.
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "anthropic"
+credential = { kind = "file", path = "/tmp/shared/creds.json" }
+
+[[accounts]]
+name = "work-secondary"
+provider = "anthropic"
+credential = { kind = "file", path = "/tmp/shared/creds.json" }
+"#;
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        let message = err.to_string();
+        assert!(message.contains("work-primary"), "{message}");
+        assert!(message.contains("work-secondary"), "{message}");
+        assert!(message.contains("/tmp/shared/creds.json"), "{message}");
+    }
+
+    #[test]
+    fn two_accounts_sharing_one_credential_variable_are_a_configuration_error() {
+        let file = r#"
+[[accounts]]
+name = "go-primary"
+provider = "anthropic"
+credential = { kind = "env", name = "AUB_SHARED_TOKEN" }
+
+[[accounts]]
+name = "go-secondary"
+provider = "anthropic"
+credential = { kind = "env", name = "AUB_SHARED_TOKEN" }
+"#;
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        let message = err.to_string();
+        assert!(message.contains("go-primary"), "{message}");
+        assert!(message.contains("go-secondary"), "{message}");
+        assert!(message.contains("AUB_SHARED_TOKEN"), "{message}");
+    }
+
+    #[test]
+    fn accounts_with_distinct_or_absent_credential_sources_resolve() {
+        // The planted negative: distinct paths are fine, and two
+        // credential-less accounts share nothing, so neither trips the
+        // duplicate-source refusal above.
+        let file = r#"
+[[accounts]]
+name = "work-primary"
+provider = "anthropic"
+credential = { kind = "file", path = "/tmp/creds-a.json" }
+
+[[accounts]]
+name = "work-secondary"
+provider = "anthropic"
+credential = { kind = "file", path = "/tmp/creds-b.json" }
+
+[[accounts]]
+name = "codex-main"
+provider = "codex"
+
+[[accounts]]
+name = "codex-side"
+provider = "codex"
+"#;
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.accounts.len(), 4);
     }
 
     #[test]

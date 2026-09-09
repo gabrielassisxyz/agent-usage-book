@@ -475,11 +475,19 @@ fn sample_and_status_idle_five_hour_window_stores_observation_and_renders_no_win
 fn bare_sample_covers_every_configured_account_with_two_stub_accounts() {
     let env = Environment::new("bare-sample-two-accounts");
 
+    // Two logical accounts need two credential sources (aub-iwkg refuses a
+    // shared path at configuration time): the same material under a second
+    // path keeps the stubbed sampling behavior unchanged.
+    std::fs::write(
+        env.root.join("creds/token-two.json"),
+        r#"{"accessToken":"test-token"}"#,
+    )
+    .unwrap();
     let toml_content = format!(
         "state.dir = \"{}\"\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}\" }}\n\n[[accounts]]\nname = \"work-secondary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}\" }}\n",
         env.state_dir().display(),
         env.root.join("creds/token.json").display(),
-        env.root.join("creds/token.json").display(),
+        env.root.join("creds/token-two.json").display(),
     );
     std::fs::write(env.root.join("aub.toml"), toml_content).unwrap();
 
