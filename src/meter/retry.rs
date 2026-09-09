@@ -32,9 +32,10 @@
 use std::fmt;
 
 use crate::domain::attempt::AttemptOutcome;
-use crate::domain::failure::{FailureClass, HttpStatusClass};
+use crate::domain::failure::{FailureClass, HttpStatusClass, ProviderErrorReport};
 use crate::domain::time::{MonotonicDuration, MonotonicInstant};
 use crate::meter::adapter::ProviderObservation;
+use crate::meter::evidence::CapturedProviderResponse;
 
 /// How the delay between transient retries grows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -252,14 +253,21 @@ impl NetworkTry {
 }
 
 /// The terminal result of one logical sampling attempt: the ordered network
-/// tries and the observation the sequence ended on.
+/// tries, the observation the sequence ended on, and what the provider said
+/// about that terminal try.
 ///
 /// One logical sample is exactly one meter attempt and at most one result; the
-/// tries are retry metadata on that one result, never extra attempts.
+/// tries are retry metadata on that one result, never extra attempts. The
+/// terminal report is what the attempt's result row stores beside its outcome:
+/// the response that ended the sequence named the failure, and the row carries
+/// its word whatever the tries before it saw.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RetryOutcome<T> {
     pub tries: Vec<NetworkTry>,
     pub terminal: ProviderObservation<T>,
+    /// The terminal try's own [`ProviderErrorReport`], `None` when no response
+    /// arrived (a pre-response failure) or the try measured.
+    pub terminal_error_report: Option<ProviderErrorReport>,
 }
 
 impl<T> RetryOutcome<T> {
@@ -287,6 +295,18 @@ impl<T> RetryOutcome<T> {
             | FailureClass::SchemaDrift => None,
         }
     }
+
+    /// The `retry_index` the attempt's result row stores: the zero-based index
+    /// of the try that ended the sequence, once a retry actually happened.
+    /// `None` for a sequence that never retried, which is the shape every row
+    /// written without the retry driver carries; the two spellings there are
+    /// the same fact.
+    pub fn retry_index(&self) -> Option<u32> {
+        if self.tries.len() < 2 {
+            return None;
+        }
+        u32::try_from(self.tries.len() - 1).ok()
+    }
 }
 
 /// Reduces an adapter's classified observation to the one attempt outcome the
@@ -307,7 +327,9 @@ pub(crate) fn attempt_outcome_of<T>(observation: &ProviderObservation<T>) -> Att
 /// during [`attempt`](Self::attempt) and [`wait`](Self::wait) is the same clock
 /// [`budget_remaining`](Self::budget_remaining) reads. The production
 /// implementation (transport, adapter, real clock, `std::thread::sleep`) lands
-/// with `aub-eun.6`.
+/// with the retry-driver wiring; the driver it defines is what keeps a retry
+/// from laundering a classified failure, which is why a try hands back the
+/// full capture and not its observation alone.
 pub trait RetryEnv {
     /// The adapter's reading type.
     type Reading;
@@ -316,7 +338,14 @@ pub trait RetryEnv {
     /// call plus the adapter classification; the command budget clips the
     /// per-call timeouts, so a try made with no budget left returns
     /// [`FailureClass::TotalBudgetExpired`].
-    fn attempt(&mut self) -> ProviderObservation<Self::Reading>;
+    ///
+    /// The whole capture crosses, not just its observation: the adapter's
+    /// [`ProviderErrorReport`](crate::domain::failure::ProviderErrorReport) is
+    /// what a failed terminal try stores, and an observation-only seam would
+    /// drop it, laundering a classified refusal into the no-provider-word
+    /// fallback (`aub-maop`). Pre-response failures carry a capture with no
+    /// report, the same shape the adapters already produce.
+    fn attempt(&mut self) -> CapturedProviderResponse<Self::Reading>;
 
     /// The monotonic instant now.
     fn now(&self) -> MonotonicInstant;
@@ -341,8 +370,9 @@ pub fn run_with_retry<E: RetryEnv>(
     let mut retries_used: u32 = 0;
     loop {
         let started = env.now();
-        let observation = env.attempt();
+        let captured = env.attempt();
         let ended = env.now();
+        let observation = captured.observation;
         let outcome = attempt_outcome_of(&observation);
         tries.push(NetworkTry {
             ordinal: tries.len() as u32 + 1,
@@ -355,6 +385,7 @@ pub fn run_with_retry<E: RetryEnv>(
                 return RetryOutcome {
                     tries,
                     terminal: observation,
+                    terminal_error_report: captured.failed_error,
                 };
             }
             RetryDecision::Retry { backoff } => {
@@ -584,13 +615,11 @@ mod tests {
     impl RetryEnv for ScriptedEnv {
         type Reading = u64;
 
-        fn attempt(&mut self) -> ProviderObservation<u64> {
+        fn attempt(&mut self) -> CapturedProviderResponse<u64> {
             self.clock.advance(self.per_try);
-            self.script
-                .pop_front()
-                .unwrap_or(ProviderObservation::Unreachable(
-                    FailureClass::ConnectTimeout,
-                ))
+            CapturedProviderResponse::without_response(self.script.pop_front().unwrap_or(
+                ProviderObservation::Unreachable(FailureClass::ConnectTimeout),
+            ))
         }
 
         fn now(&self) -> MonotonicInstant {

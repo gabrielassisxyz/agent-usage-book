@@ -17,6 +17,7 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+pub mod antigravity_credentials;
 /// Refreshing an expired Anthropic OAuth access token in place, under the
 /// profile's `.credentials.lock` (aub-79gp). Kept beside credential resolution
 /// because the lock and the atomic write are filesystem work the provider
