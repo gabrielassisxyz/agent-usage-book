@@ -220,6 +220,33 @@ pub fn assemble(
                 until,
             )?;
 
+        // The credential-change flags are computed here, in sorted attempt
+        // order (aub-x2je): an attempt whose context differs from its
+        // predecessor's resets the authentication streak, the same rule the
+        // scheduler applies. `None` on older rows never counts as a change.
+        let mut last_context: Option<&str> = None;
+        let mut attempt_records = Vec::with_capacity(attempts.len());
+        for attempt in &attempts {
+            let changed = match (attempt.credential_context_id.as_deref(), last_context) {
+                (Some(current), Some(previous)) => current != previous,
+                _ => false,
+            };
+            if attempt.credential_context_id.is_some() {
+                last_context = attempt.credential_context_id.as_deref();
+            }
+            attempt_records.push(coverage::AttemptRecord {
+                started_at: attempt.started_at,
+                result: attempt
+                    .terminal
+                    .as_ref()
+                    .map(|terminal| coverage::AttemptResultRecord {
+                        finished_at: terminal.finished_at,
+                        retry_after: terminal.retry_after,
+                        is_auth_required: matches!(terminal.outcome, AttemptOutcome::AuthRequired),
+                    }),
+                credential_changed: changed,
+            });
+        }
         let inputs = CoverageInputs {
             interval_start: since,
             interval_end: until,
@@ -231,18 +258,7 @@ pub fn assemble(
                     retry_backoff_policy: snapshot.policy().retry_backoff_policy.clone(),
                 })
                 .collect(),
-            attempts: attempts
-                .iter()
-                .map(|attempt| coverage::AttemptRecord {
-                    started_at: attempt.started_at,
-                    result: attempt.terminal.as_ref().map(|terminal| {
-                        coverage::AttemptResultRecord {
-                            finished_at: terminal.finished_at,
-                            retry_after: terminal.retry_after,
-                        }
-                    }),
-                })
-                .collect(),
+            attempts: attempt_records,
             observations: observations
                 .iter()
                 .map(|at| coverage::ObservationRecord { at: *at })

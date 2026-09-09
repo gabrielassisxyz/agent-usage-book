@@ -41,6 +41,15 @@
 //!    and the interval after it resumes the ordinary grid from the
 //!    postponement's end. A reset edge waited out is caught by the post-reset
 //!    confirmation once the reset passes.
+//! 6. **Authentication backoff** (aub-x2je): after a threshold of consecutive
+//!    `auth_required` results on one account, the due instant is the latest
+//!    rejection's finish plus an exponential delay that doubles from twice
+//!    the ordinary cadence and caps at the policy's authentication ceiling,
+//!    when that lies past the cadence boundary. A success or a credential
+//!    whose material changed on disk resets the streak, so an operator's fix
+//!    takes effect at the next tick. The hold never compounds with a
+//!    rate-limit postponement: the two share the due instant and the later
+//!    of the two wins.
 //!
 //! The decision is a pure function of its inputs. Nothing here reads a clock,
 //! a file, or a database: the caller assembles the history from the store and
@@ -95,6 +104,15 @@ pub struct DuePolicy {
     /// (aub-6w85). A delay above the ceiling is clamped to it, so a broken
     /// or malicious header cannot silence an account for a day.
     pub retry_after_cap: MonotonicDuration,
+    /// How many consecutive `auth_required` results trigger the
+    /// authentication backoff (aub-x2je). Zero disables the backoff
+    /// entirely; setting it higher than any streak the ledger will hold is
+    /// the configuration rollback.
+    pub auth_backoff_threshold: u32,
+    /// The longest the authentication backoff may hold an account past its
+    /// latest rejection (aub-x2je), in the same policy surface as
+    /// `retry_after_cap` rather than as a constant.
+    pub auth_backoff_cap: MonotonicDuration,
 }
 
 /// Which prior fact the decision was based on, at the domain level. The store
@@ -139,6 +157,17 @@ pub struct DueInputs {
     pub now: UtcTimestamp,
     /// An explicit operator or hook request: due regardless of history.
     pub forced: bool,
+    /// How many consecutive `auth_required` results close the history
+    /// (aub-x2je). The caller counts the trailing streak from the store;
+    /// any non-authentication terminal result breaks it, and a success
+    /// always leaves it at zero.
+    pub consecutive_auth_failures: u32,
+    /// The credential material changed on disk since the latest attempt
+    /// (aub-x2je): the current credential context differs from the one the
+    /// latest attempt carried. When true the authentication streak is
+    /// ignored, so an operator's fix resumes at the next tick without
+    /// waiting out the hold.
+    pub credential_changed: bool,
 }
 
 /// Evaluates the due decision for one account.
@@ -202,11 +231,13 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
         }
     }
 
-    // Rule 4: the ordinary interval expired since the previous due instant,
-    // unless the most recent result's capped Retry-After holds the account
-    // past that boundary - the postponement governs the due instant itself,
-    // not only the not-yet report, so a lockout outlasting the cadence costs
-    // one refused attempt and not one per tick.
+    // Rule 4+5+6: the ordinary interval expired since the previous due
+    // instant, unless a capped Retry-After (rule 5) or the authentication
+    // backoff (rule 6) holds the account past that boundary. Each
+    // postponement governs the due instant itself, not only the not-yet
+    // report, so a lockout outlasting the cadence costs one refused attempt
+    // and not one per tick. The two holds never compound: the later of the
+    // two wins, never their sum.
     let Some(entry) = last else {
         return DueDecision::Due {
             due_at: inputs.now,
@@ -217,8 +248,21 @@ pub fn evaluate(inputs: &DueInputs) -> DueDecision {
     let cadence_due_at = UtcTimestamp::from_unix_nanos(
         entry.due_at.unix_nanos() + inputs.policy.ordinary_cadence.as_nanos() as i64,
     );
-    let effective_due_at = retry_postponement(entry, inputs.policy.retry_after_cap)
-        .filter(|postponed_until| postponed_until.unix_nanos() > cadence_due_at.unix_nanos())
+    let retry_hold = retry_postponement(entry, inputs.policy.retry_after_cap)
+        .filter(|postponed_until| postponed_until.unix_nanos() > cadence_due_at.unix_nanos());
+    let auth_hold = auth_postponement(
+        entry,
+        inputs.policy.ordinary_cadence,
+        inputs.policy.auth_backoff_threshold,
+        inputs.policy.auth_backoff_cap,
+        inputs.consecutive_auth_failures,
+        inputs.credential_changed,
+    )
+    .filter(|postponed_until| postponed_until.unix_nanos() > cadence_due_at.unix_nanos());
+    let effective_due_at = [retry_hold, auth_hold]
+        .into_iter()
+        .flatten()
+        .max_by_key(|instant| instant.unix_nanos())
         .unwrap_or(cadence_due_at);
     if now < effective_due_at.unix_nanos() {
         return DueDecision::NotYet {
@@ -293,6 +337,69 @@ fn retry_postponement(entry: &AttemptHistoryEntry, cap: MonotonicDuration) -> Op
     }
 }
 
+/// The instant an authentication streak holds the account until, when it
+/// does: the latest rejection's finish plus the exponential delay for the
+/// streak, capped at the policy ceiling (aub-x2je).
+///
+/// The delay doubles from twice the ordinary cadence: with threshold `T`,
+/// streak `N >= T` waits `cadence * 2^(N-T+1)`, so the first hold already
+/// exceeds the cadence boundary and every further rejection doubles the
+/// wait. A streak below the threshold, a changed credential, a zero
+/// threshold (disabled) or a latest entry with no terminal result holds
+/// nothing. The caller compares against the cadence boundary, so a capped
+/// delay at or below it simply does not postpone.
+fn auth_postponement(
+    entry: &AttemptHistoryEntry,
+    cadence: MonotonicDuration,
+    threshold: u32,
+    cap: MonotonicDuration,
+    consecutive_auth_failures: u32,
+    credential_changed: bool,
+) -> Option<UtcTimestamp> {
+    let delay = auth_backoff_delay(
+        cadence,
+        threshold,
+        cap,
+        consecutive_auth_failures,
+        credential_changed,
+    )?;
+    let result = entry.result.as_ref()?;
+    Some(UtcTimestamp::from_unix_nanos(
+        result.finished_at().unix_nanos() + delay.as_nanos() as i64,
+    ))
+}
+
+/// The delay the authentication backoff would wait for a streak, before
+/// anchoring (aub-x2je). The named computation the coverage engine shares
+/// so the denominator it reconstructs matches the hold the scheduler
+/// applies: doubling from twice the cadence, capped, and nothing below
+/// the threshold, after a credential change, or when disabled.
+pub fn auth_backoff_delay(
+    cadence: MonotonicDuration,
+    threshold: u32,
+    cap: MonotonicDuration,
+    consecutive_auth_failures: u32,
+    credential_changed: bool,
+) -> Option<MonotonicDuration> {
+    if threshold == 0 || credential_changed {
+        return None;
+    }
+    if consecutive_auth_failures < threshold {
+        return None;
+    }
+    let excess = consecutive_auth_failures.saturating_sub(threshold);
+    let shift = excess.saturating_add(1).min(30);
+    let factor = 1u64.checked_shl(shift).unwrap_or(u64::MAX);
+    let delay_nanos = cadence
+        .as_nanos()
+        .saturating_mul(factor)
+        .min(cap.as_nanos());
+    if delay_nanos == 0 {
+        return None;
+    }
+    Some(MonotonicDuration::from_nanos(delay_nanos))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,6 +416,23 @@ mod tests {
             ordinary_cadence: MonotonicDuration::from_seconds(cadence_secs),
             reset_edge_lead: MonotonicDuration::from_seconds(edge_lead_secs),
             retry_after_cap: MonotonicDuration::from_seconds(cap_secs),
+            auth_backoff_threshold: 3,
+            auth_backoff_cap: MonotonicDuration::from_seconds(21_600),
+        }
+    }
+
+    fn auth_policy(
+        cadence_secs: u64,
+        edge_lead_secs: u64,
+        threshold: u32,
+        cap_secs: u64,
+    ) -> DuePolicy {
+        DuePolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(cadence_secs),
+            reset_edge_lead: MonotonicDuration::from_seconds(edge_lead_secs),
+            retry_after_cap: MonotonicDuration::from_seconds(3600),
+            auth_backoff_threshold: threshold,
+            auth_backoff_cap: MonotonicDuration::from_seconds(cap_secs),
         }
     }
 
@@ -362,6 +486,26 @@ mod tests {
         }
     }
 
+    fn auth_entry(started_nanos: i64) -> AttemptHistoryEntry {
+        auth_entry_finished_at(started_nanos, started_nanos)
+    }
+
+    fn auth_entry_finished_at(started_nanos: i64, finished_nanos: i64) -> AttemptHistoryEntry {
+        let id = AttemptId::new(started_nanos as u64);
+        let started_at = UtcTimestamp::from_unix_nanos(started_nanos);
+        let finished_at = UtcTimestamp::from_unix_nanos(finished_nanos);
+        AttemptHistoryEntry {
+            attempt: AttemptStarted::new(id, started_at),
+            due_at: started_at,
+            result: Some(AttemptResult::new(
+                id,
+                finished_at,
+                MonotonicDuration::from_nanos(0),
+                AttemptOutcome::AuthRequired,
+            )),
+        }
+    }
+
     // Rule 1: forced beats everything, including a history that would
     // otherwise say "not yet".
     #[test]
@@ -372,6 +516,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(10 * MINUTE),
             forced: true,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -392,6 +538,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(0),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -413,6 +561,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(5 * 60 * 1_000_000_000),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -434,6 +584,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(60 * 1_000_000_000),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -458,6 +610,8 @@ mod tests {
             // the only evidence (from t=0) is older than reset-lead (t=1min).
             now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -483,6 +637,8 @@ mod tests {
             known_resets: vec![reset],
             now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert!(matches!(evaluate(&inputs), DueDecision::NotYet { .. }));
     }
@@ -499,6 +655,8 @@ mod tests {
             known_resets: vec![reset],
             now: UtcTimestamp::from_unix_nanos(4 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -522,6 +680,8 @@ mod tests {
             known_resets: vec![reset],
             now: UtcTimestamp::from_unix_nanos(4 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert!(matches!(
             evaluate(&inputs),
@@ -543,6 +703,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -563,6 +725,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
 
         assert_eq!(
@@ -585,6 +749,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -607,6 +773,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -629,6 +797,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -662,6 +832,8 @@ mod tests {
                 known_resets: vec![],
                 now,
                 forced: false,
+                consecutive_auth_failures: 0,
+                credential_changed: false,
             };
             assert_eq!(
                 evaluate(&inputs),
@@ -683,6 +855,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(3601 * 1_000_000_000),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -707,6 +881,8 @@ mod tests {
             known_resets: vec![reset],
             now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -730,6 +906,8 @@ mod tests {
             known_resets: vec![reset],
             now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
         assert_eq!(
             evaluate(&inputs),
@@ -750,6 +928,8 @@ mod tests {
             known_resets: vec![],
             now: UtcTimestamp::from_unix_nanos(MINUTE),
             forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
         };
 
         assert_eq!(
@@ -778,6 +958,8 @@ mod tests {
                 known_resets: vec![],
                 now,
                 forced: false,
+                consecutive_auth_failures: 0,
+                credential_changed: false,
             };
             if let DueDecision::Due {
                 due_at,
@@ -839,6 +1021,8 @@ mod tests {
                 known_resets: known_resets.clone(),
                 now,
                 forced: false,
+                consecutive_auth_failures: 0,
+                credential_changed: false,
             };
             if let DueDecision::Due { due_at, reason, .. } = evaluate(&inputs) {
                 total += 1;
@@ -867,6 +1051,245 @@ mod tests {
         assert_eq!(
             ordinary, 286,
             "288 grid slots minus the 2 the resets reclassified to PostResetConfirmation"
+        );
+    }
+
+    // aub-x2je: below the threshold the streak holds nothing: two
+    // consecutive rejections at a threshold of three stay on cadence. The
+    // paired positive below differs only in the streak reaching the
+    // threshold, so an implementation that backed off from the first
+    // failure would fail here.
+    #[test]
+    fn auth_streak_below_threshold_stays_on_cadence() {
+        let last = auth_entry(0);
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(MINUTE),
+            forced: false,
+            consecutive_auth_failures: 2,
+            credential_changed: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    // aub-x2je: at the threshold the next attempt postpones: three
+    // consecutive rejections wait twice the cadence from the rejection's
+    // finish (10 minutes at a 5-minute cadence), not one cadence tick.
+    #[test]
+    fn auth_streak_at_threshold_postpones_past_cadence() {
+        let last = auth_entry(0);
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 3,
+            credential_changed: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(10 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    // aub-x2je: the hold doubles on continued failure: streak four waits
+    // 20 minutes, streak five waits 40, at a 5-minute cadence.
+    #[test]
+    fn auth_backoff_doubles_on_continued_failure() {
+        for (streak, expected_min) in [(4u32, 20i64), (5u32, 40i64)] {
+            let last = auth_entry(0);
+            let inputs = DueInputs {
+                policy: auth_policy(300, 120, 3, 21_600),
+                history: vec![last],
+                known_resets: vec![],
+                now: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+                forced: false,
+                consecutive_auth_failures: streak,
+                credential_changed: false,
+            };
+            assert_eq!(
+                evaluate(&inputs),
+                DueDecision::NotYet {
+                    next_due_at: UtcTimestamp::from_unix_nanos(expected_min * MINUTE),
+                    reason: DueReason::OrdinaryCadence,
+                },
+                "streak {streak} must wait {expected_min} minutes"
+            );
+        }
+    }
+
+    // aub-x2je, capped side: a streak that would wait past the ceiling
+    // clamps to it. At a 5-minute cadence with a 30-minute cap, streak ten
+    // would otherwise wait 5*2^8 minutes; it holds 30 instead.
+    #[test]
+    fn auth_backoff_above_the_cap_clamps_to_the_cap() {
+        let last = auth_entry(0);
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 1800),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(MINUTE),
+            forced: false,
+            consecutive_auth_failures: 10,
+            credential_changed: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(30 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    // aub-x2je: one success resets the streak completely, so the next
+    // attempt is owed at the ordinary cadence even when the policy would
+    // otherwise hold. The caller reports the reset as a zero streak.
+    #[test]
+    fn auth_backoff_after_a_success_resumes_ordinary_cadence() {
+        let last = success_entry(0);
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![last.clone()],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+                basis: Some(last.basis()),
+            }
+        );
+    }
+
+    // aub-x2je: a credential whose material changed resumes at ordinary
+    // cadence without waiting out the hold, even with a streak past the
+    // threshold. The near-identical negative to the threshold positive
+    // above, differing only in the change signal.
+    #[test]
+    fn auth_backoff_after_a_credential_change_resumes_ordinary_cadence() {
+        let last = auth_entry(0);
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![last.clone()],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 5,
+            credential_changed: true,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+                basis: Some(last.basis()),
+            }
+        );
+    }
+
+    // aub-x2je: per-account isolation. Two independent evaluations with the
+    // same policy and instant: the account carrying five consecutive
+    // rejections holds, while the account with none stays due. One
+    // account's hold never shifts another's due instant.
+    #[test]
+    fn auth_backoff_on_one_account_does_not_shift_another_account() {
+        let held = auth_entry(0);
+        let held_inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![held],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 5,
+            credential_changed: false,
+        };
+        assert!(matches!(evaluate(&held_inputs), DueDecision::NotYet { .. }));
+        let fresh = success_entry(0);
+        let fresh_inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![fresh.clone()],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 0,
+            credential_changed: false,
+        };
+        assert_eq!(
+            evaluate(&fresh_inputs),
+            DueDecision::Due {
+                due_at: UtcTimestamp::from_unix_nanos(5 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+                basis: Some(fresh.basis()),
+            }
+        );
+    }
+
+    // aub-x2je: a 429 during authentication backoff yields the longer of
+    // the two holds and never their sum. Here the Retry-After holds 60
+    // minutes while the auth streak alone would hold 40; the decision is
+    // the 60-minute hold, not 100.
+    #[test]
+    fn retry_after_during_auth_backoff_yields_the_longer_hold_not_the_sum() {
+        let last = rate_limited_entry_finished_at(0, MINUTE, Some(3600));
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 5,
+            credential_changed: false,
+        };
+        // Retry holds until finish(1min) + 60min = 61min; auth alone would
+        // hold until finish(1min) + 40min = 41min. The longer wins.
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(61 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
+        );
+    }
+
+    // aub-x2je, mirrored side: when the authentication hold outlasts the
+    // Retry-After, the authentication hold wins. A 30-second Retry-After
+    // against a 40-minute auth hold leaves the 40-minute hold.
+    #[test]
+    fn auth_backoff_longer_than_retry_after_wins_without_compounding() {
+        let last = rate_limited_entry_finished_at(0, MINUTE, Some(30));
+        let inputs = DueInputs {
+            policy: auth_policy(300, 120, 3, 21_600),
+            history: vec![last],
+            known_resets: vec![],
+            now: UtcTimestamp::from_unix_nanos(2 * MINUTE),
+            forced: false,
+            consecutive_auth_failures: 5,
+            credential_changed: false,
+        };
+        assert_eq!(
+            evaluate(&inputs),
+            DueDecision::NotYet {
+                next_due_at: UtcTimestamp::from_unix_nanos(41 * MINUTE),
+                reason: DueReason::OrdinaryCadence,
+            }
         );
     }
 

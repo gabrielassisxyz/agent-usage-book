@@ -280,6 +280,15 @@ pub struct BatchAccount<A> {
     /// (aub-6w85). Configuration resolves it; the policy snapshot records
     /// the same rule in its own string form.
     pub retry_after_cap: MonotonicDuration,
+    /// How many consecutive `auth_required` results trigger the
+    /// authentication backoff (aub-x2je). Configuration resolves it; the
+    /// policy snapshot records it beside the Retry-After cap, so coverage
+    /// reconstructs the same hold.
+    pub auth_backoff_threshold: u32,
+    /// The longest the authentication backoff may hold an account past its
+    /// latest rejection (aub-x2je), in the same policy surface as
+    /// `retry_after_cap` rather than as a constant.
+    pub auth_backoff_cap: MonotonicDuration,
     /// An explicit operator or hook request: due regardless of history.
     pub forced: bool,
     /// Which adapter build produced the reading, persisted on the
@@ -588,7 +597,11 @@ where
             .due_evidence_snapshot(account_id)
             .map_err(|error| error.to_string())?;
         // The decision reads only the most recent entry: the latest attempt
-        // with the terminal result it ever reached.
+        // with the terminal result it ever reached. The authentication
+        // streak and the credential-change signal travel beside it
+        // (aub-x2je): a changed credential means the operator fixed the
+        // material on disk, so the streak is ignored and the next tick
+        // attempts at ordinary cadence.
         let latest_result = snapshot.latest_result;
         let history: Vec<AttemptHistoryEntry> = snapshot
             .latest_attempt
@@ -601,16 +614,27 @@ where
             })
             .into_iter()
             .collect();
+        let credential_changed = match (
+            account.credential_context_id.as_deref(),
+            snapshot.latest_credential_context_id.as_deref(),
+        ) {
+            (Some(current), Some(latest)) => current != latest,
+            _ => false,
+        };
         Ok(due::evaluate(&DueInputs {
             policy: DuePolicy {
                 ordinary_cadence: account.policy.ordinary_cadence,
                 reset_edge_lead: account.reset_edge_lead,
                 retry_after_cap: account.retry_after_cap,
+                auth_backoff_threshold: account.auth_backoff_threshold,
+                auth_backoff_cap: account.auth_backoff_cap,
             },
             history,
             known_resets: snapshot.known_resets,
             now,
             forced: account.forced,
+            consecutive_auth_failures: snapshot.consecutive_auth_failures,
+            credential_changed,
         }))
     }
 
@@ -1466,6 +1490,8 @@ mod tests {
             },
             reset_edge_lead: MonotonicDuration::from_seconds(120),
             retry_after_cap: MonotonicDuration::from_seconds(3600),
+            auth_backoff_threshold: 3,
+            auth_backoff_cap: MonotonicDuration::from_seconds(21_600),
             forced: false,
             adapter_version: AdapterVersion::new("adapter-test-v1"),
             credential_refresh_classification: None,
@@ -1978,6 +2004,132 @@ mod tests {
             2,
             "the lockout ends with one further attempt, not a catch-up series"
         );
+    }
+
+    /// aub-x2je: a provider rejecting every request produces a declining
+    /// attempt count, not one per tick. Three rejections sample at cadence
+    /// (the threshold), the fourth tick holds for twice the cadence, the
+    /// next for four times, so ten cadence ticks produce five attempts.
+    #[test]
+    fn auth_backoff_produces_a_declining_attempt_count_not_one_per_tick() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        transport.script("reject", ScriptedOutcome::Unauthorized);
+        let account = batch_account("reject");
+        let repository = Repository::new(&database_path, policy());
+
+        let run_batch = |accounts: &[BatchAccount<AnthropicAdapter>]| {
+            SamplingOrchestrator {
+                repository: &repository,
+                transport: &transport,
+                clock: &clock,
+                trigger: Trigger::Timer,
+                configuration_fingerprint: "fixture".to_string(),
+                holder: LeaseHolder::new("test-holder"),
+                lease_ttl: MonotonicDuration::from_seconds(30),
+                command_budget: MonotonicDuration::from_seconds(30),
+                max_concurrent_requests: 2,
+            }
+            .run(accounts)
+            .expect("the batch must run")
+        };
+
+        // Ten ticks on the 300 s cadence grid.
+        let mut sampled_count = 0;
+        for _ in 0..10 {
+            let report = run_batch(std::slice::from_ref(&account));
+            if matches!(
+                report.accounts[0].disposition,
+                AccountDisposition::Sampled(_)
+            ) {
+                sampled_count += 1;
+                assert_eq!(
+                    sampled(&report.accounts[0]).outcome,
+                    AttemptOutcome::AuthRequired
+                );
+            }
+            clock.advance(MonotonicDuration::from_seconds(300));
+        }
+        assert_eq!(
+            transport.calls("reject"),
+            sampled_count,
+            "every sampled disposition issues exactly one request"
+        );
+        assert!(
+            sampled_count < 10,
+            "a permanently rejected credential must cost fewer than one attempt per tick, got {sampled_count}"
+        );
+        assert_eq!(
+            sampled_count, 5,
+            "threshold three with doubling holds ticks four, six, seven, nine and ten of ten"
+        );
+    }
+
+    /// aub-x2je: rewriting the credential file mid-backoff causes the next
+    /// tick to attempt. The streak stands at three (held), but the batch
+    /// carries a new credential context, so the change signal wins and the
+    /// tick samples instead of holding.
+    #[test]
+    fn auth_backoff_rewriting_the_credential_file_resumes_at_the_next_tick() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        transport.script("rotating", ScriptedOutcome::Unauthorized);
+        let repository = Repository::new(&database_path, policy());
+
+        let run_batch = |account: &BatchAccount<AnthropicAdapter>| {
+            SamplingOrchestrator {
+                repository: &repository,
+                transport: &transport,
+                clock: &clock,
+                trigger: Trigger::Timer,
+                configuration_fingerprint: "fixture".to_string(),
+                holder: LeaseHolder::new("test-holder"),
+                lease_ttl: MonotonicDuration::from_seconds(30),
+                command_budget: MonotonicDuration::from_seconds(30),
+                max_concurrent_requests: 2,
+            }
+            .run(std::slice::from_ref(account))
+            .expect("the batch must run")
+        };
+
+        let account = batch_account("rotating");
+        // Three rejections reach the threshold; the fourth tick holds.
+        for _ in 0..3 {
+            let report = run_batch(&account);
+            assert!(matches!(
+                report.accounts[0].disposition,
+                AccountDisposition::Sampled(_)
+            ));
+            clock.advance(MonotonicDuration::from_seconds(300));
+        }
+        let held = run_batch(&account);
+        assert!(
+            matches!(
+                held.accounts[0].disposition,
+                AccountDisposition::NotYet { .. }
+            ),
+            "the fourth tick must hold, got {:?}",
+            held.accounts[0].disposition
+        );
+        assert_eq!(transport.calls("rotating"), 3);
+
+        // The operator replaces the credential: same account, new context.
+        // No time advances; the next tick attempts at once.
+        let mut fixed = batch_account("rotating");
+        fixed.credential = CredentialHandle::new("rotated-token");
+        fixed.credential_context_id = Some("ctx-rotated".to_string());
+        let resumed = run_batch(&fixed);
+        assert!(
+            matches!(
+                resumed.accounts[0].disposition,
+                AccountDisposition::Sampled(_)
+            ),
+            "a rewritten credential must resume at the next tick, got {:?}",
+            resumed.accounts[0].disposition
+        );
+        assert_eq!(transport.calls("rotating"), 4);
     }
 
     /// Bounded concurrency respected: with a configured bound of two and four

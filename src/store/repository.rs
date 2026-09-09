@@ -79,8 +79,8 @@ impl Repository {
     /// Reads one account's evidence snapshot for the due decision in one
     /// read-only connection, so the decision is a function of one moment of
     /// the database: whether the account has a row at all, its latest attempt
-    /// with the terminal result it ever reached, and the reset instants the
-    /// newest observation carries.
+    /// with the terminal result it ever reached, the trailing authentication
+    /// streak, and the reset instants the newest observation carries.
     pub fn due_evidence_snapshot(
         &self,
         account_id: AccountId,
@@ -91,6 +91,11 @@ impl Repository {
                 Some(stored) => meter_attempt::result_by_attempt_id(conn, stored.row_id)?,
                 None => None,
             };
+            let consecutive_auth_failures =
+                meter_attempt::consecutive_auth_failures_for_account(conn, account_id)?;
+            let latest_credential_context_id = latest_attempt
+                .as_ref()
+                .and_then(|stored| stored.credential_context_id.clone());
             let known_resets =
                 match meter_evidence::newest_observation_for_account(conn, account_id)? {
                     Some(observation) => {
@@ -129,6 +134,8 @@ impl Repository {
                 latest_attempt: latest_attempt_started,
                 latest_due_at,
                 latest_result: latest_result_typed,
+                consecutive_auth_failures,
+                latest_credential_context_id,
                 known_resets,
             })
         })
@@ -498,14 +505,24 @@ pub struct TerminalBundleCommit {
 
 /// One account's evidence for the due decision, read as one snapshot: whether
 /// the account has ever been observed, its latest attempt with the terminal
-/// result it ever reached, and the reset instants the newest observation
-/// carries. `None` attempt means the account has never been sampled, which is
-/// itself a due answer (an empty history is due on ordinary cadence).
+/// result it ever reached, the trailing authentication streak, and the reset
+/// instants the newest observation carries. `None` attempt means the account
+/// has never been sampled, which is itself a due answer (an empty history is
+/// due on ordinary cadence).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DueEvidenceSnapshot {
     pub latest_attempt: Option<AttemptStarted>,
     pub latest_due_at: Option<UtcTimestamp>,
     pub latest_result: Option<AttemptResult>,
+    /// Trailing consecutive `auth_required` results (aub-x2je). Any other
+    /// terminal outcome, or an open latest attempt, leaves this at zero.
+    pub consecutive_auth_failures: u32,
+    /// The credential context the latest attempt carried (aub-x2je). The
+    /// sampler compares it against the currently resolved context: a change
+    /// means the operator fixed the credential and the streak is ignored.
+    /// `None` on older rows predates the column and never counts as a
+    /// change.
+    pub latest_credential_context_id: Option<String>,
     pub known_resets: Vec<UtcTimestamp>,
 }
 
@@ -991,6 +1008,8 @@ mod tests {
         assert_eq!(fresh.latest_attempt, None);
         assert_eq!(fresh.latest_due_at, None);
         assert_eq!(fresh.latest_result, None);
+        assert_eq!(fresh.consecutive_auth_failures, 0);
+        assert_eq!(fresh.latest_credential_context_id, None);
         assert_eq!(fresh.known_resets, Vec::new());
 
         // After one sampled-and-committed attempt, the snapshot carries the
@@ -1013,6 +1032,11 @@ mod tests {
             .expect("the committed bundle's result must be visible to the snapshot");
         assert_eq!(result.attempt_id(), started.attempt_id());
         assert_eq!(result.outcome(), AttemptOutcome::Success);
+        assert_eq!(sampled.consecutive_auth_failures, 0);
+        assert_eq!(
+            sampled.latest_credential_context_id,
+            Some("credential-context-v1".to_string())
+        );
         assert_eq!(
             sampled.known_resets,
             vec![UtcTimestamp::from_unix_nanos(9_000)],

@@ -855,19 +855,34 @@ fn the_engine_reports_the_worked_example_numbers() {
                 retry_backoff_policy: snapshot.policy().retry_backoff_policy.clone(),
             })
             .collect(),
-        attempts: attempts
-            .iter()
-            .map(|attempt| coverage::AttemptRecord {
-                started_at: attempt.started_at,
-                result: attempt
-                    .terminal
-                    .as_ref()
-                    .map(|terminal| coverage::AttemptResultRecord {
-                        finished_at: terminal.finished_at,
-                        retry_after: terminal.retry_after,
+        attempts: {
+            let mut last_context: Option<&str> = None;
+            let mut records = Vec::with_capacity(attempts.len());
+            for attempt in &attempts {
+                let changed = match (attempt.credential_context_id.as_deref(), last_context) {
+                    (Some(current), Some(previous)) => current != previous,
+                    _ => false,
+                };
+                if attempt.credential_context_id.is_some() {
+                    last_context = attempt.credential_context_id.as_deref();
+                }
+                records.push(coverage::AttemptRecord {
+                    started_at: attempt.started_at,
+                    result: attempt.terminal.as_ref().map(|terminal| {
+                        coverage::AttemptResultRecord {
+                            finished_at: terminal.finished_at,
+                            retry_after: terminal.retry_after,
+                            is_auth_required: matches!(
+                                terminal.outcome,
+                                AttemptOutcome::AuthRequired
+                            ),
+                        }
                     }),
-            })
-            .collect(),
+                    credential_changed: changed,
+                });
+            }
+            records
+        },
         observations: observations
             .iter()
             .map(|at| coverage::ObservationRecord { at: *at })

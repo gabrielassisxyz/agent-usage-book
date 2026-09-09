@@ -126,13 +126,17 @@ pub fn capture_backup_cut(
 /// Opens the archived database read-only, then runs the two checks in the order
 /// required by the recovery design. A foreign-key violation cannot be hidden by
 /// a successful integrity check because the second query is independent.
+///
+/// Opens through [`crate::store::connection::AccessMode::ArchiveImmutable`] so
+/// verification creates no `-shm`/`-wal` sidecar inside the archive directory
+/// and succeeds on read-only media (aub-2r0n).
 pub fn verify_database(
     database: &Path,
     busy_timeout: MonotonicDuration,
 ) -> Result<Result<DatabaseVerification, DatabaseVerificationFailure>, Error> {
     let connection = crate::store::connection::open(
         database,
-        crate::store::connection::AccessMode::ReadOnly,
+        crate::store::connection::AccessMode::ArchiveImmutable,
         &crate::store::connection::PragmaPolicy { busy_timeout },
     )?;
     verify_database_on_connection(&connection)
@@ -193,13 +197,15 @@ pub fn verify_database_on_connection(
 }
 
 /// Reads the archived database metadata for comparison with its manifest.
+/// Opens side-effect-free through `ArchiveImmutable` for the same reason as
+/// [`verify_database`]: no sidecar, verifiable on read-only media.
 pub fn archived_database_metadata(
     database: &Path,
     busy_timeout: MonotonicDuration,
 ) -> Result<(u32, u64), Error> {
     let connection = crate::store::connection::open(
         database,
-        crate::store::connection::AccessMode::ReadOnly,
+        crate::store::connection::AccessMode::ArchiveImmutable,
         &crate::store::connection::PragmaPolicy { busy_timeout },
     )?;
     Ok((
