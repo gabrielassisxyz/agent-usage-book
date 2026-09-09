@@ -91,20 +91,26 @@ aub_bin="$target_dir/release/aub"
 # The budget is a hard gate: a suite that grows without bound is a suite that
 # stops being run, and an unrun suite is a suite that proves nothing.
 #
-# Raised from 120s to 240s on 2026-09-09, because the measurement changed rather
-# than the tolerance. Until commit 2efab9f the suite silently ran 51 of its 62
-# cases: run.sh reads its case list on stdin and any step whose program also read
-# stdin drained it, skipping every case sorted after that reader. The honest suite
-# costs 194s on the CI runner (96-98s when it was running 51) and 156-159s on the
-# development machine, so the old ceiling was only ever met by not running a sixth
-# of the suite. The headroom here is the same ratio the old pair carried.
+# 90s since 2026-09-09 (aub-e2e-cost-rjxc), from three consecutive readings on
+# the CI runner after the suite's cost was cut: 66s, 69s and 71s (run 34342284685,
+# attempts 1 to 3), with the case count asserted at 61 of 61 on each. The rule is
+# the slowest reading times 1.25, rounded up to a multiple of 10s; the pair the
+# suite started with was 120s against 96-98s, about 1.22x, and this keeps that
+# headroom. The desktop's quiet case time is about 44s.
 #
-# The suite no longer carries the status latency benchmark (aub-oc56): case 022
-# ran the same 4000 spawns 85-status-latency-budget already runs and enforces,
-# about 24 s of case time, and a benchmark inside a wall-clock budget measures
-# the machine rather than the code. Its artifact-shape assertions moved into
-# that check. Case 015 stays, evidentiary and about 7 s; its header says why.
-budget_seconds="${E2E_BUDGET_SECONDS:-240}"
+# The history the number carries. It was 120s until 2026-09-09, met only because
+# the suite silently ran 51 of its 62 cases: run.sh read its case list on stdin
+# and a step whose program also read stdin (script's pty relay) drained it,
+# skipping every case sorted after that reader. Commit 2efab9f closed the cause,
+# the honest 62-case suite cost 194s on the runner, and the budget went to 240s
+# the same day. Three cuts then brought the suite down without hiding a case:
+# aub-rlfn fails the run and this gate when fewer cases ran than the directory
+# holds; aub-oc56 took case 022 out, the same 4000 spawns 85-status-latency-budget
+# already runs and enforces, with its artifact-shape assertions moved there;
+# aub-6fuo cut the two ten-tick cases from 41s each to about 1s and 10s, the
+# sleep their classifier condition needs. Case 015 stays, evidentiary and about
+# 7s; its header says why.
+budget_seconds="${E2E_BUDGET_SECONDS:-90}"
 
 start="$(date +%s)"
 AUB_BIN="$aub_bin" "$repo_root/tests/e2e/run.sh" --state-dir "$(mktemp -d "${TMPDIR:-/tmp}/aub-e2e-ci-XXXXXX")"
