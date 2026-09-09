@@ -22,12 +22,21 @@ which does not list them either.
 
 **Answers:** how much quota does each configured account have left?
 
-**Refuses:** the network, a write, and SQLite. `status` reads the last
-published projection file and nothing else, so it never blocks on a provider
-and never contends with a concurrent sampler for the store. It exits non-zero
-only for an argument-parsing failure; a stale reading, an auth-required
-account, or a missing projection are answers, not errors, and all render with
-exit 0 so a status bar never treats degraded output as process failure.
+**Refuses:** the network, a write, and SQLite by default. `status` reads the
+last published projection file and nothing else, so it never blocks on a
+provider and never contends with a concurrent sampler for the store. It exits
+non-zero only for an argument-parsing failure; a stale reading, an
+auth-required account, or a missing projection are answers, not errors, and
+all render with exit 0 so a status bar never treats degraded output as process
+failure.
+
+`--refresh` asks the command to take one forced sampling attempt per selected
+account before rendering, through the same sampling path `aub now` uses, and
+then to render the grid from the projection that pass published. Without the
+flag no attempt is ever taken, so the default stays a read of the ledger. An
+account whose refresh attempt fails is not an error: it renders its last known
+reading with its age, which is the fact an operator comparing against a live
+tool needs.
 
 Text output goes through one style layer (`src/presentation/style.rs`), which
 also answers `--no-color` where every other command refuses it. Colour is on
@@ -40,7 +49,8 @@ never colour-dependent.
 **Layout.** `status` prints a grouped grid: a `QUOTA` header with the current
 local time right-aligned to the terminal width, then one block per provider
 (accounts in the order the config lists them), each account a name-and-plan
-line over one row per quota window. The row columns are a fixed width: the
+line that also names how old the observation behind the reading is, over one
+row per quota window. The row columns are a fixed width: the
 window label (`5h`, `week`, or a model display name), a 30-cell bar that fills
 as quota is *used*, the percent used, the burn rate (`1.0x` is on pace to hit
 the cap exactly at the reset), then the reset in local time with any note.
@@ -49,21 +59,24 @@ the cap exactly at the reset), then the reset in local time with any note.
 QUOTA                                                       Mon 07 Sep 14:22 -03
 
 anthropic ──────────────────────────────────────────────────────────────────────
-  primary  anthropic
+  primary  anthropic · observed 2m ago
     5h       ━━━━━━━━━━━━━━━━━━━───────────   62%   1.19x Mon 17:00
     week     ━━━━━━━━━━━━──────────────────   41%   0.95x Fri 09:00
     fable    ━━━━━━━━━━━━━━━━━━━━━━━━━━────   88%   2.04x Fri 09:00
 
-  gmail  anthropic
+  gmail  anthropic · observed 2m ago
     5h       ━━━━──────────────────────────   12%   0.23x Mon 17:00
     week     ━━────────────────────────────    5%   0.12x Fri 09:00
 ```
 
 A stale account dims its whole block and each row's note reads
-`cached <age> ago  <reason>`; an auth-required account shows `auth!` in place
-of the grid; an unreadable projection is the bare `aub ?`. `--format json`
-carries every window under `accounts[].windows[]`, not only the limiting one
-(schema v3). `--model NAME` narrows both the grid rows and the reading to the
+`cached <age> ago  <reason>`, the same age the header names; an
+auth-required account shows `auth!` in place of the grid; an unreadable
+projection is the bare `aub ?`. `--format json` carries every window under
+`accounts[].windows[]`, not only the limiting one, and the reading
+observation's age as the machine-readable `observation_age_nanos` beside the
+freshness variant (schema v4; a reading with no observation behind it omits
+the field). `--model NAME` narrows both the grid rows and the reading to the
 account-wide and named-model windows.
 
 ## `aub now`

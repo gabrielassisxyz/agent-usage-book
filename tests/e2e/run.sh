@@ -145,10 +145,14 @@ step() {
     state_digest "$STATE_DIR" >"$dir/state-before.sha256"
 
     set +e
+    # Every step's stdin is /dev/null: a step runs a program, and a program
+    # that reads stdin (script's pty relay does) would otherwise drain the
+    # case list this loop is reading from, silently skipping every case
+    # sorted after the reader.
     if [ -n "$timeout_secs" ]; then
-        timeout --signal=TERM --kill-after=2 "$timeout_secs" "$@" >"$dir/stdout.bin" 2>"$dir/stderr.bin"
+        timeout --signal=TERM --kill-after=2 "$timeout_secs" "$@" <"/dev/null" >"$dir/stdout.bin" 2>"$dir/stderr.bin"
     else
-        "$@" >"$dir/stdout.bin" 2>"$dir/stderr.bin"
+        "$@" <"/dev/null" >"$dir/stdout.bin" 2>"$dir/stderr.bin"
     fi
     rc=$?
 

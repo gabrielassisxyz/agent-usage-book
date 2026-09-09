@@ -271,6 +271,99 @@ fn a_reading_without_window_context_stays_the_plain_shape() {
     );
 }
 
+/// The reading observation's age is machine-readable beside the freshness
+/// variant (aub-yg2q, schema v4): `observation_age_nanos` carries the exact
+/// age the report was computed at, through the same measurement basis the
+/// verdict used. A reading with no observation behind it omits the field by
+/// the same absence convention `included_scopes` follows. The planted
+/// negative is the exact key set: a field under any other name, or an age on
+/// an account with no observation, would fail these assertions.
+#[test]
+fn the_observation_age_is_machine_readable_beside_the_freshness_variant() {
+    use agent_usage_book::domain::time::{ClockSkewEnvelope, MonotonicDuration};
+    let now = UtcTimestamp::from_unix_nanos(2_000_000_000_000);
+    let envelope = ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60));
+    // The observed instant sits 120 seconds before the report's, so the
+    // machine-readable age is the exact 120-second span in nanoseconds.
+    let aged = MeterAccount::new(
+        LogicalName::new("primary"),
+        Freshness::Fresh {
+            observed: Observed::new(
+                QuotaRemaining::new(QuotaFractionPpm::new(380_000).unwrap()),
+                None,
+                ReceivedAt::new(UtcTimestamp::from_unix_nanos(
+                    2_000_000_000_000 - 120_000_000_000,
+                )),
+                MeasurementBasis::LocallyReceived,
+            ),
+            latest_attempt: AttemptId::new(1),
+        },
+    )
+    .with_observation_age_at(now, envelope);
+
+    let report = StatusReport::new(
+        ReportMetadata::new(
+            now,
+            now,
+            agent_usage_book::report::LedgerGeneration::new(12),
+            None,
+        ),
+        vec![aged],
+        vec![],
+        ProjectionReadState::Read,
+    );
+    let document = status_json_with_explain(&report, run(), ExplainMode::Off);
+    validate_status_report_json(&document).expect("the aged document must validate");
+
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    let account = &parsed["accounts"][0];
+    assert_eq!(account["observation_age_nanos"], 120_000_000_000u64);
+    let mut keys: Vec<String> = account.as_object().unwrap().keys().cloned().collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        vec![
+            "account",
+            "freshness",
+            "latest_attempt",
+            "observation_age_nanos",
+            "remaining"
+        ],
+        "the age joins the account field set exactly: {keys:?}"
+    );
+
+    // The absence convention: no observation, no age field, and the
+    // validator still accepts the document.
+    let never = MeterAccount::new(
+        LogicalName::new("secondary"),
+        Freshness::Stale {
+            last_good: None,
+            latest_attempt: AttemptId::new(2),
+            reason: agent_usage_book::domain::freshness::StaleReason::NoSuccessfulObservation,
+        },
+    )
+    .with_observation_age_at(now, envelope);
+    let report = StatusReport::new(
+        ReportMetadata::new(
+            now,
+            now,
+            agent_usage_book::report::LedgerGeneration::new(12),
+            None,
+        ),
+        vec![never],
+        vec![],
+        ProjectionReadState::Read,
+    );
+    let document = status_json_with_explain(&report, run(), ExplainMode::Off);
+    validate_status_report_json(&document).expect("the never-observed document must validate");
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert!(
+        parsed["accounts"][0].get("observation_age_nanos").is_none(),
+        "no observation, no age field: {}",
+        parsed["accounts"][0]
+    );
+}
+
 /// `aub status --format json` lists every window under `accounts[].windows[]`
 /// (schema v3), each carrying the full field set, and the limiting window
 /// derived from the list is the active window with the highest used ppm. The
@@ -348,7 +441,7 @@ fn the_status_document_lists_every_window_with_its_full_field_set() {
     validate_status_report_json(&document).expect("the v3 windows document must validate");
 
     let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
-    assert_eq!(parsed["schema"], 3);
+    assert_eq!(parsed["schema"], 4);
     let windows = parsed["accounts"][0]["windows"].as_array().unwrap();
     assert_eq!(windows.len(), 3);
     let fable = windows
@@ -481,14 +574,15 @@ fn a_model_group_window_serializes_its_scope_object() {
 /// The aub-v8wt decision, pinned: `reported_resolution_ppm` and
 /// `quantization` travel the report model to the grid renderer, but they do
 /// not join the JSON contract. The window object is exactly the eight known
-/// keys and the schema stays 3: the JSON consumer holds the exact
-/// `quota_used_ppm` integer and loses nothing, the projection document already
-/// publishes both keys for the machine-to-machine reader, and the envelope
-/// schema is shared by every command, so a status-windows addition would bump
-/// spend, now and coverage documents for no consumer gain. If the field set
-/// ever grows, the schema must move with it.
+/// keys. The JSON consumer holds the exact `quota_used_ppm` integer and loses
+/// nothing, the projection document already publishes both keys for the
+/// machine-to-machine reader, and the envelope schema is shared by every
+/// command. The envelope is at v4 since aub-yg2q added the account-level
+/// `observation_age_nanos`; the window field set itself is unchanged, so a
+/// consumer reading windows is unaffected by that bump beyond the version
+/// number. If the field set ever grows, the schema must move with it.
 #[test]
-fn windows_omit_resolution_fields_and_the_schema_stays_three() {
+fn windows_omit_resolution_fields_and_the_schema_moves_with_the_field_set() {
     use agent_usage_book::domain::burn_rate::BurnRate;
     use agent_usage_book::domain::quota::QuotaUsed;
     use agent_usage_book::report::StatusWindow;
@@ -525,7 +619,7 @@ fn windows_omit_resolution_fields_and_the_schema_stays_three() {
     validate_status_report_json(&document).expect("the document must validate");
 
     let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
-    assert_eq!(parsed["schema"], 3);
+    assert_eq!(parsed["schema"], 4);
     let window = parsed["accounts"][0]["windows"][0].as_object().unwrap();
     let mut keys: Vec<&str> = window.keys().map(String::as_str).collect();
     keys.sort_unstable();

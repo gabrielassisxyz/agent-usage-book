@@ -103,8 +103,12 @@ case_steps() {
         "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:$ANTHROPIC_PORT" \
         "$AUB_BIN" sample --due
 
-    # 4. Past the boundary again, now inside the backoff hold.
-    step "hold-past-second-boundary" sleep 2
+    # 4. Past the ordinary cadence boundary again but short of the two-second
+    #    backoff hold computed from step 3's finish, with margin: the hold
+    #    window between the two boundaries is one second wide, and a sleep
+    #    landing at its edge leaves no room for the step's own process
+    #    startup to land on the wrong side of it.
+    step "hold-past-second-boundary" sleep 1.5
 
     # 5. Third tick: streak two reaches the threshold, so not-due with no
     #    new attempt.

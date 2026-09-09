@@ -134,7 +134,7 @@ case_assertions() {
     # Step 5: JSON report exits 7 and carries versioned JSON structure with error envelope
     assert_exit 7 5
     assert_stdout_contains 5 '"command":"coverage"'
-    assert_stdout_contains 5 '"schema":3'
+    assert_stdout_contains 5 '"schema":4'
     assert_stdout_contains 5 '"met":false'
     assert_json_field 5 "threshold.attempt_floor.value" "980000"
     assert_json_field 5 "threshold.measurement_floor.value" "950000"

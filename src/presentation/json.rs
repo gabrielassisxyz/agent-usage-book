@@ -37,7 +37,7 @@ use crate::transcripts::TranscriptDriftReport;
 ///
 /// v3: `aub status --format json` carries every quota window under
 /// `accounts[].windows[]`, not only the limiting one.
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// An error during JSON contract validation or deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2558,6 +2558,16 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
         json_string(account.account.as_str())
     )];
     fields.push(freshness_variant_fields(&account.reading));
+    // The reading observation's age in nanoseconds, machine-readable beside
+    // the freshness variant (aub-yg2q, schema v4). Computed at report time
+    // through the same measurement basis the verdict used, so a consumer can
+    // tell a stale snapshot from a real disagreement without subtracting
+    // timestamps. Carried only when an observation stands behind the reading,
+    // by the field's absence otherwise, the same convention `included_scopes`
+    // uses.
+    if let Some(age) = account.observation_age {
+        fields.push(format!("\"observation_age_nanos\":{}", age.as_nanos()));
+    }
     // The included scopes travel only when the reading included windows: an
     // account with no window context carries the fact by the field's absence
     // rather than by an empty array that reads as a measured nothing.
@@ -3287,7 +3297,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 3,
+                "schema": 4,
                 "command": "spend",
                 "error": {
                     "code": "INVALID_USAGE",
@@ -3303,7 +3313,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 3,
+                "schema": 4,
                 "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
             })
         );
