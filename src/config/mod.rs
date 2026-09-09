@@ -355,6 +355,13 @@ pub struct AnthropicConfig {
     pub statusline: bool,
 }
 
+/// The Antigravity provider's OAuth refresh switch (aub-6qay).
+#[derive(Debug, Clone)]
+pub struct AntigravityConfig {
+    /// Whether `aub` renews an expired Antigravity access token in place.
+    pub refresh: bool,
+}
+
 /// The exclusivity policy for a configured account (`aub-c0b.7`).
 ///
 /// Exhaustive with no wildcard arm: an unrecognized configured value fails
@@ -506,6 +513,7 @@ pub struct Config {
     pub adapter_semantics: AdapterSemanticsConfig,
     pub doctor: DoctorConfig,
     pub anthropic: AnthropicConfig,
+    pub antigravity: AntigravityConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
@@ -535,6 +543,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "adapter_semantics",
     "doctor",
     "anthropic",
+    "antigravity",
     "projects",
     "repositories",
 ];
@@ -589,6 +598,7 @@ const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
 const ANTHROPIC_KEYS: &[&str] = &["refresh", "statusline"];
+const ANTIGRAVITY_KEYS: &[&str] = &["refresh"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -706,6 +716,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("anthropic").and_then(toml::Value::as_table) {
         check_keys(t, ANTHROPIC_KEYS, "anthropic", file_display)?;
+    }
+    if let Some(t) = table.get("antigravity").and_then(toml::Value::as_table) {
+        check_keys(t, ANTIGRAVITY_KEYS, "antigravity", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -1557,6 +1570,17 @@ pub fn resolve(
             &mut provenance,
         )?,
     };
+    let antigravity = AntigravityConfig {
+        refresh: resolve_bool(
+            "antigravity.refresh",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "antigravity", "refresh"),
+            Some("true"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
 
     let valuation = ValuationConfig {
         default_rate_book: file
@@ -1766,6 +1790,7 @@ pub fn resolve(
             adapter_semantics,
             doctor,
             anthropic,
+            antigravity,
             projects,
             repositories,
         },
@@ -1940,6 +1965,7 @@ impl Config {
             }
             "anthropic.refresh" => self.anthropic.refresh.to_string(),
             "anthropic.statusline" => self.anthropic.statusline.to_string(),
+            "antigravity.refresh" => self.antigravity.refresh.to_string(),
             "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
             "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
             "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
@@ -3297,6 +3323,8 @@ adapter_semantics.max_comparison_age  30d                                      d
 
 anthropic.refresh                     true                                     default
 anthropic.statusline                  true                                     default
+
+antigravity.refresh                   true                                     default
 
 attribution.recent_window             30d                                      default
 

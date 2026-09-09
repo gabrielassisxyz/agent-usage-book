@@ -164,6 +164,9 @@ without the section prefix (the full box for a two-account config):
 │  anthropic                                                                   │
 │    refresh                  true                                    default  │
 │                                                                              │
+│  antigravity                                                                 │
+│    refresh                  true                                    default  │
+│                                                                              │
 │  attribution                                                                 │
 │    recent_window            30d                                     default  │
 │                                                                              │
