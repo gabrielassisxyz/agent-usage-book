@@ -8,12 +8,19 @@
 //! same connection by the publisher, so the generation the file records names
 //! exactly the state these rows return.
 //!
-//! "The last successful observation" is defined here, once: the newest attempt
-//! of the account whose terminal outcome is success, and for that attempt's
-//! evidence the interpretation the preference selector names current under the
-//! attempt's own semantics version. A corrected adapter supersedes an older
-//! interpretation through that selector, so the projection always describes
-//! the interpretation a database reader would itself be given.
+//! "The last successful observation" is defined here, once: the newest usable
+//! full-window observation of the account whose terminal outcome is success,
+//! and for that attempt's evidence the interpretation the preference selector
+//! names current under the attempt's own semantics version. The Anthropic
+//! status-line contract deliberately reports a subset of the provider's
+//! windows, so it cannot displace a fuller observation. Carrying its windows
+//! forward was rejected: it would create a composite reading with different
+//! ages while the projection has one freshness value per account. When an
+//! account has only status-line observations, its newest observation still
+//! renders, with exactly the subset of windows the source reported. A corrected
+//! adapter supersedes an older interpretation through that selector, so the
+//! projection always describes the interpretation a database reader would
+//! itself be given.
 //!
 //! May not depend on:
 //! - HTTP or provider semantics
@@ -27,6 +34,8 @@ use crate::error::Error;
 use super::account::{Account, AccountId, all_accounts};
 use super::meter_attempt::{self, StoredMeterAttempt, StoredMeterAttemptResult};
 use super::meter_evidence::{self, EvidenceRowId, StoredMeterObservation, StoredMeterWindow};
+
+const ANTHROPIC_STATUSLINE_CONTRACT_ID: &str = "anthropic-statusline-rate-limits-v1";
 
 /// The last successful observation of one account and the windows it reported.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,27 +96,32 @@ fn last_successful_observation(
     conn: &Connection,
     account_id: AccountId,
 ) -> Result<Option<SuccessfulObservation>, Error> {
-    let Some(attempt) = meter_attempt::newest_successful_attempt_for_account(conn, account_id)?
-    else {
-        return Ok(None);
-    };
-    let Some(evidence_id) = meter_evidence::newest_evidence_for_attempt(conn, attempt.row_id)?
-    else {
-        return Ok(None);
-    };
-    let Some(observation) = current_observation(
-        conn,
-        evidence_id,
-        &MeterSemanticsId::new(attempt.meter_semantics_id.clone()),
-    )?
-    else {
-        return Ok(None);
-    };
-    let windows = meter_evidence::windows_by_observation(conn, observation.row_id)?;
-    Ok(Some(SuccessfulObservation {
-        observation,
-        windows,
-    }))
+    let mut newest_subset = None;
+    for attempt in meter_attempt::successful_attempts_for_account(conn, account_id)? {
+        let Some(evidence_id) = meter_evidence::newest_evidence_for_attempt(conn, attempt.row_id)?
+        else {
+            continue;
+        };
+        let Some(observation) = current_observation(
+            conn,
+            evidence_id,
+            &MeterSemanticsId::new(attempt.meter_semantics_id.clone()),
+        )?
+        else {
+            continue;
+        };
+        let selected = SuccessfulObservation {
+            windows: meter_evidence::windows_by_observation(conn, observation.row_id)?,
+            observation,
+        };
+        if selected.observation.provider_contract_id.as_str() != ANTHROPIC_STATUSLINE_CONTRACT_ID {
+            return Ok(Some(selected));
+        }
+        if newest_subset.is_none() {
+            newest_subset = Some(selected);
+        }
+    }
+    Ok(newest_subset)
 }
 
 /// The interpretation the preference selector names current for one evidence
@@ -321,6 +335,12 @@ pub mod test_support {
             commit_terminal_bundle_on_connection(&mut self.conn, &bundle, || Ok(())).unwrap();
         }
 
+        pub fn commit_statusline_success_bundle(&mut self, attempt_id: MeterAttemptRowId) {
+            let bundle =
+                self.success_bundle_for_contract(attempt_id, "anthropic-statusline-rate-limits-v1");
+            commit_terminal_bundle_on_connection(&mut self.conn, &bundle, || Ok(())).unwrap();
+        }
+
         pub fn commit_failure(&mut self, attempt_id: MeterAttemptRowId, class: FailureClass) {
             self.clock.advance(MonotonicDuration::from_millis(500));
             let result = NewMeterAttemptResult {
@@ -336,6 +356,14 @@ pub mod test_support {
         }
 
         pub fn success_bundle(&mut self, attempt_id: MeterAttemptRowId) -> TerminalMeterBundle {
+            self.success_bundle_for_contract(attempt_id, "contract-v1")
+        }
+
+        fn success_bundle_for_contract(
+            &mut self,
+            attempt_id: MeterAttemptRowId,
+            provider_contract_id: &str,
+        ) -> TerminalMeterBundle {
             self.clock.advance(MonotonicDuration::from_millis(500));
             let completed_at = self.clock.now();
             let window = MeterWindow::new(
@@ -366,7 +394,9 @@ pub mod test_support {
                 observed_plan: Some("max".into()),
                 observed_tier: None,
                 adapter_version: AdapterVersion::new("adapter-v1"),
-                provider_contract_id: crate::domain::ids::ProviderContractId::new("contract-v1"),
+                provider_contract_id: crate::domain::ids::ProviderContractId::new(
+                    provider_contract_id,
+                ),
                 meter_semantics_id: crate::domain::ids::MeterSemanticsId::new("semantics-v1"),
                 normalized_fingerprint: "fingerprint-v1".into(),
             };
@@ -495,6 +525,68 @@ mod tests {
         let success = states[0].last_success.as_ref().unwrap();
         assert_eq!(success.observation.attempt_id, second);
         assert_eq!(success.windows.len(), 1);
+    }
+
+    #[test]
+    fn a_newer_statusline_subset_keeps_the_newest_full_observation() {
+        let mut fixture = fixture("statusline-subset");
+        let full_attempt = fixture.start_attempt();
+        fixture.commit_success_bundle(full_attempt);
+        let subset_attempt = fixture.start_attempt();
+        fixture.commit_statusline_success_bundle(subset_attempt);
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        let success = states[0].last_success.as_ref().unwrap();
+        assert_eq!(
+            success.observation.attempt_id, full_attempt,
+            "the newer status-line observation is a deliberate window subset, not a replacement"
+        );
+        assert_eq!(
+            states[0].latest_attempt.as_ref().unwrap().attempt.row_id,
+            subset_attempt,
+            "the status-line collection remains the latest attempt even when its reading is not selected"
+        );
+    }
+
+    #[test]
+    fn a_newer_full_observation_still_supersedes_a_statusline_subset() {
+        let mut fixture = fixture("full-after-statusline");
+        let subset_attempt = fixture.start_attempt();
+        fixture.commit_statusline_success_bundle(subset_attempt);
+        let full_attempt = fixture.start_attempt();
+        fixture.commit_success_bundle(full_attempt);
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        assert_eq!(
+            states[0]
+                .last_success
+                .as_ref()
+                .unwrap()
+                .observation
+                .attempt_id,
+            full_attempt
+        );
+    }
+
+    #[test]
+    fn an_account_with_only_statusline_observations_still_selects_its_newest_reading() {
+        let mut fixture = fixture("statusline-only");
+        let first_attempt = fixture.start_attempt();
+        fixture.commit_statusline_success_bundle(first_attempt);
+        let newest_attempt = fixture.start_attempt();
+        fixture.commit_statusline_success_bundle(newest_attempt);
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        assert_eq!(
+            states[0]
+                .last_success
+                .as_ref()
+                .unwrap()
+                .observation
+                .attempt_id,
+            newest_attempt,
+            "without a full observation, the account renders the newest subset it reported"
+        );
     }
 
     #[test]

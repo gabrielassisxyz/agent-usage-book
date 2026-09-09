@@ -649,6 +649,60 @@ fn scoped_weekly_window_is_a_row_and_the_limit() {
     );
 }
 
+/// The newest observation being an Anthropic status-line subset does not cost
+/// the account its model-scoped row on the rendered grid. The projection keeps
+/// the fuller reading as `last_successful_observation` while the status-line
+/// collection is only the newer `latest_attempt`, and the grid still renders
+/// `5h`, `week` and the `fable` row beneath them. The planted negative is the
+/// model row: a selection that let the subset win would drop
+/// `weekly_scoped_fable` and leave two rows.
+#[test]
+fn a_status_line_subset_as_the_latest_attempt_keeps_the_model_row() {
+    let primary = account(
+        "primary",
+        Some(success_observation(
+            vec![
+                account_wide(620_000, 5 * 3_600, 3 * 3_600),
+                account_wide(410_000, 7 * 86_400, 4 * 86_400),
+                window(
+                    "weekly_scoped_fable",
+                    WindowScope::ModelSpecific(ModelId::new("fable".to_string())),
+                    880_000,
+                    7 * 86_400,
+                    3 * 86_400,
+                ),
+            ],
+            300,
+        )),
+        // Newer than the full observation above, successful, and from the
+        // status-line source: the latest attempt, but not the reading the
+        // projection selected.
+        Some(latest_attempt(120, success(120))),
+    );
+    let report = seeded_report(vec![primary]);
+    let rendered = render(&report);
+    let rows: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
+        .collect();
+    assert_eq!(rows.len(), 3, "5h, week, fable: {rendered}");
+    assert!(rows[0].trim_start().starts_with("5h"), "{rendered}");
+    assert!(rows[1].trim_start().starts_with("week"), "{rendered}");
+    assert!(
+        rows[2].trim_start().starts_with("fable"),
+        "the model row survives a newer status-line subset: {rendered}"
+    );
+    assert!(
+        report.accounts[0]
+            .included_scopes
+            .contains(&WindowScope::ModelSpecific(ModelId::new(
+                "fable".to_string()
+            ))),
+        "the model scope is in included_scopes: {:?}",
+        report.accounts[0].included_scopes
+    );
+}
+
 /// The window duration labels the grid's account-wide rows carry.
 #[test]
 fn window_duration_labels() {
