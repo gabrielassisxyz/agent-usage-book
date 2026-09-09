@@ -80,6 +80,7 @@ use crate::domain::window::{
     MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
     WindowResetState, WindowScope, WindowSemanticKey,
 };
+use crate::domain::window_anomaly::RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS;
 use crate::meter::adapter::{
     AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
     ProviderObservation, RequiredWindowKinds,
@@ -473,6 +474,106 @@ fn epoch_seconds_reset_state(seconds: &serde_json::Number) -> Option<WindowReset
     )))
 }
 
+/// How close to exactly one nominal duration ahead of the observation a
+/// reported reset may sit and still be the provider's unstarted-window shape
+/// rather than a boundary (aub-z09n).
+///
+/// For a window that has not been used, the provider reports no boundary at
+/// all: it reports one nominal duration from whenever you ask, so the
+/// instant it hands back lands at the observation instant plus the window's
+/// nominal duration, minus only the time the response spent in flight and
+/// whatever the two clocks disagree by. Measured over the false anomaly
+/// rows this rewrite retires, that distance was 0.36 s on every row, and
+/// the largest provider jitter the ledger has ever recorded is 0.9265 s.
+/// The envelope is therefore the ledger's own jitter tolerance, read from
+/// the one place it is defined rather than copied: the same physical
+/// envelope, how far two reports of one instant can sit apart, sizes both
+/// questions.
+///
+/// The match is strictly inside: a reset exactly at the envelope or past it
+/// is a boundary, the same convention the pair classifier holds the jitter
+/// envelope to. A genuine boundary can only be swallowed when the window's
+/// reported usage is zero and the boundary lands inside the envelope of
+/// exactly one nominal duration ahead, which for a window the provider
+/// counts as unstarted means it began under two seconds before the sample
+/// with sub-ppm usage; every other genuine boundary keeps its `Known`
+/// state.
+const UNSTARTED_RESET_TOLERANCE_NANOS: i64 = RESET_TIMESTAMP_JITTER_TOLERANCE_NANOS;
+
+/// Rewrites the one fabricated shape an unstarted Codex window arrives in
+/// into the honest claim (aub-z09n).
+///
+/// When a Codex window has not been used, the provider reports a reset
+/// instant it cannot know: the observation instant plus the window's
+/// nominal duration, so the stored anchor slides one sampling interval per
+/// tick and every consecutive pair of idle readings classifies as
+/// `unexpected_reset_change`. The stored claim becomes
+/// [`WindowResetState::NotStarted`] with no instant at all, the same claim
+/// the Anthropic adapter makes for an idle session window.
+///
+/// The condition is zero reported usage AND a reset strictly inside the
+/// envelope of exactly one nominal duration ahead of the observation, and
+/// each half is load-bearing:
+///
+/// - Zero usage alone is not enough, because a window whose usage has
+///   rounded below one part per million but which has started still
+///   carries a genuine fixed boundary; erasing it would invent idleness.
+/// - The duration match alone is not enough, because a window sampled
+///   within the envelope of its own first instant reports a boundary
+///   exactly one nominal duration ahead while it is genuinely running;
+///   erasing it would invent idleness the same way.
+/// - Only the conjunction is exclusive to the fabricated shape: the
+///   provider counts a zero-usage window as unstarted, and its unstarted
+///   answer is exactly one nominal duration from the observation, so a
+///   reading that carries both is a boundary claim the provider cannot
+///   actually know.
+///
+/// `reset_precision` stays undeclared for this adapter on purpose: the
+/// reading is not an imprecise boundary (the aub-w1a0 remedy), it is no
+/// boundary at all. Declaring hours of precision instead would widen the
+/// pair tolerance and suppress every genuine reset change on these windows
+/// forever.
+fn reinterpret_unstarted_window(window: MeterWindow, observed_at: UtcTimestamp) -> MeterWindow {
+    let WindowResetState::Known(reset) = window.reset_state() else {
+        return window;
+    };
+    if window.quota_used().as_ppm().get() != 0 {
+        return window;
+    }
+    let fabricated = observed_at
+        .unix_nanos()
+        .saturating_add(i64::try_from(window.nominal_duration().as_nanos()).unwrap_or(i64::MAX));
+    if reset.unix_nanos().abs_diff(fabricated) >= UNSTARTED_RESET_TOLERANCE_NANOS as u64 {
+        return window;
+    }
+    MeterWindow::new(
+        window.semantic_key().clone(),
+        window.scope().clone(),
+        window.quota_used(),
+        window.reported_resolution(),
+        window.quantization(),
+        WindowResetState::NotStarted,
+        window.nominal_duration(),
+    )
+}
+
+/// Applies [`reinterpret_unstarted_window`] to every window of one reading
+/// against the reading's own observation instant, when the capsule carries
+/// one. A capsule without its source instant keeps the parsed state: there
+/// is nothing to test the fabricated shape against.
+fn reinterpret_unstarted_windows(
+    windows: Vec<MeterWindow>,
+    observed_at: Option<UtcTimestamp>,
+) -> Vec<MeterWindow> {
+    match observed_at {
+        Some(observed_at) => windows
+            .into_iter()
+            .map(|window| reinterpret_unstarted_window(window, observed_at))
+            .collect(),
+        None => windows,
+    }
+}
+
 /// Parses the usage endpoint's `rate_limit` object into the same two windows
 /// the rollout path produces. A 200 whose body carries no `rate_limit`
 /// object is [`FailureClass::SchemaDrift`]: the bytes parsed and the
@@ -565,13 +666,20 @@ fn replay_codex_capsule(capsule: &str) -> Result<CodexReading, FailureClass> {
     let rate_limits = quota_response
         .get("rate_limits")
         .ok_or(FailureClass::MissingRequiredField)?;
-    let windows = parse_rate_limits(rate_limits)?;
     let provider_observed_at = quota_response
         .get("source")
         .and_then(|source| source.get("mtime_nanos"))
         .and_then(serde_json::Value::as_i64)
         .filter(|nanos| *nanos >= 0)
         .map(|nanos| ProviderObservedAt::new(UtcTimestamp::from_unix_nanos(nanos)));
+    let windows = parse_rate_limits(rate_limits)?;
+    // The fabricated unstarted shape is anchored to the provider write
+    // instant the rollout record was made at, which is the reading's own
+    // measurement time: the file's mtime.
+    let windows = reinterpret_unstarted_windows(
+        windows,
+        provider_observed_at.map(|observed| observed.as_utc()),
+    );
     Ok(CodexReading {
         windows,
         provider_observed_at,
@@ -590,7 +698,16 @@ fn replay_codex_endpoint_capsule(capsule: &str) -> Result<Vec<MeterWindow>, Fail
             FailureClass::MissingRequiredField
         }
     })?;
-    parse_wham_usage(&quota_response)
+    let windows = parse_wham_usage(&quota_response)?;
+    // The fabricated unstarted shape is anchored to the instant the bytes
+    // arrived, which the capture records beside the endpoint that answered.
+    let received_at = quota_response
+        .get("source")
+        .and_then(|source| source.get("received_at_nanos"))
+        .and_then(serde_json::Value::as_i64)
+        .filter(|nanos| *nanos >= 0)
+        .map(UtcTimestamp::from_unix_nanos);
+    Ok(reinterpret_unstarted_windows(windows, received_at))
 }
 
 impl ProviderAdapter for CodexAdapter {
@@ -1959,5 +2076,311 @@ mod tests {
         assert_eq!(report.message, "Invalid authentication token provided.");
         assert!(matched_patterns(&report.classification).is_empty());
         assert!(matched_patterns(&report.message).is_empty());
+    }
+
+    /// A two-window rollout record with configurable percents and reset
+    /// epochs, for the unstarted-shape tests: the shape is what varies, not
+    /// the transport.
+    fn rollout_body(
+        primary_used: i64,
+        primary_resets_at: i64,
+        secondary_used: i64,
+        secondary_resets_at: i64,
+    ) -> Vec<u8> {
+        let line = serde_json::json!({
+            "timestamp": "2026-09-05T22:08:20.572Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "token_count",
+                "rate_limits": {
+                    "limit_id": "codex",
+                    "primary": {
+                        "used_percent": primary_used,
+                        "window_minutes": 300,
+                        "resets_at": primary_resets_at,
+                    },
+                    "secondary": {
+                        "used_percent": secondary_used,
+                        "window_minutes": 10_080,
+                        "resets_at": secondary_resets_at,
+                    },
+                },
+            },
+        });
+        let mut body = serde_json::to_vec(&line).expect("a JSON value always serializes");
+        body.push(b'\n');
+        body
+    }
+
+    /// An endpoint response body with configurable percents and reset
+    /// epochs, the same shape the committed endpoint fixture carries.
+    fn endpoint_body(
+        primary_used: i64,
+        primary_reset_at: i64,
+        secondary_used: i64,
+        secondary_reset_at: i64,
+    ) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": primary_used,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": primary_reset_at,
+                },
+                "secondary_window": {
+                    "used_percent": secondary_used,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": secondary_reset_at,
+                },
+            },
+        }))
+        .expect("a JSON value always serializes")
+    }
+
+    /// The rollout transport pinned to its documented mtime: the seconds
+    /// spelling the unstarted-shape fixtures anchor their fabricated resets
+    /// against.
+    fn rollout_transport_at_mtime(body: Vec<u8>, mtime_seconds: i64) -> FixtureTransport {
+        FixtureTransport {
+            body,
+            source_path: "/fixture/codex-home/sessions/2026/09/05/rollout-fixture.jsonl"
+                .to_string(),
+            mtime_nanos: mtime_seconds * 1_000_000_000,
+        }
+    }
+
+    /// The fabricated unstarted shape (aub-z09n): a zero-usage window whose
+    /// reset is exactly the observation instant plus the window's nominal
+    /// duration. The provider is not reporting a boundary there, so the
+    /// parse claims none: `NotStarted` with no instant at all, the same
+    /// claim the Anthropic adapter makes for an idle session window.
+    #[test]
+    fn an_unstarted_windows_fabricated_reset_parses_to_not_started() {
+        let mtime = 1_788_646_100i64;
+        let transport = rollout_transport_at_mtime(
+            rollout_body(0, mtime + 300 * 60, 0, mtime + 10_080 * 60),
+            mtime,
+        );
+        let captured = test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_request(),
+            &transport,
+            &test_clock(),
+        );
+        let reading = expect_measured(captured);
+
+        assert_eq!(reading.windows.len(), 2);
+        for window in &reading.windows {
+            assert_eq!(
+                window.reset_state(),
+                WindowResetState::NotStarted,
+                "window '{}' carries the fabricated reset as a known instant",
+                window.semantic_key().as_str()
+            );
+            assert_eq!(window.resets_at(), None);
+            assert_eq!(window.quota_used().as_ppm().get(), 0);
+        }
+    }
+
+    /// The envelope is strictly inside: a zero-usage reset exactly two
+    /// seconds past one nominal duration ahead is a boundary the provider
+    /// may know, so it stays `Known` with its instant, while one second
+    /// inside, the direction the measured fabrication actually lands in,
+    /// is the unstarted shape.
+    #[test]
+    fn a_zero_usage_reset_at_the_unstarted_envelope_is_a_boundary() {
+        let mtime = 1_788_646_100i64;
+        let at_envelope = rollout_transport_at_mtime(
+            rollout_body(0, mtime + 300 * 60 + 2, 0, mtime + 10_080 * 60 + 2),
+            mtime,
+        );
+        let reading = expect_measured(test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_request(),
+            &at_envelope,
+            &test_clock(),
+        ));
+        match reading.windows[0].reset_state() {
+            WindowResetState::Known(resets_at) => {
+                assert_eq!(
+                    resets_at.unix_nanos(),
+                    (mtime + 300 * 60 + 2) * 1_000_000_000
+                )
+            }
+            other @ (WindowResetState::NotStarted | WindowResetState::Scheduled { .. }) => {
+                panic!("a reset at the envelope is a boundary, got {other:?}")
+            }
+        }
+
+        let one_second_inside = rollout_transport_at_mtime(
+            rollout_body(0, mtime + 300 * 60 - 1, 0, mtime + 10_080 * 60 - 1),
+            mtime,
+        );
+        let reading = expect_measured(test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_request(),
+            &one_second_inside,
+            &test_clock(),
+        ));
+        for window in &reading.windows {
+            assert_eq!(window.reset_state(), WindowResetState::NotStarted);
+        }
+    }
+
+    /// The negative that keeps the rewrite narrow: a window with real usage
+    /// whose reset lands exactly one nominal duration ahead of the
+    /// observation, the shape a window sampled at its own first instant
+    /// reports, stays a known boundary. Zero usage alone must not erase it.
+    #[test]
+    fn a_used_window_with_a_duration_matching_reset_is_known() {
+        let mtime = 1_788_646_100i64;
+        let transport = rollout_transport_at_mtime(
+            rollout_body(42, mtime + 300 * 60, 27, mtime + 10_080 * 60),
+            mtime,
+        );
+        let reading = expect_measured(test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_request(),
+            &transport,
+            &test_clock(),
+        ));
+        match reading.windows[0].reset_state() {
+            WindowResetState::Known(resets_at) => {
+                assert_eq!(resets_at.unix_nanos(), (mtime + 300 * 60) * 1_000_000_000)
+            }
+            other @ (WindowResetState::NotStarted | WindowResetState::Scheduled { .. }) => {
+                panic!("a used window keeps its boundary, got {other:?}")
+            }
+        }
+        assert!(matches!(
+            reading.windows[1].reset_state(),
+            WindowResetState::Known(_)
+        ));
+    }
+
+    /// The same three cases over the endpoint contract, since either path
+    /// may be the live one for an account: the fabricated shape, the
+    /// envelope boundary, and the used window. The observation instant here
+    /// is the response arrival the capture records, the test clock's own
+    /// instant.
+    #[test]
+    fn an_unstarted_endpoint_window_parses_to_not_started_and_a_boundary_stays_known() {
+        let received = 1_788_646_200i64;
+        let fabricated = endpoint_body(0, received + 18_000, 0, received + 604_800);
+        let reading = expect_measured(test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_shared_request(),
+            &EndpointTransport::serving(200, &fabricated),
+            &test_clock(),
+        ));
+        assert_eq!(reading.windows.len(), 2);
+        for window in &reading.windows {
+            assert_eq!(
+                window.reset_state(),
+                WindowResetState::NotStarted,
+                "endpoint window '{}' carries the fabricated reset as a known instant",
+                window.semantic_key().as_str()
+            );
+            assert_eq!(window.resets_at(), None);
+        }
+
+        let at_envelope = endpoint_body(
+            // Exactly the two-second envelope past one nominal duration:
+            // still a boundary.
+            0,
+            received + 18_000 + 2,
+            // Three seconds past: beyond the envelope, also a boundary.
+            0,
+            received + 604_800 + 3,
+        );
+        let reading = expect_measured(test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_shared_request(),
+            &EndpointTransport::serving(200, &at_envelope),
+            &test_clock(),
+        ));
+        assert!(matches!(
+            reading.windows[0].reset_state(),
+            WindowResetState::Known(_)
+        ));
+        assert!(matches!(
+            reading.windows[1].reset_state(),
+            WindowResetState::Known(_)
+        ));
+
+        let used = endpoint_body(42, received + 18_000, 27, received + 604_800);
+        let reading = expect_measured(test_adapter().observe_with_evidence(
+            &test_credential(),
+            &test_shared_request(),
+            &EndpointTransport::serving(200, &used),
+            &test_clock(),
+        ));
+        assert!(matches!(
+            reading.windows[0].reset_state(),
+            WindowResetState::Known(_)
+        ));
+        assert!(matches!(
+            reading.windows[1].reset_state(),
+            WindowResetState::Known(_)
+        ));
+    }
+
+    /// The exact envelope edge in literal nanos, which the epoch-second
+    /// transports cannot express: one nanosecond strictly inside the
+    /// two-second envelope is the fabrication, exactly at it and one
+    /// nanosecond past it is a boundary. The comparison convention matches
+    /// the pair classifier's own, where a movement exactly at the envelope
+    /// remains material.
+    #[test]
+    fn the_unstarted_envelope_is_strictly_inside() {
+        let observed_at = 1_000_000_000_000i64;
+        let observed = UtcTimestamp::from_unix_nanos(observed_at);
+        let duration = NominalWindowDuration::from_nanos(18_000_000_000_000);
+        let window_with = |reset_nanos: i64| {
+            MeterWindow::new(
+                WindowSemanticKey::new("primary"),
+                WindowScope::AccountWide,
+                QuotaUsed::new(QuotaFractionPpm::new(0).expect("zero is in range")),
+                ReportedResolution::new(QuotaFractionPpm::new(10_000).expect("in range"))
+                    .expect("non-zero"),
+                QuantizationSemantics::RoundedToNearest,
+                UtcTimestamp::from_unix_nanos(reset_nanos),
+                duration,
+            )
+        };
+        let fabricated = observed_at + duration.as_nanos() as i64;
+
+        let inside = reinterpret_unstarted_window(window_with(fabricated - 1), observed);
+        assert_eq!(inside.reset_state(), WindowResetState::NotStarted);
+
+        let at = reinterpret_unstarted_window(
+            window_with(fabricated - UNSTARTED_RESET_TOLERANCE_NANOS),
+            observed,
+        );
+        assert!(matches!(at.reset_state(), WindowResetState::Known(_)));
+
+        let past = reinterpret_unstarted_window(
+            window_with(fabricated - UNSTARTED_RESET_TOLERANCE_NANOS - 1),
+            observed,
+        );
+        assert!(matches!(past.reset_state(), WindowResetState::Known(_)));
+    }
+
+    /// The adapter declares no reset precision, and the literal `None` is
+    /// the pin (aub-z09n): the Codex reset is an exact provider field, and
+    /// the fabricated unstarted shape is no boundary at all, not an
+    /// imprecise one. A later reader reaching for the aub-w1a0 remedy of a
+    /// declared precision, which would widen the pair tolerance by hours
+    /// and suppress every genuine reset change on these windows, must break
+    /// this test first. Mirrors
+    /// `the_declarations_carry_the_one_hour_reset_precision` on the opencode
+    /// side.
+    #[test]
+    fn the_declarations_carry_no_reset_precision() {
+        let declarations = test_adapter().declarations();
+        assert_eq!(
+            declarations.reset_precision, None,
+            "the codex adapter must not declare a reset precision"
+        );
     }
 }
