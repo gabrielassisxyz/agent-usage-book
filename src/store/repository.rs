@@ -411,6 +411,21 @@ impl Repository {
         })
     }
 
+    /// The newest stored observation id for one account, or `None` when the
+    /// account has no observation yet: the interval anchor a subscription
+    /// refusal records beside the identity pair.
+    pub fn newest_observation_id(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<ObservationRowId>, Error> {
+        self.with_read_connection(|conn| {
+            Ok(
+                meter_evidence::newest_observation_for_account(conn, account_id)?
+                    .map(|observation| observation.row_id),
+            )
+        })
+    }
+
     /// Publishes through an injected publisher over one fresh read snapshot.
     fn publish_with(&self, publish: impl FnOnce(&Connection, &Path) -> Publication) -> Publication {
         match connection::open(&self.database_path, AccessMode::ReadOnly, &self.policy) {

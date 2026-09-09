@@ -106,6 +106,7 @@ use crate::store::sample_run::{SampleRunId, Trigger};
 use crate::store::sampling_lease::{AccountName, LeaseHolder, LeaseOutcome};
 use crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy;
 use crate::store::spool::{SpoolCycleOutcome, spool_then_commit};
+use crate::store::subscription_identity::{NewSubscriptionChange, SubscriptionChangeKind};
 use crate::store::window_anomaly::StoredWindowAnomaly;
 
 /// The recipe token inside the normalized fingerprint, so a later change to
@@ -405,6 +406,20 @@ pub struct SampledAttempt {
     /// (`aub-eun.14`). Always empty when `observation_committed` is false:
     /// a result with no observation has no window to compare.
     pub window_anomalies: Vec<StoredWindowAnomaly>,
+}
+
+/// What the subscription-identity comparison concluded for one measured
+/// reading (aub-iwkg).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SubscriptionGate {
+    /// No identity on one or both sides: store normally, record nothing.
+    Store,
+    /// The first sighting of this account's subscription: store, then
+    /// record the establishment carrying this identity.
+    Establish(String),
+    /// A different subscription than established: refuse, record the change
+    /// from the established identity to this one.
+    Refuse { current: String, established: String },
 }
 
 /// Stage 1's per-account outcome.
@@ -861,6 +876,23 @@ where
         } = payload;
         match &captured.observation {
             ProviderObservation::Measured(reading) => {
+                // aub-iwkg: the subscription gate runs before the bundle is
+                // built, so a refused reading never reaches the spool or the
+                // observation tables. A refusal returns here; an establishment
+                // records its row after the observation below is durable.
+                let gate = match self.subscription_gate(item, reading) {
+                    Ok(gate) => gate,
+                    Err(error) => return persist_error(error),
+                };
+                if let SubscriptionGate::Refuse { current, established } = &gate {
+                    return self.commit_refusal(
+                        item,
+                        received_at,
+                        elapsed,
+                        current.clone(),
+                        established.clone(),
+                    );
+                }
                 let bundle = match self.terminal_bundle(
                     item,
                     captured.evidence.as_ref(),
@@ -878,13 +910,41 @@ where
                 match spool_then_commit(self.repository, &bundle, &self.clock) {
                     Ok(SpoolCycleOutcome::Committed {
                         ids, publication, ..
-                    }) => AccountDisposition::Sampled(SampledAttempt {
-                        attempt_id,
-                        outcome: AttemptOutcome::Success,
-                        observation_committed: true,
-                        publication,
-                        window_anomalies: ids.window_anomalies,
-                    }),
+                    }) => {
+                        // A first sighting establishes the subscription the
+                        // committed observation was attributed under. Only
+                        // after the commit: a crash between the two delays
+                        // establishment to the next tick, which is benign,
+                        // while the reverse order could establish an identity
+                        // whose observation never landed.
+                        if let SubscriptionGate::Establish(identity) = gate {
+                            let row_id = match row_id_of(attempt_id) {
+                                Ok(row_id) => row_id,
+                                Err(error) => return persist_error(error),
+                            };
+                            let change = NewSubscriptionChange {
+                                account_id: item.account_id,
+                                kind: SubscriptionChangeKind::Established,
+                                previous_identity: None,
+                                current_identity: identity,
+                                detecting_attempt_id: row_id,
+                                previous_observation_id: None,
+                                detected_at: received_at,
+                            };
+                            if let Err(error) =
+                                self.repository.record_subscription_established(&change)
+                            {
+                                return persist_error(error);
+                            }
+                        }
+                        AccountDisposition::Sampled(SampledAttempt {
+                            attempt_id,
+                            outcome: AttemptOutcome::Success,
+                            observation_committed: true,
+                            publication,
+                            window_anomalies: ids.window_anomalies,
+                        })
+                    }
                     Ok(SpoolCycleOutcome::LeftPending { error, .. }) => {
                         AccountDisposition::Spooled {
                             attempt_id,
@@ -929,6 +989,139 @@ where
                     Err(error) => persist_error(error),
                 }
             }
+        }
+    }
+
+    /// What the subscription-identity comparison concluded for one measured
+    /// reading (aub-iwkg). Decided here, acted on in `persist_one`.
+    ///
+    /// The identity signal and why it is this one: the stable subscription
+    /// fields of the credential material as each adapter interprets them
+    /// (Anthropic `subscriptionType` and `rateLimitTier`, the Antigravity
+    /// refresh token digest, the Codex JWT email digest with a plan
+    /// fallback; absent everywhere else). Rejected: a whole-credential
+    /// fingerprint, which rotates on every ordinary token refresh on both
+    /// the Anthropic and the Antigravity paths and would flag every hourly
+    /// renewal; a response account identifier, which neither the Anthropic
+    /// nor the Antigravity response carries without a new provider call;
+    /// and a response plan and tier pair alone, which the Anthropic response
+    /// does not carry at all. The known weakness is stated, not hidden: two
+    /// different subscriptions sharing one Anthropic plan family and tier
+    /// share an identity and are not detected; Codex and Antigravity cover
+    /// those providers strongly through the email and refresh-token signals.
+    /// An ordinary token refresh for the same subscription must not trigger
+    /// this, and the regression tests prove it on both refresh paths.
+    fn subscription_gate<A>(
+        &self,
+        item: &LeasedAttempt<'_, A>,
+        reading: &A::Reading,
+    ) -> Result<SubscriptionGate, Error>
+    where
+        A: ProviderAdapter,
+        A::Reading: MeteredReading,
+    {
+        let _ = reading;
+        let Some(current) = item
+            .account
+            .adapter
+            .subscription_identity(&item.account.credential)
+        else {
+            // Identity-absent readings (providers without a stable
+            // subscription field, raw tokens, unparseable material) never
+            // block: an account that cannot name its subscription opts out
+            // of change detection rather than failing every tick.
+            return Ok(SubscriptionGate::Store);
+        };
+        match self
+            .repository
+            .established_subscription_identity(item.account_id)?
+        {
+            // The first sighting establishes what later readings compare
+            // against. Nothing is refused for having no history.
+            None => Ok(SubscriptionGate::Establish(current)),
+            Some(known) if known == current => Ok(SubscriptionGate::Store),
+            Some(established) => Ok(SubscriptionGate::Refuse { current, established }),
+        }
+    }
+
+    /// Commits a refused measured reading (aub-iwkg): the attempt result
+    /// with `Unreachable` class `subscription_changed`, and the change row
+    /// naming the identity pair, in one transaction. No observation, no
+    /// windows, no spool entry: the reading is well-formed evidence of the
+    /// wrong subscription, and storing it would be the misattribution this
+    /// bead exists to end. A repeat refusal for the same pair records the
+    /// attempt result but no second row, so a held subscription costs one
+    /// history row, not one per tick.
+    fn commit_refusal<A>(
+        &self,
+        item: &LeasedAttempt<'_, A>,
+        received_at: UtcTimestamp,
+        elapsed: MonotonicDuration,
+        current: String,
+        established: String,
+    ) -> AccountDisposition
+    where
+        A: ProviderAdapter,
+        A::Reading: MeteredReading,
+    {
+        let attempt_id = item.attempt.attempt_id();
+        let outcome = AttemptOutcome::Unreachable(FailureClass::SubscriptionChanged);
+        let persist_error = |error: Error| AccountDisposition::PersistFailed {
+            attempt_id,
+            outcome,
+            reason: error.to_string(),
+        };
+        let row_id = match row_id_of(attempt_id) {
+            Ok(row_id) => row_id,
+            Err(error) => return persist_error(error),
+        };
+        let result = NewMeterAttemptResult {
+            attempt_id: row_id,
+            completed_at: received_at,
+            elapsed,
+            outcome,
+            sanitized_error_classification: Some(stored_error_classification(outcome, None)),
+            retry_index: None,
+            clock_anomaly: false,
+        };
+        let sampled = |publication: Publication| AccountDisposition::Sampled(SampledAttempt {
+            attempt_id,
+            outcome,
+            observation_committed: false,
+            publication,
+            window_anomalies: Vec::new(),
+        });
+        let latest = match self.repository.latest_subscription_change(item.account_id) {
+            Ok(latest) => latest,
+            Err(error) => return persist_error(error),
+        };
+        let already_recorded = matches!(&latest, Some(event)
+            if event.kind == SubscriptionChangeKind::Changed
+                && event.previous_identity.as_deref() == Some(established.as_str())
+                && event.current_identity == current);
+        if already_recorded {
+            return match self.repository.commit_terminal_result(&result) {
+                Ok(publication) => sampled(publication),
+                Err(error) => persist_error(error),
+            };
+        }
+        let previous_observation_id = match self.repository.newest_observation_id(item.account_id)
+        {
+            Ok(id) => id,
+            Err(error) => return persist_error(error),
+        };
+        let change = NewSubscriptionChange {
+            account_id: item.account_id,
+            kind: SubscriptionChangeKind::Changed,
+            previous_identity: Some(established),
+            current_identity: current,
+            detecting_attempt_id: row_id,
+            previous_observation_id,
+            detected_at: received_at,
+        };
+        match self.repository.commit_subscription_refusal(&result, &change) {
+            Ok(publication) => sampled(publication),
+            Err(error) => persist_error(error),
         }
     }
 
@@ -1252,6 +1445,9 @@ mod tests {
         /// A 429 with a `Retry-After` of this many seconds, so the adapter
         /// records a rate limit carrying the header (aub-6w85).
         RateLimited(u64),
+        /// A valid Antigravity quota body, so the agy adapter measures
+        /// (aub-iwkg: the refresh-path regression needs a second provider).
+        AgySuccess,
     }
 
     /// Barrier state for one generation of the scripted transport's
@@ -1433,6 +1629,11 @@ mod tests {
                     headers: Vec::new(),
                     body: b"definitely not json".to_vec(),
                 }),
+                Some(ScriptedOutcome::AgySuccess) => Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: AGY_SUCCESS_BODY.as_bytes().to_vec(),
+                }),
                 Some(ScriptedOutcome::Success) | None => Ok(HttpResponse {
                     status: 200,
                     headers: Vec::new(),
@@ -1449,6 +1650,11 @@ mod tests {
     }
 
     const VALID_SUCCESS_BODY: &str = r#"{"five_hour":{"utilization":10.0,"resets_at":"2026-01-01T00:00:00.000Z"},"seven_day":{"utilization":20.0,"resets_at":"2026-01-08T00:00:00.000Z"}}"#;
+
+    /// A minimal valid Antigravity quota body (aub-iwkg): one group carrying
+    /// the two required window kinds, so the agy adapter measures through
+    /// the scripted transport.
+    const AGY_SUCCESS_BODY: &str = r#"{"groups":[{"displayName":"Gemini Models","buckets":[{"window":"weekly","resetTime":"2030-01-01T00:00:00Z","remainingFraction":0.5},{"window":"5h","resetTime":"2030-01-01T00:00:00Z","remainingFraction":0.5}]}]}"#;
 
     fn policy() -> PragmaPolicy {
         PragmaPolicy {
@@ -2940,6 +3146,302 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
             distinct,
             vec![AGY_401_STORED_VALUE.to_owned()],
             "one classification value across every row, not two"
+        );
+    }
+
+    // --- subscription-identity change detection (aub-iwkg) ------------------
+
+    /// An Anthropic credential file naming this subscription: rotating tokens
+    /// around stable subscription fields, the shape the refresh path writes
+    /// back (`crate::auth::credentials_lock`).
+    fn anthropic_material(access: &str, refresh: &str, subscription: &str, tier: &str) -> String {
+        format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"{subscription}","rateLimitTier":"{tier}"}}}}"#
+        )
+    }
+
+    /// An Antigravity token file: the access token rotates on refresh while
+    /// the refresh token stays stable (`crate::auth::antigravity_credentials`).
+    fn agy_material(access: &str, refresh: &str, expiry: &str) -> String {
+        format!(r#"{{"token":{{"access_token":"{access}","refresh_token":"{refresh}","expiry":"{expiry}"}}}}"#)
+    }
+
+    fn forced_anthropic_account(name: &str, material: &str) -> BatchAccount<AnthropicAdapter> {
+        let mut account = batch_account(name);
+        account.credential = CredentialHandle::new(material);
+        account.forced = true;
+        account
+    }
+
+    fn forced_agy_account(name: &str, material: &str) -> BatchAccount<AgyAdapter> {
+        let template = batch_account(name);
+        BatchAccount {
+            name: template.name,
+            provider_key: "agy".to_string(),
+            adapter: AgyAdapter::with_endpoint(format!("http://{name}.accounts.test/usage")),
+            credential: CredentialHandle::new(material),
+            credential_context_id: template.credential_context_id,
+            request: template.request,
+            policy: template.policy,
+            reset_edge_lead: template.reset_edge_lead,
+            retry_after_cap: template.retry_after_cap,
+            auth_backoff_threshold: template.auth_backoff_threshold,
+            auth_backoff_cap: template.auth_backoff_cap,
+            forced: true,
+            adapter_version: template.adapter_version,
+            credential_refresh_classification: None,
+        }
+    }
+
+    fn run_forced_batch<A>(
+        repository: &Repository,
+        transport: &ScriptedTransport,
+        clock: &SharedClock,
+        accounts: &[BatchAccount<A>],
+    ) -> BatchReport
+    where
+        A: ProviderAdapter + Sync,
+        A::Reading: MeteredReading + Send,
+    {
+        SamplingOrchestrator {
+            repository,
+            transport,
+            clock,
+            trigger: Trigger::Manual,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 3,
+        }
+        .run(accounts)
+        .expect("the batch must run")
+    }
+
+    fn terminal_result_for(
+        database_path: &Path,
+        attempt: AttemptId,
+    ) -> StoredMeterAttemptResult {
+        let conn = open(database_path, AccessMode::ReadOnly, &policy()).unwrap();
+        meter_attempt::result_by_attempt_id(&conn, row_id_of(attempt).unwrap())
+            .unwrap()
+            .expect("every sampled attempt carries its terminal result")
+    }
+
+    /// The Done-when replay (aub-iwkg): one subscription's reading followed
+    /// by another's under one logical name produces the typed record instead
+    /// of an ordinary observation, and a repeat refusal records no second row.
+    #[test]
+    fn a_changed_subscription_produces_the_typed_record_instead_of_an_observation() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        transport.script("subcase", ScriptedOutcome::Success);
+        let repository = Repository::new(&database_path, policy());
+
+        // Tick 1: the Max subscription behind the path. Stored, established.
+        let max_material = anthropic_material("access-a", "refresh-a", "max", "tier-max");
+        let report = run_forced_batch(
+            &repository,
+            &transport,
+            &clock,
+            &[forced_anthropic_account("subcase", &max_material)],
+        );
+        let first = sampled(&report.accounts[0]);
+        assert!(first.observation_committed);
+        assert_eq!(first.outcome, AttemptOutcome::Success);
+        let account_id = repository
+            .ensure_account("anthropic", "subcase", clock.now())
+            .unwrap();
+        assert_eq!(
+            repository
+                .established_subscription_identity(account_id)
+                .unwrap()
+                .as_deref(),
+            Some("anthropic:max:tier-max")
+        );
+        let first_observation = repository.newest_observation_id(account_id).unwrap();
+
+        // Tick 2: the 2026-09-05 shape, another subscription's credential
+        // behind the same path. Refused, recorded, never an observation.
+        let pro_material = anthropic_material("access-b", "refresh-b", "pro", "tier-pro");
+        let report = run_forced_batch(
+            &repository,
+            &transport,
+            &clock,
+            &[forced_anthropic_account("subcase", &pro_material)],
+        );
+        let second = sampled(&report.accounts[0]);
+        assert!(
+            !second.observation_committed,
+            "the intruding reading must not commit an observation"
+        );
+        assert_eq!(
+            second.outcome,
+            AttemptOutcome::Unreachable(FailureClass::SubscriptionChanged)
+        );
+        let stored = terminal_result_for(&database_path, second.attempt_id);
+        assert_eq!(
+            stored.sanitized_error_classification.as_deref(),
+            Some("subscription_changed")
+        );
+        assert_eq!(
+            repository.newest_observation_id(account_id).unwrap(),
+            first_observation,
+            "no ordinary observation for the second subscription"
+        );
+        let change = repository
+            .latest_subscription_change(account_id)
+            .unwrap()
+            .expect("the refusal records the typed change");
+        assert_eq!(
+            change.kind,
+            crate::store::subscription_identity::SubscriptionChangeKind::Changed
+        );
+        assert_eq!(
+            change.previous_identity.as_deref(),
+            Some("anthropic:max:tier-max")
+        );
+        assert_eq!(change.current_identity, "anthropic:pro:tier-pro");
+        assert_eq!(
+            change.previous_observation_id.map(|id| id.value()),
+            first_observation.map(|id| id.value()),
+            "the change anchors the interval at the newest stored observation"
+        );
+        // The intruder never establishes itself.
+        assert_eq!(
+            repository
+                .established_subscription_identity(account_id)
+                .unwrap()
+                .as_deref(),
+            Some("anthropic:max:tier-max")
+        );
+
+        // Tick 3: the same intruder again. Refused, but no second row: one
+        // history row per episode, not one per tick.
+        let report = run_forced_batch(
+            &repository,
+            &transport,
+            &clock,
+            &[forced_anthropic_account("subcase", &pro_material)],
+        );
+        let third = sampled(&report.accounts[0]);
+        assert!(!third.observation_committed);
+        assert_eq!(
+            repository
+                .subscription_changes_for_account(account_id)
+                .unwrap()
+                .len(),
+            2,
+            "one establishment plus one change, never a row per refusal"
+        );
+        assert_eq!(
+            repository.newest_observation_id(account_id).unwrap(),
+            first_observation
+        );
+    }
+
+    /// The refresh regression (aub-iwkg): a token refreshed in place for the
+    /// same subscription keeps sampling normally and raises nothing, on the
+    /// Anthropic rotating-pair path and the Antigravity stable-refresh path
+    /// alike.
+    #[test]
+    fn a_token_refreshed_in_place_for_the_same_subscription_is_not_flagged() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        transport.script("refreshable", ScriptedOutcome::Success);
+        transport.script("agyrefresh", ScriptedOutcome::AgySuccess);
+        let repository = Repository::new(&database_path, policy());
+
+        // Anthropic: both halves of the pair rotate, subscription fields stay.
+        for (access, refresh) in [("access-one", "refresh-one"), ("access-two", "refresh-two")] {
+            let report = run_forced_batch(
+                &repository,
+                &transport,
+                &clock,
+                &[forced_anthropic_account(
+                    "refreshable",
+                    &anthropic_material(access, refresh, "max", "tier-max"),
+                )],
+            );
+            let attempt = sampled(&report.accounts[0]);
+            assert!(attempt.observation_committed);
+            assert_eq!(attempt.outcome, AttemptOutcome::Success);
+        }
+        let anthropic_id = repository
+            .ensure_account("anthropic", "refreshable", clock.now())
+            .unwrap();
+        assert_eq!(
+            repository
+                .subscription_changes_for_account(anthropic_id)
+                .unwrap()
+                .len(),
+            1,
+            "only the establishment, never a change across the rotation"
+        );
+
+        // Antigravity: the access token and the expiry rotate, the refresh
+        // token stays stable.
+        for (access, expiry) in [
+            ("agy-access-one", "2020-01-01T00:00:00Z"),
+            ("agy-access-two", "2030-01-01T00:00:00Z"),
+        ] {
+            let report = run_forced_batch(
+                &repository,
+                &transport,
+                &clock,
+                &[forced_agy_account(
+                    "agyrefresh",
+                    &agy_material(access, "agy-stable-refresh", expiry),
+                )],
+            );
+            let attempt = sampled(&report.accounts[0]);
+            assert!(attempt.observation_committed);
+            assert_eq!(attempt.outcome, AttemptOutcome::Success);
+        }
+        let agy_id = repository
+            .ensure_account("agy", "agyrefresh", clock.now())
+            .unwrap();
+        assert_eq!(
+            repository
+                .subscription_changes_for_account(agy_id)
+                .unwrap()
+                .len(),
+            1,
+            "only the establishment, never a change across the rotation"
+        );
+    }
+
+    /// Identity-absent readings never raise anything (aub-iwkg): a raw token
+    /// names no subscription, so both ticks store and no history exists.
+    #[test]
+    fn readings_without_an_identity_never_raise_anything() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        transport.script("identityless", ScriptedOutcome::Success);
+        let repository = Repository::new(&database_path, policy());
+
+        for _ in 0..2 {
+            let report = run_forced_batch(
+                &repository,
+                &transport,
+                &clock,
+                &[forced_anthropic_account("identityless", "test-token")],
+            );
+            let attempt = sampled(&report.accounts[0]);
+            assert!(attempt.observation_committed);
+        }
+        let account_id = repository
+            .ensure_account("anthropic", "identityless", clock.now())
+            .unwrap();
+        assert_eq!(
+            repository
+                .latest_subscription_change(account_id)
+                .unwrap(),
+            None,
+            "an account that cannot name its subscription leaves no history"
         );
     }
 }
