@@ -17,6 +17,10 @@
 │                                                                                                  │
 │  backup                                                                                          │
 │    destination              /tmp/aub-golden/backups                                        file  │
+│    keep_daily               7                                                           default  │
+│    keep_monthly             6                                                           default  │
+│    keep_weekly              4                                                           default  │
+│    keep_yearly              2                                                           default  │
 │    review_after             36h                                                            file  │
 │                                                                                                  │
 │  can_run                                                                                         │

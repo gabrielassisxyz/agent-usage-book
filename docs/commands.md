@@ -169,6 +169,10 @@ without the section prefix (the full box for a two-account config):
 │                                                                              │
 │  backup                                                                      │
 │    destination              /tmp/aub-golden/backups                    file  │
+│    keep_daily               7                                       default  │
+│    keep_monthly             6                                       default  │
+│    keep_weekly              4                                       default  │
+│    keep_yearly              2                                       default  │
 │    review_after             36h                                        file  │
 │                                                                              │
 │  can_run                                                                     │
@@ -297,9 +301,21 @@ never mutating one already on record.
 **Answers:** is there a consistent, verified archive of the durable state,
 and does it restore?
 
+Usage: `aub backup [DESTINATION]` writes a new dated archive under the
+destination root (the explicit argument wins, otherwise
+`backup.destination`); `aub backup verify DESTINATION` re-checks one
+archive; `aub backup restore ARCHIVE DEST` recovers from one archive.
+Each run keeps a series of dated archives under tiered retention
+(`backup.keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`); an
+archive is retained when any bucket keeps it, and the most recent verified
+archive is never pruned.
+
 **Refuses:** to report verified without checking. Creating and verifying an
 archive both run the same checksum, manifest and SQLite integrity checks, so
 neither a fresh backup nor a re-check can claim `verified=true` on faith.
+An individual archive directory is never written over. Pruning is refused
+when no verified archive exists, and a failed verification prunes nothing
+and advances no pointer.
 `backup restore` refuses a destination that already exists or that resolves
 to the configured state directory: a restore only ever writes into a new
 directory, and the damaged state directory is never a valid destination.
