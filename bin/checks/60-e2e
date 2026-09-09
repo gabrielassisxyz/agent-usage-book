@@ -39,7 +39,15 @@ aub_bin="$target_dir/release/aub"
 
 # The budget is a hard gate: a suite that grows without bound is a suite that
 # stops being run, and an unrun suite is a suite that proves nothing.
-budget_seconds="${E2E_BUDGET_SECONDS:-120}"
+#
+# Raised from 120s to 240s on 2026-09-09, because the measurement changed rather
+# than the tolerance. Until commit 2efab9f the suite silently ran 51 of its 62
+# cases: run.sh reads its case list on stdin and any step whose program also read
+# stdin drained it, skipping every case sorted after that reader. The honest suite
+# costs 194s on the CI runner (96-98s when it was running 51) and 156-159s on the
+# development machine, so the old ceiling was only ever met by not running a sixth
+# of the suite. The headroom here is the same ratio the old pair carried.
+budget_seconds="${E2E_BUDGET_SECONDS:-240}"
 
 start="$(date +%s)"
 AUB_BIN="$aub_bin" "$repo_root/tests/e2e/run.sh" --state-dir "$(mktemp -d "${TMPDIR:-/tmp}/aub-e2e-ci-XXXXXX")"

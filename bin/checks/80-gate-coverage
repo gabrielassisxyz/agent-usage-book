@@ -214,18 +214,20 @@ check_gate_coverage() {
         fail_count=$((fail_count + 1))
     fi
 
-    # E2E_BUDGET_SECONDS: budget ceiling must not exceed 120s
+    # E2E_BUDGET_SECONDS: budget ceiling must not exceed 240s. Raised from 120s on
+    # 2026-09-09 with the check it guards: the suite had been silently running 51 of
+    # its 62 cases, and the honest suite costs 194s on the runner.
     if [ -n "${E2E_BUDGET_SECONDS:-}" ]; then
-        if [ "$E2E_BUDGET_SECONDS" -gt 120 ] 2>/dev/null; then
-            echo "gate-coverage: E2E_BUDGET_SECONDS raised past budget: ${E2E_BUDGET_SECONDS}s > 120s" >&2
+        if [ "$E2E_BUDGET_SECONDS" -gt 240 ] 2>/dev/null; then
+            echo "gate-coverage: E2E_BUDGET_SECONDS raised past budget: ${E2E_BUDGET_SECONDS}s > 240s" >&2
             fail_count=$((fail_count + 1))
         fi
     fi
     if [ -f "$checks_dir/60-e2e" ]; then
         local e2e_default
         e2e_default="$(grep -oE 'E2E_BUDGET_SECONDS:-[0-9]+' "$checks_dir/60-e2e" | cut -d- -f2 || true)"
-        if [ -z "$e2e_default" ] || [ "$e2e_default" -gt 120 ]; then
-            echo "gate-coverage: 60-e2e default budget missing or raised past 120s (found '${e2e_default:-missing}')" >&2
+        if [ -z "$e2e_default" ] || [ "$e2e_default" -gt 240 ]; then
+            echo "gate-coverage: 60-e2e default budget missing or raised past 240s (found '${e2e_default:-missing}')" >&2
             fail_count=$((fail_count + 1))
         fi
     fi
@@ -324,14 +326,14 @@ dir="$(make_scenario slop-diff)"
 sed -i 's|bin/slop-guard|bin/slop-guard --diff origin/main|' "$dir/bin/checks/50-prose-guard"
 assert_mutation_caught "$dir" "widening slop-guard to --diff" "50-prose-guard call site is narrowed" || integration_failed=1
 
-# Integration 3: raising E2E_BUDGET_SECONDS past 120s makes check fail
+# Integration 3: raising E2E_BUDGET_SECONDS past 240s makes check fail
 dir="$(make_scenario e2e-budget)"
-sed -i 's/E2E_BUDGET_SECONDS:-120/E2E_BUDGET_SECONDS:-300/' "$dir/bin/checks/60-e2e"
-assert_mutation_caught "$dir" "raising 60-e2e default budget" "60-e2e default budget missing or raised past 120s" || integration_failed=1
+sed -i 's/E2E_BUDGET_SECONDS:-240/E2E_BUDGET_SECONDS:-300/' "$dir/bin/checks/60-e2e"
+assert_mutation_caught "$dir" "raising 60-e2e default budget" "60-e2e default budget missing or raised past 240s" || integration_failed=1
 
 dir="$(make_scenario e2e-env)"
 out="$(E2E_BUDGET_SECONDS=300 "$dir/bin/checks/80-gate-coverage" "$dir" 2>&1)"
-if ! printf '%s' "$out" | grep -qF "E2E_BUDGET_SECONDS raised past budget: 300s > 120s"; then
+if ! printf '%s' "$out" | grep -qF "E2E_BUDGET_SECONDS raised past budget: 300s > 240s"; then
     echo "FAIL: integration: env E2E_BUDGET_SECONDS=300 was not caught" >&2
     integration_failed=1
 fi
