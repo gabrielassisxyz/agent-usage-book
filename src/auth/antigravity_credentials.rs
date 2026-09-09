@@ -13,6 +13,17 @@ use std::time::Duration;
 
 use crate::domain::time::UtcTimestamp;
 
+/// How long before the stored `expiry` a token is already treated as expired.
+///
+/// Deliberately smaller than Anthropic's five-minute lead
+/// (`credentials_lock::DEFAULT_EXPIRY_LEAD`): the observed Antigravity access
+/// token lifetime is about an hour, and `aub` samples roughly every five
+/// minutes, so a five-minute lead would trigger a refresh on every normal
+/// sampling cadence boundary rather than only near genuine expiry. One minute
+/// still comfortably covers clock skew between this machine and the provider
+/// while leaving most cadence boundaries untouched. The token lifetime itself
+/// is not a constant here: it is an observation that sized this number, not a
+/// value the refresh path computes with.
 pub const EXPIRY_LEAD: Duration = Duration::from_secs(60);
 pub const CLASSIFICATION_TOKEN_REFRESHED: &str = "token_refreshed";
 pub const CLASSIFICATION_REFRESH_REJECTED: &str = "refresh_rejected";
@@ -290,7 +301,12 @@ mod tests {
 
     #[test]
     fn expired_token_refreshes_from_response_lifetime_and_keeps_a_private_backup() {
-        let path = path("expired");
+        // A private scratch directory, not the shared flat helper: the
+        // write-back temp file name embeds only the process id (matching
+        // `credentials_lock`'s own scheme), so two tests writing concurrently
+        // into the *same* directory can race each other's rename.
+        let scratch = Scratch::new("expired");
+        let path = scratch.credentials();
         let original = credential("2020-01-01T00:00:00Z");
         fs::write(&path, &original).unwrap();
         let endpoint = Endpoint {
@@ -321,7 +337,7 @@ mod tests {
     }
 
     #[test]
-    fn fresh_or_unrecognised_tokens_never_call_the_endpoint() {
+    fn a_not_yet_expired_token_is_a_no_op() {
         let path = path("fresh");
         fs::write(&path, credential("2030-01-01T00:00:00Z")).unwrap();
         let endpoint = Endpoint {
@@ -332,7 +348,54 @@ mod tests {
             refresh_if_expired(&path, NOW, &endpoint),
             RefreshOutcome::NotNeeded
         );
+        assert_eq!(endpoint.calls.get(), 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn an_unrecognised_shape_is_a_no_op() {
+        let path = path("unrecognised");
         fs::write(&path, r#"{"token":{"access_token":"only"}}"#).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("unused".into(), 3600)),
+        };
+        assert_eq!(
+            refresh_if_expired(&path, NOW, &endpoint),
+            RefreshOutcome::NotNeeded
+        );
+        assert_eq!(endpoint.calls.get(), 0);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_token_expiring_exactly_at_the_lead_is_expired() {
+        // now + EXPIRY_LEAD >= expiry is the boundary the production check
+        // uses (`>=`), so a token expiring exactly at the lead must refresh.
+        let expiry_nanos = NOW + i64::try_from(EXPIRY_LEAD.as_nanos()).unwrap();
+        let scratch = Scratch::new("lead-boundary-expired");
+        let path = scratch.credentials();
+        fs::write(&path, credential(&rfc3339_utc_seconds(expiry_nanos))).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("new-access".into(), 60)),
+        };
+        assert_eq!(
+            refresh_if_expired(&path, NOW, &endpoint),
+            RefreshOutcome::Refreshed
+        );
+        assert_eq!(endpoint.calls.get(), 1);
+    }
+
+    #[test]
+    fn a_token_expiring_one_second_beyond_the_lead_is_not_yet_expired() {
+        let expiry_nanos = NOW + i64::try_from(EXPIRY_LEAD.as_nanos()).unwrap() + 1_000_000_000;
+        let path = path("lead-boundary-fresh");
+        fs::write(&path, credential(&rfc3339_utc_seconds(expiry_nanos))).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("unused".into(), 60)),
+        };
         assert_eq!(
             refresh_if_expired(&path, NOW, &endpoint),
             RefreshOutcome::NotNeeded
@@ -359,5 +422,176 @@ mod tests {
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         assert!(!format!("{outcome:?}").contains("never-render-this"));
         let _ = fs::remove_file(path);
+    }
+
+    #[test]
+    fn the_refresh_token_is_never_rendered_by_the_outcome() {
+        let scratch = Scratch::new("no-leak");
+        let path = scratch.credentials();
+        fs::write(&path, credential("2020-01-01T00:00:00Z")).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("new-access".into(), 3600)),
+        };
+        let outcome = refresh_if_expired(&path, NOW, &endpoint);
+        assert_eq!(outcome, RefreshOutcome::Refreshed);
+        assert!(!format!("{outcome:?}").contains("never-render-this"));
+    }
+
+    #[test]
+    fn a_missing_file_is_left_for_resolve_to_surface() {
+        let path = path("missing");
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("unused".into(), 3600)),
+        };
+        let outcome = refresh_if_expired(&path, NOW, &endpoint);
+        assert!(matches!(outcome, RefreshOutcome::FileUnreadable(_)));
+        assert_eq!(outcome.attempt_classification(), None);
+        assert_eq!(endpoint.calls.get(), 0);
+    }
+
+    /// A scratch directory that removes itself on drop, needed wherever a test
+    /// puts a lock file beside the credential or chmods the parent: both would
+    /// disturb every other test's file if done in the shared flat temp dir the
+    /// tests above use.
+    struct Scratch {
+        dir: PathBuf,
+    }
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!(
+                "aub-agy-refresh-dir-{tag}-{}-{}",
+                std::process::id(),
+                next_id()
+            ));
+            fs::create_dir_all(&dir).expect("scratch dir");
+            Self { dir }
+        }
+
+        fn credentials(&self) -> PathBuf {
+            self.dir.join(".token")
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn next_id() -> u64 {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_file_rewritten_by_a_third_party_between_read_and_lock_triggers_no_second_refresh() {
+        use std::os::unix::io::AsRawFd;
+
+        let scratch = Scratch::new("post-lock-reread");
+        let path = scratch.credentials();
+        let lock_path = sibling(&path, ".lock");
+        fs::write(&path, credential("2020-01-01T00:00:00Z")).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("should-not-be-used".into(), 3600)),
+        };
+
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+        let path_for_thread = path.clone();
+        let rotator = std::thread::spawn(move || {
+            let file = OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&lock_path)
+                .unwrap();
+            // SAFETY: fd is valid for the duration of the call.
+            let rc = unsafe { flock(file.as_raw_fd(), 2) }; // LOCK_EX
+            assert_eq!(rc, 0);
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(40));
+            // Another refresher rotated the file to a fresh pair while we
+            // waited on the lock.
+            fs::write(&path_for_thread, credential("2030-01-01T00:00:00Z")).unwrap();
+            std::thread::sleep(Duration::from_millis(5));
+            drop(file);
+        });
+
+        locked_rx.recv().unwrap();
+        let outcome = refresh_if_expired(&path, NOW, &endpoint);
+
+        assert_eq!(outcome, RefreshOutcome::AlreadyFreshOnDisk);
+        assert_eq!(endpoint.calls.get(), 0);
+        rotator.join().unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_held_lock_times_out_without_a_refresh() {
+        use std::os::unix::io::AsRawFd;
+
+        let scratch = Scratch::new("lock-busy");
+        let path = scratch.credentials();
+        let lock_path = sibling(&path, ".lock");
+        fs::write(&path, credential("2020-01-01T00:00:00Z")).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("unused".into(), 3600)),
+        };
+
+        let holder = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&lock_path)
+            .unwrap();
+        // SAFETY: fd is valid for the duration of the call.
+        let rc = unsafe { flock(holder.as_raw_fd(), 2) }; // LOCK_EX
+        assert_eq!(rc, 0);
+
+        let outcome = refresh_if_expired(&path, NOW, &endpoint);
+
+        assert_eq!(
+            outcome,
+            RefreshOutcome::EndpointUnreachable("credential lock stayed busy".into())
+        );
+        assert_eq!(outcome.attempt_classification(), None);
+        assert_eq!(endpoint.calls.get(), 0);
+        drop(holder);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_persist_failure_after_a_successful_exchange_stops_sampling() {
+        // The parent directory is read-only, so the write-back fails after the
+        // endpoint has already spent the refresh token.
+        use std::os::unix::fs::PermissionsExt;
+
+        let scratch = Scratch::new("persist-failed");
+        let path = scratch.credentials();
+        fs::write(&path, credential("2020-01-01T00:00:00Z")).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Ok(("new-access".into(), 3600)),
+        };
+
+        fs::set_permissions(&scratch.dir, fs::Permissions::from_mode(0o500)).unwrap();
+        let outcome = refresh_if_expired(&path, NOW, &endpoint);
+        fs::set_permissions(&scratch.dir, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(
+            matches!(outcome, RefreshOutcome::PersistFailed(_)),
+            "{outcome:?}"
+        );
+        assert!(outcome.stops_sampling());
+        assert_eq!(
+            outcome.attempt_classification(),
+            Some(CLASSIFICATION_REFRESH_PERSIST_FAILED)
+        );
     }
 }

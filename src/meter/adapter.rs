@@ -380,6 +380,11 @@ pub struct EndpointConfig {
     /// sessions tree, so a synthetic server can stand in for
     /// `https://chatgpt.com/backend-api/wham/usage` in end-to-end runs.
     pub codex: Option<String>,
+    /// Overrides the Antigravity quota endpoint URL (`AUB_AGY_ENDPOINT`), so a
+    /// synthetic server can stand in for
+    /// `https://daily-cloudcode-pa.googleapis.com/v1internal:retrieveUserQuotaSummary`
+    /// in end-to-end runs (`aub-6qay`).
+    pub agy: Option<String>,
 }
 
 /// The orchestrator-facing reading of whichever adapter the dispatch chose.
@@ -561,7 +566,13 @@ pub fn adapter_for(
             Ok(AnyAdapter::Codex(CodexAdapter::with_endpoint(endpoint)))
         }
         "ollama" => Ok(AnyAdapter::Ollama(OllamaAdapter::new())),
-        "agy" => Ok(AnyAdapter::Agy(AgyAdapter::new())),
+        "agy" => {
+            let endpoint = endpoint_overrides
+                .agy
+                .as_deref()
+                .unwrap_or(AgyAdapter::DEFAULT_ENDPOINT);
+            Ok(AnyAdapter::Agy(AgyAdapter::with_endpoint(endpoint)))
+        }
         unsupported => Err(unsupported_provider_error(unsupported, account)),
     }
 }
@@ -679,6 +690,7 @@ mod tests {
             anthropic: Some("http://127.0.0.1:9".to_string()),
             opencode: None,
             codex: None,
+            agy: None,
         };
         let adapter = adapter_for("anthropic", "work-primary", &overrides)
             .expect("anthropic is in the supported table");
@@ -716,6 +728,7 @@ mod tests {
             anthropic: None,
             opencode: Some("http://127.0.0.1:9/workspace/wrk_x/go".to_string()),
             codex: None,
+            agy: None,
         };
         let adapter = adapter_for("opencode", "go-primary", &overrides)
             .expect("opencode is in the supported table");
@@ -779,6 +792,7 @@ mod tests {
             anthropic: None,
             opencode: None,
             codex: Some("http://127.0.0.1:9/backend-api/wham/usage".to_string()),
+            agy: None,
         };
         let adapter = adapter_for("codex", "codex-primary", &overrides)
             .expect("codex is in the supported table");
@@ -847,6 +861,35 @@ mod tests {
             }
         }
         assert!(SUPPORTED_PROVIDERS.contains(&"agy"));
+    }
+
+    /// The agy endpoint override the caller resolved crosses into the chosen
+    /// adapter; the default holds only when the override is absent (aub-6qay:
+    /// the end-to-end refresh case serves a stub through this).
+    #[test]
+    fn adapter_for_honours_the_resolved_agy_endpoint_override() {
+        let overrides = EndpointConfig {
+            anthropic: None,
+            opencode: None,
+            codex: None,
+            agy: Some("http://127.0.0.1:9/v1internal:retrieveUserQuotaSummary".to_string()),
+        };
+        let adapter =
+            adapter_for("agy", "agy-primary", &overrides).expect("agy is in the supported table");
+        match adapter {
+            AnyAdapter::Agy(agy) => {
+                assert_eq!(
+                    agy.endpoint_url(),
+                    "http://127.0.0.1:9/v1internal:retrieveUserQuotaSummary"
+                );
+            }
+            AnyAdapter::Anthropic(_)
+            | AnyAdapter::Codex(_)
+            | AnyAdapter::Ollama(_)
+            | AnyAdapter::OpenCode(_) => {
+                panic!("expected the agy arm")
+            }
+        }
     }
 
     /// The negative: an unsupported provider yields the usage error that

@@ -1662,6 +1662,7 @@ pub(crate) fn sample_command(
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
                 opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
                 codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
+                agy: std::env::var("AUB_AGY_ENDPOINT").ok(),
             },
         )?;
 
@@ -2154,6 +2155,7 @@ pub(crate) fn now_command(
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
                 opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
                 codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
+                agy: std::env::var("AUB_AGY_ENDPOINT").ok(),
             },
         )?;
 
@@ -5805,6 +5807,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
                 opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
                 codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
+                agy: std::env::var("AUB_AGY_ENDPOINT").ok(),
             },
         )?;
         let batch_accounts = vec![crate::meter::sampler::BatchAccount {
