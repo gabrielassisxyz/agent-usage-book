@@ -685,6 +685,100 @@ mod tests {
         assert_eq!(reading.included_scopes.len(), 2);
     }
 
+    /// `included_scopes` is exactly the distinct scopes of the windows the
+    /// reading actually renders, which is `applicable_windows` under the same
+    /// selector, in first-seen order: a status-line-style subset carrying only
+    /// account-wide windows, a full reading that adds a model window, and the
+    /// mixed case where a selector admits one model window and excludes
+    /// another. The planted negative is that last case: a reading that listed
+    /// every stored scope regardless of the selector would carry the excluded
+    /// model.
+    #[test]
+    fn included_scopes_match_the_windows_actually_rendered() {
+        fn account_with(windows: Vec<ProjectedWindow>) -> ProjectedAccount {
+            ProjectedAccount {
+                account_id: AccountId::new(1),
+                logical_name: "work".to_string(),
+                provider: "anthropic".to_string(),
+                last_successful_observation: Some(SuccessfulObservation {
+                    observation_id: ObservationRowId::new(1),
+                    provider_contract_id: ProviderContractId::new("contract-v1"),
+                    provider_observed_at: Some(UtcTimestamp::from_unix_nanos(1_000)),
+                    received_at: UtcTimestamp::from_unix_nanos(1_100),
+                    measurement_basis: MeasurementBasis::ProviderObserved,
+                    windows,
+                }),
+                latest_attempt: None,
+            }
+        }
+
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000));
+        let scopes_of = |account: &ProjectedAccount, model: Option<&str>| {
+            account_reading(
+                Some(account),
+                model,
+                MonotonicDuration::from_seconds(720),
+                MonotonicDuration::from_seconds(8),
+                ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60)),
+                &clock,
+            )
+            .included_scopes
+        };
+        let distinct_applicable = |windows: &[ProjectedWindow], model: Option<&str>| {
+            let mut scopes: Vec<WindowScope> = Vec::new();
+            for window in applicable_windows(windows, model) {
+                if !scopes.contains(&window.scope) {
+                    scopes.push(window.scope.clone());
+                }
+            }
+            scopes
+        };
+
+        let subset = vec![window(140_000, None), window(520_000, None)];
+        let subset_account = account_with(subset.clone());
+        assert_eq!(
+            scopes_of(&subset_account, None),
+            distinct_applicable(&subset, None)
+        );
+        assert_eq!(
+            scopes_of(&subset_account, None),
+            vec![WindowScope::AccountWide]
+        );
+
+        let full = vec![window(140_000, None), window(700_000, Some("sonnet"))];
+        let full_account = account_with(full.clone());
+        assert_eq!(
+            scopes_of(&full_account, None),
+            distinct_applicable(&full, None)
+        );
+        assert_eq!(
+            scopes_of(&full_account, None),
+            vec![
+                WindowScope::AccountWide,
+                WindowScope::ModelSpecific(ModelId::new("sonnet".to_string())),
+            ]
+        );
+
+        let mixed = vec![
+            window(140_000, None),
+            window(700_000, Some("sonnet")),
+            window(300_000, Some("opus")),
+        ];
+        let mixed_account = account_with(mixed.clone());
+        assert_eq!(
+            scopes_of(&mixed_account, Some("sonnet")),
+            distinct_applicable(&mixed, Some("sonnet"))
+        );
+        assert_eq!(
+            scopes_of(&mixed_account, Some("sonnet")),
+            vec![
+                WindowScope::AccountWide,
+                WindowScope::ModelSpecific(ModelId::new("sonnet".to_string())),
+            ],
+            "the selector admits sonnet and excludes opus"
+        );
+    }
+
     /// An observation whose applicable window set is empty yields no reading
     /// value: the machine reports no successful observation rather than a
     /// number nothing justifies.

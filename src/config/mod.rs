@@ -276,11 +276,24 @@ pub struct AttributionConfig {
 #[derive(Debug, Clone)]
 pub struct BackupConfig {
     pub review_after: MonotonicDuration,
-    /// Where `doctor` looks for the last verified backup. `aub backup` takes its
-    /// destination as an explicit argument and remembers nothing durably, so
-    /// without this the backup-age check would have nowhere to look. `None`
-    /// means backup age is not applicable rather than an assumed default path.
+    /// The destination root holding the series of dated archives. `aub backup`
+    /// with no explicit argument writes under this root, and `doctor` reads
+    /// the newest-verified pointer inside it. `None` means backup age is not
+    /// applicable rather than an assumed default path.
     pub destination: Option<PathBuf>,
+    /// Tiered retention counts (aub-kzgo): keep the latest archive of each of
+    /// the last `keep_daily` days, `keep_weekly` weeks, `keep_monthly` months
+    /// and `keep_yearly` years. An archive is retained when any bucket keeps
+    /// it; the most recent verified archive is always kept. Defaults
+    /// (7/4/6/2) bound the worst case to 19 archives: at the measured upper
+    /// bound of 11.7 MB per day the ledger passes 4.5 GB within a year, so 30
+    /// full copies would cost about 135 GB of 210 GB free on /tank, while 19
+    /// cost about 86 GB and still span a week of dailies, a month of weeklies,
+    /// half a year of monthlies and two yearlies for late-noticed corruption.
+    pub keep_daily: usize,
+    pub keep_weekly: usize,
+    pub keep_monthly: usize,
+    pub keep_yearly: usize,
 }
 
 /// The periodic restore drill's own review policy, the same shape as
@@ -573,7 +586,14 @@ const CREDENTIAL_ENV_KEYS: &[&str] = &["kind", "name"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
-const BACKUP_KEYS: &[&str] = &["review_after", "destination"];
+const BACKUP_KEYS: &[&str] = &[
+    "review_after",
+    "destination",
+    "keep_daily",
+    "keep_weekly",
+    "keep_monthly",
+    "keep_yearly",
+];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
@@ -1034,6 +1054,32 @@ fn resolve_count(
     Ok(value)
 }
 
+/// A tiered-retention keep count for `backup.keep_*` (aub-kzgo). Zero is a
+/// valid policy that disables the bucket, so unlike [`resolve_count`] it is
+/// accepted rather than refused; anything that is not a whole number still
+/// fails with the key named.
+fn resolve_backup_keep_count(
+    key: &str,
+    overrides: &Overrides,
+    env: &dyn EnvSource,
+    file_value: Option<String>,
+    default: Option<&str>,
+    file_display: &str,
+    provenance: &mut Provenance,
+) -> Result<usize, Error> {
+    let raw = resolve_string(
+        key,
+        overrides,
+        env,
+        file_value,
+        default,
+        file_display,
+        provenance,
+    )?;
+    raw.parse::<usize>()
+        .map_err(|_| Error::Usage(format!("{key}: {raw:?} is not a whole number")))
+}
+
 /// Non-identifying platform defaults: derived from `$HOME` at resolution time, never
 /// from a compiled-in path. `home` is itself resolution's caller-supplied, so a test
 /// can prove no default leaks the *real* process's home directory by resolving under a
@@ -1419,6 +1465,42 @@ pub fn resolve(
             &mut provenance,
         )?,
         destination: backup_destination,
+        keep_daily: resolve_backup_keep_count(
+            "backup.keep_daily",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "backup", "keep_daily"),
+            Some("7"),
+            &file_display,
+            &mut provenance,
+        )?,
+        keep_weekly: resolve_backup_keep_count(
+            "backup.keep_weekly",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "backup", "keep_weekly"),
+            Some("4"),
+            &file_display,
+            &mut provenance,
+        )?,
+        keep_monthly: resolve_backup_keep_count(
+            "backup.keep_monthly",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "backup", "keep_monthly"),
+            Some("6"),
+            &file_display,
+            &mut provenance,
+        )?,
+        keep_yearly: resolve_backup_keep_count(
+            "backup.keep_yearly",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "backup", "keep_yearly"),
+            Some("2"),
+            &file_display,
+            &mut provenance,
+        )?,
     };
 
     let drill_result = file
@@ -1869,6 +1951,10 @@ impl Config {
             }
             "backup.review_after" => format_config_duration(self.backup.review_after),
             "backup.destination" => self.backup.destination.as_ref()?.display().to_string(),
+            "backup.keep_daily" => self.backup.keep_daily.to_string(),
+            "backup.keep_weekly" => self.backup.keep_weekly.to_string(),
+            "backup.keep_monthly" => self.backup.keep_monthly.to_string(),
+            "backup.keep_yearly" => self.backup.keep_yearly.to_string(),
             "drill.max_age" => format_config_duration(self.drill.max_age),
             "drill.result" => self.drill.result.as_ref()?.display().to_string(),
             "adapter_semantics.max_comparison_age" => {
@@ -3243,6 +3329,10 @@ antigravity.refresh                   true                                     d
 attribution.recent_window             30d                                      default
 
 backup.destination                    /tmp/aub-golden/backups                  file
+backup.keep_daily                     7                                        default
+backup.keep_monthly                   6                                        default
+backup.keep_weekly                    4                                        default
+backup.keep_yearly                    2                                        default
 backup.review_after                   36h                                      file
 
 can_run.ample_margin_multiple         2                                        default

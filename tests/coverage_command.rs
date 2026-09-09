@@ -590,6 +590,95 @@ fn a_policy_unknown_interval_is_visible_in_both_modes() {
     assert_eq!(parsed["accounts"][0]["attempt_coverage"], Value::Null);
 }
 
+/// An account configured mid-window: the head before its first policy
+/// snapshot must not inflate the longest no-attempt gap. Here the pre-policy
+/// prefix (23h) dwarfs the one real hole inside the covered span (55m), so
+/// a reader who saw the old behaviour would get a figure no pair of rows in
+/// the ledger could reproduce (`aub-53vk`).
+#[test]
+fn the_longest_gap_excludes_the_head_before_the_first_policy_snapshot() {
+    let state = StateDir::new();
+    let conn = open_ledger(&state);
+    let since = ts(T0 / SECOND);
+    let until = ts(T0 / SECOND + 86_400);
+    // 23h into the window: the account did not exist for aub before this.
+    let effective_at = UtcTimestamp::from_unix_nanos(since.unix_nanos() + 82_800 * SECOND);
+    let run = run_store::start_sample_run(&conn, run_store::Trigger::Timer, since, "test")
+        .expect("the sample run must insert");
+    let account = account_store::observe_account(&conn, "provider-a", "younger", since)
+        .expect("the account must insert");
+    let snapshot = snapshot_store::resolve_policy_snapshot(
+        &conn,
+        account,
+        effective_at,
+        &snapshot_store::ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(300),
+            freshness_horizon: MonotonicDuration::from_seconds(900),
+            reset_edge_policy: String::new(),
+            retry_backoff_policy: String::new(),
+            command_budget: MonotonicDuration::from_seconds(30),
+            policy_algorithm_version: "v1".into(),
+        },
+    )
+    .expect("the snapshot must insert");
+    // Two attempts on the grid, then silence to the interval end: the one
+    // real hole inside the covered span is 3,300s (55m), from the second
+    // attempt to the window's close.
+    seed_attempt(
+        &conn,
+        run,
+        account,
+        snapshot,
+        effective_at,
+        AttemptOutcome::Success,
+        AttemptCompletion::Terminal,
+    );
+    seed_attempt(
+        &conn,
+        run,
+        account,
+        snapshot,
+        UtcTimestamp::from_unix_nanos(effective_at.unix_nanos() + 300 * SECOND),
+        AttemptOutcome::Success,
+        AttemptCompletion::Terminal,
+    );
+
+    let report = assemble_coverage(
+        &conn,
+        since,
+        until,
+        &CoverageSelector::default(),
+        floors(),
+        until,
+        &[AccountIdentity::new("provider-a", "younger")],
+    )
+    .expect("the report must assemble");
+    let engine = &report.accounts[0].engine;
+    assert_eq!(
+        engine
+            .longest_no_attempt_gap
+            .expect("a gap exists")
+            .duration(),
+        MonotonicDuration::from_seconds(3_300),
+        "the longest gap must be the real 55m hole inside the covered span, \
+         not the 23h prefix before the account's first policy"
+    );
+
+    let rendered = render_coverage_report(&report, "24h", Style::plain());
+    assert!(
+        rendered.contains("55m"),
+        "the table must show the real gap: {rendered}"
+    );
+    assert!(
+        !rendered.contains("23h"),
+        "the pre-policy head must not read as a sampling gap: {rendered}"
+    );
+    assert!(
+        rendered.contains("policy known for 1h of 24h"),
+        "the detail block must still name the partial span: {rendered}"
+    );
+}
+
 /// The selectors compose before the threshold verdict: a named account keeps
 /// its own verdict, and adding `--severe` narrows that same account rather
 /// than evaluating a different denominator.

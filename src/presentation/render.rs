@@ -215,11 +215,17 @@ fn render_status_grid(
 ) -> String {
     let width = style.width() as usize;
 
+    // One percent column for the whole grid, sized to the widest window text
+    // it holds (aub-v8wt): every window renders at its own reported
+    // resolution, so the column is the maximum over the rows, never a global
+    // decimal count imposed on windows that did not report it.
+    let percent_width = status_percent_width(accounts);
+
     // Group accounts by provider, keeping first-seen (configured) order.
     let mut groups: Vec<(&str, Vec<String>)> = Vec::new();
     for account in accounts {
         let provider = account.provider.as_deref().unwrap_or("");
-        let body = status_account_body(account, now, envelope, style);
+        let body = status_account_body(account, now, envelope, style, percent_width);
         match groups.last_mut() {
             Some((seen, bodies)) if *seen == provider => bodies.push(body),
             _ => groups.push((provider, vec![body])),
@@ -277,6 +283,7 @@ fn status_account_body(
     now: UtcTimestamp,
     envelope: ClockSkewEnvelope,
     style: Style,
+    percent_width: usize,
 ) -> String {
     use crate::domain::freshness::FreshnessKind;
     let kind = account.reading.kind();
@@ -293,7 +300,7 @@ fn status_account_body(
     let rows = if kind == FreshnessKind::AuthRequired {
         Vec::new()
     } else {
-        status_window_rows(account, now, envelope, style, dim_block)
+        status_window_rows(account, now, envelope, style, dim_block, percent_width)
     };
     if rows.is_empty() {
         let answer = if kind == FreshnessKind::AuthRequired {
@@ -326,6 +333,7 @@ fn status_window_rows(
     envelope: ClockSkewEnvelope,
     style: Style,
     dim_block: bool,
+    percent_width: usize,
 ) -> Vec<String> {
     // A `--model` selector narrows the grid to the account-wide windows and
     // the chosen model's own, the same set the reading was computed over;
@@ -365,7 +373,15 @@ fn status_window_rows(
 
     let mut rows: Vec<String> = plain
         .into_iter()
-        .map(|window| status_window_row(window, style, dim_block, cached_note.as_deref()))
+        .map(|window| {
+            status_window_row(
+                window,
+                style,
+                dim_block,
+                cached_note.as_deref(),
+                percent_width,
+            )
+        })
         .collect();
     for (group, windows) in &groups {
         rows.push(status_group_line(group, style, dim_block));
@@ -377,6 +393,7 @@ fn status_window_rows(
                 style,
                 dim_block,
                 cached_note.as_deref(),
+                percent_width,
             ));
         }
     }
@@ -418,16 +435,17 @@ fn status_window_row(
     style: Style,
     dim_block: bool,
     cached_note: Option<&str>,
+    percent_width: usize,
 ) -> String {
-    let used_percent = status_used_percent(window);
-    let tone = status_used_tone(style, used_percent, window);
+    let used_ppm = window.quota_used.as_ppm().get();
+    let tone = status_used_tone(style, used_ppm, window);
     let label = status_window_label(window);
 
     let bar = status_bar(window, style, tone);
-    let percent_text = format!("{used_percent}%");
+    let percent_text = status_used_percent_text(window);
     let percent = style.paint(
         &format!("{}{}", tone, style.bold()),
-        &format!("{percent_text:>width$}", width = STATUS_PERCENT_WIDTH),
+        &format!("{percent_text:>width$}", width = percent_width),
     );
     let rate_text = window
         .rate
@@ -489,25 +507,67 @@ fn clamp_label(label: &str) -> String {
     format!("{head}\u{2026}")
 }
 
-/// Whole percent of the window's cap consumed, rounded.
-fn status_used_percent(window: &crate::report::StatusWindow) -> u32 {
-    let ppm = window.quota_used.as_ppm().get();
-    (ppm + 5_000) / 10_000
+/// The percent text of one grid row, at the resolution its provider reported
+/// (aub-v8wt): the decimals are the window's own, from
+/// [`status_percent_decimals`], never a grid-wide policy, and trailing zeros
+/// are trimmed by [`render_percentage`], so a whole-percent provider never
+/// prints `53.0%` because another provider reports tenths. A quantization
+/// other than `Exact` prefixes the approximate marker: the provider asserted
+/// an interval, not a scalar, and the bare number would claim a precision it
+/// did not report.
+fn status_used_percent_text(window: &crate::report::StatusWindow) -> String {
+    let decimals = status_percent_decimals(window.reported_resolution_ppm.as_ppm().get());
+    let digits = render_percentage(window.quota_used.as_ppm().get(), Precision::new(decimals));
+    let text = format!("{digits}%");
+    if window.quantization == crate::domain::window::QuantizationSemantics::Exact {
+        text
+    } else {
+        format!("~{text}")
+    }
 }
 
-/// The tone of a row by percent used: idle when nothing is used, red at or
+/// How many fractional percent digits a reported resolution earns: the fewest
+/// that keep two readings the provider distinguishes distinct. 10_000 ppm is
+/// whole percent (0), 1_000 ppm is tenths (1), 100 ppm is hundredths (2), down
+/// to 1 ppm (4). Pure integer arithmetic: no float crosses this boundary.
+fn status_percent_decimals(resolution_ppm: u32) -> u8 {
+    for decimals in 0..=4u8 {
+        let scale = 10u32.pow(u32::from(decimals));
+        if resolution_ppm.saturating_mul(scale) % 10_000 == 0 {
+            return decimals;
+        }
+    }
+    4
+}
+
+/// The percent-column width of one grid: the widest window text it holds,
+/// floored at [`STATUS_PERCENT_WIDTH`] so a whole-percent grid keeps its
+/// historic five.
+fn status_percent_width(accounts: &[crate::report::MeterAccount]) -> usize {
+    accounts
+        .iter()
+        .flat_map(|account| account.windows.iter())
+        .map(|window| status_used_percent_text(window).chars().count())
+        .max()
+        .unwrap_or(0)
+        .max(STATUS_PERCENT_WIDTH)
+}
+
+/// The tone of a row by quota used: idle when nothing is used, red at or
 /// above 85, yellow at or above 60, green otherwise. An auth-required or
-/// not-started window has no fraction to tone and reads idle.
+/// not-started window has no fraction to tone and reads idle. Compared in
+/// parts per million, not in rounded percent, so an 84.96% window does not
+/// read red because its text rounds up.
 fn status_used_tone(
     style: Style,
-    used_percent: u32,
+    used_ppm: u32,
     window: &crate::report::StatusWindow,
 ) -> &'static str {
-    if window.reset_state.is_not_started() || used_percent == 0 {
+    if window.reset_state.is_not_started() || used_ppm == 0 {
         style.idle()
-    } else if used_percent >= STATUS_TONE_RED_AT_PERCENT {
+    } else if used_ppm >= STATUS_TONE_RED_AT_PERCENT * 10_000 {
         style.red()
-    } else if used_percent >= STATUS_TONE_YELLOW_AT_PERCENT {
+    } else if used_ppm >= STATUS_TONE_YELLOW_AT_PERCENT * 10_000 {
         style.yellow()
     } else {
         style.green()
@@ -2960,6 +3020,132 @@ mod tests {
         assert_eq!(render_percentage(1_000_000, Precision::new(2)), "100");
     }
 
+    /// Each window renders at its own reported resolution (aub-v8wt): whole
+    /// percent at 10_000 ppm, tenths at 1_000, hundredths at 100, down to four
+    /// decimals at 1 ppm. The opencode pair that collided at `2%` renders
+    /// `1.6%` and `2.4%`. Trailing zeros trim, so a whole value at a fine
+    /// resolution reads `53%`, never `53.0%`. The planted negative is the naive
+    /// whole-percent rounder: it prints `2%` for both opencode values.
+    #[test]
+    fn status_percent_text_renders_each_window_at_its_reported_resolution() {
+        use crate::domain::window::{QuantizationSemantics, WindowResetState, WindowScope};
+        let text = |used_ppm: i32, resolution_ppm: i32| {
+            status_used_percent_text(&status_window_with_resolution(
+                "w",
+                WindowScope::AccountWide,
+                used_ppm,
+                5 * 3_600,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                resolution_ppm,
+                QuantizationSemantics::Exact,
+            ))
+        };
+        // The opencode collision pair.
+        assert_eq!(text(16_000, 1_000), "1.6%");
+        assert_eq!(text(24_000, 1_000), "2.4%");
+        // Whole-percent granularity never gains a decimal.
+        assert_eq!(text(20_000, 10_000), "2%");
+        assert_eq!(text(530_000, 10_000), "53%");
+        // Trailing zeros trim at fine resolutions too.
+        assert_eq!(text(530_000, 1_000), "53%");
+        assert_eq!(text(531_000, 1_000), "53.1%");
+        // Hundredths and below.
+        assert_eq!(text(385_500, 100), "38.55%");
+        assert_eq!(text(380_000, 100), "38%");
+        assert_eq!(text(1, 1), "0.0001%");
+        assert_eq!(text(10, 1), "0.001%");
+        // Half-up rounding at the rendered resolution.
+        assert_eq!(text(16_500, 1_000), "1.7%");
+        assert_eq!(text(15_000, 10_000), "2%");
+        assert_eq!(text(1_000_000, 1_000), "100%");
+        assert_eq!(text(0, 1_000), "0%");
+    }
+
+    /// A quantization other than `exact` never renders a bare number
+    /// (aub-v8wt): the provider asserted an interval, not a scalar, so the
+    /// text carries the approximate marker the stale reader already uses. The
+    /// decimals stay the reported resolution: the marker qualifies the
+    /// precision, it does not coarsen it. The planted negative is the bare
+    /// `1.6%` for a rounded reading, which claims exactness.
+    #[test]
+    fn status_percent_text_marks_non_exact_quantization_approximate() {
+        use crate::domain::window::{QuantizationSemantics, WindowResetState, WindowScope};
+        let text = |quantization: QuantizationSemantics| {
+            status_used_percent_text(&status_window_with_resolution(
+                "w",
+                WindowScope::AccountWide,
+                16_000,
+                5 * 3_600,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                1_000,
+                quantization,
+            ))
+        };
+        assert_eq!(text(QuantizationSemantics::Exact), "1.6%");
+        assert_eq!(text(QuantizationSemantics::RoundedToNearest), "~1.6%");
+        assert_eq!(text(QuantizationSemantics::RoundedDown), "~1.6%");
+        assert_eq!(text(QuantizationSemantics::RoundedUp), "~1.6%");
+        assert_eq!(text(QuantizationSemantics::Unknown), "~1.6%");
+    }
+
+    /// Bar fill and percent text derive from the same `quota_used` (aub-v8wt):
+    /// the text parses back to within the rendered resolution of the value
+    /// the bar was filled from, at every supported resolution. The bar cell is
+    /// a thirtieth of the cap, far coarser than any text resolution, so
+    /// "agree" means the text round-trips within the resolution, not within a
+    /// bar cell; the bar pins its exact fill formula beside it. The planted
+    /// negative derives the bar from the whole-percent-rounded value: at
+    /// 16_000 ppm the exact fill is 0 cells and the rounded fill is 1.
+    #[test]
+    fn status_bar_fill_and_percent_text_agree_within_the_rendered_resolution() {
+        use crate::domain::window::{QuantizationSemantics, WindowResetState, WindowScope};
+        fn displayed_ppm(text: &str) -> u32 {
+            let digits = text.trim_start_matches('~').strip_suffix('%').unwrap();
+            let (int, frac) = match digits.split_once('.') {
+                Some((int, frac)) => (int, frac),
+                None => (digits, ""),
+            };
+            let padded = format!("{frac:0<4}");
+            int.parse::<u32>().unwrap() * 10_000 + padded[..4].parse::<u32>().unwrap()
+        }
+        for (used_ppm, resolution_ppm) in [
+            (0, 10_000),
+            (16_000, 1_000),
+            (24_000, 1_000),
+            (620_000, 10_000),
+            (849_999, 1_000),
+            (385_500, 100),
+            (1, 1),
+            (999_999, 1),
+            (500_000, 10_000),
+        ] {
+            let window = status_window_with_resolution(
+                "w",
+                WindowScope::AccountWide,
+                used_ppm,
+                5 * 3_600,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(now().unix_nanos())),
+                resolution_ppm,
+                QuantizationSemantics::Exact,
+            );
+            let text = status_used_percent_text(&window);
+            let round_trip = displayed_ppm(&text);
+            assert!(
+                (i64::from(round_trip) - i64::from(used_ppm)).abs() <= i64::from(resolution_ppm),
+                "text {text} round-trips within {resolution_ppm} ppm of {used_ppm}"
+            );
+            let tone = status_used_tone(Style::plain(), used_ppm as u32, &window);
+            let bar = status_bar(&window, Style::plain(), tone);
+            let expected = ((u64::from(used_ppm as u32) * STATUS_BAR_CELLS as u64 + 500_000)
+                / 1_000_000) as usize;
+            assert_eq!(
+                bar.chars().filter(|c| *c == '\u{2501}').count(),
+                expected,
+                "bar fill derives from the same {used_ppm} ppm the text renders"
+            );
+        }
+    }
+
     /// The account-wide label names the window by what it is: `week` only for
     /// seven days, `month` for 28 to 31 days, and the rendered length for
     /// anything else. The planted negative is the 24-hour window: it used to
@@ -3025,12 +3211,37 @@ mod tests {
         nominal_seconds: i64,
         reset: crate::domain::window::WindowResetState,
     ) -> crate::report::StatusWindow {
+        status_window_with_resolution(
+            semantic_key,
+            scope,
+            used_ppm,
+            nominal_seconds,
+            reset,
+            10_000,
+            crate::domain::window::QuantizationSemantics::Exact,
+        )
+    }
+
+    fn status_window_with_resolution(
+        semantic_key: &str,
+        scope: crate::domain::window::WindowScope,
+        used_ppm: i32,
+        nominal_seconds: i64,
+        reset: crate::domain::window::WindowResetState,
+        resolution_ppm: i32,
+        quantization: crate::domain::window::QuantizationSemantics,
+    ) -> crate::report::StatusWindow {
         crate::report::StatusWindow {
             semantic_key: semantic_key.to_string(),
             scope,
             quota_used: crate::domain::quota::QuotaUsed::new(
                 QuotaFractionPpm::new(used_ppm).unwrap(),
             ),
+            reported_resolution_ppm: crate::domain::window::ReportedResolution::new(
+                QuotaFractionPpm::new(resolution_ppm).unwrap(),
+            )
+            .unwrap(),
+            quantization,
             reset_state: reset,
             nominal_duration: NominalWindowDuration::from_nanos(
                 (nominal_seconds * NANOS_PER_SECOND) as u64,

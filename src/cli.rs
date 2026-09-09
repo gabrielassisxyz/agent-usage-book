@@ -837,7 +837,7 @@ impl Command {
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
-                Some("DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]")
+                Some("[DESTINATION] | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]")
             }
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
@@ -4029,6 +4029,8 @@ fn projection_accounts(
                                 semantic_key: window.semantic_key.clone(),
                                 scope: window.scope.clone(),
                                 quota_used: window.quota_used_ppm,
+                                reported_resolution_ppm: window.reported_resolution_ppm,
+                                quantization: window.quantization,
                                 reset_state: window.resets_at,
                                 nominal_duration: window.nominal_duration_nanos,
                                 rate: crate::report::burn_rate::live_burn_rate(
@@ -4840,8 +4842,10 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
     line
 }
 
-/// `aub backup DEST` creates a new archive; `aub backup verify DEST` clears
-/// and recomputes its verification result; `aub backup restore ARCHIVE DEST
+/// `aub backup [DEST]` writes a new dated archive under the destination
+/// root (explicit argument wins, otherwise `backup.destination` from
+/// configuration); `aub backup verify DEST` clears and recomputes the
+/// verification result of one archive; `aub backup restore ARCHIVE DEST
 /// [--surviving DIR]` is the recovery path (`aub-sth.13`, docs/recovery.md).
 /// The archive module owns the cut and verification protocol, while this layer
 /// only resolves configuration and renders the typed summary.
@@ -4850,17 +4854,43 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
         [subcommand, rest @ ..] if subcommand == "restore" => {
             return restore_command(clock, rest);
         }
-        [destination] => create_backup_archive(clock, destination)?,
+        [] => {
+            let config = resolve_backup_config()?;
+            let destination = backup_resolve_destination(None, &config)?;
+            create_backup_archive(clock, &destination)?;
+        }
+        [destination] => {
+            let config = resolve_backup_config()?;
+            let destination =
+                backup_resolve_destination(Some(std::path::Path::new(destination)), &config)?;
+            create_backup_archive(clock, &destination)?;
+        }
         [subcommand, destination] if subcommand == "verify" => {
             verify_backup_archive(clock, destination)?
         }
         rest => {
             return Err(Error::Usage(format!(
-                "backup requires DEST, `verify DEST` or `restore ARCHIVE DEST`, got {rest:?}"
+                "backup requires [DEST], `verify DEST` or `restore ARCHIVE DEST`, got {rest:?}"
             )));
         }
     }
     Ok(())
+}
+
+/// Which destination root a backup run writes under: the explicit argument
+/// wins, otherwise `backup.destination` from configuration, otherwise a usage
+/// error naming both. Extracted so the precedence is unit-testable without a
+/// state directory on disk.
+fn backup_resolve_destination(
+    explicit: Option<&std::path::Path>,
+    config: &crate::config::Config,
+) -> Result<std::path::PathBuf, Error> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    config.backup.destination.clone().ok_or_else(|| {
+        Error::Usage("backup requires a destination: pass DEST or set backup.destination".into())
+    })
 }
 
 /// Resolves the configuration the backup family reads, the same way every
@@ -4879,16 +4909,22 @@ fn resolve_backup_config() -> Result<crate::config::Config, Error> {
     Ok(config)
 }
 
-fn create_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
+fn create_backup_archive(clock: &impl Clock, destination: &std::path::Path) -> Result<(), Error> {
     let config = resolve_backup_config()?;
-    let destination = std::path::Path::new(destination);
+    let retention = crate::backup::BackupSeriesRetention::new(
+        config.backup.keep_daily,
+        config.backup.keep_weekly,
+        config.backup.keep_monthly,
+        config.backup.keep_yearly,
+    );
     let summary = crate::store::startup::run_after_state_check(
         &config.state.dir,
         &crate::store::startup::ProcMounts,
         || {
-            crate::backup::create_archive(
+            crate::backup::backup_series_create(
                 &config.state.dir,
                 destination,
+                &retention,
                 config.sampling.request_timeout,
                 clock,
             )
@@ -4933,11 +4969,10 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         file_contents.as_deref(),
         &file_path,
     )?;
-    let backup = crate::backup::verify_archive(
-        std::path::Path::new(&backup_path),
-        config.sampling.request_timeout,
-        clock,
-    )?;
+    let backup_path =
+        crate::backup::backup_resolve_archive_path(std::path::Path::new(&backup_path))?;
+    let backup =
+        crate::backup::verify_archive(&backup_path, config.sampling.request_timeout, clock)?;
     if false && !backup.verified {
         return Err(Error::Store(
             "legacy import requires a verified backup archive".into(),
@@ -5018,11 +5053,10 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         file_contents.as_deref(),
         &file_path,
     )?;
-    let backup = crate::backup::verify_archive(
-        std::path::Path::new(&backup_path),
-        config.sampling.request_timeout,
-        clock,
-    )?;
+    let backup_path =
+        crate::backup::backup_resolve_archive_path(std::path::Path::new(&backup_path))?;
+    let backup =
+        crate::backup::verify_archive(&backup_path, config.sampling.request_timeout, clock)?;
     if !backup.verified {
         return Err(Error::Store(
             "seed archive import requires a verified backup archive".into(),
@@ -5118,11 +5152,10 @@ fn import_legacy_calibration(
         file_contents.as_deref(),
         &file_path,
     )?;
-    let backup = crate::backup::verify_archive(
-        std::path::Path::new(&backup_path),
-        config.sampling.request_timeout,
-        clock,
-    )?;
+    let backup_path =
+        crate::backup::backup_resolve_archive_path(std::path::Path::new(&backup_path))?;
+    let backup =
+        crate::backup::verify_archive(&backup_path, config.sampling.request_timeout, clock)?;
     if !backup.verified {
         return Err(Error::Store(
             "legacy calibration import requires a verified backup archive".into(),
@@ -5199,9 +5232,10 @@ fn import_legacy_calibration(
 
 fn verify_backup_archive(clock: &impl Clock, destination: &str) -> Result<(), Error> {
     let config = resolve_backup_config()?;
-    let destination = std::path::Path::new(destination);
+    let destination =
+        crate::backup::backup_resolve_archive_path(std::path::Path::new(destination))?;
     let summary =
-        crate::backup::verify_archive(destination, config.sampling.request_timeout, clock)?;
+        crate::backup::verify_archive(&destination, config.sampling.request_timeout, clock)?;
     println!(
         "backup: verified={} schema={} generation={} pending={} drain_completed={} destination={}",
         summary.verified,
@@ -5287,7 +5321,9 @@ fn legacy_calibration_import_flags(rest: &[String]) -> Result<(String, String), 
 }
 
 /// `aub backup restore ARCHIVE DEST [--surviving DIR]`: the recovery path
-/// (`aub-sth.13`, docs/recovery.md). Reads the archive, restores it into the
+/// (`aub-sth.13`, docs/recovery.md). ARCHIVE may name one archive directory
+/// or a destination root, in which case the newest verified archive is
+/// restored. Reads the archive, restores it into the
 /// new directory DEST, replays pending evidence from the archive and, when
 /// given, from the surviving directory, and prints what it recovered and what
 /// it could not. The configured state directory is passed to the restore so
@@ -5295,6 +5331,7 @@ fn legacy_calibration_import_flags(rest: &[String]) -> Result<(String, String), 
 /// resolves, not of a second resolution this layer would own.
 fn restore_command(clock: &impl Clock, rest: &[String]) -> Result<(), Error> {
     let (archive, destination, surviving) = parse_restore_args(rest)?;
+    let archive = crate::backup::backup_resolve_archive_path(&archive)?;
     let config = resolve_backup_config()?;
     let summary = crate::restore::restore_archive(
         &config.state.dir,
@@ -8219,6 +8256,43 @@ mod tests {
     use crate::config::FakeEnv;
     use crate::presentation::render::render_calibrate_show_entry;
 
+    /// `aub backup` with no argument uses `backup.destination`, and an
+    /// explicit argument wins over it (aub-kzgo): the command and the doctor
+    /// check can no longer disagree about which series is the real one.
+    #[test]
+    fn backup_destination_prefers_the_explicit_argument_then_the_config() {
+        let toml = "[backup]\ndestination = \"/tmp/aub-configured-root\"\n";
+        let (config, _) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &FakeEnv::new(),
+            Some(toml),
+            "/virtual/aub.toml",
+        )
+        .expect("config resolves");
+        assert_eq!(
+            backup_resolve_destination(Some(std::path::Path::new("/tmp/aub-explicit")), &config)
+                .unwrap(),
+            std::path::PathBuf::from("/tmp/aub-explicit"),
+            "an explicit argument wins over the configured destination"
+        );
+        assert_eq!(
+            backup_resolve_destination(None, &config).unwrap(),
+            std::path::PathBuf::from("/tmp/aub-configured-root"),
+            "with no argument the configured destination is used"
+        );
+        let (bare, _) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &FakeEnv::new(),
+            None,
+            "/virtual/aub.toml",
+        )
+        .expect("config resolves");
+        assert!(
+            backup_resolve_destination(None, &bare).is_err(),
+            "with neither an argument nor a configured destination the command must refuse"
+        );
+    }
+
     /// `aub sample` opens its ledger with the configured `sampling.request_timeout`,
     /// not a hardcoded value (`aub-va6s`): a config naming a busy timeout
     /// wider than the old hardcoded 500ms must actually reach the pragma
@@ -10784,5 +10858,84 @@ usage_evidence = "measured"
             Err(Error::Usage(message)) => assert!(message.contains("--resident"), "{message}"),
             other => panic!("expected Error::Usage, got {other:?}"),
         }
+    }
+
+    /// The status seam carries each window's reported resolution and
+    /// quantization into the report model (aub-v8wt): a tenth-percent rounded
+    /// window arrives intact, not rebuilt as whole-percent exact. The planted
+    /// negative is the old literal, which named no resolution at all: it
+    /// renders this window `2%`, colliding with its monthly sibling.
+    #[test]
+    fn projection_accounts_carries_reported_resolution_and_quantization() {
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowScope};
+        let toml = "state.dir = \"/tmp/aub-test-v8wt\"\n\n[[accounts]]\nname = \"opencode\"\nprovider = \"provider-a\"\n";
+        let (config, _) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &FakeEnv::new(),
+            Some(toml),
+            "/virtual/aub.toml",
+        )
+        .expect("config resolves");
+        let now = UtcTimestamp::from_unix_nanos(1_788_768_072_000_000_000);
+        let received = UtcTimestamp::from_unix_nanos(now.unix_nanos() - 41_000_000_000);
+        let projection = crate::projection::Projection {
+            ledger_generation: crate::store::ledger_generation::Generation::new(12),
+            accounts: vec![crate::projection::ProjectedAccount {
+                account_id: crate::store::account::AccountId::new(1),
+                logical_name: "opencode".to_string(),
+                provider: "provider-a".to_string(),
+                last_successful_observation: Some(crate::projection::SuccessfulObservation {
+                    observation_id: crate::store::meter_evidence::ObservationRowId::new(7),
+                    provider_contract_id: crate::domain::ids::ProviderContractId::new(
+                        "contract-v1",
+                    ),
+                    provider_observed_at: Some(received),
+                    received_at: received,
+                    measurement_basis: crate::domain::time::MeasurementBasis::ProviderObserved,
+                    windows: vec![crate::projection::ProjectedWindow {
+                        semantic_key: "weekly".to_string(),
+                        scope: WindowScope::AccountWide,
+                        quota_used_ppm: QuotaUsed::new(QuotaFractionPpm::new(16_000).unwrap()),
+                        reported_resolution_ppm: ReportedResolution::new(
+                            QuotaFractionPpm::new(1_000).unwrap(),
+                        )
+                        .unwrap(),
+                        quantization: QuantizationSemantics::RoundedToNearest,
+                        resets_at: UtcTimestamp::from_unix_nanos(
+                            now.unix_nanos() + 4 * 86_400_000_000_000,
+                        )
+                        .into(),
+                        nominal_duration_nanos:
+                            crate::domain::window::NominalWindowDuration::from_nanos(
+                                604_800_000_000_000u64,
+                            ),
+                        is_active: true,
+                        severity: crate::domain::window::WindowSeverity::unknown(),
+                    }],
+                }),
+                latest_attempt: Some(crate::projection::LatestAttempt {
+                    attempt_id: crate::domain::attempt::AttemptId::new(9),
+                    request_started_at: received,
+                    credential_context_id: Some("ctx".to_string()),
+                    result: Some(crate::projection::TerminalOutcome {
+                        completed_at: received,
+                        outcome: crate::domain::attempt::AttemptOutcome::Success,
+                    }),
+                }),
+            }],
+        };
+        let clock = FakeClock::new(now);
+        let accounts = projection_accounts(&config, &projection, None, None, &clock);
+        assert_eq!(accounts.len(), 1);
+        let window = accounts[0]
+            .windows
+            .iter()
+            .find(|window| window.semantic_key == "weekly")
+            .expect("the weekly window");
+        assert_eq!(window.quota_used.as_ppm().get(), 16_000);
+        assert_eq!(window.reported_resolution_ppm.as_ppm().get(), 1_000);
+        assert_eq!(window.quantization, QuantizationSemantics::RoundedToNearest);
     }
 }

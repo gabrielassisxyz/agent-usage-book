@@ -51,15 +51,37 @@ fn window(
     duration_seconds: i64,
     reset_offset_seconds: i64,
 ) -> agent_usage_book::projection::ProjectedWindow {
-    use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
     use agent_usage_book::domain::window::{QuantizationSemantics, ReportedResolution};
+    window_with_resolution(
+        semantic_key,
+        scope,
+        used_ppm,
+        duration_seconds,
+        reset_offset_seconds,
+        ReportedResolution::new(
+            agent_usage_book::domain::quota::QuotaFractionPpm::new(10_000).unwrap(),
+        )
+        .unwrap(),
+        QuantizationSemantics::Exact,
+    )
+}
+
+fn window_with_resolution(
+    semantic_key: &str,
+    scope: WindowScope,
+    used_ppm: i32,
+    duration_seconds: i64,
+    reset_offset_seconds: i64,
+    reported_resolution_ppm: agent_usage_book::domain::window::ReportedResolution,
+    quantization: agent_usage_book::domain::window::QuantizationSemantics,
+) -> agent_usage_book::projection::ProjectedWindow {
+    use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
     agent_usage_book::projection::ProjectedWindow {
         semantic_key: semantic_key.to_string(),
         scope,
         quota_used_ppm: QuotaUsed::new(QuotaFractionPpm::new(used_ppm).unwrap()),
-        reported_resolution_ppm: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
-            .unwrap(),
-        quantization: QuantizationSemantics::Exact,
+        reported_resolution_ppm,
+        quantization,
         resets_at: agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
             NOW_NANOS + nanos(reset_offset_seconds),
         )
@@ -133,10 +155,19 @@ fn account(
     last_success: Option<agent_usage_book::projection::SuccessfulObservation>,
     attempt: Option<agent_usage_book::projection::LatestAttempt>,
 ) -> ProjectedAccount {
+    account_with_provider(name, "anthropic", last_success, attempt)
+}
+
+fn account_with_provider(
+    name: &str,
+    provider: &str,
+    last_success: Option<agent_usage_book::projection::SuccessfulObservation>,
+    attempt: Option<agent_usage_book::projection::LatestAttempt>,
+) -> ProjectedAccount {
     ProjectedAccount {
         account_id: agent_usage_book::store::account::AccountId::new(1),
         logical_name: name.to_string(),
-        provider: "anthropic".to_string(),
+        provider: provider.to_string(),
         last_successful_observation: last_success,
         latest_attempt: attempt,
     }
@@ -186,6 +217,8 @@ fn status_account(projected: &ProjectedAccount, clock: &FakeClock) -> MeterAccou
                 semantic_key: w.semantic_key.clone(),
                 scope: w.scope.clone(),
                 quota_used: w.quota_used_ppm,
+                reported_resolution_ppm: w.reported_resolution_ppm,
+                quantization: w.quantization,
                 reset_state: w.resets_at,
                 nominal_duration: w.nominal_duration_nanos,
                 rate: agent_usage_book::report::burn_rate::live_burn_rate(
@@ -255,11 +288,17 @@ fn seeded_report(accounts: Vec<ProjectedAccount>) -> StatusReport {
     report_with(report_accounts, ProjectionReadState::Read)
 }
 
-/// The two-account fixture golden: the `QUOTA` header, one `anthropic` block,
-/// both accounts, and per account the `5h` and `week` rows plus one `fable`
-/// row for `primary`, matched byte for byte.
+/// The mixed-resolution fixture golden (aub-v8wt): the `QUOTA` header, the
+/// `anthropic` block with both accounts, and the `opencode` block holding the
+/// measured ledger shape, matched byte for byte. The opencode account mixes a
+/// whole-percent `5h` row with tenth-percent `week` and `month` rows the old
+/// whole-percent rounder printed as one `2%` twice, plus a rounded-to-nearest
+/// model row that must not claim exactness.
 #[test]
-fn two_account_grid_golden() {
+fn mixed_resolution_grid_golden() {
+    use agent_usage_book::domain::quota::QuotaFractionPpm;
+    use agent_usage_book::domain::window::{QuantizationSemantics, ReportedResolution};
+    let tenth = || ReportedResolution::new(QuotaFractionPpm::new(1_000).unwrap()).unwrap();
     let primary = account(
         "primary",
         Some(success_observation(
@@ -289,7 +328,45 @@ fn two_account_grid_golden() {
         )),
         Some(latest_attempt(120, success(120))),
     );
-    let rendered = render(&seeded_report(vec![primary, gmail]));
+    let opencode = account_with_provider(
+        "opencode",
+        "opencode",
+        Some(success_observation(
+            vec![
+                account_wide(0, 5 * 3_600, 3 * 3_600),
+                window_with_resolution(
+                    "weekly",
+                    WindowScope::AccountWide,
+                    16_000,
+                    7 * 86_400,
+                    4 * 86_400,
+                    tenth(),
+                    QuantizationSemantics::Exact,
+                ),
+                window_with_resolution(
+                    "monthly",
+                    WindowScope::AccountWide,
+                    24_000,
+                    30 * 86_400,
+                    20 * 86_400,
+                    tenth(),
+                    QuantizationSemantics::Exact,
+                ),
+                window_with_resolution(
+                    "weekly_scoped_sonnet",
+                    WindowScope::ModelSpecific(ModelId::new("sonnet".to_string())),
+                    410_000,
+                    7 * 86_400,
+                    3 * 86_400,
+                    tenth(),
+                    QuantizationSemantics::RoundedToNearest,
+                ),
+            ],
+            120,
+        )),
+        Some(latest_attempt(120, success(120))),
+    );
+    let rendered = render(&seeded_report(vec![primary, gmail, opencode]));
     if let Ok(path) = std::env::var("AUB_BLESS_STATUS_GRID") {
         std::fs::write(path, format!("{rendered}\n")).unwrap();
     }
@@ -297,6 +374,14 @@ fn two_account_grid_golden() {
         std::fs::read_to_string("tests/fixtures/presentation/status_grid_two_accounts.txt")
             .unwrap();
     assert_eq!(rendered, expected.trim_end_matches('\n'));
+    assert!(
+        rendered.contains("1.6%") && rendered.contains("2.4%"),
+        "the opencode week and month keep their tenths: {rendered}"
+    );
+    assert!(
+        rendered.contains("~41%"),
+        "the rounded model row does not claim exactness: {rendered}"
+    );
 }
 
 /// Every non-blank row of the grid is the same visible width and the fixed
@@ -561,6 +646,60 @@ fn scoped_weekly_window_is_a_row_and_the_limit() {
             .limiting_status_window()
             .map(|w| w.semantic_key.as_str()),
         Some("weekly_scoped_sonnet"),
+    );
+}
+
+/// The newest observation being an Anthropic status-line subset does not cost
+/// the account its model-scoped row on the rendered grid. The projection keeps
+/// the fuller reading as `last_successful_observation` while the status-line
+/// collection is only the newer `latest_attempt`, and the grid still renders
+/// `5h`, `week` and the `fable` row beneath them. The planted negative is the
+/// model row: a selection that let the subset win would drop
+/// `weekly_scoped_fable` and leave two rows.
+#[test]
+fn a_status_line_subset_as_the_latest_attempt_keeps_the_model_row() {
+    let primary = account(
+        "primary",
+        Some(success_observation(
+            vec![
+                account_wide(620_000, 5 * 3_600, 3 * 3_600),
+                account_wide(410_000, 7 * 86_400, 4 * 86_400),
+                window(
+                    "weekly_scoped_fable",
+                    WindowScope::ModelSpecific(ModelId::new("fable".to_string())),
+                    880_000,
+                    7 * 86_400,
+                    3 * 86_400,
+                ),
+            ],
+            300,
+        )),
+        // Newer than the full observation above, successful, and from the
+        // status-line source: the latest attempt, but not the reading the
+        // projection selected.
+        Some(latest_attempt(120, success(120))),
+    );
+    let report = seeded_report(vec![primary]);
+    let rendered = render(&report);
+    let rows: Vec<&str> = rendered
+        .lines()
+        .filter(|line| line.starts_with("    ") && !line.trim().is_empty())
+        .collect();
+    assert_eq!(rows.len(), 3, "5h, week, fable: {rendered}");
+    assert!(rows[0].trim_start().starts_with("5h"), "{rendered}");
+    assert!(rows[1].trim_start().starts_with("week"), "{rendered}");
+    assert!(
+        rows[2].trim_start().starts_with("fable"),
+        "the model row survives a newer status-line subset: {rendered}"
+    );
+    assert!(
+        report.accounts[0]
+            .included_scopes
+            .contains(&WindowScope::ModelSpecific(ModelId::new(
+                "fable".to_string()
+            ))),
+        "the model scope is in included_scopes: {:?}",
+        report.accounts[0].included_scopes
     );
 }
 

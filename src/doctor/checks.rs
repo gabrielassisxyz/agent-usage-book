@@ -631,8 +631,9 @@ enum SubcheckVerdict {
 }
 
 /// The age of the last verified backup, when `backup.destination` is
-/// configured. `store::backup::backup_health`'s own doc comment names this
-/// bead as the later doctor registry it was built to feed.
+/// configured. The destination is a root holding dated archives; the age
+/// comes from the newest-verified pointer inside it, read by
+/// `crate::backup::backup_health`, never from file mtime.
 fn backup_subcheck(ctx: &DoctorContext) -> SubcheckVerdict {
     match &ctx.config.backup.destination {
         None => SubcheckVerdict::NotConfigured,

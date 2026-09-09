@@ -292,6 +292,11 @@ fn the_status_document_lists_every_window_with_its_full_field_set() {
             semantic_key: key.to_string(),
             scope,
             quota_used: QuotaUsed::new(QuotaFractionPpm::new(used_ppm).unwrap()),
+            reported_resolution_ppm: agent_usage_book::domain::window::ReportedResolution::new(
+                QuotaFractionPpm::new(10_000).unwrap(),
+            )
+            .unwrap(),
+            quantization: agent_usage_book::domain::window::QuantizationSemantics::Exact,
             reset_state: reset,
             nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
             rate: BurnRate::from_window(used_ppm.max(0) as u32, Some(0.5)),
@@ -423,6 +428,11 @@ fn a_model_group_window_serializes_its_scope_object() {
         semantic_key: "5h".to_string(),
         scope: WindowScope::ModelGroup(GroupName::new("Gemini Models".to_string())),
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(85_528).unwrap()),
+        reported_resolution_ppm: agent_usage_book::domain::window::ReportedResolution::new(
+            QuotaFractionPpm::new(10_000).unwrap(),
+        )
+        .unwrap(),
+        quantization: agent_usage_book::domain::window::QuantizationSemantics::Exact,
         reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
         nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
         rate: BurnRate::from_window(85_528, Some(0.5)),
@@ -466,4 +476,71 @@ fn a_model_group_window_serializes_its_scope_object() {
         .map(|scope| scope.as_str().unwrap())
         .collect();
     assert_eq!(scopes, vec!["account_wide", "group:Gemini Models"]);
+}
+
+/// The aub-v8wt decision, pinned: `reported_resolution_ppm` and
+/// `quantization` travel the report model to the grid renderer, but they do
+/// not join the JSON contract. The window object is exactly the eight known
+/// keys and the schema stays 3: the JSON consumer holds the exact
+/// `quota_used_ppm` integer and loses nothing, the projection document already
+/// publishes both keys for the machine-to-machine reader, and the envelope
+/// schema is shared by every command, so a status-windows addition would bump
+/// spend, now and coverage documents for no consumer gain. If the field set
+/// ever grows, the schema must move with it.
+#[test]
+fn windows_omit_resolution_fields_and_the_schema_stays_three() {
+    use agent_usage_book::domain::burn_rate::BurnRate;
+    use agent_usage_book::domain::quota::QuotaUsed;
+    use agent_usage_book::report::StatusWindow;
+
+    let fresh = Freshness::Fresh {
+        observed: observed(620_000),
+        latest_attempt: AttemptId::new(1),
+    };
+    let account = MeterAccount::from_projection(
+        LogicalName::new("primary"),
+        fresh.clone(),
+        None,
+        vec![],
+        None,
+    )
+    .with_windows(vec![StatusWindow {
+        semantic_key: "five_hour".to_string(),
+        scope: WindowScope::AccountWide,
+        quota_used: QuotaUsed::new(QuotaFractionPpm::new(16_000).unwrap()),
+        reported_resolution_ppm: agent_usage_book::domain::window::ReportedResolution::new(
+            QuotaFractionPpm::new(1_000).unwrap(),
+        )
+        .unwrap(),
+        quantization: agent_usage_book::domain::window::QuantizationSemantics::Exact,
+        reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(9_000)),
+        nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+        rate: BurnRate::from_window(16_000, Some(0.5)),
+        capped_at: None,
+        observation: fresh,
+    }]);
+
+    let report = StatusReport::new(metadata(), vec![account], vec![], ProjectionReadState::Read);
+    let document = status_json_with_explain(&report, run(), ExplainMode::Off);
+    validate_status_report_json(&document).expect("the document must validate");
+
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert_eq!(parsed["schema"], 3);
+    let window = parsed["accounts"][0]["windows"][0].as_object().unwrap();
+    let mut keys: Vec<&str> = window.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "burn_rate",
+            "capped_at",
+            "nominal_duration_nanos",
+            "observation_freshness",
+            "quota_used_ppm",
+            "resets_at_nanos",
+            "scope",
+            "semantic_key",
+        ],
+        "the window field set is exactly the eight contracted keys"
+    );
 }
