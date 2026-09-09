@@ -116,7 +116,7 @@ case_assertions() {
     assert_stdout_contains 6 "[FAIL] subscription-identity-change"
     assert_stdout_contains 6 "work-a"
     assert_exit 0 7
-    assert_stdout_contains 7 "stale"
+    assert_stdout_contains 7 "cached"
     assert_stdout_contains 7 "credential changed"
     assert_exit 0 8
     assert_stdout_contains 8 "established:anthropic:max:default_claude_max_20x"
