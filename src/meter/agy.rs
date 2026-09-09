@@ -278,11 +278,51 @@ fn parse_401_auth_reason(_body: &[u8]) -> AuthReason {
     AuthReason::CredentialRejected
 }
 
+/// The subscription identity this account's credential material names
+/// (aub-iwkg): a digest of the token file's `.token.refresh_token`.
+///
+/// The refresh token is the stable half of the Antigravity pair: a refresh
+/// preserves it and rotates only the access token and the expiry
+/// (`crate::auth::antigravity_credentials` keeps every other field), so an
+/// ordinary refresh under the aub-6qay path returns this same string, while
+/// a different subscription's login carries a different refresh token. The
+/// digest is the truncated SHA-256 the credential context ids use, so no
+/// credential byte survives into the persisted comparison. An unrecognized
+/// shape or an empty refresh token yields `None`: absent never blocks.
+fn agy_subscription_identity(credential: &CredentialHandle) -> Option<String> {
+    let value: serde_json::Value =
+        serde_json::from_str(credential.expose().trim()).ok()?;
+    let refresh = value
+        .get("token")?
+        .get("refresh_token")?
+        .as_str()
+        .map(str::trim)
+        .filter(|refresh| !refresh.is_empty())?;
+    Some(format!("agy:refresh:{}", sha256_hex_16(refresh.as_bytes())))
+}
+
+/// The first 16 hex characters of the SHA-256 digest of `bytes`: the same
+/// construction the credential context ids use, duplicated here rather than
+/// shared because adapters may not reach into the credential module (rule
+/// `07`) and a two-line digest is below the bar for its own module.
+fn sha256_hex_16(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 impl ProviderAdapter for AgyAdapter {
     type Reading = AgyReading;
 
     fn declarations(&self) -> AdapterDeclarations {
         self.declarations.clone()
+    }
+
+    fn subscription_identity(&self, credential: &CredentialHandle) -> Option<String> {
+        agy_subscription_identity(credential)
     }
 
     fn observe(
@@ -917,5 +957,78 @@ mod tests {
         );
         assert!(matched_patterns(&report.classification).is_empty());
         assert!(matched_patterns(&report.message).is_empty());
+    }
+
+    /// The subscription identity (aub-iwkg): a digest of the stable refresh
+    /// token, surviving the access-token rotation the refresh path performs.
+    fn subscription_credential(access: &str, refresh: &str, expiry: &str) -> CredentialHandle {
+        CredentialHandle::new(format!(
+            r#"{{"token":{{"access_token":"{access}","refresh_token":"{refresh}","expiry":"{expiry}"}}}}"#
+        ))
+    }
+
+    #[test]
+    fn subscription_identity_digests_the_stable_refresh_token() {
+        let identity = AgyAdapter::new()
+            .subscription_identity(&subscription_credential(
+                "old-access",
+                "never-render-this-refresh",
+                "2020-01-01T00:00:00Z",
+            ))
+            .expect("a credential with a refresh token names an identity");
+        assert!(identity.starts_with("agy:refresh:"));
+        assert!(!identity.contains("never-render-this-refresh"));
+        assert!(matched_patterns(&identity).is_empty());
+    }
+
+    #[test]
+    fn subscription_identity_survives_an_ordinary_token_refresh() {
+        // The aub-6qay path rotates the access token and the expiry and keeps
+        // the refresh token: the identity before and after must compare
+        // equal, or every hourly refresh would read as a subscription change.
+        let before = AgyAdapter::new().subscription_identity(&subscription_credential(
+            "old-access",
+            "stable-refresh",
+            "2020-01-01T00:00:00Z",
+        ));
+        let after = AgyAdapter::new().subscription_identity(&subscription_credential(
+            "new-access",
+            "stable-refresh",
+            "2030-01-01T00:00:00Z",
+        ));
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn subscription_identity_changes_with_the_subscription() {
+        // A different login carries a different refresh token.
+        let before = AgyAdapter::new().subscription_identity(&subscription_credential(
+            "a",
+            "refresh-one",
+            "2030-01-01T00:00:00Z",
+        ));
+        let after = AgyAdapter::new().subscription_identity(&subscription_credential(
+            "b",
+            "refresh-two",
+            "2030-01-01T00:00:00Z",
+        ));
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn subscription_identity_is_absent_without_a_refresh_token() {
+        assert!(
+            AgyAdapter::new()
+                .subscription_identity(&test_credential())
+                .is_none(),
+            "the access-token-only test credential names no subscription"
+        );
+        assert!(
+            AgyAdapter::new()
+                .subscription_identity(&CredentialHandle::new(
+                    r#"{"token":{"access_token":"only"}}"#
+                ))
+                .is_none()
+        );
     }
 }

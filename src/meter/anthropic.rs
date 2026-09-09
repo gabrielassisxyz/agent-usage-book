@@ -223,6 +223,40 @@ fn extract_bearer_token(credential: &CredentialHandle) -> Result<String, AuthRea
     Ok(raw.to_string())
 }
 
+/// The subscription identity this account's credential material names
+/// (aub-iwkg): `subscriptionType` and `rateLimitTier` from the `claudeAiOauth`
+/// object, the two stable subscription fields Claude Code's credential file
+/// carries beside the rotating token pair.
+///
+/// Stable across an ordinary refresh because a refresh preserves every other
+/// field (`crate::auth::credentials_lock` proves the write-back field by
+/// field): rotating `accessToken` and `refreshToken` under an unchanged
+/// subscription returns this same string. A different subscription's
+/// credential behind the same path names a different `subscriptionType`
+/// (the 2026-09-05 `pro` to Max change) or a different tier, so it compares
+/// different. A raw token string or a credential without `subscriptionType`
+/// yields `None`: an absent identity never blocks a reading.
+///
+/// The rejected alternatives are recorded on the sampler's comparison, not
+/// here: a whole-credential fingerprint would flag every hourly refresh, and
+/// the usage response carries no account identifier to read instead.
+fn anthropic_subscription_identity(credential: &CredentialHandle) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(credential.expose().trim()).ok()?;
+    let oauth = value.get("claudeAiOauth").unwrap_or(&value);
+    let object = oauth.as_object()?;
+    let subscription = object
+        .get("subscriptionType")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|subscription| !subscription.is_empty())?;
+    let tier = object
+        .get("rateLimitTier")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .unwrap_or_default();
+    Some(format!("anthropic:{subscription}:{tier}"))
+}
+
 /// Parses the JSON response body from Anthropic `/api/oauth/usage`.
 pub fn parse_anthropic_usage_body(
     body: &[u8],
@@ -945,6 +979,10 @@ impl ProviderAdapter for AnthropicAdapter {
 
     fn declarations(&self) -> AdapterDeclarations {
         self.declarations.clone()
+    }
+
+    fn subscription_identity(&self, credential: &CredentialHandle) -> Option<String> {
+        anthropic_subscription_identity(credential)
     }
 
     fn observe(
@@ -2095,6 +2133,107 @@ mod tests {
         assert_eq!(
             report.classification, "http_401",
             "a classification the sanitizer must rewrite is not stored; the status fallback is"
+        );
+    }
+
+    /// The subscription identity (aub-iwkg): the `subscriptionType` and
+    /// `rateLimitTier` the credential file carries beside the rotating pair.
+    fn subscription_credential(
+        access: &str,
+        refresh: &str,
+        subscription: &str,
+        tier: &str,
+    ) -> CredentialHandle {
+        CredentialHandle::new(format!(
+            r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"{subscription}","rateLimitTier":"{tier}"}}}}"#
+        ))
+    }
+
+    #[test]
+    fn subscription_identity_names_the_subscription_pair() {
+        let identity = test_adapter()
+            .subscription_identity(&subscription_credential(
+                "a",
+                "r",
+                "max",
+                "default_claude_max_20x",
+            ))
+            .expect("a credential with subscription fields names an identity");
+        assert_eq!(identity, "anthropic:max:default_claude_max_20x");
+        assert!(matched_patterns(&identity).is_empty());
+    }
+
+    #[test]
+    fn subscription_identity_survives_an_ordinary_token_refresh() {
+        // The refresh path rotates both tokens and preserves every other
+        // field: the identity before and after must compare equal, or every
+        // hourly refresh would read as a subscription change.
+        let before = test_adapter().subscription_identity(&subscription_credential(
+            "old-access",
+            "old-refresh",
+            "max",
+            "default_claude_max_20x",
+        ));
+        let after = test_adapter().subscription_identity(&subscription_credential(
+            "new-access",
+            "new-refresh",
+            "max",
+            "default_claude_max_20x",
+        ));
+        assert_eq!(before, after);
+        let identity = before.expect("both readings name an identity");
+        assert!(!identity.contains("old-access"));
+        assert!(!identity.contains("new-refresh"));
+    }
+
+    #[test]
+    fn subscription_identity_changes_with_the_subscription() {
+        // The 2026-09-05 shape: the same path, another subscription's
+        // credential behind it.
+        let before = test_adapter().subscription_identity(&subscription_credential(
+            "a",
+            "r",
+            "max",
+            "default_claude_max_20x",
+        ));
+        let after = test_adapter().subscription_identity(&subscription_credential(
+            "b",
+            "s",
+            "pro",
+            "default_claude_pro",
+        ));
+        assert_ne!(before, after);
+        // Planted negative: a tier change inside one subscription family also
+        // compares different, so a naive "family only" implementation fails.
+        let retiered = test_adapter().subscription_identity(&subscription_credential(
+            "c",
+            "t",
+            "max",
+            "default_claude_max_5x",
+        ));
+        assert_ne!(before, retiered);
+    }
+
+    #[test]
+    fn subscription_identity_is_absent_without_subscription_fields() {
+        assert!(
+            test_adapter()
+                .subscription_identity(&test_credential())
+                .is_none(),
+            "a raw token names no subscription"
+        );
+        assert!(
+            test_adapter()
+                .subscription_identity(&CredentialHandle::new(r#"{"accessToken":"only"}"#))
+                .is_none()
+        );
+        assert!(
+            test_adapter()
+                .subscription_identity(&CredentialHandle::new(
+                    r#"{"claudeAiOauth":{"accessToken":"a","refreshToken":"r"}}"#
+                ))
+                .is_none(),
+            "tokens without a subscription type name no subscription"
         );
     }
 }

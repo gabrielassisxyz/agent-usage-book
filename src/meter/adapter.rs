@@ -349,6 +349,32 @@ pub trait ProviderAdapter {
             self.observe(credential, request, transport, clock),
         )
     }
+
+    /// The subscription identity this account's credential material names
+    /// (aub-iwkg), or `None` when the provider exposes nothing stable to
+    /// name it with. The sampler compares this against the account's
+    /// established identity before committing a measured reading, and refuses
+    /// to attribute across a change.
+    ///
+    /// Credential-side by construction, never response-side: it is available
+    /// before any provider call, it needs no new endpoint, and interpreting
+    /// credential material is the adapter's own contract (`aub-eun.4`). The
+    /// default is `None` (ollama, opencode and every future adapter without
+    /// a stable subscription field): an absent identity never blocks a
+    /// reading, it only opts the account out of change detection.
+    ///
+    /// The stability contract every override keeps: an ordinary in-place
+    /// token refresh for the same subscription returns the same identity,
+    /// and a different subscription's credential returns a different one.
+    /// A whole-credential fingerprint would break the first half (both the
+    /// Anthropic rotating pair and the Antigravity access token turn over
+    /// on refresh), so each override names only the stable subscription
+    /// fields and digests anything identifying (the same truncated-SHA-256
+    /// construction the credential context ids use, so no credential byte
+    /// survives into the persisted comparison).
+    fn subscription_identity(&self, _credential: &CredentialHandle) -> Option<String> {
+        None
+    }
 }
 
 /// The provider keys [`adapter_for`] can dispatch on, in dispatch order.
@@ -471,15 +497,13 @@ impl ProviderAdapter for AnyAdapter {
     ) -> CapturedProviderResponse<Reading> {
         match self {
             AnyAdapter::Anthropic(adapter) => {
-                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
-                CapturedProviderResponse {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);                CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::Anthropic),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
                     failed_error: captured.failed_error,
                 }
-            }
-            AnyAdapter::OpenCode(adapter) => {
+            }            AnyAdapter::OpenCode(adapter) => {
                 let captured = adapter.observe_with_evidence(credential, request, transport, clock);
                 CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::OpenCode),
@@ -515,6 +539,16 @@ impl ProviderAdapter for AnyAdapter {
                     failed_error: captured.failed_error,
                 }
             }
+        }
+    }
+
+    fn subscription_identity(&self, credential: &CredentialHandle) -> Option<String> {
+        match self {
+            AnyAdapter::Anthropic(adapter) => adapter.subscription_identity(credential),
+            AnyAdapter::OpenCode(adapter) => adapter.subscription_identity(credential),
+            AnyAdapter::Codex(adapter) => adapter.subscription_identity(credential),
+            AnyAdapter::Ollama(adapter) => adapter.subscription_identity(credential),
+            AnyAdapter::Agy(adapter) => adapter.subscription_identity(credential),
         }
     }
 }

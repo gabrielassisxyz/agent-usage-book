@@ -98,8 +98,11 @@ use crate::meter::transport::{
 /// JWT payload. Carried on the reading as the label the observation was made
 /// under; the orchestrator persists only what [`crate::meter::sampler::
 /// MeteredReading`] exposes, so neither field of this struct reaches the
-/// ledger, and both are registered as sensitive material so neither can
-/// reach the evidence capsule either.
+/// ledger as such, and both are registered as sensitive material so neither
+/// can reach the evidence capsule either. The one exception is the truncated
+/// digest [`codex_subscription_identity`] persists for change detection:
+/// a digest names no account the way the email does, and it follows the same
+/// construction the credential context ids already store.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexIdentity {
     /// The ChatGPT plan label the JWT payload carries, the observed-plan
@@ -243,6 +246,52 @@ fn decode_identity(credential: &CredentialHandle) -> Option<CodexIdentity> {
         return None;
     }
     Some(CodexIdentity { plan, email })
+}
+
+/// The subscription identity this account's credential material names
+/// (aub-iwkg): a digest of the JWT payload's email, falling back to the
+/// plan label when the token carries no email.
+///
+/// The email is the strongest signal this bead's candidates offer (an
+/// account identifier from the credential, stable across the token
+/// rotations a login survives), and the digest keeps it out of the ledger:
+/// truncated SHA-256, the construction the credential context ids use, so
+/// no credential byte survives into the persisted comparison. The email is
+/// lowercased before digesting (addresses are case-insensitive; a rewrite
+/// that changed only case is the same subscription). A credential with no
+/// decodable JWT, or a JWT with neither email nor plan, yields `None`.
+fn codex_subscription_identity(credential: &CredentialHandle) -> Option<String> {
+    let identity = decode_identity(credential)?;
+    if let Some(email) = identity
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|email| !email.is_empty())
+    {
+        return Some(format!(
+            "codex:account:{}",
+            sha256_hex_16(email.to_lowercase().as_bytes())
+        ));
+    }
+    let plan = identity
+        .plan
+        .as_deref()
+        .map(str::trim)
+        .filter(|plan| !plan.is_empty())?;
+    Some(format!("codex:plan:{plan}"))
+}
+
+/// The first 16 hex characters of the SHA-256 digest of `bytes`: the same
+/// construction the credential context ids use, duplicated here rather than
+/// shared because adapters may not reach into the credential module (rule
+/// `07`) and a two-line digest is below the bar for its own module.
+fn sha256_hex_16(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    sha2::Sha256::digest(bytes)
+        .iter()
+        .take(8)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 /// Decodes the payload segment of a JWT: exactly three dot-separated
@@ -715,6 +764,10 @@ impl ProviderAdapter for CodexAdapter {
 
     fn declarations(&self) -> AdapterDeclarations {
         self.declarations.clone()
+    }
+
+    fn subscription_identity(&self, credential: &CredentialHandle) -> Option<String> {
+        codex_subscription_identity(credential)
     }
 
     fn observe(
@@ -2381,6 +2434,76 @@ mod tests {
         assert_eq!(
             declarations.reset_precision, None,
             "the codex adapter must not declare a reset precision"
+        );
+    }
+
+    /// The subscription identity (aub-iwkg): a digest of the JWT email, so a
+    /// different login compares different while the address itself never
+    /// reaches the ledger.
+    fn subscription_credential(id_token: &str, access: &str) -> CredentialHandle {
+        CredentialHandle::new(format!(
+            r#"{{"tokens":{{"id_token":"{id_token}","access_token":"{access}","account_id":"x"}},"last_refresh":"2026-09-05T22:00:00Z"}}"#
+        ))
+    }
+
+    /// A second account's JWT: same plan, different email (precomputed
+    /// base64url, signature fake like the fixture's).
+    const SECOND_ACCOUNT_ID_TOKEN: &str = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJlbWFpbCI6InNlY29uZC1hY2NvdW50QGV4YW1wbGUudGVzdCIsImVtYWlsX3ZlcmlmaWVkIjp0cnVlLCJodHRwczovL2FwaS5vcGVuYWkuY29tL2F1dGgiOnsiY2hhdGdwdF9wbGFuX3R5cGUiOiJwbHVzIn19.fake-signature-not-a-real-secret";
+
+    #[test]
+    fn subscription_identity_digests_the_jwt_email() {
+        let identity = test_adapter()
+            .subscription_identity(&test_credential())
+            .expect("the fixture JWT names a subscription");
+        assert!(identity.starts_with("codex:account:"));
+        assert!(!identity.contains("fixture-account@example.test"));
+        assert!(matched_patterns(&identity).is_empty());
+    }
+
+    #[test]
+    fn subscription_identity_survives_a_token_rotation_for_the_same_account() {
+        // Rotating the access token under the same id_token is the same
+        // subscription: the identity must compare equal.
+        let fixture_token = serde_json::from_str::<serde_json::Value>(
+            &String::from_utf8(FIXTURE_AUTH.to_vec()).unwrap(),
+        )
+        .unwrap()["tokens"]["id_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = test_adapter()
+            .subscription_identity(&subscription_credential(&fixture_token, "access-one"));
+        let after = test_adapter()
+            .subscription_identity(&subscription_credential(&fixture_token, "access-two"));
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn subscription_identity_changes_with_the_account() {
+        // Two logins on the same plan still compare different: the email
+        // digest is what keeps same-plan swaps detectable here.
+        let fixture_token = serde_json::from_str::<serde_json::Value>(
+            &String::from_utf8(FIXTURE_AUTH.to_vec()).unwrap(),
+        )
+        .unwrap()["tokens"]["id_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let before = test_adapter()
+            .subscription_identity(&subscription_credential(&fixture_token, "access-one"));
+        let after = test_adapter()
+            .subscription_identity(&subscription_credential(SECOND_ACCOUNT_ID_TOKEN, "access-one"));
+        assert_ne!(before, after);
+    }
+
+    #[test]
+    fn subscription_identity_is_absent_without_a_decodable_jwt() {
+        assert!(
+            test_adapter()
+                .subscription_identity(&CredentialHandle::new(
+                    "{\"tokens\":{},\"last_refresh\":\"2026-09-05T22:00:00Z\"}"
+                ))
+                .is_none()
         );
     }
 }
