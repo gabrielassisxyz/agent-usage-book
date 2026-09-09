@@ -14,6 +14,16 @@ jobs:
     # A title or body edit changes no code, so the expensive job opts out of it.
     if: github.event.action != 'edited'
     runs-on: ubuntu-latest
+    # bin/ci derives a per-worktree CARGO_TARGET_DIR so parallel worktrees on the
+    # desktop never judge each other's artifacts; on a machine without /mnt/build
+    # that lands under /tmp. The runner has one checkout and nothing to isolate,
+    # and Swatinem/rust-cache saves <workspace>/target without ever reading
+    # CARGO_TARGET_DIR, so without this line the two paths differed and every run
+    # compiled all 249 dependency crates cold (run 34325246356, 2026-09-09: 363s of
+    # 30-test and a 96s release build inside 60-e2e, both from scratch). bin/ci
+    # honours an explicit value, which is why this is set here and not there.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
