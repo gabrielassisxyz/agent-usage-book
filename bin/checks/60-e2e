@@ -98,6 +98,12 @@ aub_bin="$target_dir/release/aub"
 # costs 194s on the CI runner (96-98s when it was running 51) and 156-159s on the
 # development machine, so the old ceiling was only ever met by not running a sixth
 # of the suite. The headroom here is the same ratio the old pair carried.
+#
+# The suite no longer carries the status latency benchmark (aub-oc56): case 022
+# ran the same 4000 spawns 85-status-latency-budget already runs and enforces,
+# about 24 s of case time, and a benchmark inside a wall-clock budget measures
+# the machine rather than the code. Its artifact-shape assertions moved into
+# that check. Case 015 stays, evidentiary and about 7 s; its header says why.
 budget_seconds="${E2E_BUDGET_SECONDS:-240}"
 
 start="$(date +%s)"

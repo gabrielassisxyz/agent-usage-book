@@ -12,6 +12,72 @@ set -uo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 
+# artifact_shape_ok FILE: the report carries the schema tag, the budget literal
+# the Rust test compares against, and one entry per contention case. Each
+# miss is named on stderr.
+artifact_shape_ok() {
+    local file="$1" missing=0 field
+    if ! jq -e . "$file" >/dev/null 2>&1; then
+        echo "status-latency-budget: artifact $file is not JSON" >&2
+        return 1
+    fi
+    if [ "$(jq -r '.schema // empty' "$file")" != "aub.status_benchmark.v1" ]; then
+        echo "status-latency-budget: artifact schema is not aub.status_benchmark.v1" >&2
+        missing=1
+    fi
+    if [ "$(jq -r '.status_p99_budget_ns // empty' "$file")" != "15000000" ]; then
+        echo "status-latency-budget: artifact status_p99_budget_ns is not 15000000" >&2
+        missing=1
+    fi
+    for field in uncontended large_populated active_writer active_migration; do
+        if ! jq -e --arg c "$field" '.cases[] | select(.case == $c)' "$file" >/dev/null 2>&1; then
+            echo "status-latency-budget: artifact has no entry for case $field" >&2
+            missing=1
+        fi
+    done
+    [ "$missing" -eq 0 ]
+}
+
+# The shape check is proven on scratch input before it judges the real
+# artifact: a report missing one case and one carrying another budget are
+# both refused naming the field, and a complete one passes.
+artifact_shape_selftest() {
+    local tmp
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/aub-status-shape-XXXXXX")"
+    local full='{"schema":"aub.status_benchmark.v1","status_p99_budget_ns":15000000,"cases":[{"case":"uncontended"},{"case":"large_populated"},{"case":"active_writer"},{"case":"active_migration"}]}'
+    printf '%s\n' "$full" >"$tmp/full.json"
+    printf '%s\n' "$full" | jq -c 'del(.cases[3])' >"$tmp/short.json"
+    printf '%s\n' "$full" | jq -c '.status_p99_budget_ns = 30000000' >"$tmp/budget.json"
+    local out
+    if out="$(artifact_shape_ok "$tmp/short.json" 2>&1)"; then
+        echo "status-latency-budget self-test: an artifact missing a case was accepted" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    case "$out" in *"no entry for case active_migration"*) : ;; *)
+        echo "status-latency-budget self-test: the missing case was not named: $out" >&2
+        rm -rf "$tmp"; return 1 ;;
+    esac
+    if out="$(artifact_shape_ok "$tmp/budget.json" 2>&1)"; then
+        echo "status-latency-budget self-test: an artifact with another budget was accepted" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    case "$out" in *"status_p99_budget_ns is not 15000000"*) : ;; *)
+        echo "status-latency-budget self-test: the wrong budget was not named: $out" >&2
+        rm -rf "$tmp"; return 1 ;;
+    esac
+    if ! artifact_shape_ok "$tmp/full.json" 2>/dev/null; then
+        echo "status-latency-budget self-test: a complete artifact was refused" >&2
+        rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$tmp"
+    echo "status-latency-budget self-test: artifact shape check ok"
+}
+
+if ! artifact_shape_selftest; then
+    echo "==> status-latency-budget FAILED (artifact shape self-test)" >&2
+    exit 1
+fi
+
 cargo build --release || {
     echo "==> status-latency-budget FAILED (release build failed; the crate must compile before the benchmark can run)" >&2
     exit 1
@@ -35,6 +101,16 @@ fi
 
 if [ "$rc" -ne 0 ]; then
     echo "==> status-latency-budget FAILED (a case's p99 exceeded the accepted budget, or the benchmark itself failed; see output above)" >&2
+    exit 1
+fi
+
+# The artifact's shape is asserted here since aub-oc56: e2e case 022 used to run
+# the same 4000 spawns a second time inside the wall-clock-budgeted suite only to
+# read these fields back, so the suite paid the benchmark twice and its budget
+# absorbed the machine's noise. The p99 comparison stays in the Rust test; this
+# checks that what it wrote is the report the test claims to write.
+if ! artifact_shape_ok "$artifact"; then
+    echo "==> status-latency-budget FAILED (the benchmark artifact is not the report tests/status_benchmark.rs claims to write; see above)" >&2
     exit 1
 fi
 
