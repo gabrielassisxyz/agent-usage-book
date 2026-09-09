@@ -52,11 +52,12 @@ pub enum CheckName {
     LastSampleTick,
     SamplingFailureCounts,
     MeterErrorClassifications,
+    SubscriptionIdentityChange,
 }
 
 impl CheckName {
     /// The design's full check list (PLAN.md 27, 36, aub-smqu), encoded once so the
-    /// registry can be compared against it. Twenty-two entries: the design's
+    /// registry can be compared against it. Twenty-four entries: the design's
     /// original nineteen, [`Self::AdapterSemanticsComparisonAge`] added by
     /// `aub-x2bq` once the adapter-semantics mechanism (`aub-eun.12`) existed for
     /// a check to cover, [`Self::LastSampleTick`] added by `aub-va6s` once the
@@ -65,8 +66,10 @@ impl CheckName {
     /// per-reason failure counter (`crate::store::sampling_failure_counts`)
     /// existed for a check to read, and [`Self::MeterErrorClassifications`]
     /// added by `aub-rfot` once the failed attempts' sanitized error
-    /// classification column was populated for a check to read.
-    pub const EXPECTED: [CheckName; 23] = [
+    /// classification column was populated for a check to read, and
+    /// [`Self::SubscriptionIdentityChange`] added by `aub-iwkg` once the
+    /// subscription-history table existed for a check to read.
+    pub const EXPECTED: [CheckName; 24] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -90,6 +93,7 @@ impl CheckName {
         Self::LastSampleTick,
         Self::SamplingFailureCounts,
         Self::MeterErrorClassifications,
+        Self::SubscriptionIdentityChange,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -118,6 +122,7 @@ impl CheckName {
             Self::LastSampleTick => "last-sample-tick",
             Self::SamplingFailureCounts => "sampling-failure-counts",
             Self::MeterErrorClassifications => "meter-error-classifications",
+            Self::SubscriptionIdentityChange => "subscription-identity-change",
         }
     }
 }

@@ -298,6 +298,10 @@ const POPULATION: &[(&str, Populate)] = &[
         populate_meter_calibration_exclusion,
     ),
     ("meter_window_set_change", populate_meter_window_set_change),
+    (
+        "meter_subscription_change",
+        populate_meter_subscription_change,
+    ),
 ];
 
 fn populate_account_attribution_segment(conn: &rusqlite::Connection) -> Result<(), String> {
@@ -825,6 +829,20 @@ fn populate_meter_window_set_change(conn: &rusqlite::Connection) -> Result<(), S
         "INSERT INTO meter_window_set_change (id, kind, account_id, semantic_key, scope_kind, scoped_model, previous_observation_id, previous_window_id, current_observation_id, current_window_id, detected_at) VALUES
             (1, 'new_account_wide_window', 1, 'matrix-key-1', 'account_wide', NULL, 1, NULL, 2, 1, 420),
             (2, 'missing_model_specific_window', 1, 'matrix-key-1', 'model_specific', 'model-x', 1, 2, 2, NULL, 430)",
+    )
+}
+
+fn populate_meter_subscription_change(conn: &rusqlite::Connection) -> Result<(), String> {
+    // Both kinds, and both arms of the kind-pairing CHECK: an establishment
+    // with no previous identity or observation, and a change naming both,
+    // over the attempts and the observation the meter tables already
+    // inserted.
+    exec(
+        conn,
+        "meter_subscription_change",
+        "INSERT INTO meter_subscription_change (id, account_id, kind, previous_identity, current_identity, detecting_attempt_id, previous_observation_id, detected_at) VALUES
+            (1, 1, 'established', NULL, 'matrix-subscription-a', 1, NULL, 500),
+            (2, 1, 'changed', 'matrix-subscription-a', 'matrix-subscription-b', 2, 1, 600)",
     )
 }
 

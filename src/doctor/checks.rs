@@ -77,6 +77,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         last_sample_tick(ctx),
         sampling_failure_counts(ctx),
         meter_error_classifications(ctx),
+        subscription_identity_change(ctx),
     ]
 }
 
@@ -134,6 +135,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::LastSampleTick => "store::sample_tick",
         CheckName::SamplingFailureCounts => "store::sampling_failure_counts",
         CheckName::MeterErrorClassifications => "store::meter_attempt",
+        CheckName::SubscriptionIdentityChange => "store::subscription_identity",
     }
 }
 
@@ -191,6 +193,9 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::MeterErrorClassifications => {
             "every failed attempt in the recent window carries the provider error              classification the sampler stored for it"
+        }
+        CheckName::SubscriptionIdentityChange => {
+            "no account's credential changed subscription without being refused and recorded"
         }
     }
 }
@@ -1274,6 +1279,108 @@ fn meter_error_classifications(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::MeterErrorClassifications, status)
 }
 
+/// The subscription behind a credential path changed (aub-iwkg): the sampler
+/// refused the intruding readings and recorded the identity pair in
+/// `meter_subscription_change`. Fails while a configured account's newest
+/// history row is a `changed` one with no newer stored observation behind
+/// the established identity: that account's readings are being refused
+/// right now. Passes with a historical note once an observation newer than
+/// the change exists (readings under the established identity resumed),
+/// and passes quietly when no account ever recorded a change.
+///
+/// Recovery is an operator rename to a fresh logical name for the new
+/// subscription (docs/subscription-identity-change.md); no `--fix` repair
+/// can acknowledge one subscription in place of another, so `has_repair`
+/// stays false for this check.
+fn subscription_identity_change(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.config.accounts.is_empty() {
+        CheckStatus::NotApplicable("no accounts configured".to_string())
+    } else if ctx.db_missing {
+        CheckStatus::NotApplicable(
+            "no ledger database exists yet; nothing has been sampled".to_string(),
+        )
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => {
+                let mut refusing = Vec::new();
+                let mut resumed = Vec::new();
+                let mut unreadable: Option<String> = None;
+                for account in &ctx.config.accounts {
+                    let id = match crate::store::account::account_id_by_identity(
+                        conn,
+                        &account.provider,
+                        &account.name,
+                    ) {
+                        Ok(id) => id,
+                        Err(error) => {
+                            unreadable = Some(error.to_string());
+                            break;
+                        }
+                    };
+                    let Some(id) = id else {
+                        continue;
+                    };
+                    let latest =
+                        match crate::store::subscription_identity::latest_for_account(conn, id) {
+                            Ok(latest) => latest,
+                            Err(error) => {
+                                unreadable = Some(error.to_string());
+                                break;
+                            }
+                        };
+                    let Some(event) = latest else {
+                        continue;
+                    };
+                    if event.kind
+                        != crate::store::subscription_identity::SubscriptionChangeKind::Changed
+                    {
+                        continue;
+                    }
+                    let previous = event.previous_identity.as_deref().unwrap_or("<unknown>");
+                    let resumed_after = match crate::store::meter_evidence::newest_observation_for_account(
+                        conn, id,
+                    ) {
+                        Ok(Some(observation)) => {
+                            observation.received_at.unix_nanos() > event.detected_at.unix_nanos()
+                        }
+                        Ok(None) | Err(_) => false,
+                    };
+                    if resumed_after {
+                        resumed.push(format!(
+                            "{}: subscription changed from '{}' to '{}' (change id={}), readings under the established subscription resumed after it",
+                            account.name,
+                            previous,
+                            event.current_identity,
+                            event.row_id.value(),
+                        ));
+                    } else {
+                        refusing.push(format!(
+                            "{}: subscription changed from '{}' to '{}' (change id={}); readings refused, see docs/subscription-identity-change.md",
+                            account.name,
+                            previous,
+                            event.current_identity,
+                            event.row_id.value(),
+                        ));
+                    }
+                }
+                if let Some(error) = unreadable {
+                    CheckStatus::Fail(format!("cannot read the subscription history: {error}"))
+                } else if !refusing.is_empty() {
+                    CheckStatus::Fail(refusing.join("; "))
+                } else if !resumed.is_empty() {
+                    CheckStatus::PassWithDetail(resumed.join("; "))
+                } else {
+                    CheckStatus::Pass
+                }
+            }
+        }
+    };
+    outcome(CheckName::SubscriptionIdentityChange, status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2313,5 +2420,246 @@ mod tests {
             "{:?}",
             outcome.status
         );
+    }
+
+    /// The subscription-identity change check (aub-iwkg): fails while an
+    /// account's newest history row refuses its readings, passes quietly
+    /// with no history, and passes with a historical note once readings
+    /// under the established subscription resumed.
+
+    fn subscription_test_config(state_dir: &std::path::Path) -> Config {
+        let env = RealEnv;
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[[accounts]]\nname = \"primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"/nonexistent/creds.json\" }}\n",
+            state_dir
+        );
+        let (config, _) =
+            resolve(&Overrides::new(), &env, Some(&toml), "aub.toml").expect("config must resolve");
+        config
+    }
+
+    /// A migrated ledger with one account, one run and two attempts: the
+    /// parents every subscription-history row references.
+    fn seeded_subscription_parents(
+        conn: &rusqlite::Connection,
+    ) -> (
+        crate::store::account::AccountId,
+        crate::store::meter_attempt::MeterAttemptRowId,
+        crate::store::meter_attempt::MeterAttemptRowId,
+    ) {
+        use crate::domain::time::MonotonicDuration;
+        use crate::store::account::observe_account;
+        use crate::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
+        use crate::store::sample_run::{Trigger, start_sample_run};
+        use crate::store::sampling_policy_snapshot::{
+            ResolvedSamplingPolicy, resolve_policy_snapshot,
+        };
+
+        let account = observe_account(conn, "anthropic", "primary", UtcTimestamp::from_unix_nanos(10))
+            .expect("account must insert");
+        let run = start_sample_run(conn, Trigger::Manual, UtcTimestamp::from_unix_nanos(10), "seed")
+            .expect("sample run must insert");
+        let snapshot = resolve_policy_snapshot(
+            conn,
+            account,
+            UtcTimestamp::from_unix_nanos(10),
+            &ResolvedSamplingPolicy {
+                ordinary_cadence: MonotonicDuration::from_seconds(300),
+                freshness_horizon: MonotonicDuration::from_seconds(900),
+                reset_edge_policy: "lead-120s".into(),
+                retry_backoff_policy: "exponential-3".into(),
+                command_budget: MonotonicDuration::from_seconds(30),
+                policy_algorithm_version: "v1".into(),
+            },
+        )
+        .expect("policy snapshot must insert");
+        let attempt = |started: i64| {
+            start_meter_attempt(
+                conn,
+                &NewMeterAttempt {
+                    run_id: run,
+                    account_id: account,
+                    provider: "anthropic".into(),
+                    request_started_at: UtcTimestamp::from_unix_nanos(started),
+                    credential_context_id: Some("ctx".into()),
+                    policy_snapshot_id: snapshot,
+                    due_at: UtcTimestamp::from_unix_nanos(started - 1),
+                    due_reason: DueReason::ForcedOrManual,
+                    due_basis: None,
+                    provider_contract_id: "contract-v1".into(),
+                    meter_semantics_id: "semantics-v1".into(),
+                },
+            )
+            .expect("attempt must insert")
+        };
+        (account, attempt(20), attempt(40))
+    }
+
+    fn record_established(
+        conn: &rusqlite::Connection,
+        account: crate::store::account::AccountId,
+        attempt: crate::store::meter_attempt::MeterAttemptRowId,
+        identity: &str,
+        at: i64,
+    ) {
+        use crate::store::subscription_identity::{
+            NewSubscriptionChange, SubscriptionChangeKind, insert_change,
+        };
+        insert_change(
+            conn,
+            &NewSubscriptionChange {
+                account_id: account,
+                kind: SubscriptionChangeKind::Established,
+                previous_identity: None,
+                current_identity: identity.into(),
+                detecting_attempt_id: attempt,
+                previous_observation_id: None,
+                detected_at: UtcTimestamp::from_unix_nanos(at),
+            },
+        )
+        .expect("establishment must insert");
+    }
+
+    fn record_changed(
+        conn: &rusqlite::Connection,
+        account: crate::store::account::AccountId,
+        attempt: crate::store::meter_attempt::MeterAttemptRowId,
+        previous: &str,
+        current: &str,
+        at: i64,
+    ) {
+        use crate::store::subscription_identity::{
+            NewSubscriptionChange, SubscriptionChangeKind, insert_change,
+        };
+        insert_change(
+            conn,
+            &NewSubscriptionChange {
+                account_id: account,
+                kind: SubscriptionChangeKind::Changed,
+                previous_identity: Some(previous.into()),
+                current_identity: current.into(),
+                detecting_attempt_id: attempt,
+                previous_observation_id: None,
+                detected_at: UtcTimestamp::from_unix_nanos(at),
+            },
+        )
+        .expect("change must insert");
+    }
+
+    #[test]
+    fn a_refused_subscription_change_fails_the_check() {
+        let dir = scratch_dir("subscription-refused");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = subscription_test_config(&dir);
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        let conn = crate::store::rate_card::open_ledger(
+            &ctx.db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate");
+        let (account, first, second) = seeded_subscription_parents(&conn);
+        record_established(&conn, account, first, "anthropic:max:tier", 30);
+        record_changed(&conn, account, second, "anthropic:max:tier", "anthropic:pro:tier", 50);
+        ctx.db = Some(&conn);
+        let outcome = subscription_identity_change(&ctx);
+        match outcome.status {
+            CheckStatus::Fail(message) => {
+                assert!(message.contains("primary"), "{message}");
+                assert!(message.contains("anthropic:pro:tier"), "{message}");
+            }
+            other => panic!("a refused change must fail, got {other:?}"),
+        }
+        assert!(!outcome.has_repair, "no repair can acknowledge a subscription");
+    }
+
+    #[test]
+    fn no_subscription_history_passes_quietly() {
+        let dir = scratch_dir("subscription-quiet");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = subscription_test_config(&dir);
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        let conn = crate::store::rate_card::open_ledger(
+            &ctx.db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate");
+        let (_account, _first, _second) = seeded_subscription_parents(&conn);
+        ctx.db = Some(&conn);
+        let outcome = subscription_identity_change(&ctx);
+        assert_eq!(outcome.status, CheckStatus::Pass);
+    }
+
+    #[test]
+    fn an_observation_newer_than_the_change_passes_with_a_historical_note() {
+        // Planted negative: the newest row is still a change, so a check
+        // that only read the latest kind would keep failing. The observation
+        // stored after the change proves readings under the established
+        // subscription resumed.
+        let dir = scratch_dir("subscription-resumed");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = subscription_test_config(&dir);
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        let conn = crate::store::rate_card::open_ledger(
+            &ctx.db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate");
+        let (account, first, second) = seeded_subscription_parents(&conn);
+        record_established(&conn, account, first, "anthropic:max:tier", 30);
+        record_changed(&conn, account, second, "anthropic:max:tier", "anthropic:pro:tier", 50);
+        // An observation received after the change was detected.
+        let evidence = crate::store::meter_evidence::insert_response_evidence(
+            &conn,
+            &crate::store::meter_evidence::NewMeterResponseEvidence {
+                attempt_id: first,
+                response_classification: "200".into(),
+                received_at: UtcTimestamp::from_unix_nanos(60),
+                provider_observed_at_original: None,
+                evidence_capsule: r#"{"windows":[]}"#.into(),
+                capsule_schema_version: "capsule-v1".into(),
+                sanitizer_version: "sanitizer-v1".into(),
+                capture_truncated: false,
+            },
+        )
+        .expect("evidence must insert");
+        {
+            use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+            use crate::domain::time::{MeasurementBasis, MonotonicDuration as Duration};
+            let _ = Duration::from_seconds(1);
+            crate::store::meter_evidence::insert_observation(
+                &conn,
+                &crate::store::meter_evidence::NewMeterObservation {
+                    attempt_id: first,
+                    evidence_id: evidence,
+                    account_id: account,
+                    provider: "anthropic".into(),
+                    provider_observed_at: None,
+                    received_at: UtcTimestamp::from_unix_nanos(60),
+                    measurement_basis: MeasurementBasis::LocallyReceived,
+                    observed_plan: None,
+                    observed_tier: None,
+                    adapter_version: AdapterVersion::new("adapter-v1"),
+                    provider_contract_id: ProviderContractId::new("contract-v1"),
+                    meter_semantics_id: MeterSemanticsId::new("semantics-v1"),
+                    normalized_fingerprint: "fp-1".into(),
+                },
+            )
+            .expect("observation must insert");
+        }
+        ctx.db = Some(&conn);
+        let outcome = subscription_identity_change(&ctx);
+        match outcome.status {
+            CheckStatus::PassWithDetail(message) => {
+                assert!(message.contains("primary"), "{message}");
+                assert!(message.contains("resumed"), "{message}");
+            }
+            other => panic!("a resumed account must pass with detail, got {other:?}"),
+        }
     }
 }
