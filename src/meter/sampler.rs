@@ -1178,6 +1178,7 @@ mod tests {
 
     use crate::store::spool::{drain_pending, pending_file_path};
     use std::collections::HashMap;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -2623,7 +2624,7 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
     /// persist path derives it. Returns what the row stored.
     fn persist_retry_sequence(
         repository: &Repository,
-        conn: &rusqlite::Connection,
+        database_path: &Path,
         transport: &RetrySequenceTransport,
     ) -> StoredMeterAttemptResult {
         let clock = transport.clock.clone();
@@ -2693,7 +2694,8 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
             .expect("the terminal result must commit");
 
         meter_attempt::result_by_attempt_id(
-            conn,
+            &open(database_path, AccessMode::ReadWrite, &policy())
+                .expect("the fixture ledger must reopen"),
             row_id_of(started.attempt_id()).expect("a storage row id"),
         )
         .expect("the stored result must read")
@@ -2716,10 +2718,8 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
             let repository = Repository::new(&database_path, policy());
             let transport =
                 RetrySequenceTransport::timing_out_then_401(SharedClock::new(), timeouts);
-            let conn = open(&database_path, AccessMode::ReadWrite, &policy())
-                .expect("the fixture ledger must reopen");
 
-            let stored = persist_retry_sequence(&repository, &conn, &transport);
+            let stored = persist_retry_sequence(&repository, &database_path, &transport);
 
             assert_eq!(
                 stored.outcome,
@@ -2754,7 +2754,7 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
         const SAMPLES: usize = 3;
         for _ in 0..SAMPLES {
             let transport = RetrySequenceTransport::timing_out_then_401(SharedClock::new(), 0);
-            persist_retry_sequence(&repository, &conn, &transport);
+            persist_retry_sequence(&repository, &database_path, &transport);
         }
 
         let account = repository
