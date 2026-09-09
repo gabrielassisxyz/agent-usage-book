@@ -2234,7 +2234,16 @@ It must not perform:
 
 This makes "status never blocks on another `aub` operation" structurally testable.
 
-A provider value that aged past its freshness threshold is rendered as stale.
+The one exception is `status --refresh` (aub-yg2q): the operator has asked for
+a current reading, so the command takes one forced sampling attempt per
+selected account through the same sampling path `aub now` uses. HTTP, the
+store and lease waiting included, exactly as any mutating invocation. Without
+the flag the command performs none of the forbidden operations, and the
+default path's read-only contract is what the source scan and boundary rules
+hold.
+
+A provider value that aged past its freshness threshold is rendered as stale,
+with the age of the observation it was read from shown beside it.
 
 If the projection is missing, malformed, unsupported, or too old:
 

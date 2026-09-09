@@ -29,6 +29,7 @@ commands:
 status:
   answers: how much quota does each configured account have left?
   format: text | json
+  options: --refresh
 
 spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions?
