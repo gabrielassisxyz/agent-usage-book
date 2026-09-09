@@ -31,6 +31,7 @@ fn attempt(started_secs: i64, result: Option<AttemptResultRecord>) -> AttemptRec
     AttemptRecord {
         started_at: ts(started_secs),
         result,
+        credential_changed: false,
     }
 }
 
@@ -38,6 +39,7 @@ fn success_result(finished_secs: i64) -> AttemptResultRecord {
     AttemptResultRecord {
         finished_at: ts(finished_secs),
         retry_after: None,
+        is_auth_required: false,
     }
 }
 

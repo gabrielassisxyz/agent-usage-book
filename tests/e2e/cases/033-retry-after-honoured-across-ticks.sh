@@ -187,11 +187,11 @@ case_assertions() {
 
     # Step 7: the snapshot records the rule, not a constant none.
     assert_exit 0 7
-    if grep -qx "retry-after-capped-3600s" "$(step_dir 7)/stdout.txt"; then
-        record_assertion "retry_backoff_policy" "retry-after-capped-3600s" \
+    if grep -qx "retry-after-capped-3600s auth-3-21600s" "$(step_dir 7)/stdout.txt"; then
+        record_assertion "retry_backoff_policy" "retry-after-capped-3600s auth-3-21600s" \
             "$(cat "$(step_dir 7)/stdout.txt")" "pass"
     else
-        record_assertion "retry_backoff_policy" "retry-after-capped-3600s" \
+        record_assertion "retry_backoff_policy" "retry-after-capped-3600s auth-3-21600s" \
             "$(cat "$(step_dir 7)/stdout.txt")" "fail"
         CASE_FAILED=1
     fi

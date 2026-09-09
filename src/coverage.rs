@@ -18,8 +18,10 @@ use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 /// other resolved fields (freshness horizon, retry backoff, command budget) do not
 /// change how many opportunities a policy owed. The retry backoff string carries
 /// the `Retry-After` ceiling (`retry-after-capped-<n>s`) the scheduler honours,
-/// so the postponement reads the same cap; a `none` or pre-cap shape means
-/// uncapped.
+/// plus the authentication-backoff threshold and ceiling
+/// (`auth-<threshold>-<cap>s`, aub-x2je), so both postponements read the same
+/// caps; a `none` or pre-cap shape means uncapped with no authentication
+/// backoff.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PolicySnapshot {
     pub effective_at: UtcTimestamp,
@@ -27,20 +29,26 @@ pub struct PolicySnapshot {
     pub retry_backoff_policy: String,
 }
 
-/// The terminal result of one attempt, reduced to the two facts coverage reads: when
-/// it finished, and whether a `Retry-After` postponed the next opportunity.
+/// The terminal result of one attempt, reduced to the facts coverage reads:
+/// when it finished, whether a `Retry-After` postponed the next opportunity,
+/// and whether it was an authentication rejection (aub-x2je).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttemptResultRecord {
     pub finished_at: UtcTimestamp,
     pub retry_after: Option<MonotonicDuration>,
+    pub is_auth_required: bool,
 }
 
 /// One started attempt and its optional terminal result. A start with no result is the
 /// collector-interruption state, reported separately from both coverage numbers.
+/// `credential_changed` (aub-x2je) marks an attempt whose credential context
+/// differs from its predecessor's: the authentication streak resets there,
+/// the same rule the scheduler applies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttemptRecord {
     pub started_at: UtcTimestamp,
     pub result: Option<AttemptResultRecord>,
+    pub credential_changed: bool,
 }
 
 /// One successful observation, at the instant it was received.
@@ -292,8 +300,10 @@ fn cadence_at(snapshots: &[PolicySnapshot], at: UtcTimestamp) -> Option<Monotoni
 }
 
 /// The `Retry-After` ceiling in force at `at`, parsed from the
-/// `retry_backoff_policy` snapshot string (`retry-after-capped-<n>s`). `None`
-/// means uncapped: the snapshot records `none` or a pre-cap shape.
+/// `retry_backoff_policy` snapshot string (`retry-after-capped-<n>s`, with
+/// an optional ` auth-<threshold>-<cap>s` suffix the authentication backoff
+/// adds). `None` means uncapped: the snapshot records `none` or a pre-cap
+/// shape.
 fn retry_after_cap_at(snapshots: &[PolicySnapshot], at: UtcTimestamp) -> Option<MonotonicDuration> {
     let policy = snapshots
         .iter()
@@ -306,46 +316,115 @@ fn retry_after_cap_at(snapshots: &[PolicySnapshot], at: UtcTimestamp) -> Option<
 
 /// Parses the `retry-after-capped-<n>s` snapshot string back into its ceiling.
 /// Anything else (`none`, a pre-cap backoff shape, an unreadable value) is
-/// `None`: uncapped, never a guessed cap.
+/// `None`: uncapped, never a guessed cap. A trailing authentication segment
+/// (` auth-<threshold>-<cap>s`) is ignored here and parsed by
+/// [`parse_auth_backoff_policy`].
 fn parse_capped_retry_after_policy(text: &str) -> Option<MonotonicDuration> {
-    let seconds = text
+    let first = text.split_whitespace().next().unwrap_or(text);
+    let seconds = first
         .strip_prefix("retry-after-capped-")?
         .strip_suffix('s')?;
     let seconds: u64 = seconds.parse().ok()?;
     Some(MonotonicDuration::from_seconds(seconds))
 }
 
-/// The postponement intervals owed to persisted `Retry-After` instructions. A
-/// postponement exists only when the retry delay exceeds the ordinary cadence in force
+/// The authentication-backoff threshold and ceiling in force at `at`,
+/// parsed from the `auth-<threshold>-<cap>s` segment of the
+/// `retry_backoff_policy` snapshot string (aub-x2je). `None` means no
+/// authentication backoff: the snapshot predates the segment, records
+/// `none`, or is unreadable, and the engine then owes every cadence tick.
+fn auth_backoff_at(
+    snapshots: &[PolicySnapshot],
+    at: UtcTimestamp,
+) -> Option<(u32, MonotonicDuration)> {
+    let policy = snapshots
+        .iter()
+        .rev()
+        .find(|s| s.effective_at.unix_nanos() <= at.unix_nanos())?
+        .retry_backoff_policy
+        .as_str();
+    parse_auth_backoff_policy(policy)
+}
+
+/// Parses the `auth-<threshold>-<cap>s` segment of a snapshot string back
+/// into its threshold and ceiling. Anything without the segment is `None`.
+fn parse_auth_backoff_policy(text: &str) -> Option<(u32, MonotonicDuration)> {
+    let segment = text
+        .split_whitespace()
+        .find(|token| token.starts_with("auth-"))?;
+    let rest = segment.strip_prefix("auth-")?.strip_suffix('s')?;
+    let (threshold, cap_secs) = rest.split_once('-')?;
+    let threshold: u32 = threshold.parse().ok()?;
+    if threshold == 0 {
+        return None;
+    }
+    let cap_secs: u64 = cap_secs.parse().ok()?;
+    Some((threshold, MonotonicDuration::from_seconds(cap_secs)))
+}
+
+/// The postponement intervals owed to persisted `Retry-After` instructions
+/// and to authentication-backoff holds (aub-x2je). A retry postponement
+/// exists only when the retry delay exceeds the ordinary cadence in force
 /// at the result's finish: a shorter delay is absorbed by the ordinary cadence and does
 /// not remove an opportunity. The delay is capped by the ceiling the policy snapshot
 /// covering the finish records, the same rule the scheduler applies, so a header
 /// above the cap postpones only until the cap expires.
+///
+/// An authentication postponement exists only when the trailing streak of
+/// `auth_required` results ending at this attempt reaches the threshold in
+/// force at its finish: the hold is the scheduler's doubling delay
+/// (`cadence * 2^(streak-threshold+1)`, capped), and only when it exceeds
+/// the cadence. A credential change resets the streak first, the same rule
+/// the scheduler applies, and an interruption (no terminal result) resets
+/// it too. Both families merge into one interval set, so an instant held
+/// by both counts once: the two holds share the due instant and the later
+/// wins, never their sum.
 fn postponements(attempts: &[AttemptRecord], snapshots: &[PolicySnapshot]) -> Vec<Postponement> {
     let mut out = Vec::new();
+    let mut auth_streak = 0u32;
     for attempt in attempts {
         let Some(result) = &attempt.result else {
+            auth_streak = 0;
             continue;
         };
-        let Some(retry_after) = result.retry_after else {
-            continue;
-        };
+        if attempt.credential_changed {
+            auth_streak = 0;
+        }
+        if result.is_auth_required {
+            auth_streak = auth_streak.saturating_add(1);
+        } else {
+            auth_streak = 0;
+        }
         let Some(cadence) = cadence_at(snapshots, result.finished_at) else {
             continue;
         };
-        let effective = match retry_after_cap_at(snapshots, result.finished_at) {
-            Some(cap) => retry_after.min(cap),
-            None => retry_after,
-        };
-        if effective.as_nanos() <= cadence.as_nanos() {
-            continue;
+        if let Some(retry_after) = result.retry_after {
+            let effective = match retry_after_cap_at(snapshots, result.finished_at) {
+                Some(cap) => retry_after.min(cap),
+                None => retry_after,
+            };
+            if effective.as_nanos() > cadence.as_nanos() {
+                out.push(Postponement {
+                    start: result.finished_at,
+                    end: UtcTimestamp::from_unix_nanos(
+                        result.finished_at.unix_nanos() + effective.as_nanos() as i64,
+                    ),
+                });
+            }
         }
-        out.push(Postponement {
-            start: result.finished_at,
-            end: UtcTimestamp::from_unix_nanos(
-                result.finished_at.unix_nanos() + effective.as_nanos() as i64,
-            ),
-        });
+        if result.is_auth_required
+            && let Some((threshold, cap)) = auth_backoff_at(snapshots, result.finished_at)
+            && let Some(delay) =
+                crate::meter::due::auth_backoff_delay(cadence, threshold, cap, auth_streak, false)
+            && delay.as_nanos() > cadence.as_nanos()
+        {
+            out.push(Postponement {
+                start: result.finished_at,
+                end: UtcTimestamp::from_unix_nanos(
+                    result.finished_at.unix_nanos() + delay.as_nanos() as i64,
+                ),
+            });
+        }
     }
     merge_postponements(out)
 }
@@ -652,6 +731,31 @@ mod tests {
         AttemptResultRecord {
             finished_at: ts(finished_secs),
             retry_after: Some(cadence(retry_after_secs)),
+            is_auth_required: false,
+        }
+    }
+
+    fn auth_result(finished_secs: i64) -> AttemptResultRecord {
+        AttemptResultRecord {
+            finished_at: ts(finished_secs),
+            retry_after: None,
+            is_auth_required: true,
+        }
+    }
+
+    fn snapshot_with_auth_backoff(
+        effective_secs: i64,
+        cadence_secs: u64,
+        retry_cap_secs: u64,
+        threshold: u32,
+        auth_cap_secs: u64,
+    ) -> PolicySnapshot {
+        PolicySnapshot {
+            effective_at: ts(effective_secs),
+            ordinary_cadence: cadence(cadence_secs),
+            retry_backoff_policy: format!(
+                "retry-after-capped-{retry_cap_secs}s auth-{threshold}-{auth_cap_secs}s"
+            ),
         }
     }
 
@@ -659,6 +763,19 @@ mod tests {
         AttemptRecord {
             started_at: ts(started_secs),
             result,
+            credential_changed: false,
+        }
+    }
+
+    fn attempt_with_change(
+        started_secs: i64,
+        result: Option<AttemptResultRecord>,
+        credential_changed: bool,
+    ) -> AttemptRecord {
+        AttemptRecord {
+            started_at: ts(started_secs),
+            result,
+            credential_changed,
         }
     }
 
@@ -666,6 +783,7 @@ mod tests {
         AttemptResultRecord {
             finished_at: ts(finished_secs),
             retry_after: None,
+            is_auth_required: false,
         }
     }
 
@@ -982,6 +1100,7 @@ mod tests {
                 Some(AttemptResultRecord {
                     finished_at: ts(1_000),
                     retry_after: Some(cadence(600)),
+                    is_auth_required: false,
                 }),
             )],
             Vec::new(),
@@ -1003,6 +1122,7 @@ mod tests {
                 Some(AttemptResultRecord {
                     finished_at: ts(1_000),
                     retry_after: Some(cadence(30)),
+                    is_auth_required: false,
                 }),
             )],
             Vec::new(),
@@ -1053,6 +1173,81 @@ mod tests {
             assert_eq!(postponed.len(), 1, "policy {policy:?} must stay uncapped");
             assert_eq!(postponed[0].end, ts(1_000 + 7200), "policy {policy:?}");
         }
+    }
+
+    /// aub-x2je: an old snapshot without the auth segment owes every tick:
+    /// three consecutive rejections under `retry-after-capped-3600s` alone
+    /// postpone nothing, because the sampler that wrote those rows never
+    /// backed off. The paired positive below differs only in the snapshot
+    /// carrying the segment.
+    #[test]
+    fn auth_streak_without_an_auth_segment_in_the_snapshot_postpones_nothing() {
+        let snapshots = vec![snapshot_with_capped_retry_after(0, 300, 3600)];
+        let attempts = vec![
+            attempt(0, Some(auth_result(0))),
+            attempt(300, Some(auth_result(300))),
+            attempt(600, Some(auth_result(600))),
+        ];
+        assert!(postponements(&attempts, &snapshots).is_empty());
+    }
+
+    /// aub-x2je: three consecutive rejections under a snapshot carrying
+    /// `auth-3-21600s` postpone the third's finish by twice the cadence
+    /// (600 s at a 300 s cadence), so the denominator loses those
+    /// opportunities instead of counting them missed.
+    #[test]
+    fn auth_streak_at_threshold_postpones_twice_the_cadence() {
+        let snapshots = vec![snapshot_with_auth_backoff(0, 300, 3600, 3, 21_600)];
+        let attempts = vec![
+            attempt(0, Some(auth_result(0))),
+            attempt(300, Some(auth_result(300))),
+            attempt(600, Some(auth_result(600))),
+        ];
+        let postponed = postponements(&attempts, &snapshots);
+        assert_eq!(postponed.len(), 1);
+        assert_eq!(postponed[0].start, ts(600));
+        assert_eq!(postponed[0].end, ts(1_200));
+    }
+
+    /// aub-x2je: below the threshold nothing postpones: two rejections at a
+    /// threshold of three leave the denominator whole.
+    #[test]
+    fn auth_streak_below_threshold_postpones_nothing() {
+        let snapshots = vec![snapshot_with_auth_backoff(0, 300, 3600, 3, 21_600)];
+        let attempts = vec![
+            attempt(0, Some(auth_result(0))),
+            attempt(300, Some(auth_result(300))),
+        ];
+        assert!(postponements(&attempts, &snapshots).is_empty());
+    }
+
+    /// aub-x2je: a credential change resets the streak, so the third
+    /// rejection after a change (streak one under the new credential)
+    /// postpones nothing. The near-identical negative to the threshold
+    /// positive above, differing only in the change flag on the last
+    /// attempt.
+    #[test]
+    fn auth_streak_after_a_credential_change_postpones_nothing() {
+        let snapshots = vec![snapshot_with_auth_backoff(0, 300, 3600, 3, 21_600)];
+        let attempts = vec![
+            attempt(0, Some(auth_result(0))),
+            attempt(300, Some(auth_result(300))),
+            attempt_with_change(600, Some(auth_result(600)), true),
+        ];
+        assert!(postponements(&attempts, &snapshots).is_empty());
+    }
+
+    /// aub-x2je: a success breaks the streak, so auth-success-auth never
+    /// reaches a threshold of three and postpones nothing.
+    #[test]
+    fn auth_streak_broken_by_a_success_postpones_nothing() {
+        let snapshots = vec![snapshot_with_auth_backoff(0, 300, 3600, 3, 21_600)];
+        let attempts = vec![
+            attempt(0, Some(auth_result(0))),
+            attempt(300, Some(success_result(300))),
+            attempt(600, Some(auth_result(600))),
+        ];
+        assert!(postponements(&attempts, &snapshots).is_empty());
     }
 
     /// The report names the most recent timer-triggered run and the most recent
@@ -1148,8 +1343,13 @@ mod tests {
                 let result = has_result.then_some(AttemptResultRecord {
                     finished_at: started_at,
                     retry_after: None,
+                    is_auth_required: false,
                 });
-                attempts.push(AttemptRecord { started_at, result });
+                attempts.push(AttemptRecord {
+                    started_at,
+                    result,
+                    credential_changed: false,
+                });
                 if has_observation {
                     observations.push(ObservationRecord { at: started_at });
                 }

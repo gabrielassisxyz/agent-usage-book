@@ -544,6 +544,48 @@ pub fn latest_attempt_for_account(
     .map_err(|e| Error::Store(format!("cannot read the latest meter attempt: {e}")))
 }
 
+/// How many consecutive `auth_required` terminal results close one
+/// account's history (aub-x2je): the trailing streak the authentication
+/// backoff reads. Any other terminal outcome breaks the streak, and a
+/// latest attempt with no result yet (collector interruption) breaks it
+/// too, because consecutiveness is a fact about terminal outcomes. The
+/// walk is bounded: once the hold saturates at the cap, a longer exact
+/// count changes nothing, so 64 entries are more than enough.
+pub fn consecutive_auth_failures_for_account(
+    conn: &rusqlite::Connection,
+    account_id: crate::store::account::AccountId,
+) -> Result<u32, Error> {
+    let latest = latest_attempt_for_account(conn, account_id)?;
+    let Some(latest) = latest else {
+        return Ok(0);
+    };
+    // An open latest attempt breaks the streak: it has no terminal outcome.
+    if result_by_attempt_id(conn, latest.row_id)?.is_none() {
+        return Ok(0);
+    }
+    let mut statement = conn
+        .prepare(
+            "SELECT mar.outcome FROM meter_attempt ma
+             JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
+             WHERE ma.account_id = ?1 ORDER BY ma.id DESC LIMIT 64",
+        )
+        .map_err(|e| Error::Store(format!("cannot read the auth failure streak: {e}")))?;
+    let outcomes = statement
+        .query_map(params![account_id.value()], |row| row.get::<_, String>(0))
+        .map_err(|e| Error::Store(format!("cannot read the auth failure streak: {e}")))?;
+    let mut streak = 0u32;
+    for outcome in outcomes {
+        let outcome = outcome
+            .map_err(|e| Error::Store(format!("cannot read the auth failure streak: {e}")))?;
+        if outcome == "auth_required" {
+            streak = streak.saturating_add(1);
+        } else {
+            break;
+        }
+    }
+    Ok(streak)
+}
+
 /// Reads the newest attempt of one account whose terminal outcome is success,
 /// or `None` when the account has never had a successful attempt. This is the
 /// anchor of "the last successful observation" (`aub-me5.5`): the success is a
@@ -675,6 +717,12 @@ pub fn open_attempt_row_ids(conn: &rusqlite::Connection) -> Result<Vec<MeterAtte
 pub struct AttemptWithOutcome {
     pub started_at: UtcTimestamp,
     pub terminal: Option<AttemptTerminalOutcome>,
+    /// The credential context the attempt carried (aub-x2je): the coverage
+    /// engine resets the authentication streak when it changes, the same
+    /// rule the scheduler applies, so a fixed credential stops discounting
+    /// the denominator. `None` on older rows predates the column being
+    /// populated and never counts as a change.
+    pub credential_context_id: Option<String>,
 }
 
 /// The terminal outcome of one attempt, as the coverage command reads it.
@@ -705,7 +753,7 @@ pub fn attempts_with_outcomes_for_account_between(
         .prepare(
             "SELECT ma.request_started_at, mar.completed_at, mar.outcome,
                     mar.failure_class, mar.retry_after_nanos,
-                    mar.sanitized_error_classification
+                    mar.sanitized_error_classification, ma.credential_context_id
              FROM meter_attempt ma
              LEFT JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
              WHERE ma.account_id = ?1
@@ -753,6 +801,7 @@ pub fn attempts_with_outcomes_for_account_between(
                 Ok(AttemptWithOutcome {
                     started_at,
                     terminal,
+                    credential_context_id: row.get(6)?,
                 })
             },
         )
