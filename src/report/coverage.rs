@@ -499,7 +499,9 @@ mod tests {
     use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
     use crate::domain::time::{MeasurementBasis, MonotonicDuration};
     use crate::store::connection::{self, PragmaPolicy};
-    use crate::store::meter_attempt::{self, DueReason, NewMeterAttempt, NewMeterAttemptResult};
+    use crate::store::meter_attempt::{
+        self, DueReason, NewMeterAttempt, NewMeterAttemptResult, record_pre_classification_result,
+    };
     use crate::store::meter_evidence::{self, NewMeterObservation, NewMeterResponseEvidence};
 
     use crate::store::sample_run::{self, Trigger};
@@ -875,19 +877,25 @@ mod tests {
                 },
             )
             .expect("attempt must insert");
-            meter_attempt::record_meter_attempt_result(
-                &conn,
-                &NewMeterAttemptResult {
-                    attempt_id: row,
-                    completed_at: UtcTimestamp::from_unix_nanos(started.unix_nanos() + 1_000),
-                    elapsed: MonotonicDuration::from_millis(100),
-                    outcome: *outcome,
-                    sanitized_error_classification: classification.clone(),
-                    retry_index: None,
-                    clock_anomaly: false,
-                },
-            )
-            .expect("attempt result must insert");
+            let record = NewMeterAttemptResult {
+                attempt_id: row,
+                completed_at: UtcTimestamp::from_unix_nanos(started.unix_nanos() + 1_000),
+                elapsed: MonotonicDuration::from_millis(100),
+                outcome: *outcome,
+                sanitized_error_classification: classification.clone(),
+                retry_index: None,
+                clock_anomaly: false,
+            };
+            // The classification-less row is the pre-column shape the ledger
+            // already holds: production writers refuse it now, so it goes
+            // through the test-only legacy writer that fixture exists for.
+            if classification.is_none() && !matches!(outcome, AttemptOutcome::Success) {
+                record_pre_classification_result(&conn, &record)
+                    .expect("the legacy-shape row must insert");
+            } else {
+                meter_attempt::record_meter_attempt_result(&conn, &record)
+                    .expect("attempt result must insert");
+            }
         }
 
         let selector = CoverageSelector::default();

@@ -302,6 +302,20 @@ fn pending_evidence(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::PendingEvidence, status)
 }
 
+/// A recent-sampling-attempt window, three times the configured default
+/// interval: shared by [`sampling_cadence`], which asks whether an attempt
+/// happened recently at all, and [`env_credential_resolves_for_sampler`],
+/// which asks whether a *successful* one did. One definition, so the two
+/// checks cannot disagree about what "recent" means without the disagreement
+/// being visible as a diff to this function.
+fn recent_attempt_threshold_nanos(ctx: &DoctorContext) -> u64 {
+    ctx.config
+        .sampling
+        .default_interval
+        .as_nanos()
+        .saturating_mul(3)
+}
+
 /// One configured account's latest sampling attempt is older than three times the
 /// configured default interval, or it has never had one at all.
 fn sampling_cadence(ctx: &DoctorContext) -> CheckOutcome {
@@ -317,12 +331,7 @@ fn sampling_cadence(ctx: &DoctorContext) -> CheckOutcome {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
             Some(conn) => {
-                let threshold_nanos = ctx
-                    .config
-                    .sampling
-                    .default_interval
-                    .as_nanos()
-                    .saturating_mul(3);
+                let threshold_nanos = recent_attempt_threshold_nanos(ctx);
                 let mut stale = Vec::new();
                 for account in &ctx.config.accounts {
                     let lookup = crate::store::account::account_id_by_identity(
@@ -373,23 +382,104 @@ fn sampling_cadence(ctx: &DoctorContext) -> CheckOutcome {
 
 /// Every configured account's credential resolves (`auth::resolve`), performed
 /// against the real filesystem and never over the network.
+///
+/// An `env`-kind credential (aub-e2uz) is unresolvable from any process that
+/// does not carry the variable, which includes every interactive shell that
+/// is not `aub-sample.service` itself: the same binary, the same ledger, one
+/// minute apart, disagreed about an account that was sampling successfully
+/// throughout (aub-a0tj). Three shapes were weighed for what this check
+/// should say about a credential it cannot see but the sampler can:
+///
+/// - degrade straight to a warning naming the invocation as the likely
+///   cause. Rejected: it is the cheapest option and the weakest one, because
+///   it stops being a red flag for the one case that matters, a credential
+///   that really is missing everywhere, unless something else notices first.
+/// - report the check as not-applicable for `env`-kind credentials outside
+///   the unit's own environment. Rejected: honest about the process's own
+///   blind spot, but it silently drops real coverage exactly when the
+///   variable is genuinely unset for the sampler too.
+/// - keep the failure, but only when the sampler is *also* failing to
+///   resolve the credential, which the ledger can answer from recent
+///   sampling attempts. **Chosen.** It is the only shape that stays truthful
+///   in both directions: a credential the sampler resolves reads as resolved
+///   everywhere, and a credential nothing can resolve still fails loudly
+///   (`env_credential_resolves_for_sampler`'s planted-negative test).
+///
+/// The recovered case reports [`CheckStatus::PassWithDetail`] rather than a
+/// bare [`CheckStatus::Pass`], naming the invocation context in its message:
+/// an operator who runs `doctor` from a shell that disagrees with the unit
+/// needs to see why, not just that the answer came out the same.
 fn unresolved_authentication(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.config.accounts.is_empty() {
         CheckStatus::NotApplicable("no accounts configured".to_string())
     } else {
         let mut unresolved = Vec::new();
+        let mut recovered = Vec::new();
         for account in &ctx.config.accounts {
             if let Err(error) = crate::auth::resolve(account, &crate::auth::RealFs, false) {
-                unresolved.push(format!("{}: {error}", account.name));
+                match env_credential_resolves_for_sampler(ctx, account) {
+                    Some(evidence) => recovered.push(format!(
+                        "{}: not set in this process; resolves for the sampler ({evidence})",
+                        account.name
+                    )),
+                    None => unresolved.push(format!("{}: {error}", account.name)),
+                }
             }
         }
-        if unresolved.is_empty() {
-            CheckStatus::Pass
-        } else {
+        if !unresolved.is_empty() {
             CheckStatus::Fail(unresolved.join("; "))
+        } else if !recovered.is_empty() {
+            CheckStatus::PassWithDetail(recovered.join("; "))
+        } else {
+            CheckStatus::Pass
         }
     };
     outcome(CheckName::UnresolvedAuthentication, status)
+}
+
+/// Whether an `env`-kind credential this process cannot see is nonetheless
+/// resolving for the sampler, read from recent attempt history rather than
+/// re-derived: an unattended unit and an interactive shell disagree about
+/// which environment they carry, never about which account is or is not
+/// authenticated, so the ledger's own record of what actually happened is
+/// the one source that cannot be invocation-dependent.
+///
+/// Returns `None` for a `file` or `none`-kind credential (unaffected by this
+/// bead, `aub-a0tj`), for an account this process has never observed, for an
+/// account with no successful attempt at all, and for a success old enough
+/// that it can no longer speak for the credential's current state, using the
+/// same recency window [`sampling_cadence`] uses for "recent" everywhere else
+/// in this module. Any of those leaves the credential reported as failed,
+/// because a `None` here is what keeps a credential missing for the sampler
+/// too failing loudly rather than being read as merely unseen.
+fn env_credential_resolves_for_sampler(
+    ctx: &DoctorContext,
+    account: &crate::config::AccountConfig,
+) -> Option<String> {
+    if !matches!(
+        crate::auth::CredentialSource::from_account(account),
+        Ok(crate::auth::CredentialSource::Env { .. })
+    ) {
+        return None;
+    }
+    let conn = ctx.db?;
+    let account_id =
+        crate::store::account::account_id_by_identity(conn, &account.provider, &account.name)
+            .ok()??;
+    let attempt =
+        crate::store::meter_attempt::newest_successful_attempt_for_account(conn, account_id)
+            .ok()??;
+    let gap_nanos = ctx
+        .timestamp
+        .unix_nanos()
+        .saturating_sub(attempt.request_started_at.unix_nanos()) as u64;
+    if gap_nanos > recent_attempt_threshold_nanos(ctx) {
+        return None;
+    }
+    Some(format!(
+        "last successful sampler attempt {}s ago",
+        gap_nanos / 1_000_000_000
+    ))
 }
 
 /// Every configured transcript root exists on disk. Distinct from the deeper
@@ -1324,6 +1414,360 @@ mod tests {
             unresolved_authentication(&ctx).status,
             CheckStatus::NotApplicable(_)
         ));
+    }
+
+    // --- aub-a0tj: one answer about an env credential, whichever shell asked ---
+
+    /// One account, `credential = { kind = "env", name = <var> }`, the shape
+    /// `aub-r7k0`/`aub-e2uz` chose for the OpenCode session cookie.
+    fn env_account_config(
+        state_dir: &std::path::Path,
+        provider: &str,
+        name: &str,
+        var: &str,
+    ) -> Config {
+        let env = RealEnv;
+        let workspace_line = if provider == "opencode" {
+            "opencode_workspace = \"wrk_test\"\n"
+        } else {
+            ""
+        };
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[[accounts]]\nname = {:?}\nprovider = {:?}\n{workspace_line}\
+             credential = {{ kind = \"env\", name = {:?} }}\n",
+            state_dir, name, provider, var
+        );
+        let (config, _) = resolve(&Overrides::new(), &env, Some(&toml), "aub.toml")
+            .expect("env-credential account config must resolve");
+        config
+    }
+
+    /// One account, `credential = { kind = "file", path = <path> }`, for
+    /// proving the `file` kind is unaffected by this bead's ledger fallback.
+    fn missing_file_account_config(
+        state_dir: &std::path::Path,
+        provider: &str,
+        name: &str,
+        path: &std::path::Path,
+    ) -> Config {
+        let env = RealEnv;
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[[accounts]]\nname = {:?}\nprovider = {:?}\n\
+             credential = {{ kind = \"file\", path = {:?} }}\n",
+            state_dir, name, provider, path
+        );
+        let (config, _) = resolve(&Overrides::new(), &env, Some(&toml), "aub.toml")
+            .expect("file-credential account config must resolve");
+        config
+    }
+
+    /// One account, no `credential` table at all, i.e. the `none` kind
+    /// (Codex reads its meter from the transcript).
+    fn no_credential_account_config(
+        state_dir: &std::path::Path,
+        provider: &str,
+        name: &str,
+    ) -> Config {
+        let env = RealEnv;
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[[accounts]]\nname = {:?}\nprovider = {:?}\n",
+            state_dir, name, provider
+        );
+        let (config, _) = resolve(&Overrides::new(), &env, Some(&toml), "aub.toml")
+            .expect("no-credential account config must resolve");
+        config
+    }
+
+    /// Seeds one account with a single successful sampling attempt at
+    /// `started_at`: the minimum fixture `env_credential_resolves_for_sampler`
+    /// needs. No observation or window, because the check never reads either.
+    fn seed_successful_attempt(
+        conn: &rusqlite::Connection,
+        provider: &str,
+        name: &str,
+        started_at: UtcTimestamp,
+    ) {
+        use crate::domain::attempt::AttemptOutcome;
+        use crate::domain::time::MonotonicDuration;
+        use crate::store::account::observe_account;
+        use crate::store::meter_attempt::{
+            DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
+            start_meter_attempt,
+        };
+        use crate::store::sample_run::{Trigger, start_sample_run};
+        use crate::store::sampling_policy_snapshot::{
+            ResolvedSamplingPolicy, resolve_policy_snapshot,
+        };
+
+        const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_millis(300_000),
+            freshness_horizon: MonotonicDuration::from_millis(900_000),
+            reset_edge_policy: String::new(),
+            retry_backoff_policy: String::new(),
+            command_budget: MonotonicDuration::from_millis(60_000),
+            policy_algorithm_version: String::new(),
+        };
+
+        let account =
+            observe_account(conn, provider, name, started_at).expect("account must insert");
+        let run = start_sample_run(conn, Trigger::Manual, started_at, "seed")
+            .expect("sample run must insert");
+        let snapshot = resolve_policy_snapshot(conn, account, started_at, &POLICY)
+            .expect("policy snapshot must insert");
+        let attempt = start_meter_attempt(
+            conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: provider.to_string(),
+                request_started_at: started_at,
+                credential_context_id: Some("ctx".into()),
+                policy_snapshot_id: snapshot,
+                due_at: started_at,
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "account-5h-v2".into(),
+            },
+        )
+        .expect("attempt must insert");
+        record_meter_attempt_result(
+            conn,
+            &NewMeterAttemptResult {
+                attempt_id: attempt,
+                completed_at: started_at,
+                elapsed: MonotonicDuration::from_millis(10),
+                outcome: AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .expect("result must insert");
+    }
+
+    fn open_fresh_ledger(db_path: &std::path::Path) -> rusqlite::Connection {
+        crate::store::rate_card::open_ledger(
+            db_path,
+            crate::domain::time::MonotonicDuration::from_millis(500),
+            &crate::domain::time::RealClock::new(),
+        )
+        .expect("a fresh ledger must open and migrate")
+    }
+
+    /// An `env` credential this process cannot see, but that the sampler
+    /// resolved successfully a minute ago, passes rather than failing: the
+    /// recovered case, evidenced from the ledger.
+    #[test]
+    fn env_credential_absent_in_process_but_recently_successful_for_sampler_passes() {
+        let dir = scratch_dir("env-recovered");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = env_account_config(
+            &dir,
+            "opencode",
+            "opencode",
+            "AUB_A0TJ_TEST_ENV_CREDENTIAL_UNSET",
+        );
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        let started_at = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        seed_successful_attempt(&conn, "opencode", "opencode", started_at);
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        // A minute after the successful attempt: comfortably inside the
+        // three-times-default-interval recency window.
+        ctx.timestamp = UtcTimestamp::from_unix_nanos(started_at.unix_nanos() + 60_000_000_000);
+
+        let outcome = unresolved_authentication(&ctx);
+        match outcome.status {
+            CheckStatus::PassWithDetail(detail) => {
+                assert!(detail.contains("opencode"), "{detail}");
+                assert!(detail.contains("not set in this process"), "{detail}");
+                assert!(detail.contains("resolves for the sampler"), "{detail}");
+            }
+            CheckStatus::Pass
+            | CheckStatus::Fail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!("expected PassWithDetail, got {:?}", outcome.name)
+            }
+        }
+    }
+
+    /// Planted negative: an `env` credential unset in this process, with no
+    /// successful sampler attempt anywhere in the ledger, still fails loudly.
+    /// This is the case the recovery path must never turn into a false green.
+    #[test]
+    fn env_credential_absent_everywhere_still_fails() {
+        let dir = scratch_dir("env-absent-everywhere");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = env_account_config(
+            &dir,
+            "opencode",
+            "opencode",
+            "AUB_A0TJ_TEST_ENV_CREDENTIAL_UNSET",
+        );
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        // No attempt seeded at all: the account has never been observed.
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+
+        let outcome = unresolved_authentication(&ctx);
+        assert!(
+            matches!(outcome.status, CheckStatus::Fail(ref msg) if msg.contains("opencode")),
+            "{:?}",
+            outcome.status
+        );
+    }
+
+    /// The same planted negative, but proving the *staleness* half rather
+    /// than the absence half: a successful attempt exists, but it is older
+    /// than the recency window this bead's fallback reads, so it can no
+    /// longer speak for the credential's current state.
+    #[test]
+    fn env_credential_with_only_a_stale_successful_attempt_still_fails() {
+        let dir = scratch_dir("env-stale-success");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = env_account_config(
+            &dir,
+            "opencode",
+            "opencode",
+            "AUB_A0TJ_TEST_ENV_CREDENTIAL_UNSET",
+        );
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        let started_at = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        seed_successful_attempt(&conn, "opencode", "opencode", started_at);
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        // One hour later: past the three-times-five-minute recency window.
+        ctx.timestamp = UtcTimestamp::from_unix_nanos(started_at.unix_nanos() + 3_600_000_000_000);
+
+        let outcome = unresolved_authentication(&ctx);
+        assert!(
+            matches!(outcome.status, CheckStatus::Fail(ref msg) if msg.contains("opencode")),
+            "{:?}",
+            outcome.status
+        );
+    }
+
+    /// An `env` credential this process *can* see resolves the same way this
+    /// bead's fallback never gets a chance to run: the direct success path is
+    /// unaffected by the ledger reachable from the same context.
+    #[test]
+    fn env_credential_present_in_process_passes_without_consulting_the_ledger() {
+        let dir = scratch_dir("env-present");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        const VAR: &str = "AUB_A0TJ_TEST_ENV_CREDENTIAL_SET";
+        let config = env_account_config(&dir, "opencode", "opencode", VAR);
+        // No ledger at all: if the direct resolution did not short-circuit
+        // the ledger fallback, this would panic on a missing connection
+        // instead of passing.
+        let ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+
+        // SAFETY: VAR is unique to this test and read by no other code in
+        // this crate, so no concurrently running test can observe or race it.
+        unsafe {
+            std::env::set_var(VAR, "cookie-value");
+        }
+        let outcome = unresolved_authentication(&ctx);
+        unsafe {
+            std::env::remove_var(VAR);
+        }
+
+        assert_eq!(outcome.status, CheckStatus::Pass);
+    }
+
+    /// `file`-kind and `none`-kind credentials never consult the ledger this
+    /// bead added: a missing file still fails even with a ledger sitting
+    /// right there recording the same account's sampler as succeeding, and a
+    /// `none` credential still passes trivially.
+    #[test]
+    fn file_and_none_kind_credentials_are_unaffected() {
+        let dir = scratch_dir("file-and-none-unaffected");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        let started_at = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        // A successful attempt for the very account whose file credential is
+        // about to fail to resolve: if the fallback ignored credential kind,
+        // this would turn the file failure into a false green.
+        seed_successful_attempt(&conn, "provider-a", "primary", started_at);
+
+        let missing_path = dir.join("does-not-exist.json");
+        let file_config = missing_file_account_config(&dir, "provider-a", "primary", &missing_path);
+        let mut file_ctx = empty_ctx(&file_config, dir.join("ledger.sqlite3"));
+        file_ctx.db_missing = false;
+        file_ctx.db = Some(&conn);
+        file_ctx.timestamp = started_at;
+        assert!(matches!(
+            unresolved_authentication(&file_ctx).status,
+            CheckStatus::Fail(_)
+        ));
+
+        let none_config = no_credential_account_config(&dir, "provider-a", "codex");
+        let mut none_ctx = empty_ctx(&none_config, dir.join("ledger.sqlite3"));
+        none_ctx.db_missing = false;
+        none_ctx.db = Some(&conn);
+        none_ctx.timestamp = started_at;
+        assert_eq!(
+            unresolved_authentication(&none_ctx).status,
+            CheckStatus::Pass
+        );
+    }
+
+    /// Integration-shaped: the full registry's pass/fail counts must agree
+    /// between an invocation that carries the credential's variable and one
+    /// that does not, against a ledger where the account is sampling
+    /// successfully. This is the summary line's own promise (aub-a0tj).
+    #[test]
+    fn doctor_summary_counts_agree_regardless_of_which_shell_started_it() {
+        let dir = scratch_dir("summary-agrees");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        const VAR: &str = "AUB_A0TJ_TEST_ENV_CREDENTIAL_SUMMARY";
+        let config = env_account_config(&dir, "opencode", "opencode", VAR);
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        let started_at = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        seed_successful_attempt(&conn, "opencode", "opencode", started_at);
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        ctx.timestamp = UtcTimestamp::from_unix_nanos(started_at.unix_nanos() + 60_000_000_000);
+
+        let without_var = build_registry(&ctx);
+        let passed_without = without_var
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Pass | CheckStatus::PassWithDetail(_)))
+            .count();
+        let failed_without = without_var
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Fail(_)))
+            .count();
+
+        // SAFETY: VAR is unique to this test and read by no other code in
+        // this crate, so no concurrently running test can observe or race it.
+        unsafe {
+            std::env::set_var(VAR, "cookie-value");
+        }
+        let with_var = build_registry(&ctx);
+        unsafe {
+            std::env::remove_var(VAR);
+        }
+        let passed_with = with_var
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Pass | CheckStatus::PassWithDetail(_)))
+            .count();
+        let failed_with = with_var
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Fail(_)))
+            .count();
+
+        assert_eq!(passed_without, passed_with);
+        assert_eq!(failed_without, failed_with);
     }
 
     #[test]

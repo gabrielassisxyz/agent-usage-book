@@ -1169,13 +1169,16 @@ mod tests {
     use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
     use crate::domain::time::{FakeClock, MonotonicInstant};
     use crate::domain::window::{NominalWindowDuration, ReportedResolution, WindowSemanticKey};
+    use crate::meter::agy::AgyAdapter;
     use crate::meter::anthropic::AnthropicAdapter;
+    use crate::meter::retry::{RetryBackoffPolicy, RetryEnv, run_with_retry};
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
     use crate::store::ledger_generation;
-    use crate::store::meter_attempt;
+    use crate::store::meter_attempt::{self, StoredMeterAttemptResult};
 
     use crate::store::spool::{drain_pending, pending_file_path};
     use std::collections::HashMap;
+    use std::path::Path;
     use std::path::PathBuf;
     use std::sync::Arc;
     use std::sync::Barrier;
@@ -1609,14 +1612,18 @@ mod tests {
         let (_scratch_dir, database_path) = fixture_database();
         let transport = ScriptedTransport::new(SharedClock::new());
         let clock = transport.clock.clone();
+        // The success beside the failures is the planted negative for the
+        // other half of the column's contract: a success stores no
+        // classification, so the fix never invents one where there is no error.
         let accounts: Vec<BatchAccount<AnthropicAdapter>> =
-            ["authfail", "serverfail", "malformedfail"]
+            ["authfail", "serverfail", "malformedfail", "measuredok"]
                 .iter()
                 .map(|tag| batch_account(tag))
                 .collect();
         transport.script("authfail", ScriptedOutcome::Unauthorized);
         transport.script("serverfail", ScriptedOutcome::ServerError);
         transport.script("malformedfail", ScriptedOutcome::Malformed);
+        transport.script("measuredok", ScriptedOutcome::Success);
 
         let repository = Repository::new(&database_path, policy());
         let report = SamplingOrchestrator {
@@ -2513,6 +2520,274 @@ mod tests {
             ledger_generation::current(&conn).expect("the generation must read"),
             published,
             "the published projection generation equals the committed ledger generation"
+        );
+    }
+
+    // --- the retry seam: a retried attempt carries the classification the
+    // response that ended it produced (aub-maop) ---------------------------
+
+    /// The real Antigravity 401 body: Google's shape, whose `error.message`
+    /// is the provider's word and whose `error.status` is not a body
+    /// classification the parser reads, so the stored classification is the
+    /// `http_401` fallback with the message beside it.
+    const AGY_401_BODY: &[u8] = include_bytes!("../../tests/fixtures/meter/agy/error-401.json");
+
+    /// The exact value that body's refusal stores: the status spelling and
+    /// the provider's message joined by the column separator, the same string
+    /// the ledger's classified agy refusals carry.
+    const AGY_401_STORED_VALUE: &str = "http_401: Request had invalid authentication \
+credentials. Expected OAuth 2 access token, login cookie or other valid authentication \
+credential. See https://developers.google.com/identity/sign-in/web/devconsole-project.";
+
+    /// A transport handing out one scripted response per call, in order: the
+    /// tries of one retry sequence see different responses.
+    struct RetrySequenceTransport {
+        clock: SharedClock,
+        script: Mutex<std::collections::VecDeque<Result<HttpResponse, FailureClass>>>,
+    }
+
+    impl RetrySequenceTransport {
+        /// A sequence ending on the fixture's 401, prefixed by `timeouts`
+        /// transient connect timeouts for the policy to retry through.
+        fn timing_out_then_401(clock: SharedClock, timeouts: usize) -> Self {
+            let mut script = std::collections::VecDeque::new();
+            for _ in 0..timeouts {
+                script.push_back(Err(FailureClass::ConnectTimeout));
+            }
+            script.push_back(Ok(HttpResponse {
+                status: 401,
+                headers: Vec::new(),
+                body: AGY_401_BODY.to_vec(),
+            }));
+            Self {
+                clock,
+                script: Mutex::new(script),
+            }
+        }
+    }
+
+    impl HttpTransport for RetrySequenceTransport {
+        fn send(
+            &self,
+            _request: &HttpRequest,
+            _budget: &CommandBudget,
+            _clock: &impl Clock,
+        ) -> Result<HttpResponse, FailureClass> {
+            self.clock.advance(MonotonicDuration::from_millis(100));
+            self.script
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .pop_front()
+                .unwrap_or_else(|| panic!("the retry script is exhausted"))
+        }
+    }
+
+    /// The retry environment the production driver wraps: the real adapter's
+    /// observe_with_evidence over the real transport, the real backoff waits,
+    /// the real budget. Nothing here is scripted except the network.
+    struct RealAdapterRetryEnv<'a, T: HttpTransport> {
+        adapter: &'a AgyAdapter,
+        transport: &'a T,
+        credential: CredentialHandle,
+        clock: SharedClock,
+        budget: CommandBudget,
+    }
+
+    impl<T: HttpTransport> RetryEnv for RealAdapterRetryEnv<'_, T> {
+        type Reading = AgyReading;
+
+        fn attempt(&mut self) -> CapturedProviderResponse<AgyReading> {
+            self.adapter.observe_with_evidence(
+                &self.credential,
+                &MeterRequest::default(),
+                self.transport,
+                &self.clock,
+            )
+        }
+
+        fn now(&self) -> MonotonicInstant {
+            self.clock.monotonic_now()
+        }
+
+        fn budget_remaining(&self) -> Option<MonotonicDuration> {
+            self.budget.remaining(&self.clock)
+        }
+
+        fn wait(&mut self, delay: MonotonicDuration) {
+            self.clock.advance(delay);
+        }
+    }
+
+    /// Starts one real attempt for `agy` in the fixture ledger and persists
+    /// one logical retry sequence's terminal fact through the real commit
+    /// boundary, deriving the stored classification exactly the single-try
+    /// persist path derives it. Returns what the row stored.
+    fn persist_retry_sequence(
+        repository: &Repository,
+        database_path: &Path,
+        transport: &RetrySequenceTransport,
+    ) -> StoredMeterAttemptResult {
+        let clock = transport.clock.clone();
+        let mut env = RealAdapterRetryEnv {
+            adapter: &AgyAdapter::new(),
+            transport,
+            credential: CredentialHandle::new(
+                r#"{"token":{"access_token":"agy-test-token-12345"}}"#,
+            ),
+            budget: CommandBudget::new(MonotonicDuration::from_seconds(30), &clock),
+            clock,
+        };
+        let retried = run_with_retry(RetryBackoffPolicy::conservative_default(), &mut env);
+
+        let run = repository
+            .start_sample_run(Trigger::Timer, env.clock.now(), "retry-fixture")
+            .expect("the fixture sample run must insert");
+        let account = repository
+            .ensure_account("agy", "agy", env.clock.now())
+            .expect("the fixture account must insert");
+        let started = repository
+            .start_meter_attempt(&NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "agy".to_string(),
+                request_started_at: env.clock.now(),
+                credential_context_id: Some("ctx-retry".to_string()),
+                policy_snapshot_id: repository
+                    .resolve_policy_snapshot(
+                        account,
+                        env.clock.now(),
+                        &crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
+                            ordinary_cadence: MonotonicDuration::from_seconds(300),
+                            freshness_horizon: MonotonicDuration::from_seconds(900),
+                            reset_edge_policy: "lead-120s".to_string(),
+                            retry_backoff_policy: "exponential-2-250ms".to_string(),
+                            command_budget: MonotonicDuration::from_seconds(30),
+                            policy_algorithm_version: "v1".to_string(),
+                        },
+                    )
+                    .expect("the fixture policy snapshot must resolve"),
+                due_at: env.clock.now(),
+                due_reason: StoredDueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".to_string(),
+                meter_semantics_id: "account-5h-v2".to_string(),
+            })
+            .expect("the fixture attempt must start");
+
+        let outcome = retried.attempt_outcome();
+        repository
+            .commit_terminal_result(&NewMeterAttemptResult {
+                attempt_id: row_id_of(started.attempt_id()).expect("a storage row id"),
+                completed_at: env.clock.now(),
+                elapsed: MonotonicDuration::from_millis(100),
+                outcome,
+                // The one derivation the persist path uses, fed the terminal
+                // try's own report: a retry cannot re-derive from a lesser
+                // fact than the response that ended the sequence.
+                sanitized_error_classification: Some(stored_error_classification(
+                    outcome,
+                    retried.terminal_error_report.as_ref(),
+                )),
+                retry_index: retried.retry_index(),
+                clock_anomaly: false,
+            })
+            .expect("the terminal result must commit");
+
+        meter_attempt::result_by_attempt_id(
+            &open(database_path, AccessMode::ReadWrite, &policy())
+                .expect("the fixture ledger must reopen"),
+            row_id_of(started.attempt_id()).expect("a storage row id"),
+        )
+        .expect("the stored result must read")
+        .expect("the attempt carries its terminal result")
+    }
+
+    /// A retried attempt stores the classification of the response that ended
+    /// it, at every retry index: a sequence whose terminal response is a
+    /// classified 401 stores that 401's own value whether the response
+    /// arrived on the first try or after two retried timeouts, and the value
+    /// is the provider's word, not the no-report fallback an implementation
+    /// that dropped the report at the seam would store. Planted negative: the
+    /// laundering derivations (`credential_error` from the outcome alone,
+    /// the first timeout's `connect` spelling) are both different strings,
+    /// so either passes this only by failing.
+    #[test]
+    fn a_retried_attempt_stores_the_classification_of_the_try_that_ended_it() {
+        for timeouts in [1, 2] {
+            let (_scratch_dir, database_path) = fixture_database();
+            let repository = Repository::new(&database_path, policy());
+            let transport =
+                RetrySequenceTransport::timing_out_then_401(SharedClock::new(), timeouts);
+
+            let stored = persist_retry_sequence(&repository, &database_path, &transport);
+
+            assert_eq!(
+                stored.outcome,
+                AttemptOutcome::AuthRequired,
+                "the sequence ends on the 401 the script answers with"
+            );
+            assert_eq!(
+                stored.retry_index,
+                Some(timeouts as u32),
+                "the terminal try's zero-based index rides on the row"
+            );
+            assert_eq!(
+                stored.sanitized_error_classification.as_deref(),
+                Some(AGY_401_STORED_VALUE),
+                "the response that ended the sequence names the failure, \
+                 whatever the tries before it saw"
+            );
+        }
+    }
+
+    /// A synthetic Antigravity endpoint answering 401 on every attempt,
+    /// sampled repeatedly through the real retry policy, produces rows with
+    /// exactly one distinct classification value: no null, no fallback, and
+    /// no second value a partial store path would split the record into.
+    #[test]
+    fn a_synthetic_401_endpoint_produces_one_classification_across_sampled_attempts() {
+        let (_scratch_dir, database_path) = fixture_database();
+        let repository = Repository::new(&database_path, policy());
+        let conn = open(&database_path, AccessMode::ReadWrite, &policy())
+            .expect("the fixture ledger must reopen");
+
+        const SAMPLES: usize = 3;
+        for _ in 0..SAMPLES {
+            let transport = RetrySequenceTransport::timing_out_then_401(SharedClock::new(), 0);
+            persist_retry_sequence(&repository, &database_path, &transport);
+        }
+
+        let account = repository
+            .ensure_account("agy", "agy", SharedClock::new().now())
+            .expect("the fixture account must exist");
+        let attempts = meter_attempt::attempts_with_outcomes_for_account_between(
+            &conn,
+            account,
+            UtcTimestamp::from_unix_nanos(0),
+            UtcTimestamp::from_unix_nanos(i64::MAX / 2),
+        )
+        .expect("the coverage read must succeed");
+        assert_eq!(attempts.len(), SAMPLES, "every sample produced one attempt");
+        let mut distinct: Vec<String> = Vec::new();
+        for attempt in &attempts {
+            let terminal = attempt
+                .terminal
+                .as_ref()
+                .expect("every sampled attempt has a terminal result");
+            assert_eq!(terminal.outcome, AttemptOutcome::AuthRequired);
+            let classification = terminal
+                .error_classification
+                .as_deref()
+                .expect("no refusal stores a null classification");
+            assert_eq!(classification, AGY_401_STORED_VALUE);
+            if !distinct.iter().any(|seen| seen == classification) {
+                distinct.push(classification.to_owned());
+            }
+        }
+        assert_eq!(
+            distinct,
+            vec![AGY_401_STORED_VALUE.to_owned()],
+            "one classification value across every row, not two"
         );
     }
 }
