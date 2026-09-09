@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::Path;
 
+use agent_usage_book::backup::{BackupSeriesRetention, backup_series_create};
 use agent_usage_book::config::{Config, Overrides, RealEnv, resolve};
 use agent_usage_book::doctor::{
     CheckName, CheckStatus, DoctorContext, build_registry, configuration_failed_registry, run_fix,
@@ -460,6 +461,91 @@ fn check_fails_backup_age() {
         .expect("BackupAge present");
     assert!(
         matches!(outcome.status, CheckStatus::Fail(ref reason) if reason.contains("no backup found"))
+    );
+}
+
+/// `aub-kzgo`: `backup-age` reads the newest verified archive from the
+/// destination root and reports its age from the manifest's
+/// `created_at_unix_nanos`, not from file mtime. The second half rewrites the
+/// newest manifest byte-for-byte (which moves its mtime to now) and shows the
+/// verdict does not move with it.
+#[test]
+fn check_reads_backup_age_from_the_newest_verified_manifest_not_mtime() {
+    let state = StateDir::new();
+    open_ledger(state.path());
+    let root = state.path().join("backups");
+    let retention = BackupSeriesRetention::new(7, 4, 6, 2);
+    let busy = MonotonicDuration::from_millis(500);
+    let first_at = UtcTimestamp::parse_rfc3339("2026-09-01T12:00:00Z").unwrap();
+    let second_at = UtcTimestamp::parse_rfc3339("2026-09-02T12:00:00Z").unwrap();
+    backup_series_create(
+        state.path(),
+        &root,
+        &retention,
+        busy,
+        &FakeClock::new(first_at),
+    )
+    .expect("first series backup must succeed");
+    let second = backup_series_create(
+        state.path(),
+        &root,
+        &retention,
+        busy,
+        &FakeClock::new(second_at),
+    )
+    .expect("second series backup must succeed");
+
+    let toml = format!(
+        "[state]\ndir = {:?}\n\n[backup]\ndestination = {:?}\nreview_after = \"48h\"\n",
+        state.path(),
+        root
+    );
+    let (config, _) = resolve(&Overrides::new(), &RealEnv, Some(&toml), "aub.toml").unwrap();
+    let outcome_at = |now: UtcTimestamp| {
+        let ctx = DoctorContext {
+            config: &config,
+            timestamp: now,
+            db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+            db: None,
+            db_missing: true,
+            db_open_error: None,
+        };
+        build_registry(&ctx)
+            .into_iter()
+            .find(|o| o.name == CheckName::BackupAge)
+            .expect("BackupAge present")
+    };
+
+    // One hour after the newer archive: within the 48h horizon, so it passes.
+    let fresh_now = UtcTimestamp::from_unix_nanos(second_at.unix_nanos() + 3_600_000_000_000);
+    assert!(
+        matches!(
+            outcome_at(fresh_now).status,
+            CheckStatus::Pass | CheckStatus::PassWithDetail(_)
+        ),
+        "a series with a fresh newest-verified archive must pass"
+    );
+
+    // Forty nine hours after the newer archive: past the horizon, so it fails
+    // naming the backup even though the older archive exists too.
+    let stale_now = UtcTimestamp::from_unix_nanos(second_at.unix_nanos() + 49 * 3_600_000_000_000);
+    let stale = outcome_at(stale_now);
+    assert!(
+        matches!(stale.status, CheckStatus::Fail(ref reason) if reason.contains("backup")),
+        "a stale newest-verified archive must fail naming the backup: {:?}",
+        stale.status
+    );
+
+    // Rewriting the newest manifest byte-for-byte moves its mtime to now
+    // without changing its content; the verdict must not move with the mtime.
+    let manifest_path = second.destination.join("manifest.json");
+    let bytes = fs::read(&manifest_path).expect("newest manifest must be readable");
+    fs::write(&manifest_path, &bytes).expect("rewriting the same manifest must work");
+    let stale_again = outcome_at(stale_now);
+    assert!(
+        matches!(stale_again.status, CheckStatus::Fail(_)),
+        "backup age must come from created_at, not file mtime: {:?}",
+        stale_again.status
     );
 }
 

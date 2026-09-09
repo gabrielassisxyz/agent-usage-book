@@ -1233,6 +1233,110 @@ mod tests {
         assert_eq!(all_exclusions(&fx.conn).unwrap().len(), 1);
     }
 
+    /// The Codex idle pair this bead exists for (aub-z09n), through the
+    /// persistence path: two consecutive readings five minutes apart of a
+    /// window the adapter now stores as `NotStarted` with no reset instant,
+    /// both at zero usage. Idle-to-idle carries no change and no forward
+    /// motion, so the pair persists no anomaly and no exclusion. Mirrors
+    /// `opencode_drift_within_the_declared_precision_persists_no_anomaly`.
+    #[test]
+    fn two_consecutive_idle_not_started_readings_persist_no_anomaly() {
+        let fx = fixture();
+        let (first_obs, first_window) =
+            record_observation(&fx, 30_000, 0, WindowResetState::NotStarted);
+        detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &first_obs,
+            &[first_window],
+            UtcTimestamp::from_unix_nanos(30_500),
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Five minutes later, the same idle reading.
+        let (second_obs, second_window) = record_observation(
+            &fx,
+            30_000 + 300_000_000_000,
+            0,
+            WindowResetState::NotStarted,
+        );
+        let outcome = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &[second_window],
+            UtcTimestamp::from_unix_nanos(30_500 + 300_000_000_000),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert!(outcome.anomalies.is_empty());
+        assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 0);
+        assert!(all_exclusions(&fx.conn).unwrap().is_empty());
+    }
+
+    /// The planted negative for aub-z09n: the identical idle pair in the
+    /// representation the adapter used before the fix, each reading claiming
+    /// the fabricated boundary one nominal duration after its own
+    /// observation instant. The claimed anchor slides one sampling interval
+    /// per tick, three hundred seconds here against the two-second jitter
+    /// envelope, so the same pair persists the typed unexpected-reset
+    /// anomaly and its exclusion. Mirrors
+    /// `the_same_drift_without_the_declared_precision_persists_the_anomaly`.
+    #[test]
+    fn the_same_idle_pair_with_sliding_known_resets_persists_the_anomaly() {
+        let fx = fixture();
+        // The fabricated shape: reset = observation instant + one nominal
+        // window, the reading the codex adapter used to store for an
+        // unstarted window.
+        let (first_obs, first_window) = record_observation(
+            &fx,
+            30_000,
+            0,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(30_000 + 3_600_000_000_000)),
+        );
+        detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &first_obs,
+            &[first_window],
+            UtcTimestamp::from_unix_nanos(30_500),
+            None,
+            false,
+        )
+        .unwrap();
+
+        let (second_obs, second_window) = record_observation(
+            &fx,
+            30_000 + 300_000_000_000,
+            0,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                30_000 + 300_000_000_000 + 3_600_000_000_000,
+            )),
+        );
+        let outcome = detect_and_persist(
+            &fx.conn,
+            fx.account,
+            &second_obs,
+            &[second_window],
+            UtcTimestamp::from_unix_nanos(30_500 + 300_000_000_000),
+            None,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(outcome.anomalies.len(), 1);
+        assert_eq!(
+            outcome.anomalies[0].kind,
+            WindowAnomalyKind::UnexpectedResetTimestampChange
+        );
+        assert_eq!(anomaly_count(&fx.conn).unwrap().value(), 1);
+        assert_eq!(all_exclusions(&fx.conn).unwrap().len(), 1);
+    }
+
     /// Rerunning detection over the same pair of observations persists
     /// nothing new: the second call finds the same anomaly already recorded
     /// and returns without duplicating it.

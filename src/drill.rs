@@ -224,9 +224,11 @@ pub fn run_seeded(
 
 /// Runs the drill against a real, named archive: the periodic case, exercised
 /// on a schedule against last night's backup rather than against a seeded
-/// fixture. Same refusal, same scratch destination, same integrity and
-/// foreign-key checking as the seeded cases; the only difference is the
-/// input, per this bead's own reasoning for keeping the two in one command.
+/// fixture. The archive may name one archive directory or a destination root,
+/// in which case the newest verified archive runs. Same refusal, same scratch
+/// destination, same integrity and foreign-key checking as the seeded cases;
+/// the only difference is the input, per this bead's own reasoning for
+/// keeping the two in one command.
 pub fn run_archive(
     configured_state_dir: &Path,
     archive: &Path,
@@ -236,9 +238,10 @@ pub fn run_archive(
     clock: &impl Clock,
 ) -> Result<DrillReport, Error> {
     refuse_operator_state_directory(configured_state_dir, scratch_destination, Some(archive))?;
+    let resolved = crate::backup::backup_resolve_archive_path(archive)?;
     let restore = restore_archive(
         configured_state_dir,
-        archive,
+        &resolved,
         scratch_destination,
         None,
         busy_timeout,
@@ -246,7 +249,7 @@ pub fn run_archive(
         clock,
     )?;
     Ok(DrillReport {
-        source: DrillSource::Archive(archive.to_path_buf()),
+        source: DrillSource::Archive(resolved),
         scratch_destination: scratch_destination.to_path_buf(),
         restore,
         damaged_directory: None,

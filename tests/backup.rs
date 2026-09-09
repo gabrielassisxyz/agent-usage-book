@@ -10,8 +10,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use agent_usage_book::backup::{
-    ARCHIVE_CHECKSUMS_FILE, ARCHIVE_DATABASE_FILE, ARCHIVE_MANIFEST_FILE, create_archive,
-    verify_archive,
+    ARCHIVE_CHECKSUMS_FILE, ARCHIVE_DATABASE_FILE, ARCHIVE_MANIFEST_FILE,
+    BACKUP_SERIES_POINTER_FILE, BackupSeriesRetention, backup_series_create,
+    backup_series_list_archives, backup_series_read_pointer, create_archive, verify_archive,
 };
 use agent_usage_book::domain::time::{
     FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
@@ -432,5 +433,209 @@ fn a_corrupted_pending_record_fails_verification_at_the_spool_records_stage() {
     assert!(
         error.contains("backup verification spool_records"),
         "expected a spool_records-stage failure, got: {error}"
+    );
+}
+
+/// A destination root that still holds the old single-archive layout is
+/// refused with a migration message rather than nested into (aub-kzgo): the
+/// two archives that exist today stay in place until the operator moves them
+/// aside by hand (see docs/backup.md).
+#[test]
+fn a_legacy_single_archive_root_is_refused_with_a_migration_message() {
+    let scratch = migrated_state_dir();
+    let root = scratch.path().join("backups");
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+    create_archive(scratch.path(), &root, busy_timeout(), &clock).unwrap();
+
+    let retention = BackupSeriesRetention::new(7, 4, 6, 2);
+    let later = FakeClock::new(UtcTimestamp::from_unix_nanos(2));
+    let error = backup_series_create(scratch.path(), &root, &retention, busy_timeout(), &later)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("holds a single archive"),
+        "a legacy root must be refused with a migration message, got: {error}"
+    );
+}
+
+/// Two successive series backups into one destination root produce two dated
+/// archives, the pointer names the newer, and neither overwrites the other
+/// (aub-kzgo).
+#[test]
+fn two_successive_series_backups_produce_two_archives_and_advance_the_pointer() {
+    let scratch = migrated_state_dir();
+    let root = scratch.path().join("backups");
+    let retention = BackupSeriesRetention::new(7, 4, 6, 2);
+
+    let first_clock = FakeClock::new(UtcTimestamp::parse_rfc3339("2026-09-08T12:00:00Z").unwrap());
+    let first = backup_series_create(
+        scratch.path(),
+        &root,
+        &retention,
+        busy_timeout(),
+        &first_clock,
+    )
+    .unwrap();
+    assert!(first.verified);
+
+    let second_clock = FakeClock::new(UtcTimestamp::parse_rfc3339("2026-09-09T12:00:00Z").unwrap());
+    let second = backup_series_create(
+        scratch.path(),
+        &root,
+        &retention,
+        busy_timeout(),
+        &second_clock,
+    )
+    .unwrap();
+    assert!(second.verified);
+    assert_ne!(
+        first.destination, second.destination,
+        "two runs must not share one archive directory"
+    );
+    assert!(first.destination.is_dir() && second.destination.is_dir());
+
+    for summary in [&first, &second] {
+        let name = summary
+            .destination
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            name.contains(&summary.ledger_generation.to_string()),
+            "the archive name must carry the source generation: {name}"
+        );
+    }
+
+    let pointer = backup_series_read_pointer(&root)
+        .unwrap()
+        .expect("pointer must exist");
+    assert_eq!(
+        pointer,
+        second.destination.file_name().unwrap().to_string_lossy(),
+        "the pointer must name the newer archive"
+    );
+    // The pointer file itself lives beside the archives, never inside one.
+    assert!(root.join(BACKUP_SERIES_POINTER_FILE).is_file());
+
+    let archives = backup_series_list_archives(&root).unwrap();
+    assert_eq!(
+        archives.len(),
+        2,
+        "both archives must still be present: {archives:?}"
+    );
+    assert!(archives.iter().all(|entry| entry.verified));
+}
+
+/// The single-archive refusal still applies to an individual archive
+/// directory: an archive is never written over (aub-kzgo).
+#[test]
+fn writing_over_an_existing_archive_is_refused() {
+    let scratch = migrated_state_dir();
+    let destination = scratch.path().join("archive");
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+    let summary = create_archive(scratch.path(), &destination, busy_timeout(), &clock).unwrap();
+    assert!(summary.verified);
+
+    let error = create_archive(scratch.path(), &destination, busy_timeout(), &clock)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("already exists; refusing to overwrite it"),
+        "an existing archive directory must never be written over, got: {error}"
+    );
+}
+
+/// A run whose verification fails leaves the previous pointer and every
+/// archive untouched and prunes nothing (aub-kzgo).
+#[test]
+fn a_failed_verification_leaves_the_pointer_and_every_archive_untouched() {
+    let scratch = migrated_state_dir();
+    let root = scratch.path().join("backups");
+    // Two keeps per daily bucket so both successful archives survive; a third
+    // successful run on a third day would prune the oldest, which is what the
+    // failed run must not do.
+    let retention = BackupSeriesRetention::new(2, 0, 0, 0);
+
+    let first_clock = FakeClock::new(UtcTimestamp::parse_rfc3339("2026-09-07T12:00:00Z").unwrap());
+    let first = backup_series_create(
+        scratch.path(),
+        &root,
+        &retention,
+        busy_timeout(),
+        &first_clock,
+    )
+    .unwrap();
+    let second_clock = FakeClock::new(UtcTimestamp::parse_rfc3339("2026-09-08T12:00:00Z").unwrap());
+    let second = backup_series_create(
+        scratch.path(),
+        &root,
+        &retention,
+        busy_timeout(),
+        &second_clock,
+    )
+    .unwrap();
+    let pointer_before = backup_series_read_pointer(&root)
+        .unwrap()
+        .expect("pointer must exist");
+    assert_eq!(
+        pointer_before,
+        second.destination.file_name().unwrap().to_string_lossy()
+    );
+
+    // Poison the source ledger with a foreign-key violation the archive
+    // inherits: the next cut copies it and verification fails at that stage.
+    let source = scratch.path().join(LEDGER_DATABASE_FILE);
+    let raw = rusqlite::Connection::open(&source).unwrap();
+    raw.execute_batch(
+        "PRAGMA foreign_keys = OFF;
+         INSERT INTO meter_response_evidence
+             (id, attempt_id, response_classification, received_at, evidence_capsule,
+              capsule_schema_version, sanitizer_version, content_hash, capture_truncated)
+         VALUES (1, 999999, 'success', 0, '{}', 'v1', 'v1', 'hash', 0);",
+    )
+    .unwrap();
+    drop(raw);
+
+    let third_clock = FakeClock::new(UtcTimestamp::parse_rfc3339("2026-09-09T12:00:00Z").unwrap());
+    let error = backup_series_create(
+        scratch.path(),
+        &root,
+        &retention,
+        busy_timeout(),
+        &third_clock,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.contains("backup verification foreign_keys"),
+        "expected a foreign-keys verification failure, got: {error}"
+    );
+
+    let pointer_after = backup_series_read_pointer(&root)
+        .unwrap()
+        .expect("pointer must exist");
+    assert_eq!(
+        pointer_before, pointer_after,
+        "a failed run must not advance the pointer"
+    );
+    assert!(first.destination.is_dir() && second.destination.is_dir());
+    // Both previously verified archives still verify: the failed run changed
+    // none of them.
+    for archive in [&first.destination, &second.destination] {
+        let summary = verify_archive(archive, busy_timeout(), &third_clock).unwrap();
+        assert!(
+            summary.verified,
+            "a failed run must leave existing archives verified"
+        );
+    }
+    let verified = backup_series_list_archives(&root)
+        .unwrap()
+        .into_iter()
+        .filter(|entry| entry.verified)
+        .count();
+    assert_eq!(
+        verified, 2,
+        "a failed run prunes nothing and verifies nothing new"
     );
 }
