@@ -639,3 +639,175 @@ fn a_failed_verification_leaves_the_pointer_and_every_archive_untouched() {
         "a failed run prunes nothing and verifies nothing new"
     );
 }
+
+/// Hashes every regular file under an archive directory, keyed by relative
+/// path, so a before/after comparison proves byte-identity including the
+/// absence of new sidecars.
+fn archive_directory_digest(destination: &Path) -> std::collections::BTreeMap<String, String> {
+    fn visit(root: &Path, dir: &Path, out: &mut std::collections::BTreeMap<String, String>) {
+        let mut entries: Vec<_> = std::fs::read_dir(dir)
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .unwrap()
+                .to_string_lossy()
+                .into_owned();
+            let kind = entry.file_type().unwrap();
+            if kind.is_dir() {
+                visit(root, &path, out);
+            } else if kind.is_file() {
+                let bytes = std::fs::read(&path).unwrap();
+                out.insert(relative, sha256_hex(&bytes));
+            }
+        }
+    }
+    let mut out = std::collections::BTreeMap::new();
+    visit(destination, destination, &mut out);
+    out
+}
+
+// --- verify without writing (aub-2r0n) --------------------------------------
+
+/// A healthy archive hashes identically before and after `verify`, with no
+/// `-shm`/`-wal` sidecar created inside it.
+#[test]
+fn verify_leaves_a_healthy_archive_byte_identical_with_no_sidecar() {
+    let scratch = migrated_state_dir();
+    let destination = scratch.path().join("archive");
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+    let summary = create_archive(scratch.path(), &destination, busy_timeout(), &clock).unwrap();
+    assert!(summary.verified);
+
+    let before = archive_directory_digest(&destination);
+    let later = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000_000_000));
+    let second = verify_archive(&destination, busy_timeout(), &later).unwrap();
+    assert!(second.verified);
+    let after = archive_directory_digest(&destination);
+    assert_eq!(
+        before, after,
+        "verify must leave every file byte-identical when the result is unchanged"
+    );
+    assert!(
+        !destination.join("ledger.db-shm").exists() && !destination.join("ledger.db-wal").exists(),
+        "verification must create no sidecar inside the archive"
+    );
+}
+
+/// A verification that legitimately changes the result still records it: an
+/// unverified archive becomes verified and the manifest bytes change.
+#[test]
+fn verify_records_a_changed_result_on_first_verification() {
+    let scratch = migrated_state_dir();
+    let destination = scratch.path().join("archive");
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+    create_archive(scratch.path(), &destination, busy_timeout(), &clock).unwrap();
+
+    let manifest_path = destination.join(ARCHIVE_MANIFEST_FILE);
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    manifest["verification"]["verified"] = serde_json::Value::Bool(false);
+    manifest["verification"]["checked_at_unix_nanos"] = serde_json::Value::Null;
+    manifest["verification"]["integrity_check"] = serde_json::Value::Bool(false);
+    manifest["verification"]["foreign_key_check"] = serde_json::Value::Bool(false);
+    manifest["verification"]["spool_records_validated"] = serde_json::Value::Number(0.into());
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).unwrap() + "\n",
+    )
+    .unwrap();
+    let before = std::fs::read(&manifest_path).unwrap();
+
+    let later = FakeClock::new(UtcTimestamp::from_unix_nanos(99));
+    let summary = verify_archive(&destination, busy_timeout(), &later).unwrap();
+    assert!(summary.verified);
+    let after = std::fs::read(&manifest_path).unwrap();
+    assert_ne!(before, after, "a changed result must still be recorded");
+    let recorded: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&manifest_path).unwrap()).unwrap();
+    assert_eq!(recorded["verification"]["verified"], true);
+}
+
+/// Verification succeeds against an archive directory whose permissions forbid
+/// writing, leaving it byte-identical; a failing archive under the same
+/// permissions still reports its stage to the caller instead of swallowing the
+/// failure behind the unwritable manifest.
+#[cfg(unix)]
+#[test]
+fn verify_succeeds_on_a_readonly_directory_and_reports_failure_there() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let scratch = migrated_state_dir();
+    let destination = scratch.path().join("archive");
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+    create_archive(scratch.path(), &destination, busy_timeout(), &clock).unwrap();
+    let before = archive_directory_digest(&destination);
+
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let later = FakeClock::new(UtcTimestamp::from_unix_nanos(2));
+    let outcome = verify_archive(&destination, busy_timeout(), &later);
+    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let summary = outcome.expect("verify on a read-only archive directory must succeed");
+    assert!(summary.verified);
+    assert_eq!(
+        before,
+        archive_directory_digest(&destination),
+        "a read-only verify must change nothing"
+    );
+    assert!(
+        !destination.join("ledger.db-shm").exists() && !destination.join("ledger.db-wal").exists(),
+        "a read-only verify must create no sidecar"
+    );
+
+    let failing = scratch.path().join("failing");
+    spool_pending(scratch.path(), &undrainable_bundle(7)).unwrap();
+    create_archive(scratch.path(), &failing, busy_timeout(), &clock).unwrap();
+    let pending_relative = "pending/attempt-7.json";
+    std::fs::write(failing.join(pending_relative), b"{ not json").unwrap();
+    recompute_checksum_for(&failing, pending_relative);
+    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o500)).unwrap();
+    let error = verify_archive(&failing, busy_timeout(), &later)
+        .unwrap_err()
+        .to_string();
+    std::fs::set_permissions(&failing, std::fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(
+        error.contains("backup verification spool_records"),
+        "a failing archive under read-only permissions must still report its stage, got: {error}"
+    );
+}
+
+/// A failing archive on a writable directory still has the failure recorded:
+/// the manifest flips back to unverified.
+#[test]
+fn a_failing_verification_records_the_failure_on_a_writable_archive() {
+    let scratch = migrated_state_dir();
+    let destination = scratch.path().join("archive");
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+    create_archive(scratch.path(), &destination, busy_timeout(), &clock).unwrap();
+
+    let database = destination.join(ARCHIVE_DATABASE_FILE);
+    let mut bytes = std::fs::read(&database).unwrap();
+    let mid = bytes.len() / 2;
+    bytes[mid] ^= 0xFF;
+    std::fs::write(&database, &bytes).unwrap();
+
+    let error = verify_archive(&destination, busy_timeout(), &clock)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        error.contains("backup verification checksums"),
+        "expected a checksums-stage failure, got: {error}"
+    );
+    let manifest: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(destination.join(ARCHIVE_MANIFEST_FILE)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest["verification"]["verified"], false,
+        "a failing verification must record the failure in the manifest"
+    );
+}

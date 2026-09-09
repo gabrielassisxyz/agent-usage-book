@@ -70,6 +70,17 @@ pub enum AccessMode {
     /// enforcing them against a foreign schema would refuse a healthy foreign
     /// database for disagreeing with settings it was never asked to hold.
     ForeignReadOnly,
+    /// A side-effect-free read of an archived database that must stay
+    /// byte-identical while it is checked (aub-2r0n). Opened through a URI with
+    /// `immutable=1`, so SQLite never creates or consults the `-shm`/`-wal`
+    /// sidecars and the archive verifies on read-only media. The archive cut is
+    /// checkpointed at creation, so the main file already holds the whole
+    /// snapshot and ignoring a sidecar cannot hide committed data. Skips the
+    /// `journal_mode` readback: an immutable connection reports `delete`
+    /// regardless of the file's persistent mode, because it never uses the
+    /// journal at all. `drill` and `restore` can adopt this mode without
+    /// duplicating the URI.
+    ArchiveImmutable,
 }
 
 /// The pragma policy every connection must establish and verify.
@@ -130,7 +141,10 @@ fn verify_pragma(conn: &dyn PragmaConnection, name: &str, required: &str) -> Res
 /// `journal_mode` is persistent in the database file and can only be set with
 /// write access, so the read-only path verifies it by readback while the
 /// read-write path sets it (transitioning a DELETE-journal database to WAL) and
-/// then verifies it. The other three pragmas are per connection and are set and
+/// then verifies it. The archive-immutable path skips the `journal_mode`
+/// readback: an `immutable=1` connection reports `delete` because it never uses
+/// the journal, while the archived file itself stays WAL-mode on disk from the
+/// checkpointed cut. The other three pragmas are per connection and are set and
 /// verified on every connection. Any failure is a store-failure class refusal
 /// before repository work begins.
 pub fn apply_policy(
@@ -153,7 +167,9 @@ pub fn apply_policy(
     if mode == AccessMode::ReadWrite {
         conn.pragma_set("journal_mode", "WAL")?;
     }
-    verify_pragma(conn, "journal_mode", REQUIRED_JOURNAL_MODE)?;
+    if mode != AccessMode::ArchiveImmutable {
+        verify_pragma(conn, "journal_mode", REQUIRED_JOURNAL_MODE)?;
+    }
 
     conn.pragma_set("synchronous", "FULL")?;
     verify_pragma(conn, "synchronous", REQUIRED_SYNCHRONOUS)?;
@@ -177,6 +193,26 @@ fn shm_sidecar_path(path: &Path) -> PathBuf {
     let mut os = path.as_os_str().to_os_string();
     os.push("-shm");
     PathBuf::from(os)
+}
+
+/// The URI SQLite opens for [`AccessMode::ArchiveImmutable`]: the archive path
+/// as a `file:` URI with `immutable=1`, so no sidecar is created or consulted.
+/// Percent-encodes every byte outside the unreserved set plus `/`, which stays
+/// the path separator; absolute Unix archive paths only ever need `%`, `?` and
+/// `#` encoded, but encoding the full unsafe set keeps a space or `&` in a
+/// temporary directory from splitting the URI.
+fn archive_immutable_uri(path: &Path) -> String {
+    let raw = path.to_string_lossy();
+    let mut encoded = String::with_capacity(raw.len() + 16);
+    for byte in raw.bytes() {
+        let safe = matches!(byte, b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' | b'/');
+        if safe {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    format!("file:{encoded}?immutable=1")
 }
 
 /// Opens a database connection through the one setup path every caller uses.
@@ -217,6 +253,9 @@ pub fn open(
         AccessMode::ReadOnly | AccessMode::ForeignReadOnly => {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
         }
+        AccessMode::ArchiveImmutable => {
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI
+        }
         AccessMode::ReadWrite => {
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
         }
@@ -224,8 +263,14 @@ pub fn open(
     if mode == AccessMode::ReadWrite {
         create_file_mode_0600(path)?;
     }
-    let conn = rusqlite::Connection::open_with_flags(path, flags)
-        .map_err(|e| Error::Store(format!("cannot open database {path:?}: {e}")))?;
+    let conn = if mode == AccessMode::ArchiveImmutable {
+        let uri = archive_immutable_uri(path);
+        rusqlite::Connection::open_with_flags(Path::new(&uri), flags)
+            .map_err(|e| Error::Store(format!("cannot open database {path:?}: {e}")))?
+    } else {
+        rusqlite::Connection::open_with_flags(path, flags)
+            .map_err(|e| Error::Store(format!("cannot open database {path:?}: {e}")))?
+    };
     if mode != AccessMode::ForeignReadOnly {
         apply_policy(&conn, mode, policy)?;
     }
@@ -582,6 +627,95 @@ mod tests {
         assert!(
             err.to_string().contains("readonly"),
             "a read-only connection must refuse writes: {err}"
+        );
+    }
+
+    // --- unit: archive-immutable side-effect-free open (aub-2r0n) ---------------
+
+    /// The existing `ReadOnly` mode creates the `-shm` sidecar on a WAL
+    /// database even for a pure read, while the new `ArchiveImmutable` mode
+    /// reads the same checkpointed database with no sidecar at all.
+    #[test]
+    fn archive_immutable_reads_without_sidecars_where_readonly_creates_them() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("archive.db");
+        {
+            let conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE samples (id INTEGER PRIMARY KEY, value INTEGER); \
+                 INSERT INTO samples (value) VALUES (1); \
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .unwrap();
+        }
+        let _ = std::fs::remove_file(wal_sidecar_path(&db_path));
+        let _ = std::fs::remove_file(shm_sidecar_path(&db_path));
+        assert!(
+            !wal_sidecar_path(&db_path).exists() && !shm_sidecar_path(&db_path).exists(),
+            "the checkpointed fixture must start with no sidecars"
+        );
+
+        {
+            let read = open(&db_path, AccessMode::ReadOnly, &policy()).unwrap();
+            let count: i64 = read
+                .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+        }
+        assert!(
+            shm_sidecar_path(&db_path).exists(),
+            "a plain read-only open of a WAL database must create the -shm sidecar"
+        );
+
+        let _ = std::fs::remove_file(wal_sidecar_path(&db_path));
+        let _ = std::fs::remove_file(shm_sidecar_path(&db_path));
+
+        {
+            let immut = open(&db_path, AccessMode::ArchiveImmutable, &policy()).unwrap();
+            let count: i64 = immut
+                .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(count, 1);
+            assert!(
+                !wal_sidecar_path(&db_path).exists() && !shm_sidecar_path(&db_path).exists(),
+                "an immutable archive read must create no sidecar while open"
+            );
+            let integrity: String = immut
+                .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(integrity, "ok");
+        }
+        assert!(
+            !wal_sidecar_path(&db_path).exists() && !shm_sidecar_path(&db_path).exists(),
+            "an immutable archive read must leave no sidecar after close"
+        );
+    }
+
+    /// Planted negative: the same fixture read through `ReadOnly` is the
+    /// control that proves the test above actually exercises WAL sidecar
+    /// behaviour rather than passing because the fixture never had any.
+    #[test]
+    fn readonly_control_creates_a_sidecar_on_the_wal_fixture() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("control.db");
+        {
+            let conn = open(&db_path, AccessMode::ReadWrite, &policy()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE samples (id INTEGER PRIMARY KEY, value INTEGER); \
+                 INSERT INTO samples (value) VALUES (1);",
+            )
+            .unwrap();
+        }
+        let _ = std::fs::remove_file(wal_sidecar_path(&db_path));
+        let _ = std::fs::remove_file(shm_sidecar_path(&db_path));
+        let read = open(&db_path, AccessMode::ReadOnly, &policy()).unwrap();
+        let count: i64 = read
+            .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 1);
+        assert!(
+            shm_sidecar_path(&db_path).exists(),
+            "the control must observe the sidecar a plain read-only open creates"
         );
     }
 

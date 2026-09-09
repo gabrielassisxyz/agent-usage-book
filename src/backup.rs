@@ -258,18 +258,64 @@ pub fn create_archive(
 }
 
 /// Re-runs checksum, SQLite and spool validation against an existing archive.
-/// The verified bit is cleared before any check and restored only after all
-/// checks pass.
+///
+/// Reads without writing: the database is opened side-effect-free and the
+/// manifest is rewritten only when the verification result actually differs
+/// from what is recorded, so a healthy archive on writable media and on a
+/// read-only copy both hash identically before and after (aub-2r0n). A
+/// verification that legitimately changes the result still records it, and a
+/// failure is still recorded as unverified when the manifest differs; when the
+/// manifest cannot be written the original verification failure is returned to
+/// the caller rather than swallowed by the write error.
 pub fn verify_archive(
     destination: &Path,
     busy_timeout: MonotonicDuration,
     clock: &dyn Clock,
 ) -> Result<BackupSummary, Error> {
     let mut manifest = read_manifest(destination)?;
-    manifest.verification = unverified_result();
-    write_manifest(destination, &manifest)?;
+    let original = manifest.verification.clone();
+    match run_verification_checks(destination, &manifest, busy_timeout, clock) {
+        Ok(fresh) => {
+            if verification_content_equal(&original, &fresh) {
+                Ok(summary(destination, &manifest))
+            } else {
+                manifest.verification = fresh;
+                write_manifest(destination, &manifest)?;
+                Ok(summary(destination, &manifest))
+            }
+        }
+        Err(verification_failure) => {
+            if original != unverified_result() {
+                let mut failure_manifest = manifest.clone();
+                failure_manifest.verification = unverified_result();
+                let _ = write_manifest(destination, &failure_manifest);
+            }
+            Err(verification_failure)
+        }
+    }
+}
 
-    verify_checksums(destination, &manifest)?;
+/// Whether two verification results carry the same outcome, ignoring
+/// `checked_at_unix_nanos`. The timestamp moves on every clock tick, so
+/// comparing it would make every re-verification look changed and force a
+/// rewrite; the archive's health is the verified bit plus the three checks.
+fn verification_content_equal(a: &VerificationResult, b: &VerificationResult) -> bool {
+    a.verified == b.verified
+        && a.integrity_check == b.integrity_check
+        && a.foreign_key_check == b.foreign_key_check
+        && a.spool_records_validated == b.spool_records_validated
+}
+
+/// Runs every check `verify_archive` promises without touching the manifest or
+/// the archived database's directory. Returns the fresh verified result on
+/// success, or the stage-named verification error on the first failure.
+fn run_verification_checks(
+    destination: &Path,
+    manifest: &ArchiveManifest,
+    busy_timeout: MonotonicDuration,
+    clock: &dyn Clock,
+) -> Result<VerificationResult, Error> {
+    verify_checksums(destination, manifest)?;
     let database = destination.join(ARCHIVE_DATABASE_FILE);
     let database_result = crate::store::backup::verify_database(&database, busy_timeout)?;
     let database_result = database_result.map_err(|failure| {
@@ -317,15 +363,13 @@ pub fn verify_archive(
         })?;
     }
 
-    manifest.verification = VerificationResult {
+    Ok(VerificationResult {
         verified: true,
         checked_at_unix_nanos: Some(clock.now().unix_nanos()),
         integrity_check: database_result.integrity_check,
         foreign_key_check: database_result.foreign_key_check,
         spool_records_validated: manifest.pending_records.len(),
-    };
-    write_manifest(destination, &manifest)?;
-    Ok(summary(destination, &manifest))
+    })
 }
 
 /// Reads the archive's doctor fact. An unverified archive has no age by
@@ -1316,6 +1360,109 @@ mod tests {
         assert!(
             matches!(health, BackupHealth::Unverified { .. }),
             "a manifest with verification.verified = false must never report an age: {health:?}"
+        );
+    }
+
+    // --- unit: conditional manifest write (aub-2r0n) --------------------------
+
+    /// An identical verification outcome ignoring the clock needs no manifest
+    /// write, while any content difference does. The clock always moves, so a
+    /// comparison that included `checked_at_unix_nanos` would rewrite on every
+    /// run and could never leave a healthy archive byte-identical.
+    #[test]
+    fn identical_verification_needs_no_write_and_differing_verification_does() {
+        let recorded = VerificationResult {
+            verified: true,
+            checked_at_unix_nanos: Some(1),
+            integrity_check: true,
+            foreign_key_check: true,
+            spool_records_validated: 1,
+        };
+        let same_content_new_clock = VerificationResult {
+            checked_at_unix_nanos: Some(2),
+            ..recorded.clone()
+        };
+        assert!(
+            verification_content_equal(&recorded, &same_content_new_clock),
+            "same outcome at a new clock must compare equal or every verify rewrites"
+        );
+        let cleared = unverified_result();
+        assert!(
+            !verification_content_equal(&recorded, &cleared),
+            "verified versus unverified must compare different or a first verify never records"
+        );
+        let different_spool = VerificationResult {
+            spool_records_validated: 0,
+            checked_at_unix_nanos: Some(1),
+            ..recorded.clone()
+        };
+        assert!(
+            !verification_content_equal(&recorded, &different_spool),
+            "a changed spool count must compare different"
+        );
+    }
+
+    /// Planted negative: the same test with the timestamp included would claim
+    /// the identical outcome differs, which is exactly the rewrite-every-run
+    /// behaviour this bead removes.
+    #[test]
+    fn including_the_timestamp_would_claim_an_identical_outcome_differs() {
+        let recorded = VerificationResult {
+            verified: true,
+            checked_at_unix_nanos: Some(1),
+            integrity_check: true,
+            foreign_key_check: true,
+            spool_records_validated: 0,
+        };
+        let reticked = VerificationResult {
+            checked_at_unix_nanos: Some(2),
+            ..recorded.clone()
+        };
+        assert_ne!(
+            recorded, reticked,
+            "full equality includes the clock, so it cannot be the write gate"
+        );
+        assert!(
+            verification_content_equal(&recorded, &reticked),
+            "the content gate must ignore the clock"
+        );
+    }
+
+    /// End to end through `verify_archive`: a second verification at a later
+    /// clock leaves the manifest bytes untouched, while a first verification
+    /// of an unverified archive records the change.
+    #[test]
+    fn reverify_at_a_later_clock_leaves_the_manifest_bytes_untouched() {
+        let scratch = migrated_state_dir();
+        let destination = scratch.path().join("archive");
+        let first_clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1));
+        let summary = create_archive(
+            scratch.path(),
+            &destination,
+            MonotonicDuration::from_millis(1000),
+            &first_clock,
+        )
+        .unwrap();
+        assert!(summary.verified);
+        let before = fs::read(destination.join(ARCHIVE_MANIFEST_FILE)).unwrap();
+
+        let later_clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000_000_000));
+        let second = verify_archive(
+            &destination,
+            MonotonicDuration::from_millis(1000),
+            &later_clock,
+        )
+        .unwrap();
+        assert!(second.verified);
+        let after = fs::read(destination.join(ARCHIVE_MANIFEST_FILE)).unwrap();
+        assert_eq!(
+            before, after,
+            "a re-verification with an identical result must not rewrite the manifest"
+        );
+        assert!(
+            !destination.join("ledger.db-shm").exists()
+                && !destination.join("ledger.db-wal").exists(),
+            "verification must create no sidecar inside the archive"
         );
     }
 
