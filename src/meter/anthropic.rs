@@ -229,7 +229,7 @@ fn extract_bearer_token(credential: &CredentialHandle) -> Result<String, AuthRea
 /// carries beside the rotating token pair.
 ///
 /// Stable across an ordinary refresh because a refresh preserves every other
-/// field (`crate::auth::credentials_lock` proves the write-back field by
+/// field (the credential-lock refresh proves the write-back field by
 /// field): rotating `accessToken` and `refreshToken` under an unchanged
 /// subscription returns this same string. A different subscription's
 /// credential behind the same path names a different `subscriptionType`

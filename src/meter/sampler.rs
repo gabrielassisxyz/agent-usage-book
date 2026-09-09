@@ -3166,8 +3166,8 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
     // --- subscription-identity change detection (aub-iwkg) ------------------
 
     /// An Anthropic credential file naming this subscription: rotating tokens
-    /// around stable subscription fields, the shape the refresh path writes
-    /// back (`crate::auth::credentials_lock`).
+    /// around stable subscription fields, the shape the credential-lock
+    /// refresh path writes back.
     fn anthropic_material(access: &str, refresh: &str, subscription: &str, tier: &str) -> String {
         format!(
             r#"{{"claudeAiOauth":{{"accessToken":"{access}","refreshToken":"{refresh}","expiresAt":4102444800000,"scopes":["user:inference"],"subscriptionType":"{subscription}","rateLimitTier":"{tier}"}}}}"#
@@ -3175,7 +3175,7 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
     }
 
     /// An Antigravity token file: the access token rotates on refresh while
-    /// the refresh token stays stable (`crate::auth::antigravity_credentials`).
+    /// the refresh token stays stable (the antigravity refresh behavior).
     fn agy_material(access: &str, refresh: &str, expiry: &str) -> String {
         format!(
             r#"{{"token":{{"access_token":"{access}","refresh_token":"{refresh}","expiry":"{expiry}"}}}}"#

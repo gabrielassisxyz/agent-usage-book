@@ -282,8 +282,8 @@ fn parse_401_auth_reason(_body: &[u8]) -> AuthReason {
 /// (aub-iwkg): a digest of the token file's `.token.refresh_token`.
 ///
 /// The refresh token is the stable half of the Antigravity pair: a refresh
-/// preserves it and rotates only the access token and the expiry
-/// (`crate::auth::antigravity_credentials` keeps every other field), so an
+/// preserves it and rotates only the access token and the expiry (the
+/// antigravity refresh logic keeps every other field), so an
 /// ordinary refresh under the aub-6qay path returns this same string, while
 /// a different subscription's login carries a different refresh token. The
 /// digest is the truncated SHA-256 the credential context ids use, so no
