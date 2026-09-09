@@ -610,7 +610,7 @@ fn stale_block_notes_the_cache_age_and_explain_still_appends() {
 /// assertions behind.
 #[test]
 fn the_age_and_the_verdict_move_together_across_the_horizon() {
-    let (fresh_horizon, command, skew) = horizon();
+    let (fresh_horizon, _command, _skew) = horizon();
     // Observed ten minutes before NOW, against a 12-minute horizon: fresh.
     let projected = account(
         "primary",
