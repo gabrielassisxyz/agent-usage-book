@@ -308,7 +308,7 @@ fn status_account_body(
     let rows = if kind == FreshnessKind::AuthRequired {
         Vec::new()
     } else {
-        status_window_rows(account, now, envelope, style, dim_block, percent_width)
+        status_window_rows(account, style, dim_block, percent_width)
     };
     if rows.is_empty() {
         let answer = if kind == FreshnessKind::AuthRequired {
@@ -337,8 +337,6 @@ fn status_account_body(
 /// rows.
 fn status_window_rows(
     account: &crate::report::MeterAccount,
-    now: UtcTimestamp,
-    envelope: ClockSkewEnvelope,
     style: Style,
     dim_block: bool,
     percent_width: usize,

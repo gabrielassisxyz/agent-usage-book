@@ -90,15 +90,15 @@ fn contract_status_json_matches_golden_fixture() {
         serde_json::from_str(&generated_json).expect("generated status JSON must parse");
 
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v3.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v4.json");
     let fixture_content =
-        std::fs::read_to_string(&fixture_path).expect("fixture status_v3.json must exist");
+        std::fs::read_to_string(&fixture_path).expect("fixture status_v4.json must exist");
     let parsed_fixture: serde_json::Value =
         serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
 
     assert_eq!(
         parsed_generated, parsed_fixture,
-        "generated status JSON must match golden status_v3.json fixture"
+        "generated status JSON must match golden status_v4.json fixture"
     );
 
     let parsed_env = validate_status_report_json(&generated_json)
@@ -157,15 +157,15 @@ fn contract_spend_json_matches_golden_fixture() {
         serde_json::from_str(&generated_json).expect("generated spend JSON must parse");
 
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v3.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v4.json");
     let fixture_content =
-        std::fs::read_to_string(&fixture_path).expect("fixture spend_v3.json must exist");
+        std::fs::read_to_string(&fixture_path).expect("fixture spend_v4.json must exist");
     let parsed_fixture: serde_json::Value =
         serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
 
     assert_eq!(
         parsed_generated, parsed_fixture,
-        "generated spend JSON must match golden spend_v3.json fixture"
+        "generated spend JSON must match golden spend_v4.json fixture"
     );
 
     let parsed_env = validate_spend_report_json(&generated_json)
