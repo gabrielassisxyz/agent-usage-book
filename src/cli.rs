@@ -1323,6 +1323,20 @@ fn meter_request_for_account(
     }
 }
 
+/// The `retry_backoff_policy` snapshot string the sampler records (aub-6w85,
+/// aub-x2je): the Retry-After ceiling plus the authentication-backoff
+/// threshold and ceiling, so coverage reconstructs both holds from the same
+/// row. One definition, read by the three batch builders below, because
+/// hand-copying the format is the defect this project exists to end.
+fn retry_backoff_snapshot_string(config: &crate::config::Config) -> String {
+    format!(
+        "retry-after-capped-{}s auth-{}-{}s",
+        config.sampling.retry_after_cap.as_nanos() / 1_000_000_000,
+        config.sampling.auth_backoff_threshold,
+        config.sampling.auth_backoff_cap.as_nanos() / 1_000_000_000,
+    )
+}
+
 /// The status-line record an Anthropic account's meter may read its
 /// freshest observation from, when the feature is on and the account's name
 /// can name a record file. `None` for every other provider and when
@@ -1570,10 +1584,7 @@ pub(crate) fn sample_command(
                 "lead-{}s",
                 config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
             ),
-            retry_backoff_policy: format!(
-                "retry-after-capped-{}s",
-                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
-            ),
+            retry_backoff_policy: retry_backoff_snapshot_string(&config),
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
@@ -1598,6 +1609,8 @@ pub(crate) fn sample_command(
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,
+            auth_backoff_threshold: config.sampling.auth_backoff_threshold,
+            auth_backoff_cap: config.sampling.auth_backoff_cap,
             forced,
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
@@ -2062,10 +2075,7 @@ pub(crate) fn now_command(
                 "lead-{}s",
                 config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
             ),
-            retry_backoff_policy: format!(
-                "retry-after-capped-{}s",
-                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
-            ),
+            retry_backoff_policy: retry_backoff_snapshot_string(&config),
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
@@ -2090,6 +2100,8 @@ pub(crate) fn now_command(
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,
+            auth_backoff_threshold: config.sampling.auth_backoff_threshold,
+            auth_backoff_cap: config.sampling.auth_backoff_cap,
             forced: true,
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),
@@ -5751,10 +5763,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 "lead-{}s",
                 config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
             ),
-            retry_backoff_policy: format!(
-                "retry-after-capped-{}s",
-                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
-            ),
+            retry_backoff_policy: retry_backoff_snapshot_string(&config),
             command_budget: config.sampling.command_budget,
             policy_algorithm_version: "v1".to_string(),
         };
@@ -5777,6 +5786,8 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,
+            auth_backoff_threshold: config.sampling.auth_backoff_threshold,
+            auth_backoff_cap: config.sampling.auth_backoff_cap,
             forced: true,
             adapter_version: crate::domain::ids::AdapterVersion::new(
                 crate::build_info::crate_version(),

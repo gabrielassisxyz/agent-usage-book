@@ -216,6 +216,24 @@ pub struct SamplingConfig {
     /// a delay above this ceiling is clamped to it. `0s` disables honouring
     /// beyond the ordinary cadence, which is the rollback.
     pub retry_after_cap: MonotonicDuration,
+    /// How many consecutive `auth_required` results on one account trigger
+    /// the authentication backoff (aub-x2je). Three is the observed
+    /// provider-penalty boundary: on 2026-09-07 three consecutive
+    /// `auth_required` earned a 429 with `Retry-After: 3600` and an
+    /// eleven-hour hold, so the third rejection is where retrying stops
+    /// being free. Setting this high enough (above any streak the ledger
+    /// will ever hold) disables the behaviour and returns the sampler to
+    /// cadence, which is the configuration rollback.
+    pub auth_backoff_threshold: u32,
+    /// The longest the authentication backoff may hold an account past its
+    /// last rejection (aub-x2je), in the same policy surface as
+    /// `retry_after_cap` rather than as a constant. Six hours bounds a
+    /// permanently dead credential to about eleven attempts a day at a
+    /// five-minute cadence instead of 288, while a credential fixed at noon
+    /// still resumes the same day even if the change signal were missed;
+    /// the normal path resumes at the next tick via the credential-context
+    /// change, so the cap only bounds the un-fixed case.
+    pub auth_backoff_cap: MonotonicDuration,
 }
 
 /// The transcript ingest batch policy (PLAN.md section 11.2: "Transcript ingest
@@ -548,6 +566,8 @@ const SAMPLING_KEYS: &[&str] = &[
     "command_budget",
     "max_concurrent_requests",
     "retry_after_cap",
+    "auth_backoff_threshold",
+    "auth_backoff_cap",
 ];
 const INGEST_KEYS: &[&str] = &["max_batch_events", "max_batch_files", "max_batch_seconds"];
 const FRESHNESS_KEYS: &[&str] = &["meter"];
@@ -1220,6 +1240,31 @@ pub fn resolve(
             env,
             file_raw(file.as_ref(), "sampling", "retry_after_cap"),
             Some("3600s"),
+            &file_display,
+            &mut provenance,
+        )?,
+        auth_backoff_threshold: {
+            let count = resolve_count(
+                "sampling.auth_backoff_threshold",
+                overrides,
+                env,
+                file_raw(file.as_ref(), "sampling", "auth_backoff_threshold"),
+                Some("3"),
+                &file_display,
+                &mut provenance,
+            )?;
+            u32::try_from(count).map_err(|_| {
+                Error::Usage(format!(
+                    "sampling.auth_backoff_threshold: {count} exceeds the u32 range"
+                ))
+            })?
+        },
+        auth_backoff_cap: resolve_duration(
+            "sampling.auth_backoff_cap",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "sampling", "auth_backoff_cap"),
+            Some("6h"),
             &file_display,
             &mut provenance,
         )?,
@@ -1897,6 +1942,8 @@ impl Config {
             "sampling.command_budget" => format_config_duration(self.sampling.command_budget),
             "sampling.max_concurrent_requests" => self.sampling.max_concurrent_requests.to_string(),
             "sampling.retry_after_cap" => format_config_duration(self.sampling.retry_after_cap),
+            "sampling.auth_backoff_threshold" => self.sampling.auth_backoff_threshold.to_string(),
+            "sampling.auth_backoff_cap" => format_config_duration(self.sampling.auth_backoff_cap),
             "ingest.max_batch_events" => self.ingest.max_batch_events.to_string(),
             "ingest.max_batch_files" => self.ingest.max_batch_files.to_string(),
             "ingest.max_batch_seconds" => format_config_duration(self.ingest.max_batch_seconds),
@@ -3327,6 +3374,8 @@ ingest.max_batch_seconds              2s                                       d
 reconciliation.residual_min_eligible  5                                        default
 reconciliation.residual_window        30d                                      default
 
+sampling.auth_backoff_cap             6h                                       default
+sampling.auth_backoff_threshold       3                                        default
 sampling.busy_timeout                 10s                                      default
 sampling.command_budget               8s                                       default
 sampling.default_interval             5m                                       default

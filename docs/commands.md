@@ -203,6 +203,8 @@ without the section prefix (the full box for a two-account config):
 │    residual_window          30d                                     default  │
 │                                                                              │
 │  sampling                                                                    │
+│    auth_backoff_cap         6h                                      default  │
+│    auth_backoff_threshold   3                                       default  │
 │    busy_timeout             10s                                     default  │
 │    command_budget           8s                                      default  │
 │    default_interval         5m                                      default  │

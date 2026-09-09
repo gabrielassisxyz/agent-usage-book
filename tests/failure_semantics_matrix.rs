@@ -1274,14 +1274,18 @@ fn row_25_timer_ran_provider_failed() {
                 result: Some(AttemptResultRecord {
                     finished_at: ts(100_100_000_000),
                     retry_after: None,
+                    is_auth_required: false,
                 }),
+                credential_changed: false,
             },
             AttemptRecord {
                 started_at: ts(400_000_000_000),
                 result: Some(AttemptResultRecord {
                     finished_at: ts(400_100_000_000),
                     retry_after: None,
+                    is_auth_required: false,
                 }),
+                credential_changed: false,
             },
         ],
         observations: vec![],
