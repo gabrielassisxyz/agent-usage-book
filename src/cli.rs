@@ -3950,6 +3950,8 @@ fn projection_accounts(
                                 semantic_key: window.semantic_key.clone(),
                                 scope: window.scope.clone(),
                                 quota_used: window.quota_used_ppm,
+                                reported_resolution_ppm: window.reported_resolution_ppm,
+                                quantization: window.quantization,
                                 reset_state: window.resets_at,
                                 nominal_duration: window.nominal_duration_nanos,
                                 rate: crate::report::burn_rate::live_burn_rate(
@@ -10704,5 +10706,84 @@ usage_evidence = "measured"
             Err(Error::Usage(message)) => assert!(message.contains("--resident"), "{message}"),
             other => panic!("expected Error::Usage, got {other:?}"),
         }
+    }
+
+    /// The status seam carries each window's reported resolution and
+    /// quantization into the report model (aub-v8wt): a tenth-percent rounded
+    /// window arrives intact, not rebuilt as whole-percent exact. The planted
+    /// negative is the old literal, which named no resolution at all: it
+    /// renders this window `2%`, colliding with its monthly sibling.
+    #[test]
+    fn projection_accounts_carries_reported_resolution_and_quantization() {
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::domain::window::{QuantizationSemantics, ReportedResolution, WindowScope};
+        let toml = "state.dir = \"/tmp/aub-test-v8wt\"\n\n[[accounts]]\nname = \"opencode\"\nprovider = \"provider-a\"\n";
+        let (config, _) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &FakeEnv::new(),
+            Some(toml),
+            "/virtual/aub.toml",
+        )
+        .expect("config resolves");
+        let now = UtcTimestamp::from_unix_nanos(1_788_768_072_000_000_000);
+        let received = UtcTimestamp::from_unix_nanos(now.unix_nanos() - 41_000_000_000);
+        let projection = crate::projection::Projection {
+            ledger_generation: crate::store::ledger_generation::Generation::new(12),
+            accounts: vec![crate::projection::ProjectedAccount {
+                account_id: crate::store::account::AccountId::new(1),
+                logical_name: "opencode".to_string(),
+                provider: "provider-a".to_string(),
+                last_successful_observation: Some(crate::projection::SuccessfulObservation {
+                    observation_id: crate::store::meter_evidence::ObservationRowId::new(7),
+                    provider_contract_id: crate::domain::ids::ProviderContractId::new(
+                        "contract-v1",
+                    ),
+                    provider_observed_at: Some(received),
+                    received_at: received,
+                    measurement_basis: crate::domain::time::MeasurementBasis::ProviderObserved,
+                    windows: vec![crate::projection::ProjectedWindow {
+                        semantic_key: "weekly".to_string(),
+                        scope: WindowScope::AccountWide,
+                        quota_used_ppm: QuotaUsed::new(QuotaFractionPpm::new(16_000).unwrap()),
+                        reported_resolution_ppm: ReportedResolution::new(
+                            QuotaFractionPpm::new(1_000).unwrap(),
+                        )
+                        .unwrap(),
+                        quantization: QuantizationSemantics::RoundedToNearest,
+                        resets_at: UtcTimestamp::from_unix_nanos(
+                            now.unix_nanos() + 4 * 86_400_000_000_000,
+                        )
+                        .into(),
+                        nominal_duration_nanos:
+                            crate::domain::window::NominalWindowDuration::from_nanos(
+                                604_800_000_000_000u64,
+                            ),
+                        is_active: true,
+                        severity: crate::domain::window::WindowSeverity::unknown(),
+                    }],
+                }),
+                latest_attempt: Some(crate::projection::LatestAttempt {
+                    attempt_id: crate::domain::attempt::AttemptId::new(9),
+                    request_started_at: received,
+                    credential_context_id: Some("ctx".to_string()),
+                    result: Some(crate::projection::TerminalOutcome {
+                        completed_at: received,
+                        outcome: crate::domain::attempt::AttemptOutcome::Success,
+                    }),
+                }),
+            }],
+        };
+        let clock = FakeClock::new(now);
+        let accounts = projection_accounts(&config, &projection, None, None, &clock);
+        assert_eq!(accounts.len(), 1);
+        let window = accounts[0]
+            .windows
+            .iter()
+            .find(|window| window.semantic_key == "weekly")
+            .expect("the weekly window");
+        assert_eq!(window.quota_used.as_ppm().get(), 16_000);
+        assert_eq!(window.reported_resolution_ppm.as_ppm().get(), 1_000);
+        assert_eq!(window.quantization, QuantizationSemantics::RoundedToNearest);
     }
 }

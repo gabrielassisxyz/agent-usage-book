@@ -2625,6 +2625,15 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
 /// One `accounts[].windows[]` entry: the provider's stored inputs for the
 /// window, the report-time burn rate, the cap-freeze instant and the freshness
 /// of the observation it was read from.
+///
+/// Deliberately not the full stored input (aub-v8wt): `reported_resolution_ppm`
+/// and `quantization` stay out of this contract. The JSON consumer holds the
+/// exact `quota_used_ppm` integer and loses nothing by their absence; the
+/// deficit they repair is human-text-only, the grid's whole-percent rounder.
+/// The machine-to-machine surface that needs them, the projection document,
+/// already publishes both keys. Adding them here would bump the envelope
+/// schema every command shares for no consumer gain, so the whitelist and
+/// `SCHEMA_VERSION` stay where they are.
 fn status_window_json(window: &crate::report::StatusWindow) -> String {
     let scope_part = match &window.scope {
         WindowScope::AccountWide => "\"scope\":\"account_wide\"".to_string(),

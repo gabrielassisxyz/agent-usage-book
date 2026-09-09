@@ -22,7 +22,8 @@ use crate::domain::quota::{PercentagePoints, QuotaRemaining, QuotaUsed};
 use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::domain::window::{
-    ModelId, NominalWindowDuration, WindowResetState, WindowScope, WindowSeverity,
+    ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowResetState,
+    WindowScope, WindowSeverity,
 };
 use crate::evidence::{
     CoverageCompleteness, Derivation, EvidenceQuality, MissingRequiredFacts, Provenance,
@@ -241,6 +242,14 @@ pub struct StatusWindow {
     /// and percent are quota *used*, so this is rendered directly, not
     /// complemented.
     pub quota_used: QuotaUsed,
+    /// The smallest provider-reported increment of quota usage, in parts per
+    /// million. The grid renders each window at this resolution (aub-v8wt), so
+    /// two readings the provider distinguishes are never printed as one.
+    pub reported_resolution_ppm: ReportedResolution,
+    /// How the provider mapped its underlying value onto the reported
+    /// resolution. Anything but `Exact` renders with the approximate marker,
+    /// so a rounded reading never claims exactness (aub-v8wt).
+    pub quantization: QuantizationSemantics,
     pub reset_state: WindowResetState,
     pub nominal_duration: NominalWindowDuration,
     /// The burn rate derived for this window at report time, or `None` when it
@@ -2207,6 +2216,11 @@ mod tests {
             quota_used: crate::domain::quota::QuotaUsed::new(
                 QuotaFractionPpm::new(used_ppm).unwrap(),
             ),
+            reported_resolution_ppm: ReportedResolution::new(
+                QuotaFractionPpm::new(10_000).unwrap(),
+            )
+            .unwrap(),
+            quantization: QuantizationSemantics::Exact,
             reset_state: WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000)),
             nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
             rate: None,
