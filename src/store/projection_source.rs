@@ -151,7 +151,7 @@ pub mod test_support {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::domain::attempt::AttemptOutcome;
-    use crate::domain::failure::FailureClass;
+    use crate::domain::failure::{FailureClass, provider_error_classification};
     use crate::domain::ids::AdapterVersion;
     use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
     use crate::domain::time::Clock as _;
@@ -348,7 +348,14 @@ pub mod test_support {
                 completed_at: self.clock.now(),
                 elapsed: MonotonicDuration::from_nanos(1),
                 outcome: AttemptOutcome::Unreachable(class),
-                sanitized_error_classification: None,
+                // The shared insert refuses an unclassified refusal (aub-maop);
+                // a fixture refusal carries the documented fallback, the word
+                // the production persist stage stores for a provider-less
+                // transport failure. The deliberately-legacy null rows go
+                // through `record_pre_classification_result`, not here.
+                sanitized_error_classification: Some(
+                    provider_error_classification(class).to_owned(),
+                ),
                 retry_index: None,
                 clock_anomaly: false,
             };

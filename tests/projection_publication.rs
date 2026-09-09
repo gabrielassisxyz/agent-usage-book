@@ -230,7 +230,11 @@ impl Fixture {
             } else {
                 AttemptOutcome::Unreachable(FailureClass::ConnectTimeout)
             },
-            sanitized_error_classification: None,
+            // The documented fallbacks for the refusal spellings: a refusal
+            // records why it failed (aub-maop).
+            sanitized_error_classification: Some(
+                if auth { "credential_error" } else { "connect" }.to_owned(),
+            ),
             retry_index: None,
             clock_anomaly: false,
         }
