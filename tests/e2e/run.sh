@@ -101,10 +101,37 @@ DECLARED_GOLDEN_STEPS=()
 
 # json_string VALUE: a JSON-quoted, escaped string, for values that may contain
 # quotes or backslashes (assertion text drawn from a step's own stdout).
+# The control characters json_string escapes as \u00XX, paired with their
+# escapes, built once here: a summary holds thousands of values, and a fork per
+# character per value (the first version of this) cost a full gate its budget.
+JSON_CONTROL_CHARS=()
+JSON_CONTROL_ESCAPES=()
+for _code in 1 2 3 4 5 6 7 8 11 12 14 15 16 17 18 19 20 21 22 23 24 25 26 27 28 29 30 31; do
+    printf -v _ch '%b' "$(printf '\\x%02x' "$_code")"
+    JSON_CONTROL_CHARS+=("$_ch")
+    JSON_CONTROL_ESCAPES+=("$(printf '\\u%04x' "$_code")")
+done
+unset _code _ch
+
 json_string() {
     local s="$1"
     s="${s//\\/\\\\}"
     s="${s//\"/\\\"}"
+    # Control characters are escaped too, or the summary stops being JSON the
+    # first time an assertion records a coloured or multi-line observed value:
+    # until 2026-09-09 jq refused every real summary.json for that reason,
+    # which is also why nothing could read the case count back out of it. A
+    # value with none, which is nearly every value, takes the short way out.
+    if [[ "$s" == *[[:cntrl:]]* ]]; then
+        s="${s//$'\n'/\\n}"
+        s="${s//$'\r'/\\r}"
+        s="${s//$'\t'/\\t}"
+        local i
+        for i in "${!JSON_CONTROL_CHARS[@]}"; do
+            [[ "$s" == *"${JSON_CONTROL_CHARS[$i]}"* ]] || continue
+            s="${s//"${JSON_CONTROL_CHARS[$i]}"/${JSON_CONTROL_ESCAPES[$i]}}"
+        done
+    fi
     printf '"%s"' "$s"
 }
 
@@ -1224,9 +1251,108 @@ CASE
     echo "self-test: self-sufficient build ok"
 }
 
+# self_test_case_count: a step whose program reads stdin does not shorten the
+# run, and a run that executed fewer cases than the directory holds is refused
+# with both numbers named. The first half runs a scratch suite whose first case
+# runs `cat`, which reads stdin until EOF: with each step's stdin on /dev/null
+# the second case still runs and the count line reads 2 of 2; with that
+# redirection removed, `cat` drains the case list and the run reports 1 of 2 and
+# fails. The second half exercises the verdict directly.
+self_test_case_count() {
+    local tmp
+    tmp="$(mktemp -d)"
+    local fake_bin="$tmp/fake-aub"
+    printf '#!/usr/bin/env bash\necho fake-aub\n' >"$fake_bin"
+    chmod +x "$fake_bin"
+
+    local cases="$tmp/cases"
+    mkdir -p "$cases"
+    cat >"$cases/001-reader.sh" <<'CASE'
+CASE_ID="001-reader"
+CASE_DESCRIPTION="a step whose program reads stdin until EOF."
+case_steps() {
+    step "read-stdin" cat
+}
+case_assertions() {
+    assert_exit 0 1
+}
+CASE
+    cat >"$cases/002-after.sh" <<'CASE'
+CASE_ID="002-after"
+CASE_DESCRIPTION="the case sorted after the reader still runs."
+case_steps() {
+    step "version" "$AUB_BIN"
+}
+case_assertions() {
+    assert_exit 0 1
+}
+CASE
+
+    local runs="$tmp/runs"
+    local out
+    out="$(AUB_BIN="$fake_bin" CASES_DIR="$cases" RUNS_DIR="$runs" STATE_ROOT="$tmp/state" \
+        bash "$0" --state-dir "$tmp/state" --cases-dir "$cases" --runs-dir "$runs" 2>&1)"
+    local rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "self-test: a suite with a stdin-reading step exited $rc, expected 0: $out" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *"2 of 2 case files"*) : ;;
+        *) echo "self-test: the count line did not read 2 of 2 case files: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+    if [ -z "$(find "$runs" -path '*/cases/002-after/case.log' 2>/dev/null)" ]; then
+        echo "self-test: the case after the stdin reader did not run" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    if out="$(case_count_verdict scratch 1 2 2>&1)"; then
+        echo "self-test: a short case count was accepted" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *"executed 1 of 2 case files"*) : ;;
+        *) echo "self-test: the short-count message did not name both numbers: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+    if ! case_count_verdict scratch 2 2 2>/dev/null; then
+        echo "self-test: a matching case count was refused" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    rm -rf "$tmp"
+    echo "self-test: case count ok"
+}
+
+# self_test_json_string: a value carrying a quote, a backslash, a newline and an
+# escape byte comes back as one JSON string jq accepts and decodes to the input.
+self_test_json_string() {
+    command -v jq >/dev/null 2>&1 || { echo "self-test: jq required for json_string check" >&2; return 1; }
+    local input decoded
+    input=$'say "hi"\\ then\n'$'\e''[1mbold'$'\t''end'
+    if ! decoded="$(json_string "$input" | jq -r . 2>/dev/null)"; then
+        echo "self-test: json_string produced a value jq refuses: $(json_string "$input")" >&2
+        return 1
+    fi
+    if [ "$decoded" != "$input" ]; then
+        echo "self-test: json_string did not round-trip a control-character value" >&2
+        return 1
+    fi
+    echo "self-test: json string escaping ok"
+}
+
 self_test() {
     local overall=0
     self_test_basic || overall=1
+    self_test_json_string || overall=1
+    self_test_case_count || overall=1
     self_test_pruning || overall=1
     self_test_golden || overall=1
     self_test_consistency || overall=1
@@ -1236,6 +1362,26 @@ self_test() {
     self_test_self_sufficient_build || overall=1
     [ "$overall" -eq 0 ] && echo "self-test: ok"
     return "$overall"
+}
+
+# --- case count --------------------------------------------------------------
+
+# count_case_files DIR: the number of case files the run loop is expected to
+# execute, derived the same way the loop derives its list.
+count_case_files() {
+    find "$1" -maxdepth 1 -type f -name '*.sh' | wc -l | tr -d ' '
+}
+
+# case_count_verdict RUN_ID EXECUTED EXPECTED: non-zero, with both numbers on
+# stderr, when the run executed fewer or more cases than the directory holds.
+# A short count is a case loop cut short, never a passing run: there is no skip
+# state (require_command fails a case rather than skipping it) and no filter
+# flag, so the only honest value of EXECUTED is EXPECTED.
+case_count_verdict() {
+    local run_id="$1" executed="$2" expected="$3"
+    [ "$executed" -eq "$expected" ] && return 0
+    echo "run $run_id FAILED: executed $executed of $expected case files; the case loop ended early (a step reading stdin, or a case that broke the loop) and every case after the last executed one never ran" >&2
+    return 1
 }
 
 # --- main --------------------------------------------------------------------
@@ -1316,8 +1462,18 @@ main() {
         [ "$verdict" = "fail" ] && failed=1
     done
 
-    echo "run $RUN_ID: ${#CASE_RESULTS[@]} cases, log at $RUN_DIR"
-    [ "$failed" -eq 0 ] || { echo "run $RUN_ID FAILED" >&2; exit 1; }
+    # The executed count is compared against the case directory, counted again here
+    # in a pipeline of its own: from 2026-09-07 to 2026-09-09 the loop above ended
+    # early (a step's program drained the list on stdin) and reported 51 cases while
+    # 62 files existed, and nothing compared the two. The line names both numbers so
+    # any later gate log shows them agreeing.
+    local case_files
+    case_files="$(count_case_files "$CASES_DIR")"
+    echo "run $RUN_ID: ${#CASE_RESULTS[@]} of $case_files case files, log at $RUN_DIR"
+    local short=0
+    case_count_verdict "$RUN_ID" "${#CASE_RESULTS[@]}" "$case_files" || short=1
+    [ "$failed" -eq 0 ] || echo "run $RUN_ID FAILED" >&2
+    [ "$failed" -eq 0 ] && [ "$short" -eq 0 ] || exit 1
 }
 
 main "$@"

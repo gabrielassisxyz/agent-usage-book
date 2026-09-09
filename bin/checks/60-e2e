@@ -8,11 +8,62 @@ set -uo pipefail
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../.." && pwd)"
 
+# case_count_matches SUMMARY CASES_DIR: the number of cases the run recorded
+# equals the number of case files in the directory, else both numbers on stderr.
+# Until 2026-09-09 the suite ran 51 of 62 cases for two days with nothing
+# comparing the two numbers; this is the comparison, made by the gate itself.
+case_count_matches() {
+    local summary="$1" cases_dir="$2" executed expected
+    executed="$(jq '.cases | length' "$summary" 2>/dev/null)" || executed="unreadable"
+    expected="$(find "$cases_dir" -maxdepth 1 -type f -name '*.sh' | wc -l | tr -d ' ')"
+    if [ "$executed" = "$expected" ]; then
+        return 0
+    fi
+    echo "e2e: $summary records $executed cases but $cases_dir holds $expected case files" >&2
+    return 1
+}
+
+# The comparison is proven on scratch input before it judges a real run: a
+# summary one case short of its directory is refused naming both numbers, and a
+# matching pair passes.
+case_count_selftest() {
+    local tmp
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/aub-e2e-count-XXXXXX")"
+    mkdir -p "$tmp/cases"
+    : >"$tmp/cases/001-a.sh"
+    : >"$tmp/cases/002-b.sh"
+    printf '{"cases":[{"id":"001-a"}]}\n' >"$tmp/short.json"
+    printf '{"cases":[{"id":"001-a"},{"id":"002-b"}]}\n' >"$tmp/full.json"
+    local out
+    if out="$(case_count_matches "$tmp/short.json" "$tmp/cases" 2>&1)"; then
+        echo "e2e self-test: a summary one case short of its directory was accepted" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *"records 1 cases"*"holds 2 case files"*) : ;;
+        *) echo "e2e self-test: the short-count message did not name both numbers: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+    if ! case_count_matches "$tmp/full.json" "$tmp/cases" 2>/dev/null; then
+        echo "e2e self-test: a matching summary was refused" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    rm -rf "$tmp"
+    echo "e2e self-test: case count comparison ok"
+}
+
 # The runner's own self-test and the command-surface consistency check need no
 # release binary, so they run before the build: a broken runner or an unexercised
 # command fails fast instead of waiting on a compile first.
 if ! "$repo_root/tests/e2e/run.sh" --self-test; then
     echo "==> e2e FAILED (runner self-test)"
+    exit 1
+fi
+if ! case_count_selftest; then
+    echo "==> e2e FAILED (case count self-test)"
     exit 1
 fi
 if ! "$repo_root/tests/e2e/run.sh" --check-consistency; then
@@ -57,6 +108,16 @@ elapsed=$(( $(date +%s) - start ))
 echo "e2e suite: ${elapsed}s (budget ${budget_seconds}s)"
 if [ "$rc" -ne 0 ]; then
     echo "==> e2e FAILED (exit $rc)"
+    exit 1
+fi
+
+# Independent of the runner's own count: the newest run's summary.json is read
+# here and compared against the case directory by this process, which shares no
+# state with the loop that produced it. The runner refuses a short run on its
+# own; this catches a runner whose count and whose loop failed together.
+newest_run="$(find "$repo_root/tests/e2e/runs" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' | sort -rn | head -1 | cut -d' ' -f2-)"
+if ! case_count_matches "$newest_run/summary.json" "$repo_root/tests/e2e/cases"; then
+    echo "==> e2e FAILED (case count)"
     exit 1
 fi
 if [ "$elapsed" -gt "$budget_seconds" ]; then
