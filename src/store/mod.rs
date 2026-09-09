@@ -56,6 +56,7 @@ pub mod session_heartbeat;
 pub mod spend;
 pub mod spool;
 pub mod startup;
+pub mod subscription_identity;
 pub mod task_event;
 pub mod task_identity;
 #[cfg(test)]

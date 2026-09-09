@@ -86,6 +86,7 @@ pub enum DurableClass {
     MeterWindowAnomaly,
     MeterCalibrationExclusion,
     MeterWindowSetChange,
+    MeterSubscriptionChange,
 
     // Core SQLite tables: Versioned interpretation
     MeterObservation,
@@ -152,7 +153,8 @@ impl DurableClass {
             | Self::AdapterSemanticsAnnotation
             | Self::MeterWindowAnomaly
             | Self::MeterCalibrationExclusion
-            | Self::MeterWindowSetChange => DurableClassCategory::Irreplaceable,
+            | Self::MeterWindowSetChange
+            | Self::MeterSubscriptionChange => DurableClassCategory::Irreplaceable,
 
             Self::SamplingPolicySnapshot
             | Self::MeterObservation
@@ -221,7 +223,8 @@ impl DurableClass {
             | Self::AdapterSemanticsAnnotation
             | Self::MeterWindowAnomaly
             | Self::MeterCalibrationExclusion
-            | Self::MeterWindowSetChange => RetentionRule::Forever,
+            | Self::MeterWindowSetChange
+            | Self::MeterSubscriptionChange => RetentionRule::Forever,
 
             Self::SessionAccountMarker => RetentionRule::ForeverUnlessExplicitlyPurged,
 
@@ -299,6 +302,7 @@ impl DurableClass {
             Self::MeterWindowAnomaly => Some("meter_window_anomaly"),
             Self::MeterCalibrationExclusion => Some("meter_calibration_exclusion"),
             Self::MeterWindowSetChange => Some("meter_window_set_change"),
+            Self::MeterSubscriptionChange => Some("meter_subscription_change"),
             Self::StatusProjection | Self::PendingObservationSpool | Self::RetainedProviderBody => {
                 None
             }
@@ -376,6 +380,7 @@ impl DurableClass {
             | Self::MeterWindowAnomaly
             | Self::MeterCalibrationExclusion
             | Self::MeterWindowSetChange
+            | Self::MeterSubscriptionChange
             | Self::MeterObservation
             | Self::MeterWindow
             | Self::MeterObservationPreference
@@ -442,6 +447,7 @@ impl DurableClass {
             Self::MeterWindowAnomaly,
             Self::MeterCalibrationExclusion,
             Self::MeterWindowSetChange,
+            Self::MeterSubscriptionChange,
             Self::StatusProjection,
             Self::PendingObservationSpool,
             Self::RetainedProviderBody,
@@ -495,6 +501,7 @@ impl DurableClass {
             Self::MeterWindowAnomaly,
             Self::MeterCalibrationExclusion,
             Self::MeterWindowSetChange,
+            Self::MeterSubscriptionChange,
         ]
     }
 }

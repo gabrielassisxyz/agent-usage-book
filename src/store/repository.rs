@@ -29,6 +29,9 @@ use super::meter_evidence::{
 use super::sample_run::{self, SampleRunId, Trigger};
 use super::sampling_lease::{self, AccountName, LeaseHolder, LeaseOutcome};
 use super::sampling_policy_snapshot::{ResolvedSamplingPolicy, SamplingPolicySnapshotId};
+use super::subscription_identity::{
+    self, NewSubscriptionChange, StoredSubscriptionChange,
+};
 use super::window_anomaly::{self, StoredWindowAnomaly};
 
 /// Opens repository operations against one ledger database under one pragma policy.
@@ -328,6 +331,84 @@ impl Repository {
             .map_err(|error| Error::Store(format!("cannot commit the terminal result: {error}")))?;
         drop(conn);
         Ok(self.publish_projection())
+    }
+
+    /// Commits a refused terminal result together with its subscription-change
+    /// record, in one transaction (aub-iwkg): a measured reading whose
+    /// subscription identity differs from the account's established one. The
+    /// result carries `Unreachable` with class `subscription_changed` and no
+    /// observation is stored; the change row carries the identity pair, so
+    /// the refused interval stays marked even though no observation exists
+    /// for it. The ledger generation advances in the same transaction, and
+    /// the projection is published from the committed state, like every
+    /// other terminal commit.
+    pub fn commit_subscription_refusal(
+        &self,
+        result: &NewMeterAttemptResult,
+        change: &NewSubscriptionChange,
+    ) -> Result<Publication, Error> {
+        let mut conn = self.open_write()?;
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(|error| {
+                Error::Store(format!(
+                    "cannot open the subscription-refusal transaction: {error}"
+                ))
+            })?;
+        meter_attempt::record_meter_attempt_result(&tx, result)?;
+        subscription_identity::insert_change(&tx, change)?;
+        ledger_generation::advance(&tx)?;
+        tx.commit().map_err(|error| {
+            Error::Store(format!("cannot commit the subscription refusal: {error}"))
+        })?;
+        drop(conn);
+        Ok(self.publish_projection())
+    }
+
+    /// Records the first sighting of an account's subscription, after the
+    /// observation it arrived with is already durable. A crash between the
+    /// observation commit and this insert only delays establishment to the
+    /// next tick; it can never misattribute, because nothing is compared
+    /// until an establishment exists.
+    pub fn record_subscription_established(
+        &self,
+        change: &NewSubscriptionChange,
+    ) -> Result<(), Error> {
+        let conn = self.open_write()?;
+        subscription_identity::insert_change(&conn, change)?;
+        Ok(())
+    }
+
+    /// The identity the account's readings are attributed under, or `None`
+    /// when no subscription has ever been established for it.
+    pub fn established_subscription_identity(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<String>, Error> {
+        self.with_read_connection(|conn| {
+            subscription_identity::established_identity_for_account(conn, account_id)
+        })
+    }
+
+    /// The newest subscription-history row for one account, or `None` when
+    /// the account's subscription has never been sighted.
+    pub fn latest_subscription_change(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<StoredSubscriptionChange>, Error> {
+        self.with_read_connection(|conn| {
+            subscription_identity::latest_for_account(conn, account_id)
+        })
+    }
+
+    /// Every subscription-history row for one account, oldest first.
+    pub fn subscription_changes_for_account(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<StoredSubscriptionChange>, Error> {
+        self.with_read_connection(|conn| {
+            subscription_identity::changes_for_account(conn, account_id)
+        })
     }
 
     /// Publishes through an injected publisher over one fresh read snapshot.
