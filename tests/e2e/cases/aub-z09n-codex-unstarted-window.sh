@@ -186,8 +186,17 @@ case_steps() {
     # anchor is one nominal duration after that tick's own instant, so in
     # the old representation every consecutive pair slid by the sampling
     # interval. Stored as not_started, the pair is idle to idle.
+    #
+    # Each tick waits four seconds before sampling, on purpose: back-to-back
+    # ticks would slide the fabricated anchor only tens of milliseconds per
+    # pair, inside the fixed 2 s provider-jitter envelope, and the old
+    # representation would then record no anomaly either, leaving the
+    # zero-anomaly assertion below nothing to distinguish. Four seconds of
+    # gap puts the per-pair slide past that envelope, which is what makes
+    # ten idle ticks a discriminating test of this bead.
     local tick
     for tick in 01 02 03 04 05 06 07 08 09 10; do
+        sleep 4
         step "tick-$tick-codex-idle-sample" env \
             "HOME=$STATE_DIR/home" \
             "AUB_STATE_DIR=$STATE_DIR" \
