@@ -12,6 +12,9 @@
 │    refresh                  true                                    default  │
 │    statusline               true                                    default  │
 │                                                                              │
+│  antigravity                                                                 │
+│    refresh                  true                                    default  │
+│                                                                              │
 │  attribution                                                                 │
 │    recent_window            30d                                     default  │
 │                                                                              │
