@@ -59,6 +59,16 @@ pub enum FailureClass {
     /// drifted schema is readable text wearing an unexpected shape, and the
     /// remediation is a parser correction rather than a retry.
     SchemaDrift,
+    /// The subscription behind the account's credential path changed
+    /// (aub-iwkg): the provider answered, the reading parsed, and the sampler
+    /// refused to attribute it because its subscription identity differs from
+    /// the account's established one. Synthesized by the sampler, never by an
+    /// adapter: no provider response carries this meaning, and an adapter
+    /// that emitted it would be inventing sampler policy. Maps to
+    /// [`StaleReason::CredentialChangedUnverified`](super::freshness::StaleReason::CredentialChangedUnverified),
+    /// which is what it is: the credential material changed and the new
+    /// subscription's continuity under this logical name is unverified.
+    SubscriptionChanged,
 }
 
 /// Maps every [`FailureClass`] variant into exactly one [`StaleReason`]. Total, with no
@@ -76,6 +86,10 @@ pub fn to_stale_reason(class: FailureClass) -> StaleReason {
         FailureClass::MalformedBody
         | FailureClass::MissingRequiredField
         | FailureClass::SchemaDrift => StaleReason::MalformedProviderResponse,
+        // Deliberately not a new StaleReason: the freshness taxonomy stays at
+        // three states and nine reasons, and "the credential behind the path
+        // changed, continuity unverified" is exactly what this reason names.
+        FailureClass::SubscriptionChanged => StaleReason::CredentialChangedUnverified,
     }
 }
 
@@ -136,6 +150,7 @@ pub fn provider_error_classification(class: FailureClass) -> &'static str {
         FailureClass::MalformedBody => "malformed_body",
         FailureClass::MissingRequiredField => "missing_required_field",
         FailureClass::SchemaDrift => "schema_drift",
+        FailureClass::SubscriptionChanged => "subscription_changed",
     }
 }
 

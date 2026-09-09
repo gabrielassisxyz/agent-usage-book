@@ -61,7 +61,10 @@ impl CoverageFailureGroup {
                 crate::domain::failure::FailureClass::RateLimited { .. } => Some(Self::RateLimited),
                 crate::domain::failure::FailureClass::MalformedBody
                 | crate::domain::failure::FailureClass::MissingRequiredField
-                | crate::domain::failure::FailureClass::SchemaDrift => Some(Self::ResponseUnusable),
+                | crate::domain::failure::FailureClass::SchemaDrift
+                | crate::domain::failure::FailureClass::SubscriptionChanged => {
+                    Some(Self::ResponseUnusable)
+                }
                 crate::domain::failure::FailureClass::DnsFailure
                 | crate::domain::failure::FailureClass::ConnectTimeout
                 | crate::domain::failure::FailureClass::ReadTimeout

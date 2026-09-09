@@ -190,7 +190,8 @@ fn is_transient(class: FailureClass) -> bool {
         | FailureClass::RateLimited { .. }
         | FailureClass::MalformedBody
         | FailureClass::MissingRequiredField
-        | FailureClass::SchemaDrift => false,
+        | FailureClass::SchemaDrift
+        | FailureClass::SubscriptionChanged => false,
     }
 }
 
@@ -292,7 +293,8 @@ impl<T> RetryOutcome<T> {
             | FailureClass::HttpStatus(_)
             | FailureClass::MalformedBody
             | FailureClass::MissingRequiredField
-            | FailureClass::SchemaDrift => None,
+            | FailureClass::SchemaDrift
+            | FailureClass::SubscriptionChanged => None,
         }
     }
 

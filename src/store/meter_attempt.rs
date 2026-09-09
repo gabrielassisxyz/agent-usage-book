@@ -173,6 +173,7 @@ pub mod failure_class_sql {
             FailureClass::MalformedBody => "malformed_body",
             FailureClass::MissingRequiredField => "missing_required_field",
             FailureClass::SchemaDrift => "schema_drift",
+            FailureClass::SubscriptionChanged => "subscription_changed",
         }
     }
 
@@ -190,6 +191,7 @@ pub mod failure_class_sql {
             "malformed_body" => Ok(FailureClass::MalformedBody),
             "missing_required_field" => Ok(FailureClass::MissingRequiredField),
             "schema_drift" => Ok(FailureClass::SchemaDrift),
+            "subscription_changed" => Ok(FailureClass::SubscriptionChanged),
             other => Err(Error::Store(format!(
                 "unknown failure class stored in the database: {other:?}"
             ))),
@@ -270,7 +272,8 @@ pub(crate) fn outcome_failure_fields(outcome: &AttemptOutcome) -> (Option<String
                 | FailureClass::HttpStatus(_)
                 | FailureClass::MalformedBody
                 | FailureClass::MissingRequiredField
-                | FailureClass::SchemaDrift => None,
+                | FailureClass::SchemaDrift
+                | FailureClass::SubscriptionChanged => None,
             };
             (
                 Some(failure_class_sql::as_sql(class).to_owned()),

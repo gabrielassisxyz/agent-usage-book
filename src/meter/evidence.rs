@@ -176,7 +176,8 @@ pub fn error_report_for_observation<T>(
             | FailureClass::TotalBudgetExpired
             | FailureClass::MalformedBody
             | FailureClass::MissingRequiredField
-            | FailureClass::SchemaDrift),
+            | FailureClass::SchemaDrift
+            | FailureClass::SubscriptionChanged),
         ) => provider_error_classification(class).to_owned(),
         Some(_) | None => format!("http_{status}"),
     };

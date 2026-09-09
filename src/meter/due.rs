@@ -300,7 +300,8 @@ pub fn next_due_after(
             | FailureClass::HttpStatus(_)
             | FailureClass::MalformedBody
             | FailureClass::MissingRequiredField
-            | FailureClass::SchemaDrift,
+            | FailureClass::SchemaDrift
+            | FailureClass::SubscriptionChanged,
         ) => None,
     };
     let capped = retry_after.map(|delay| delay.min(retry_after_cap));
@@ -332,7 +333,8 @@ fn retry_postponement(entry: &AttemptHistoryEntry, cap: MonotonicDuration) -> Op
             | FailureClass::HttpStatus(_)
             | FailureClass::MalformedBody
             | FailureClass::MissingRequiredField
-            | FailureClass::SchemaDrift,
+            | FailureClass::SchemaDrift
+            | FailureClass::SubscriptionChanged,
         ) => None,
     }
 }
