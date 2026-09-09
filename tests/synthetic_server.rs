@@ -429,7 +429,9 @@ fn the_transport_failure_shapes_reach_the_persisted_attempt_result() {
             completed_at: UtcTimestamp::from_unix_nanos(25_000),
             elapsed: MonotonicDuration::from_millis(250),
             outcome: AttemptOutcome::Unreachable(FailureClass::ReadTimeout),
-            sanitized_error_classification: None,
+            // The documented fallback for the transport-class spelling: a
+            // refusal records why it failed (aub-maop).
+            sanitized_error_classification: Some("timeout".to_owned()),
             retry_index: None,
             clock_anomaly: false,
         },

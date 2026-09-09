@@ -360,6 +360,27 @@ pub fn record_meter_attempt_result(
     conn: &rusqlite::Connection,
     result: &NewMeterAttemptResult,
 ) -> Result<(), Error> {
+    // Every refusal records why it failed: an auth_required or unreachable
+    // result with a null classification would reach the coverage findings as
+    // the unclassified non-class, unlistable and unmatchable to a fixture
+    // (aub-maop). The adapter's own report or the documented fallback is the
+    // caller's obligation; the refusal itself is enforced here, at the one
+    // insert every writer shares. A success is unconstrained: its column is
+    // null by contract, and the restore and import paths may tag it.
+    let stored = result.sanitized_error_classification.as_deref();
+    let classified = match stored {
+        None => false,
+        Some(value) => !value.is_empty(),
+    };
+    if !matches!(&result.outcome, AttemptOutcome::Success) && !classified {
+        return Err(Error::Store(format!(
+            "attempt {} records outcome '{}' with no sanitized_error_classification; \
+             a refusal stores the adapter's classification or the documented fallback, \
+             never a null",
+            result.attempt_id.value(),
+            attempt_outcome_as_sql(&result.outcome),
+        )));
+    }
     let outcome_sql = attempt_outcome_as_sql(&result.outcome);
     let (failure_class_sql, retry_after) = outcome_failure_fields(&result.outcome);
     conn.execute(
@@ -390,6 +411,40 @@ pub fn record_meter_attempt_result(
             Error::Store(format!("cannot record the meter attempt result: {e}"))
         }
     })?;
+    Ok(())
+}
+
+/// Writes the pre-classification row shape: a refusal whose classification is
+/// null, exactly the rows the ledger already holds from before the column was
+/// populated (the aub-maop recovery path keeps them rather than rewriting
+/// them, and every reader of the column decodes that null as `unclassified`).
+/// The production writers refuse the shape, so the fixtures that prove those
+/// readers keep working go through this test-only writer instead of through a
+/// production door a caller could misuse.
+#[cfg(test)]
+pub(crate) fn record_pre_classification_result(
+    conn: &rusqlite::Connection,
+    result: &NewMeterAttemptResult,
+) -> Result<(), Error> {
+    let outcome_sql = attempt_outcome_as_sql(&result.outcome);
+    let (failure_class_sql, retry_after) = outcome_failure_fields(&result.outcome);
+    conn.execute(
+        "INSERT INTO meter_attempt_result (
+            attempt_id, completed_at, elapsed_nanos, outcome, failure_class,
+            retry_after_nanos, sanitized_error_classification, retry_index, clock_anomaly
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, NULL, ?7, ?8)",
+        params![
+            result.attempt_id.value(),
+            result.completed_at.unix_nanos(),
+            result.elapsed.as_nanos() as i64,
+            outcome_sql,
+            failure_class_sql,
+            retry_after,
+            result.retry_index,
+            result.clock_anomaly as i64,
+        ],
+    )
+    .map_err(|e| Error::Store(format!("cannot record the pre-classification result: {e}")))?;
     Ok(())
 }
 
@@ -926,6 +981,92 @@ mod tests {
         );
     }
 
+    /// Every refusal records why it failed: the insert refuses an
+    /// auth_required or unreachable result whose classification is null or
+    /// empty, whatever writer produced it (aub-maop). The planted negative is
+    /// the near-identical permitted case beside each refusal: the documented
+    /// fallback inserts, and a success still carries no classification.
+    #[test]
+    fn a_refusal_with_no_classification_is_refused_at_the_insert() {
+        let (_scratch, conn, run, account, snapshot) = fixture();
+        let row_id = start_meter_attempt(&conn, &attempt_start(run, account, snapshot))
+            .expect("the attempt must insert");
+
+        for outcome in [
+            AttemptOutcome::AuthRequired,
+            AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+        ] {
+            let null = NewMeterAttemptResult {
+                attempt_id: row_id,
+                completed_at: UtcTimestamp::from_unix_nanos(30_000),
+                elapsed: MonotonicDuration::from_millis(100),
+                outcome,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            };
+            let err = record_meter_attempt_result(&conn, &null)
+                .expect_err("a refusal with a null classification must be refused");
+            assert!(
+                err.to_string()
+                    .contains("with no sanitized_error_classification"),
+                "the refusal must name the invariant: {err}"
+            );
+            let empty = NewMeterAttemptResult {
+                sanitized_error_classification: Some(String::new()),
+                ..null
+            };
+            let err = record_meter_attempt_result(&conn, &empty)
+                .expect_err("an empty classification launders exactly like a null");
+            assert!(
+                err.to_string()
+                    .contains("with no sanitized_error_classification"),
+                "the refusal must name the invariant: {err}"
+            );
+        }
+
+        // The near-identical permitted cases: each refusal carries its
+        // documented fallback and inserts, and a success with no
+        // classification stays the success shape.
+        let classified = [
+            (AttemptOutcome::AuthRequired, "credential_error"),
+            (
+                AttemptOutcome::Unreachable(FailureClass::ConnectTimeout),
+                "connect",
+            ),
+        ];
+        for (outcome, fallback) in classified {
+            let attempt = start_meter_attempt(&conn, &attempt_start(run, account, snapshot))
+                .expect("each classified refusal needs its own attempt");
+            let permitted = NewMeterAttemptResult {
+                attempt_id: attempt,
+                completed_at: UtcTimestamp::from_unix_nanos(30_000),
+                elapsed: MonotonicDuration::from_millis(100),
+                outcome,
+                sanitized_error_classification: Some(fallback.to_owned()),
+                retry_index: None,
+                clock_anomaly: false,
+            };
+            record_meter_attempt_result(&conn, &permitted)
+                .unwrap_or_else(|_| panic!("the documented fallback must insert: {fallback}"));
+        }
+        let success_row = start_meter_attempt(&conn, &attempt_start(run, account, snapshot))
+            .expect("the second attempt must insert");
+        record_meter_attempt_result(
+            &conn,
+            &NewMeterAttemptResult {
+                attempt_id: success_row,
+                completed_at: UtcTimestamp::from_unix_nanos(31_000),
+                elapsed: MonotonicDuration::from_millis(100),
+                outcome: AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .expect("a success still stores no classification");
+    }
+
     #[test]
     fn triggers_refuse_every_update_and_delete_on_both_tables() {
         let (_scratch, conn, run, account, snapshot) = fixture();
@@ -1304,10 +1445,18 @@ mod coverage_query_tests {
         let _outside = start_meter_attempt(&conn, &started(run, account, snapshot, 9_000))
             .expect("fifth attempt must insert");
 
-        for (row, result) in [
-            (success, UtcTimestamp::from_unix_nanos(1_500)),
-            (auth, UtcTimestamp::from_unix_nanos(2_500)),
-            (rate_limited, UtcTimestamp::from_unix_nanos(3_500)),
+        for (row, result, classification) in [
+            (success, UtcTimestamp::from_unix_nanos(1_500), None),
+            (
+                auth,
+                UtcTimestamp::from_unix_nanos(2_500),
+                Some("authentication_error".to_owned()),
+            ),
+            (
+                rate_limited,
+                UtcTimestamp::from_unix_nanos(3_500),
+                Some("http_429".to_owned()),
+            ),
         ] {
             record_meter_attempt_result(
                 &conn,
@@ -1322,7 +1471,7 @@ mod coverage_query_tests {
                             retry_after: Some(MonotonicDuration::from_seconds(60)),
                         }),
                     },
-                    sanitized_error_classification: None,
+                    sanitized_error_classification: classification,
                     retry_index: None,
                     clock_anomaly: false,
                 },
