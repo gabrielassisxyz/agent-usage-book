@@ -234,8 +234,25 @@ pub fn compute(inputs: &CoverageInputs) -> CoverageReport {
         .filter(|a| a.started_at >= start && a.started_at < end && a.result.is_none())
         .count() as u64;
 
-    let no_attempt_gaps = gaps(start, end, &attempt_times);
-    let no_observation_gaps = gaps(start, end, &observation_times);
+    // A no-attempt or no-observation gap starts no earlier than the policy's own
+    // covered span: the head before the account's first snapshot was never a
+    // sampling opportunity, so it must not silently inflate a gap presented as a
+    // sampling failure. With no snapshot anywhere in the interval the whole span
+    // is already reported as `policy_unknown`, and the gap falls back to the raw
+    // interval start.
+    let gap_start = policy_covered_start(start, end, &snapshots).unwrap_or(start);
+    let attempt_gap_times: Vec<UtcTimestamp> = attempt_times
+        .iter()
+        .copied()
+        .filter(|t| *t >= gap_start)
+        .collect();
+    let observation_gap_times: Vec<UtcTimestamp> = observation_times
+        .iter()
+        .copied()
+        .filter(|t| *t >= gap_start)
+        .collect();
+    let no_attempt_gaps = gaps(gap_start, end, &attempt_gap_times);
+    let no_observation_gaps = gaps(gap_start, end, &observation_gap_times);
     let reset_spanning_gaps = reset_spanning_gaps(&resets, &no_attempt_gaps, &snapshots);
     let severe = !reset_spanning_gaps.is_empty();
 
@@ -349,6 +366,30 @@ fn merge_postponements(mut intervals: Vec<Postponement>) -> Vec<Postponement> {
     merged
 }
 
+/// The instant from which a policy snapshot covers `[instant, end)` without
+/// interruption: `start` itself when a snapshot is already in force there,
+/// otherwise the earliest snapshot that becomes effective inside the
+/// interval. `None` when no snapshot applies anywhere in `[start, end)`, the
+/// `policy_unknown` case. Shared by the denominator reconstruction and the
+/// gap computation, so both agree on where the account's history for aub
+/// begins: the span before this instant owes nothing and cannot be a
+/// sampling failure, because the account did not exist for aub yet.
+fn policy_covered_start(
+    start: UtcTimestamp,
+    end: UtcTimestamp,
+    snapshots: &[PolicySnapshot],
+) -> Option<UtcTimestamp> {
+    if cadence_at(snapshots, start).is_some() {
+        Some(start)
+    } else {
+        snapshots
+            .iter()
+            .map(|snapshot| snapshot.effective_at)
+            .filter(|effective| *effective > start && *effective < end)
+            .min()
+    }
+}
+
 /// Reconstructs the expected-opportunity denominator over the covered span,
 /// from the first snapshot `effective_at` inside or before `[start, end)` to
 /// `end`, excluding postponement intervals. `None` when no snapshot applies
@@ -361,15 +402,7 @@ fn expected_opportunities(
     snapshots: &[PolicySnapshot],
     postponements: &[Postponement],
 ) -> Option<(u64, MonotonicDuration)> {
-    let covered_start = if cadence_at(snapshots, start).is_some() {
-        start
-    } else {
-        snapshots
-            .iter()
-            .map(|snapshot| snapshot.effective_at)
-            .filter(|effective| *effective > start && *effective < end)
-            .min()?
-    };
+    let covered_start = policy_covered_start(start, end, snapshots)?;
     let covered_nanos = (end.unix_nanos() - covered_start.unix_nanos()).max(0) as u64;
     let covered_span = MonotonicDuration::from_nanos(covered_nanos);
     let mut boundaries = vec![covered_start, end];
@@ -677,7 +710,10 @@ mod tests {
 
     /// An interval whose only snapshot becomes effective mid-interval is
     /// covered from that snapshot: the head before it owes nothing because
-    /// the account did not exist for aub yet.
+    /// the account did not exist for aub yet. The head must also not
+    /// inflate the longest no-attempt gap: with no attempts anywhere, the
+    /// one gap the engine can justify runs from the snapshot to the
+    /// interval end (1,800 s), never from the raw interval start (3,600 s).
     #[test]
     fn an_interval_with_a_head_before_the_first_snapshot_covers_from_the_snapshot() {
         let report = compute(&inputs(
@@ -697,6 +733,18 @@ mod tests {
             !render(&report).contains("policy unknown"),
             "a covered tail must not read as unknown: {}",
             render(&report)
+        );
+        assert_eq!(
+            report.longest_no_attempt_gap,
+            Some(Gap {
+                start: ts(1_800),
+                end: ts(3_600)
+            }),
+            "the gap must start at the snapshot, not at the raw interval start"
+        );
+        assert_eq!(
+            report.longest_no_attempt_gap.unwrap().duration(),
+            MonotonicDuration::from_seconds(1_800)
         );
     }
 
@@ -726,6 +774,12 @@ mod tests {
             report.attempt_coverage.unwrap().as_f64(),
             1.0,
             "144 attempts against 144 owed must read 100%"
+        );
+        assert_eq!(
+            report.longest_no_attempt_gap.unwrap().duration(),
+            MonotonicDuration::from_seconds(300),
+            "every gap between two attempts on the grid is exactly one cadence, \
+             including the tail to the interval end; there is no larger gap to find"
         );
     }
 
@@ -853,6 +907,18 @@ mod tests {
         let report = compute(&report_inputs);
         assert_eq!(report.reset_spanning_gaps.len(), 1);
         assert!(report.severe, "a reset inside a hole must be severe");
+        assert_eq!(
+            report.longest_no_attempt_gap,
+            Some(Gap {
+                start: ts(300),
+                end: ts(3_000)
+            }),
+            "the longest gap is between the two attempts that bracket the hole"
+        );
+        assert_eq!(
+            report.longest_no_attempt_gap.unwrap().duration(),
+            MonotonicDuration::from_seconds(2_700)
+        );
     }
 
     /// Two reset instants one second apart count as one reset: consecutive
