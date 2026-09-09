@@ -29,9 +29,7 @@ use super::meter_evidence::{
 use super::sample_run::{self, SampleRunId, Trigger};
 use super::sampling_lease::{self, AccountName, LeaseHolder, LeaseOutcome};
 use super::sampling_policy_snapshot::{ResolvedSamplingPolicy, SamplingPolicySnapshotId};
-use super::subscription_identity::{
-    self, NewSubscriptionChange, StoredSubscriptionChange,
-};
+use super::subscription_identity::{self, NewSubscriptionChange, StoredSubscriptionChange};
 use super::window_anomaly::{self, StoredWindowAnomaly};
 
 /// Opens repository operations against one ledger database under one pragma policy.

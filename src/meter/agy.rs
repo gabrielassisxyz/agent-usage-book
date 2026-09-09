@@ -290,8 +290,7 @@ fn parse_401_auth_reason(_body: &[u8]) -> AuthReason {
 /// credential byte survives into the persisted comparison. An unrecognized
 /// shape or an empty refresh token yields `None`: absent never blocks.
 fn agy_subscription_identity(credential: &CredentialHandle) -> Option<String> {
-    let value: serde_json::Value =
-        serde_json::from_str(credential.expose().trim()).ok()?;
+    let value: serde_json::Value = serde_json::from_str(credential.expose().trim()).ok()?;
     let refresh = value
         .get("token")?
         .get("refresh_token")?

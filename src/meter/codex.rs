@@ -2464,13 +2464,12 @@ mod tests {
     fn subscription_identity_survives_a_token_rotation_for_the_same_account() {
         // Rotating the access token under the same id_token is the same
         // subscription: the identity must compare equal.
-        let fixture_token = serde_json::from_str::<serde_json::Value>(
-            &String::from_utf8(FIXTURE_AUTH.to_vec()).unwrap(),
-        )
-        .unwrap()["tokens"]["id_token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let fixture_token =
+            serde_json::from_str::<serde_json::Value>(core::str::from_utf8(FIXTURE_AUTH).unwrap())
+                .unwrap()["tokens"]["id_token"]
+                .as_str()
+                .unwrap()
+                .to_string();
         let before = test_adapter()
             .subscription_identity(&subscription_credential(&fixture_token, "access-one"));
         let after = test_adapter()
@@ -2482,17 +2481,18 @@ mod tests {
     fn subscription_identity_changes_with_the_account() {
         // Two logins on the same plan still compare different: the email
         // digest is what keeps same-plan swaps detectable here.
-        let fixture_token = serde_json::from_str::<serde_json::Value>(
-            &String::from_utf8(FIXTURE_AUTH.to_vec()).unwrap(),
-        )
-        .unwrap()["tokens"]["id_token"]
-            .as_str()
-            .unwrap()
-            .to_string();
+        let fixture_token =
+            serde_json::from_str::<serde_json::Value>(core::str::from_utf8(FIXTURE_AUTH).unwrap())
+                .unwrap()["tokens"]["id_token"]
+                .as_str()
+                .unwrap()
+                .to_string();
         let before = test_adapter()
             .subscription_identity(&subscription_credential(&fixture_token, "access-one"));
-        let after = test_adapter()
-            .subscription_identity(&subscription_credential(SECOND_ACCOUNT_ID_TOKEN, "access-one"));
+        let after = test_adapter().subscription_identity(&subscription_credential(
+            SECOND_ACCOUNT_ID_TOKEN,
+            "access-one",
+        ));
         assert_ne!(before, after);
     }
 

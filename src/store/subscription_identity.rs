@@ -102,14 +102,15 @@ fn row_to_change(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredSubscription
     Ok(StoredSubscriptionChange {
         row_id: SubscriptionChangeRowId::new(row.get("id")?),
         account_id: AccountId::new(row.get("account_id")?),
-        kind: SubscriptionChangeKind::from_sql(row.get::<_, String>("kind")?.as_str())
-            .map_err(|_| {
+        kind: SubscriptionChangeKind::from_sql(row.get::<_, String>("kind")?.as_str()).map_err(
+            |_| {
                 rusqlite::Error::FromSqlConversionFailure(
                     2,
                     rusqlite::types::Type::Text,
                     "unknown subscription change kind".into(),
                 )
-            })?,
+            },
+        )?,
         previous_identity: row.get("previous_identity")?,
         current_identity: row.get("current_identity")?,
         detecting_attempt_id: MeterAttemptRowId::new(row.get("detecting_attempt_id")?),
@@ -311,7 +312,7 @@ mod tests {
         }
     }
 
-    fn reopen(database_path: &PathBuf) -> rusqlite::Connection {
+    fn reopen(database_path: &std::path::Path) -> rusqlite::Connection {
         open(database_path, AccessMode::ReadWrite, &policy()).unwrap()
     }
 

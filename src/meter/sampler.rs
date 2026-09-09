@@ -419,7 +419,10 @@ enum SubscriptionGate {
     Establish(String),
     /// A different subscription than established: refuse, record the change
     /// from the established identity to this one.
-    Refuse { current: String, established: String },
+    Refuse {
+        current: String,
+        established: String,
+    },
 }
 
 /// Stage 1's per-account outcome.
@@ -884,7 +887,11 @@ where
                     Ok(gate) => gate,
                     Err(error) => return persist_error(error),
                 };
-                if let SubscriptionGate::Refuse { current, established } = &gate {
+                if let SubscriptionGate::Refuse {
+                    current,
+                    established,
+                } = &gate
+                {
                     return self.commit_refusal(
                         item,
                         received_at,
@@ -1040,7 +1047,10 @@ where
             // against. Nothing is refused for having no history.
             None => Ok(SubscriptionGate::Establish(current)),
             Some(known) if known == current => Ok(SubscriptionGate::Store),
-            Some(established) => Ok(SubscriptionGate::Refuse { current, established }),
+            Some(established) => Ok(SubscriptionGate::Refuse {
+                current,
+                established,
+            }),
         }
     }
 
@@ -1084,13 +1094,15 @@ where
             retry_index: None,
             clock_anomaly: false,
         };
-        let sampled = |publication: Publication| AccountDisposition::Sampled(SampledAttempt {
-            attempt_id,
-            outcome,
-            observation_committed: false,
-            publication,
-            window_anomalies: Vec::new(),
-        });
+        let sampled = |publication: Publication| {
+            AccountDisposition::Sampled(SampledAttempt {
+                attempt_id,
+                outcome,
+                observation_committed: false,
+                publication,
+                window_anomalies: Vec::new(),
+            })
+        };
         let latest = match self.repository.latest_subscription_change(item.account_id) {
             Ok(latest) => latest,
             Err(error) => return persist_error(error),
@@ -1105,8 +1117,7 @@ where
                 Err(error) => persist_error(error),
             };
         }
-        let previous_observation_id = match self.repository.newest_observation_id(item.account_id)
-        {
+        let previous_observation_id = match self.repository.newest_observation_id(item.account_id) {
             Ok(id) => id,
             Err(error) => return persist_error(error),
         };
@@ -1119,7 +1130,10 @@ where
             previous_observation_id,
             detected_at: received_at,
         };
-        match self.repository.commit_subscription_refusal(&result, &change) {
+        match self
+            .repository
+            .commit_subscription_refusal(&result, &change)
+        {
             Ok(publication) => sampled(publication),
             Err(error) => persist_error(error),
         }
@@ -3163,7 +3177,9 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
     /// An Antigravity token file: the access token rotates on refresh while
     /// the refresh token stays stable (`crate::auth::antigravity_credentials`).
     fn agy_material(access: &str, refresh: &str, expiry: &str) -> String {
-        format!(r#"{{"token":{{"access_token":"{access}","refresh_token":"{refresh}","expiry":"{expiry}"}}}}"#)
+        format!(
+            r#"{{"token":{{"access_token":"{access}","refresh_token":"{refresh}","expiry":"{expiry}"}}}}"#
+        )
     }
 
     fn forced_anthropic_account(name: &str, material: &str) -> BatchAccount<AnthropicAdapter> {
@@ -3218,10 +3234,7 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
         .expect("the batch must run")
     }
 
-    fn terminal_result_for(
-        database_path: &Path,
-        attempt: AttemptId,
-    ) -> StoredMeterAttemptResult {
+    fn terminal_result_for(database_path: &Path, attempt: AttemptId) -> StoredMeterAttemptResult {
         let conn = open(database_path, AccessMode::ReadOnly, &policy()).unwrap();
         meter_attempt::result_by_attempt_id(&conn, row_id_of(attempt).unwrap())
             .unwrap()
@@ -3437,9 +3450,7 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
             .ensure_account("anthropic", "identityless", clock.now())
             .unwrap();
         assert_eq!(
-            repository
-                .latest_subscription_change(account_id)
-                .unwrap(),
+            repository.latest_subscription_change(account_id).unwrap(),
             None,
             "an account that cannot name its subscription leaves no history"
         );

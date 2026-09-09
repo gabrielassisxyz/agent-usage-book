@@ -497,13 +497,15 @@ impl ProviderAdapter for AnyAdapter {
     ) -> CapturedProviderResponse<Reading> {
         match self {
             AnyAdapter::Anthropic(adapter) => {
-                let captured = adapter.observe_with_evidence(credential, request, transport, clock);                CapturedProviderResponse {
+                let captured = adapter.observe_with_evidence(credential, request, transport, clock);
+                CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::Anthropic),
                     evidence: captured.evidence,
                     failed_body: captured.failed_body,
                     failed_error: captured.failed_error,
                 }
-            }            AnyAdapter::OpenCode(adapter) => {
+            }
+            AnyAdapter::OpenCode(adapter) => {
                 let captured = adapter.observe_with_evidence(credential, request, transport, clock);
                 CapturedProviderResponse {
                     observation: map_observation(captured.observation, Reading::OpenCode),

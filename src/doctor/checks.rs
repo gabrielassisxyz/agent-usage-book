@@ -1340,14 +1340,15 @@ fn subscription_identity_change(ctx: &DoctorContext) -> CheckOutcome {
                         continue;
                     }
                     let previous = event.previous_identity.as_deref().unwrap_or("<unknown>");
-                    let resumed_after = match crate::store::meter_evidence::newest_observation_for_account(
-                        conn, id,
-                    ) {
-                        Ok(Some(observation)) => {
-                            observation.received_at.unix_nanos() > event.detected_at.unix_nanos()
-                        }
-                        Ok(None) | Err(_) => false,
-                    };
+                    let resumed_after =
+                        match crate::store::meter_evidence::newest_observation_for_account(conn, id)
+                        {
+                            Ok(Some(observation)) => {
+                                observation.received_at.unix_nanos()
+                                    > event.detected_at.unix_nanos()
+                            }
+                            Ok(None) | Err(_) => false,
+                        };
                     if resumed_after {
                         resumed.push(format!(
                             "{}: subscription changed from '{}' to '{}' (change id={}), readings under the established subscription resumed after it",
@@ -2426,7 +2427,6 @@ mod tests {
     /// account's newest history row refuses its readings, passes quietly
     /// with no history, and passes with a historical note once readings
     /// under the established subscription resumed.
-
     fn subscription_test_config(state_dir: &std::path::Path) -> Config {
         let env = RealEnv;
         let toml = format!(
@@ -2455,10 +2455,20 @@ mod tests {
             ResolvedSamplingPolicy, resolve_policy_snapshot,
         };
 
-        let account = observe_account(conn, "anthropic", "primary", UtcTimestamp::from_unix_nanos(10))
-            .expect("account must insert");
-        let run = start_sample_run(conn, Trigger::Manual, UtcTimestamp::from_unix_nanos(10), "seed")
-            .expect("sample run must insert");
+        let account = observe_account(
+            conn,
+            "anthropic",
+            "primary",
+            UtcTimestamp::from_unix_nanos(10),
+        )
+        .expect("account must insert");
+        let run = start_sample_run(
+            conn,
+            Trigger::Manual,
+            UtcTimestamp::from_unix_nanos(10),
+            "seed",
+        )
+        .expect("sample run must insert");
         let snapshot = resolve_policy_snapshot(
             conn,
             account,
@@ -2561,7 +2571,14 @@ mod tests {
         .expect("a fresh ledger must open and migrate");
         let (account, first, second) = seeded_subscription_parents(&conn);
         record_established(&conn, account, first, "anthropic:max:tier", 30);
-        record_changed(&conn, account, second, "anthropic:max:tier", "anthropic:pro:tier", 50);
+        record_changed(
+            &conn,
+            account,
+            second,
+            "anthropic:max:tier",
+            "anthropic:pro:tier",
+            50,
+        );
         ctx.db = Some(&conn);
         let outcome = subscription_identity_change(&ctx);
         match outcome.status {
@@ -2569,9 +2586,17 @@ mod tests {
                 assert!(message.contains("primary"), "{message}");
                 assert!(message.contains("anthropic:pro:tier"), "{message}");
             }
-            other => panic!("a refused change must fail, got {other:?}"),
+            CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!("a refused change must fail, got {:?}", outcome.status)
+            }
         }
-        assert!(!outcome.has_repair, "no repair can acknowledge a subscription");
+        assert!(
+            !outcome.has_repair,
+            "no repair can acknowledge a subscription"
+        );
     }
 
     #[test]
@@ -2612,7 +2637,14 @@ mod tests {
         .expect("a fresh ledger must open and migrate");
         let (account, first, second) = seeded_subscription_parents(&conn);
         record_established(&conn, account, first, "anthropic:max:tier", 30);
-        record_changed(&conn, account, second, "anthropic:max:tier", "anthropic:pro:tier", 50);
+        record_changed(
+            &conn,
+            account,
+            second,
+            "anthropic:max:tier",
+            "anthropic:pro:tier",
+            50,
+        );
         // An observation received after the change was detected.
         let evidence = crate::store::meter_evidence::insert_response_evidence(
             &conn,
@@ -2659,7 +2691,15 @@ mod tests {
                 assert!(message.contains("primary"), "{message}");
                 assert!(message.contains("resumed"), "{message}");
             }
-            other => panic!("a resumed account must pass with detail, got {other:?}"),
+            CheckStatus::Pass
+            | CheckStatus::Fail(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. } => {
+                panic!(
+                    "a resumed account must pass with detail, got {:?}",
+                    outcome.status
+                )
+            }
         }
     }
 }
