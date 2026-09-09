@@ -19,7 +19,10 @@ use crate::domain::interval::Interval;
 use crate::domain::money::Usd;
 use crate::domain::provenance::{CostModelId, DerivationId, RateCardId, WindowCalibrationId};
 use crate::domain::quota::{PercentagePoints, QuotaRemaining, QuotaUsed};
-use crate::domain::time::{MonotonicDuration, UtcDate, UtcTimestamp};
+use crate::domain::time::{
+    Age, ClockSkewEnvelope, MonotonicDuration, UtcDate, UtcTimestamp, age,
+};
+use crate::domain::freshness::Observed;
 use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowResetState,
@@ -146,6 +149,13 @@ pub struct MeterAccount {
     /// under the account name. `None` for `aub now` and for reports assembled
     /// without configuration.
     pub provider: Option<String>,
+    /// How old the reading's observation was at the report instant, computed
+    /// through the same measurement basis the freshness verdict was derived
+    /// from, so the age and the verdict can never disagree about which
+    /// instant the reading came from. `None` when no successful observation
+    /// stands behind the reading, and when the observation's instants are a
+    /// clock anomaly the freshness machine already reports.
+    pub observation_age: Option<Age>,
 }
 
 impl MeterAccount {
@@ -160,6 +170,7 @@ impl MeterAccount {
             burn_rate: None,
             windows: Vec::new(),
             provider: None,
+            observation_age: None,
         }
     }
 
@@ -182,6 +193,7 @@ impl MeterAccount {
             burn_rate: None,
             windows: Vec::new(),
             provider: None,
+            observation_age: None,
         }
     }
 
@@ -203,6 +215,34 @@ impl MeterAccount {
     pub fn with_provider(mut self, provider: impl Into<String>) -> Self {
         self.provider = Some(provider.into());
         self
+    }
+
+    /// Computes and attaches the reading observation's age at `now`, through
+    /// the same measurement basis the freshness verdict was derived from.
+    /// A reading with no observation behind it keeps `None`.
+    pub fn with_observation_age_at(mut self, now: UtcTimestamp, envelope: ClockSkewEnvelope) -> Self {
+        self.observation_age = Self::reading_observation(&self.reading).and_then(|observed| {
+            age(
+                observed.provider_observed_at(),
+                observed.received_at(),
+                observed.measurement_basis(),
+                now,
+                envelope,
+            )
+            .ok()
+        });
+        self
+    }
+
+    /// The observation a reading's freshness verdict was computed over: the
+    /// fresh variant's own observation, else the last good reading the stale
+    /// and auth-required variants carry, when one exists.
+    fn reading_observation(freshness: &Freshness<QuotaRemaining>) -> Option<&Observed<QuotaRemaining>> {
+        match freshness {
+            Freshness::Fresh { observed, .. } => Some(observed),
+            Freshness::Stale { last_good, .. } => last_good.as_ref(),
+            Freshness::AuthRequired { last_good, .. } => last_good.as_ref(),
+        }
     }
 
     /// The window this account is most constrained by, derived from

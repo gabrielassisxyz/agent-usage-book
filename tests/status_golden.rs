@@ -208,7 +208,11 @@ fn status_account(projected: &ProjectedAccount, clock: &FakeClock) -> MeterAccou
         reading.included_scopes,
         None,
     )
-    .with_provider(projected.provider.clone());
+    .with_provider(projected.provider.clone())
+    // The same age computation `cli::projection_accounts` performs: the
+    // observation's own age through the same measurement basis the verdict
+    // used, at the same instant (aub-yg2q).
+    .with_observation_age_at(clock.now(), skew);
     if let Some(observed) = projected.last_successful_observation.as_ref() {
         let windows = observed
             .windows
@@ -515,11 +519,17 @@ fn reset_labels_render_local_and_not_started() {
 }
 
 /// A never-observed account renders the freshness answer under its header, not
-/// a fabricated grid.
+/// a fabricated grid. The header names no age: there is no observation to
+/// age, and inventing one would be the fabricated value this answer exists to
+/// prevent.
 #[test]
 fn never_successfully_observed_renders_the_freshness_answer() {
     let rendered = render(&seeded_report(vec![account("primary", None, None)]));
     assert!(rendered.contains("  primary  anthropic\n    ? · stale · no successful sample"));
+    assert!(
+        !rendered.contains("observed "),
+        "no observation, no age: {rendered}"
+    );
 }
 
 /// An auth-required account renders `auth!` and no rows.
@@ -542,13 +552,15 @@ fn auth_required_renders_the_marker() {
         )),
     )]));
     assert!(
-        rendered.contains("  primary  anthropic\n    auth!"),
+        rendered.contains("  primary  anthropic · observed 5m ago\n    auth!"),
         "{rendered}"
     );
 }
 
 /// A stale block carries `cached <age> ago` and the explain block still
-/// follows the grid unchanged in content.
+/// follows the grid unchanged in content. The header names the same
+/// observation's age at a glance, so the age is on the block even before the
+/// first row.
 #[test]
 fn stale_block_notes_the_cache_age_and_explain_still_appends() {
     let projected = account(
@@ -572,6 +584,10 @@ fn stale_block_notes_the_cache_age_and_explain_still_appends() {
     let report = seeded_report(vec![projected]);
     let plain = render(&report);
     assert!(plain.contains("cached 14m ago"), "{plain}");
+    assert!(
+        plain.contains("  primary  anthropic · observed 14m ago\n"),
+        "the header names the age at a glance: {plain}"
+    );
 
     pin_local_zone();
     let explained = render_status_report_with_explain(
@@ -583,6 +599,64 @@ fn stale_block_notes_the_cache_age_and_explain_still_appends() {
     );
     assert!(explained.contains("meter explain:"), "{explained}");
     assert!(explained.contains("provider contract: contract-v1"));
+}
+
+/// The rendered age and the freshness verdict are derived from one instant
+/// (aub-yg2q): the same observation, through the same measurement basis, at
+/// the same clock. Moving the clock across the freshness horizon flips the
+/// verdict and ages the header together — a fresh reading one side, a stale
+/// one with a larger age on the other. A rendering that aged a different
+/// instant than the verdict was computed over would leave one of the two
+/// assertions behind.
+#[test]
+fn the_age_and_the_verdict_move_together_across_the_horizon() {
+    let (fresh_horizon, command, skew) = horizon();
+    // Observed ten minutes before NOW, against a 12-minute horizon: fresh.
+    let projected = account(
+        "primary",
+        Some(success_observation(
+            vec![account_wide(380_000, 5 * 3_600, 3 * 3_600)],
+            10 * 60,
+        )),
+        Some(latest_attempt(10 * 60, success(10 * 60))),
+    );
+
+    let fresh_clock = clock();
+    let fresh_report = report_with(
+        vec![status_account(&projected, &fresh_clock)],
+        ProjectionReadState::Read,
+    );
+    let fresh_rendered = render(&fresh_report);
+    assert!(
+        fresh_rendered.contains("  primary  anthropic · observed 10m ago\n"),
+        "the fresh reading's age: {fresh_rendered}"
+    );
+    assert_eq!(
+        fresh_report.accounts[0].reading.kind(),
+        agent_usage_book::domain::freshness::FreshnessKind::Fresh,
+        "ten minutes inside the 12-minute horizon is fresh"
+    );
+
+    // The same observation, the clock moved past the horizon: the verdict
+    // flips to stale (AgeExceeded) and the header's age grows to 23 minutes
+    // — both from the one moved instant.
+    let moved_clock = FakeClock::new(agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
+        NOW_NANOS + nanos(13 * 60),
+    ));
+    assert!(13 * 60 > fresh_horizon.as_nanos() as i64 / 1_000_000_000);
+    let moved_report = report_with(
+        vec![status_account(&projected, &moved_clock)],
+        ProjectionReadState::Read,
+    );
+    let moved_rendered = render(&moved_report);
+    assert!(
+        moved_rendered.contains("  primary  anthropic · observed 23m ago\n"),
+        "the aged reading's age: {moved_rendered}"
+    );
+    assert!(
+        moved_rendered.contains("cached 23m ago · age exceeded"),
+        "the verdict aged with it: {moved_rendered}"
+    );
 }
 
 /// The projection itself being missing is still the bare question mark.

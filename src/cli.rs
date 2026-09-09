@@ -866,13 +866,13 @@ impl Command {
                 "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
+            Command::Status => Some("--refresh"),
             Command::CanRun => {
                 Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
             }
             Command::Account => Some("list | rename PROVIDER OLD NEW"),
             Command::Statusline => None,
-            Command::Status
-            | Command::LoggingFixture
+            Command::LoggingFixture
             | Command::StateCheck
             | Command::ExitClass
             | Command::AttemptCrashHook
@@ -1148,18 +1148,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         .unwrap_or(Level::DEFAULT)
         .raised_by(invocation.verbosity);
     match invocation.command {
-        Command::Status => {
-            reject_positionals(&invocation)?;
-            status(
-                &RealClock::new(),
-                level,
-                invocation.format,
-                invocation.explain,
-                invocation.no_color,
-                invocation.account.as_deref(),
-                invocation.model.as_deref(),
-            )
-        }
+        Command::Status => status(&RealClock::new(), level, &invocation),
         Command::Spend => spend(&RealClock::new(), level, &invocation),
         Command::Config => config_command(invocation.rest.into_iter().map(OsString::from)),
         Command::Export => export_command(&RealClock::new(), level, &invocation),
@@ -2044,76 +2033,7 @@ pub(crate) fn now_command(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    let mut batch_accounts = Vec::new();
-    for acc in &target_accounts {
-        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
-        if refresh.skip_account {
-            continue;
-        }
-        let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?;
-        let credential_handle =
-            crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
-        let credential_context_id = Some(resolved.context_id.as_str().to_string());
-
-        let resolved_policy = crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
-            ordinary_cadence: config.sampling.default_interval,
-            freshness_horizon: config.freshness.meter,
-            reset_edge_policy: format!(
-                "lead-{}s",
-                config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
-            ),
-            retry_backoff_policy: format!(
-                "retry-after-capped-{}s",
-                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
-            ),
-            command_budget: config.sampling.command_budget,
-            policy_algorithm_version: "v1".to_string(),
-        };
-
-        let adapter = crate::meter::adapter::adapter_for(
-            &acc.provider,
-            &acc.name,
-            &crate::meter::adapter::EndpointConfig {
-                anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
-                opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
-                codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
-            },
-        )?;
-
-        batch_accounts.push(crate::meter::sampler::BatchAccount {
-            name: crate::store::sampling_lease::AccountName::new(&acc.name),
-            provider_key: acc.provider.clone(),
-            adapter,
-            credential: credential_handle,
-            credential_context_id,
-            request: meter_request_for_account(acc, &config),
-            policy: resolved_policy,
-            reset_edge_lead: config.sampling.reset_edge_lead,
-            retry_after_cap: config.sampling.retry_after_cap,
-            forced: true,
-            adapter_version: crate::domain::ids::AdapterVersion::new(
-                crate::build_info::crate_version(),
-            ),
-            credential_refresh_classification: refresh.classification,
-        });
-    }
-
-    let orchestrator = crate::meter::sampler::SamplingOrchestrator {
-        repository: &repo,
-        transport: crate::meter::transport::BlockingTransport,
-        clock: crate::domain::time::RealClock::new(),
-        trigger: crate::store::sample_run::Trigger::Live,
-        configuration_fingerprint: "aub-v1".to_string(),
-        holder: crate::store::sampling_lease::LeaseHolder::new(format!(
-            "pid-{}",
-            std::process::id()
-        )),
-        lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
-        command_budget: config.sampling.command_budget,
-        max_concurrent_requests: config.sampling.max_concurrent_requests,
-    };
-
-    let batch_report = orchestrator.run(&batch_accounts)?;
+    let batch_report = forced_sampling_batch(&repo, &config, &target_accounts, invocation.verbosity > 0, clock)?;
 
     // A disposition that failed to record the attempt or its terminal fact is a
     // persistence failure, reported with the store class. The projection is not
@@ -3752,15 +3672,12 @@ fn status_clock_skew_envelope() -> ClockSkewEnvelope {
     ClockSkewEnvelope::new(MonotonicDuration::from_seconds(60))
 }
 
-fn status(
-    clock: &impl Clock,
-    level: Level,
-    format: OutputFormat,
-    explain: ExplainMode,
-    no_color: bool,
-    account_selector: Option<&str>,
-    model_selector: Option<&str>,
-) -> Result<(), Error> {
+fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let format = invocation.format;
+    let explain = invocation.explain;
+    let no_color = invocation.no_color;
+    let account_selector = invocation.account.as_deref();
+    let model_selector = invocation.model.as_deref();
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
     let command = LogicalName::new("status");
@@ -3773,10 +3690,30 @@ fn status(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
+    // The command's own flag: a bare `--refresh` asks for one sampling attempt
+    // per selected account before the grid renders. Anything else left in the
+    // argument surface is rejected here, where `reject_positionals` stands for
+    // every other command.
+    let mut refresh = false;
+    for arg in &invocation.rest {
+        match arg.as_str() {
+            "--refresh" => refresh = true,
+            other => {
+                return Err(Error::Usage(format!(
+                    "unknown argument: {other}; run aub --help for command usage"
+                )));
+            }
+        }
+    }
+
     // The status contract (PLAN.md section 16.2): minimal configuration
     // sufficient to locate the projection, one bounded file read, freshness
-    // computation and formatting. Nothing else runs here, which the source
-    // contract test below and the boundary rules both hold this function to.
+    // computation and formatting. Nothing else runs here by default, which the
+    // source contract test below and the boundary rules both hold this
+    // function to. The one exception is the flag-gated branch below: a
+    // `--refresh` the operator asked for takes the same forced sampling pass
+    // `aub now` takes, through the same helper; without the flag no sampling
+    // attempt is made and the command stays a read of the ledger.
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -3796,6 +3733,22 @@ fn status(
         return Err(Error::Usage(format!(
             "unknown account '{name}': status --account names a configured account"
         )));
+    }
+
+    if refresh {
+        logger
+            .emit(
+                timestamp,
+                DiagnosticEvent::RequestAttempted,
+                &[("command", &command)],
+            )
+            .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+        status_refresh_attempts(
+            &config,
+            account_selector,
+            invocation.verbosity > 0,
+            clock,
+        )?;
     }
 
     let projection_path = crate::projection::projection_path_in(&config.state.dir);
@@ -3867,6 +3820,134 @@ fn status(
     Ok(())
 }
 
+/// The flag-gated sampling pass `aub status --refresh` runs: one forced
+/// attempt per selected account through the same helper `aub now` uses, and
+/// nothing rendered here. The rendering reads the projection afterwards in
+/// [`fn status`]'s ordinary path, so an account whose attempt failed renders
+/// its last known reading with its age rather than an error, and the command
+/// without the flag never reaches this function at all.
+fn status_refresh_attempts(
+    config: &crate::config::Config,
+    account_selector: Option<&str>,
+    verbose: bool,
+    clock: &impl Clock,
+) -> Result<(), Error> {
+    let target_accounts: Vec<&crate::config::AccountConfig> = match account_selector {
+        Some(name) => config
+            .accounts
+            .iter()
+            .filter(|account| account.name == name)
+            .collect(),
+        None => config.accounts.iter().collect(),
+    };
+    if target_accounts.is_empty() {
+        return Ok(());
+    }
+
+    crate::store::startup::ensure_state_dir_ready(
+        &config.state.dir,
+        &crate::store::startup::ProcMounts,
+    )?;
+    let db_path = config
+        .state
+        .dir
+        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+    let busy_policy = crate::store::connection::PragmaPolicy {
+        busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
+    };
+    let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
+    crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
+    drop(conn);
+    let repo = crate::store::repository::Repository::new(&db_path, busy_policy);
+    forced_sampling_batch(&repo, config, &target_accounts, verbose, clock)?;
+    Ok(())
+}
+
+/// The forced sampling pass `aub now` and `aub status --refresh` share: one
+/// batch account per selected account, one forced attempt each through the
+/// sampling orchestrator, and no rendering. A per-account failure (unreachable
+/// endpoint, held lease, failed credential preflight) is a recorded disposition
+/// the caller's projection read then reflects as an unchanged reading, not a
+/// batch error; only a failure to record the run itself surfaces here.
+fn forced_sampling_batch(
+    repo: &crate::store::repository::Repository,
+    config: &crate::config::Config,
+    target_accounts: &[&crate::config::AccountConfig],
+    verbose: bool,
+    clock: &impl Clock,
+) -> Result<crate::meter::sampler::BatchReport, Error> {
+    let mut batch_accounts = Vec::new();
+    for acc in target_accounts {
+        let refresh = preflight_anthropic_refresh(acc, config, clock, verbose);
+        if refresh.skip_account {
+            continue;
+        }
+        let resolved = crate::auth::resolve(acc, &crate::auth::RealFs, verbose)?;
+        let credential_handle =
+            crate::meter::adapter::CredentialHandle::new(resolved.material.into_inner().as_str());
+        let credential_context_id = Some(resolved.context_id.as_str().to_string());
+
+        let resolved_policy = crate::store::sampling_policy_snapshot::ResolvedSamplingPolicy {
+            ordinary_cadence: config.sampling.default_interval,
+            freshness_horizon: config.freshness.meter,
+            reset_edge_policy: format!(
+                "lead-{}s",
+                config.sampling.reset_edge_lead.as_nanos() / 1_000_000_000
+            ),
+            retry_backoff_policy: format!(
+                "retry-after-capped-{}s",
+                config.sampling.retry_after_cap.as_nanos() / 1_000_000_000
+            ),
+            command_budget: config.sampling.command_budget,
+            policy_algorithm_version: "v1".to_string(),
+        };
+
+        let adapter = crate::meter::adapter::adapter_for(
+            &acc.provider,
+            &acc.name,
+            &crate::meter::adapter::EndpointConfig {
+                anthropic: std::env::var("AUB_ANTHROPIC_ENDPOINT").ok(),
+                opencode: std::env::var("AUB_OPENCODE_ENDPOINT").ok(),
+                codex: std::env::var("AUB_CODEX_ENDPOINT").ok(),
+            },
+        )?;
+
+        batch_accounts.push(crate::meter::sampler::BatchAccount {
+            name: crate::store::sampling_lease::AccountName::new(&acc.name),
+            provider_key: acc.provider.clone(),
+            adapter,
+            credential: credential_handle,
+            credential_context_id,
+            request: meter_request_for_account(acc, config),
+            policy: resolved_policy,
+            reset_edge_lead: config.sampling.reset_edge_lead,
+            retry_after_cap: config.sampling.retry_after_cap,
+            forced: true,
+            adapter_version: crate::domain::ids::AdapterVersion::new(
+                crate::build_info::crate_version(),
+            ),
+            credential_refresh_classification: refresh.classification,
+        });
+    }
+
+    let orchestrator = crate::meter::sampler::SamplingOrchestrator {
+        repository: repo,
+        transport: crate::meter::transport::BlockingTransport,
+        clock: crate::domain::time::RealClock::new(),
+        trigger: crate::store::sample_run::Trigger::Live,
+        configuration_fingerprint: "aub-v1".to_string(),
+        holder: crate::store::sampling_lease::LeaseHolder::new(format!(
+            "pid-{}",
+            std::process::id()
+        )),
+        lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
+        command_budget: config.sampling.command_budget,
+        max_concurrent_requests: config.sampling.max_concurrent_requests,
+    };
+
+    orchestrator.run(&batch_accounts)
+}
+
 /// Builds one report account per configured account from the projection's
 /// accounts, joined on the logical name. A configured account the projection
 /// says nothing about reports no reading rather than a fabricated value: the
@@ -3936,7 +4017,14 @@ fn projection_accounts(
                     reading.included_scopes,
                     model_selector.map(crate::domain::window::ModelId::new),
                 )
-                .with_provider(provider);
+                .with_provider(provider)
+                // The age of the observation the reading was computed from,
+                // through the same measurement basis the freshness verdict
+                // used, at the same instant the reading's freshness was
+                // evaluated under (aub-yg2q). The grid header and the JSON
+                // document both render it, so neither can disagree with the
+                // verdict about which instant the reading came from.
+                .with_observation_age_at(clock.now(), status_clock_skew_envelope());
                 let account = match burn_rate {
                     Some(burn_rate) => account.with_burn_rate(burn_rate),
                     None => account,
@@ -9339,11 +9427,23 @@ usage_evidence = "measured"
     /// it, so a store, transcript, calibration, rate-card or write call that
     /// joined the status path would fail here before it could block a status
     /// bar on another aub operation.
+    ///
+    /// The one named exception is the flag-gated branch (aub-yg2q): a bare
+    /// `--refresh` routes through `status_refresh_attempts`, which takes the
+    /// same forced sampling pass `aub now` takes. The scan below still holds
+    /// the default path to the read-only contract — without the flag the
+    /// command references no sampling helper at all — and the behaviour (no
+    /// attempt without the flag, exactly one attempt with it) is owned by the
+    /// integration and end-to-end suites, which run the real binary.
     #[test]
     fn the_status_function_performs_only_the_status_contract() {
         let source = include_str!("cli.rs");
         // The status path is fn status and the helpers it alone uses, so the
         // scan covers the bodies that carry its work, not just its own text.
+        // The refresh branch (`status_refresh_attempts`, sharing
+        // `forced_sampling_batch` with `now`) is deliberately not scanned: it
+        // is the sampling path the operator explicitly asked for, and the
+        // default path's contract is what this scan protects.
         let status_body = [
             function_body(source, "fn status("),
             function_body(source, "fn projection_accounts("),
