@@ -229,7 +229,7 @@ fn auth_required_exits_zero() {
     let (code, stdout, _) = env.run(&["status"]);
     assert_eq!(code, 0, "status must exit zero for an auth-required state");
     assert!(
-        stdout.contains("  work-primary  anthropic\n    auth!"),
+        stdout.contains("  work-primary  anthropic · observed 5m ago\n    auth!"),
         "{stdout}"
     );
 }
