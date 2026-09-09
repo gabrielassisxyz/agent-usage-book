@@ -2033,7 +2033,13 @@ pub(crate) fn now_command(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    let batch_report = forced_sampling_batch(&repo, &config, &target_accounts, invocation.verbosity > 0, clock)?;
+    let batch_report = forced_sampling_batch(
+        &repo,
+        &config,
+        &target_accounts,
+        invocation.verbosity > 0,
+        clock,
+    )?;
 
     // A disposition that failed to record the attempt or its terminal fact is a
     // persistence failure, reported with the store class. The projection is not
@@ -3743,12 +3749,7 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
                 &[("command", &command)],
             )
             .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-        status_refresh_attempts(
-            &config,
-            account_selector,
-            invocation.verbosity > 0,
-            clock,
-        )?;
+        status_refresh_attempts(&config, account_selector, invocation.verbosity > 0, clock)?;
     }
 
     let projection_path = crate::projection::projection_path_in(&config.state.dir);
@@ -9431,8 +9432,8 @@ usage_evidence = "measured"
     /// The one named exception is the flag-gated branch (aub-yg2q): a bare
     /// `--refresh` routes through `status_refresh_attempts`, which takes the
     /// same forced sampling pass `aub now` takes. The scan below still holds
-    /// the default path to the read-only contract — without the flag the
-    /// command references no sampling helper at all — and the behaviour (no
+    /// the default path to the read-only contract: without the flag the
+    /// command references no sampling helper at all, and the behaviour (no
     /// attempt without the flag, exactly one attempt with it) is owned by the
     /// integration and end-to-end suites, which run the real binary.
     #[test]

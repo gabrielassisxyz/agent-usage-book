@@ -604,7 +604,7 @@ fn stale_block_notes_the_cache_age_and_explain_still_appends() {
 /// The rendered age and the freshness verdict are derived from one instant
 /// (aub-yg2q): the same observation, through the same measurement basis, at
 /// the same clock. Moving the clock across the freshness horizon flips the
-/// verdict and ages the header together — a fresh reading one side, a stale
+/// verdict and ages the header together: a fresh reading one side, a stale
 /// one with a larger age on the other. A rendering that aged a different
 /// instant than the verdict was computed over would leave one of the two
 /// assertions behind.
@@ -638,11 +638,11 @@ fn the_age_and_the_verdict_move_together_across_the_horizon() {
     );
 
     // The same observation, the clock moved past the horizon: the verdict
-    // flips to stale (AgeExceeded) and the header's age grows to 23 minutes
-    // — both from the one moved instant.
-    let moved_clock = FakeClock::new(agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(
-        NOW_NANOS + nanos(13 * 60),
-    ));
+    // flips to stale (AgeExceeded) and the header's age grows to 23 minutes,
+    // both from the one moved instant.
+    let moved_clock = FakeClock::new(
+        agent_usage_book::domain::time::UtcTimestamp::from_unix_nanos(NOW_NANOS + nanos(13 * 60)),
+    );
     assert!(13 * 60 > fresh_horizon.as_nanos() as i64 / 1_000_000_000);
     let moved_report = report_with(
         vec![status_account(&projected, &moved_clock)],

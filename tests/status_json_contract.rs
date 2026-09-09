@@ -291,7 +291,9 @@ fn the_observation_age_is_machine_readable_beside_the_freshness_variant() {
             observed: Observed::new(
                 QuotaRemaining::new(QuotaFractionPpm::new(380_000).unwrap()),
                 None,
-                ReceivedAt::new(UtcTimestamp::from_unix_nanos(2_000_000_000_000 - 120_000_000_000)),
+                ReceivedAt::new(UtcTimestamp::from_unix_nanos(
+                    2_000_000_000_000 - 120_000_000_000,
+                )),
                 MeasurementBasis::LocallyReceived,
             ),
             latest_attempt: AttemptId::new(1),

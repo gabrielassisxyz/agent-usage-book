@@ -2566,10 +2566,7 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
     // by the field's absence otherwise, the same convention `included_scopes`
     // uses.
     if let Some(age) = account.observation_age {
-        fields.push(format!(
-            "\"observation_age_nanos\":{}",
-            age.as_nanos()
-        ));
+        fields.push(format!("\"observation_age_nanos\":{}", age.as_nanos()));
     }
     // The included scopes travel only when the reading included windows: an
     // account with no window context carries the fact by the field's absence
@@ -3300,7 +3297,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 3,
+                "schema": 4,
                 "command": "spend",
                 "error": {
                     "code": "INVALID_USAGE",
@@ -3316,7 +3313,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 3,
+                "schema": 4,
                 "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
             })
         );

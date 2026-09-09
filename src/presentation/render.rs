@@ -608,9 +608,9 @@ fn status_reset_label(window: &crate::report::StatusWindow) -> String {
 
 /// `cached <age> ago · <reason>` for a stale block: the age of the observation
 /// the window was read from, then why the reader would not call it fresh.
-/// The age is the account's own carried one — the same value the header
+/// The age is the account's own carried one, the same value the header
 /// renders, computed through the same measurement basis the freshness verdict
-/// used — so the block cannot disagree with itself about how old the reading
+/// used, so the block cannot disagree with itself about how old the reading
 /// is. The reason is dropped only when the observation is not itself stale.
 fn status_cached_note(
     account: &crate::report::MeterAccount,
@@ -619,7 +619,8 @@ fn status_cached_note(
     let age = account.observation_age?;
     let reason = match &window.observation {
         Freshness::Stale { reason, .. } => Some(render_stale_reason(*reason)),
-        Freshness::Fresh { .. } | Freshness::AuthRequired { .. } => None,
+        Freshness::Fresh { .. } => None,
+        Freshness::AuthRequired { .. } => None,
     };
     let mut note = format!("cached {} ago", render_status_compound_age(age));
     if let Some(reason) = reason {
@@ -3550,6 +3551,9 @@ mod tests {
             None,
         )
         .with_provider("anthropic")
+        // The row note renders the carried age, so the stale block must carry
+        // it the way the projection loop does.
+        .with_observation_age_at(now(), envelope())
         .with_windows(vec![window]);
 
         let plain = render_status_report(
@@ -3594,6 +3598,7 @@ mod tests {
                     None,
                 )
                 .with_provider("anthropic")
+                .with_observation_age_at(now(), envelope())
                 .with_windows(vec![window])
             }]),
             now(),
@@ -3648,7 +3653,7 @@ mod tests {
 
     /// Every account block's header names the age of the observation it
     /// renders (aub-yg2q), in the compound form the grid reads at a glance:
-    /// seconds, minutes, hours — never a timestamp to subtract. A block with
+    /// seconds, minutes, hours, never a timestamp to subtract. A block with
     /// no successful observation names no age, because there is no instant to
     /// render and the freshness answer below the header already says so. The
     /// age is computed through the same `measurement_basis` the freshness
@@ -3692,7 +3697,9 @@ mod tests {
             Freshness::Stale {
                 last_good: Some(observed(
                     620_000,
-                    UtcTimestamp::from_unix_nanos(now().unix_nanos() - 3 * 3_600 * NANOS_PER_SECOND),
+                    UtcTimestamp::from_unix_nanos(
+                        now().unix_nanos() - 3 * 3_600 * NANOS_PER_SECOND,
+                    ),
                 )),
                 latest_attempt: AttemptId::new(3),
                 reason: StaleReason::AgeExceeded,
@@ -3710,9 +3717,38 @@ mod tests {
         )
         .with_provider("anthropic")
         .with_observation_age_at(now(), envelope());
+        // A provider-observed reading: the basis the freshness machine used
+        // picks the provider's own instant (42s ago), not the later receive
+        // instant (12s ago). An age computed off the receive time instead of
+        // the observation's basis would render 12s here and disagree with the
+        // verdict about which instant the reading came from.
+        let provider_based = MeterAccount::new(
+            LogicalName::new("prov"),
+            Freshness::Fresh {
+                observed: Observed::new(
+                    remaining(620_000),
+                    Some(crate::domain::time::ProviderObservedAt::new(
+                        UtcTimestamp::from_unix_nanos(now().unix_nanos() - 42 * NANOS_PER_SECOND),
+                    )),
+                    ReceivedAt::new(UtcTimestamp::from_unix_nanos(
+                        now().unix_nanos() - 12 * NANOS_PER_SECOND,
+                    )),
+                    MeasurementBasis::ProviderObserved,
+                ),
+                latest_attempt: AttemptId::new(5),
+            },
+        )
+        .with_provider("anthropic")
+        .with_observation_age_at(now(), envelope());
 
         let rendered = render_status_report(
-            &grid_report(vec![seconds_old, minutes_old, hours_old, never]),
+            &grid_report(vec![
+                seconds_old,
+                minutes_old,
+                hours_old,
+                never,
+                provider_based,
+            ]),
             now(),
             envelope(),
             Style::plain(),
@@ -3732,6 +3768,11 @@ mod tests {
         assert!(
             rendered.contains("  never  anthropic\n"),
             "no observation, no age: {rendered}"
+        );
+        assert!(
+            rendered.contains("  prov  anthropic · observed 42s ago"),
+            "a provider-observed reading is aged from the basis the verdict used, \
+             not from the receive instant: {rendered}"
         );
     }
 

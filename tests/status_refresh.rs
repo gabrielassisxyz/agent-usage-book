@@ -38,7 +38,8 @@ impl Environment {
     /// Two anthropic accounts under an isolated `HOME`, state and credential
     /// tree, so account selection can be observed in the attempt count.
     fn new(tag: &str) -> Self {
-        let root = std::env::temp_dir().join(format!("aub-status-refresh-{tag}-{}", std::process::id()));
+        let root =
+            std::env::temp_dir().join(format!("aub-status-refresh-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("home")).unwrap();
         std::fs::create_dir_all(root.join("state-parent/state")).unwrap();
@@ -139,7 +140,10 @@ fn refresh_takes_exactly_one_attempt_for_the_selected_account_and_renders_it() {
     // count is asserted after the first one only.
     let server = success_server(2);
 
-    let refreshed = env.run(&server.url(), &["status", "--refresh", "--account", "work-a"]);
+    let refreshed = env.run(
+        &server.url(),
+        &["status", "--refresh", "--account", "work-a"],
+    );
     assert_eq!(
         refreshed.code, 0,
         "status --refresh must exit 0: {}",
@@ -178,9 +182,20 @@ fn refresh_takes_exactly_one_attempt_for_the_selected_account_and_renders_it() {
     // variant, and the schema moved with the field set.
     let json = env.run(
         &server.url(),
-        &["status", "--refresh", "--account", "work-a", "--format", "json"],
+        &[
+            "status",
+            "--refresh",
+            "--account",
+            "work-a",
+            "--format",
+            "json",
+        ],
     );
-    assert_eq!(json.code, 0, "status --refresh --format json: {}", json.stderr);
+    assert_eq!(
+        json.code, 0,
+        "status --refresh --format json: {}",
+        json.stderr
+    );
     let parsed: serde_json::Value = serde_json::from_str(json.stdout.trim()).unwrap();
     assert_eq!(parsed["schema"], 4);
     let account = &parsed["accounts"][0];
@@ -193,7 +208,7 @@ fn refresh_takes_exactly_one_attempt_for_the_selected_account_and_renders_it() {
 }
 
 /// Without `--refresh` the command takes no sampling attempt: the default
-/// stays a read of the ledger. The planted negative is the attempt count — a
+/// stays a read of the ledger. The planted negative is the attempt count: a
 /// status that sampled on its own would grow it.
 #[test]
 fn plain_status_takes_no_sampling_attempt() {
@@ -212,7 +227,11 @@ fn plain_status_takes_no_sampling_attempt() {
     assert_eq!(evidence, 2);
 
     let status = env.run(UNREACHABLE, &["status"]);
-    assert_eq!(status.code, 0, "plain status must exit 0: {}", status.stderr);
+    assert_eq!(
+        status.code, 0,
+        "plain status must exit 0: {}",
+        status.stderr
+    );
     assert!(
         status.stdout.contains("  work-a  "),
         "plain status renders the stored reading: {}",

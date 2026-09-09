@@ -14,15 +14,13 @@ use crate::domain::attempt::AttemptOutcome;
 use crate::domain::burn_rate::BurnRate;
 use crate::domain::credits::Credits;
 use crate::domain::freshness::Freshness;
+use crate::domain::freshness::Observed;
 use crate::domain::ids::{NativeRunId, ProviderContractId};
 use crate::domain::interval::Interval;
 use crate::domain::money::Usd;
 use crate::domain::provenance::{CostModelId, DerivationId, RateCardId, WindowCalibrationId};
 use crate::domain::quota::{PercentagePoints, QuotaRemaining, QuotaUsed};
-use crate::domain::time::{
-    Age, ClockSkewEnvelope, MonotonicDuration, UtcDate, UtcTimestamp, age,
-};
-use crate::domain::freshness::Observed;
+use crate::domain::time::{Age, ClockSkewEnvelope, MonotonicDuration, UtcDate, UtcTimestamp, age};
 use crate::domain::tokens::{TokenCount, UsageVector};
 use crate::domain::window::{
     ModelId, NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowResetState,
@@ -220,7 +218,11 @@ impl MeterAccount {
     /// Computes and attaches the reading observation's age at `now`, through
     /// the same measurement basis the freshness verdict was derived from.
     /// A reading with no observation behind it keeps `None`.
-    pub fn with_observation_age_at(mut self, now: UtcTimestamp, envelope: ClockSkewEnvelope) -> Self {
+    pub fn with_observation_age_at(
+        mut self,
+        now: UtcTimestamp,
+        envelope: ClockSkewEnvelope,
+    ) -> Self {
         self.observation_age = Self::reading_observation(&self.reading).and_then(|observed| {
             age(
                 observed.provider_observed_at(),
@@ -237,7 +239,9 @@ impl MeterAccount {
     /// The observation a reading's freshness verdict was computed over: the
     /// fresh variant's own observation, else the last good reading the stale
     /// and auth-required variants carry, when one exists.
-    fn reading_observation(freshness: &Freshness<QuotaRemaining>) -> Option<&Observed<QuotaRemaining>> {
+    fn reading_observation(
+        freshness: &Freshness<QuotaRemaining>,
+    ) -> Option<&Observed<QuotaRemaining>> {
         match freshness {
             Freshness::Fresh { observed, .. } => Some(observed),
             Freshness::Stale { last_good, .. } => last_good.as_ref(),
