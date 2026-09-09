@@ -425,6 +425,35 @@ mod tests {
     }
 
     #[test]
+    fn a_rejected_client_pairing_surfaces_as_configuration_failed_not_an_ordinary_failure() {
+        // The endpoint distinguishes a rejected client id/secret pair from a
+        // rejected refresh token: the former is a configuration fault (re-extract
+        // the credentials), the latter an auth failure (log in again). A pairing
+        // rejection must not fold into `Rejected` or `EndpointUnreachable`.
+        let path = path("config-failed");
+        let original = credential("2020-01-01T00:00:00Z");
+        fs::write(&path, &original).unwrap();
+        let endpoint = Endpoint {
+            calls: Cell::new(0),
+            reply: Err(RefreshError::Configuration(
+                "the OAuth client credentials extracted from the agy binary were rejected".into(),
+            )),
+        };
+        let outcome = refresh_if_expired(&path, NOW, &endpoint);
+        assert!(
+            matches!(outcome, RefreshOutcome::ConfigurationFailed(_)),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            outcome.attempt_classification(),
+            Some(CLASSIFICATION_REFRESH_CONFIGURATION_FAILED)
+        );
+        assert_ne!(outcome, RefreshOutcome::Rejected);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let _ = fs::remove_file(path);
+    }
+
+    #[test]
     fn the_refresh_token_is_never_rendered_by_the_outcome() {
         let scratch = Scratch::new("no-leak");
         let path = scratch.credentials();

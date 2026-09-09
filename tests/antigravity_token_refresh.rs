@@ -253,3 +253,52 @@ fn invalid_grant_leaves_the_file_untouched_and_records_refresh_rejected() {
         .unwrap();
     assert_eq!(classification, "refresh_rejected");
 }
+
+/// The pairing half of the bead's criterion: when the token endpoint rejects
+/// the OAuth *client* credentials (`invalid_client` / `unauthorized_client`,
+/// RFC 6749 5.2) rather than the refresh token, the attempt records
+/// `refresh_configuration_failed`, not the ordinary auth/unreachable
+/// classification `invalid_grant` would produce. The two remediations differ:
+/// a rejected client pair is re-extracted from the `agy` binary, a rejected
+/// refresh token is re-authenticated.
+#[test]
+fn a_rejected_client_pairing_records_refresh_configuration_failed() {
+    let env = Environment::new(
+        "invalid-client",
+        &credential_json(OLD_REFRESH, "2020-01-01T00:00:00Z"),
+    );
+    let original = std::fs::read_to_string(env.credential_path()).unwrap();
+
+    let quota = SyntheticServer::start(vec![ScriptedOutcome::Unauthorized401]).unwrap();
+    let token = SyntheticServer::start(vec![ScriptedOutcome::Response {
+        status: 401,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body:
+            br#"{"error":"invalid_client","error_description":"The OAuth client was not found."}"#
+                .to_vec(),
+    }])
+    .unwrap();
+
+    let (_code, _stdout, stderr) = env.run(&quota.url(), &token.url());
+
+    assert_eq!(token.request_count(), 1);
+    assert_eq!(
+        std::fs::read_to_string(env.credential_path()).unwrap(),
+        original,
+        "the credential file must be byte-identical when the client pairing is rejected"
+    );
+    assert!(
+        stderr.contains("could not configure Antigravity OAuth refresh"),
+        "stderr: {stderr}"
+    );
+
+    let conn = rusqlite::Connection::open(env.db_path()).unwrap();
+    let classification: String = conn
+        .query_row(
+            "SELECT sanitized_error_classification FROM meter_attempt_result",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(classification, "refresh_configuration_failed");
+}

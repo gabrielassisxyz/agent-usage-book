@@ -119,10 +119,22 @@ impl crate::auth::antigravity_credentials::TokenEndpoint for AntigravityTokenEnd
             serde_json::from_str(response.body_as_str().unwrap_or_default()).map_err(|_| {
                 RefreshError::Endpoint("token endpoint response was not JSON".into())
             })?;
-        if response.status() == 400
-            && parsed.get("error").and_then(serde_json::Value::as_str) == Some("invalid_grant")
-        {
+        let error_code = parsed.get("error").and_then(serde_json::Value::as_str);
+        if response.status() == 400 && error_code == Some("invalid_grant") {
             return Err(RefreshError::InvalidGrant);
+        }
+        // `invalid_client` and `unauthorized_client` (RFC 6749 section 5.2)
+        // reject the OAuth client id and secret pair itself, not the refresh
+        // token. That pair is extracted from the installed `agy` binary, so a
+        // rejection here is a configuration fault whose fix is to re-extract the
+        // credentials, distinct from `invalid_grant`, whose fix is to log in
+        // again. The provider returns it as 401 as readily as 400, so the error
+        // code decides, not the status.
+        if matches!(error_code, Some("invalid_client" | "unauthorized_client")) {
+            return Err(RefreshError::Configuration(format!(
+                "the OAuth client credentials extracted from the agy binary were rejected by the token endpoint ('{}'); re-extract them from the binary",
+                error_code.unwrap_or_default()
+            )));
         }
         if response.status() != 200 {
             return Err(RefreshError::Endpoint(format!(
