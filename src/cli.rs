@@ -1301,6 +1301,83 @@ fn preflight_anthropic_refresh(
     }
 }
 
+/// Renews an expired Antigravity OAuth token before credential resolution. The
+/// one-minute lead is deliberately smaller than Anthropic's five minutes: the
+/// observed Antigravity lifetime is about an hour and sampling is every five
+/// minutes, so five minutes would refresh on every normal cadence boundary.
+fn preflight_antigravity_refresh(
+    account: &crate::config::AccountConfig,
+    config: &crate::config::Config,
+    clock: &impl Clock,
+    verbose: bool,
+) -> PreflightRefresh {
+    use crate::auth::antigravity_credentials::{
+        self, CLASSIFICATION_TOKEN_REFRESHED, RefreshOutcome,
+    };
+    if !config.antigravity.refresh || account.provider != "agy" {
+        return PreflightRefresh::inert();
+    }
+    let path = match crate::auth::CredentialSource::from_account(account) {
+        Ok(crate::auth::CredentialSource::File { path }) => path,
+        Ok(crate::auth::CredentialSource::Env { .. })
+        | Ok(crate::auth::CredentialSource::None)
+        | Err(_) => return PreflightRefresh::inert(),
+    };
+    let endpoint = crate::auth::token_endpoint::AntigravityTokenEndpoint::from_env();
+    let outcome =
+        antigravity_credentials::refresh_if_expired(&path, clock.now().unix_nanos(), &endpoint);
+    match &outcome {
+        RefreshOutcome::Refreshed if verbose => eprintln!(
+            "aub: {CLASSIFICATION_TOKEN_REFRESHED}: renewed the expired Antigravity OAuth token for account '{}'",
+            account.name
+        ),
+        RefreshOutcome::Rejected => eprintln!(
+            "aub: the Antigravity OAuth token endpoint rejected the stored refresh token for account '{}'; re-authenticate with agy",
+            account.name
+        ),
+        RefreshOutcome::ConfigurationFailed(detail) => eprintln!(
+            "aub: could not configure Antigravity OAuth refresh for account '{}' ({detail}); sampling with the stored token",
+            account.name
+        ),
+        RefreshOutcome::PersistFailed(detail) => {
+            eprintln!(
+                "aub: renewed the Antigravity OAuth token for account '{}' but could not write it back ({detail}); this account is not being sampled until re-authenticated",
+                account.name
+            );
+            return PreflightRefresh {
+                classification: outcome.attempt_classification().map(str::to_string),
+                skip_account: true,
+            };
+        }
+        RefreshOutcome::EndpointUnreachable(detail) if verbose => eprintln!(
+            "aub: could not reach the Antigravity OAuth token endpoint for account '{}' ({detail}); sampling with the stored token",
+            account.name
+        ),
+        RefreshOutcome::NotNeeded
+        | RefreshOutcome::Refreshed
+        | RefreshOutcome::AlreadyFreshOnDisk
+        | RefreshOutcome::EndpointUnreachable(_)
+        | RefreshOutcome::FileUnreadable(_) => {}
+    }
+    PreflightRefresh {
+        classification: outcome.attempt_classification().map(str::to_string),
+        skip_account: false,
+    }
+}
+
+fn preflight_credential_refresh(
+    account: &crate::config::AccountConfig,
+    config: &crate::config::Config,
+    clock: &impl Clock,
+    verbose: bool,
+) -> PreflightRefresh {
+    if account.provider == "agy" {
+        preflight_antigravity_refresh(account, config, clock, verbose)
+    } else {
+        preflight_anthropic_refresh(account, config, clock, verbose)
+    }
+}
+
 /// The meter request one account's sampling batch entry carries: the facts
 /// the caller resolves because the adapter resolves none of them itself
 /// (`aub-cg6k`, `aub-er47`). The status-line record is resolved the same way
@@ -1554,7 +1631,7 @@ pub(crate) fn sample_command(
 
     let mut batch_accounts = Vec::new();
     for acc in &target_accounts {
-        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
+        let refresh = preflight_credential_refresh(acc, &config, clock, invocation.verbosity > 0);
         if refresh.skip_account {
             continue;
         }
@@ -2046,7 +2123,7 @@ pub(crate) fn now_command(
 
     let mut batch_accounts = Vec::new();
     for acc in &target_accounts {
-        let refresh = preflight_anthropic_refresh(acc, &config, clock, invocation.verbosity > 0);
+        let refresh = preflight_credential_refresh(acc, &config, clock, invocation.verbosity > 0);
         if refresh.skip_account {
             continue;
         }
@@ -5692,7 +5769,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let anthropic_refresh = if cached {
         PreflightRefresh::inert()
     } else {
-        preflight_anthropic_refresh(account_config, &config, clock, invocation.verbosity > 0)
+        preflight_credential_refresh(account_config, &config, clock, invocation.verbosity > 0)
     };
     if !cached && !anthropic_refresh.skip_account {
         // Default: perform and persist one fresh meter sample for the
