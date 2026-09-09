@@ -57,7 +57,7 @@ backup:
   answers: is there a consistent, verified archive of the durable state, and does it restore?
   refuses: --format (backup prints one operational result); --explain (backup derives no quantity); --account (backup covers the whole ledger); --model (backup covers the whole ledger); --no-color (backup prints no color)
   format: text only: backup prints one operational result
-  options: DESTINATION | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]
+  options: [DESTINATION] | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]
 
 ingest:
   answers: have the transcript-derived tables been refreshed from the transcripts on disk, under one generation?

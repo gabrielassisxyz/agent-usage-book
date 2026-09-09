@@ -76,7 +76,8 @@ documented here is a code the binary can actually return.
 A fresh machine has reached a working state once: `aub config` shows every
 key resolving from the file just written, `aub status` reflects at least one
 recorded sampling attempt for each configured account, and `aub backup
-verify DESTINATION` reports `verified=true` against an archive named in
-`backup.destination`. `tests/e2e/cases/019-fresh-machine-walkthrough.sh`
+verify DESTINATION` reports `verified=true` against the newest verified
+archive under the root named in `backup.destination`.
+`tests/e2e/cases/019-fresh-machine-walkthrough.sh`
 exercises exactly this sequence end to end against the release binary, using
 only the invocations this document and the ones it links to describe.
