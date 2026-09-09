@@ -187,16 +187,21 @@ case_steps() {
     # the old representation every consecutive pair slid by the sampling
     # interval. Stored as not_started, the pair is idle to idle.
     #
-    # Each tick waits four seconds before sampling, on purpose: back-to-back
-    # ticks would slide the fabricated anchor only tens of milliseconds per
-    # pair, inside the fixed 2 s provider-jitter envelope, and the old
-    # representation would then record no anomaly either, leaving the
-    # zero-anomaly assertion below nothing to distinguish. Four seconds of
-    # gap puts the per-pair slide past that envelope, which is what makes
-    # ten idle ticks a discriminating test of this bead.
+    # The ticks run back to back on purpose. The decision under test is made
+    # per reading, never per pair: `reinterpret_unstarted_window`
+    # (src/meter/codex.rs) rewrites a zero-usage window whose reported reset
+    # sits within the 2 s jitter envelope of `observed_at + nominal_duration`
+    # into `not_started` before any pair comparison, and two `not_started`
+    # readings are never an anomaly whatever the gap between them. So the
+    # spacing of the ticks decides nothing about the zero-anomaly assertion,
+    # and the assertion that tells the old representation from the new one
+    # is the stored shape in step 12: `Known` anchors with a `resets_at`
+    # fail it at any spacing, `not_started` with an empty `resets_at` passes.
+    # This case used to sleep four seconds per tick to push each pair's slide
+    # past the envelope; that made the old code fail the anomaly count too,
+    # at a cost of 40 s per run, and proved nothing step 12 does not.
     local tick
     for tick in 01 02 03 04 05 06 07 08 09 10; do
-        sleep 4
         step "tick-$tick-codex-idle-sample" env \
             "HOME=$STATE_DIR/home" \
             "AUB_STATE_DIR=$STATE_DIR" \

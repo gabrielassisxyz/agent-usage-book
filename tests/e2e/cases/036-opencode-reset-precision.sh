@@ -4,13 +4,14 @@
 # anything. The adapter declares a one-hour reset precision, and the
 # window-anomaly classifier holds a `Known`-to-`Known` move within that
 # precision plus the gap between the observations to be one unchanged
-# boundary. Ten consecutive samples of an unchanging page must therefore
-# record zero `meter_window_anomaly` rows, while one sample whose page really
-# moved the boundary far past that tolerance must still record the typed
+# boundary. Consecutive samples of an unchanging page, spaced further apart
+# than the fixed jitter envelope, must therefore record zero
+# `meter_window_anomaly` rows, while one sample whose page really moved the
+# boundary far past that tolerance must still record the typed
 # `unexpected_reset_change` anomaly for every window.
 
 CASE_ID="036-opencode-reset-precision"
-CASE_DESCRIPTION="ten consecutive opencode samples of an unchanging page record zero window anomalies, and a real boundary move still records unexpected_reset_change."
+CASE_DESCRIPTION="three opencode samples of an unchanging page, spaced past the jitter envelope, record zero window anomalies, and a real boundary move still records unexpected_reset_change."
 
 LEDGER_DB=""
 STABLE_STUB_PID=""
@@ -128,16 +129,21 @@ httpd.serve_forever()
 }
 
 case_steps() {
-    # Each tick waits four seconds before sampling, on purpose: the sampling
+    # Each tick waits three seconds before sampling, on purpose: the sampling
     # process is fast against a local stub, so back-to-back ticks re-derive
     # resets only fractions of a second apart and the fixed 2 s provider-jitter
-    # envelope would absorb the drift with no declaration at all. Four seconds
-    # of gap puts the drift past the fixed envelope - the declared precision is
-    # what has to absorb it - while staying far inside that precision plus the
-    # gap, which is the tolerance aub-w1a0 declares.
+    # envelope would absorb the drift with no declaration at all. The gap has
+    # to put each pair's drift past that envelope, so that the declared
+    # precision is what absorbs it, while staying far inside the precision
+    # plus the gap, which is the tolerance aub-w1a0 declares. The classifier
+    # judges pairs, so two pairs prove it as well as nine did; three seconds
+    # is the floor rather than 2.5 because a sleep never shortens under load
+    # while start-up overhead only widens the gap, and because the codex
+    # sibling case's stub truncates its anchor to whole seconds, so the two
+    # tick cases carry one rule. Ten ticks at four seconds cost 40 s per run.
     local tick
-    for tick in 01 02 03 04 05 06 07 08 09 10; do
-        sleep 4
+    for tick in 01 02 03; do
+        sleep 3
         step "tick-$tick-opencode-sample" env \
             "HOME=$STATE_DIR/home" \
             "AUB_STATE_DIR=$STATE_DIR" \
@@ -147,8 +153,8 @@ case_steps() {
             "$AUB_BIN" sample --account go-primary
     done
 
-    # The ledger must hold zero window anomalies after the ten ticks.
-    step "query-anomaly-count-after-ten-ticks" sqlite3 "$LEDGER_DB" \
+    # The ledger must hold zero window anomalies after the three ticks.
+    step "query-anomaly-count-after-ticks" sqlite3 "$LEDGER_DB" \
         "SELECT 'anomaly_count=' || count(*) FROM meter_window_anomaly"
 
     # One sample against the page whose rendered resets moved by hundreds of
@@ -182,20 +188,21 @@ case_assertions() {
         wait "$MOVED_STUB_PID" 2>/dev/null || true
     fi
 
-    # Steps 1 through 10 are the ten ticks, in order.
+    # Steps 1 through 3 are the three ticks, in order.
     local n
-    for n in 1 2 3 4 5 6 7 8 9 10; do
+    for n in 1 2 3; do
         assert_exit 0 "$n"
         assert_stdout_contains "$n" "sample: account=go-primary outcome=success"
     done
 
-    # Step 11: ten ticks of an unchanging page recorded no anomaly of any kind.
-    assert_exit 0 11
-    assert_stdout_contains 11 "anomaly_count=0"
+    # Step 4: three ticks of an unchanging page, two pairs each drifting past
+    # the jitter envelope, recorded no anomaly of any kind.
+    assert_exit 0 4
+    assert_stdout_contains 4 "anomaly_count=0"
 
-    # Step 12 ran, and step 13 shows the real move still records one anomaly
+    # Step 5 ran, and step 6 shows the real move still records one anomaly
     # per window, named by kind.
-    assert_exit 0 12
-    assert_exit 0 13
-    assert_stdout_contains 13 "unexpected_reset_change=3"
+    assert_exit 0 5
+    assert_exit 0 6
+    assert_stdout_contains 6 "unexpected_reset_change=3"
 }
