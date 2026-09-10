@@ -31,11 +31,19 @@ const ANTHROPIC_CLASSES: [TokenClass; 5] = [
     TokenClass::CacheWrite1h,
 ];
 
+/// What one rate is keyed by: vendor, model and token class. One rate per key
+/// may be effective at a time, which is the property the overlap check owns.
+type CardKey = (String, String, &'static str);
+
+/// A half-open effective interval: the first day the rate applies, and the day
+/// it stops applying (`None` is open ended).
+type Interval = (UtcDate, Option<UtcDate>);
+
 fn shipped() -> RateBook {
     rate_book::parse(SHIPPED).expect("the shipped rate book must parse")
 }
 
-fn key(card: &RateCardDraft) -> (String, String, &'static str) {
+fn key(card: &RateCardDraft) -> CardKey {
     (
         card.vendor.clone(),
         card.model.clone(),
@@ -46,15 +54,14 @@ fn key(card: &RateCardDraft) -> (String, String, &'static str) {
 /// Two intervals overlap when each starts before the other ends. `effective_end`
 /// is the day the rate stops applying, so an interval is half-open and a row
 /// starting on another's end day hands off rather than overlapping.
-fn overlaps(a: (UtcDate, Option<UtcDate>), b: (UtcDate, Option<UtcDate>)) -> bool {
+fn overlaps(a: Interval, b: Interval) -> bool {
     let a_before_b_end = b.1.is_none_or(|end| a.0 < end);
     let b_before_a_end = a.1.is_none_or(|end| b.0 < end);
     a_before_b_end && b_before_a_end
 }
 
 fn overlapping_intervals(book: &RateBook) -> Vec<String> {
-    let mut by_key: BTreeMap<(String, String, &'static str), Vec<(UtcDate, Option<UtcDate>)>> =
-        BTreeMap::new();
+    let mut by_key: BTreeMap<CardKey, Vec<Interval>> = BTreeMap::new();
     for card in &book.cards {
         by_key
             .entry(key(card))
