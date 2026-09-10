@@ -1,0 +1,2050 @@
+# The sourced rate book this repository ships: one row per vendor, model and
+# token class, each carrying the page it was read from and the date it was read.
+# This is the book the operator imports (`aub rate-card import
+# rate-book/rates.toml`). The book under `tests/fixtures/rate-book/` is test
+# data for the import contract and is not imported anywhere real.
+#
+# A vendor price change is a new dated row imported alongside the old one, never
+# an edit in place: editing a rate in place silently revalues historical traffic.
+#
+# THE RULES THIS BOOK IS WRITTEN UNDER
+#
+# 1. `model` is the id as the ledger stores it for Anthropic and OpenAI, because
+#    valuation looks a rate up by the event's own model string. Hence
+#    `claude-haiku-4-5-20251001` rather than `claude-haiku-4-5`, and
+#    `gpt-5.6-terra` rather than `gpt-5.6`. For Ollama the id is Ollama's own;
+#    the litellm aliases the pi harness records reach these rows through the
+#    model mapping, which lands separately. Until it does, an event naming an
+#    alias stays unvalued rather than being valued at a guessed row.
+# 2. `vendor` is `ollama` for everything served through Ollama Cloud and
+#    litellm, because Ollama's per-token table is what the subscription credits
+#    burn at. The upstream vendors publish their own list prices (DeepSeek has
+#    its own peak and off-peak windows, Z.ai runs a promotion, MiniMax prices by
+#    context length); none of them is what this machine is billed at, so none is
+#    a row here.
+# 3. `effective_start` is the date the price was read unless the vendor's own
+#    page states an earlier date. A price read today is not claimed for August.
+#    The one dated exception is `gpt-5.6-sol`, cut on 2026-08-21 per OpenAI's
+#    own announcement, whose rows start then.
+# 4. OpenAI and Ollama publish no separate cache-write price: a cache write
+#    bills as input. Their models therefore carry `input`, `cache_read` and
+#    `output` and no `cache_write_*` row. This is not a gap the cost model has
+#    to report, because a missing term against a zero count is not a missing
+#    fact.
+# 5. Time-of-day pricing cannot be expressed by a date-effective row. Ollama
+#    doubles both DeepSeek models inside its peak window (12:00 to 18:00 UTC,
+#    Monday to Friday: deepseek-v4-flash 0.44 / 0.014 / 1.32 and deepseek-v4-pro
+#    1.32 / 0.044 / 3.96 per million tokens). The rows below carry the off-peak
+#    rate, so traffic inside that window is valued low. A peak-aware term is out
+#    of scope here and needs a rate shape that has a schedule in it.
+# 6. `claude-sonnet-5` carries one open-ended row per class at 2.00 / 10.00,
+#    starting 2026-06-24, and no standard-price rows. The introductory pricing
+#    the fixture recorded as expiring on 2026-08-31 does not expire: Anthropic's
+#    page as read on 2026-09-07 states the increase will not occur.
+#
+# WHICH MODELS HAVE NO RATE BEFORE THE READ DATE, AND WHY
+#
+# Every row whose `effective_start` is 2026-09-07 or 2026-09-09 was read on that
+# day and is not claimed for any earlier traffic, per rule 3. That is every
+# OpenCode and Ollama row, every OpenAI row except `gpt-5.6-sol`, and four
+# Anthropic models: `claude-fable-5-1`, `claude-mythos-5-1`,
+# `claude-opus-4-5-20251101` and `claude-sonnet-4-6`. Events from those models
+# before their start date stay unvalued, which is the intended outcome: the
+# price on those days was not recorded, and inventing one would produce a number
+# nothing can justify.
+#
+# The five Ollama models read 2026-09-09 rather than 2026-09-07
+# (`mistral-large-3`, `nemotron-3-nano`, `nemotron-3-super`, `nemotron-3-ultra`,
+# `qwen3.5:397b`) were named in the source that produced this book but arrived
+# without figures, so their prices come from a second read of the same page two
+# days later. Every row the two reads have in common was identical, so the later
+# read is an extension of the book rather than a correction to it.
+#
+# WHAT THE SHAPE OF A CARD CANNOT SAY
+#
+# OpenCode publishes a single cache-write price where it publishes one at all.
+# There is no 5m and 1h distinction to record, so that one price is written to
+# both TTL classes and those rows say so in `source`. A context-length tier
+# (Luna above 272K, Qwen Plus above 256K) is not expressible either, and the base
+# tier is what the row carries. The `Usage` column on the OpenCode page is a
+# credit-consumption multiplier rather than a per-token price, and is not
+# imported.
+#
+# Three Ollama models (`mistral-large-3`, `nemotron-3-nano`, `qwen3.5:397b`) have
+# no cached-input price on the page, so they carry `input` and `output` only. The
+# absent class is the vendor's fact, not an omission here.
+#
+# Ollama's own catalog tags two of those ids with a parameter count
+# (`mistral-large-3:675b`, `nemotron-3-nano:30b`) where the pricing page does
+# not. The page's spelling is what these rows use, matching every other Ollama
+# row in this file; an event carrying the tagged spelling reaches its rate
+# through the model mapping.
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5-1"
+token_class = "input"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5-1"
+token_class = "output"
+rate = "50.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5-1"
+token_class = "cache_read"
+rate = "0.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5-1"
+token_class = "cache_write_5m"
+rate = "12.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5-1"
+token_class = "cache_write_1h"
+rate = "20.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5-1"
+token_class = "input"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5-1"
+token_class = "output"
+rate = "50.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5-1"
+token_class = "cache_read"
+rate = "0.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5-1"
+token_class = "cache_write_5m"
+rate = "12.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5-1"
+token_class = "cache_write_1h"
+rate = "20.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "input"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "output"
+rate = "50.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "cache_read"
+rate = "1.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "cache_write_5m"
+rate = "12.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "cache_write_1h"
+rate = "20.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5"
+token_class = "input"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5"
+token_class = "output"
+rate = "50.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5"
+token_class = "cache_read"
+rate = "1.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5"
+token_class = "cache_write_5m"
+rate = "12.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-mythos-5"
+token_class = "cache_write_1h"
+rate = "20.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-5"
+token_class = "input"
+rate = "5.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-5"
+token_class = "output"
+rate = "25.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-5"
+token_class = "cache_read"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-5"
+token_class = "cache_write_5m"
+rate = "6.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-5"
+token_class = "cache_write_1h"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-8"
+token_class = "input"
+rate = "5.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-8"
+token_class = "output"
+rate = "25.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-8"
+token_class = "cache_read"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-8"
+token_class = "cache_write_5m"
+rate = "6.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-8"
+token_class = "cache_write_1h"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-7"
+token_class = "input"
+rate = "5.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-7"
+token_class = "output"
+rate = "25.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-7"
+token_class = "cache_read"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-7"
+token_class = "cache_write_5m"
+rate = "6.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-7"
+token_class = "cache_write_1h"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-6"
+token_class = "input"
+rate = "5.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-6"
+token_class = "output"
+rate = "25.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-6"
+token_class = "cache_read"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-6"
+token_class = "cache_write_5m"
+rate = "6.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-6"
+token_class = "cache_write_1h"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-5-20251101"
+token_class = "input"
+rate = "5.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-5-20251101"
+token_class = "output"
+rate = "25.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-5-20251101"
+token_class = "cache_read"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-5-20251101"
+token_class = "cache_write_5m"
+rate = "6.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-opus-4-5-20251101"
+token_class = "cache_write_1h"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-5"
+token_class = "input"
+rate = "2.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-5"
+token_class = "output"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-5"
+token_class = "cache_read"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-5"
+token_class = "cache_write_5m"
+rate = "2.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-5"
+token_class = "cache_write_1h"
+rate = "4.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4-6"
+token_class = "input"
+rate = "3.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4-6"
+token_class = "output"
+rate = "15.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4-6"
+token_class = "cache_read"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4-6"
+token_class = "cache_write_5m"
+rate = "3.75"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4-6"
+token_class = "cache_write_1h"
+rate = "6.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-haiku-4-5-20251001"
+token_class = "input"
+rate = "1.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-haiku-4-5-20251001"
+token_class = "output"
+rate = "5.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-haiku-4-5-20251001"
+token_class = "cache_read"
+rate = "0.10"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-haiku-4-5-20251001"
+token_class = "cache_write_5m"
+rate = "1.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-haiku-4-5-20251001"
+token_class = "cache_write_1h"
+rate = "2.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-06-24"
+published_at = "2026-09-07"
+source = "https://platform.claude.com/docs/en/about-claude/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-6-astra"
+token_class = "input"
+rate = "10.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-6-astra"
+token_class = "output"
+rate = "50.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-6-astra"
+token_class = "cache_read"
+rate = "1.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-sol"
+token_class = "input"
+rate = "4.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-08-21"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-sol"
+token_class = "output"
+rate = "20.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-08-21"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-sol"
+token_class = "cache_read"
+rate = "0.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-08-21"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-terra"
+token_class = "input"
+rate = "2.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-terra"
+token_class = "output"
+rate = "12.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-terra"
+token_class = "cache_read"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-luna"
+token_class = "input"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-luna"
+token_class = "output"
+rate = "1.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.6-luna"
+token_class = "cache_read"
+rate = "0.02"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.3-codex"
+token_class = "input"
+rate = "1.75"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.3-codex"
+token_class = "output"
+rate = "14.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "openai"
+model = "gpt-5.3-codex"
+token_class = "cache_read"
+rate = "0.175"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://developers.openai.com/api/docs/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "input"
+rate = "0.22"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "output"
+rate = "0.66"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "cache_read"
+rate = "0.007"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-pro"
+token_class = "input"
+rate = "0.66"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-pro"
+token_class = "output"
+rate = "1.98"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-pro"
+token_class = "cache_read"
+rate = "0.022"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.3"
+token_class = "input"
+rate = "1.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.3"
+token_class = "output"
+rate = "4.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.3"
+token_class = "cache_read"
+rate = "0.26"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.3-flash"
+token_class = "input"
+rate = "0.15"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.3-flash"
+token_class = "output"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.3-flash"
+token_class = "cache_read"
+rate = "0.03"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.2"
+token_class = "input"
+rate = "1.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.2"
+token_class = "output"
+rate = "4.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.2"
+token_class = "cache_read"
+rate = "0.26"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.1"
+token_class = "input"
+rate = "1.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.1"
+token_class = "output"
+rate = "3.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "glm-5.1"
+token_class = "cache_read"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k3"
+token_class = "input"
+rate = "3.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k3"
+token_class = "output"
+rate = "15.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k3"
+token_class = "cache_read"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k2.7-code"
+token_class = "input"
+rate = "0.95"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k2.7-code"
+token_class = "output"
+rate = "4.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k2.7-code"
+token_class = "cache_read"
+rate = "0.19"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k2.6"
+token_class = "input"
+rate = "0.95"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k2.6"
+token_class = "output"
+rate = "4.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "kimi-k2.6"
+token_class = "cache_read"
+rate = "0.16"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "minimax-m3"
+token_class = "input"
+rate = "0.60"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "minimax-m3"
+token_class = "output"
+rate = "2.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "minimax-m3"
+token_class = "cache_read"
+rate = "0.12"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "minimax-m2.7"
+token_class = "input"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "minimax-m2.7"
+token_class = "output"
+rate = "1.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "minimax-m2.7"
+token_class = "cache_read"
+rate = "0.06"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gpt-oss:120b"
+token_class = "input"
+rate = "0.15"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gpt-oss:120b"
+token_class = "output"
+rate = "0.60"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gpt-oss:120b"
+token_class = "cache_read"
+rate = "0.014"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gpt-oss:20b"
+token_class = "input"
+rate = "0.07"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gpt-oss:20b"
+token_class = "output"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gpt-oss:20b"
+token_class = "cache_read"
+rate = "0.035"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gemma4"
+token_class = "input"
+rate = "0.14"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gemma4"
+token_class = "output"
+rate = "0.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "gemma4"
+token_class = "cache_read"
+rate = "0.05"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "mistral-large-3"
+token_class = "input"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "mistral-large-3"
+token_class = "output"
+rate = "1.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-nano"
+token_class = "input"
+rate = "0.06"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-nano"
+token_class = "output"
+rate = "0.24"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-super"
+token_class = "input"
+rate = "0.015"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-super"
+token_class = "output"
+rate = "0.60"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-super"
+token_class = "cache_read"
+rate = "0.015"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-ultra"
+token_class = "input"
+rate = "0.10"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-ultra"
+token_class = "output"
+rate = "3.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "nemotron-3-ultra"
+token_class = "cache_read"
+rate = "0.10"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "qwen3.5:397b"
+token_class = "input"
+rate = "0.60"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "ollama"
+model = "qwen3.5:397b"
+token_class = "output"
+rate = "3.60"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-09"
+published_at = "2026-09-09"
+source = "https://ollama.com/pricing"
+
+[[card]]
+vendor = "opencode"
+model = "opencode/muse-spark-1.3-contributor-free"
+token_class = "input"
+rate = "0.10"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode/muse-spark-1.3-contributor-free"
+token_class = "output"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode/muse-spark-1.3-contributor-free"
+token_class = "cache_read"
+rate = "0.002"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/muse-spark-1.3-contributor"
+token_class = "input"
+rate = "0.10"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/muse-spark-1.3-contributor"
+token_class = "output"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/muse-spark-1.3-contributor"
+token_class = "cache_read"
+rate = "0.002"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/muse-spark-1.2-contributor"
+token_class = "input"
+rate = "0.10"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/muse-spark-1.2-contributor"
+token_class = "output"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/muse-spark-1.2-contributor"
+token_class = "cache_read"
+rate = "0.002"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/deepseek-v4-flash"
+token_class = "input"
+rate = "0.22"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/deepseek-v4-flash"
+token_class = "output"
+rate = "0.66"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/deepseek-v4-flash"
+token_class = "cache_read"
+rate = "0.007"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/deepseek-v4-pro"
+token_class = "input"
+rate = "0.66"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/deepseek-v4-pro"
+token_class = "output"
+rate = "1.98"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/deepseek-v4-pro"
+token_class = "cache_read"
+rate = "0.022"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/glm-5.3-flash"
+token_class = "input"
+rate = "0.15"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/glm-5.3-flash"
+token_class = "output"
+rate = "0.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/glm-5.3-flash"
+token_class = "cache_read"
+rate = "0.03"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/glm-5.3"
+token_class = "input"
+rate = "1.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/glm-5.3"
+token_class = "output"
+rate = "4.40"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/glm-5.3"
+token_class = "cache_read"
+rate = "0.26"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/kimi-k3"
+token_class = "input"
+rate = "3.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/kimi-k3"
+token_class = "output"
+rate = "15.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/kimi-k3"
+token_class = "cache_read"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/kimi-k2.7-code"
+token_class = "input"
+rate = "0.95"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/kimi-k2.7-code"
+token_class = "output"
+rate = "4.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/kimi-k2.7-code"
+token_class = "cache_read"
+rate = "0.19"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m3"
+token_class = "input"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m3"
+token_class = "output"
+rate = "1.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m3"
+token_class = "cache_read"
+rate = "0.06"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m2.7"
+token_class = "input"
+rate = "0.30"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m2.7"
+token_class = "output"
+rate = "1.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m2.7"
+token_class = "cache_read"
+rate = "0.06"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m2.7"
+token_class = "cache_write_5m"
+rate = "0.375"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/minimax-m2.7"
+token_class = "cache_write_1h"
+rate = "0.375"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/gpt-5.6-luna"
+token_class = "input"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/gpt-5.6-luna"
+token_class = "output"
+rate = "1.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/gpt-5.6-luna"
+token_class = "cache_read"
+rate = "0.02"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/gpt-5.6-luna"
+token_class = "cache_write_5m"
+rate = "0.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/gpt-5.6-luna"
+token_class = "cache_write_1h"
+rate = "0.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-max"
+token_class = "input"
+rate = "2.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-max"
+token_class = "output"
+rate = "6.00"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-max"
+token_class = "cache_read"
+rate = "0.25"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-max"
+token_class = "cache_write_5m"
+rate = "2.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-max"
+token_class = "cache_write_1h"
+rate = "2.50"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-flash"
+token_class = "input"
+rate = "0.15"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-flash"
+token_class = "output"
+rate = "0.47"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-flash"
+token_class = "cache_read"
+rate = "0.016"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table)"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-flash"
+token_class = "cache_write_5m"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
+
+[[card]]
+vendor = "opencode"
+model = "opencode-go/qwen3.8-flash"
+token_class = "cache_write_1h"
+rate = "0.20"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://opencode.ai (Go/Zen pricing table); the vendor publishes one cache-write price, recorded on both TTL classes"
