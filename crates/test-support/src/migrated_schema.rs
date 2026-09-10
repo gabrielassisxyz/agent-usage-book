@@ -22,8 +22,10 @@
 use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock, PoisonError};
+
+use rusqlite::backup::{Backup, StepResult};
 
 use agent_usage_book::build_info::source_revision;
 use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
@@ -264,6 +266,77 @@ pub fn open_migrated(dest: &Path, policy: &PragmaPolicy) -> rusqlite::Connection
         .unwrap_or_else(|e| panic!("the copied database must open at {}: {e}", dest.display()))
 }
 
+/// The migrated template held in memory, one per process, for fixtures that
+/// want an in-memory database rather than a file.
+///
+/// Populated from the file template through a scratch copy, which is removed as
+/// soon as its pages are in memory: the template itself is published read-only
+/// under the store's WAL policy, and this keeps every reader of that file on the
+/// one path `copy_migrated` already exercises. A `Mutex` and not a bare
+/// `OnceLock<Connection>` because `rusqlite::Connection` is `Send` but not
+/// `Sync`, and the tests that clone from it run on many threads.
+fn in_memory_template() -> &'static Mutex<rusqlite::Connection> {
+    static TEMPLATE: OnceLock<Mutex<rusqlite::Connection>> = OnceLock::new();
+    TEMPLATE.get_or_init(|| {
+        let scratch = std::env::temp_dir().join(format!(
+            "aub-migrated-template-{}-{}.db",
+            std::process::id(),
+            WRITER_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        remove_db_family(&scratch);
+        copy_migrated(&scratch);
+        let mut conn =
+            rusqlite::Connection::open_in_memory().expect("the in-memory template must open");
+        conn.restore(
+            rusqlite::DatabaseName::Main,
+            &scratch,
+            None::<fn(rusqlite::backup::Progress)>,
+        )
+        .unwrap_or_else(|e| {
+            panic!(
+                "the migrated template must restore into memory from {}: {e}",
+                scratch.display()
+            )
+        });
+        remove_db_family(&scratch);
+        Mutex::new(conn)
+    })
+}
+
+/// A fresh, writable in-memory database carrying the migrated schema.
+///
+/// The drop-in for the `open_in_memory()` + `run_migrations(...)` pair, for a
+/// fixture that never reopens its database by path. Each call clones the whole
+/// template through SQLite's backup API into its own `:memory:` connection, so
+/// two callers share no page and no lock once this returns.
+///
+/// WHY this exists next to `open_migrated`, measured 2026-09-09 (`aub-iatc`):
+/// `tests/reconciliation.rs` replayed the registry ~530 times per run, once per
+/// test and once per proptest case, for 62 s of a 293 s `30-test`. An on-disk
+/// copy per case would have moved that cost into `synchronous=FULL` writes
+/// instead of removing it; a page copy between two in-memory databases costs
+/// neither the replay nor the fsync.
+pub fn open_migrated_in_memory() -> rusqlite::Connection {
+    let source = in_memory_template()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let mut dest =
+        rusqlite::Connection::open_in_memory().expect("the in-memory database must open");
+    let backup = Backup::new(&source, &mut dest).expect("the template backup must start");
+    // A negative page count copies everything in one step: the template is a
+    // few hundred pages, and holding the source lock for that long is cheaper
+    // than the bookkeeping of stepping through it.
+    let outcome = backup.step(-1).expect("the template pages must copy");
+    assert_eq!(
+        outcome,
+        StepResult::Done,
+        "one step over the whole template must finish the copy"
+    );
+    drop(backup);
+    drop(source);
+    dest
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,7 +461,9 @@ mod tests {
         fs::copy(template_path, dest).expect("the template must be copyable");
         // The template is published read-only and `fs::copy` carries its mode, so the copy has
         // to be made writable exactly as `copy_migrated` does it.
-        let mut perms = fs::metadata(dest).expect("the copy must stat").permissions();
+        let mut perms = fs::metadata(dest)
+            .expect("the copy must stat")
+            .permissions();
         #[allow(clippy::permissions_set_readonly_false)]
         perms.set_readonly(false);
         fs::set_permissions(dest, perms).expect("the copy must become writable");
@@ -470,5 +545,43 @@ mod tests {
         );
         drop(conn);
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Each in-memory clone is a complete, writable database of its own: at the
+    /// highest migration version, and sharing no rows with its siblings. Mutation:
+    /// return the template's own connection instead of a backup and the second
+    /// assertion goes red.
+    #[test]
+    fn an_in_memory_clone_is_complete_and_independent() {
+        let first = open_migrated_in_memory();
+        let second = open_migrated_in_memory();
+        assert_eq!(
+            recorded_schema_version(&first).expect("the clone must report a schema version"),
+            schema_max_version(),
+            "an in-memory clone must be at the highest migration version"
+        );
+        first
+            .execute(
+                "INSERT INTO account \
+                 (logical_name, provider_key, first_observed_at, last_observed_at) \
+                 VALUES ('only-in-first', 'p', 1, 1)",
+                [],
+            )
+            .expect("a clone must be writable");
+        let rows: i64 = second
+            .query_row("SELECT count(*) FROM account", [], |r| r.get(0))
+            .expect("the sibling clone must be queryable");
+        assert_eq!(
+            rows, 0,
+            "a row written to one clone must not appear in another"
+        );
+        let third = open_migrated_in_memory();
+        let rows: i64 = third
+            .query_row("SELECT count(*) FROM account", [], |r| r.get(0))
+            .expect("a later clone must be queryable");
+        assert_eq!(
+            rows, 0,
+            "a row written to one clone must not leak into the template"
+        );
     }
 }

@@ -34,7 +34,7 @@ pub use evidence::{
 };
 pub use fixture::{fixture_path, load_fixture};
 pub use log_events::{LogEvent, assert_event};
-pub use migrated_schema::{copy_migrated, open_migrated};
+pub use migrated_schema::{copy_migrated, open_migrated, open_migrated_in_memory};
 pub use rng::{Rng, Seed, check_property};
 pub use sanitization::{FORBIDDEN_PATTERNS, matched_patterns};
 pub use state_dir::StateDir;
