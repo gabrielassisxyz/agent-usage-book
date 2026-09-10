@@ -310,6 +310,13 @@ required; `export` does not guess which key a downstream consumer wants.
 
 **Answers:** what do the immutable dated vendor rate cards contain?
 
+The book to import is `rate-book/rates.toml`, the sourced dated book this
+repository ships: `aub rate-card import rate-book/rates.toml`. Every row there
+names the page it was read from and the day it was read, and the file's header
+carries the rules it was written under. The book under
+`tests/fixtures/rate-book/` is test data for the import contract and is
+imported by the test suite alone; it is not a price this machine is billed at.
+
 **Refuses:** to edit history. A rate book is imported into a new, immutable,
 versioned record; correcting a stale price means importing a new version,
 never mutating one already on record.

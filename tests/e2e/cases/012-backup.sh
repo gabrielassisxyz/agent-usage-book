@@ -1,16 +1,20 @@
 # aub-sth.12: `aub backup` against a populated state directory, run against the
 # release binary because the property under test spans two process invocations
 # writing and reading a real archive on disk, not one function call. The state
-# directory is populated the same way case 011 populates one: a real
-# `rate-card import` against the shipped fixture, which is the first production
-# store user and therefore the cheapest way to get a migrated ledger on disk.
+# directory is populated by a real `rate-card import`, which is the first
+# production store user and therefore the cheapest way to get a migrated ledger
+# on disk. The book it imports is `rate-book/rates.toml`, the sourced book this
+# repository ships and the one the operator imports, so the gate exercises the
+# delivered book through the release binary rather than only through the parser.
+# Case 011 keeps the fixture, whose expiring introductory rows are the import
+# contract's test data and are deliberately absent from the shipped book.
 # The archive's file listing is captured as its own step precisely so the
 # archive's contents are recorded in the run log, not just asserted about.
 
 CASE_ID="012-backup"
 CASE_DESCRIPTION="aub backup creates a verified archive of a populated state directory, and aub backup verify re-runs the same checks against it."
 
-RATE_BOOK="$REPO_ROOT/tests/fixtures/rate-book/rates.toml"
+RATE_BOOK="$REPO_ROOT/rate-book/rates.toml"
 ARCHIVE_DIR=""
 
 aub_backup() {
@@ -24,7 +28,7 @@ case_preconditions() {
     require_command "$AUB_BIN"
     ARCHIVE_DIR="$STATE_DIR/aub-archive"
     if [ ! -r "$RATE_BOOK" ]; then
-        record_assertion "rate book fixture readable" "present" "absent" "fail"
+        record_assertion "shipped rate book readable" "present" "absent" "fail"
         CASE_FAILED=1
     fi
 }
@@ -42,7 +46,7 @@ case_steps() {
 
 case_assertions() {
     assert_exit 0 1
-    assert_stdout_contains 1 "added=55"
+    assert_stdout_contains 1 "added=179 unchanged=0"
 
     # The archive is verified the moment it is created: schema version 36 is
     # what the ledger migration chain produces today, and the ledger
