@@ -585,6 +585,111 @@ fn check_fails_stale_rate_cards() {
     );
 }
 
+/// `aub-6wym`: with prices imported and no model active, the check warns and
+/// names the command that repairs it. Planted negative: a naive implementation
+/// that warns without the repair line (or that fails instead of warning) fails
+/// one of the two assertions below, since a credits ledger is still complete
+/// without pricing and the finding must stay advisory.
+#[test]
+fn cost_model_active_warns_with_rate_cards_and_no_active_model() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    conn.execute(
+        "INSERT INTO rate_card (
+            vendor, model, token_class, rate_micros, currency, billing_basis,
+            effective_start, imported_at, review_due
+         ) VALUES ('anthropic', 'claude-opus-4', 'input', 10, 'USD', 'per_million_tokens', '2026-01-01', 1000, '2099-01-01')",
+        [],
+    )
+    .expect("insert rate card");
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::CostModelActive)
+        .expect("CostModelActive present");
+    assert_eq!(outcome.owner_module, "store::cost_model");
+    assert!(!outcome.has_repair);
+    match &outcome.status {
+        CheckStatus::Warn(reason) => {
+            assert!(reason.contains("1 rate card row(s)"), "{reason}");
+            assert!(reason.contains("aub cost-model activate"), "{reason}");
+        }
+        other => panic!("expected Warn naming the activation command, got {other:?}"),
+    }
+}
+
+/// `aub-6wym`: after the operator activates a published model the check passes
+/// naming the active model, and with no rate card imported at all the check is
+/// not applicable, since there is nothing pricing is due against yet.
+#[test]
+fn cost_model_active_passes_after_activation_and_na_without_cards() {
+    use agent_usage_book::store::cost_model::{
+        ANTHROPIC_CLAUDE_MESSAGES_V1_ID, activate_if_not_active, published_model,
+    };
+
+    let state = StateDir::new();
+    let mut conn = open_ledger(state.path());
+    let config = test_config(state.path());
+
+    // No rate card, no active model: the pricing premise is absent.
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcome = build_registry(&ctx)
+        .iter()
+        .find(|o| o.name == CheckName::CostModelActive)
+        .expect("CostModelActive present")
+        .clone();
+    assert!(matches!(outcome.status, CheckStatus::NotApplicable(_)));
+
+    // One rate card plus an activation: the check passes naming the model.
+    conn.execute(
+        "INSERT INTO rate_card (
+            vendor, model, token_class, rate_micros, currency, billing_basis,
+            effective_start, imported_at, review_due
+         ) VALUES ('anthropic', 'claude-opus-4', 'input', 10, 'USD', 'per_million_tokens', '2026-01-01', 1000, '2099-01-01')",
+        [],
+    )
+    .expect("insert rate card");
+    let model = published_model(ANTHROPIC_CLAUDE_MESSAGES_V1_ID, ts(1_700_000_000))
+        .expect("published model");
+    assert!(
+        activate_if_not_active(&mut conn, &model, ts(1_700_000_000)).expect("activation writes")
+    );
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let binding = build_registry(&ctx);
+    let outcome = binding
+        .iter()
+        .find(|o| o.name == CheckName::CostModelActive)
+        .expect("CostModelActive present");
+    assert!(
+        matches!(outcome.status, CheckStatus::PassWithDetail(ref detail) if detail.contains("active cost model: anthropic-claude-messages-v1")),
+        "{outcome:?}"
+    );
+}
+
 #[test]
 fn check_fails_projection_versus_database_generation() {
     let state = StateDir::new();
@@ -2071,7 +2176,7 @@ fn golden_doctor_human_output_justified_state_and_omission_state() {
         residual: None,
     };
     let output_omitted = render_doctor_report(&report_omitted);
-    let expected_omitted = "Doctor: 1 checks\n  [N/A ] unexplained-residual: no eligible reconciliation intervals in recent window\nSummary: 0 passed, 0 failed, 1 not applicable, 0 not yet available";
+    let expected_omitted = "Doctor: 1 checks\n  [N/A ] unexplained-residual: no eligible reconciliation intervals in recent window\nSummary: 0 passed, 0 failed, 0 warned, 1 not applicable, 0 not yet available";
     assert_eq!(output_omitted, expected_omitted);
 
     // Justified case: eligible intervals exist and show discrepancy
@@ -2107,7 +2212,7 @@ fn golden_doctor_human_output_justified_state_and_omission_state() {
         residual: Some(health),
     };
     let output_justified = render_doctor_report(&report_justified);
-    let expected_justified = "Doctor: 1 checks\n  [FAIL] unexplained-residual: rolling residual discrepancy: interval [1000000 .. 3000000] credits; pattern: step change in residual: possible plan or provider accounting transition; pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable\nSummary: 0 passed, 1 failed, 0 not applicable, 0 not yet available\n\nDoctor: Rolling Residual Health\n  window: 30d (6 eligible intervals, minimum: 5)\n  residual interval: [1000000 .. 3000000] credits\n  residual fraction: +20.00%\n  verdict: discrepancy\n  pattern: step change in residual: possible plan or provider accounting transition\n  pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable";
+    let expected_justified = "Doctor: 1 checks\n  [FAIL] unexplained-residual: rolling residual discrepancy: interval [1000000 .. 3000000] credits; pattern: step change in residual: possible plan or provider accounting transition; pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable\nSummary: 0 passed, 1 failed, 0 warned, 0 not applicable, 0 not yet available\n\nDoctor: Rolling Residual Health\n  window: 30d (6 eligible intervals, minimum: 5)\n  residual interval: [1000000 .. 3000000] credits\n  residual fraction: +20.00%\n  verdict: discrepancy\n  pattern: step change in residual: possible plan or provider accounting transition\n  pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable";
     assert_eq!(output_justified, expected_justified);
 }
 
@@ -2849,6 +2954,7 @@ fn human_and_versioned_json_results_agree_on_names_states_reasons_and_repairs() 
         assert_eq!(entry["has_repair"], outcome.has_repair);
         let expected_reason = match &outcome.status {
             CheckStatus::Fail(reason)
+            | CheckStatus::Warn(reason)
             | CheckStatus::NotApplicable(reason)
             | CheckStatus::PassWithDetail(reason) => Some(reason.as_str()),
             CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => None,
@@ -2972,6 +3078,7 @@ fn doctor_reasons_never_carry_credential_values() {
         for outcome in outcomes {
             let reason = match &outcome.status {
                 CheckStatus::Fail(reason)
+                | CheckStatus::Warn(reason)
                 | CheckStatus::NotApplicable(reason)
                 | CheckStatus::PassWithDetail(reason) => reason.as_str(),
                 CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => continue,
@@ -3016,6 +3123,7 @@ fn registry_reasons_contain_no_absolute_state_path() {
     for outcome in &outcomes {
         let reason = match &outcome.status {
             CheckStatus::Fail(reason)
+            | CheckStatus::Warn(reason)
             | CheckStatus::NotApplicable(reason)
             | CheckStatus::PassWithDetail(reason) => reason.as_str(),
             CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => continue,

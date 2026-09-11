@@ -15,12 +15,12 @@
 # example's window shape once, then is killed before the two scenarios that
 # must prove they read no network at all.
 #
-# Two calibration/cost-model seams have no CLI path yet (`load_active_at`'s
-# scope key requires a calibration row nothing here ingests, and the same is
-# true of an active cost model), so this case seeds both through the real
-# store functions behind two test-only hooks (`__cost-model-fixture`,
-# `__calibration-fixture`) rather than hand-writing SQL against schemas this
-# file does not own. Task identity has the same gap (no CLI resolves a task's
+# The cost-model seam has a CLI path now (`aub cost-model activate`, aub-6wym);
+# the calibration seam still has none (`load_active_at`'s scope key requires a
+# calibration row nothing here ingests), so this case seeds it through the real
+# store functions behind one test-only hook (`__calibration-fixture`) rather
+# than hand-writing SQL against schemas this file does not own. Task identity
+# has the same gap (no CLI resolves a task's
 # kind yet) and is seeded directly against `task_identity`, matching this
 # suite's own convention for every table with no ingestion path
 # (`025-now-account-switch-boundary.sh` does the same for
@@ -185,10 +185,9 @@ case_steps() {
          ('claude-code', 's3', 1787632200000000000, NULL, 'work-primary', NULL, 'hook', NULL, NULL, 'launcher_or_hook');
     "
 
-    # 5. An active, complete cost model: no CLI activates one outside this
-    #    test-only hook (`aub-cab.4`'s own scope note applies here too).
+    # 5. An active, complete cost model, through the shipping command.
     step "seed-cost-model" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
-        "$AUB_BIN" __cost-model-fixture complete
+        "$AUB_BIN" cost-model activate anthropic_claude_messages_v1
 
     # 6-8. A current calibration for every window except the opus-specific
     #    one, seeded through the real experiment/result/activation chain.

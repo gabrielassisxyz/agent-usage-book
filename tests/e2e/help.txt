@@ -8,6 +8,7 @@ commands:
   spend    canonical token usage grouped and filtered by day, session, project, repository, harness, model, task or account
   config   print every resolved configuration key with the source that won
   export   emit versioned JSONL usage rows keyed by session-id or run-id for external joins
+  cost-model list and activate the published cost models
   rate-card import, show and history the immutable dated vendor rate cards
   backup   create or verify a consistent archive of durable state
   ingest   land the configured transcripts' normalized usage into the ledger, advancing the ingestion generation
@@ -48,6 +49,12 @@ export:
   refuses: --format (export is always versioned JSONL); --explain (export derives no quantity); --account (export reads every stored session, not one account); --model (export keys on session or run, not on a model); --no-color (export prints no color)
   format: text only: export is always versioned JSONL
   options: --key session-id|run-id (required), --include-logical-ids
+
+cost-model:
+  answers: which published cost model prices usage into credits?
+  refuses: --format (cost-model prints plain rows, not a report); --explain (cost-model derives no quantity); --account (a cost model is scoped to a provider, not to an account); --model (cost-model takes its model as a positional id, not --model); --no-color (cost-model prints plain rows)
+  format: text only: cost-model prints plain rows, not a report
+  options: list | activate MODEL-ID
 
 rate-card:
   answers: what do the immutable dated vendor rate cards contain?

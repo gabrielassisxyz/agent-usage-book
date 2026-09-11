@@ -175,11 +175,12 @@ case_steps() {
                     $RESETS_NS, 18000000000000);
     "
 
-    # 6-7. An active, complete cost model and the first calibration: a
+    # 6-7. An active, complete cost model (through the shipping command) and
+    #    the first calibration: a
     #    conspicuous 30 micros/point, so the arithmetic stays comparable
     #    with the two-consumer proof.
     step "seed-cost-model" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
-        "$AUB_BIN" __cost-model-fixture complete
+        "$AUB_BIN" cost-model activate anthropic_claude_messages_v1
     step "seed-calibration" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
         "$AUB_BIN" __calibration-fixture five_hour 30
 

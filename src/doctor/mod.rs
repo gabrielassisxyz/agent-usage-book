@@ -8,7 +8,7 @@
 //! outside a module; a check written beside the evidence sees the failure the module
 //! itself would flag.
 //!
-//! [`CheckName::EXPECTED`] is the design's full twenty-four-condition list, encoded once
+//! [`CheckName::EXPECTED`] is the design's full twenty-five-condition list, encoded once
 //! so the registry can be compared against it rather than trusted by inspection. An
 //! entry with no registered [`CheckOutcome`] is a failing build
 //! ([`missing_checks`]). During staged implementation an entry whose owning
@@ -56,11 +56,12 @@ pub enum CheckName {
     SamplingFailureCounts,
     MeterErrorClassifications,
     SubscriptionIdentityChange,
+    CostModelActive,
 }
 
 impl CheckName {
     /// The design's full check list (PLAN.md 27, 36, aub-smqu), encoded once so the
-    /// registry can be compared against it. Twenty-four entries: the design's
+    /// registry can be compared against it. Twenty-five entries: the design's
     /// original nineteen, [`Self::AdapterSemanticsComparisonAge`] added by
     /// `aub-x2bq` once the adapter-semantics mechanism (`aub-eun.12`) existed for
     /// a check to cover, [`Self::LastSampleTick`] added by `aub-va6s` once the
@@ -71,8 +72,11 @@ impl CheckName {
     /// added by `aub-rfot` once the failed attempts' sanitized error
     /// classification column was populated for a check to read, and
     /// [`Self::SubscriptionIdentityChange`] added by `aub-iwkg` once the
-    /// subscription-history table existed for a check to read.
-    pub const EXPECTED: [CheckName; 24] = [
+    /// subscription-history table existed for a check to read, and
+    /// [`Self::CostModelActive`] added by `aub-6wym` once the `cost-model`
+    /// command gave the operator a shipping path to repair what the check
+    /// reports.
+    pub const EXPECTED: [CheckName; 25] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -97,6 +101,7 @@ impl CheckName {
         Self::SamplingFailureCounts,
         Self::MeterErrorClassifications,
         Self::SubscriptionIdentityChange,
+        Self::CostModelActive,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -126,19 +131,22 @@ impl CheckName {
             Self::SamplingFailureCounts => "sampling-failure-counts",
             Self::MeterErrorClassifications => "meter-error-classifications",
             Self::SubscriptionIdentityChange => "subscription-identity-change",
+            Self::CostModelActive => "cost-model-active",
         }
     }
 }
 
 /// The outcome of one check. Never a bare pass/fail boolean: a check that cannot
-/// apply to the current configuration says so and why, and a check whose owning
-/// subsystem is not built yet says which bead will own it, rather than going
-/// missing in either case.
+/// apply to the current configuration says so and why, a check whose owning
+/// subsystem is not built yet says which bead will own it, and a check whose
+/// finding is advisory rather than gating warns while naming the repair,
+/// rather than going missing in either case.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CheckStatus {
     Pass,
     PassWithDetail(String),
     Fail(String),
+    Warn(String),
     NotApplicable(String),
     NotYetAvailable { owning_bead: &'static str },
 }
@@ -150,6 +158,7 @@ impl CheckStatus {
         match self {
             Self::Pass | Self::PassWithDetail(_) => "pass",
             Self::Fail(_) => "fail",
+            Self::Warn(_) => "warn",
             Self::NotApplicable(_) => "not_applicable",
             Self::NotYetAvailable { .. } => "not_yet_available",
         }
@@ -191,6 +200,13 @@ impl DoctorReport {
         self.outcomes
             .iter()
             .filter(|o| matches!(o.status, CheckStatus::Fail(_)))
+            .count()
+    }
+
+    pub fn warned(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Warn(_)))
             .count()
     }
 
@@ -294,6 +310,7 @@ mod tests {
             // status added later fails this assertion instead of being folded into the panic.
             CheckStatus::Pass
             | CheckStatus::PassWithDetail(_)
+            | CheckStatus::Warn(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_) => {
                 panic!("expected not-yet-available")

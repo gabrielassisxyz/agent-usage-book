@@ -1863,6 +1863,7 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
             );
             match &outcome.status {
                 crate::doctor::CheckStatus::Fail(reason)
+                | crate::doctor::CheckStatus::Warn(reason)
                 | crate::doctor::CheckStatus::NotApplicable(reason)
                 | crate::doctor::CheckStatus::PassWithDetail(reason) => {
                     fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
@@ -1878,9 +1879,10 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
         .join(",");
 
     let mut body = format!(
-        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"not_applicable\":{},\"not_yet_available\":{}",
+        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"warned\":{},\"not_applicable\":{},\"not_yet_available\":{}",
         report.passed(),
         report.failed(),
+        report.warned(),
         report.not_applicable(),
         report.not_yet_available(),
     );

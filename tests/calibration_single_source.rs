@@ -13,8 +13,9 @@
 //! shared record: a consumer that copied a coefficient into a local constant
 //! would pass that check and still be wrong. Each test here seeds one record
 //! with a conspicuous synthetic value through the real store chain (the
-//! `__calibration-fixture` / `__cost-model-fixture` hooks, the only production
-//! path into these tables from outside the crate), reads every consumer
+//! `__calibration-fixture` hook and, since aub-6wym, the shipping
+//! `cost-model activate` command (the only paths into these tables from
+//! outside the crate), reads every consumer
 //! through the release binary, supersedes the record append-only, and reads
 //! every consumer again with no source or configuration edit in between. A
 //! consumer that cached or copied the value instead of resolving it through
@@ -253,7 +254,10 @@ fn calibration_supersession_moves_calibrate_show_and_spend_window_equivalent_tog
         }],
     );
     mark_account(&state, "s-single-source-work");
-    run(&state, &["__cost-model-fixture", "complete"]);
+    run(
+        &state,
+        &["cost-model", "activate", "anthropic_claude_messages_v1"],
+    );
 
     // First half: a conspicuous synthetic coefficient. 1,000,000 input tokens
     // at the complete model's 3 micros/token price 3,000,000 micros of
@@ -354,7 +358,14 @@ fn cost_model_supersession_moves_calibrate_show_and_spend_credits_together() {
 
     // First half: the incomplete model has no cache_write term, so it prices
     // nothing of this workload, and no calibration can activate against it.
-    run(&state, &["__cost-model-fixture", "incomplete"]);
+    run(
+        &state,
+        &[
+            "cost-model",
+            "activate",
+            "anthropic_claude_messages_incomplete_v1",
+        ],
+    );
 
     let show_before = run(&state, &["calibrate", "show"]);
     assert!(
@@ -375,7 +386,10 @@ fn cost_model_supersession_moves_calibrate_show_and_spend_credits_together() {
     // covers the workload, followed by the calibration that can only activate
     // now that its referenced cost model is complete. No source or
     // configuration edit accompanies either step.
-    run(&state, &["__cost-model-fixture", "complete"]);
+    run(
+        &state,
+        &["cost-model", "activate", "anthropic_claude_messages_v1"],
+    );
     run(&state, &["__calibration-fixture", "five_hour", "1000000"]);
 
     let show_after = run(&state, &["calibrate", "show"]);
@@ -822,7 +836,10 @@ fn can_run_supersession_moves_all_three_consumers_together() {
         )
         .expect("the account marker must insert");
     }
-    run(&state, &["__cost-model-fixture", "complete"]);
+    run(
+        &state,
+        &["cost-model", "activate", "anthropic_claude_messages_v1"],
+    );
     seed_meter_five_hour(&state);
 
     // First half: the conspicuous 30 micros/point coefficient from the

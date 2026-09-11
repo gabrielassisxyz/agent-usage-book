@@ -69,7 +69,7 @@ case_steps() {
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        "$AUB_BIN" __cost-model-fixture complete
+        "$AUB_BIN" cost-model activate anthropic_claude_messages_v1
 
     step "seed-five-hour-calibration" env \
         "HOME=$STATE_DIR/home" \

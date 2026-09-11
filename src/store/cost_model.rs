@@ -702,16 +702,53 @@ pub fn load_by_semantic_id(
 /// its event instant, so two events at the same instant can only both name the same
 /// predecessor, and the later-inserted row is the one that speaks).
 pub fn load_active_at(conn: &Connection, at: UtcTimestamp) -> Result<Option<CostModel>, Error> {
-    load_model(
-        conn,
-        "WHERE id = (
-            SELECT cost_model_id FROM cost_model_lifecycle
-            WHERE event_at <= ?1
-            ORDER BY event_at DESC, id DESC
-            LIMIT 1
-        )",
+    let Some((db_id, _)) = active_lifecycle_row(conn, at)? else {
+        return Ok(None);
+    };
+    load_model(conn, "WHERE id = ?1", params![db_id.value()])
+}
+
+/// The model active at `at` with the instant it became active: the same
+/// lifecycle row [`load_active_at`] resolves the model from, so the model and
+/// its `active since` instant can never disagree.
+pub fn load_active_with_activation_at(
+    conn: &Connection,
+    at: UtcTimestamp,
+) -> Result<Option<(CostModel, UtcTimestamp)>, Error> {
+    let Some((db_id, since)) = active_lifecycle_row(conn, at)? else {
+        return Ok(None);
+    };
+    Ok(load_model(conn, "WHERE id = ?1", params![db_id.value()])?.map(|model| (model, since)))
+}
+
+/// The lifecycle row the active-at query resolves from: the rowid of the
+/// active `cost_model` row and the instant it became active. One definition
+/// for the "latest row at or before `at`" rule, read by both
+/// [`load_active_at`] and [`load_active_with_activation_at`]. Ties at one
+/// instant are broken by event row id, the later row winning; the
+/// repository's activation rule makes ties unreachable in practice (a
+/// successor must supersede the model active just before its event instant,
+/// so two events at the same instant can only both name the same
+/// predecessor, and the later-inserted row is the one that speaks).
+fn active_lifecycle_row(
+    conn: &Connection,
+    at: UtcTimestamp,
+) -> Result<Option<(CostModelDbId, UtcTimestamp)>, Error> {
+    conn.query_row(
+        "SELECT cost_model_id, event_at FROM cost_model_lifecycle
+         WHERE event_at <= ?1
+         ORDER BY event_at DESC, id DESC
+         LIMIT 1",
         params![at.unix_nanos()],
+        |row| {
+            Ok((
+                CostModelDbId::new(row.get::<_, i64>(0)?),
+                UtcTimestamp::from_unix_nanos(row.get::<_, i64>(1)?),
+            ))
+        },
     )
+    .optional()
+    .map_err(|e| Error::Store(format!("cannot read the active lifecycle row: {e}")))
 }
 
 /// Whether a later lifecycle event names this cost model as superseded: a
@@ -870,8 +907,57 @@ pub fn activate(
     Ok(LifecycleEventId::new(event_id))
 }
 
+/// Records `model` becoming active at `event_at`, unless it already is the
+/// active model then: a repeated activation writes nothing and reports
+/// `false`, so the command surface stays idempotent through this one path
+/// rather than a command-side second check that could drift from the store.
+/// Otherwise behaves exactly like [`activate`] and reports `true`.
+pub fn activate_if_not_active(
+    conn: &mut Connection,
+    model: &CostModel,
+    event_at: UtcTimestamp,
+) -> Result<bool, Error> {
+    let active = load_active_at(conn, event_at)?;
+    if active.as_ref().map(|current| current.id()) == Some(model.id()) {
+        return Ok(false);
+    }
+    activate(
+        conn,
+        model,
+        event_at,
+        active.as_ref().map(|current| current.id()),
+    )?;
+    Ok(true)
+}
+
+/// The semantic id of the complete published cost model. Defined once here and
+/// read by the constructors below, the `cost-model` command surface and its
+/// refusal text, so the three can never name different models.
+pub const ANTHROPIC_CLAUDE_MESSAGES_V1_ID: &str = "anthropic-claude-messages-v1";
+/// The semantic id of the published model with its cache-write term removed,
+/// kept activatable so missing-rate refusals stay testable from the surface.
+pub const ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID: &str =
+    "anthropic-claude-messages-incomplete-v1";
+/// Every published model id, in list order: the complete model first.
+pub const PUBLISHED_MODEL_IDS: [&str; 2] = [
+    ANTHROPIC_CLAUDE_MESSAGES_V1_ID,
+    ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID,
+];
+
+/// The published model for `id` with validity starting at `valid_from`, or
+/// `None` for an id no published model carries. The caller matches against
+/// [`PUBLISHED_MODEL_IDS`] first, so this constructor and that list agree by
+/// construction: both read the same two constants.
+pub fn published_model(id: &str, valid_from: UtcTimestamp) -> Option<CostModel> {
+    match id {
+        ANTHROPIC_CLAUDE_MESSAGES_V1_ID => Some(anthropic_claude_messages_v1(valid_from)),
+        ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID => {
+            Some(anthropic_claude_messages_incomplete_v1(valid_from))
+        }
+        _ => None,
+    }
+}
 /// The default / first published cost model for Anthropic Claude messages subscription (`aub-ai3.3`).
-///
 /// Published with explicit per-term provenance covering all 4 token kinds:
 /// - input: 3_000_000 micro-credits / M tokens (3.0 credits / M)
 /// - output: 15_000_000 micro-credits / M tokens (15.0 credits / M)
@@ -889,7 +975,7 @@ pub fn anthropic_claude_messages_v1(valid_from: UtcTimestamp) -> CostModel {
         QuerySemantics::new("cost_model", "published_seed"),
     );
     CostModel::new(
-        CostModelId::new("anthropic-claude-messages-v1"),
+        CostModelId::new(ANTHROPIC_CLAUDE_MESSAGES_V1_ID),
         ProviderKey::new("anthropic"),
         CostModelScope::ModelClass,
         BillingSemanticsId::new("anthropic-messages-subscription-v1"),
@@ -950,7 +1036,7 @@ pub fn anthropic_claude_messages_incomplete_v1(valid_from: UtcTimestamp) -> Cost
         QuerySemantics::new("cost_model", "published_seed_without_cache_write"),
     );
     CostModel::new(
-        CostModelId::new("anthropic-claude-messages-incomplete-v1"),
+        CostModelId::new(ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID),
         ProviderKey::new("anthropic"),
         CostModelScope::ModelClass,
         BillingSemanticsId::new("anthropic-messages-subscription-v1"),
@@ -1376,6 +1462,68 @@ mod tests {
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].0, "activation");
         assert_eq!(events[1].0, "supersession");
+    }
+
+    /// `activate_if_not_active` over the published models: first activation
+    /// writes one `activation` row, supersession writes one `supersession`
+    /// row naming the previous model, and re-activating the active model at
+    /// a later instant writes nothing. The active-since lookup agrees with
+    /// the active model at every instant probed.
+    #[test]
+    fn published_activation_then_supersession_then_idempotent_reactivation() {
+        let (_scratch, mut conn) = fixture_conn();
+        assert!(published_model("nope", ts(1_000)).is_none());
+        let complete =
+            published_model(ANTHROPIC_CLAUDE_MESSAGES_V1_ID, ts(1_000)).expect("published");
+        let incomplete = published_model(ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID, ts(2_000))
+            .expect("published");
+
+        assert!(
+            load_active_with_activation_at(&conn, ts(999))
+                .unwrap()
+                .is_none()
+        );
+
+        assert!(activate_if_not_active(&mut conn, &complete, ts(1_000)).unwrap());
+        assert!(activate_if_not_active(&mut conn, &incomplete, ts(2_000)).unwrap());
+        // Planted negative first: without the short-circuit this third call
+        // would refuse (a model cannot supersede itself), not succeed
+        // quietly, so asserting `false` pins the no-write path, not an error.
+        assert!(!activate_if_not_active(&mut conn, &incomplete, ts(3_000)).unwrap());
+
+        let kinds: Vec<String> = conn
+            .prepare("SELECT event_kind FROM cost_model_lifecycle ORDER BY event_at")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(kinds, vec!["activation", "supersession"]);
+
+        let superseded: String = conn
+            .query_row(
+                "SELECT cost_model.cost_model_id FROM cost_model
+                 JOIN cost_model_lifecycle
+                   ON cost_model_lifecycle.supersedes_model_id = cost_model.id
+                 WHERE cost_model_lifecycle.event_kind = 'supersession'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(superseded, ANTHROPIC_CLAUDE_MESSAGES_V1_ID);
+
+        let (active, since) = load_active_with_activation_at(&conn, ts(2_500))
+            .unwrap()
+            .expect("a model is active");
+        assert_eq!(
+            active.id().as_str(),
+            ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID
+        );
+        assert_eq!(since, ts(2_000));
+        let (still_active, _) = load_active_with_activation_at(&conn, ts(99_000))
+            .unwrap()
+            .expect("the model stays active");
+        assert_eq!(still_active.id(), active.id());
     }
 
     /// Both interval constructors reject an inverted range rather than normalising

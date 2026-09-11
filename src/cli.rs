@@ -88,7 +88,7 @@ aub_command_enum! {
     ExitClass,
     AttemptCrashHook,
     ProjectionCrashHook,
-    CostModelFixture,
+    CostModel,
     RateCard,
     Backup,
     Ingest,
@@ -152,7 +152,7 @@ impl Command {
         Self::ExitClass,
         Self::AttemptCrashHook,
         Self::ProjectionCrashHook,
-        Self::CostModelFixture,
+        Self::CostModel,
         Self::RateCard,
         Self::Backup,
         Self::Ingest,
@@ -295,21 +295,21 @@ impl Command {
                 },
                 verbosity: FlagSupport::Accepted,
             },
-            Command::CostModelFixture => FlagPolicy {
+            Command::CostModel => FlagPolicy {
                 format: FlagSupport::Rejected {
-                    reason: "cost-model-fixture drives the store, not a report",
+                    reason: "cost-model prints plain rows, not a report",
                 },
                 explain: FlagSupport::Rejected {
-                    reason: "cost-model-fixture derives no quantity",
+                    reason: "cost-model derives no quantity",
                 },
                 account: FlagSupport::Rejected {
                     reason: "a cost model is scoped to a provider, not to an account",
                 },
                 model: FlagSupport::Rejected {
-                    reason: "cost-model-fixture names its own model",
+                    reason: "cost-model takes its model as a positional id, not --model",
                 },
                 no_color: FlagSupport::Rejected {
-                    reason: "cost-model-fixture prints a plain activation line",
+                    reason: "cost-model prints plain rows",
                 },
                 verbosity: FlagSupport::Accepted,
             },
@@ -655,7 +655,7 @@ impl Command {
             Command::ExitClass => "__exit-class",
             Command::AttemptCrashHook => "__attempt-crash-hook",
             Command::ProjectionCrashHook => "__projection-crash-hook",
-            Command::CostModelFixture => "__cost-model-fixture",
+            Command::CostModel => "cost-model",
             Command::RateCard => "rate-card",
             Command::Backup => "backup",
             Command::Ingest => "ingest",
@@ -694,7 +694,7 @@ impl Command {
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
-            Command::CostModelFixture => None,
+            Command::CostModel => Some("list and activate the published cost models"),
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }
@@ -802,7 +802,7 @@ impl Command {
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
-            Command::CostModelFixture => None,
+            Command::CostModel => Some("which published cost model prices usage into credits?"),
             Command::CalibrationFixture => None,
         }
     }
@@ -879,13 +879,13 @@ impl Command {
                 Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
             }
             Command::Account => Some("list | rename PROVIDER OLD NEW"),
+            Command::CostModel => Some("list | activate MODEL-ID"),
             Command::Statusline => None,
             Command::LoggingFixture
             | Command::StateCheck
             | Command::ExitClass
             | Command::AttemptCrashHook
             | Command::ProjectionCrashHook
-            | Command::CostModelFixture
             | Command::CalibrationFixture
             | Command::RateCard => None,
         }
@@ -1187,7 +1187,7 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Command::AttemptCrashHook => attempt_crash_hook(&RealClock::new(), level, &invocation),
         Command::ProjectionCrashHook => projection_crash_hook(&RealClock::new(), &invocation),
-        Command::CostModelFixture => cost_model_fixture(&RealClock::new(), &invocation),
+        Command::CostModel => cost_model_command(&RealClock::new(), &invocation),
         Command::RateCard => rate_card_command(&RealClock::new(), &invocation),
         Command::Backup => backup_command(&RealClock::new(), &invocation),
         Command::Ingest => ingest_command(&RealClock::new(), level, &invocation),
@@ -4884,38 +4884,106 @@ fn projection_crash_hook(clock: &impl Clock, invocation: &Invocation) -> Result<
     Ok(())
 }
 
-/// `aub rate-card`: the subcommand selects the operation; the shared flags are
-/// refused by the command's policy. The store path follows the state-check and
-/// crash-hook commands: readiness first, then the one connection path, then
-/// migrations, then the operation.
-/// Activates one of the two published cost models against the ledger, superseding
-/// whatever is active. Nothing in the shipping surface activates a cost model yet, so
-/// without this hook `spend --credits` can only ever report the missing-model refusal
-/// and the conversion itself would go untested through the binary.
-fn cost_model_fixture(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    let at = clock.now();
-    let model = match invocation.rest.first().map(String::as_str) {
-        Some("complete") => crate::store::cost_model::anthropic_claude_messages_v1(at),
-        Some("incomplete") => crate::store::cost_model::anthropic_claude_messages_incomplete_v1(at),
-        other => {
-            return Err(Error::Usage(format!(
-                "__cost-model-fixture requires complete or incomplete, got {other:?}"
-            )));
-        }
-    };
-    let mut conn = open_ledger(clock)?;
-    let active = crate::store::cost_model::load_active_at(&conn, at)?;
-    if active.as_ref().map(|current| current.id()) == Some(model.id()) {
-        println!("cost model {} already active", model.id().as_str());
-        return Ok(());
+/// `aub cost-model`: the subcommand selects the operation; the shared flags are
+/// refused by the command's policy. `list` prints one line per published
+/// model, `activate` records the lifecycle row the store already defines.
+/// The store path follows the state-check and crash-hook commands: readiness
+/// first, then the one connection path, then migrations, then the operation.
+fn cost_model_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    match parse_cost_model_action(&invocation.rest)? {
+        CostModelAction::List => cost_model_list(clock),
+        CostModelAction::Activate { model_id } => cost_model_activate(clock, &model_id),
     }
-    crate::store::cost_model::activate(
-        &mut conn,
-        &model,
-        at,
-        active.as_ref().map(|current| current.id()),
-    )?;
-    println!("cost model {} active", model.id().as_str());
+}
+
+/// The parsed `cost-model` subcommand: `list` names no model, `activate`
+/// carries the normalized published id the store recognises.
+#[derive(Debug)]
+enum CostModelAction {
+    List,
+    Activate { model_id: String },
+}
+
+/// Reads the `cost-model` subcommand without touching the store, so argument
+/// handling is unit-tested without a ledger. Underscores in the model id are
+/// accepted and read as dashes: the bead names the models with underscores
+/// (the constructor names in `store::cost_model`) while the stored semantic
+/// ids use dashes, and both spellings must reach the same model.
+fn parse_cost_model_action(rest: &[String]) -> Result<CostModelAction, Error> {
+    match rest.first().map(String::as_str) {
+        Some("list") => {
+            if rest.len() > 1 {
+                return Err(Error::Usage(format!(
+                    "cost-model list takes no arguments, got {:?}",
+                    &rest[1..]
+                )));
+            }
+            Ok(CostModelAction::List)
+        }
+        Some("activate") => {
+            let raw = rest.get(1).ok_or_else(|| {
+                Error::Usage(format!(
+                    "cost-model activate requires a model id (one of: {})",
+                    crate::store::cost_model::PUBLISHED_MODEL_IDS.join(", ")
+                ))
+            })?;
+            if rest.len() > 2 {
+                return Err(Error::Usage(format!(
+                    "cost-model activate takes one model id, got {:?}",
+                    &rest[1..]
+                )));
+            }
+            let model_id = normalize_cost_model_id(raw);
+            if !crate::store::cost_model::PUBLISHED_MODEL_IDS.contains(&model_id.as_str()) {
+                return Err(Error::Usage(format!(
+                    "unknown cost model '{raw}'; known models: {}",
+                    crate::store::cost_model::PUBLISHED_MODEL_IDS.join(", ")
+                )));
+            }
+            Ok(CostModelAction::Activate { model_id })
+        }
+        other => Err(Error::Usage(format!(
+            "cost-model requires a subcommand (list | activate <id>), got {other:?}"
+        ))),
+    }
+}
+
+/// The stored semantic ids use dashes; an underscore spelling names the same
+/// model rather than a different one.
+fn normalize_cost_model_id(raw: &str) -> String {
+    raw.replace('_', "-")
+}
+
+/// Prints one line per published model: `{id} active since <RFC 3339>` for
+/// the active one, `{id} inactive` for the rest.
+fn cost_model_list(clock: &impl Clock) -> Result<(), Error> {
+    let at = clock.now();
+    let conn = open_ledger(clock)?;
+    let active = crate::store::cost_model::load_active_with_activation_at(&conn, at)?;
+    for id in crate::store::cost_model::PUBLISHED_MODEL_IDS {
+        match &active {
+            Some((model, since)) if model.id().as_str() == id => {
+                println!("{id} active since {}", since.to_rfc3339());
+            }
+            _ => println!("{id} inactive"),
+        }
+    }
+    Ok(())
+}
+
+/// Activates one published model, superseding whatever is active. Repeating
+/// the active id prints `already active` and writes nothing, through the
+/// store's own idempotent path rather than a command-side second check.
+fn cost_model_activate(clock: &impl Clock, model_id: &str) -> Result<(), Error> {
+    let at = clock.now();
+    let model = crate::store::cost_model::published_model(model_id, at)
+        .expect("parse_cost_model_action only yields published ids");
+    let mut conn = open_ledger(clock)?;
+    if crate::store::cost_model::activate_if_not_active(&mut conn, &model, at)? {
+        println!("cost model {} active", model.id().as_str());
+    } else {
+        println!("cost model {} already active", model.id().as_str());
+    }
     Ok(())
 }
 
@@ -5082,6 +5150,10 @@ fn clear_diagnostics_report(
     }
 }
 
+/// `aub rate-card`: the subcommand selects the operation; the shared flags are
+/// refused by the command's policy. The store path follows the state-check and
+/// crash-hook commands: readiness first, then the one connection path, then
+/// migrations, then the operation.
 fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let subcommand = invocation.rest.first().map(String::as_str);
     match subcommand {
@@ -8836,6 +8908,89 @@ mod tests {
             None,
         );
         assert!(attribution_quality_breach_error(&unjudged).is_none());
+    }
+
+    /// `cost-model` argument handling (aub-6wym): `list` takes nothing,
+    /// `activate` takes exactly one published id, and every other shape is a
+    /// usage error. No ledger is touched, so these run without a state dir.
+    #[test]
+    fn cost_model_action_parses_list_and_activate() {
+        let list = parse_cost_model_action(&["list".to_string()]).unwrap();
+        assert!(matches!(list, CostModelAction::List));
+
+        let activate = parse_cost_model_action(&[
+            "activate".to_string(),
+            "anthropic-claude-messages-v1".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(activate, CostModelAction::Activate { model_id } if model_id == "anthropic-claude-messages-v1")
+        );
+
+        // The bead names the models with underscores; that spelling reaches
+        // the same stored model rather than a second identity.
+        let underscored = parse_cost_model_action(&[
+            "activate".to_string(),
+            "anthropic_claude_messages_v1".to_string(),
+        ])
+        .unwrap();
+        assert!(
+            matches!(underscored, CostModelAction::Activate { model_id } if model_id == "anthropic-claude-messages-v1")
+        );
+    }
+
+    /// `cost-model` refusals (aub-6wym): a missing id, an unknown id, a
+    /// missing subcommand and trailing arguments are all usage errors, and
+    /// the unknown-id error lists both published ids.
+    #[test]
+    fn cost_model_action_refuses_missing_and_unknown_ids() {
+        let missing = parse_cost_model_action(&["activate".to_string()]);
+        assert!(
+            matches!(missing, Err(Error::Usage(ref message)) if message.contains("requires a model id")),
+            "{missing:?}"
+        );
+
+        let unknown = parse_cost_model_action(&["activate".to_string(), "nope".to_string()]);
+        match unknown {
+            Err(Error::Usage(message)) => {
+                assert!(message.contains("unknown cost model 'nope'"), "{message}");
+                for id in crate::store::cost_model::PUBLISHED_MODEL_IDS {
+                    assert!(message.contains(id), "{message}");
+                }
+            }
+            other => panic!("unknown id must be a usage error, got {other:?}"),
+        }
+
+        // Planted negative: the unknown-id refusal must name the known ids,
+        // so asserting on a bare refusal without them would pass for a
+        // weaker error that leaves the operator guessing.
+        let bare = parse_cost_model_action(&[]);
+        assert!(
+            matches!(bare, Err(Error::Usage(ref message)) if message.contains("requires a subcommand")),
+            "{bare:?}"
+        );
+
+        assert!(parse_cost_model_action(&["list".to_string(), "extra".to_string()]).is_err());
+        assert!(
+            parse_cost_model_action(&[
+                "activate".to_string(),
+                "anthropic-claude-messages-v1".to_string(),
+                "extra".to_string()
+            ])
+            .is_err()
+        );
+        assert!(parse_cost_model_action(&["bogus".to_string()]).is_err());
+    }
+
+    /// The shipping surface names `cost-model`; the `__cost-model-fixture`
+    /// hook is gone, so the old token resolves to no command.
+    #[test]
+    fn cost_model_replaces_the_fixture_hook_on_the_command_line() {
+        assert_eq!(Command::from_name("cost-model"), Some(Command::CostModel));
+        assert_eq!(Command::from_name("__cost-model-fixture"), None);
+        assert_eq!(Command::CostModel.name(), "cost-model");
+        assert!(Command::CostModel.summary().is_some());
+        assert!(Command::CostModel.question().is_some());
     }
 
     /// `Command::ALL` must name every variant the enum declares. `DECLARED_VARIANTS`
