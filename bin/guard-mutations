@@ -261,7 +261,7 @@ case_id_of() {
 
 build_scratch() {
     if [ -d "$SCRATCH_BASE" ]; then
-        echo "guard-mutations: removed stale scratch from an interrupted run: $SCRATCH_BASE"
+        echo "guard-mutations: removed scratch left by a previous run: $SCRATCH_BASE"
         rm -rf "$SCRATCH_BASE"
     fi
     mkdir -p "$SCRATCH" "$MUT_TARGET"
@@ -272,23 +272,23 @@ build_scratch() {
 }
 
 snapshot_target() {
-    local target="$1" bak="$2"
-    if [ -e "$SCRATCH/$target" ]; then
-        mkdir -p "$(dirname "$bak")"
-        cp -a "$SCRATCH/$target" "$bak"
-        printf 'present'
-    else
-        printf 'absent'
-    fi
+    # Unused: rows restore via reset_tree below, which also reverts anything a
+    # sibling snippet touched. Kept as documentation of the rejected design:
+    # reverting only the named target lets sibling side-effects leak into the
+    # next row, which a later row then blames on its own mutation.
+    return 0
 }
 
-restore_target() {
-    local target="$1" bak="$2" was="$3"
-    if [ "$was" = "present" ]; then
-        cp -a "$bak" "$SCRATCH/$target"
-    else
-        rm -rf "$SCRATCH/$target"
-    fi
+# reset_tree: restore the scratch copy to its pristine commit. A row's command
+# and sibling snippets may write anywhere in the scratch copy, so reverting
+# only the named mutation target is not enough: an unreverted sibling plant
+# from row N fires a guard in row N+1, which then reports a mismatch for its
+# own mutation. git checkout/clean here touch only this private scratch
+# repository, never the live checkout.
+reset_tree() {
+    git -C "$SCRATCH" checkout -q -- . 2>/dev/null
+    git -C "$SCRATCH" clean -fdq 2>/dev/null
+    true
 }
 
 refuse_if_dirty() {
@@ -325,7 +325,6 @@ run_row() {
     sib_re="$(row_field "$line" 12)"
 
     local out="$SCRATCH_BASE/out-$guard.txt" sib_out="$SCRATCH_BASE/sib-$guard.txt"
-    local bak="$SCRATCH_BASE/bak-$guard" was=""
 
     if [ -n "$target" ]; then
         if [ "$mut" = "plant" ] && [ -e "$LIVE/$target" ]; then
@@ -336,10 +335,9 @@ run_row() {
             echo "ERROR $guard: mutation target missing from scratch: $target"
             return 0
         fi
-        was="$(snapshot_target "$target" "$bak")"
         if ! ( cd "$SCRATCH" && apply_mutation "$mut" "$target" "$mut_arg" "$mut_arg2" ); then
             echo "ERROR $guard: mutation failed to apply"
-            restore_target "$target" "$bak" "$was"
+            reset_tree
             return 0
         fi
     fi
@@ -354,7 +352,7 @@ run_row() {
         rc=$?
         if [ "$rc" -eq 3 ]; then
             echo "ERROR $guard: e2e harness failure (see $out)"
-            [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+            reset_tree
             return 0
         fi
         local target_id sibling_id target_verdict sibling_verdict
@@ -373,7 +371,7 @@ run_row() {
         else
             echo "MISMATCH $guard ($beads): mutated case failed but sibling $sibling_id verdict: ${sibling_verdict:-unknown}"
         fi
-        [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+        reset_tree
         return 0
     fi
 
@@ -389,22 +387,22 @@ run_row() {
     rc=$?
     if [ "$rc" -eq 3 ] || [ "$rc" -eq 124 ]; then
         echo "ERROR $guard ($beads): command harness failure (exit $rc; see $out)"
-        [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+        reset_tree
         return 0
     fi
     if [ "$scope" = "cargo" ] && ! grep -qE 'test result:|^test .* \.\.\. (ok|FAILED)' "$out"; then
         echo "ERROR $guard ($beads): cargo produced no test result (build failure? see $out)"
-        [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+        reset_tree
         return 0
     fi
     if [ "$rc" -eq 0 ]; then
         echo "DEAD $guard ($beads): mutation left the suite green"
-        [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+        reset_tree
         return 0
     fi
     if ! grep -Eq -- "$expect_re" "$out"; then
         echo "MISMATCH $guard ($beads): failed without the expected signature ($expect_re; see $out)"
-        [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+        reset_tree
         return 0
     fi
 
@@ -423,7 +421,7 @@ run_row() {
     else
         echo "GUARD-OK $guard ($beads)"
     fi
-    [ -n "$target" ] && restore_target "$target" "$bak" "$was"
+    reset_tree
     return 0
 }
 
@@ -692,7 +690,7 @@ EOF
     mkdir -p "$t/stale/tree"
     touch "$t/stale/tree/sentinel"
     out="$(cd "$repo" && SCRATCH_BASE_OVERRIDE="$t/stale" bash "$SCRIPT" --inventory "$good_inv" --only "syn-ok" 2>&1)"
-    case "$out" in *"removed stale scratch"*) : ;; *) echo "self-test: stale scratch was not reported: $out" >&2; fail=1 ;; esac
+    case "$out" in *"removed scratch left by"*) : ;; *) echo "self-test: stale scratch was not reported: $out" >&2; fail=1 ;; esac
 
     # 5. consistency: duplicate guard fails, good file passes structural half
     out="$(cd "$repo" && bash "$SCRIPT" --check-consistency --inventory "$inv" 2>&1)"
