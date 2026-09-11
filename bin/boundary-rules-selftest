@@ -7,6 +7,11 @@
 # planted once and the runner must fail naming the rule and the file, and each runner
 # mechanic (unreadable rule, non-executable rule, undeclared module, new-file discovery)
 # is broken once and the runner must fail naming it.
+#
+# A scenario whose planting step itself fails reports staleness naming the scenario
+# (aub-80nm), never a rule failure: a needle keyed to exact source formatting goes
+# stale the next time a signature is reformatted, and the wrong report there sends the
+# reader to debug a rule that is fine while the fixture that disarmed it stays broken.
 set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -51,6 +56,57 @@ runner_for() {
     printf '%s/bin/checks/45-boundary-rules' "$1"
 }
 
+# Locates a scenario's plant target and reports staleness naming the scenario when the
+# plant did nothing, rather than letting the later assertions blame a rule for a
+# violation that was never established. Every scenario that plants goes through one of
+# these, so the same staleness in any scenario is reported the same way.
+fail_planted_nothing() {
+    echo "FAIL: $1: scenario planted nothing (staleness: $2)" >&2
+    fail=1
+}
+
+plant_line() {
+    local label="$1" target="$2" line="$3"
+    if [ ! -f "$target" ]; then
+        fail_planted_nothing "$label" "$target missing"
+        return 1
+    fi
+    printf '%s\n' "$line" >> "$target"
+}
+
+# plant_store_edge FILE: inserts a store reference as the first statement of `fn
+# status`'s body. The declaration is located by a line-anchored pattern and the body
+# by the first line from the declaration onward that ends with the body's opening
+# brace, so reformatting the signature (one line or wrapped across several) cannot
+# silently disarm the scenario (aub-80nm: the old needle required a newline straight
+# after the open paren and found nothing once the signature went one-line). Exits
+# non-zero with the reason when the declaration cannot be located, which the caller
+# reports as scenario staleness.
+plant_store_edge() {
+    python3 - "$1" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+with open(path) as f:
+    lines = f.readlines()
+decls = [i for i, line in enumerate(lines) if re.match(r"\s*fn status\(", line)]
+if len(decls) != 1:
+    raise SystemExit(f"expected exactly one 'fn status(' declaration, found {len(decls)}")
+body = next(
+    (i for i in range(decls[0], len(lines)) if lines[i].rstrip().endswith("{")),
+    None,
+)
+if body is None:
+    raise SystemExit("no body-opening '{' found after the 'fn status(' declaration")
+lines.insert(
+    body + 1, "    let _planted_store_edge = crate::store::connection::open;\n"
+)
+with open(path, "w") as f:
+    f.writelines(lines)
+PYEOF
+}
+
 # --- clean run passes, and the whole set completes in under 5 seconds ---
 dir="$(make_scenario clean)"
 start="$(date +%s%N)"
@@ -70,7 +126,7 @@ violation() {
     local dir out rc
     dir="$(make_scenario "$label")"
     mkdir -p "$(dirname "$dir/$source_file")"
-    printf '%s\n' "$injection" >> "$dir/$source_file"
+    plant_line "$label" "$dir/$source_file" "$injection" || return 0
     out="$("$(runner_for "$dir")" 2>&1)"
     rc=$?
     assert_exit "$label exits 1" 1 "$rc"
@@ -78,8 +134,13 @@ violation() {
     assert_contains "$label names file" "$source_file" "$out"
 }
 
-# Flat-file violations (kept as near-identical positives/negatives)
-violation "rule01-flat" "01-presentation-no-provider-adapters" "src/presentation.rs" "use crate::meter;"
+# Violations planted into the modules' real files (kept as near-identical
+# positives/negatives). Where a module is a directory today (presentation, store) the
+# plant lands in its root mod.rs: the earlier flat-file paths src/presentation.rs and
+# src/store.rs) stopped existing when those modules split, and the old append silently
+# created phantom files the rules still caught, so the scenarios stopped exercising
+# their labels' targets (aub-80nm).
+violation "rule01-flat" "01-presentation-no-provider-adapters" "src/presentation/mod.rs" "use crate::meter;"
 violation "rule02-flat" "02-transcripts-no-calibration" "src/transcripts.rs" "use crate::calibration;"
 violation "rule03-flat" "03-meter-no-sqlite" "src/meter.rs" "use rusqlite::Connection;"
 violation "rule04-flat" "04-cost-model-no-config" "src/cost_model.rs" "use crate::config;"
@@ -87,9 +148,9 @@ violation "rule05-flat" "05-advice-no-calibration" "src/advice.rs" "use crate::c
 violation "rule06-flat" "06-status-no-http-transport" "src/projection.rs" "use ureq::get;"
 violation "rule07-flat" "07-provider-adapters-no-credential-paths" "src/meter.rs" "use crate::auth;"
 violation "rule08" "08-window-selection-ownership" "src/advice.rs" "lowest_remaining_fraction_window(windows, model);"
-violation "rule09-flat" "09-presentation-no-store-or-calibration" "src/presentation.rs" "use crate::store;"
+violation "rule09-flat" "09-presentation-no-store-or-calibration" "src/presentation/mod.rs" "use crate::store;"
 violation "rule10" "10-freshness-constructed-only-in-domain" "src/advice.rs" "pub fn bad() { let _ = Freshness::AuthRequired { last_good: None, latest_attempt: crate::domain::attempt::AttemptId::new(1) }; }"
-violation "rule11" "11-store-connections-through-one-function" "src/store.rs" "rusqlite::Connection::open(\"foo\");"
+violation "rule11" "11-store-connections-through-one-function" "src/store/mod.rs" "rusqlite::Connection::open(\"foo\");"
 violation "rule12" "12-transport-no-ureq-outside-transport" "src/advice.rs" "use ureq::Agent;"
 violation "rule14-flat" "14-parser-no-cost-or-meter" "src/transcripts.rs" "use crate::cost_model;"
 violation "rule15-flat" "15-status-no-migration" "src/projection.rs" "use crate::store::migrate;"
@@ -98,89 +159,221 @@ violation "rule18-flat" "18-no-system-clock-outside-time" "src/advice.rs" "pub f
 
 # --- rule 19: function-scoped, not flat-file/nested like the rules above, because
 # status shares src/cli.rs with every other command. A store reference planted inside
-# `fn status` itself must be caught ...
+# `fn status` itself must be caught ... A planter that cannot locate the declaration
+# is scenario staleness, reported as such, never a rule failure.
 dir="$(make_scenario rule19-status)"
-python3 - "$dir/src/cli.rs" <<'PYEOF'
-import sys
-path = sys.argv[1]
-with open(path) as f:
-    content = f.read()
-needle = "fn status(\n"
-count = content.count(needle)
-if count != 1:
-    raise SystemExit(f"expected exactly one 'fn status(' declaration, found {count}")
-marker = ") -> Result<(), Error> {\n"
-idx = content.index(needle)
-brace_idx = content.index(marker, idx) + len(marker)
-content = (
-    content[:brace_idx]
-    + "    let _planted_store_edge = crate::store::connection::open;\n"
-    + content[brace_idx:]
-)
-with open(path, "w") as f:
-    f.write(content)
-PYEOF
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "rule19-status exits 1" 1 "$rc"
-assert_contains "rule19-status names rule" "19-status-no-store-connection" "$out"
-assert_contains "rule19-status names file" "src/cli.rs" "$out"
+if planter_out="$(plant_store_edge "$dir/src/cli.rs" 2>&1)"; then
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "rule19-status [19-status-no-store-connection] exits 1" 1 "$rc"
+    assert_contains "rule19-status names rule" "19-status-no-store-connection" "$out"
+    assert_contains "rule19-status names file" "src/cli.rs" "$out"
+else
+    fail_planted_nothing "rule19-status" "$planter_out"
+fi
+
+# ... and the same plant must land and be caught with the signature wrapped across
+# several lines, the shape the old needle assumed and went stale against. This runs
+# only rule 19 over a synthetic mini-tree, so the wrapped shape is exercised without
+# paying a second full-tree scenario for it.
+wrap_dir="$scratch/rule19-status-wrapped"
+mkdir -p "$wrap_dir/bin/checks/boundary-rules" "$wrap_dir/src"
+cp -a "$repo_root/bin/checks/45-boundary-rules" "$wrap_dir/bin/checks/45-boundary-rules"
+cp -a "$repo_root/bin/checks/boundary-rules/19-status-no-store-connection" \
+    "$wrap_dir/bin/checks/boundary-rules/"
+cat > "$wrap_dir/src/cli.rs" <<'EOF'
+fn projection_accounts() -> Result<(), Error> { Ok(()) }
+fn status(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let _ = clock;
+    Ok(())
+}
+fn unrelated_later() {}
+EOF
+if planter_out="$(plant_store_edge "$wrap_dir/src/cli.rs" 2>&1)"; then
+    out="$("$wrap_dir/bin/checks/45-boundary-rules" 2>&1)"
+    rc=$?
+    assert_exit "rule19-status-wrapped [19-status-no-store-connection] exits 1" 1 "$rc"
+    assert_contains "rule19-status-wrapped names rule" "19-status-no-store-connection" "$out"
+    assert_contains "rule19-status-wrapped names file" "src/cli.rs" "$out"
+else
+    fail_planted_nothing "rule19-status-wrapped" "$planter_out"
+fi
 
 # ... and the identical reference in an unrelated cli.rs function, outside the status
 # path, must pass: the rule scans the status functions, never the whole file.
 dir="$(make_scenario rule19-elsewhere)"
-printf '\nfn unrelated_uses_the_store() { let _ = crate::store::connection::open; }\n' >> "$dir/src/cli.rs"
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "rule19-elsewhere exits 0" 0 "$rc"
+if plant_line "rule19-elsewhere" "$dir/src/cli.rs" \
+    "fn unrelated_uses_the_store() { let _ = crate::store::connection::open; }"
+then
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "rule19-elsewhere exits 0" 0 "$rc"
+fi
 
-# Nested-file violations under module directories
+# --- unit: the rule19 planter against a `fn status(` declaration written on one line
+# and across several, asserting both plant at the body's first statement (aub-80nm) ---
+unit_dir="$scratch/unit-plant"
+mkdir -p "$unit_dir"
+
+plant_unit_case() {
+    # $1 = fixture stem; the fixture and its expected planted shape are
+    # $unit_dir/<stem>.rs and $unit_dir/<stem>.expected.rs
+    local stem="$1"
+    if planter_out="$(plant_store_edge "$unit_dir/$stem.rs" 2>&1)"; then
+        if ! diff -u "$unit_dir/$stem.expected.rs" "$unit_dir/$stem.rs" > "$unit_dir/$stem.diff"; then
+            echo "FAIL: unit-planter-$stem: planted shape differs from expected" >&2
+            cat "$unit_dir/$stem.diff" >&2
+            fail=1
+        fi
+    else
+        fail_planted_nothing "unit-planter-$stem" "$planter_out"
+    fi
+}
+
+cat > "$unit_dir/one-line.rs" <<'EOF'
+fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let _ = clock;
+    Ok(())
+}
+EOF
+cat > "$unit_dir/one-line.expected.rs" <<'EOF'
+fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let _planted_store_edge = crate::store::connection::open;
+    let _ = clock;
+    Ok(())
+}
+EOF
+plant_unit_case one-line
+
+cat > "$unit_dir/wrapped.rs" <<'EOF'
+fn status(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let _ = clock;
+    Ok(())
+}
+EOF
+cat > "$unit_dir/wrapped.expected.rs" <<'EOF'
+fn status(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let _planted_store_edge = crate::store::connection::open;
+    let _ = clock;
+    Ok(())
+}
+EOF
+plant_unit_case wrapped
+
+# The refusals that keep a stale needle loud instead of silent: a file with no `fn
+# status(` declaration (near-identical prefixes like status_refresh_attempts must not
+# count), one with two, and one whose declaration never opens a body.
+cat > "$unit_dir/no-decl.rs" <<'EOF'
+fn statusline_command(clock: &impl Clock) -> Result<(), Error> { Ok(()) }
+fn status_refresh_attempts(clock: &impl Clock) -> Result<(), Error> { Ok(()) }
+EOF
+if planter_out="$(plant_store_edge "$unit_dir/no-decl.rs" 2>&1)"; then
+    echo "FAIL: unit-planter-refuses-no-declaration: planted without an 'fn status(' declaration" >&2
+    fail=1
+else
+    assert_contains "unit-planter-refuses-no-declaration names reason" "found 0" "$planter_out"
+fi
+
+cat > "$unit_dir/two-decls.rs" <<'EOF'
+fn status() -> Result<(), Error> { Ok(()) }
+fn status() -> Result<(), Error> { Ok(()) }
+EOF
+if planter_out="$(plant_store_edge "$unit_dir/two-decls.rs" 2>&1)"; then
+    echo "FAIL: unit-planter-refuses-two-declarations: planted with two 'fn status(' declarations" >&2
+    fail=1
+else
+    assert_contains "unit-planter-refuses-two-declarations names reason" "found 2" "$planter_out"
+fi
+
+cat > "$unit_dir/no-body.rs" <<'EOF'
+fn status(
+EOF
+if planter_out="$(plant_store_edge "$unit_dir/no-body.rs" 2>&1)"; then
+    echo "FAIL: unit-planter-refuses-bodyless-declaration: planted without a body brace" >&2
+    fail=1
+else
+    assert_contains "unit-planter-refuses-bodyless names reason" "no body-opening" "$planter_out"
+fi
+
+# Nested-file violations under module directories. Where the module has no directory
+# in the real tree the nested scenario was silently fabricating one; those scenarios
+# now plant into real files of the module instead (cost_model has no directory at all,
+# so its nested case is redundant with its flat one and is gone).
 violation "rule01-nested" "01-presentation-no-provider-adapters" "src/presentation/render.rs" "use crate::meter;"
 violation "rule02-nested" "02-transcripts-no-calibration" "src/transcripts/native.rs" "use crate::calibration;"
 violation "rule03-nested" "03-meter-no-sqlite" "src/meter/transport.rs" "use rusqlite::Connection;"
-violation "rule04-nested" "04-cost-model-no-config" "src/cost_model/nested.rs" "use crate::config;"
-violation "rule05-nested" "05-advice-no-calibration" "src/advice/nested.rs" "use crate::calibration;"
-violation "rule06-nested" "06-status-no-http-transport" "src/projection/nested.rs" "use ureq::get;"
+violation "rule05-nested" "05-advice-no-calibration" "src/advice/verdict.rs" "use crate::calibration;"
+violation "rule06-nested" "06-status-no-http-transport" "src/projection/reader.rs" "use ureq::get;"
 violation "rule07-nested" "07-provider-adapters-no-credential-paths" "src/meter/transport.rs" "use crate::auth;"
 violation "rule09-nested" "09-presentation-no-store-or-calibration" "src/presentation/render.rs" "use crate::store;"
 violation "rule14-nested" "14-parser-no-cost-or-meter" "src/transcripts/native.rs" "use crate::cost_model;"
-violation "rule15-nested" "15-status-no-migration" "src/projection/nested.rs" "use crate::store::migrate;"
+violation "rule15-nested" "15-status-no-migration" "src/projection/reader.rs" "use crate::store::migrate;"
 violation "rule18-nested" "18-no-system-clock-outside-time" "src/presentation/precision.rs" "pub fn bad() { let _ = std::time::Instant::now(); }"
 
 # --- rule 18: a near-identical planting inside the clock module itself passes ---
 dir="$(make_scenario rule18-allowed)"
-printf 'pub fn also_ok() { let _ = std::time::SystemTime::now(); }\n' >> "$dir/src/domain/time.rs"
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "rule18-allowed exits 0" 0 "$rc"
+if plant_line "rule18-allowed" "$dir/src/domain/time.rs" \
+    "pub fn also_ok() { let _ = std::time::SystemTime::now(); }"
+then
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "rule18-allowed exits 0" 0 "$rc"
+fi
 
 # --- two rules violated in one run are BOTH named, not only the first ---
 dir="$(make_scenario two-fail)"
-printf 'use crate::meter;\n' >> "$dir/src/presentation.rs"
-printf 'use crate::calibration;\n' >> "$dir/src/transcripts.rs"
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "two-fail exits 1" 1 "$rc"
-assert_contains "two-fail names first" "01-presentation-no-provider-adapters" "$out"
-assert_contains "two-fail names second" "02-transcripts-no-calibration" "$out"
+if plant_line "two-fail" "$dir/src/presentation/mod.rs" "use crate::meter;" \
+    && plant_line "two-fail" "$dir/src/transcripts.rs" "use crate::calibration;"
+then
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "two-fail exits 1" 1 "$rc"
+    assert_contains "two-fail names first" "01-presentation-no-provider-adapters" "$out"
+    assert_contains "two-fail names second" "02-transcripts-no-calibration" "$out"
+fi
 
 # --- a present, non-executable rule file fails the run rather than being skipped ---
 dir="$(make_scenario non-exec)"
-chmod 644 "$dir/bin/checks/boundary-rules/01-presentation-no-provider-adapters"
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "non-exec exits 1" 1 "$rc"
-assert_contains "non-exec names rule" "01-presentation-no-provider-adapters" "$out"
-assert_contains "non-exec reason" "not executable" "$out"
+non_exec_rule="$dir/bin/checks/boundary-rules/01-presentation-no-provider-adapters"
+if [ -f "$non_exec_rule" ]; then
+    chmod 644 "$non_exec_rule"
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "non-exec exits 1" 1 "$rc"
+    assert_contains "non-exec names rule" "01-presentation-no-provider-adapters" "$out"
+    assert_contains "non-exec reason" "not executable" "$out"
+else
+    fail_planted_nothing "non-exec" "$non_exec_rule missing"
+fi
 
 # --- a present, executable-but-unreadable rule fails rather than being skipped ---
 dir="$(make_scenario unreadable)"
-chmod 100 "$dir/bin/checks/boundary-rules/01-presentation-no-provider-adapters"
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "unreadable exits 1" 1 "$rc"
-assert_contains "unreadable names rule" "01-presentation-no-provider-adapters" "$out"
-assert_contains "unreadable reason" "unreadable" "$out"
+unreadable_rule="$dir/bin/checks/boundary-rules/01-presentation-no-provider-adapters"
+if [ -f "$unreadable_rule" ]; then
+    chmod 100 "$unreadable_rule"
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "unreadable exits 1" 1 "$rc"
+    # The needle is the runner's own verdict text, deliberately not the bare word:
+    # the scenario's directory is named "unreadable" and the shell's exec-failure
+    # message embeds that path, so the bare word passes vacuously and removing the
+    # unreadable branch would go unnoticed (aub-80nm, guard row sh-22).
+    assert_contains "unreadable reason" "FAIL (unreadable)" "$out"
+else
+    fail_planted_nothing "unreadable" "$unreadable_rule missing"
+fi
 
 # --- a new flat module with no declared dependency policy fails rather than passing ---
 dir="$(make_scenario undeclared)"
@@ -223,12 +416,13 @@ fi
 exit 0
 INNER_EOF
 chmod +x "$dir/bin/checks/boundary-rules/08-contributed"
-printf 'use crate::backup;\n' >> "$dir/src/advice.rs"
-out="$("$(runner_for "$dir")" 2>&1)"
-rc=$?
-assert_exit "new-rule exits 1" 1 "$rc"
-assert_contains "new-rule is discovered" "08-contributed" "$out"
-assert_contains "new-rule names file" "src/advice.rs" "$out"
+if plant_line "new-rule" "$dir/src/advice.rs" "use crate::backup;"; then
+    out="$("$(runner_for "$dir")" 2>&1)"
+    rc=$?
+    assert_exit "new-rule exits 1" 1 "$rc"
+    assert_contains "new-rule is discovered" "08-contributed" "$out"
+    assert_contains "new-rule names file" "src/advice.rs" "$out"
+fi
 
 # --- every module-scoped rule under boundary-rules/ calls the shared module-resolution helper ---
 for rule in "$repo_root"/bin/checks/boundary-rules/*; do
