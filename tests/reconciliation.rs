@@ -24,9 +24,7 @@ use agent_usage_book::domain::provenance::{
     CostModelId, EvidenceId, WindowCalibrationId, WitnessId,
 };
 use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
-use agent_usage_book::domain::time::{
-    FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
-};
+use agent_usage_book::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
 use agent_usage_book::domain::window::{
     NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
     WindowSemanticKey,
@@ -46,8 +44,6 @@ use agent_usage_book::store::meter_evidence::{
     NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
     insert_response_evidence, insert_window,
 };
-use agent_usage_book::store::migrate::run_migrations;
-use agent_usage_book::store::migrations::registry;
 use agent_usage_book::store::reconciliation::reconcile_candidate_from_store;
 use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
 use agent_usage_book::store::sampling_policy_snapshot::{
@@ -64,16 +60,11 @@ const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
     policy_algorithm_version: String::new(),
 };
 
+/// A fresh in-memory database at the current schema. Cloned from a template built
+/// once per binary rather than migrated per call: the 19 tests and the two
+/// unbounded `proptest!` blocks below call this about 530 times per run.
 fn fixture_db() -> rusqlite::Connection {
-    let mut conn = rusqlite::Connection::open_in_memory().expect("open in memory db");
-    run_migrations(
-        &mut conn,
-        &registry(),
-        None,
-        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
-    )
-    .expect("run migrations");
-    conn
+    test_support::open_migrated_in_memory()
 }
 
 /// Disjoint fitting and validation evidence sets for one test calibration,
