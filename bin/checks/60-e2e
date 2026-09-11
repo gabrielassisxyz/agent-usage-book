@@ -123,7 +123,10 @@ aub_bin="$target_dir/release/aub"
 # This is what the budget has to absorb, and it is why the headroom is 1.5x rather
 # than the rule's 1.25x: the quantity being bounded swings by 50 percent on its
 # own. Anyone tempted to tighten it back should re-read those three numbers first.
-# What is still not measured stays on aub-kg2a: the per-case migration cost.
+# The per-case migration cost was measured on the same day and is not the driver:
+# 3.33ms per migration application (the repo's own migration_matrix test prints
+# it), about 127ms for a fresh ledger's whole chain, roughly 9.3s across the 73
+# ledgers a run creates, so a new migration adds about 0.24s to the suite.
 #
 # It was 90s from 2026-09-09 to 2026-09-11 (aub-e2e-cost-rjxc), from three
 # consecutive readings on the CI runner after the suite's cost was cut: 66s, 69s
