@@ -14,7 +14,7 @@ shipping command has a section below; a section that only restated `--help`
 would not be worth a second document.
 
 Test hooks (`__logging-fixture`, `__state-check`, `__exit-class`,
-`__attempt-crash-hook`, `__projection-crash-hook`, `__cost-model-fixture`) are
+`__attempt-crash-hook`, `__projection-crash-hook`) are
 not part of the shipping surface and have no section here, matching `--help`,
 which does not list them either.
 
@@ -407,6 +407,34 @@ JSONL ledger for an external join?
 
 **Refuses:** to run without a chosen join key. `--key session-id|run-id` is
 required; `export` does not guess which key a downstream consumer wants.
+
+## `aub cost-model`
+
+**Answers:** which published cost model prices usage into credits, and which
+one is active right now?
+
+`cost-model list` prints one line per published model:
+`<model-id> active since <RFC 3339 instant>` for the one an activation
+event names, `<model-id> inactive` for the rest. Two models are published:
+`anthropic-claude-messages-v1`, the complete rate structure, and
+`anthropic-claude-messages-incomplete-v1`, which is published with its
+cache-write term deliberately removed so the missing-rate refusal is
+reachable and testable without editing anything.
+
+`cost-model activate <model-id>` records the lifecycle event that makes one
+published model active: an `activation` when nothing was active before, a
+`supersession` naming the displaced model otherwise. Activating the model
+that is already active prints `already active`, exits 0, and writes
+nothing, so the command is safe to re-run in a script. The underscore
+spelling of a model id (`anthropic_claude_messages_v1`) names the same
+stored model as its dashed id.
+
+**Refuses:** any id that is not a published model, naming the known ones;
+and any subcommand other than `list` or `activate <model-id>`. Activation
+is never inferred: `spend --credits` refuses to price usage while no model
+is active, and `aub doctor`'s `cost-model-active` check warns with this
+command's name when rate cards are imported but none is, so the one missing
+step is always stated, never guessed.
 
 ## `aub rate-card`
 

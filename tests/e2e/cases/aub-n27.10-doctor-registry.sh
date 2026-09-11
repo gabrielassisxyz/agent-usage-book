@@ -175,7 +175,7 @@ case_steps() {
 case_assertions() {
     # Step 1: doctor reports, it does not gate: exit success with failures.
     assert_exit 0 1
-    assert_stdout_contains 1 "Doctor: 24 checks"
+    assert_stdout_contains 1 "Doctor: 25 checks"
     assert_stdout_contains 1 "[PASS] configuration-validity"
     assert_stdout_contains 1 "[PASS] sqlite-and-schema-health"
     assert_stdout_contains 1 "[PASS] strict-and-constraint-integrity"
@@ -210,19 +210,24 @@ case_assertions() {
     assert_stdout_contains 1 "rate_limit_error"
     assert_stdout_contains 1 "[FAIL] subscription-identity-change"
     assert_stdout_contains 1 "readings refused"
+    # Rate cards are imported and no cost model is active: advisory warn, with
+    # the command that repairs it named in the reason.
+    assert_stdout_contains 1 "[WARN] cost-model-active"
+    assert_stdout_contains 1 'run `aub cost-model activate anthropic-claude-messages-v1`'
     assert_stdout_contains 1 "[repairable with --fix]"
 
     # Step 2: the versioned JSON carries every expected check name.
     assert_exit 0 2
     assert_json_field 2 "command" "doctor"
     assert_json_field 2 "schema" "5"
-    for name in configuration-validity sqlite-and-schema-health strict-and-constraint-integrity pending-evidence sampling-cadence unresolved-authentication transcript-roots parser-failures unmapped-accounts missing-active-calibrations stale-rate-cards projection-versus-database-generation backup-age meter-anomalies unexplained-residual heuristic-dedup-counts clock-skew local-filesystem-and-wal-suitability accumulated-diagnostic-material adapter-semantics-comparison-age last-sample-tick sampling-failure-counts meter-error-classifications subscription-identity-change; do
+    for name in configuration-validity sqlite-and-schema-health strict-and-constraint-integrity pending-evidence sampling-cadence unresolved-authentication transcript-roots parser-failures unmapped-accounts missing-active-calibrations stale-rate-cards projection-versus-database-generation backup-age meter-anomalies unexplained-residual heuristic-dedup-counts clock-skew local-filesystem-and-wal-suitability accumulated-diagnostic-material adapter-semantics-comparison-age last-sample-tick sampling-failure-counts meter-error-classifications subscription-identity-change cost-model-active; do
         assert_stdout_contains 2 "\"name\":\"$name\""
     done
     assert_stdout_contains 2 '"name":"unmapped-accounts","status":"fail"'
     assert_stdout_contains 2 '"name":"meter-anomalies","status":"pass"'
     assert_stdout_contains 2 '"name":"unexplained-residual","status":"not_applicable"'
     assert_stdout_contains 2 '"name":"pending-evidence","status":"fail"'
+    assert_stdout_contains 2 '"name":"cost-model-active","status":"warn"'
 
     # Steps 3-4: the leak scans pass.
     assert_exit 0 3
@@ -256,6 +261,8 @@ case_assertions() {
     assert_stdout_contains 6 "[FAIL] last-sample-tick"
     assert_stdout_contains 6 "[FAIL] sampling-failure-counts"
     assert_stdout_contains 6 "[FAIL] subscription-identity-change"
+    # Activation is an operator decision, not a --fix repair: the warn stands.
+    assert_stdout_contains 6 "[WARN] cost-model-active"
 
     # Step 7: JSON reflects the repaired state.
     assert_exit 0 7

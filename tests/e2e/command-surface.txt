@@ -6,6 +6,7 @@
 status
 spend
 config
+cost-model
 rate-card
 backup
 export
