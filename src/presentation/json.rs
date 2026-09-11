@@ -983,7 +983,7 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
     let mut fields = format!(
         "\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{},\"children\":[{children}]",
         json_string(group.key.as_str()),
-        coverage_and_quality_json(group.usage.coverage(), group.usage.quality())
+        coverage_quality_and_methods_json(group.usage.coverage(), group.usage.quality())
             .trim_matches(|c| c == '{' || c == '}'),
         provenance_json(&group.provenance),
     );
@@ -2788,6 +2788,25 @@ pub fn coverage_and_quality_json<T: DomainQuantity>(
     quality: &EvidenceQuality<T>,
 ) -> String {
     format!(
+        "{{\"coverage\":{},\"evidence_quality\":{}}}",
+        json_string(coverage_name(coverage)),
+        json_string(quality_name(quality)),
+    )
+}
+
+/// The same two fields plus the estimator ids behind an estimated quality.
+///
+/// Separate from `coverage_and_quality_json` rather than an extra field on it
+/// because the two are read by different documents: aub-pwtn asks the SPEND
+/// GROUP to name the method behind a degraded quality, and widening the shared
+/// block instead would have added the field to the task report and the credits
+/// derivation as well, silently changing two published contracts that no bead
+/// asked to change. The task report's strict validator caught exactly that.
+fn coverage_quality_and_methods_json<T: DomainQuantity>(
+    coverage: &CoverageCompleteness,
+    quality: &EvidenceQuality<T>,
+) -> String {
+    format!(
         "{{\"coverage\":{},\"evidence_quality\":{},\"estimation_methods\":[{}]}}",
         json_string(coverage_name(coverage)),
         json_string(quality_name(quality)),
@@ -3339,17 +3358,55 @@ mod tests {
             parsed,
             serde_json::json!({
                 "coverage": "complete",
+                "evidence_quality": "measured"
+            })
+        );
+    }
+
+    /// The shared block carries no estimator ids, so the documents that embed it
+    /// keep the contract they published. A field added here would reach the task
+    /// report and the credits derivation, which is what the task report's strict
+    /// validator refused when this was one helper instead of two.
+    #[test]
+    fn the_shared_quality_block_does_not_name_estimators() {
+        let json = coverage_and_quality_json::<TokenCount>(
+            &CoverageCompleteness::partial([crate::evidence::ComponentKind::new("x")]),
+            &EvidenceQuality::estimated([crate::evidence::EstimatorId::new("chars")], None),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid coverage/quality JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "coverage": "partial",
+                "evidence_quality": "estimated"
+            })
+        );
+    }
+
+    #[test]
+    fn the_spend_block_names_the_estimators_behind_an_estimated_quality() {
+        let json = coverage_quality_and_methods_json::<TokenCount>(
+            &CoverageCompleteness::Complete,
+            &EvidenceQuality::Measured,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid spend coverage/quality JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "coverage": "complete",
                 "evidence_quality": "measured",
                 "estimation_methods": []
             })
         );
 
-        let partial = coverage_and_quality_json::<TokenCount>(
+        let partial = coverage_quality_and_methods_json::<TokenCount>(
             &CoverageCompleteness::partial([crate::evidence::ComponentKind::new("x")]),
             &EvidenceQuality::estimated([crate::evidence::EstimatorId::new("chars")], None),
         );
         let partial_parsed: serde_json::Value =
-            serde_json::from_str(&partial).expect("valid partial coverage/quality JSON");
+            serde_json::from_str(&partial).expect("valid partial spend coverage/quality JSON");
         assert_eq!(
             partial_parsed,
             serde_json::json!({
