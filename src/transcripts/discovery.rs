@@ -12,7 +12,10 @@
 //! characters, `?` matches exactly one, and a leading `**/` component matches
 //! zero components (so the config's `**/*.jsonl` matches a bare file name at
 //! every depth). A pattern that needs anything else a glob could mean is
-//! rejected as unsupported rather than silently mis-matched.
+//! rejected as unsupported rather than silently mis-matched. The match itself is
+//! `crate::domain::glob`, shared with the model table so the two cannot drift
+//! apart; what stays here is the rejection of everything that matcher does not
+//! implement, which only a file name can carry.
 //!
 //! May not depend on:
 //! - calibration
@@ -265,37 +268,8 @@ impl GlobPattern {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("");
-        glob_match(&self.name_pattern, name)
+        crate::domain::glob::glob_match(&self.name_pattern, name)
     }
-}
-
-/// Greedy glob matching over `*` and `?`, linear in the name length.
-fn glob_match(pattern: &str, name: &str) -> bool {
-    let pattern: Vec<char> = pattern.chars().collect();
-    let name: Vec<char> = name.chars().collect();
-    let (mut pi, mut ni) = (0usize, 0usize);
-    let mut star: Option<usize> = None;
-    let mut mark = 0usize;
-    while ni < name.len() {
-        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == name[ni]) {
-            pi += 1;
-            ni += 1;
-        } else if pi < pattern.len() && pattern[pi] == '*' {
-            star = Some(pi);
-            mark = ni;
-            pi += 1;
-        } else if let Some(star_pos) = star {
-            pi = star_pos + 1;
-            mark += 1;
-            ni = mark;
-        } else {
-            return false;
-        }
-    }
-    while pi < pattern.len() && pattern[pi] == '*' {
-        pi += 1;
-    }
-    pi == pattern.len()
 }
 
 #[cfg(test)]

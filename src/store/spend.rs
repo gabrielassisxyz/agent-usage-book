@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, params};
 
+use crate::config::{ModelTable, PricedModel};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
 use crate::sessions::{UNKNOWN_PROJECT, UNKNOWN_REPOSITORY};
@@ -35,8 +36,17 @@ pub struct CanonicalSpendEvent {
     pub evidence_kind: String,
     pub sources: BTreeSet<String>,
     pub components: BTreeMap<String, u64>,
+    /// The vendor that prices this event, resolved from `model` through the
+    /// configured model table. `None` when no rule and no built-in default
+    /// matched: the event is reported as unmapped rather than valued.
     pub vendor: Option<String>,
+    /// The model id the transcript stored, carried through unchanged so a
+    /// report can name what actually ran.
     pub model: Option<String>,
+    /// The model the rate book is looked up under, which is not always the id
+    /// above: a litellm alias encodes the reasoning effort and the upstream
+    /// account, and neither changes the price.
+    pub priced_as: Option<String>,
 }
 
 /// Diagnostics that qualify a canonical spend query.
@@ -54,6 +64,7 @@ pub fn canonical_events(
     conn: &Connection,
     since: UtcTimestamp,
     until: UtcTimestamp,
+    models: &ModelTable,
 ) -> Result<Vec<CanonicalSpendEvent>, Error> {
     let mut stmt = conn
         .prepare(
@@ -95,23 +106,14 @@ pub fn canonical_events(
         ) =
             row.map_err(|error| Error::Store(format!("cannot read canonical spend row: {error}")))?;
         let (project, repository) = session_labels(conn, source.as_deref(), session_id.as_deref())?;
-        let vendor = match source.as_deref() {
-            Some("claude-code" | "anthropic") => Some("anthropic".to_string()),
-            Some("codex" | "openai") => Some("openai".to_string()),
-            Some(other) => Some(other.to_string()),
-            None => {
-                if let Some(m) = &model_id {
-                    if m.starts_with("claude") {
-                        Some("anthropic".to_string())
-                    } else if m.starts_with("gpt") {
-                        Some("openai".to_string())
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                }
-            }
+        // The vendor is a property of the model, never of the harness that
+        // recorded it: one harness runs models from several vendors, and the pi
+        // harness's litellm aliases reach Ollama Cloud, which the string "pi"
+        // cannot say. An earlier revision read the transcript source here, which
+        // gave every pi event the vendor `pi` and no rate card could match it.
+        let (vendor, priced_as) = match models.resolve(model_id.as_deref().unwrap_or_default()) {
+            PricedModel::Mapped { vendor, model } => (Some(vendor), Some(model)),
+            PricedModel::Unmapped => (None, None),
         };
         events.push(CanonicalSpendEvent {
             canonical_id,
@@ -130,6 +132,7 @@ pub fn canonical_events(
             components: components(conn, event_id)?,
             vendor,
             model: model_id,
+            priced_as,
         });
     }
     Ok(events)

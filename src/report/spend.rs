@@ -22,7 +22,7 @@ use crate::attribution::account_segment::{
 };
 use crate::attribution::report::{AttributableEvent, attribute_events};
 use crate::attribution::segment::SegmentTarget;
-use crate::config::Config;
+use crate::config::{Config, ModelTable};
 use crate::dedup::deduplicate;
 use crate::domain::credits::Credits;
 use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
@@ -41,9 +41,10 @@ use crate::evidence::{
 use crate::logging::LogicalName;
 use crate::report::models::{
     AccountGroupExplain, AccountMarkerReference, IngestSummary, IngestionGeneration,
-    LedgerGeneration, ReportMetadata, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup,
-    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGroupWindowEquivalentProvenance,
-    SpendGrouping, SpendReport, UNKNOWN_ACCOUNT_LABEL, WindowEquivalentDerivation,
+    LedgerGeneration, PricedModelRef, ReportMetadata, SpendDiagnostic, SpendDiagnosticProvenance,
+    SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
+    SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, UNKNOWN_ACCOUNT_LABEL,
+    UNNAMED_MODEL_LABEL, WindowEquivalentDerivation,
 };
 use crate::report::provenance::{ProvenanceNode, Unit, ValueArithmetic};
 use crate::store::cost_model::CostModel;
@@ -474,6 +475,7 @@ pub fn assemble_canonical(
     refresh_failure: Option<String>,
     rate_book: Option<&RateBook>,
     credit_reporting: CreditReporting<'_>,
+    models: &ModelTable,
 ) -> Result<SpendReport, Error> {
     assemble_canonical_with_window_equivalent(
         conn,
@@ -485,6 +487,7 @@ pub fn assemble_canonical(
         rate_book,
         credit_reporting,
         None,
+        models,
     )
 }
 
@@ -502,14 +505,19 @@ pub fn assemble_canonical_with_window_equivalent(
     rate_book: Option<&RateBook>,
     credit_reporting: CreditReporting<'_>,
     window_resolver: Option<&dyn WindowEquivalentResolver>,
+    models: &ModelTable,
 ) -> Result<SpendReport, Error> {
     let grouping = if grouping.is_empty() {
         vec![SpendGrouping::Day]
     } else {
         grouping
     };
-    let events =
-        crate::store::spend::canonical_events(conn, window.since.start(), window.until.start())?;
+    let events = crate::store::spend::canonical_events(
+        conn,
+        window.since.start(),
+        window.until.start(),
+        models,
+    )?;
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let replayed_occurrences = diagnostics.replayed_occurrences;
     let heuristic_identities = diagnostics.heuristic_identities;
@@ -587,6 +595,19 @@ pub fn assemble_canonical_with_window_equivalent(
         events_outside_window: 0,
         events_in_window: events.len() as u64,
     };
+    // Counted over the events the window actually holds, so the footer names
+    // the ids an operator can act on today rather than every id the ledger ever
+    // stored.
+    let mut unmapped_models: BTreeMap<String, u64> = BTreeMap::new();
+    for event in &events {
+        if event.vendor.is_none() {
+            let label = match event.model.as_deref() {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => UNNAMED_MODEL_LABEL.to_string(),
+            };
+            *unmapped_models.entry(label).or_default() += 1;
+        }
+    }
     let diagnostic_members = events
         .iter()
         .map(|event| EvidenceId::new(event.canonical_id.clone()))
@@ -620,6 +641,7 @@ pub fn assemble_canonical_with_window_equivalent(
     .with_stale_rate_card_note(stale_note)
     .with_grouping(grouping)
     .with_account_explain(account_explain)
+    .with_unmapped_models(unmapped_models)
     .with_window_equivalent_window(
         window_resolver.map(|resolver| resolver.window_semantic_key().to_string()),
     )
@@ -770,6 +792,7 @@ fn canonical_groups(
                     window_node,
                 ));
             }
+            let priced_as = members_priced_as(&members);
             let children = canonical_groups(
                 &members.into_iter().cloned().collect::<Vec<_>>(),
                 grouping,
@@ -789,7 +812,8 @@ fn canonical_groups(
             path.pop();
             let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
                 .with_valuation(valuation)
-                .with_children(children);
+                .with_children(children)
+                .with_priced_as(priced_as);
             let group = match credits {
                 Some(credits) => group.with_credits(credits),
                 None => group,
@@ -806,6 +830,23 @@ fn canonical_groups(
             } else {
                 Ok(group)
             }
+        })
+        .collect()
+}
+
+/// The distinct vendor and model pairs a group's events were priced under.
+///
+/// An unmapped event contributes nothing rather than a placeholder pair: the
+/// report already names those ids in its own footer, and a `unknown/unknown`
+/// entry here would read as a vendor somebody configured.
+fn members_priced_as(members: &[&CanonicalSpendEvent]) -> BTreeSet<PricedModelRef> {
+    members
+        .iter()
+        .filter_map(|event| {
+            Some(PricedModelRef {
+                vendor: event.vendor.clone()?,
+                model: event.priced_as.clone()?,
+            })
         })
         .collect()
 }
@@ -945,8 +986,13 @@ fn value_events(events: &[&CanonicalSpendEvent], book: &RateBook) -> ValuationOu
     let mut outcome: Option<ValuationOutcome<Usd>> = None;
     for event in events {
         let usage = canonical_usage(&[event], false);
+        // The rate book is keyed by the canonical model, not by the id the
+        // transcript stored: a litellm alias carries the reasoning effort and
+        // the upstream account, and neither is priced. An unmapped event keeps
+        // "unknown" here so no card can match it; it is reported in the footer
+        // instead of being priced against whatever card sorted first.
         let vendor = event.vendor.as_deref().unwrap_or("unknown");
-        let model = event.model.as_deref().unwrap_or("unknown");
+        let model = event.priced_as.as_deref().unwrap_or("unknown");
         let event_val = crate::valuation::value_usage_vector::<Usd>(
             book,
             vendor,
@@ -1026,11 +1072,33 @@ fn uniform_account<'a>(
 }
 
 fn uniform_provider(members: &[&CanonicalSpendEvent]) -> Option<String> {
-    let first = members.first()?.vendor.as_deref()?;
+    let first = provider_of(members.first()?)?;
     members
         .iter()
-        .all(|event| event.vendor.as_deref() == Some(first))
-        .then(|| first.to_string())
+        .all(|event| provider_of(event).as_deref() == Some(first.as_str()))
+        .then_some(first)
+}
+
+/// The provider whose window a session's usage is calibrated against, derived
+/// from the harness that wrote the transcript.
+///
+/// This is not the vendor that prices the models, and the two shared one field
+/// until they were separated: a subscription window belongs to the harness's
+/// provider, while a price belongs to the model, and one harness runs models
+/// several vendors publish rates for. Reading the priced vendor here would
+/// calibrate an Anthropic subscription window against whichever vendor happened
+/// to price the model that ran inside it.
+///
+/// A session with no source resolves to no provider, and the window-equivalent
+/// derivation then refuses naming `provider identity`. The earlier version
+/// guessed one from the model id in that case, which is the same conflation one
+/// level down.
+fn provider_of(event: &CanonicalSpendEvent) -> Option<String> {
+    match event.session_source.as_deref()? {
+        "claude-code" | "anthropic" => Some("anthropic".to_string()),
+        "codex" | "openai" => Some("openai".to_string()),
+        other => Some(other.to_string()),
+    }
 }
 
 /// The task-or-overhead label for every event, keyed by its own
@@ -1208,13 +1276,34 @@ mod tests {
         evidence_kind: &str,
         components: &[(&str, u64)],
     ) {
+        seed_canonical_with_model(
+            conn,
+            id,
+            timestamp,
+            session,
+            evidence_kind,
+            components,
+            None,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_canonical_with_model(
+        conn: &rusqlite::Connection,
+        id: &str,
+        timestamp: i64,
+        session: &str,
+        evidence_kind: &str,
+        components: &[(&str, u64)],
+        model_id: Option<&str>,
+    ) {
         let event = insert_event(
             conn,
             &NewUsageEvent {
                 canonical_event_id: id,
                 session_id: Some(session),
                 event_timestamp: Some(UtcTimestamp::from_unix_nanos(timestamp)),
-                model_id: None,
+                model_id,
                 evidence_kind,
                 source_provenance: "fixture.jsonl",
                 parser_version: "fixture-v1",
@@ -1330,6 +1419,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 
@@ -1496,6 +1586,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         let work = composed
@@ -1524,6 +1615,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         let day_total: u64 = by_day
@@ -1554,6 +1646,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         let cell = |day: &str, account: &str| -> u64 {
@@ -1657,6 +1750,7 @@ mod tests {
             None,
             CreditReporting::Active(&model),
             Some(&FixtureResolver),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 
@@ -1716,6 +1810,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 
@@ -1826,6 +1921,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         let canonical_total = ungrouped.groups[0].usage.known().input().value();
@@ -1840,6 +1936,7 @@ mod tests {
             None,
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         let grouped_total: u64 = by_task
@@ -1890,6 +1987,7 @@ mod tests {
             Some("refresh failed: fixture unreadable; retained prior subtotal".to_string()),
             None,
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 
@@ -1899,6 +1997,220 @@ mod tests {
         let json = crate::presentation::spend_json(&report, crate::logging::RunId::new(now()));
         assert!(json.contains("\"ingestion_generation\":0"));
         assert!(json.contains("\"refresh_failure\""));
+        crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    /// A rate card for one vendor, model and token class.
+    fn input_card(
+        id: i64,
+        vendor: &str,
+        model: &str,
+        rate_micros: i64,
+    ) -> crate::domain::rate_card::RateCard {
+        crate::domain::rate_card::RateCard {
+            id,
+            imported_at: UtcTimestamp::from_unix_nanos(100),
+            draft: crate::domain::rate_card::RateCardDraft {
+                vendor: vendor.to_string(),
+                model: model.to_string(),
+                token_class: crate::domain::rate_card::TokenClass::Input,
+                rate_micros,
+                currency: crate::domain::rate_card::CurrencyCode::Usd,
+                billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
+                effective_start: UtcDate::parse("2026-08-01").unwrap(),
+                effective_end: None,
+                publication: crate::domain::rate_card::Publication {
+                    source: None,
+                    published_at: None,
+                },
+                review_due: crate::domain::rate_card::ReviewDuePolicy::None,
+            },
+        }
+    }
+
+    /// The `[[models]]` table this machine configures, in file order.
+    fn example_model_table() -> crate::config::ModelTable {
+        crate::config::ModelTable::new(vec![
+            crate::config::ModelRule::new("deepseek-v4-pro*", "ollama", "deepseek-v4-pro").unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// A ledger holding one event per harness, each with the model id its
+    /// transcript actually stores.
+    fn seed_three_harnesses(conn: &rusqlite::Connection, day: i64) {
+        seed_session(conn, "s-pi");
+        seed_session(conn, "s-codex");
+        seed_canonical_with_model(
+            conn,
+            "e-pi",
+            day + 1,
+            "s-pi",
+            "reported",
+            &[("input", 1_000_000)],
+            Some("deepseek-v4-pro-high-k1"),
+        );
+        seed_canonical_with_model(
+            conn,
+            "e-codex",
+            day + 2,
+            "s-codex",
+            "reported",
+            &[("input", 1_000_000)],
+            Some("gpt-5.6-terra"),
+        );
+    }
+
+    fn valued_usd(report: &SpendReport, key: &str) -> Option<String> {
+        report
+            .groups
+            .iter()
+            .find(|group| group.key.as_str().contains(key))
+            .and_then(|group| match group.valuation.as_ref()? {
+                ValuationOutcome::Complete(equiv) => Some(
+                    crate::presentation::render::render_money_amount(equiv.amount()),
+                ),
+                ValuationOutcome::Incomplete { .. }
+                | ValuationOutcome::UnsupportedCurrency { .. } => None,
+            })
+    }
+
+    /// The configured table is what lets a pi event and a codex event reach a
+    /// rate card at all: the pi event's vendor is Ollama, which no harness name
+    /// says, and the codex event's model is the one its turn context named.
+    #[test]
+    fn the_model_table_values_the_pi_and_codex_events() {
+        let (_root, conn) = canonical_conn("canonical-model-table");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_three_harnesses(&conn, day);
+        let book = RateBook::new(vec![
+            input_card(1, "ollama", "deepseek-v4-pro", 1_000_000),
+            input_card(2, "openai", "gpt-5.6-terra", 2_000_000),
+        ]);
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Session],
+            false,
+            None,
+            Some(&book),
+            CreditReporting::NotRequested,
+            &example_model_table(),
+        )
+        .unwrap();
+
+        assert_eq!(valued_usd(&report, "s-pi").as_deref(), Some("1.00"));
+        assert_eq!(valued_usd(&report, "s-codex").as_deref(), Some("2.00"));
+        assert!(
+            report.unmapped_models.is_empty(),
+            "every id resolved: {:?}",
+            report.unmapped_models
+        );
+    }
+
+    /// The planted negative for the test above, identical but for the missing
+    /// table. The codex event still prices, because `gpt*` is a built-in
+    /// vendor; the pi event does not, and the report names the alias instead of
+    /// reporting a window in which that spend did not happen.
+    #[test]
+    fn without_the_table_the_pi_event_is_unmapped_and_named() {
+        let (_root, conn) = canonical_conn("canonical-model-table-absent");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_three_harnesses(&conn, day);
+        let book = RateBook::new(vec![
+            input_card(1, "ollama", "deepseek-v4-pro", 1_000_000),
+            input_card(2, "openai", "gpt-5.6-terra", 2_000_000),
+        ]);
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Session],
+            false,
+            None,
+            Some(&book),
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            valued_usd(&report, "s-pi"),
+            None,
+            "nothing prices the alias"
+        );
+        assert_eq!(valued_usd(&report, "s-codex").as_deref(), Some("2.00"));
+        assert_eq!(
+            report.unmapped_models.get("deepseek-v4-pro-high-k1"),
+            Some(&1)
+        );
+        let text = crate::presentation::render_spend_report(&report);
+        assert!(
+            text.contains("unmapped models: 1 events (deepseek-v4-pro-high-k1)"),
+            "{text}"
+        );
+    }
+
+    /// The vendor comes from the model and never from the harness. Both events
+    /// were recorded by sources named `fixture`, which no rate card names, and
+    /// both price anyway.
+    #[test]
+    fn the_transcript_source_never_decides_the_vendor() {
+        let (_root, conn) = canonical_conn("canonical-vendor-not-harness");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_three_harnesses(&conn, day);
+        let events = crate::store::spend::canonical_events(
+            &conn,
+            window("2026-08-25", 1).since.start(),
+            window("2026-08-25", 1).until.start(),
+            &example_model_table(),
+        )
+        .unwrap();
+        let vendors: Vec<Option<&str>> =
+            events.iter().map(|event| event.vendor.as_deref()).collect();
+        assert!(
+            vendors.contains(&Some("ollama")) && vendors.contains(&Some("openai")),
+            "{vendors:?}"
+        );
+        assert!(
+            !vendors.contains(&Some("fixture")),
+            "the source namespace must not reach the vendor: {vendors:?}"
+        );
+    }
+
+    /// `priced_as` names the canonical model behind the valuation, which is not
+    /// the id the transcript stored when the id is a litellm alias.
+    #[test]
+    fn explain_names_the_priced_as_vendor_and_model_per_group() {
+        let (_root, conn) = canonical_conn("canonical-priced-as-explain");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_three_harnesses(&conn, day);
+        let book = RateBook::new(vec![input_card(1, "ollama", "deepseek-v4-pro", 1_000_000)]);
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Session],
+            false,
+            None,
+            Some(&book),
+            CreditReporting::NotRequested,
+            &example_model_table(),
+        )
+        .unwrap();
+
+        let text = crate::presentation::render::render_spend_report_with_explain(
+            &report,
+            crate::presentation::render::ExplainMode::Full,
+        );
+        assert!(text.contains("priced as ollama/deepseek-v4-pro"), "{text}");
+        assert!(text.contains("priced as openai/gpt-5.6-terra"), "{text}");
+        let json = crate::presentation::spend_json(&report, crate::logging::RunId::new(now()));
+        assert!(
+            json.contains("\"priced_as\":[{\"vendor\":\"ollama\",\"model\":\"deepseek-v4-pro\"}]"),
+            "{json}"
+        );
         crate::presentation::validate_spend_report_json(&json).unwrap();
     }
 
@@ -1938,6 +2250,7 @@ mod tests {
             None,
             Some(&book),
             CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 

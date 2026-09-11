@@ -2855,6 +2855,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         window_resolver
             .as_ref()
             .map(|resolver| resolver as &dyn WindowEquivalentResolver),
+        &config.models,
     )?;
     if let Some(refresh) = refresh_report {
         report.ingest.files_read = refresh.files_parsed;
@@ -4822,6 +4823,15 @@ fn rate_card_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
 /// resolves from [`crate::store::connection::LEDGER_DATABASE_FILE`], and the
 /// readiness gate runs before any connection is made.
 fn open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Error> {
+    open_ledger_with_config(clock).map(|(conn, _config)| conn)
+}
+
+/// The same open, handing back the configuration it had to resolve anyway. A
+/// caller that also needs the model table takes this one rather than resolving
+/// the file a second time and risking two readings of it in one command.
+fn open_ledger_with_config(
+    clock: &impl Clock,
+) -> Result<(rusqlite::Connection, crate::config::Config), Error> {
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -4840,7 +4850,7 @@ fn open_ledger(clock: &impl Clock) -> Result<rusqlite::Connection, Error> {
         &crate::store::startup::ProcMounts,
         || crate::store::rate_card::open_ledger(&db_path, config.sampling.request_timeout, clock),
     )??;
-    Ok(opened)
+    Ok((opened, config))
 }
 
 fn rate_card_import(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
@@ -6042,6 +6052,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         period,
         timestamp,
         &config.task_distribution,
+        &config.models,
     )?;
 
     let inputs = crate::report::can_run::CanRunJoinInputs {
@@ -8092,8 +8103,9 @@ fn task_report_command(clock: &impl Clock, invocation: &Invocation) -> Result<()
     let task_id = parse_task_id(task_id_arg)?;
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
-    let conn = open_ledger(clock)?;
-    let report = crate::report::task::assemble_task_report(&conn, &task_id, timestamp)?;
+    let (conn, config) = open_ledger_with_config(clock)?;
+    let report =
+        crate::report::task::assemble_task_report(&conn, &task_id, timestamp, &config.models)?;
     match invocation.format {
         OutputFormat::Text => println!(
             "{}",
@@ -8137,8 +8149,9 @@ fn task_overhead_command(clock: &impl Clock, invocation: &Invocation) -> Result<
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
     let window = task_overhead_window(&invocation.rest[1..], timestamp)?;
-    let conn = open_ledger(clock)?;
-    let report = crate::report::task::assemble_task_overhead(&conn, window, timestamp)?;
+    let (conn, config) = open_ledger_with_config(clock)?;
+    let report =
+        crate::report::task::assemble_task_overhead(&conn, window, timestamp, &config.models)?;
     match invocation.format {
         OutputFormat::Text => println!(
             "{}",

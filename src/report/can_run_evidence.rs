@@ -63,6 +63,7 @@ use crate::attribution::account_segment::{
 };
 use crate::attribution::segment::{OverheadReason, SegmentTarget};
 use crate::attribution::{TaskIdentityState, TaskKind};
+use crate::config::ModelTable;
 use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace, TaskId};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
@@ -80,8 +81,9 @@ pub fn gather_task_history_group_report(
     period: SelectionPeriod,
     generated_at: UtcTimestamp,
     config: &HistoricalDistributionConfig,
+    models: &ModelTable,
 ) -> Result<GroupHistoryReport<TaskKind>, Error> {
-    let samples = gather_task_history_samples(conn, task_kind, period, generated_at)?;
+    let samples = gather_task_history_samples(conn, task_kind, period, generated_at, models)?;
     let mut reports = build_group_reports(samples, period, config);
     Ok(reports
         .remove(&task_kind)
@@ -108,8 +110,9 @@ fn gather_task_history_samples(
     task_kind: TaskKind,
     period: SelectionPeriod,
     generated_at: UtcTimestamp,
+    models: &ModelTable,
 ) -> Result<Vec<TaskHistorySample<TaskKind>>, Error> {
-    let events = crate::report::task::all_canonical_events(conn)?;
+    let events = crate::report::task::all_canonical_events(conn, models)?;
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let partial = !diagnostics.quarantined_by_class.is_empty();
     let attributed = crate::report::task::attribute_all(conn, &events)?;
@@ -467,6 +470,7 @@ mod tests {
             TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 
@@ -526,6 +530,7 @@ mod tests {
             TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         assert!(samples.is_empty(), "{samples:?}");
@@ -569,6 +574,7 @@ mod tests {
             TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         assert!(samples.is_empty(), "{samples:?}");
@@ -616,6 +622,7 @@ mod tests {
             TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         assert_eq!(samples.len(), 1);
@@ -647,6 +654,7 @@ mod tests {
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &config,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         assert_eq!(report.sample_count, 0);

@@ -36,12 +36,12 @@ pub use models::{
     CoverageErrorClassification, CoverageReport, CoverageReset, CoverageThreshold, DoctorReport,
     ExportReport, IngestReport, IngestSummary, IngestionGeneration, LedgerGeneration,
     LimitingWindow, MeterAccount, MeterExplanation, MeterReadingProvenance, MeterWindowExplanation,
-    NowReport, ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport, SharePpm,
-    SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance,
+    NowReport, PricedModelRef, ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport,
+    SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance,
     SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport,
     StatusReport, StatusWindow, TaskIdentityRow, TaskIngestReport, TaskOverheadBucket,
-    TaskOverheadReport, TaskReport, TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, WindowBurnRate,
-    WindowEquivalentDerivation, WindowEquivalentValue,
+    TaskOverheadReport, TaskReport, TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, UNNAMED_MODEL_LABEL,
+    WindowBurnRate, WindowEquivalentDerivation, WindowEquivalentValue,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

@@ -26,8 +26,9 @@ use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
-    ActiveActivityState, CoverageReport, LivenessGap, NowReport, ProvenanceGraph, SpendGroup,
-    SpendReport, StatusReport, TaskOverheadReport, TaskReport, WindowEquivalentDerivation,
+    ActiveActivityState, CoverageReport, LivenessGap, NowReport, PricedModelRef, ProvenanceGraph,
+    SpendGroup, SpendReport, StatusReport, TaskOverheadReport, TaskReport,
+    WindowEquivalentDerivation,
 };
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
@@ -906,6 +907,9 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
         render_spend_group(group, 0, &mut lines);
     }
     lines.push(render_ingest_summary(report));
+    if let Some(unmapped) = render_unmapped_models(report) {
+        lines.push(unmapped);
+    }
     let report_text = lines.join("\n");
     if explain == ExplainMode::Off {
         report_text
@@ -916,12 +920,66 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
             explain_text.push_str("\n\n");
             explain_text.push_str(&account_text);
         }
+        let priced_text = render_priced_as_explain(report);
+        if !priced_text.is_empty() {
+            explain_text.push_str("\n\n");
+            explain_text.push_str(&priced_text);
+        }
         if report_text.is_empty() {
             explain_text
         } else {
             format!("{report_text}\n\n{explain_text}")
         }
     }
+}
+
+/// The vendor and model behind every group's valuation, under `--explain`.
+///
+/// The generic explain block above reports the rate card a group used; this
+/// reports which row of it, which is the half that moves when a model id is
+/// mapped to the wrong canonical model. Nested groups are walked so a report
+/// with more than one dimension names its leaves rather than only its roots.
+fn render_priced_as_explain(report: &SpendReport) -> String {
+    fn walk(group: &SpendGroup, lines: &mut Vec<String>) {
+        if !group.priced_as.is_empty() {
+            let labels: Vec<String> = group.priced_as.iter().map(PricedModelRef::label).collect();
+            lines.push(format!(
+                "  {}: priced as {}",
+                group.key.as_str(),
+                labels.join(", ")
+            ));
+        }
+        for child in &group.children {
+            walk(child, lines);
+        }
+    }
+    let mut lines = Vec::new();
+    for group in &report.groups {
+        walk(group, &mut lines);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.insert(0, "priced as:".to_string());
+    lines.join("\n")
+}
+
+/// The footer line naming the model ids nothing priced, or `None` when every id
+/// in the window resolved.
+///
+/// Its own line rather than a clause on the ingest summary: the ingest counters
+/// describe reading the transcripts, and this describes pricing what they
+/// contained, which is a different thing to have gone wrong.
+fn render_unmapped_models(report: &SpendReport) -> Option<String> {
+    if report.unmapped_models.is_empty() {
+        return None;
+    }
+    let events: u64 = report.unmapped_models.values().sum();
+    let ids: Vec<&str> = report.unmapped_models.keys().map(String::as_str).collect();
+    Some(format!(
+        "unmapped models: {events} events ({})",
+        ids.join(", ")
+    ))
 }
 
 /// The marker evidence behind every account group, under `--explain`. Empty

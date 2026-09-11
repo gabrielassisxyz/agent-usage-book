@@ -367,6 +367,15 @@ fn claude_cache_write_fallback(
 /// names. A `token_count` whose `info` is null carries only a rate-limit update
 /// and is neither an event nor a quarantine. Codex provides no stable per-event
 /// identifier, so no strong dedup identity is reported.
+///
+/// The model comes from the `turn_context` records, which is the only place a
+/// rollout states it: `session_meta` names `model_provider` and not the model,
+/// and a `token_count` payload carries `info`, `rate_limits` and `type` only.
+/// A rollout may carry several turn contexts, so the model in force is the one
+/// the most recent `turn_context` *before that record* named, never the last
+/// one in the file. A record before any turn context keeps an empty model, and
+/// a `session_meta` that does name a model is honoured so a future rollout
+/// format that moves it into the header does not silently lose it.
 pub struct CodexParser;
 
 const CODEX_KNOWN: [(&str, TokenKind); 4] = [
@@ -396,8 +405,9 @@ impl ParserAdapter for CodexParser {
     }
 
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
-        let mut last: Option<(UsageCounts, Option<UtcTimestamp>)> = None;
+        let mut last: Option<(UsageCounts, Option<UtcTimestamp>, Option<String>)> = None;
         let mut session: Option<SessionId> = None;
+        let mut model: Option<String> = None;
         let mut quarantined = Vec::new();
         for (index, line) in input.lines().enumerate() {
             let line = line.trim();
@@ -407,8 +417,20 @@ impl ParserAdapter for CodexParser {
             let record_location =
                 SourceLocation::new(location.file().to_string(), location.line() + index as u64);
             match parse_codex_line(line) {
-                Ok(CodexLine::Usage(usage, occurred_at)) => last = Some((usage, occurred_at)),
-                Ok(CodexLine::Session(id)) => session = Some(id),
+                // The model travels with the record rather than being read off
+                // the end of the file: a rollout that switched models after its
+                // last usage record would otherwise price that usage under a
+                // model it never ran.
+                Ok(CodexLine::Usage(usage, occurred_at)) => {
+                    last = Some((usage, occurred_at, model.clone()));
+                }
+                Ok(CodexLine::Session(id, header_model)) => {
+                    session = Some(id);
+                    if header_model.is_some() {
+                        model = header_model;
+                    }
+                }
+                Ok(CodexLine::TurnContext(turn_model)) => model = Some(turn_model),
                 Ok(CodexLine::Nothing) => {}
                 Err(class) => quarantined.push(QuarantineRecord::new(
                     record_location,
@@ -418,7 +440,7 @@ impl ParserAdapter for CodexParser {
             }
         }
         let events = last
-            .map(|(counts, occurred_at)| {
+            .map(|(counts, occurred_at, model)| {
                 event(
                     measured_usage(counts),
                     location.file(),
@@ -426,7 +448,7 @@ impl ParserAdapter for CodexParser {
                         event_id: None,
                         occurred_at,
                         session,
-                        model: None,
+                        model: model.as_deref(),
                     },
                     self.parser_version(),
                 )
@@ -438,10 +460,12 @@ impl ParserAdapter for CodexParser {
 }
 
 /// What one Codex line contributes: a cumulative usage record, the session
-/// header, or nothing this parser reads.
+/// header, a turn context naming the model from here on, or nothing this
+/// parser reads.
 enum CodexLine {
     Usage(UsageCounts, Option<UtcTimestamp>),
-    Session(SessionId),
+    Session(SessionId, Option<String>),
+    TurnContext(String),
     Nothing,
 }
 
@@ -452,10 +476,25 @@ fn parse_codex_line(line: &str) -> Result<CodexLine, QuarantineClass> {
         return Ok(CodexLine::Nothing);
     };
     if value.get("type").and_then(Value::as_str) == Some("session_meta") {
+        let model = payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string);
         return Ok(payload
             .get("id")
             .and_then(Value::as_str)
-            .map(|native| CodexLine::Session(session_id(CODEX_NAMESPACE, native)))
+            .map(|native| CodexLine::Session(session_id(CODEX_NAMESPACE, native), model))
+            .unwrap_or(CodexLine::Nothing));
+    }
+    if value.get("type").and_then(Value::as_str) == Some("turn_context") {
+        // A turn context with no model is not a defect: it states everything
+        // else about the turn, and the model in force simply does not change.
+        return Ok(payload
+            .get("model")
+            .and_then(Value::as_str)
+            .filter(|model| !model.is_empty())
+            .map(|model| CodexLine::TurnContext(model.to_string()))
             .unwrap_or(CodexLine::Nothing));
     }
     if payload.get("type").and_then(Value::as_str) != Some("token_count") {
@@ -1239,6 +1278,95 @@ mod tests {
         let known = output.events()[0].usage().known();
         assert_eq!(known.input().value(), 200, "the last record, not the sum");
         assert_eq!(known.output().value(), 100);
+    }
+
+    fn codex_model(output: &crate::transcripts::ParseOutput) -> Option<String> {
+        output.events()[0]
+            .provenance()
+            .sources()
+            .iter()
+            .find_map(|source| source.strip_prefix("model:").map(str::to_string))
+    }
+
+    /// The model of the turn context in force when the last cumulative record
+    /// was written, read from the real rollout shape: `turn_context` is the
+    /// only record that names it.
+    #[test]
+    fn codex_carries_the_model_of_the_turn_context_in_force() {
+        let parser = CodexParser;
+        let output = parser.parse(
+            &read_fixture("codex-model-change.jsonl"),
+            &SourceLocation::new("codex-model-change.jsonl", 1),
+        );
+        assert_eq!(output.events().len(), 1);
+        assert_eq!(codex_model(&output).as_deref(), Some("gpt-5.6-luna"));
+    }
+
+    /// The planted negative for the one above. The two inputs differ only in
+    /// where the last `token_count` sits: here it precedes the second turn
+    /// context, so the usage was produced under the first model and the second
+    /// never ran a priced token. An implementation that scans the file for the
+    /// last `turn_context` passes the positive and fails this.
+    #[test]
+    fn codex_never_takes_a_turn_context_that_follows_the_last_usage_record() {
+        let parser = CodexParser;
+        let input = concat!(
+            r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-terra"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":200,"output_tokens":100}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"turn_id":"t2","model":"gpt-5.6-luna"}}"#,
+        );
+        let output = parser.parse(input, &location());
+        assert_eq!(
+            codex_model(&output).as_deref(),
+            Some("gpt-5.6-terra"),
+            "the model in force at the record, not the last one in the file"
+        );
+    }
+
+    /// A record before any turn context keeps an empty model rather than
+    /// borrowing one from later in the file.
+    #[test]
+    fn codex_usage_before_any_turn_context_carries_no_model() {
+        let parser = CodexParser;
+        let input = concat!(
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-terra"}}"#,
+        );
+        let output = parser.parse(input, &location());
+        assert_eq!(codex_model(&output), None);
+    }
+
+    /// A `turn_context` that states everything but the model leaves the model
+    /// in force unchanged, rather than clearing it.
+    #[test]
+    fn a_turn_context_without_a_model_does_not_clear_the_one_in_force() {
+        let parser = CodexParser;
+        let input = concat!(
+            r#"{"type":"turn_context","payload":{"turn_id":"t1","model":"gpt-5.6-terra"}}"#,
+            "\n",
+            r#"{"type":"turn_context","payload":{"turn_id":"t2","cwd":"/work/project"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#,
+        );
+        let output = parser.parse(input, &location());
+        assert_eq!(codex_model(&output).as_deref(), Some("gpt-5.6-terra"));
+    }
+
+    /// A `session_meta` that names a model is honoured, so a rollout format
+    /// that moves the model into the header does not silently lose it.
+    #[test]
+    fn codex_session_meta_names_the_model_when_it_carries_one() {
+        let parser = CodexParser;
+        let input = concat!(
+            r#"{"type":"session_meta","payload":{"id":"s1","model":"gpt-5.6-terra"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#,
+        );
+        let output = parser.parse(input, &location());
+        assert_eq!(codex_model(&output).as_deref(), Some("gpt-5.6-terra"));
     }
 
     /// pi's `reasoning` field is a token class outside the four known kinds and

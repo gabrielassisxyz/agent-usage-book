@@ -114,11 +114,18 @@ is reported as its own partial group rather than merged or dropped. `--explain`
 on an account group names the exact markers behind the attribution and their
 evidence class.
 
+Valuation is keyed by the vendor and model the `[[models]]` table resolves from
+each event's stored model id, never by the harness the transcript came from.
+`--explain` names that pair per group, and a footer line names any id nothing
+priced; both are documented under `aub config`.
+
 **Refuses:** to guess at an unreadable transcript. A source that cannot be
 normalized leaves the report `IngestIncomplete` rather than silently omitted
 or extrapolated from what did parse. `spend` also refuses to answer a quota
 question; `status`, `now` and `sample` own that, and refuses to forecast a
-cost that has not happened yet.
+cost that has not happened yet. It also refuses to price a model id nothing
+maps: an unmapped id is reported in the footer, never valued against whatever
+card would otherwise have matched.
 
 ## `aub task`
 
@@ -290,6 +297,72 @@ authentication-required outcome naming the account and the source, never a
 crash, and the material is never printed, logged or persisted; the context id
 stored with each attempt identifies the credential revision without exposing
 its bytes and changes when the value is replaced.
+
+### `[[models]]`: which vendor and model prices an event
+
+The vendor of a usage event is a property of the model, never of the harness
+that recorded it: one harness runs models from several vendors, and a litellm
+alias such as `deepseek-v4-pro-high-k1` reaches Ollama Cloud, which the string
+`pi` cannot say. `[[models]]` maps the model id a transcript stores onto the
+vendor and model the rate book is keyed by:
+
+```toml
+[[models]]
+pattern = "deepseek-v4-pro*"
+vendor = "ollama"
+model = "deepseek-v4-pro"
+
+[[models]]
+pattern = "glm-5.3-flash*"
+vendor = "ollama"
+model = "glm-5.3-flash"
+
+[[models]]
+pattern = "glm-5.3*"
+vendor = "ollama"
+model = "glm-5.3"
+```
+
+`pattern` is a glob over the stored id, where `*` matches any run of characters
+and `?` exactly one. Matching is case sensitive and there are no character
+classes, braces or escapes.
+
+**The first rule that matches wins, and the order is the file's own.** The
+example above works only because `glm-5.3-flash*` is listed before `glm-5.3*`,
+which also matches `glm-5.3-flash-max-k2`. A rule an earlier one already covers
+entirely can never fire, so it is rejected naming both patterns rather than
+sitting in the file looking effective. This is why the section is an array of
+tables rather than a keyed table: TOML guarantees no order among a table's
+keys, so an order written that way is not an order at all.
+
+`model` is what the rate book is looked up under, and it is not always the
+stored id: the alias encodes the reasoning effort (`-high`, `-max`, `-xhigh`)
+and the upstream account (`-k1`, `-k2`, `-k3`), and neither changes the price.
+Reports keep naming the stored id; the resolved pair is a second field,
+`priced_as`, shown under `--explain` and in the JSON of each spend group.
+
+After the configured rules come the built-in vendors, which every id identifies
+on its own and which carry the id through unchanged:
+
+| pattern | vendor |
+| --- | --- |
+| `claude*` | `anthropic` |
+| `gpt*`, `o?`, `o?-*` | `openai` |
+| `opencode/*`, `opencode-go/*` | `opencode` |
+
+A configured rule outranks a built-in, so a model proxied somewhere else is not
+overruled by its prefix.
+
+An id that matches nothing at all is unmapped. It is never valued against a
+card that happened to sort first: no rate matches, and `aub spend` prints a
+footer line naming the ids and how many events carried each.
+
+```
+unmapped models: 412 events (kimi-k2.7, minimax-m3-max-k3)
+```
+
+That line is how a new alias becomes visible the day it first appears. An event
+whose transcript recorded no model id at all is counted under `(no model id)`.
 
 For scheduled runs, note that the sampler runs from `aub-sample.service`,
 which has no shell: a variable exported in an interactive profile does not

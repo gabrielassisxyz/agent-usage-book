@@ -550,7 +550,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 16] = [
+    const KNOWN_SPEND_KEYS: [&str; 17] = [
         "schema",
         "command",
         "run",
@@ -567,6 +567,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "stale_rate_card_note",
         "credit_model",
         "window_equivalent_window",
+        "unmapped_models",
     ];
     for key in obj.keys() {
         if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
@@ -849,6 +850,17 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
             json_string(window)
         ));
     }
+    // Emitted only when something went unpriced, so the presence of the key is
+    // itself the signal a consumer keys on, and a clean window carries no field
+    // that a reader has to check for zero.
+    if !report.unmapped_models.is_empty() {
+        let entries: Vec<String> = report
+            .unmapped_models
+            .iter()
+            .map(|(id, count)| format!("{}:{count}", json_string(id)))
+            .collect();
+        body.push_str(&format!(",\"unmapped_models\":{{{}}}", entries.join(",")));
+    }
     if explain != ExplainMode::Off {
         // explain_json always yields a `{...}` object; splice the spend-only
         // account_groups array in before its closing brace rather than
@@ -964,6 +976,21 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
                 fields.push_str(",\"api_list_price_equivalent\":{\"status\":\"unavailable\"}");
             }
         }
+    }
+    if !group.priced_as.is_empty() {
+        let priced = group
+            .priced_as
+            .iter()
+            .map(|priced| {
+                format!(
+                    "{{\"vendor\":{},\"model\":{}}}",
+                    json_string(&priced.vendor),
+                    json_string(&priced.model)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push_str(&format!(",\"priced_as\":[{priced}]"));
     }
     if let Some(credits) = &group.credits {
         fields.push_str(&format!(",\"credits\":{}", credits_json(credits)));

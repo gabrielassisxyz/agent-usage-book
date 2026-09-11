@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 
 use crate::attribution::report::{AttributableEvent, attribute_events};
 use crate::attribution::segment::{OverheadReason, SegmentTarget};
+use crate::config::ModelTable;
 use crate::domain::credits::Credits;
 use crate::domain::ids::TaskId;
 use crate::domain::provenance::{EvidenceId, QuerySemantics};
@@ -38,8 +39,9 @@ pub fn assemble_task_report(
     conn: &rusqlite::Connection,
     task_id: &TaskId,
     generated_at: UtcTimestamp,
+    models: &ModelTable,
 ) -> Result<TaskReport, Error> {
-    let events = all_canonical_events(conn)?;
+    let events = all_canonical_events(conn, models)?;
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let partial = !diagnostics.quarantined_by_class.is_empty();
     let attributed = attribute_all(conn, &events)?;
@@ -107,9 +109,14 @@ pub fn assemble_task_overhead(
     conn: &rusqlite::Connection,
     window: SpendWindow,
     generated_at: UtcTimestamp,
+    models: &ModelTable,
 ) -> Result<TaskOverheadReport, Error> {
-    let events =
-        crate::store::spend::canonical_events(conn, window.since.start(), window.until.start())?;
+    let events = crate::store::spend::canonical_events(
+        conn,
+        window.since.start(),
+        window.until.start(),
+        models,
+    )?;
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let partial = !diagnostics.quarantined_by_class.is_empty();
     let attributed = attribute_all(conn, &events)?;
@@ -188,11 +195,13 @@ pub fn assemble_task_overhead(
 /// opening a second `canonical_events` scan of its own.
 pub(crate) fn all_canonical_events(
     conn: &rusqlite::Connection,
+    models: &ModelTable,
 ) -> Result<Vec<CanonicalSpendEvent>, Error> {
     crate::store::spend::canonical_events(
         conn,
         UtcTimestamp::from_unix_nanos(0),
         UtcTimestamp::from_unix_nanos(i64::MAX),
+        models,
     )
 }
 
@@ -478,6 +487,7 @@ mod tests {
             &conn,
             &task_id,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 
@@ -535,6 +545,7 @@ mod tests {
             &conn,
             &task_id,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         assert!(
@@ -556,6 +567,7 @@ mod tests {
             &clean,
             &task_id,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
         assert!(clean_report.usage.coverage().missing().is_none());
@@ -580,6 +592,7 @@ mod tests {
             &conn,
             SpendWindow::starting(UtcDate::parse("2026-08-25").unwrap(), 1).unwrap(),
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 

@@ -495,6 +495,27 @@ pub struct SpendGroup {
     /// dimension is a tree, so every parent subtotal has the same typed usage
     /// vector as its children rather than a lossy scalar total.
     pub children: Vec<SpendGroup>,
+    /// The vendor and model the rate book was looked up under for this group's
+    /// events, deduplicated and in a stable order. Empty when nothing in the
+    /// group resolved to a priced model.
+    ///
+    /// A group is not one model: `--group-by day` holds every model that ran
+    /// that day, so this is a set rather than a field, and reading it is how a
+    /// valuation nobody expected is traced back to the id that produced it.
+    pub priced_as: BTreeSet<PricedModelRef>,
+}
+
+/// One vendor and model a group's events were priced under.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PricedModelRef {
+    pub vendor: String,
+    pub model: String,
+}
+
+impl PricedModelRef {
+    pub fn label(&self) -> String {
+        format!("{}/{}", self.vendor, self.model)
+    }
 }
 
 impl SpendGroup {
@@ -513,7 +534,13 @@ impl SpendGroup {
             credits: None,
             window_equivalent: None,
             children: Vec::new(),
+            priced_as: BTreeSet::new(),
         }
+    }
+
+    pub fn with_priced_as(mut self, priced_as: BTreeSet<PricedModelRef>) -> Self {
+        self.priced_as = priced_as;
+        self
     }
 
     pub fn with_valuation(mut self, valuation: Option<ValuationOutcome<Usd>>) -> Self {
@@ -809,7 +836,22 @@ pub struct SpendReport {
     /// requested, naming the marker evidence behind each attribution. Empty
     /// otherwise.
     pub account_explain: Vec<AccountGroupExplain>,
+    /// Model ids in the window that the model table and the built-in defaults
+    /// both declined to price, with how many events carried each.
+    ///
+    /// Reported rather than dropped: an id nobody prices is the shape a new
+    /// alias arrives in, and a report that stays silent about it reads as a
+    /// window in which that spend did not happen. `--credits` and `--value` are
+    /// the numbers this qualifies, so it belongs on the report beside them
+    /// rather than in the ingest counters, which describe reading the
+    /// transcripts and not pricing what they contained.
+    pub unmapped_models: BTreeMap<String, u64>,
 }
+
+/// The key `unmapped_models` uses for an event whose transcript recorded no
+/// model id at all, so the footer names a readable thing instead of an empty
+/// pair of quotes.
+pub const UNNAMED_MODEL_LABEL: &str = "(no model id)";
 
 impl SpendReport {
     pub fn new(
@@ -837,7 +879,13 @@ impl SpendReport {
             credit_model: None,
             window_equivalent_window: None,
             account_explain: Vec::new(),
+            unmapped_models: BTreeMap::new(),
         }
+    }
+
+    pub fn with_unmapped_models(mut self, unmapped_models: BTreeMap<String, u64>) -> Self {
+        self.unmapped_models = unmapped_models;
+        self
     }
 
     pub fn with_account_explain(mut self, account_explain: Vec<AccountGroupExplain>) -> Self {
@@ -2034,7 +2082,7 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 10] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 11] = [
         (
             "IngestSummary",
             "*",
@@ -2047,6 +2095,13 @@ mod tests {
             "operational counters describing what the tracker-event ingestion run \
              did, not measurements it reports; they exist to say the report is \
              incomplete",
+        ),
+        (
+            "SpendReport",
+            "unmapped_models",
+            "a count of events the report declined to price, not a measurement it \
+             reports; it exists to say which model ids nothing valued, and the \
+             quantities it qualifies are the group subtotals beside it",
         ),
         (
             "SpendGroup",
@@ -2238,13 +2293,13 @@ mod tests {
         );
     }
 
-    /// The structurally qualified exceptions are exactly the ten documented here,
-    /// each naming the reason it is not an unqualified number. An eleventh one cannot
-    /// be added without this test being edited, which is the point: the list is a
-    /// decision, not a convenience.
+    /// The structurally qualified exceptions are exactly the eleven documented
+    /// here, each naming the reason it is not an unqualified number. A twelfth one
+    /// cannot be added without this test being edited, which is the point: the list
+    /// is a decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 10);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 11);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),

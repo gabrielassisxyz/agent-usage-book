@@ -39,6 +39,7 @@
 mod duration;
 
 pub mod aliases;
+pub mod models;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -53,6 +54,7 @@ use crate::error::Error;
 
 pub use aliases::AliasTable;
 pub use duration::{format_config_duration, parse_duration};
+pub use models::{ModelRule, ModelTable, PricedModel};
 
 /// Where a resolved value came from, in the order that decides a tie.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -524,6 +526,9 @@ pub struct Config {
     pub accounts: Vec<AccountConfig>,
     pub ingest: IngestConfig,
     pub transcripts: Vec<TranscriptConfig>,
+    /// Which vendor and priced model a stored model id is valued against
+    /// (`aub-28py`), in the order the file listed the rules.
+    pub models: ModelTable,
     pub tracker: Option<TrackerConfig>,
     pub valuation: ValuationConfig,
     pub backup: BackupConfig,
@@ -554,6 +559,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "reconciliation",
     "accounts",
     "transcripts",
+    "models",
     "tracker",
     "valuation",
     "backup",
@@ -604,6 +610,7 @@ const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const CREDENTIAL_ENV_KEYS: &[&str] = &["kind", "name"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
+const MODEL_KEYS: &[&str] = &["pattern", "vendor", "model"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &[
@@ -821,6 +828,45 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
                 check_keys(transcript, TRANSCRIPT_KEYS, "transcripts[]", file_display)?;
             }
         }
+    }
+    // `models` is an array of tables rather than a keyed section because the
+    // order of its rules decides which one prices an id, and TOML guarantees no
+    // order among a table's keys (`crate::config::models`). A section written as
+    // a table is therefore rejected here by name, rather than parsed into a
+    // silently reordered set of rules.
+    match table.get("models") {
+        Some(toml::Value::Array(models)) => {
+            for entry in models {
+                let Some(entry) = entry.as_table() else {
+                    return Err(Error::Usage(
+                        "models[]: every entry must be a table with pattern, vendor and model"
+                            .to_string(),
+                    ));
+                };
+                check_keys(entry, MODEL_KEYS, "models[]", file_display)?;
+                for key in MODEL_KEYS {
+                    match entry.get(*key) {
+                        Some(toml::Value::String(_)) => {}
+                        Some(_) => {
+                            return Err(Error::Usage(format!("models[].{key} must be a string")));
+                        }
+                        None => {
+                            return Err(missing_key_error(
+                                &format!("models[].{key}"),
+                                file_display,
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Some(_) => {
+            return Err(Error::Usage(
+                "models must be an array of tables ([[models]] with pattern, vendor and model),                  because the order of the rules decides which one prices a model id and a TOML                  table has no order"
+                    .to_string(),
+            ));
+        }
+        None => {}
     }
     for section in ["projects", "repositories"] {
         if let Some(aliases) = table.get(section).and_then(toml::Value::as_table) {
@@ -1848,6 +1894,11 @@ pub fn resolve(
         provenance.set("transcripts", ConfigSource::File);
     }
 
+    let models = model_table_from_file(file.as_ref())?;
+    if !models.is_empty() {
+        provenance.set("models", ConfigSource::File);
+    }
+
     let projects = alias_table_from_file(file.as_ref(), "projects")?;
     if projects.entries().next().is_some() {
         provenance.set("projects", ConfigSource::File);
@@ -1870,6 +1921,7 @@ pub fn resolve(
             reconciliation,
             accounts,
             transcripts,
+            models,
             tracker,
             valuation,
             backup,
@@ -1933,6 +1985,7 @@ impl Config {
                 "transcripts" => {
                     push_transcript_provenance_rows(&mut rows, &self.transcripts, source);
                 }
+                "models" => push_model_provenance_rows(&mut rows, &self.models, source),
                 "projects" => {
                     push_alias_provenance_rows(&mut rows, "projects", &self.projects, source)
                 }
@@ -2171,6 +2224,27 @@ fn push_transcript_provenance_rows(
     }
 }
 
+/// The model table's expanded rows, in the file's own order rather than sorted.
+///
+/// Sorting these would print a table that resolves differently from the one it
+/// shows, since the order of the rules is what decides which rule prices an id.
+fn push_model_provenance_rows(
+    rows: &mut Vec<ConfigProvenanceRow>,
+    models: &ModelTable,
+    source: ConfigSource,
+) {
+    for (index, rule) in models.rules().iter().enumerate() {
+        let base = format!("models[{index}]");
+        for (key, value) in [
+            (format!("{base}.model"), rule.model().to_string()),
+            (format!("{base}.pattern"), rule.pattern().to_string()),
+            (format!("{base}.vendor"), rule.vendor().to_string()),
+        ] {
+            rows.push(ConfigProvenanceRow { key, value, source });
+        }
+    }
+}
+
 /// One alias table's expanded rows (aub-ukh5): `section.<path>` to the
 /// logical name it maps to, in path order.
 fn push_alias_provenance_rows(
@@ -2268,6 +2342,40 @@ fn render_provenance_rows(rows: &[ConfigProvenanceRow]) -> String {
 /// validated [`AliasTable`]. File-only, like the other heterogeneous sections:
 /// overriding a path-to-name mapping through one `--set` string is not a
 /// well-formed operation.
+/// Reads `[[models]]` into a validated [`ModelTable`]. File-only, like the other
+/// heterogeneous sections: a rule is three strings that only mean anything
+/// together, which one `--set key=value` string cannot express.
+///
+/// Shape errors are already refused by `validate_known_keys`, so what is decided
+/// here is the table's own rule about order, which only the assembled list can
+/// answer.
+fn model_table_from_file(file: Option<&toml::Table>) -> Result<ModelTable, Error> {
+    let Some(entries) = file
+        .and_then(|table| table.get("models"))
+        .and_then(toml::Value::as_array)
+    else {
+        return Ok(ModelTable::default());
+    };
+    let mut rules = Vec::new();
+    for entry in entries {
+        let Some(entry) = entry.as_table() else {
+            continue;
+        };
+        let field = |key: &str| {
+            entry
+                .get(key)
+                .and_then(toml::Value::as_str)
+                .unwrap_or_default()
+        };
+        rules.push(ModelRule::new(
+            field("pattern"),
+            field("vendor"),
+            field("model"),
+        )?);
+    }
+    ModelTable::new(rules)
+}
+
 fn alias_table_from_file(file: Option<&toml::Table>, section: &str) -> Result<AliasTable, Error> {
     let Some(table) = file
         .and_then(|t| t.get(section))
@@ -2362,6 +2470,122 @@ mod tests {
     }
 
     // --- unknown key: checked in both directions -----------------------------------
+
+    /// The example table from `aub-28py`, which is also the shape the operator
+    /// writes on this machine.
+    const MODELS_FILE: &str = "\
+[[models]]
+pattern = \"deepseek-v4-pro*\"
+vendor = \"ollama\"
+model = \"deepseek-v4-pro\"
+
+[[models]]
+pattern = \"glm-5.3-flash*\"
+vendor = \"ollama\"
+model = \"glm-5.3-flash\"
+
+[[models]]
+pattern = \"glm-5.3*\"
+vendor = \"ollama\"
+model = \"glm-5.3\"
+";
+
+    #[test]
+    fn the_models_section_resolves_in_the_order_the_file_lists_it() {
+        let (config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), Some(MODELS_FILE)).unwrap();
+        assert_eq!(
+            config.models.rules().len(),
+            3,
+            "every listed rule reaches the table"
+        );
+        assert_eq!(
+            config.models.resolve("glm-5.3-flash-max-k2"),
+            PricedModel::Mapped {
+                vendor: "ollama".to_string(),
+                model: "glm-5.3-flash".to_string(),
+            },
+            "the file lists the specific pattern first, so it wins"
+        );
+        assert_eq!(
+            provenance
+                .entries()
+                .find(|(key, _)| *key == "models")
+                .map(|(_, source)| source),
+            Some(ConfigSource::File)
+        );
+    }
+
+    /// The negative that separates a real order-preserving read from a keyed
+    /// one. A `BTreeMap` sorts `"glm-5.3*"` ahead of `"glm-5.3-flash*"` because
+    /// `*` is 0x2A and `-` is 0x2D, so a table-shaped section would price this
+    /// id as the full model, and the test above would pass for the wrong
+    /// reason. Rejecting the table shape by name is what makes it impossible.
+    #[test]
+    fn a_models_section_written_as_a_table_is_rejected_by_name() {
+        let file = "[models]\n\"glm-5.3*\" = { vendor = \"ollama\", model = \"glm-5.3\" }\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("[[models]]"), "{message}");
+        assert!(message.contains("order"), "{message}");
+    }
+
+    #[test]
+    fn a_models_entry_missing_a_field_names_the_field() {
+        let file = "[[models]]\npattern = \"glm-5.3*\"\nvendor = \"ollama\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("models[].model"), "{message}");
+    }
+
+    #[test]
+    fn an_unknown_models_key_is_a_named_error() {
+        let file =
+            "[[models]]\npattern = \"glm*\"\nvendor = \"ollama\"\nmodel = \"glm\"\nrate = 1\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("models[].rate"), "{message}");
+    }
+
+    #[test]
+    fn a_shadowed_models_pattern_is_rejected_naming_both_patterns() {
+        let file = "\
+[[models]]
+pattern = \"glm-5.3*\"
+vendor = \"ollama\"
+model = \"glm-5.3\"
+
+[[models]]
+pattern = \"glm-5.3-flash*\"
+vendor = \"ollama\"
+model = \"glm-5.3-flash\"
+";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("glm-5.3-flash*"), "{message}");
+        assert!(message.contains("glm-5.3*"), "{message}");
+    }
+
+    /// A file with no `[[models]]` still resolves every id the built-in vendors
+    /// name, so removing the harness rule does not depend on the operator
+    /// having configured anything.
+    #[test]
+    fn an_absent_models_section_still_resolves_the_built_in_vendors() {
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(config.models.is_empty());
+        assert_eq!(
+            config.models.resolve("claude-opus-5"),
+            PricedModel::Mapped {
+                vendor: "anthropic".to_string(),
+                model: "claude-opus-5".to_string(),
+            }
+        );
+        assert_eq!(config.models.resolve("kimi-k2.7"), PricedModel::Unmapped);
+    }
 
     #[test]
     fn an_unknown_key_is_a_named_error() {
