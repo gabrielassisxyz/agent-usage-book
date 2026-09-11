@@ -92,7 +92,7 @@ fn contract_status_json_matches_golden_fixture() {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v5.json");
     let fixture_content =
-        std::fs::read_to_string(&fixture_path).expect("fixture status_v4.json must exist");
+        std::fs::read_to_string(&fixture_path).expect("fixture status_v5.json must exist");
     let parsed_fixture: serde_json::Value =
         serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
 
@@ -159,7 +159,7 @@ fn contract_spend_json_matches_golden_fixture() {
     let fixture_path =
         Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v5.json");
     let fixture_content =
-        std::fs::read_to_string(&fixture_path).expect("fixture spend_v4.json must exist");
+        std::fs::read_to_string(&fixture_path).expect("fixture spend_v5.json must exist");
     let parsed_fixture: serde_json::Value =
         serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
 

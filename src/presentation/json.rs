@@ -3364,7 +3364,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 4,
+                "schema": 5,
                 "command": "spend",
                 "error": {
                     "code": "INVALID_USAGE",
@@ -3380,7 +3380,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 4,
+                "schema": 5,
                 "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
             })
         );

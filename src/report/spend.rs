@@ -1859,6 +1859,18 @@ mod tests {
                 None,
                 &[("input", 10)],
             );
+            // The unknown session carries a second event, so session counts
+            // and event counts come apart in the exclusions: a filter's
+            // session count is not its event count.
+            seed_event_in_harness(
+                &conn,
+                harness,
+                &format!("e-{harness}-unknown-2"),
+                day + 35 + offset,
+                "s-unknown",
+                None,
+                &[("input", 10)],
+            );
         }
         ingestion_generation::advance(&conn).unwrap();
 
@@ -1887,23 +1899,24 @@ mod tests {
             .unwrap()
         };
 
-        // No filter: the window holds all nine events and reports no filter.
+        // No filter: the window holds all twelve events and reports no filter.
         let unfiltered = report(&[]);
-        assert_eq!(unfiltered.ingest.events_in_window, 9);
+        assert_eq!(unfiltered.ingest.events_in_window, 12);
         assert_eq!(unfiltered.groups[0].children.len(), 9);
         assert!(unfiltered.filters.is_empty());
 
         // One account filter: three sessions kept, the rest excluded with the
-        // unknown-account usage named in the split.
+        // unknown-account usage named in the split. The unknown session lost
+        // two events per harness, so its events and its sessions come apart.
         let account = report(&[filter("--account", SpendGrouping::Account, &["work-a"])]);
         assert_eq!(account.filters.len(), 1);
         assert_eq!(
             account.filters[0].excluded,
             SpendFilterExcluded {
                 sessions: 6,
-                events: 6,
+                events: 9,
                 unknown_sessions: 3,
-                unknown_events: 3,
+                unknown_events: 6,
             }
         );
         let kept: Vec<&str> = account.groups[0]
@@ -1932,9 +1945,9 @@ mod tests {
             both.filters[0].excluded,
             SpendFilterExcluded {
                 sessions: 3,
-                events: 3,
+                events: 6,
                 unknown_sessions: 3,
-                unknown_events: 3,
+                unknown_events: 6,
             },
             "the unknown-account bucket is the only exclusion, and it is counted"
         );
@@ -1946,7 +1959,7 @@ mod tests {
             harness.filters[0].excluded,
             SpendFilterExcluded {
                 sessions: 6,
-                events: 6,
+                events: 8,
                 unknown_sessions: 0,
                 unknown_events: 0,
             }
@@ -1959,14 +1972,14 @@ mod tests {
             filter("--harness", SpendGrouping::Harness, &["harness-a"]),
             filter("--account", SpendGrouping::Account, &["work-b"]),
         ]);
-        assert_eq!(combined.filters[0].excluded.events, 6);
+        assert_eq!(combined.filters[0].excluded.events, 8);
         assert_eq!(
             combined.filters[1].excluded,
             SpendFilterExcluded {
                 sessions: 2,
-                events: 2,
+                events: 3,
                 unknown_sessions: 1,
-                unknown_events: 1,
+                unknown_events: 2,
             },
             "the second filter is measured against the first filter's survivors"
         );
@@ -1977,7 +1990,7 @@ mod tests {
         );
         // The window count stays the ledger's own read; the filters explain
         // the difference the groups carry.
-        assert_eq!(combined.ingest.events_in_window, 9);
+        assert_eq!(combined.ingest.events_in_window, 12);
         assert_eq!(combined.groups[0].children.len(), 1);
 
         // The model dimension keys the stored model id, and the events with
@@ -1991,9 +2004,9 @@ mod tests {
             model.filters[0].excluded,
             SpendFilterExcluded {
                 sessions: 3,
-                events: 3,
+                events: 6,
                 unknown_sessions: 3,
-                unknown_events: 3,
+                unknown_events: 6,
             }
         );
         assert_eq!(model.groups[0].children.len(), 6);

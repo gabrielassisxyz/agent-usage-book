@@ -9614,7 +9614,7 @@ mod tests {
             ])
             .is_err()
         );
-        assert!(window(&["--today", "--until", "2026-09-09"]).is_ok());
+        assert!(window(&["--today", "--until", "2026-09-13"]).is_ok());
         assert!(window(&["--today", "--days", "2"]).is_ok());
         // A start after today with no end flag would be an empty window.
         assert!(window(&["--since", "2026-09-12"]).is_err());

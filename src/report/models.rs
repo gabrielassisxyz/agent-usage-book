@@ -2172,12 +2172,20 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 11] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 12] = [
         (
             "IngestSummary",
             "*",
             "operational counters describing what the ingestion run did, not \
              measurements it reports; they exist to say the report is incomplete",
+        ),
+        (
+            "SpendFilterExcluded",
+            "*",
+            "operational counters describing what one command-line filter removed, \
+             not measurements it reports; they exist to keep the unknown buckets \
+             the filter hid visible, and the quantities they qualify are the \
+             group subtotals beside them (aub-satk)",
         ),
         (
             "TaskIngestReport",
@@ -2383,13 +2391,13 @@ mod tests {
         );
     }
 
-    /// The structurally qualified exceptions are exactly the eleven documented
-    /// here, each naming the reason it is not an unqualified number. A twelfth one
-    /// cannot be added without this test being edited, which is the point: the list
-    /// is a decision, not a convenience.
+    /// The structurally qualified exceptions are exactly the twelve documented
+    /// here, each naming the reason it is not an unqualified number. A thirteenth
+    /// one cannot be added without this test being edited, which is the point: the
+    /// list is a decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 11);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 12);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),
