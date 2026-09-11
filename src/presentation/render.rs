@@ -27,7 +27,7 @@ use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
     ActiveActivityState, CoverageReport, LivenessGap, NowReport, PricedModelRef, ProvenanceGraph,
-    SpendGroup, SpendReport, StatusReport, TaskOverheadReport, TaskReport,
+    SpendFilterOutcome, SpendGroup, SpendReport, StatusReport, TaskOverheadReport, TaskReport,
     WindowEquivalentDerivation,
 };
 use crate::transcripts::TranscriptDriftReport;
@@ -906,6 +906,9 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
     for group in &report.groups {
         render_spend_group(group, 0, &mut lines);
     }
+    for outcome in &report.filters {
+        lines.push(render_spend_filter_exclusion(outcome));
+    }
     lines.push(render_ingest_summary(report));
     if let Some(unmapped) = render_unmapped_models(report) {
         lines.push(unmapped);
@@ -980,6 +983,21 @@ fn render_unmapped_models(report: &SpendReport) -> Option<String> {
         "unmapped models: {events} events ({})",
         ids.join(", ")
     ))
+}
+
+/// The footer line one active filter reports: what it excluded and how much of
+/// that was the dimension's `unknown-*` bucket. The bucket term is the
+/// attribution gap staying visible: a filter that hides an `unknown-account`
+/// row says exactly how much it hid, so the operator who asked for the filter
+/// never loses the gap (aub-satk).
+fn render_spend_filter_exclusion(outcome: &SpendFilterOutcome) -> String {
+    format!(
+        "excluded by {}: {} sessions ({} {})",
+        outcome.filter.flag,
+        outcome.excluded.sessions,
+        outcome.excluded.unknown_sessions,
+        outcome.filter.dimension.unknown_bucket(),
+    )
 }
 
 /// The marker evidence behind every account group, under `--explain`. Empty
@@ -4378,5 +4396,88 @@ mod tests {
             "no threshold breach was recorded"
         );
         assert!(coverage_footer_lines(&zero).is_empty());
+    }
+
+    /// The filter footer names the flag the operator typed and the dimension's
+    /// unknown bucket, exactly the shape the bead pins, and sits above the
+    /// ingest line (aub-satk).
+    #[test]
+    fn the_spend_filter_footer_names_the_flag_and_the_unknown_bucket() {
+        use crate::report::SpendFilter;
+        use std::collections::BTreeSet;
+
+        let outcome = SpendFilterOutcome::new(
+            SpendFilter {
+                flag: "--account",
+                dimension: crate::report::SpendGrouping::Account,
+                values: BTreeSet::from(["max".to_string()]),
+            },
+            crate::report::SpendFilterExcluded {
+                sessions: 3,
+                events: 5,
+                unknown_sessions: 2,
+                unknown_events: 4,
+            },
+        );
+        assert_eq!(
+            render_spend_filter_exclusion(&outcome),
+            "excluded by --account: 3 sessions (2 unknown-account)"
+        );
+
+        let spend_report = |filters: Vec<SpendFilterOutcome>| {
+            SpendReport::new(
+                crate::report::ReportMetadata::new(
+                    UtcTimestamp::from_unix_nanos(1_000),
+                    UtcTimestamp::from_unix_nanos(1_000),
+                    crate::report::LedgerGeneration::new(1),
+                    None,
+                ),
+                crate::domain::time::UtcDate::parse("2026-08-26").unwrap(),
+                crate::domain::time::UtcDate::parse("2026-08-27").unwrap(),
+                Vec::new(),
+                Vec::new(),
+                crate::report::IngestSummary {
+                    files_read: 1,
+                    events_in_window: 5,
+                    ..Default::default()
+                },
+            )
+            .with_filters(filters)
+        };
+        let rendered = render_spend_report(&spend_report(vec![outcome.clone()]));
+        let filter_line = rendered
+            .lines()
+            .position(|line| line.starts_with("excluded by --account:"))
+            .expect("the filter footer is present for an active filter");
+        let ingest_line = rendered
+            .lines()
+            .position(|line| line.starts_with("ingest:"))
+            .expect("the ingest line is always present");
+        assert!(
+            filter_line < ingest_line,
+            "the filter footer sits above the ingest line: {rendered}"
+        );
+
+        let no_filter = render_spend_report(&spend_report(Vec::new()));
+        assert!(
+            !no_filter.contains("excluded by"),
+            "a filter-free report carries no filter footer: {no_filter}"
+        );
+
+        // The JSON carries the same numbers under filters[].
+        let json = crate::presentation::spend_json_with_explain(
+            &spend_report(vec![outcome]),
+            crate::logging::RunId::new(UtcTimestamp::from_unix_nanos(1_000)),
+            ExplainMode::Off,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let filters = parsed.get("filters").expect("filters array is present");
+        let first = filters.as_array().unwrap()[0].clone();
+        assert_eq!(first["flag"], "--account");
+        assert_eq!(first["dimension"], "account");
+        assert_eq!(first["excluded"]["sessions"], 3);
+        assert_eq!(first["excluded"]["events"], 5);
+        assert_eq!(first["excluded"]["unknown_sessions"], 2);
+        assert_eq!(first["excluded"]["unknown_events"], 4);
     }
 }

@@ -197,7 +197,7 @@ fn refresh_takes_exactly_one_attempt_for_the_selected_account_and_renders_it() {
         json.stderr
     );
     let parsed: serde_json::Value = serde_json::from_str(json.stdout.trim()).unwrap();
-    assert_eq!(parsed["schema"], 4);
+    assert_eq!(parsed["schema"], 5);
     let account = &parsed["accounts"][0];
     assert_eq!(account["account"], "work-a");
     assert_eq!(account["freshness"], "fresh");

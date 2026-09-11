@@ -21,8 +21,8 @@ use agent_usage_book::presentation::json::{
     validate_spend_report_json, validate_status_report_json,
 };
 use agent_usage_book::report::{
-    IngestSummary, LedgerGeneration, MeterAccount, ReportMetadata, SpendGroup, SpendReport,
-    StatusReport,
+    IngestSummary, LedgerGeneration, MeterAccount, ReportMetadata, SpendFilter,
+    SpendFilterExcluded, SpendFilterOutcome, SpendGroup, SpendGrouping, SpendReport, StatusReport,
 };
 use proptest::prelude::*;
 use test_support::sanitization::matched_patterns;
@@ -90,7 +90,7 @@ fn contract_status_json_matches_golden_fixture() {
         serde_json::from_str(&generated_json).expect("generated status JSON must parse");
 
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v4.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/status_v5.json");
     let fixture_content =
         std::fs::read_to_string(&fixture_path).expect("fixture status_v4.json must exist");
     let parsed_fixture: serde_json::Value =
@@ -98,7 +98,7 @@ fn contract_status_json_matches_golden_fixture() {
 
     assert_eq!(
         parsed_generated, parsed_fixture,
-        "generated status JSON must match golden status_v4.json fixture"
+        "generated status JSON must match golden status_v5.json fixture"
     );
 
     let parsed_env = validate_status_report_json(&generated_json)
@@ -157,7 +157,7 @@ fn contract_spend_json_matches_golden_fixture() {
         serde_json::from_str(&generated_json).expect("generated spend JSON must parse");
 
     let fixture_path =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v4.json");
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/presentation/spend_v5.json");
     let fixture_content =
         std::fs::read_to_string(&fixture_path).expect("fixture spend_v4.json must exist");
     let parsed_fixture: serde_json::Value =
@@ -165,7 +165,7 @@ fn contract_spend_json_matches_golden_fixture() {
 
     assert_eq!(
         parsed_generated, parsed_fixture,
-        "generated spend JSON must match golden spend_v4.json fixture"
+        "generated spend JSON must match golden spend_v5.json fixture"
     );
 
     let parsed_env = validate_spend_report_json(&generated_json)
@@ -173,6 +173,128 @@ fn contract_spend_json_matches_golden_fixture() {
     assert_eq!(parsed_env.schema, SCHEMA_VERSION);
     assert_eq!(parsed_env.command, "spend");
     assert_eq!(parsed_env.run.as_str(), "run-1000-2000-1");
+}
+
+/// The golden for a filtered, harness-grouped report: the `grouping` value
+/// `harness` and the `filters[]` array the schema bump to v5 added (aub-satk).
+/// The filtered report carries the filter's exclusion record under `filters[]`,
+/// and the validation pass proves the array is a schema'd field rather than an
+/// ad-hoc key.
+#[test]
+fn contract_spend_filtered_harness_json_matches_golden_fixture() {
+    let since = UtcDate::parse("2026-09-10").unwrap();
+    let until = UtcDate::parse("2026-09-11").unwrap();
+    let usage = UsageVector::new(
+        KnownTokenVector::new(
+            InputTokens::new(400),
+            OutputTokens::new(60),
+            CacheReadTokens::new(20),
+            CacheWriteTokens::new(0),
+        ),
+        BTreeMap::new(),
+        CoverageCompleteness::Complete,
+        EvidenceQuality::Measured,
+    );
+    let manifest = agent_usage_book::domain::provenance::ProvenanceManifest::new(
+        vec![],
+        vec![],
+        agent_usage_book::domain::provenance::QuerySemantics::new("harness", "none"),
+    );
+    let derivation_id = DerivationId::from_manifest(&manifest);
+    let groups = vec![SpendGroup::new(
+        LogicalName::new("harness=codex"),
+        usage,
+        Provenance::new(["codex:session-9".to_string()]),
+        derivation_id,
+    )];
+    let ingest = IngestSummary {
+        refresh_attempted: false,
+        refresh_failure: None,
+        files_read: 0,
+        files_skipped_before_window: 0,
+        unreadable_files: vec![],
+        quarantined_by_class: BTreeMap::new(),
+        replayed_occurrences: 0,
+        collisions: 0,
+        without_identity: 0,
+        heuristic_identities: 0,
+        undated_events: 0,
+        events_outside_window: 0,
+        events_in_window: 3,
+    };
+    let filters = vec![SpendFilterOutcome::new(
+        SpendFilter {
+            flag: "--harness",
+            dimension: SpendGrouping::Harness,
+            values: ["codex".to_string()].into_iter().collect(),
+        },
+        SpendFilterExcluded {
+            sessions: 2,
+            events: 2,
+            unknown_sessions: 0,
+            unknown_events: 0,
+        },
+    )];
+    let report = SpendReport::new(test_metadata(), since, until, groups, vec![], ingest)
+        .with_grouping(vec![SpendGrouping::Harness])
+        .with_filters(filters);
+
+    let generated_json = spend_json(&report, test_run_id());
+    let parsed_generated: serde_json::Value =
+        serde_json::from_str(&generated_json).expect("generated spend JSON must parse");
+
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/presentation/spend_filtered_harness_v5.json");
+    let fixture_content = std::fs::read_to_string(&fixture_path)
+        .expect("fixture spend_filtered_harness_v5.json must exist");
+    let parsed_fixture: serde_json::Value =
+        serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
+
+    assert_eq!(
+        parsed_generated, parsed_fixture,
+        "generated filtered spend JSON must match golden spend_filtered_harness_v5.json fixture"
+    );
+
+    let parsed_env = validate_spend_report_json(&generated_json)
+        .expect("spend JSON must strictly validate against contract");
+    assert_eq!(parsed_env.schema, SCHEMA_VERSION);
+    assert_eq!(parsed_env.command, "spend");
+    // The contract covers both new grouping values and the filters array.
+    let grouping: Vec<String> = parsed_generated["grouping"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|value| value.as_str().unwrap().to_string())
+        .collect();
+    assert!(grouping.contains(&"harness".to_string()));
+    assert_eq!(
+        parsed_generated["filters"].as_array().unwrap().len(),
+        1,
+        "the filtered report carries its exclusion record under filters[]"
+    );
+}
+
+/// The grouping values `harness` and `model` serialize under the envelope's
+/// `grouping` array, and `validate_spend_report_json` accepts them (aub-satk).
+#[test]
+fn contract_grouping_accepts_harness_and_model_values() {
+    let report = SpendReport::new(
+        test_metadata(),
+        UtcDate::parse("2026-09-10").unwrap(),
+        UtcDate::parse("2026-09-11").unwrap(),
+        Vec::new(),
+        Vec::new(),
+        IngestSummary::default(),
+    )
+    .with_grouping(vec![SpendGrouping::Harness, SpendGrouping::Model]);
+    let json = spend_json(&report, test_run_id());
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+        parsed["grouping"],
+        serde_json::json!(["harness", "model"]),
+        "the two new dimensions serialize by their dimension names"
+    );
+    validate_spend_report_json(&json).expect("the harness and model grouping values must validate");
 }
 
 #[test]

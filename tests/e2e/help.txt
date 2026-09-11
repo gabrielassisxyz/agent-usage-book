@@ -5,7 +5,7 @@ shared flags: -v, --format text|json, --explain[=summary|full], --account NAME, 
 
 commands:
   status   render the last known meter reading per configured account
-  spend    canonical token usage grouped by day, session, project, repository, task or account
+  spend    canonical token usage grouped and filtered by day, session, project, repository, harness, model, task or account
   config   print every resolved configuration key with the source that won
   export   emit versioned JSONL usage rows keyed by session-id or run-id for external joins
   rate-card import, show and history the immutable dated vendor rate cards
@@ -32,10 +32,10 @@ status:
   options: --refresh
 
 spend:
-  answers: how many canonical tokens were used, grouped by the requested dimensions?
-  refuses: --account (spend groups by account with --group-by account; it has no single-account filter); --model (spend has no model dimension until a model selector is needed); --no-color (spend prints no color)
+  answers: how many canonical tokens were used, grouped by the requested dimensions and kept by the requested filters?
+  refuses: --no-color (spend prints no color)
   format: text | json
-  options: --today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list
+  options: --today (default) | --yesterday | --since YYYY-MM-DD | --until YYYY-MM-DD | --days N | --group-by day|session|project|repository|harness|model|task|account (repeatable) | filters (repeatable, OR-ed): --harness --account --project --repo --task --model --session NAME | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list
 
 config:
   answers: which configuration key resolved from where?

@@ -103,8 +103,37 @@ without `--session-id` the state is always `no_evidence`.
 
 **Answers:** how many canonical tokens were used, grouped by the requested
 dimensions? `--group-by` takes `day`, `session`, `project`, `repository`,
-`task` or `account` and is repeatable, so `--group-by account --group-by day`
-nests days under each account.
+`harness`, `model`, `task` or `account` and is repeatable, so
+`--group-by account --group-by day` nests days under each account. `harness`
+is the transcript namespace the config named (`claude-code`, `codex`, `pi`,
+`opencode`) and `model` is the model id the transcript stored; usage neither
+field names lands in the `unknown-harness` or `unknown-model` bucket.
+
+Every dimension except `day` has a filter flag of the same name: `--harness`,
+`--account`, `--project`, `--repo`, `--task`, `--model` and `--session`, where
+`--repo` is the flag for the repository dimension and the `--group-by
+repository` spelling keeps `repo` as its alias. Each flag is repeatable and its
+values are OR-ed; different flags combine with AND. A filter that would hide an
+`unknown-*` bucket does not hide it silently: every active filter reports, in
+the footer, how many sessions and events it excluded and how many of those were
+in the dimension's `unknown-*` bucket, one line per filter in the order the
+flags were given, for example `excluded by --account: 3 sessions (2
+unknown-account)`. The JSON carries the same record per filter under `filters[]`.
+
+The window is read the way people say it (UTC days, end exclusive):
+
+| flags | window |
+| --- | --- |
+| none, `--today` | today |
+| `--yesterday` | yesterday |
+| `--days N` | the N days ending today, today included |
+| `--since D` | D up to and including today |
+| `--since D --until E` | D up to E exclusive; `E <= D` is a usage error |
+| `--since D --days N` | D forward N days, the reading an explicit start keeps |
+| `--until` without `--since` | usage error naming both flags |
+
+`--yesterday` stands alone and does not combine with the other window flags,
+and the window line states the resolved dates every time.
 
 Account grouping is the session-identifier join: the session id already appears
 in every transcript and in every account marker, and `--group-by account` reads
