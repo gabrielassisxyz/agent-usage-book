@@ -694,9 +694,7 @@ impl Command {
             Command::LoggingFixture | Command::StateCheck | Command::ExitClass => None,
             Command::AttemptCrashHook => None,
             Command::ProjectionCrashHook => None,
-            Command::CostModel => {
-                Some("list and activate the published cost models")
-            }
+            Command::CostModel => Some("list and activate the published cost models"),
             Command::RateCard => {
                 Some("import, show and history the immutable dated vendor rate cards")
             }

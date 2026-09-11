@@ -1459,30 +1459,25 @@ fn cost_model_active(ctx: &DoctorContext) -> CheckOutcome {
     } else {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
-            Some(conn) => {
-                match crate::store::cost_model::load_active_at(conn, ctx.timestamp) {
-                    Err(error) => {
-                        CheckStatus::Fail(format!("cannot read the active cost model: {error}"))
-                    }
-                    Ok(Some(model)) => CheckStatus::PassWithDetail(format!(
-                        "active cost model: {}",
-                        model.id().as_str()
-                    )),
-                    Ok(None) => match crate::store::rate_card::count(conn) {
-                        Err(error) => {
-                            CheckStatus::Fail(format!("cannot count rate cards: {error}"))
-                        }
-                        Ok(0) => CheckStatus::NotApplicable(
-                            "no rate card is imported, so no credits pricing is due yet"
-                                .to_string(),
-                        ),
-                        Ok(cards) => CheckStatus::Warn(format!(
-                            "{cards} rate card row(s) imported but no cost model is active; run `aub cost-model activate {}`",
-                            crate::store::cost_model::ANTHROPIC_CLAUDE_MESSAGES_V1_ID
-                        )),
-                    },
+            Some(conn) => match crate::store::cost_model::load_active_at(conn, ctx.timestamp) {
+                Err(error) => {
+                    CheckStatus::Fail(format!("cannot read the active cost model: {error}"))
                 }
-            }
+                Ok(Some(model)) => CheckStatus::PassWithDetail(format!(
+                    "active cost model: {}",
+                    model.id().as_str()
+                )),
+                Ok(None) => match crate::store::rate_card::count(conn) {
+                    Err(error) => CheckStatus::Fail(format!("cannot count rate cards: {error}")),
+                    Ok(0) => CheckStatus::NotApplicable(
+                        "no rate card is imported, so no credits pricing is due yet".to_string(),
+                    ),
+                    Ok(cards) => CheckStatus::Warn(format!(
+                        "{cards} rate card row(s) imported but no cost model is active; run `aub cost-model activate {}`",
+                        crate::store::cost_model::ANTHROPIC_CLAUDE_MESSAGES_V1_ID
+                    )),
+                },
+            },
         }
     };
     outcome(CheckName::CostModelActive, status)

@@ -718,8 +718,7 @@ pub fn load_active_with_activation_at(
     let Some((db_id, since)) = active_lifecycle_row(conn, at)? else {
         return Ok(None);
     };
-    Ok(load_model(conn, "WHERE id = ?1", params![db_id.value()])?
-        .map(|model| (model, since)))
+    Ok(load_model(conn, "WHERE id = ?1", params![db_id.value()])?.map(|model| (model, since)))
 }
 
 /// The lifecycle row the active-at query resolves from: the rowid of the
@@ -1476,13 +1475,14 @@ mod tests {
         assert!(published_model("nope", ts(1_000)).is_none());
         let complete =
             published_model(ANTHROPIC_CLAUDE_MESSAGES_V1_ID, ts(1_000)).expect("published");
-        let incomplete = published_model(
-            ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID,
-            ts(2_000),
-        )
-        .expect("published");
+        let incomplete = published_model(ANTHROPIC_CLAUDE_MESSAGES_INCOMPLETE_V1_ID, ts(2_000))
+            .expect("published");
 
-        assert!(load_active_with_activation_at(&conn, ts(999)).unwrap().is_none());
+        assert!(
+            load_active_with_activation_at(&conn, ts(999))
+                .unwrap()
+                .is_none()
+        );
 
         assert!(activate_if_not_active(&mut conn, &complete, ts(1_000)).unwrap());
         assert!(activate_if_not_active(&mut conn, &incomplete, ts(2_000)).unwrap());
