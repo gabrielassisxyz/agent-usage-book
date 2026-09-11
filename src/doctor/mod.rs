@@ -310,6 +310,7 @@ mod tests {
             // status added later fails this assertion instead of being folded into the panic.
             CheckStatus::Pass
             | CheckStatus::PassWithDetail(_)
+            | CheckStatus::Warn(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_) => {
                 panic!("expected not-yet-available")

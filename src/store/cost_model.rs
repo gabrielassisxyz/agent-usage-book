@@ -1529,7 +1529,8 @@ mod tests {
     /// Both interval constructors reject an inverted range rather than normalising
     /// it, and the derivation-method vocabulary round-trips.
     #[test]
-    fn inverted_intervals_are_rejected_and_vocabulary_round_trips() {        assert!(ValidityInterval::new(ts(2_000), ts(1_000)).is_err());
+    fn inverted_intervals_are_rejected_and_vocabulary_round_trips() {
+        assert!(ValidityInterval::new(ts(2_000), ts(1_000)).is_err());
         assert!(ValidityInterval::new(ts(1_000), ts(1_000)).is_ok());
         assert!(
             CoefficientUncertainty::new(

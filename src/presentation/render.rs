@@ -1596,12 +1596,14 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
         let marker = match &outcome.status {
             CheckStatus::Pass | CheckStatus::PassWithDetail(_) => "PASS".to_string(),
             CheckStatus::Fail(_) => "FAIL".to_string(),
+            CheckStatus::Warn(_) => "WARN".to_string(),
             CheckStatus::NotApplicable(_) => "N/A ".to_string(),
             CheckStatus::NotYetAvailable { .. } => "TODO".to_string(),
         };
         let mut line = format!("  [{marker}] {}", outcome.name.as_str());
         match &outcome.status {
             CheckStatus::Fail(reason)
+            | CheckStatus::Warn(reason)
             | CheckStatus::NotApplicable(reason)
             | CheckStatus::PassWithDetail(reason) => {
                 line.push_str(&format!(": {reason}"));
@@ -1617,9 +1619,10 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
         lines.push(line);
     }
     lines.push(format!(
-        "Summary: {} passed, {} failed, {} not applicable, {} not yet available",
+        "Summary: {} passed, {} failed, {} warned, {} not applicable, {} not yet available",
         report.passed(),
         report.failed(),
+        report.warned(),
         report.not_applicable(),
         report.not_yet_available(),
     ));

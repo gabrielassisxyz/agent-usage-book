@@ -832,7 +832,8 @@ mod calendar_tests {
     /// The planted negative: a date-only string, an impossible day and a missing
     /// zone are all refused rather than guessed.
     #[test]
-    fn unreadable_timestamps_are_none_not_guessed() {        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30"), None);
+    fn unreadable_timestamps_are_none_not_guessed() {
+        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30"), None);
         assert_eq!(UtcTimestamp::parse_rfc3339("2026-02-30T00:00:00Z"), None);
         assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30T14:26:29"), None);
         assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30T24:00:00Z"), None);

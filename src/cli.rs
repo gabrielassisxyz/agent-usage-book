@@ -4900,6 +4900,7 @@ fn cost_model_command(clock: &impl Clock, invocation: &Invocation) -> Result<(),
 
 /// The parsed `cost-model` subcommand: `list` names no model, `activate`
 /// carries the normalized published id the store recognises.
+#[derive(Debug)]
 enum CostModelAction {
     List,
     Activate { model_id: String },
@@ -9000,7 +9001,8 @@ mod tests {
     /// the failure names it. The equality assert after it pins identity and order
     /// together, so a shortened or reordered `ALL` is loud, not silent.
     #[test]
-    fn all_lists_every_declared_variant() {        let missing: Vec<_> = Command::DECLARED_VARIANTS
+    fn all_lists_every_declared_variant() {
+        let missing: Vec<_> = Command::DECLARED_VARIANTS
             .iter()
             .filter(|variant| !Command::ALL.contains(variant))
             .collect();

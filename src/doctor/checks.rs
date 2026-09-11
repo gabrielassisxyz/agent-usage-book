@@ -76,6 +76,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         sampling_failure_counts(ctx),
         meter_error_classifications(ctx),
         subscription_identity_change(ctx),
+        cost_model_active(ctx),
     ]
 }
 
@@ -134,6 +135,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::SamplingFailureCounts => "store::sampling_failure_counts",
         CheckName::MeterErrorClassifications => "store::meter_attempt",
         CheckName::SubscriptionIdentityChange => "store::subscription_identity",
+        CheckName::CostModelActive => "store::cost_model",
     }
 }
 
@@ -194,6 +196,9 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::SubscriptionIdentityChange => {
             "no account's credential changed subscription without being refused and recorded"
+        }
+        CheckName::CostModelActive => {
+            "a published cost model is active whenever rate cards are imported"
         }
     }
 }
@@ -1439,6 +1444,50 @@ fn subscription_identity_change(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::SubscriptionIdentityChange, status)
 }
 
+/// A published cost model active against the ledger, whenever rate cards are
+/// imported at all: credits pricing resolves through the active model, so with
+/// prices present but none active `spend --credits` refuses and the doctor
+/// names the one command that repairs it. Advisory, never gating: the token
+/// ledger is complete without credits pricing, so the finding warns rather than
+/// fails, and `--fix` has no repair because activation is an explicit operator
+/// decision, not a safe mechanical one.
+fn cost_model_active(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => {
+                match crate::store::cost_model::load_active_at(conn, ctx.timestamp) {
+                    Err(error) => {
+                        CheckStatus::Fail(format!("cannot read the active cost model: {error}"))
+                    }
+                    Ok(Some(model)) => CheckStatus::PassWithDetail(format!(
+                        "active cost model: {}",
+                        model.id().as_str()
+                    )),
+                    Ok(None) => match crate::store::rate_card::count(conn) {
+                        Err(error) => {
+                            CheckStatus::Fail(format!("cannot count rate cards: {error}"))
+                        }
+                        Ok(0) => CheckStatus::NotApplicable(
+                            "no rate card is imported, so no credits pricing is due yet"
+                                .to_string(),
+                        ),
+                        Ok(cards) => CheckStatus::Warn(format!(
+                            "{cards} rate card row(s) imported but no cost model is active; run `aub cost-model activate {}`",
+                            crate::store::cost_model::ANTHROPIC_CLAUDE_MESSAGES_V1_ID
+                        )),
+                    },
+                }
+            }
+        }
+    };
+    outcome(CheckName::CostModelActive, status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1749,6 +1798,7 @@ mod tests {
                 assert!(detail.contains("resolves for the sampler"), "{detail}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2040,6 +2090,7 @@ mod tests {
                 assert!(!message.contains("backup:"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2096,6 +2147,7 @@ mod tests {
                 assert!(!message.contains("backup:"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2150,6 +2202,7 @@ mod tests {
                 assert!(!message.contains("drill:"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2438,6 +2491,7 @@ mod tests {
                 assert!(detail.contains("3600s old"), "{detail}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2641,6 +2695,7 @@ mod tests {
                 assert!(message.contains("anthropic:pro:tier"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2746,6 +2801,7 @@ mod tests {
                 assert!(message.contains("resumed"), "{message}");
             }
             CheckStatus::Pass
+            | CheckStatus::Warn(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
