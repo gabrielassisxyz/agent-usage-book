@@ -108,9 +108,22 @@ aub_bin="$target_dir/release/aub"
 # The readings come from this desktop and not from the CI runner, as the 90s ones
 # did, because the desktop is the machine that decides whether work lands here:
 # three landings went red on the 90s budget in one night, each with
-# attribution=environment and no bead convicted. What this number still does not
-# state stays open on aub-kg2a: the per-case migration cost, and case 015
-# measuring 16.6s against the roughly 7s its own header claims.
+# attribution=environment and no bead convicted.
+#
+# Measured again on 2026-09-11 with nothing else running, three consecutive
+# readings on main at 63 of 63 cases: 73s, 96s and 64s, all green. That is a 32s
+# spread with no change to the tree, half again the smallest reading, and it does
+# not track the io pressure read at launch (the 96s run started at avg10=7.86, the
+# 64s run at avg10=4.33). What it does track is what the page cache already holds:
+# in the first reading case 015 alone cost 14.6s and in the next two it cost 1.8s
+# and 1.9s, with the summed case time moving 53.8s, 76.4s, 44.5s. The suite reads
+# its binary and fixtures from a SATA SSD shared with every cargo target on this
+# machine, so a cold run pays for that and a warm one does not.
+#
+# This is what the budget has to absorb, and it is why the headroom is 1.5x rather
+# than the rule's 1.25x: the quantity being bounded swings by 50 percent on its
+# own. Anyone tempted to tighten it back should re-read those three numbers first.
+# What is still not measured stays on aub-kg2a: the per-case migration cost.
 #
 # It was 90s from 2026-09-09 to 2026-09-11 (aub-e2e-cost-rjxc), from three
 # consecutive readings on the CI runner after the suite's cost was cut: 66s, 69s
