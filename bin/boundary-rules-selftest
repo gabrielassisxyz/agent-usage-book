@@ -136,7 +136,7 @@ violation() {
 
 # Violations planted into the modules' real files (kept as near-identical
 # positives/negatives). Where a module is a directory today (presentation, store) the
-# plant lands in its root mod.rs: the earlier flat-file paths src/presentation.rs and
+# plant lands in its root mod.rs. The earlier flat-file paths (src/presentation.rs and
 # src/store.rs) stopped existing when those modules split, and the old append silently
 # created phantom files the rules still caught, so the scenarios stopped exercising
 # their labels' targets (aub-80nm).
