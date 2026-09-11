@@ -56,10 +56,11 @@ same thing in both documents.
 | 25 | Provider response evidence and its normalized interpretation are separate records; a corrected adapter reinterprets retained evidence and never overwrites the earlier interpretation. | src/store/meter_evidence.rs | tests::switching_the_preference_keeps_both_interpretations_immutable |
 | 26 | Workload feasibility is evaluated against every constraining window in calibrated credits, never against the lowest remaining percentage alone. | src/domain/window.rs | tests::display_and_advice_select_different_windows_when_calibrations_diverge |
 | 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | src/coverage.rs | tests::a_cadence_change_mid_interval_follows_the_historical_policy |
+| 28 | At most one rate card is in force per vendor, model, token class and instant. | src/rate_book.rs | tests::two_scheduled_rows_overlapping_on_a_shared_day_are_refused |
 
 ## Enforcement status
 
-Of the 27 invariants above, 27 are enforced by mechanical checks present at HEAD (file paths and tests), and 0 are unenforced and tracked by open beads in the tracker.
+Of the 28 invariants above, 28 are enforced by mechanical checks present at HEAD (file paths and tests), and 0 are unenforced and tracked by open beads in the tracker.
 
 ## Maintaining this document
 

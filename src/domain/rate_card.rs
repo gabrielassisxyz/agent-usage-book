@@ -314,7 +314,9 @@ impl Schedule {
 
     /// The ISO weekdays in ascending order.
     pub fn days_iso(&self) -> Vec<u32> {
-        (1..=7).filter(|day| (self.days >> (day - 1)) & 1 == 1).collect()
+        (1..=7)
+            .filter(|day| (self.days >> (day - 1)) & 1 == 1)
+            .collect()
     }
 
     /// The day set in compact prose: one `mon-fri` range when the days form a
@@ -334,8 +336,7 @@ impl Schedule {
                 )
             }
         } else {
-            days
-                .iter()
+            days.iter()
                 .map(|day| day_name(*day).unwrap_or("?"))
                 .collect::<Vec<_>>()
                 .join(",")
@@ -418,8 +419,8 @@ pub fn parse_hours_utc(text: &str) -> Result<(u16, u16), HoursParseError> {
         .ok_or_else(|| HoursParseError::Malformed(text.to_string()))?;
     let start = parse_clock(start_text.trim())
         .ok_or_else(|| HoursParseError::Malformed(text.to_string()))?;
-    let end = parse_clock(end_text.trim())
-        .ok_or_else(|| HoursParseError::Malformed(text.to_string()))?;
+    let end =
+        parse_clock(end_text.trim()).ok_or_else(|| HoursParseError::Malformed(text.to_string()))?;
     if start == end {
         return Err(HoursParseError::StartNotBeforeEnd(text.to_string()));
     }

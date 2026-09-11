@@ -157,6 +157,7 @@ mod tests {
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse("2026-06-24").unwrap(),
             effective_end: None,
+            schedule: None,
             publication: Publication {
                 source: None,
                 published_at: None,

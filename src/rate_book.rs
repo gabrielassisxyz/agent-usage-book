@@ -343,9 +343,7 @@ fn parse_schedule(index: usize, value: &toml::Value) -> Result<Schedule, RateBoo
                 format!("schedule.hours_utc {hours_text:?} starts at or after it ends")
             }
             HoursParseError::CrossesMidnight(_) => {
-                format!(
-                    "schedule.hours_utc {hours_text:?} crosses midnight; write it as two cards"
-                )
+                format!("schedule.hours_utc {hours_text:?} crosses midnight; write it as two cards")
             }
         };
         RateBookError {
@@ -431,7 +429,7 @@ token_class = "input"
 rate = "3.00"
 currency = "USD"
 billing_basis = "per_million_tokens"
-effective_start = "2026-06-24"
+effective_start = "2026-08-31"
 published_at = "2026-06-24"
 source = "claude-api reference"
 
@@ -452,7 +450,7 @@ review_due = "2026-08-31"
         );
         assert_eq!(book.cards.len(), 2);
         let standard = &book.cards[0];
-        assert_eq!(standard.effective_start.iso(), "2026-06-24");
+        assert_eq!(standard.effective_start.iso(), "2026-08-31");
         assert_eq!(standard.effective_end, None);
         assert!(standard.publication.fully_sourced());
         assert_eq!(
@@ -602,8 +600,8 @@ schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:0
             "days = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]",
             "days = []",
         );
-        let error = parse(&format!("{MINIMAL_CARD}{empty_days}"))
-            .expect_err("empty days must be refused");
+        let error =
+            parse(&format!("{MINIMAL_CARD}{empty_days}")).expect_err("empty days must be refused");
         assert_eq!(error.card_index, 1);
         assert!(error.reason.contains("schedule.days"), "{}", error.reason);
 
@@ -611,20 +609,32 @@ schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:0
         let error = parse(&format!("{MINIMAL_CARD}{zero_window}"))
             .expect_err("start not before end must be refused");
         assert_eq!(error.card_index, 1);
-        assert!(error.reason.contains("schedule.hours_utc"), "{}", error.reason);
+        assert!(
+            error.reason.contains("schedule.hours_utc"),
+            "{}",
+            error.reason
+        );
 
         let overnight = SCHEDULED_CARD.replace("12:00-18:00", "22:00-02:00");
         let error = parse(&format!("{MINIMAL_CARD}{overnight}"))
             .expect_err("a window crossing midnight must be refused");
         assert_eq!(error.card_index, 1);
-        assert!(error.reason.contains("schedule.hours_utc"), "{}", error.reason);
+        assert!(
+            error.reason.contains("schedule.hours_utc"),
+            "{}",
+            error.reason
+        );
         assert!(error.reason.contains("two cards"), "{}", error.reason);
 
         let malformed = SCHEDULED_CARD.replace("12:00-18:00", "noon");
         let error = parse(&format!("{MINIMAL_CARD}{malformed}"))
             .expect_err("malformed hours must be refused");
         assert_eq!(error.card_index, 1);
-        assert!(error.reason.contains("schedule.hours_utc"), "{}", error.reason);
+        assert!(
+            error.reason.contains("schedule.hours_utc"),
+            "{}",
+            error.reason
+        );
     }
 
     #[test]
@@ -635,7 +645,13 @@ schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:0
             SCHEDULED_CARD,
             SCHEDULED_CARD.replace("deepseek-v4-flash", "deepseek-v4-pro"),
         );
-        assert_eq!(parse(&book).expect("default beside peaks must pass").cards.len(), 3);
+        assert_eq!(
+            parse(&book)
+                .expect("default beside peaks must pass")
+                .cards
+                .len(),
+            3
+        );
     }
 
     #[test]
@@ -676,7 +692,10 @@ schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:0
             SCHEDULED_CARD,
             weekend,
         );
-        assert_eq!(parse(&book).expect("disjoint days must pass").cards.len(), 3);
+        assert_eq!(
+            parse(&book).expect("disjoint days must pass").cards.len(),
+            3
+        );
     }
 
     #[test]

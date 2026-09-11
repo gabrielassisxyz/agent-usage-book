@@ -25,6 +25,13 @@ pub const UNKNOWN_SESSION: &str = "unknown-session";
 pub struct CanonicalSpendEvent {
     pub canonical_id: String,
     pub occurred_at: UtcTimestamp,
+    /// True when the instant above was inferred because the transcript
+    /// stated none. The ledger never infers: an undated event is excluded
+    /// from spend rather than placed in a day, so this reads false for
+    /// every row `canonical_events` returns today. It exists so valuation
+    /// can value a future inferred instant at the default card instead of
+    /// silently assuming off-peak (aub-pwtn).
+    pub timestamp_heuristic: bool,
     pub session: String,
     /// The source namespace and native id behind `session`, kept apart so the
     /// account-marker join can address the session without re-splitting the
@@ -118,6 +125,7 @@ pub fn canonical_events(
         events.push(CanonicalSpendEvent {
             canonical_id,
             occurred_at: UtcTimestamp::from_unix_nanos(occurred_at),
+            timestamp_heuristic: false,
             session: session_label(source.as_deref(), session_id.as_deref()),
             session_source: source.clone(),
             session_native: session_id.clone(),

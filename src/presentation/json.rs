@@ -18,7 +18,7 @@ use crate::domain::tokens::TokenKind;
 use crate::domain::window::WindowScope;
 use crate::error::Error;
 use crate::evidence::{
-    CoverageCompleteness, Derivation, EvidenceQuality, Provenance, RequiredFact,
+    CoverageCompleteness, Derivation, EstimatorId, EvidenceQuality, Provenance, RequiredFact,
 };
 use crate::logging::RunId;
 use crate::presentation::render::{
@@ -1031,6 +1031,27 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
             .collect::<Vec<_>>()
             .join(",");
         fields.push_str(&format!(",\"priced_as\":[{priced}]"));
+    }
+    // One entry per rate card that valued the group, with the schedule that
+    // selected it (`default` or the window, e.g. `peak mon-fri 12:00-18:00
+    // UTC`). Absent when nothing priced, by the same presence rule as
+    // `priced_as` (aub-pwtn).
+    if !group.priced_cards.is_empty() {
+        let cards = group
+            .priced_cards
+            .iter()
+            .map(|card| {
+                format!(
+                    "{{\"vendor\":{},\"model\":{},\"token_class\":{},\"schedule\":{}}}",
+                    json_string(&card.vendor),
+                    json_string(&card.model),
+                    json_string(&card.token_class),
+                    json_string(&card.schedule),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push_str(&format!(",\"rate_cards\":[{cards}]"));
     }
     if let Some(credits) = &group.credits {
         fields.push_str(&format!(",\"credits\":{}", credits_json(credits)));
@@ -2767,10 +2788,30 @@ pub fn coverage_and_quality_json<T: DomainQuantity>(
     quality: &EvidenceQuality<T>,
 ) -> String {
     format!(
-        "{{\"coverage\":{},\"evidence_quality\":{}}}",
+        "{{\"coverage\":{},\"evidence_quality\":{},\"estimation_methods\":[{}]}}",
         json_string(coverage_name(coverage)),
         json_string(quality_name(quality)),
+        estimation_methods(quality)
+            .iter()
+            .map(|method| json_string(method.as_str()))
+            .collect::<Vec<_>>()
+            .join(","),
     )
+}
+
+/// The estimator names behind an estimated or mixed quality, in a stable
+/// order. Empty for measured evidence: the methods key is always present so
+/// a consumer reads one shape either way, and a group degraded for an
+/// unknown schedule hour names `schedule-unresolved` here (aub-pwtn).
+fn estimation_methods<T: DomainQuantity>(quality: &EvidenceQuality<T>) -> Vec<EstimatorId> {
+    let mut methods: Vec<EstimatorId> = match quality {
+        EvidenceQuality::Measured => Vec::new(),
+        EvidenceQuality::Estimated { methods, .. } | EvidenceQuality::Mixed { methods, .. } => {
+            methods.iter().cloned().collect()
+        }
+    };
+    methods.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    methods
 }
 
 /// Serializes an interval with both endpoints and the unit of its element type.
@@ -3298,7 +3339,8 @@ mod tests {
             parsed,
             serde_json::json!({
                 "coverage": "complete",
-                "evidence_quality": "measured"
+                "evidence_quality": "measured",
+                "estimation_methods": []
             })
         );
 
@@ -3312,7 +3354,8 @@ mod tests {
             partial_parsed,
             serde_json::json!({
                 "coverage": "partial",
-                "evidence_quality": "estimated"
+                "evidence_quality": "estimated",
+                "estimation_methods": ["chars"]
             })
         );
     }

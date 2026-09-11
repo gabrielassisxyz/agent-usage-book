@@ -36,13 +36,14 @@ pub use models::{
     CoverageErrorClassification, CoverageReport, CoverageReset, CoverageThreshold, DoctorReport,
     ExportReport, IngestReport, IngestSummary, IngestionGeneration, LedgerGeneration,
     LimitingWindow, MeterAccount, MeterExplanation, MeterReadingProvenance, MeterWindowExplanation,
-    NowReport, PricedModelRef, ProjectionReadState, ReportMetadata, SampleAttempt, SampleReport,
-    SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendFilter, SpendFilterExcluded,
-    SpendFilterOutcome, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
-    SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, StatusReport, StatusWindow,
-    TaskIdentityRow, TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport,
-    TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL, UNKNOWN_MODEL_LABEL,
-    UNNAMED_MODEL_LABEL, WindowBurnRate, WindowEquivalentDerivation, WindowEquivalentValue,
+    NowReport, PricedCardRef, PricedModelRef, ProjectionReadState, ReportMetadata, SampleAttempt,
+    SampleReport, SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendFilter,
+    SpendFilterExcluded, SpendFilterOutcome, SpendGroup, SpendGroupCreditsProvenance,
+    SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport,
+    StatusReport, StatusWindow, TaskIdentityRow, TaskIngestReport, TaskOverheadBucket,
+    TaskOverheadReport, TaskReport, TaskSessionUsage, UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL,
+    UNKNOWN_MODEL_LABEL, UNNAMED_MODEL_LABEL, WindowBurnRate, WindowEquivalentDerivation,
+    WindowEquivalentValue,
 };
 pub use provenance::{ProvenanceGraph, ProvenanceNode, ReportField, Unit, ValueArithmetic};
 

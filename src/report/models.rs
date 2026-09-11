@@ -503,6 +503,11 @@ pub struct SpendGroup {
     /// that day, so this is a set rather than a field, and reading it is how a
     /// valuation nobody expected is traced back to the id that produced it.
     pub priced_as: BTreeSet<PricedModelRef>,
+    /// The rate cards that valued this group's events, with the schedule
+    /// that selected each one. Empty when nothing in the group priced.
+    /// Shown under `--explain` and in the JSON of each spend group
+    /// (aub-pwtn).
+    pub priced_cards: BTreeSet<PricedCardRef>,
 }
 
 /// One vendor and model a group's events were priced under.
@@ -515,6 +520,32 @@ pub struct PricedModelRef {
 impl PricedModelRef {
     pub fn label(&self) -> String {
         format!("{}/{}", self.vendor, self.model)
+    }
+}
+
+/// One rate card a group's events were valued under: the vendor, model and
+/// token class it priced, and the schedule that selected it (`default` for
+/// an unscheduled card, otherwise the window the card carries, e.g.
+/// `peak mon-fri 12:00-18:00 UTC`).
+///
+/// A group is not one card: events at different hours of one day land on
+/// the peak and the default rows, so this is a set rather than a field, and
+/// reading it is how a valuation nobody expected is traced back to the
+/// window that produced it (aub-pwtn).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct PricedCardRef {
+    pub vendor: String,
+    pub model: String,
+    pub token_class: String,
+    pub schedule: String,
+}
+
+impl PricedCardRef {
+    pub fn label(&self) -> String {
+        format!(
+            "{}/{}/{} ({})",
+            self.vendor, self.model, self.token_class, self.schedule
+        )
     }
 }
 
@@ -535,11 +566,17 @@ impl SpendGroup {
             window_equivalent: None,
             children: Vec::new(),
             priced_as: BTreeSet::new(),
+            priced_cards: BTreeSet::new(),
         }
     }
 
     pub fn with_priced_as(mut self, priced_as: BTreeSet<PricedModelRef>) -> Self {
         self.priced_as = priced_as;
+        self
+    }
+
+    pub fn with_priced_cards(mut self, priced_cards: BTreeSet<PricedCardRef>) -> Self {
+        self.priced_cards = priced_cards;
         self
     }
 
