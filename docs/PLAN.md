@@ -5054,6 +5054,8 @@ The critical invariants are:
     credits, never against the lowest remaining percentage alone.
 27. Coverage denominators come from the sampling policy that was in force over the
     interval, never from current configuration.
+28. At most one rate card is in force per vendor, model, token class and
+    instant.
 
 These are more important than most implementation choices.
 

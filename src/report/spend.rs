@@ -41,11 +41,11 @@ use crate::evidence::{
 use crate::logging::LogicalName;
 use crate::report::models::{
     AccountGroupExplain, AccountMarkerReference, IngestSummary, IngestionGeneration,
-    LedgerGeneration, PricedModelRef, ReportMetadata, SpendDiagnostic, SpendDiagnosticProvenance,
-    SpendFilter, SpendFilterExcluded, SpendFilterOutcome, SpendGroup, SpendGroupCreditsProvenance,
-    SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport,
-    UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL, UNKNOWN_MODEL_LABEL, UNNAMED_MODEL_LABEL,
-    WindowEquivalentDerivation,
+    LedgerGeneration, PricedCardRef, PricedModelRef, ReportMetadata, SpendDiagnostic,
+    SpendDiagnosticProvenance, SpendFilter, SpendFilterExcluded, SpendFilterOutcome, SpendGroup,
+    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGroupWindowEquivalentProvenance,
+    SpendGrouping, SpendReport, UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL, UNKNOWN_MODEL_LABEL,
+    UNNAMED_MODEL_LABEL, WindowEquivalentDerivation,
 };
 use crate::report::provenance::{ProvenanceNode, Unit, ValueArithmetic};
 use crate::store::cost_model::CostModel;
@@ -745,12 +745,32 @@ fn canonical_groups(
         .map(|(value, members)| -> Result<SpendGroup, Error> {
             path.push(format!("{}={value}", dimension.as_str()));
             let key = LogicalName::new(path.join(" / "));
-            let usage = canonical_usage(&members, partial);
+            let mut usage = canonical_usage(&members, partial);
+            // An event whose timestamp is a heuristic was valued at the
+            // default card without knowing its hour, so the group's quality
+            // is estimated with the schedule-unresolved method rather than
+            // reading as measured (aub-pwtn). The estimators the group
+            // already carried join the method set instead of being replaced:
+            // a reconstructed count stays named alongside the unknown hour.
+            if members.iter().any(|event| event.timestamp_heuristic) {
+                usage = UsageVector::new(
+                    usage.known(),
+                    usage.unknown().clone(),
+                    usage.coverage().clone(),
+                    degrade_for_heuristic_timestamp(usage.quality()),
+                );
+            }
             let sources = members
                 .iter()
                 .flat_map(|event| event.sources.iter().cloned())
                 .collect::<BTreeSet<_>>();
-            let valuation = rate_book.map(|book| value_events(&members, book));
+            let (valuation, priced_cards) = match rate_book {
+                Some(book) => {
+                    let (outcome, cards) = value_events(&members, book);
+                    (Some(outcome), cards)
+                }
+                None => (None, BTreeSet::new()),
+            };
             let mut witnesses = Vec::new();
             if let Some(book) = rate_book
                 && let Some(rc_id) = book.version()
@@ -859,7 +879,8 @@ fn canonical_groups(
             let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
                 .with_valuation(valuation)
                 .with_children(children)
-                .with_priced_as(priced_as);
+                .with_priced_as(priced_as)
+                .with_priced_cards(priced_cards);
             let group = match credits {
                 Some(credits) => group.with_credits(credits),
                 None => group,
@@ -1028,8 +1049,45 @@ fn known_vector(components: &BTreeMap<String, u64>) -> KnownTokenVector {
     )
 }
 
-fn value_events(events: &[&CanonicalSpendEvent], book: &RateBook) -> ValuationOutcome<Usd> {
+/// The estimation method a spend group carries when any member's timestamp
+/// is a heuristic: the group was valued at the default card because the
+/// hour the schedule would need is unknown (aub-pwtn).
+const SCHEDULE_UNRESOLVED_METHOD: &str = "schedule-unresolved";
+
+/// Degrades a group's quality for a heuristic member timestamp: estimated
+/// with the schedule-unresolved method joined into whatever estimators the
+/// group already carried. The variant is estimated even when the token
+/// counts themselves are measured, because the group's price basis is what
+/// this quality qualifies: a peak-hour event valued at the default card is
+/// an estimated valuation of measured usage.
+fn degrade_for_heuristic_timestamp(
+    quality: &EvidenceQuality<TokenCount>,
+) -> EvidenceQuality<TokenCount> {
+    let degraded = quality.combine(&EvidenceQuality::estimated(
+        [EstimatorId::new(SCHEDULE_UNRESOLVED_METHOD)],
+        None,
+    ));
+    match degraded {
+        EvidenceQuality::Measured => {
+            EvidenceQuality::estimated([EstimatorId::new(SCHEDULE_UNRESOLVED_METHOD)], None)
+        }
+        EvidenceQuality::Estimated {
+            methods,
+            uncertainty,
+        }
+        | EvidenceQuality::Mixed {
+            methods,
+            uncertainty,
+        } => EvidenceQuality::estimated(methods, uncertainty),
+    }
+}
+
+fn value_events(
+    events: &[&CanonicalSpendEvent],
+    book: &RateBook,
+) -> (ValuationOutcome<Usd>, BTreeSet<PricedCardRef>) {
     let mut outcome: Option<ValuationOutcome<Usd>> = None;
+    let mut cards = BTreeSet::new();
     for event in events {
         let usage = canonical_usage(&[event], false);
         // The rate book is keyed by the canonical model, not by the id the
@@ -1039,23 +1097,57 @@ fn value_events(events: &[&CanonicalSpendEvent], book: &RateBook) -> ValuationOu
         // instead of being priced against whatever card sorted first.
         let vendor = event.vendor.as_deref().unwrap_or("unknown");
         let model = event.priced_as.as_deref().unwrap_or("unknown");
-        let event_val = crate::valuation::value_usage_vector::<Usd>(
-            book,
-            vendor,
-            model,
-            event.occurred_at.utc_date(),
-            &usage,
-        );
+        // An event whose timestamp is a heuristic is valued at the default
+        // card: its hour is unknown, so a schedule must never select a peak
+        // for it (aub-pwtn).
+        let event_val = if event.timestamp_heuristic {
+            crate::valuation::value_usage_vector_default_card::<Usd>(
+                book,
+                vendor,
+                model,
+                event.occurred_at,
+                &usage,
+            )
+        } else {
+            crate::valuation::value_usage_vector::<Usd>(
+                book,
+                vendor,
+                model,
+                event.occurred_at,
+                &usage,
+            )
+        };
+        let event_cards = if event.timestamp_heuristic {
+            crate::valuation::used_rate_cards_default_card(
+                book,
+                vendor,
+                model,
+                event.occurred_at,
+                &usage,
+            )
+        } else {
+            crate::valuation::used_rate_cards(book, vendor, model, event.occurred_at, &usage)
+        };
+        cards.extend(event_cards.into_iter().map(|used| {
+            let schedule = used.schedule_label();
+            PricedCardRef {
+                vendor: used.vendor,
+                model: used.model,
+                token_class: used.token_class,
+                schedule,
+            }
+        }));
         outcome = match outcome {
             Some(prev) => Some(prev.combine(event_val)),
             None => Some(event_val),
         };
     }
-    outcome.unwrap_or_else(|| {
+    let outcome = outcome.unwrap_or_else(|| {
         ValuationOutcome::Complete(crate::valuation::ApiListPriceEquivalent::new(
             crate::domain::money::Money::<Usd>::from_micros(0),
         ))
-    })
+    });
+    (outcome, cards)
 }
 
 /// The credit derivation for one spend group, or `None` when the caller did not ask
@@ -1756,6 +1848,7 @@ mod tests {
         let base = CanonicalSpendEvent {
             canonical_id: "c1".to_string(),
             occurred_at: UtcTimestamp::parse_rfc3339("2026-08-25T10:00:00Z").unwrap(),
+            timestamp_heuristic: false,
             session: "claude-code:s1".to_string(),
             session_source: Some("claude-code".to_string()),
             session_native: Some("s1".to_string()),
@@ -2491,6 +2584,7 @@ mod tests {
                 billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse("2026-08-01").unwrap(),
                 effective_end: None,
+                schedule: None,
                 publication: crate::domain::rate_card::Publication {
                     source: None,
                     published_at: None,
@@ -2504,6 +2598,30 @@ mod tests {
     fn example_model_table() -> crate::config::ModelTable {
         crate::config::ModelTable::new(vec![
             crate::config::ModelRule::new("deepseek-v4-pro*", "ollama", "deepseek-v4-pro").unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// A weekday 12:00 to 18:00 UTC peak input card beside an `input_card`
+    /// default, the Ollama DeepSeek shape at test scale.
+    fn scheduled_input_card(
+        id: i64,
+        vendor: &str,
+        model: &str,
+        rate_micros: i64,
+    ) -> crate::domain::rate_card::RateCard {
+        let mut card = input_card(id, vendor, model, rate_micros);
+        card.draft.schedule =
+            crate::domain::rate_card::Schedule::new(&[1, 2, 3, 4, 5], 12 * 60, 18 * 60);
+        card
+    }
+
+    /// The `[[models]]` table mapping the pi harness's DeepSeek flash alias
+    /// to the Ollama card it prices under.
+    fn flash_model_table() -> crate::config::ModelTable {
+        crate::config::ModelTable::new(vec![
+            crate::config::ModelRule::new("deepseek-flash-*", "ollama", "deepseek-v4-flash")
+                .unwrap(),
         ])
         .unwrap()
     }
@@ -2686,6 +2804,211 @@ mod tests {
         crate::presentation::validate_spend_report_json(&json).unwrap();
     }
 
+    /// A weekday afternoon prices at the peak and a Saturday afternoon at
+    /// the default, through the whole canonical pipeline: the ledger, the
+    /// model table, the book and the day groups (aub-pwtn).
+    #[test]
+    fn peak_schedule_values_a_weekday_afternoon_at_the_peak() {
+        let (_root, conn) = canonical_conn("canonical-peak-schedule");
+        seed_session(&conn, "s1");
+        // Tuesday 2026-09-08 and Saturday 2026-09-12, both 14:00 UTC, one
+        // million input tokens each.
+        let tuesday =
+            UtcDate::parse("2026-09-08").unwrap().start().unix_nanos() + 14 * 3_600 * 1_000_000_000;
+        let saturday =
+            UtcDate::parse("2026-09-12").unwrap().start().unix_nanos() + 14 * 3_600 * 1_000_000_000;
+        seed_canonical_with_model(
+            &conn,
+            "e-tue",
+            tuesday,
+            "s1",
+            "reported",
+            &[("input", 1_000_000)],
+            Some("deepseek-flash-lite"),
+        );
+        seed_canonical_with_model(
+            &conn,
+            "e-sat",
+            saturday,
+            "s1",
+            "reported",
+            &[("input", 1_000_000)],
+            Some("deepseek-flash-lite"),
+        );
+        let book = RateBook::new(vec![
+            input_card(1, "ollama", "deepseek-v4-flash", 220_000),
+            scheduled_input_card(2, "ollama", "deepseek-v4-flash", 440_000),
+        ]);
+        let report = assemble_canonical(
+            &conn,
+            window("2026-09-08", 5),
+            now(),
+            vec![SpendGrouping::Day],
+            false,
+            None,
+            Some(&book),
+            CreditReporting::NotRequested,
+            &flash_model_table(),
+        )
+        .unwrap();
+
+        assert_eq!(valued_usd(&report, "2026-09-08").as_deref(), Some("0.44"));
+        assert_eq!(valued_usd(&report, "2026-09-12").as_deref(), Some("0.22"));
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        let tuesday_cards: Vec<String> = by_key["day=2026-09-08"]
+            .priced_cards
+            .iter()
+            .map(PricedCardRef::label)
+            .collect();
+        assert_eq!(
+            tuesday_cards,
+            vec!["ollama/deepseek-v4-flash/input (peak mon-fri 12:00-18:00 UTC)".to_string()]
+        );
+        let saturday_cards: Vec<String> = by_key["day=2026-09-12"]
+            .priced_cards
+            .iter()
+            .map(PricedCardRef::label)
+            .collect();
+        assert_eq!(
+            saturday_cards,
+            vec!["ollama/deepseek-v4-flash/input (default)".to_string()]
+        );
+    }
+
+    /// `--explain` names each card that valued a group with its schedule,
+    /// in the human text and in the group JSON (aub-pwtn).
+    #[test]
+    fn explain_names_the_card_and_schedule_per_group() {
+        let (_root, conn) = canonical_conn("canonical-rate-cards-explain");
+        seed_session(&conn, "s1");
+        let tuesday =
+            UtcDate::parse("2026-09-08").unwrap().start().unix_nanos() + 14 * 3_600 * 1_000_000_000;
+        seed_canonical_with_model(
+            &conn,
+            "e-tue",
+            tuesday,
+            "s1",
+            "reported",
+            &[("input", 1_000_000)],
+            Some("deepseek-flash-lite"),
+        );
+        let book = RateBook::new(vec![
+            input_card(1, "ollama", "deepseek-v4-flash", 220_000),
+            scheduled_input_card(2, "ollama", "deepseek-v4-flash", 440_000),
+        ]);
+        let report = assemble_canonical(
+            &conn,
+            window("2026-09-08", 1),
+            now(),
+            vec![SpendGrouping::Day],
+            false,
+            None,
+            Some(&book),
+            CreditReporting::NotRequested,
+            &flash_model_table(),
+        )
+        .unwrap();
+
+        let text = crate::presentation::render::render_spend_report_with_explain(
+            &report,
+            crate::presentation::render::ExplainMode::Full,
+        );
+        assert!(
+            text.contains(
+                "2026-09-08: rate cards ollama/deepseek-v4-flash/input (peak mon-fri 12:00-18:00 UTC)"
+            ),
+            "{text}"
+        );
+        let json = crate::presentation::spend_json(&report, crate::logging::RunId::new(now()));
+        assert!(
+            json.contains(
+                "\"rate_cards\":[{\"vendor\":\"ollama\",\"model\":\"deepseek-v4-flash\",\
+                 \"token_class\":\"input\",\"schedule\":\"peak mon-fri 12:00-18:00 UTC\"}]"
+            ),
+            "{json}"
+        );
+        crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    /// An event whose timestamp is a heuristic is valued at the default card
+    /// even at a peak hour, and its group carries estimated quality with the
+    /// schedule-unresolved method (aub-pwtn).
+    #[test]
+    fn a_heuristic_timestamp_values_at_the_default_card_and_degrades_quality() {
+        let at = UtcTimestamp::parse_rfc3339("2026-09-08T14:00:00Z").unwrap();
+        let event = CanonicalSpendEvent {
+            canonical_id: "c-heuristic".to_string(),
+            occurred_at: at,
+            timestamp_heuristic: true,
+            session: "fixture:s1".to_string(),
+            session_source: Some("fixture".to_string()),
+            session_native: Some("s1".to_string()),
+            project: "project-a".to_string(),
+            repository: "repository-a".to_string(),
+            evidence_kind: "reported".to_string(),
+            sources: BTreeSet::from(["fixture.jsonl".to_string()]),
+            components: BTreeMap::from([("input".to_string(), 1_000_000)]),
+            vendor: Some("ollama".to_string()),
+            model: Some("deepseek-flash-lite".to_string()),
+            priced_as: Some("deepseek-v4-flash".to_string()),
+        };
+        let book = RateBook::new(vec![
+            input_card(1, "ollama", "deepseek-v4-flash", 220_000),
+            scheduled_input_card(2, "ollama", "deepseek-v4-flash", 440_000),
+        ]);
+        let events = vec![event];
+        let mut provenance = Vec::new();
+        let mut credit_provenance = Vec::new();
+        let mut window_provenance = Vec::new();
+        let groups = canonical_groups(
+            &events,
+            &[SpendGrouping::Day],
+            0,
+            &mut Vec::new(),
+            &window("2026-09-08", 1),
+            false,
+            &BTreeMap::new(),
+            &mut provenance,
+            Some(&book),
+            &mut credit_provenance,
+            CreditReporting::NotRequested,
+            &BTreeMap::new(),
+            None,
+            &mut window_provenance,
+        )
+        .unwrap();
+
+        assert_eq!(groups.len(), 1);
+        match groups[0].valuation.as_ref().expect("a valued group") {
+            ValuationOutcome::Complete(equiv) => assert_eq!(equiv.micros(), 220_000),
+            ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+                panic!("the default card prices a peak-hour heuristic event");
+            }
+        }
+        match groups[0].usage.quality() {
+            EvidenceQuality::Estimated { methods, .. } => assert!(
+                methods.contains(&EstimatorId::new(SCHEDULE_UNRESOLVED_METHOD)),
+                "heuristic hour degrades the group to schedule-unresolved: {methods:?}"
+            ),
+            EvidenceQuality::Measured | EvidenceQuality::Mixed { .. } => {
+                panic!(
+                    "a heuristic timestamp must degrade quality to estimated: {:?}",
+                    groups[0].usage.quality()
+                );
+            }
+        }
+        let cards: Vec<String> = groups[0]
+            .priced_cards
+            .iter()
+            .map(PricedCardRef::label)
+            .collect();
+        assert_eq!(
+            cards,
+            vec!["ollama/deepseek-v4-flash/input (default)".to_string()]
+        );
+    }
+
     #[test]
     fn rate_card_version_populates_in_assemble_canonical() {
         let (_root, conn) = canonical_conn("canonical-valuation-ver");
@@ -2705,6 +3028,7 @@ mod tests {
                 billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse("2026-08-01").unwrap(),
                 effective_end: None,
+                schedule: None,
                 publication: crate::domain::rate_card::Publication {
                     source: None,
                     published_at: None,

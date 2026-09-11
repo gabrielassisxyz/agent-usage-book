@@ -153,6 +153,7 @@ fn a_missing_publication_reference_is_recorded_as_missing() {
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-06-24").unwrap(),
         effective_end: None,
+        schedule: None,
         publication: agent_usage_book::domain::rate_card::Publication {
             source: None,
             published_at: None,
@@ -196,6 +197,7 @@ fn the_effective_book_is_the_one_true_today() {
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-08-31").unwrap(),
         effective_end: None,
+        schedule: None,
         publication: agent_usage_book::domain::rate_card::Publication {
             source: Some("claude-api reference".into()),
             published_at: Some(UtcDate::parse("2026-06-24").unwrap().start()),
@@ -271,6 +273,7 @@ fn two_fully_open_cards_do_not_duplicate_on_reimport() {
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-06-24").unwrap(),
         effective_end: None,
+        schedule: None,
         publication: agent_usage_book::domain::rate_card::Publication {
             source: None,
             published_at: None,
@@ -312,6 +315,7 @@ fn direct_update_and_delete_are_refused_by_the_table() {
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-06-24").unwrap(),
         effective_end: None,
+        schedule: None,
         publication: agent_usage_book::domain::rate_card::Publication {
             source: None,
             published_at: None,

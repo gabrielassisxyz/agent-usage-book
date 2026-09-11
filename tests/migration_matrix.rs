@@ -590,7 +590,22 @@ fn populate_rate_card(conn: &rusqlite::Connection) -> Result<(), String> {
         "INSERT INTO rate_card (id, vendor, model, token_class, rate_micros, currency, billing_basis, effective_start, effective_end, imported_at, published_at, source, review_due) VALUES
             (1, 'anthropic', 'model-x', 'input', 0, 'usd', 'per_million_tokens', '2026-01-01', NULL, 5, NULL, NULL, NULL),
             (2, 'anthropic', 'model-x', 'output', 15, 'usd', 'per_million_tokens', '2026-01-01', '2026-12-31', 5, 4, 'matrix-source', '2026-06-01')",
-    )
+    )?;
+    // The schedule columns from migration 0037: a peak row beside its
+    // default exercises the new columns and the widened content index on
+    // every matrix row that migrates past them. Older schema versions have
+    // no such columns, so the extra row is conditional on their presence.
+    // An INSERT, never an UPDATE: the table's immutability trigger refuses
+    // every UPDATE, including a fixture's.
+    if column_exists(conn, "rate_card", "schedule_days") {
+        exec(
+            conn,
+            "rate_card",
+            "INSERT INTO rate_card (id, vendor, model, token_class, rate_micros, currency, billing_basis, effective_start, effective_end, imported_at, published_at, source, review_due, schedule_days, schedule_hours) VALUES
+                (3, 'ollama', 'deepseek-v4-flash', 'input', 440000, 'USD', 'per_million_tokens', '2026-09-07', NULL, 6, 6, 'matrix-source', NULL, 'mon,tue,wed,thu,fri', '12:00-18:00')",
+        )?;
+    }
+    Ok(())
 }
 
 fn populate_meter_response_evidence(conn: &rusqlite::Connection) -> Result<(), String> {

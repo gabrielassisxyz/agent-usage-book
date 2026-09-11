@@ -1,0 +1,726 @@
+#!/usr/bin/env bash
+# Guard mutation runner (aub-71j.7): replays every row of docs/guard-inventory.md.
+#
+# Each row names a guard, the test that asserts it, and the exact mutation that
+# must make that test fail. The runner applies the mutation in a scratch copy
+# of the tree, never in the working tree, and classifies the outcome:
+#
+#   GUARD-OK   the mutated run fails with the expected signature, and the
+#              sibling check keeps its result (exactly the expected test fails)
+#   DEAD       the mutated run stays green (the guard no longer discriminates)
+#   MISMATCH   the mutated run fails, but with another signature, or the
+#              sibling check changed result (guard and test are not the pair
+#              the inventory claims)
+#   ERROR      the harness itself broke (unknown guard, missing file, command
+#              not found, build failure with no test result, timeout)
+#
+# Usage:
+#   bin/guard-mutations [--scope shell|cargo|e2e|all] [--only GUARD]
+#                       [--budget-seconds N] [--inventory PATH]
+#   bin/guard-mutations --check-consistency [--inventory PATH]
+#   bin/guard-mutations --self-test
+#   bin/guard-mutations --list [--inventory PATH]
+#
+# Modes:
+#   run (default)   replay rows; on a full-scope pass, stamp the last-run line
+#                   in the live inventory document
+#   --check-consistency
+#                   structural checks over every row, plus the bead scan when a
+#                   tracker is present: every bead whose acceptance text matches
+#                   a can-fail marker must own a row or an exclusion entry.
+#                   Without a tracker the bead scan is SKIPPED out loud, never
+#                   silently passed.
+#   --self-test     runner mechanics against a synthetic repo (dirty refusal,
+#                   dead, wrong-signature, sibling-break, budget, stale scratch,
+#                   consistency); seconds, no toolchain needed
+#
+# Safety:
+#   - mutations land only in the scratch copy; the runner refuses to start
+#     when the working tree is dirty in any path the in-scope rows would
+#     mutate (git status --porcelain over exactly those paths)
+#   - the scratch copy lives outside the checkout at a stable path, so a run
+#     interrupted mid-mutation leaves a directory the next run finds, reports
+#     and removes before doing anything else
+#   - e2e rows drive tests/e2e/run.sh with isolated state, cases and runs
+#     directories under the scratch copy, and never touch the operator state
+#     directory (the runner's own refusal row re-proves that refusal)
+#   - cargo rows build in a dedicated target directory, never the worktree's:
+#     two checkouts sharing one target directory produce fingerprints cargo
+#     cannot tell apart, and a gate then passes on units another tree built
+#     without compiling the mutation (the same reason bin/ci isolates builds
+#     per worktree). The directory persists between runs the way a CI cache
+#     does; the wall-clock budget in docs/guard-inventory.md covers warm runs.
+set -uo pipefail
+
+GUARD_BUDGET_DEFAULT=3600
+
+SCOPE="all"
+ONLY=""
+BUDGET="$GUARD_BUDGET_DEFAULT"
+INVENTORY=""
+MODE="run"
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --scope) SCOPE="${2:-}"; shift 2 ;;
+        --only) ONLY="${2:-}"; shift 2 ;;
+        --budget-seconds) BUDGET="${2:-}"; shift 2 ;;
+        --inventory) INVENTORY="${2:-}"; shift 2 ;;
+        --check-consistency) MODE="consistency"; shift ;;
+        --self-test) MODE="selftest"; shift ;;
+        --list) MODE="list"; shift ;;
+        -h|--help)
+            sed -n '1,45p' "$0"
+            exit 0
+            ;;
+        *)
+            echo "guard-mutations: unknown argument: $1" >&2
+            exit 2
+            ;;
+    esac
+done
+
+case "$SCOPE" in
+    shell|cargo|e2e|all) ;;
+    *) echo "guard-mutations: --scope must be shell, cargo, e2e or all" >&2; exit 2 ;;
+esac
+
+LIVE="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$LIVE" ]; then
+    echo "guard-mutations: not inside a git checkout" >&2
+    exit 2
+fi
+cd "$LIVE"
+
+SCRIPT="$(readlink -f "$0")"
+
+if [ -z "$INVENTORY" ]; then
+    INVENTORY="$LIVE/docs/guard-inventory.md"
+fi
+if [ ! -f "$INVENTORY" ]; then
+    echo "guard-mutations: inventory not found: $INVENTORY" >&2
+    exit 2
+fi
+
+SCRATCH_BASE="${TMPDIR:-/tmp}/aub-guard-mutations-$(basename "$LIVE" | tr -c 'A-Za-z0-9' '-')"
+if [ -n "${SCRATCH_BASE_OVERRIDE:-}" ]; then
+    SCRATCH_BASE="$SCRATCH_BASE_OVERRIDE"
+fi
+SCRATCH="$SCRATCH_BASE/tree"
+MUT_TARGET="$SCRATCH_BASE/target"
+
+# --- inventory parsing -------------------------------------------------------
+# Rows live in the ```tsv fenced block: 12 tab-separated columns. Only lines
+# starting with a row prefix are rows; everything else is prose.
+
+read_inventory_rows() {
+    awk -F'\t' '
+        /^```tsv/ { in_block = 1; next }
+        in_block && /^```/ { in_block = 0; next }
+        in_block && /^(sh|c|e|syn)-[0-9a-z-]+\t/ { print }
+    ' "$INVENTORY"
+}
+
+row_field() {
+    local line="$1" n="$2"
+    printf '%s' "$line" | awk -F'\t' -v n="$n" '{ print $n }'
+}
+
+expand_pct_b() {
+    printf '%b' "$1"
+}
+
+# --- mutation application (cwd must be the scratch copy) ---------------------
+
+apply_mutation() {
+    local kind="$1" target="$2" arg="$3" arg2="$4"
+    case "$kind" in
+        neuter)
+            sed -i '2i exit 0' "$target"
+            ;;
+        sed)
+            sed -i -e "$arg" "$target"
+            ;;
+        append)
+            expand_pct_b "$arg" >> "$target"
+            printf '\n' >> "$target"
+            ;;
+        plant|write)
+            mkdir -p "$(dirname "$target")"
+            expand_pct_b "$arg" > "$target"
+            printf '\n' >> "$target"
+            ;;
+        delete)
+            rm -f "$target"
+            ;;
+        replace)
+            OLD_STR="$arg" NEW_STR="$arg2" FILE_STR="$target" python3 - <<'PYEOF'
+import os
+path = os.environ["FILE_STR"]
+old = os.environ["OLD_STR"]
+new = os.environ["NEW_STR"]
+text = open(path, encoding="utf-8").read()
+if old not in text:
+    print("replace: old string not found in %s" % path)
+    raise SystemExit(3)
+open(path, "w", encoding="utf-8").write(text.replace(old, new, 1))
+PYEOF
+            ;;
+        python)
+            local script="$SCRATCH_BASE/mut-script.py"
+            expand_pct_b "$arg" > "$script"
+            python3 "$script"
+            ;;
+        none|oc56)
+            ;;
+        *)
+            echo "unknown mutation kind: $kind" >&2
+            return 3
+            ;;
+    esac
+}
+
+# --- snippet execution -------------------------------------------------------
+
+run_snippet() {
+    local snippet="$1" timeout_secs="$2" out_file="$3"
+    case "$snippet" in
+        oc56-shape|oc56-shape-ok)
+            oc56_shape_snippet "$snippet" >"$out_file" 2>&1
+            return $?
+            ;;
+        run-e2e|run-e2e-sibling)
+            e2e_snippet "$snippet" >"$out_file" 2>&1
+            return $?
+            ;;
+        *)
+            timeout -s TERM "$timeout_secs" bash -c "$snippet" >"$out_file" 2>&1
+            return $?
+            ;;
+    esac
+}
+
+# oc56-shape: the artifact-shape function is byte-identical guard logic taken
+# from the check itself, isolated from the benchmark spawns the full check
+# pays for. The mutated object is the artifact file in the scratch copy.
+oc56_shape_snippet() {
+    local which="$1"
+    local dir="$SCRATCH/oc56"
+    mkdir -p "$dir"
+    sed -n '/^artifact_shape_ok()/,/^}/p' "$SCRATCH/bin/checks/85-status-latency-budget" >"$dir/shape.sh"
+    local budget="15000000"
+    [ "$which" = "oc56-shape" ] && budget="$OC56_BUDGET"
+    cat >"$dir/artifact.json" <<EOF
+{"schema":"aub.status_benchmark.v1","status_p99_budget_ns":$budget,"cases":[{"case":"uncontended"},{"case":"large_populated"},{"case":"active_writer"},{"case":"active_migration"}]}
+EOF
+    # shellcheck disable=SC1091
+    if ( source "$dir/shape.sh"; artifact_shape_ok "$dir/artifact.json" ); then
+        [ "$which" = "oc56-shape-ok" ] && echo "status-latency-budget: artifact shape ok"
+        return 0
+    fi
+    return 1
+}
+
+# run-e2e / run-e2e-sibling: copy the named cases into a scratch cases
+# directory (applying the row mutation to the target copy only), run the
+# scratch runner over exactly those cases, and report verdicts.
+e2e_snippet() {
+    local which="$1"
+    local cases_dir="$SCRATCH/e2e-cases-$E2E_GUARD"
+    if [ "$which" = "run-e2e" ] && [ ! -d "$cases_dir" ]; then
+        mkdir -p "$cases_dir"
+        cp -a "$LIVE/$E2E_TARGET" "$cases_dir/" 2>/dev/null || cp -a "$SCRATCH/$E2E_TARGET" "$cases_dir/"
+        cp -a "$LIVE/tests/e2e/cases/$E2E_SIBLING" "$cases_dir/"
+        if [ "$E2E_MUT" != "none" ]; then
+            ( cd "$cases_dir" && apply_mutation "$E2E_MUT" "$(basename "$E2E_TARGET")" "$E2E_ARG" "$E2E_ARG2" ) || return 3
+        fi
+    fi
+    if [ ! -x "$AUB_BIN" ]; then
+        echo "run-e2e: no release binary (set AUB_BIN or build it: cargo build --release)" >&2
+        return 3
+    fi
+    local state_dir="$SCRATCH/e2e-state-$E2E_GUARD" runs_dir="$SCRATCH/e2e-runs-$E2E_GUARD"
+    mkdir -p "$state_dir" "$runs_dir"
+    AUB_BIN="$AUB_BIN" "$SCRATCH/tests/e2e/run.sh" \
+        --state-dir "$state_dir" --cases-dir "$cases_dir" --runs-dir "$runs_dir"
+}
+
+e2e_verdict() {
+    local runs_dir="$1" case_id="$2"
+    local newest
+    newest="$(find "$runs_dir" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -1 | cut -d' ' -f2-)"
+    [ -n "$newest" ] && [ -f "$newest/summary.json" ] || return 3
+    jq -r --arg id "$case_id" '.cases[] | select(.id == $id) | .verdict' "$newest/summary.json" 2>/dev/null | head -1
+}
+
+case_id_of() {
+    grep -E '^CASE_ID=' "$1" | head -1 | cut -d'"' -f2
+}
+
+# --- scratch construction ----------------------------------------------------
+
+build_scratch() {
+    if [ -d "$SCRATCH_BASE" ]; then
+        echo "guard-mutations: removed scratch left by a previous run: $SCRATCH_BASE"
+        rm -rf "$SCRATCH_BASE"
+    fi
+    mkdir -p "$SCRATCH" "$MUT_TARGET"
+    ( cd "$LIVE" && tar --exclude=.git -cf - . ) | ( cd "$SCRATCH" && tar -xf - )
+    git -C "$SCRATCH" init -q -b main 2>/dev/null || git -C "$SCRATCH" init -q
+    git -C "$SCRATCH" add -A
+    git -C "$SCRATCH" -c user.email=guard-mutations@example.invalid -c user.name=guard-mutations commit -qm "pristine scratch snapshot"
+}
+
+snapshot_target() {
+    # Unused: rows restore via reset_tree below, which also reverts anything a
+    # sibling snippet touched. Kept as documentation of the rejected design:
+    # reverting only the named target lets sibling side-effects leak into the
+    # next row, which a later row then blames on its own mutation.
+    return 0
+}
+
+# reset_tree: restore the scratch copy to its pristine commit. A row's command
+# and sibling snippets may write anywhere in the scratch copy, so reverting
+# only the named mutation target is not enough: an unreverted sibling plant
+# from row N fires a guard in row N+1, which then reports a mismatch for its
+# own mutation. git checkout/clean here touch only this private scratch
+# repository, never the live checkout.
+reset_tree() {
+    git -C "$SCRATCH" checkout -q -- . 2>/dev/null
+    git -C "$SCRATCH" clean -fdq 2>/dev/null
+    true
+}
+
+refuse_if_dirty() {
+    local targets_file="$1"
+    if [ ! -s "$targets_file" ]; then
+        return 0
+    fi
+    local dirty
+    dirty="$(git -C "$LIVE" status --porcelain -- $(cat "$targets_file") 2>/dev/null || true)"
+    if [ -n "$dirty" ]; then
+        echo "guard-mutations: refusing to run: working tree is dirty in paths this run would mutate:" >&2
+        printf '%s\n' "$dirty" >&2
+        return 1
+    fi
+    return 0
+}
+
+# --- single row --------------------------------------------------------------
+
+run_row() {
+    local line="$1" budget_left="$2"
+    local guard beads scope command mut target mut_arg mut_arg2 expect_re sibling sib_expect sib_re
+    guard="$(row_field "$line" 1)"
+    beads="$(row_field "$line" 2)"
+    scope="$(row_field "$line" 3)"
+    command="$(row_field "$line" 4)"
+    mut="$(row_field "$line" 5)"
+    target="$(row_field "$line" 6)"
+    mut_arg="$(expand_pct_b "$(row_field "$line" 7)")"
+    mut_arg2="$(expand_pct_b "$(row_field "$line" 8)")"
+    expect_re="$(row_field "$line" 9)"
+    sibling="$(row_field "$line" 10)"
+    sib_expect="$(row_field "$line" 11)"
+    sib_re="$(row_field "$line" 12)"
+
+    local out="$SCRATCH_BASE/out-$guard.txt" sib_out="$SCRATCH_BASE/sib-$guard.txt"
+
+    if [ -n "$target" ]; then
+        if [ "$mut" = "plant" ] && [ -e "$LIVE/$target" ]; then
+            echo "ERROR $guard: plant target already exists in live tree: $target"
+            return 0
+        fi
+        if [ "$mut" != "plant" ] && [ ! -e "$SCRATCH/$target" ]; then
+            echo "ERROR $guard: mutation target missing from scratch: $target"
+            return 0
+        fi
+        if ! ( cd "$SCRATCH" && apply_mutation "$mut" "$target" "$mut_arg" "$mut_arg2" ); then
+            echo "ERROR $guard: mutation failed to apply"
+            reset_tree
+            return 0
+        fi
+    fi
+
+    local rc
+    if [ "$scope" = "e2e" ]; then
+        export E2E_GUARD="$guard" E2E_TARGET="$target" E2E_SIBLING="$sib_re"
+        export E2E_MUT="$mut" E2E_ARG="$mut_arg" E2E_ARG2="$mut_arg2"
+        export AUB_BIN="${AUB_BIN:-$LIVE/target/release/aub}"
+        export SCRATCH LIVE MUT_TARGET
+        ( cd "$SCRATCH" && run_snippet "$command" "$budget_left" "$out" )
+        rc=$?
+        if [ "$rc" -eq 3 ]; then
+            echo "ERROR $guard: e2e harness failure (see $out)"
+            reset_tree
+            return 0
+        fi
+        local target_id sibling_id target_verdict sibling_verdict
+        target_id="$(case_id_of "$SCRATCH/e2e-cases-$guard/$(basename "$target")")"
+        sibling_id="$(case_id_of "$SCRATCH/e2e-cases-$guard/$sib_re")"
+        target_verdict="$(e2e_verdict "$SCRATCH/e2e-runs-$guard" "$target_id")"
+        sibling_verdict="$(e2e_verdict "$SCRATCH/e2e-runs-$guard" "$sibling_id")"
+        if [ "$target_verdict" = "fail" ] && [ "$sibling_verdict" = "pass" ]; then
+            if printf '%s' "$(cat "$out")" | grep -Eq -- "$expect_re"; then
+                echo "GUARD-OK $guard ($beads): $target_id failed as expected, $sibling_id passed"
+            else
+                echo "MISMATCH $guard ($beads): verdicts right but expected signature missing: $expect_re"
+            fi
+        elif [ "$target_verdict" != "fail" ]; then
+            echo "DEAD $guard ($beads): mutated case $target_id did not fail (verdict: ${target_verdict:-unknown})"
+        else
+            echo "MISMATCH $guard ($beads): mutated case failed but sibling $sibling_id verdict: ${sibling_verdict:-unknown}"
+        fi
+        reset_tree
+        return 0
+    fi
+
+    if [ "$scope" = "cargo" ]; then
+        export CARGO_TARGET_DIR="$MUT_TARGET"
+    fi
+    if [ "$mut" = "oc56" ]; then
+        export OC56_BUDGET="$mut_arg"
+    fi
+    export SCRATCH LIVE MUT_TARGET
+
+    ( cd "$SCRATCH" && run_snippet "$command" "$budget_left" "$out" )
+    rc=$?
+    if [ "$rc" -eq 3 ] || [ "$rc" -eq 124 ]; then
+        echo "ERROR $guard ($beads): command harness failure (exit $rc; see $out)"
+        reset_tree
+        return 0
+    fi
+    if [ "$scope" = "cargo" ] && ! grep -qE 'test result:|^test .* \.\.\. (ok|FAILED)' "$out"; then
+        echo "ERROR $guard ($beads): cargo produced no test result (build failure? see $out)"
+        reset_tree
+        return 0
+    fi
+    if [ "$rc" -eq 0 ]; then
+        echo "DEAD $guard ($beads): mutation left the suite green"
+        reset_tree
+        return 0
+    fi
+    if ! grep -Eq -- "$expect_re" "$out"; then
+        echo "MISMATCH $guard ($beads): failed without the expected signature ($expect_re; see $out)"
+        reset_tree
+        return 0
+    fi
+
+    local sib_rc=0
+    ( cd "$SCRATCH" && run_snippet "$sibling" "$budget_left" "$sib_out" ) || sib_rc=$?
+    local sib_ok=0
+    if [ "$sib_expect" = "0" ] && [ "$sib_rc" -ne 0 ]; then
+        sib_ok=1
+    elif [ "$sib_expect" = "nonzero" ] && [ "$sib_rc" -eq 0 ]; then
+        sib_ok=1
+    elif [ -n "$sib_re" ] && ! grep -Eq -- "$sib_re" "$sib_out"; then
+        sib_ok=1
+    fi
+    if [ "$sib_ok" -ne 0 ]; then
+        echo "MISMATCH $guard ($beads): sibling check changed result (exit $sib_rc; see $sib_out)"
+    else
+        echo "GUARD-OK $guard ($beads)"
+    fi
+    reset_tree
+    return 0
+}
+
+# --- run mode ----------------------------------------------------------------
+
+mode_run() {
+    local rows selected targets_file
+    rows="$(read_inventory_rows)"
+    if [ -n "$ONLY" ]; then
+        selected="$(printf '%s\n' "$rows" | awk -F'\t' -v g="$ONLY" '$1 == g')"
+        if [ -z "$selected" ]; then
+            echo "guard-mutations: unknown guard: $ONLY (see --list)" >&2
+            exit 2
+        fi
+    else
+        case "$SCOPE" in
+            all) selected="$rows" ;;
+            *) selected="$(printf '%s\n' "$rows" | awk -F'\t' -v s="$SCOPE" '$3 == s')" ;;
+        esac
+    fi
+    if [ -z "$selected" ]; then
+        echo "guard-mutations: no rows in scope $SCOPE" >&2
+        exit 2
+    fi
+
+    targets_file="$(mktemp "$SCRATCH_BASE-targets-XXXXXX" 2>/dev/null || mktemp "${TMPDIR:-/tmp}/guard-targets-XXXXXX")"
+    printf '%s\n' "$selected" | awk -F'\t' '$6 != "" { print $6 }' | sort -u >"$targets_file"
+    if ! refuse_if_dirty "$targets_file"; then
+        rm -f "$targets_file"
+        exit 1
+    fi
+    rm -f "$targets_file"
+
+    build_scratch
+
+    local total=0 ok=0 dead=0 mismatch=0 errors=0 skipped=0
+    local starthne="$SECONDS" line result
+    total="$(printf '%s\n' "$selected" | grep -c . || true)"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        local left=$(( BUDGET - (SECONDS - starthne) ))
+        if [ "$left" -le 0 ]; then
+            echo "SKIPPED $(row_field "$line" 1): wall-clock budget exceeded (${BUDGET}s); failing rather than truncating"
+            skipped=$((skipped + 1))
+            continue
+        fi
+        result="$(run_row "$line" "$left")"
+        printf '%s\n' "$result"
+        case "$result" in
+            GUARD-OK*) ok=$((ok + 1)) ;;
+            DEAD*) dead=$((dead + 1)) ;;
+            MISMATCH*) mismatch=$((mismatch + 1)) ;;
+            ERROR*) errors=$((errors + 1)) ;;
+            SKIPPED*) skipped=$((skipped + 1)) ;;
+        esac
+    done <<<"$selected"
+
+    echo "guard-mutations: $ok ok, $dead dead, $mismatch mismatched, $errors errors, $skipped skipped, of $total rows"
+    if [ "$dead" -eq 0 ] && [ "$mismatch" -eq 0 ] && [ "$errors" -eq 0 ] && [ "$skipped" -eq 0 ]; then
+        if [ -z "$ONLY" ] && [ "$SCOPE" = "all" ]; then
+            stamp_last_run "$total"
+        fi
+        return 0
+    fi
+    return 1
+}
+
+stamp_last_run() {
+    local total="$1"
+    local today
+    today="$(date -u +%F)"
+    sed -i "s/^Last successful full run:.*/Last successful full run: $today (bin\/guard-mutations, scope all, $total rows)/" "$INVENTORY"
+    echo "guard-mutations: stamped last successful full run $today in $INVENTORY (commit it with the run)"
+}
+
+# --- consistency mode --------------------------------------------------------
+
+MARKER_RE='proved to fail|proven to fail|verified to fail|demonstrated to fail|made to fail|forced to fail|shown to fail|shown by mutation|deliberately wrong|deliberate omission|broken deliberately|broken once|broken deliberately once|violated on purpose|on purpose once|plant|neutralis|swapping them once|verified by swapping|does not compile|fails to compile|breaks compilation|must fail|must break|must go red|fails naming|goes red|observed to fail|observed to succeed|observing the failure|verified once|fails when|fails if|fails the test|makes the scan fail|makes it fail|exit 0.{0,20}top'
+
+mode_consistency() {
+    local fail=0
+    local rows
+    rows="$(read_inventory_rows)"
+    if [ -z "$rows" ]; then
+        echo "consistency: no rows parsed from $INVENTORY" >&2
+        return 1
+    fi
+
+    # structural: 12 columns, known scope/kind, unique ids, targets exist
+    local seen
+    seen="$(mktemp "${TMPDIR:-/tmp}/guard-seen-XXXXXX")"
+    while IFS= read -r line; do
+        [ -n "$line" ] || continue
+        local nf guard scope mut target sib_expect
+        nf="$(printf '%s' "$line" | awk -F'\t' '{ print NF }')"
+        guard="$(row_field "$line" 1)"
+        scope="$(row_field "$line" 3)"
+        mut="$(row_field "$line" 5)"
+        target="$(row_field "$line" 6)"
+        sib_expect="$(row_field "$line" 11)"
+        if [ "$nf" -ne 12 ]; then
+            echo "consistency: $guard: want 12 columns, got $nf" >&2
+            fail=1
+        fi
+        case "$scope" in shell|cargo|e2e) ;; *) echo "consistency: $guard: bad scope $scope" >&2; fail=1 ;; esac
+        case "$mut" in neuter|sed|append|plant|write|delete|replace|python|none|oc56) ;; *) echo "consistency: $guard: bad mutation kind $mut" >&2; fail=1 ;; esac
+        case "$sib_expect" in 0|nonzero) ;; *) echo "consistency: $guard: bad sibling expectation $sib_expect" >&2; fail=1 ;; esac
+        # A python row's script is expanded with printf %b like every other
+        # mutation argument, so a \n written inside one of its own string
+        # literals becomes a real newline and truncates the literal. The row
+        # then dies at run time as an unreadable ERROR instead of a verdict,
+        # leaving its guard silently unverified.
+        if [ "$mut" = "python" ]; then
+            local mut_arg
+            mut_arg="$(row_field "$line" 7)"
+            if ! expand_pct_b "$mut_arg" | python3 -c 'import sys; compile(sys.stdin.read(), "<row>", "exec")' 2>/dev/null; then
+                echo "consistency: $guard: python mutation does not compile once escapes are expanded" >&2
+                fail=1
+            fi
+        fi
+        if grep -qxF "$guard" "$seen" 2>/dev/null; then
+            echo "consistency: duplicate guard id $guard" >&2
+            fail=1
+        fi
+        printf '%s\n' "$guard" >>"$seen"
+        if [ -n "$target" ]; then
+            if [ "$mut" = "plant" ]; then
+                if [ -e "$LIVE/$target" ]; then
+                    echo "consistency: $guard: plant target already exists: $target" >&2
+                    fail=1
+                fi
+            elif [ ! -e "$LIVE/$target" ]; then
+                echo "consistency: $guard: mutation target missing: $target" >&2
+                fail=1
+            fi
+        fi
+    done <<<"$rows"
+    rm -f "$seen"
+
+    # last-run line is present and well-formed
+    if ! grep -qE '^Last successful full run: (none yet|.*[0-9]{4}-[0-9]{2}-[0-9]{2})' "$INVENTORY"; then
+        echo "consistency: last-run line missing or malformed" >&2
+        fail=1
+    fi
+
+    # bead scan: every bead matching a can-fail marker needs a row or an
+    # exclusion entry. Needs the tracker; without one this half is skipped
+    # out loud.
+    if [ ! -d "$LIVE/.beads" ] || ! command -v br >/dev/null 2>&1 || ! br list >/dev/null 2>&1; then
+        echo "consistency: bead scan SKIPPED (no tracker at .beads or no br); structural checks ${fail:+FAILED} ${fail:-passed}"
+        [ "$fail" -eq 0 ]
+        return $?
+    fi
+
+    local row_beads exclusions
+    row_beads="$(printf '%s\n' "$rows" | awk -F'\t' '{ print $2 }' | tr ',' '\n' | sort -u)"
+    exclusions="$(awk '/^## Exclusion log/,0' "$INVENTORY" | grep -oE 'aub-[a-z0-9.]+' | sort -u)"
+
+    local bead_ids bead text
+    bead_ids="$(br list --status all 2>/dev/null | grep -oE 'aub-[a-z0-9.]+' | sort -u)"
+    for bead in $bead_ids; do
+        text="$(br show "$bead" 2>/dev/null | awk '/## Acceptance criteria/,/## Tests/' | grep -iE "$MARKER_RE" || true)"
+        if [ -z "$text" ]; then
+            continue
+        fi
+        if printf '%s\n' "$row_beads" | grep -qxF "$bead"; then
+            continue
+        fi
+        if printf '%s\n' "$exclusions" | grep -qxF "$bead"; then
+            continue
+        fi
+        echo "consistency: bead $bead has a can-fail criterion but no inventory row (add a row or an exclusion entry)" >&2
+        fail=1
+    done
+
+    if [ "$fail" -eq 0 ]; then
+        echo "consistency: inventory rows, bead scan and last-run line agree."
+    fi
+    return "$fail"
+}
+
+# --- self-test mode ----------------------------------------------------------
+# Runner mechanics against a synthetic repo: no toolchain, no network, seconds.
+
+mode_selftest() {
+    local t fail=0
+    t="$(mktemp -d "${TMPDIR:-/tmp}/guard-selftest-XXXXXX")"
+    # shellcheck disable=SC2064
+    trap "rm -rf '$t'" EXIT
+
+    local repo="$t/repo" inv="$t/inv.md"
+    mkdir -p "$repo"
+    (
+        cd "$repo" && git init -q -b main . 2>/dev/null || git init -q .
+        cat >data.txt <<'EOF'
+clean
+EOF
+        cat >data2.txt <<'EOF'
+clean
+EOF
+        cat >guard.sh <<'EOF'
+#!/bin/sh
+grep -q MARK data.txt && exit 1 || exit 0
+EOF
+        cat >guard2.sh <<'EOF'
+#!/bin/sh
+grep -q MARK2 data2.txt && exit 1 || exit 0
+EOF
+        cat >test.sh <<'EOF'
+#!/bin/sh
+if ./guard.sh >/dev/null 2>&1; then echo "guard silent"; exit 0; else echo "guard fired"; exit 1; fi
+EOF
+        cat >test2.sh <<'EOF'
+#!/bin/sh
+if ./guard2.sh >/dev/null 2>&1; then echo "guard2 silent"; exit 0; else echo "guard2 fired"; exit 1; fi
+EOF
+        chmod +x guard.sh guard2.sh test.sh test2.sh
+        git add -A
+        git -c user.email=t@example.invalid -c user.name=t commit -qm init
+    )
+
+    cat >"$inv" <<'EOF'
+# self-test inventory
+
+Last successful full run: none yet (self-test fixture).
+
+```tsv
+guard	beads	scope	command	mut	target	mut_arg	mut_arg2	expect_re	sibling	sib_expect	sib_re
+syn-ok	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	./test2.sh	0	guard2 silent
+syn-dead	aub-selftest	shell	./test.sh	append	data.txt	# nothing observable		guard fired	./test2.sh	0	guard2 silent
+syn-wrongsig	aub-selftest	shell	./test.sh	append	data.txt	MARK		no-such-signature	./test2.sh	0	guard2 silent
+syn-badsib	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	printf 'MARK2\n' >> data2.txt; ./test2.sh	0	guard2 silent
+syn-dup	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	./test2.sh	0	guard2 silent
+syn-dup	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	./test2.sh	0	guard2 silent
+```
+EOF
+
+    selftest_run() {
+        local tag="$1" inv_file="$2" only_guard="${3:-}" budget="${4:-60}"
+        if [ -n "$only_guard" ]; then
+            ( cd "$repo" && SCRATCH_BASE_OVERRIDE="$t/scratch-$tag" \
+                bash "$SCRIPT" --inventory "$inv_file" --only "$only_guard" --budget-seconds "$budget" 2>&1 )
+        else
+            ( cd "$repo" && SCRATCH_BASE_OVERRIDE="$t/scratch-$tag" \
+                bash "$SCRIPT" --inventory "$inv_file" --budget-seconds "$budget" 2>&1 )
+        fi
+    }
+
+    local good_inv="$t/good.md"
+    grep -v '^syn-dup' "$inv" >"$good_inv"
+
+    local out rc
+    # 1. ok row passes, dead/wrongsig/badsib are reported distinctly
+    out="$(selftest_run ok "$good_inv" "syn-ok")"; rc=$?
+    case "$out" in *GUARD-OK*) : ;; *) echo "self-test: syn-ok was not ok: $out" >&2; fail=1 ;; esac
+    out="$(selftest_run dead "$good_inv" "syn-dead")"
+    case "$out" in *DEAD*) : ;; *) echo "self-test: syn-dead was not reported dead: $out" >&2; fail=1 ;; esac
+    selftest_run deadrun "$good_inv" "syn-dead" >/dev/null 2>&1; rc=$?
+    case "$rc" in 1) : ;; *) echo "self-test: dead guard did not fail the run (rc=$rc)" >&2; fail=1 ;; esac
+    out="$(selftest_run wrongsig "$good_inv" "syn-wrongsig")"
+    case "$out" in *MISMATCH*) : ;; *) echo "self-test: wrong signature was not a mismatch: $out" >&2; fail=1 ;; esac
+    out="$(selftest_run badsib "$good_inv" "syn-badsib")"
+    case "$out" in *MISMATCH*) : ;; *) echo "self-test: sibling break was not a mismatch: $out" >&2; fail=1 ;; esac
+
+    # 2. dirty working tree in a mutated path refuses (restored by rewrite,
+    # never by discarding versioned state)
+    printf 'dirty\n' >>"$repo/data.txt"
+    out="$(selftest_run dirty "$good_inv" "syn-ok")"
+    case "$out" in *refusing*dirty*) : ;; *) echo "self-test: dirty tree was not refused: $out" >&2; fail=1 ;; esac
+    printf 'clean\n' >"$repo/data.txt"
+    git -C "$repo" status --porcelain -- data.txt | grep -q . && { echo "self-test: could not restore data.txt" >&2; fail=1; }
+
+    # 3. zero budget fails rather than truncating
+    out="$(selftest_run budget "$good_inv" "syn-ok" 0)"
+    case "$out" in *"budget exceeded"*) : ;; *) echo "self-test: zero budget did not fail loudly: $out" >&2; fail=1 ;; esac
+
+    # 4. stale scratch is reported and removed: point the run at the
+    # pre-seeded stale directory
+    mkdir -p "$t/stale/tree"
+    touch "$t/stale/tree/sentinel"
+    out="$(cd "$repo" && SCRATCH_BASE_OVERRIDE="$t/stale" bash "$SCRIPT" --inventory "$good_inv" --only "syn-ok" 2>&1)"
+    case "$out" in *"removed scratch left by"*) : ;; *) echo "self-test: stale scratch was not reported: $out" >&2; fail=1 ;; esac
+
+    # 5. consistency: duplicate guard fails, good file passes structural half
+    out="$(cd "$repo" && bash "$SCRIPT" --check-consistency --inventory "$inv" 2>&1)"
+    case "$out" in *"duplicate guard id syn-dup"*) : ;; *) echo "self-test: duplicate guard was not caught: $out" >&2; fail=1 ;; esac
+
+    if [ "$fail" -ne 0 ]; then
+        echo "guard-mutations self-test FAILED" >&2
+        return 1
+    fi
+    echo "guard-mutations self-test: mechanics ok (ok/dead/mismatch/budget/dirty/stale/consistency)."
+}
+
+# --- dispatch ----------------------------------------------------------------
+
+case "$MODE" in
+    consistency) mode_consistency ;;
+    selftest) mode_selftest ;;
+    list) read_inventory_rows | awk -F'\t' '{ printf "%-8s %-6s %s\n", $1, $3, $2 }' ;;
+    run) mode_run ;;
+esac

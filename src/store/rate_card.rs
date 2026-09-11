@@ -10,7 +10,8 @@
 use rusqlite::params;
 
 use crate::domain::rate_card::{
-    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, TokenClass,
+    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, Schedule,
+    TokenClass, parse_day_name, parse_hours_utc,
 };
 use crate::domain::time::{Clock, MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::error::Error;
@@ -66,12 +67,14 @@ pub fn insert(
         cards_unchanged: 0,
     };
     for draft in drafts {
+        let (schedule_days, schedule_hours) = schedule_columns(&draft.schedule);
         let added = connection
             .execute(
                 "INSERT INTO rate_card (
                     vendor, model, token_class, rate_micros, currency, billing_basis,
-                    effective_start, effective_end, imported_at, published_at, source, review_due
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                    effective_start, effective_end, imported_at, published_at, source, review_due,
+                    schedule_days, schedule_hours
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 ON CONFLICT DO NOTHING",
                 params![
                     draft.vendor,
@@ -86,6 +89,8 @@ pub fn insert(
                     draft.publication.published_at.map(UtcTimestamp::unix_nanos),
                     draft.publication.source,
                     draft.review_due.iso(),
+                    schedule_days,
+                    schedule_hours,
                 ],
             )
             .map_err(|error| Error::Store(format!("cannot insert rate card: {error}")))?;
@@ -104,7 +109,8 @@ pub fn history(connection: &rusqlite::Connection) -> Result<Vec<RateCard>, Error
     let mut statement = connection
         .prepare(
             "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
-                    billing_basis, effective_start, effective_end, published_at, source, review_due
+                    billing_basis, effective_start, effective_end, published_at, source, review_due,
+                    schedule_days, schedule_hours
              FROM rate_card
              ORDER BY vendor, model, token_class, effective_start, id",
         )
@@ -119,6 +125,10 @@ pub fn history(connection: &rusqlite::Connection) -> Result<Vec<RateCard>, Error
 /// The records effective at an instant: the interval contains it. `rate-card
 /// show` asks for now; the valuation layer (aub-wyu.2) asks for an event's
 /// time through its own named path.
+///
+/// Day granularity, deliberately: scheduled cards for the day are returned
+/// too, and the instant test happens in `find_rate`, where the whole day's
+/// candidates are in hand (aub-pwtn).
 pub fn effective_at(
     connection: &rusqlite::Connection,
     at: UtcTimestamp,
@@ -127,7 +137,8 @@ pub fn effective_at(
     let mut statement = connection
         .prepare(
             "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
-                    billing_basis, effective_start, effective_end, published_at, source, review_due
+                    billing_basis, effective_start, effective_end, published_at, source, review_due,
+                    schedule_days, schedule_hours
              FROM rate_card
              WHERE effective_start <= ?1
                AND (effective_end IS NULL OR effective_end > ?1)
@@ -139,6 +150,61 @@ pub fn effective_at(
         .map_err(|error| Error::Store(format!("cannot query effective rate cards: {error}")))?;
     rows.collect::<Result<Vec<_>, _>>()
         .map_err(|error| Error::Store(format!("cannot decode rate card: {error}")))
+}
+
+/// The schedule as the two stored columns: the day names in ISO order
+/// joined by `,` and the `HH:MM-HH:MM` window, both absent for a default
+/// card. Both-or-neither by construction, matching the pairing trigger.
+fn schedule_columns(schedule: &Option<Schedule>) -> (Option<String>, Option<String>) {
+    match schedule {
+        None => (None, None),
+        Some(window) => (Some(window.days_text()), Some(window.hours_text())),
+    }
+}
+
+/// A stored window back into a [`Schedule`]. A row the repository wrote
+/// always parses; anything else is a corrupt row, refused like any other
+/// unparseable stored column.
+fn parse_schedule(
+    days: Option<String>,
+    hours: Option<String>,
+) -> Result<Option<Schedule>, rusqlite::Error> {
+    match (days, hours) {
+        (None, None) => Ok(None),
+        (Some(days), Some(hours)) => {
+            let mut iso = Vec::new();
+            for name in days.split(',') {
+                iso.push(parse_day_name(name).ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        format!("unparseable schedule_days {days:?}").into(),
+                    )
+                })?);
+            }
+            let (start, end) = parse_hours_utc(&hours).map_err(|_| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    14,
+                    rusqlite::types::Type::Text,
+                    format!("unparseable schedule_hours {hours:?}").into(),
+                )
+            })?;
+            Schedule::new(&iso, start, end)
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        13,
+                        rusqlite::types::Type::Text,
+                        format!("unparseable schedule {days:?} {hours:?}").into(),
+                    )
+                })
+                .map(Some)
+        }
+        (days, hours) => Err(rusqlite::Error::FromSqlConversionFailure(
+            13,
+            rusqlite::types::Type::Text,
+            format!("half-present schedule {days:?} {hours:?}").into(),
+        )),
+    }
 }
 
 /// How many records the table holds, for import reporting and the e2e cases.
@@ -160,7 +226,8 @@ pub fn stale_rate_cards(
     let mut statement = connection
         .prepare(
             "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
-                    billing_basis, effective_start, effective_end, published_at, source, review_due
+                    billing_basis, effective_start, effective_end, published_at, source, review_due,
+                    schedule_days, schedule_hours
              FROM rate_card
              WHERE review_due IS NOT NULL AND review_due <= ?1
              ORDER BY vendor, model, token_class, effective_start, id",
@@ -187,6 +254,9 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
     let published_at: Option<i64> = row.get(10)?;
     let source: Option<String> = row.get(11)?;
     let review_due: Option<String> = row.get(12)?;
+    let schedule_days: Option<String> = row.get(13)?;
+    let schedule_hours: Option<String> = row.get(14)?;
+    let schedule = parse_schedule(schedule_days, schedule_hours)?;
 
     let token_class = TokenClass::parse(&token_class).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -249,6 +319,7 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
             billing_basis,
             effective_start,
             effective_end,
+            schedule,
             publication: Publication {
                 source,
                 published_at: published_at.map(UtcTimestamp::from_unix_nanos),
@@ -310,6 +381,7 @@ mod tests {
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse("2026-06-24").unwrap(),
             effective_end: None,
+            schedule: None,
             publication: Publication {
                 source: None,
                 published_at: None,

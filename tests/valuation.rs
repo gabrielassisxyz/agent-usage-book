@@ -37,6 +37,7 @@ fn helper_card(
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse(start).expect("valid start date"),
             effective_end: end.map(|d| UtcDate::parse(d).expect("valid end date")),
+            schedule: None,
             publication: Publication {
                 source: Some("https://pricing.vendor.example".to_string()),
                 published_at: None,
@@ -119,7 +120,7 @@ fn golden_hand_computed_exact_decimal_fixtures() {
     // 10,000 cache write tokens at $3.75/M => 10000 * 3_750_000 / 1_000_000 = 37,500 micros
     // Hand-computed total: 370_368 + 685_170 + 24_000 + 37_500 = 1,117,038 micros ($1.117038)
     let usage = helper_usage(123_456, 45_678, 80_000, 10_000, BTreeMap::new());
-    let date = UtcDate::parse("2024-07-15").unwrap();
+    let date = UtcDate::parse("2024-07-15").unwrap().start();
 
     let outcome = value_usage_vector::<Usd>(&book, "anthropic", "claude-3-5-sonnet", date, &usage);
     match outcome {
@@ -158,7 +159,7 @@ fn effective_date_boundaries_both_directions() {
         &book,
         "vendor",
         "model-a",
-        UtcDate::parse("2024-04-30").unwrap(),
+        UtcDate::parse("2024-04-30").unwrap().start(),
         &usage,
     );
     assert!(matches!(res_before, ValuationOutcome::Incomplete { .. }));
@@ -168,7 +169,7 @@ fn effective_date_boundaries_both_directions() {
         &book,
         "vendor",
         "model-a",
-        UtcDate::parse("2024-05-01").unwrap(),
+        UtcDate::parse("2024-05-01").unwrap().start(),
         &usage,
     );
     assert!(matches!(res_start, ValuationOutcome::Complete(..)));
@@ -178,7 +179,7 @@ fn effective_date_boundaries_both_directions() {
         &book,
         "vendor",
         "model-a",
-        UtcDate::parse("2024-05-31").unwrap(),
+        UtcDate::parse("2024-05-31").unwrap().start(),
         &usage,
     );
     assert!(matches!(res_end, ValuationOutcome::Complete(..)));
@@ -188,7 +189,7 @@ fn effective_date_boundaries_both_directions() {
         &book,
         "vendor",
         "model-a",
-        UtcDate::parse("2024-06-01").unwrap(),
+        UtcDate::parse("2024-06-01").unwrap().start(),
         &usage,
     );
     assert!(matches!(res_after, ValuationOutcome::Incomplete { .. }));
@@ -210,7 +211,7 @@ fn missing_rate_names_vendor_model_and_token_class() {
     let book = RateBook::new(cards);
     // Usage has output tokens, but no output rate exists!
     let usage = helper_usage(10_000, 5_000, 0, 0, BTreeMap::new());
-    let date = UtcDate::parse("2024-06-01").unwrap();
+    let date = UtcDate::parse("2024-06-01").unwrap().start();
 
     let outcome = value_usage_vector::<Usd>(&book, "anthropic", "claude-3-opus", date, &usage);
     match outcome {
@@ -223,7 +224,7 @@ fn missing_rate_names_vendor_model_and_token_class() {
             assert_eq!(missing_rates[0].vendor, "anthropic");
             assert_eq!(missing_rates[0].model, "claude-3-opus");
             assert_eq!(missing_rates[0].token_class, "output");
-            assert_eq!(missing_rates[0].date, date);
+            assert_eq!(missing_rates[0].at, date);
         }
         ValuationOutcome::Complete(..) | ValuationOutcome::UnsupportedCurrency { .. } => {
             panic!("expected Incomplete outcome, got {outcome:?}");
@@ -258,7 +259,7 @@ fn missing_cache_write_price_never_zero_cost() {
     ];
     let book = RateBook::new(cards);
     let usage = helper_usage(10_000, 10_000, 0, 50_000, BTreeMap::new());
-    let date = UtcDate::parse("2024-06-01").unwrap();
+    let date = UtcDate::parse("2024-06-01").unwrap().start();
 
     let outcome = value_usage_vector::<Usd>(&book, "vendor", "model-x", date, &usage);
     match outcome {
@@ -323,7 +324,7 @@ fn different_rates_per_token_class_order_of_magnitude() {
     ];
     let book = RateBook::new(cards);
     let usage = helper_usage(1_000_000, 10_000, 1_000_000, 0, BTreeMap::new());
-    let date = UtcDate::parse("2024-06-01").unwrap();
+    let date = UtcDate::parse("2024-06-01").unwrap().start();
 
     let outcome = value_usage_vector::<Usd>(&book, "vendor", "model-x", date, &usage);
     match outcome {
@@ -368,8 +369,8 @@ fn mid_period_model_price_change_two_halves() {
     let book = RateBook::new(cards);
     let usage = helper_usage(2_000_000, 0, 0, 0, BTreeMap::new());
 
-    let july = UtcDate::parse("2024-07-15").unwrap();
-    let aug = UtcDate::parse("2024-08-15").unwrap();
+    let july = UtcDate::parse("2024-07-15").unwrap().start();
+    let aug = UtcDate::parse("2024-08-15").unwrap().start();
 
     let batch = vec![
         ("openai", "gpt-4o", july, &usage),
@@ -404,7 +405,7 @@ fn unsupported_currency_is_rejected() {
     )];
     let book = RateBook::new(cards);
     let usage = helper_usage(100_000, 0, 0, 0, BTreeMap::new());
-    let date = UtcDate::parse("2024-06-01").unwrap();
+    let date = UtcDate::parse("2024-06-01").unwrap().start();
 
     // Requested in Usd, but rate card is in Eur
     let outcome = value_usage_vector::<Usd>(&book, "mistral", "mistral-large", date, &usage);
@@ -449,7 +450,7 @@ fn valuation_order_independence() {
     let u1 = helper_usage(10_000, 5_000, 0, 0, BTreeMap::new());
     let u2 = helper_usage(20_000, 10_000, 0, 0, BTreeMap::new());
     let u3 = helper_usage(30_000, 15_000, 0, 0, BTreeMap::new());
-    let date = UtcDate::parse("2024-06-01").unwrap();
+    let date = UtcDate::parse("2024-06-01").unwrap().start();
 
     let batch_fwd = vec![
         ("anthropic", "claude-3-5-sonnet", date, &u1),

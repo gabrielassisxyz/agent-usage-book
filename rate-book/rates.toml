@@ -31,12 +31,17 @@
 #    `output` and no `cache_write_*` row. This is not a gap the cost model has
 #    to report, because a missing term against a zero count is not a missing
 #    fact.
-# 5. Time-of-day pricing cannot be expressed by a date-effective row. Ollama
+# 5. Time-of-day pricing is a scheduled card beside its default. Ollama
 #    doubles both DeepSeek models inside its peak window (12:00 to 18:00 UTC,
 #    Monday to Friday: deepseek-v4-flash 0.44 / 0.014 / 1.32 and deepseek-v4-pro
-#    1.32 / 0.044 / 3.96 per million tokens). The rows below carry the off-peak
-#    rate, so traffic inside that window is valued low. A peak-aware term is out
-#    of scope here and needs a rate shape that has a schedule in it.
+#    1.32 / 0.044 / 3.96 per million tokens for input / cache_read / output).
+#    The rows above carry the off-peak rate with no schedule, and the peak
+#    rows below carry the window, so traffic inside that window values at the
+#    peak and everything else at the default.
+#    There are no OpenCode peak rows: the Zen pricing table as read on
+#    2026-09-11 lists one rate per DeepSeek model with no peak window and no
+#    hours, so a peak hour cannot be told apart from an off-peak one and no
+#    peak card can name when it applies.
 # 6. `claude-sonnet-5` carries one open-ended row per class at 2.00 / 10.00,
 #    starting 2026-06-24, and no standard-price rows. The introductory pricing
 #    the fixture recorded as expiring on 2026-08-31 does not expire: Anthropic's
@@ -970,6 +975,83 @@ billing_basis = "per_million_tokens"
 effective_start = "2026-09-07"
 published_at = "2026-09-07"
 source = "https://ollama.com/pricing"
+
+# Peak rows for the two DeepSeek models: Ollama Cloud doubles both rows
+# between 12:00 and 18:00 UTC, Monday to Friday, so each peak card carries
+# the window that selects it and the off-peak card above stays the default
+# for the triple. A window crossing midnight would be written as two cards;
+# this one stays inside the UTC day.
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "input"
+rate = "0.44"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "output"
+rate = "1.32"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "cache_read"
+rate = "0.014"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-pro"
+token_class = "input"
+rate = "1.32"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-pro"
+token_class = "output"
+rate = "3.96"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
+
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-pro"
+token_class = "cache_read"
+rate = "0.044"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+published_at = "2026-09-07"
+source = "https://ollama.com/pricing"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
 
 [[card]]
 vendor = "ollama"

@@ -10,7 +10,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use agent_usage_book::domain::rate_card::{RateCardDraft, TokenClass};
+use agent_usage_book::domain::rate_card::{RateCardDraft, Schedule, TokenClass};
 use agent_usage_book::domain::time::UtcDate;
 use agent_usage_book::rate_book::{self, RateBook};
 
@@ -61,22 +61,36 @@ fn overlaps(a: Interval, b: Interval) -> bool {
 }
 
 fn overlapping_intervals(book: &RateBook) -> Vec<String> {
-    let mut by_key: BTreeMap<CardKey, Vec<Interval>> = BTreeMap::new();
+    // A default beside its peak rows is the intended shape and never an
+    // overlap: a scheduled card conflicts only with another scheduled card
+    // whose day set intersects and whose hour range overlaps, and a default
+    // only with another default. This mirrors the importer's consistency
+    // check (`rate_book::parse`), so the shipped book proves the rule it
+    // ships under rather than a stricter one no book could satisfy.
+    let mut by_key: BTreeMap<CardKey, Vec<(Interval, Option<Schedule>)>> = BTreeMap::new();
     for card in &book.cards {
         by_key
             .entry(key(card))
             .or_default()
-            .push((card.effective_start, card.effective_end));
+            .push(((card.effective_start, card.effective_end), card.schedule));
     }
     let mut found = Vec::new();
-    for ((vendor, model, class), intervals) in by_key {
-        for (index, first) in intervals.iter().enumerate() {
-            for second in &intervals[index + 1..] {
-                if overlaps(*first, *second) {
+    for ((vendor, model, class), dated) in by_key {
+        for (index, first) in dated.iter().enumerate() {
+            for second in &dated[index + 1..] {
+                if !overlaps(first.0, second.0) {
+                    continue;
+                }
+                let conflict = match (first.1, second.1) {
+                    (None, None) => true,
+                    (Some(first), Some(second)) => first.overlaps(&second),
+                    (None, Some(_)) | (Some(_), None) => false,
+                };
+                if conflict {
                     found.push(format!(
                         "{vendor} {model} {class}: {} and {} overlap",
-                        first.0.iso(),
-                        second.0.iso()
+                        first.0.0.iso(),
+                        second.0.0.iso()
                     ));
                 }
             }
@@ -165,6 +179,76 @@ fn the_shipped_book_prices_one_rate_per_vendor_model_and_class_at_a_time() {
     assert_eq!(overlapping_intervals(&shipped()), Vec::<String>::new());
 }
 
+/// The Ollama DeepSeek peak rows: one scheduled card per model and class at
+/// twice the default rate, on the weekday 12:00 to 18:00 UTC window, beside
+/// the unscheduled defaults they never overlap.
+#[test]
+fn the_shipped_book_carries_the_ollama_deepseek_peak_rows() {
+    let book = shipped();
+    for (
+        model,
+        default_input,
+        peak_input,
+        default_cache,
+        peak_cache,
+        default_output,
+        peak_output,
+    ) in [
+        (
+            "deepseek-v4-flash",
+            220_000,
+            440_000,
+            7_000,
+            14_000,
+            660_000,
+            1_320_000,
+        ),
+        (
+            "deepseek-v4-pro",
+            660_000,
+            1_320_000,
+            22_000,
+            44_000,
+            1_980_000,
+            3_960_000,
+        ),
+    ] {
+        for (class, default_rate, peak_rate) in [
+            ("input", default_input, peak_input),
+            ("output", default_output, peak_output),
+            ("cache_read", default_cache, peak_cache),
+        ] {
+            let rows: Vec<&RateCardDraft> = book
+                .cards
+                .iter()
+                .filter(|card| {
+                    card.vendor == "ollama"
+                        && card.model == model
+                        && card.token_class.as_str() == class
+                })
+                .collect();
+            assert_eq!(
+                rows.len(),
+                2,
+                "one default and one peak row for {model} {class}"
+            );
+            let default = rows
+                .iter()
+                .find(|card| card.schedule.is_none())
+                .expect("the default row carries no schedule");
+            assert_eq!(default.rate_micros, default_rate);
+            let peak = rows
+                .iter()
+                .find(|card| card.schedule.is_some())
+                .expect("the peak row carries its window");
+            assert_eq!(peak.rate_micros, peak_rate);
+            let window = peak.schedule.expect("peak row is scheduled");
+            assert_eq!(window.days_iso(), vec![1, 2, 3, 4, 5]);
+            assert_eq!(window.describe(), "peak mon-fri 12:00-18:00 UTC");
+        }
+    }
+}
+
 #[test]
 fn the_shipped_book_carries_only_vendors_these_checks_understand() {
     assert_eq!(unknown_vendors(&shipped()), Vec::<String>::new());
@@ -235,6 +319,59 @@ fn parse_cards(text: &str) -> RateBook {
     rate_book::parse(text).expect("the constructed book must parse")
 }
 
+/// One draft for the overlap planted negatives below, scheduled or not.
+/// Built by hand rather than parsed: the importer refuses an inconsistent
+/// book, so a parsed fixture can never exhibit the overlap this check owns.
+fn draft_with_schedule(schedule: Option<Schedule>) -> RateCardDraft {
+    use agent_usage_book::domain::rate_card::{
+        BillingBasis, CurrencyCode, Publication, ReviewDuePolicy,
+    };
+    RateCardDraft {
+        vendor: "ollama".to_string(),
+        model: "deepseek-v4-flash".to_string(),
+        token_class: TokenClass::Input,
+        rate_micros: 440_000,
+        currency: CurrencyCode::Usd,
+        billing_basis: BillingBasis::PerMillionTokens,
+        effective_start: UtcDate::parse("2026-09-07").unwrap(),
+        effective_end: None,
+        schedule,
+        publication: Publication {
+            source: Some("test".to_string()),
+            published_at: None,
+        },
+        review_due: ReviewDuePolicy::None,
+    }
+}
+
+fn scheduled_draft(days: &[u32], hours: (u16, u16)) -> RateCardDraft {
+    let mut draft = draft_with_schedule(None);
+    draft.schedule = Schedule::new(days, hours.0, hours.1);
+    draft
+}
+
+#[test]
+fn two_scheduled_rows_overlapping_on_a_shared_day_are_reported() {
+    let book = RateBook {
+        cards: vec![
+            scheduled_draft(&[1, 2, 3, 4, 5], (12 * 60, 18 * 60)),
+            scheduled_draft(&[1, 2, 3, 4, 5], (17 * 60, 20 * 60)),
+        ],
+    };
+    assert_eq!(overlapping_intervals(&book).len(), 1);
+}
+
+#[test]
+fn two_scheduled_rows_sharing_hours_on_disjoint_days_pass() {
+    let book = RateBook {
+        cards: vec![
+            scheduled_draft(&[1, 2, 3, 4, 5], (12 * 60, 18 * 60)),
+            scheduled_draft(&[6, 7], (12 * 60, 18 * 60)),
+        ],
+    };
+    assert_eq!(overlapping_intervals(&book), Vec::<String>::new());
+}
+
 #[test]
 fn two_open_ended_rows_for_one_class_are_reported_as_overlapping() {
     let handing_off = format!(
@@ -262,7 +399,9 @@ fn two_open_ended_rows_for_one_class_are_reported_as_overlapping() {
     );
 
     // The same two rows with the earlier one left open ended: nothing else
-    // changes, and now both are effective on the same day.
+    // changes, and now both are effective on the same day. The importer
+    // refuses the book naming both indexes, and the overlap helper reports
+    // the same pair on hand-built drafts.
     let overlapping = format!(
         "{}{}",
         card(
@@ -282,7 +421,14 @@ fn two_open_ended_rows_for_one_class_are_reported_as_overlapping() {
             None
         ),
     );
-    assert_eq!(overlapping_intervals(&parse_cards(&overlapping)).len(), 1);
+    let error =
+        rate_book::parse(&overlapping).expect_err("two open-ended defaults must be refused");
+    assert_eq!(error.card_index, 1);
+    assert!(error.reason.contains("card 0"), "{}", error.reason);
+    let built = RateBook {
+        cards: vec![draft_with_schedule(None), draft_with_schedule(None)],
+    };
+    assert_eq!(overlapping_intervals(&built).len(), 1);
 }
 
 #[test]

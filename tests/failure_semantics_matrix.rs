@@ -1093,7 +1093,7 @@ fn row_20_missing_rate_card() {
         &empty_book,
         "anthropic",
         "claude-opus-4",
-        UtcDate::parse("2026-08-30").expect("valid date"),
+        UtcDate::parse("2026-08-30").expect("valid date").start(),
         &usage,
     );
 

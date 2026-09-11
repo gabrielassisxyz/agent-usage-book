@@ -76,6 +76,22 @@ impl UtcTimestamp {
         UtcDate::from_days_since_epoch(self.0.div_euclid(86_400 * 1_000_000_000))
     }
 
+    /// The ISO weekday of this instant, Monday = 1 through Sunday = 7, on the
+    /// UTC calendar day. Derived from `unix_nanos` with the same day
+    /// arithmetic `utc_date` uses, so the two never disagree about the day.
+    pub fn weekday(self) -> u32 {
+        let days = self.0.div_euclid(86_400 * 1_000_000_000);
+        (days + 3).rem_euclid(7) as u32 + 1
+    }
+
+    /// The clock time of this instant as UTC hour and minute. Derived from
+    /// `unix_nanos`, so midnight reads 00:00 and the last minute reads 23:59.
+    pub fn hour_minute_utc(self) -> (u32, u32) {
+        let day_nanos = self.0.rem_euclid(86_400 * 1_000_000_000);
+        let seconds = (day_nanos / 1_000_000_000) as u32;
+        (seconds / 3_600, (seconds % 3_600) / 60)
+    }
+
     /// The RFC 3339 UTC form (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`), the inverse
     /// of [`parse_rfc3339`]: whatever renders here parses back to the same
     /// instant. A timestamp is a label here, not a quantity, so the text is
@@ -882,5 +898,34 @@ mod calendar_tests {
     fn a_pre_epoch_instant_still_lands_on_its_calendar_day() {
         let before = UtcTimestamp::from_unix_nanos(-1);
         assert_eq!(before.utc_date().iso(), "1969-12-31");
+    }
+
+    /// The weekday and clock time of three literal instants: a Monday
+    /// afternoon, a Sunday just before midnight, and the epoch itself, which
+    /// was a Thursday.
+    #[test]
+    fn weekday_and_hour_minute_read_the_utc_calendar() {
+        let monday = UtcTimestamp::parse_rfc3339("2026-09-07T13:30:00Z").unwrap();
+        assert_eq!(monday.weekday(), 1);
+        assert_eq!(monday.hour_minute_utc(), (13, 30));
+
+        let sunday = UtcTimestamp::parse_rfc3339("2026-09-06T23:59:59Z").unwrap();
+        assert_eq!(sunday.weekday(), 7);
+        assert_eq!(sunday.hour_minute_utc(), (23, 59));
+
+        let epoch = UtcTimestamp::from_unix_nanos(0);
+        assert_eq!(epoch.weekday(), 4);
+        assert_eq!(epoch.hour_minute_utc(), (0, 0));
+    }
+
+    /// Midnight belongs to the new day, and the weekday follows the date
+    /// across the boundary rather than the clock time before it.
+    #[test]
+    fn weekday_follows_the_date_across_midnight() {
+        let late = UtcTimestamp::parse_rfc3339("2026-09-07T23:59:59Z").unwrap();
+        let early = UtcTimestamp::parse_rfc3339("2026-09-08T00:00:00Z").unwrap();
+        assert_eq!(late.weekday(), 1);
+        assert_eq!(early.weekday(), 2);
+        assert_eq!(early.hour_minute_utc(), (0, 0));
     }
 }

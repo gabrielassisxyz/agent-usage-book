@@ -38,6 +38,7 @@
       "unknown_components": {},
       "coverage": "complete",
       "evidence_quality": "measured",
+      "estimation_methods": [],
       "provenance": {
         "sources": [
           "codex:session-9"

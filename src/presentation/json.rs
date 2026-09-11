@@ -18,7 +18,7 @@ use crate::domain::tokens::TokenKind;
 use crate::domain::window::WindowScope;
 use crate::error::Error;
 use crate::evidence::{
-    CoverageCompleteness, Derivation, EvidenceQuality, Provenance, RequiredFact,
+    CoverageCompleteness, Derivation, EstimatorId, EvidenceQuality, Provenance, RequiredFact,
 };
 use crate::logging::RunId;
 use crate::presentation::render::{
@@ -983,7 +983,7 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
     let mut fields = format!(
         "\"key\":{},\"tokens\":{{{kinds}}},\"unknown_components\":{{{unknown}}},{},\"provenance\":{},\"children\":[{children}]",
         json_string(group.key.as_str()),
-        coverage_and_quality_json(group.usage.coverage(), group.usage.quality())
+        coverage_quality_and_methods_json(group.usage.coverage(), group.usage.quality())
             .trim_matches(|c| c == '{' || c == '}'),
         provenance_json(&group.provenance),
     );
@@ -1031,6 +1031,27 @@ fn spend_group_json(group: &crate::report::SpendGroup) -> String {
             .collect::<Vec<_>>()
             .join(",");
         fields.push_str(&format!(",\"priced_as\":[{priced}]"));
+    }
+    // One entry per rate card that valued the group, with the schedule that
+    // selected it (`default` or the window, e.g. `peak mon-fri 12:00-18:00
+    // UTC`). Absent when nothing priced, by the same presence rule as
+    // `priced_as` (aub-pwtn).
+    if !group.priced_cards.is_empty() {
+        let cards = group
+            .priced_cards
+            .iter()
+            .map(|card| {
+                format!(
+                    "{{\"vendor\":{},\"model\":{},\"token_class\":{},\"schedule\":{}}}",
+                    json_string(&card.vendor),
+                    json_string(&card.model),
+                    json_string(&card.token_class),
+                    json_string(&card.schedule),
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        fields.push_str(&format!(",\"rate_cards\":[{cards}]"));
     }
     if let Some(credits) = &group.credits {
         fields.push_str(&format!(",\"credits\":{}", credits_json(credits)));
@@ -2775,6 +2796,45 @@ pub fn coverage_and_quality_json<T: DomainQuantity>(
     )
 }
 
+/// The same two fields plus the estimator ids behind an estimated quality.
+///
+/// Separate from `coverage_and_quality_json` rather than an extra field on it
+/// because the two are read by different documents: aub-pwtn asks the SPEND
+/// GROUP to name the method behind a degraded quality, and widening the shared
+/// block instead would have added the field to the task report and the credits
+/// derivation as well, silently changing two published contracts that no bead
+/// asked to change. The task report's strict validator caught exactly that.
+fn coverage_quality_and_methods_json<T: DomainQuantity>(
+    coverage: &CoverageCompleteness,
+    quality: &EvidenceQuality<T>,
+) -> String {
+    format!(
+        "{{\"coverage\":{},\"evidence_quality\":{},\"estimation_methods\":[{}]}}",
+        json_string(coverage_name(coverage)),
+        json_string(quality_name(quality)),
+        estimation_methods(quality)
+            .iter()
+            .map(|method| json_string(method.as_str()))
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+}
+
+/// The estimator names behind an estimated or mixed quality, in a stable
+/// order. Empty for measured evidence: the methods key is always present so
+/// a consumer reads one shape either way, and a group degraded for an
+/// unknown schedule hour names `schedule-unresolved` here (aub-pwtn).
+fn estimation_methods<T: DomainQuantity>(quality: &EvidenceQuality<T>) -> Vec<EstimatorId> {
+    let mut methods: Vec<EstimatorId> = match quality {
+        EvidenceQuality::Measured => Vec::new(),
+        EvidenceQuality::Estimated { methods, .. } | EvidenceQuality::Mixed { methods, .. } => {
+            methods.iter().cloned().collect()
+        }
+    };
+    methods.sort_by(|left, right| left.as_str().cmp(right.as_str()));
+    methods
+}
+
 /// Serializes an interval with both endpoints and the unit of its element type.
 /// Uses exact string representations of the endpoints to prevent float rounding.
 pub fn interval_json<T: DomainQuantity>(interval: &Interval<T>) -> String {
@@ -3303,18 +3363,58 @@ mod tests {
                 "evidence_quality": "measured"
             })
         );
+    }
 
-        let partial = coverage_and_quality_json::<TokenCount>(
+    /// The shared block carries no estimator ids, so the documents that embed it
+    /// keep the contract they published. A field added here would reach the task
+    /// report and the credits derivation, which is what the task report's strict
+    /// validator refused when this was one helper instead of two.
+    #[test]
+    fn the_shared_quality_block_does_not_name_estimators() {
+        let json = coverage_and_quality_json::<TokenCount>(
+            &CoverageCompleteness::partial([crate::evidence::ComponentKind::new("x")]),
+            &EvidenceQuality::estimated([crate::evidence::EstimatorId::new("chars")], None),
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid coverage/quality JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "coverage": "partial",
+                "evidence_quality": "estimated"
+            })
+        );
+    }
+
+    #[test]
+    fn the_spend_block_names_the_estimators_behind_an_estimated_quality() {
+        let json = coverage_quality_and_methods_json::<TokenCount>(
+            &CoverageCompleteness::Complete,
+            &EvidenceQuality::Measured,
+        );
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid spend coverage/quality JSON");
+        assert_eq!(
+            parsed,
+            serde_json::json!({
+                "coverage": "complete",
+                "evidence_quality": "measured",
+                "estimation_methods": []
+            })
+        );
+
+        let partial = coverage_quality_and_methods_json::<TokenCount>(
             &CoverageCompleteness::partial([crate::evidence::ComponentKind::new("x")]),
             &EvidenceQuality::estimated([crate::evidence::EstimatorId::new("chars")], None),
         );
         let partial_parsed: serde_json::Value =
-            serde_json::from_str(&partial).expect("valid partial coverage/quality JSON");
+            serde_json::from_str(&partial).expect("valid partial spend coverage/quality JSON");
         assert_eq!(
             partial_parsed,
             serde_json::json!({
                 "coverage": "partial",
-                "evidence_quality": "estimated"
+                "evidence_quality": "estimated",
+                "estimation_methods": ["chars"]
             })
         );
     }
