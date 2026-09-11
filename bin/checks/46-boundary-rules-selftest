@@ -3,7 +3,7 @@
 # boundary rules (aub-80nm). The runner in 45-boundary-rules proves the rules
 # pass on a clean tree; this proves they still catch what each one exists to
 # catch. Without a gate check over the selftest, a scenario keyed to exact
-# source formatting goes stale silently — the rule19-status scenario was keyed
+# source formatting goes stale silently: the rule19-status scenario was keyed
 # to a one-line `fn status(` declaration, planted nothing once the signature
 # was reformatted onto one line, and sat red on main indefinitely because no
 # check under bin/checks/ ever invoked the selftest.
