@@ -1,0 +1,2 @@
+{"type":"session","version":3,"id":"session-fixture-pi-0001","timestamp":"2026-08-25T23:31:38.741Z","cwd":"/tmp/aub-fixture-project"}
+{"type":"message","id":"rec-fixture-0001","timestamp":"2026-08-25T23:33:39.627Z","message":{"role":"assistant","model":"kimi-k2","usage":{"input":100,"output":50,"cacheRead":20,"cacheWrite":10,"totalTokens":180}}}

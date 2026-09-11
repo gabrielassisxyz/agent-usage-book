@@ -66,6 +66,24 @@ fn seed_session_with_usage(
     provenance: &str,
     counts: &[(&str, u64)],
 ) {
+    seed_session_with_usage_and_directory(
+        conn, index, source, native, run, provenance, counts, None,
+    );
+}
+
+/// Seeds one namespaced session carrying the given working directory, so the
+/// export contract test can prove the column never leaves the ledger.
+#[allow(clippy::too_many_arguments)]
+fn seed_session_with_usage_and_directory(
+    conn: &rusqlite::Connection,
+    index: usize,
+    source: &str,
+    native: &str,
+    run: Option<&str>,
+    provenance: &str,
+    counts: &[(&str, u64)],
+    working_directory: Option<&str>,
+) {
     insert_session(
         conn,
         &NewSession {
@@ -75,6 +93,7 @@ fn seed_session_with_usage(
             end: Some(UtcTimestamp::from_unix_nanos(100 * index as i64 + 50)),
             project_key: ProjectKey::new(format!("proj-{index}")),
             repository_key: RepositoryKey::new(format!("repo-{index}")),
+            working_directory: working_directory.map(str::to_string),
             run_id: run.map(NativeRunId::new),
         },
     )
@@ -262,6 +281,59 @@ fn re_rendering_unchanged_data_differs_only_in_generated_at() {
     );
     assert_eq!(first_header["generated_at"], 1_000);
     assert_eq!(second_header["generated_at"], 9_000);
+}
+
+/// The export contract for the stored working directory (`aub-4ow0`): a
+/// session carrying one exports exactly as a session without one. The column
+/// name and the stored path both stay out of the rendered JSONL, while the
+/// legitimate identifiers the export was asked to include survive.
+#[test]
+fn a_stored_working_directory_never_reaches_the_export() {
+    let db = TestDb::new();
+    let conn = db.open();
+    seed_session_with_usage_and_directory(
+        &conn,
+        0,
+        "claude-code",
+        "sess-dir",
+        Some("run-dir"),
+        "transcripts/a.jsonl",
+        &[("input", 100), ("output", 40)],
+        Some("/tmp/aub-fixture-project"),
+    );
+
+    for key in [ExportKey::Session, ExportKey::Run] {
+        let report = assemble(&conn, key, true, UtcTimestamp::from_unix_nanos(2_000)).unwrap();
+        let rendered = export_jsonl(&report);
+        assert!(
+            !rendered.contains("working_directory"),
+            "{key:?}: the column name reached the export"
+        );
+        assert!(
+            !rendered.contains("/tmp/aub-fixture-project"),
+            "{key:?}: the stored machine path reached the export"
+        );
+    }
+
+    // The positive control: the identifiers the export was asked to include
+    // are genuinely present, so the scan above constrains exactly the
+    // directory material and nothing else.
+    let report = assemble(
+        &conn,
+        ExportKey::Session,
+        true,
+        UtcTimestamp::from_unix_nanos(2_000),
+    )
+    .unwrap();
+    let rendered = export_jsonl(&report);
+    assert!(
+        rendered.contains("proj-0"),
+        "the included project key survives"
+    );
+    assert!(
+        rendered.contains("claude-code:sess-dir"),
+        "the session key survives"
+    );
 }
 
 // The privacy scan (`aub-xus.7`): over generated exports, no credential

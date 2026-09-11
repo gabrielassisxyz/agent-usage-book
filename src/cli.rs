@@ -8105,7 +8105,7 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         &mut progress_sink,
     )?;
     println!(
-        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={}",
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={} working_directory_changes={}",
         report.sources.join(","),
         report.files_scanned,
         report.files_parsed,
@@ -8114,6 +8114,7 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         report.quarantined,
         report.generation.value(),
         report.batches.len(),
+        report.working_directory_changes,
     );
     let outcome = &report.outcome;
     println!(
@@ -8182,15 +8183,21 @@ fn ingest_flags(rest: &[String]) -> Result<crate::ingest::IngestOptions, Error> 
 }
 
 /// `aub rebuild <target>`: explicit destructive rebuild of rebuildable
-/// materializations (aub-lqe.11, PLAN.md 6, 27, 34.16). The target resolves
-/// through the shared taxonomy's rebuild groups, so the command cannot name a
-/// class the taxonomy does not classify rebuildable, and the sweep it runs is
-/// the one [`crate::store::retention::delete_rebuildable`] derives from the
-/// taxonomy rather than a list declared here.
+/// materializations (aub-lqe.11, PLAN.md 6, 27, 34.16). The `transcripts` and
+/// `attribution` targets resolve through the shared taxonomy's rebuild groups,
+/// so the command cannot name a class the taxonomy does not classify
+/// rebuildable, and the sweep it runs is the one
+/// [`crate::store::retention::delete_rebuildable`] derives from the
+/// taxonomy rather than a list declared here. The `sessions` target is not a
+/// sweep: it re-resolves every stored session's project and repository keys
+/// from its stored working directory through the current alias tables
+/// (`aub-4ow0`), rewriting derived keys only and leaving every evidence table
+/// untouched, so a new alias applies to history and not only to sessions
+/// ingested after it.
 fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let target_name = invocation.rest.first().cloned().ok_or_else(|| {
         Error::Usage(format!(
-            "rebuild requires a target: {}",
+            "rebuild requires a target: {} | sessions",
             crate::store::retention::RebuildGroup::ALL
                 .iter()
                 .map(|group| group.name())
@@ -8204,10 +8211,13 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
             invocation.rest[1]
         )));
     }
+    if target_name == "sessions" {
+        return rebuild_sessions_command(clock);
+    }
     let group =
         crate::store::retention::RebuildGroup::from_name(&target_name).ok_or_else(|| {
             Error::Usage(format!(
-                "unknown rebuild target {target_name}; rebuildable targets are: {}",
+                "unknown rebuild target {target_name}; rebuildable targets are: {} | sessions",
                 crate::store::retention::RebuildGroup::ALL
                     .iter()
                     .map(|group| group.name())
@@ -8229,6 +8239,32 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
             .unwrap_or_else(|| unreachable!("a sweep class is a table class by construction"));
         println!("  {table}: {} rows", count.value());
     }
+    Ok(())
+}
+
+/// `aub rebuild sessions`: re-resolves every stored session's project and
+/// repository keys from its stored working directory through the current
+/// `[projects]` and `[repositories]` alias tables. Derived keys only move;
+/// bounds, run ids and every evidence table stay untouched, so the pass is
+/// idempotent and advances the ledger generation with the rewrite.
+fn rebuild_sessions_command(clock: &impl Clock) -> Result<(), Error> {
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    let mut conn = open_ledger(clock)?;
+    let outcome =
+        crate::store::session::reresolve_keys(&mut conn, &config.projects, &config.repositories)?;
+    println!(
+        "rebuild sessions: re-resolved {} sessions generation={}",
+        outcome.sessions,
+        outcome.generation.value(),
+    );
     Ok(())
 }
 

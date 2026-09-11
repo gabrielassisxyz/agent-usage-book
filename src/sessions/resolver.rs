@@ -63,6 +63,48 @@ pub fn resolve_repository(aliases: &AliasTable, working_dir: Option<&str>) -> Re
     }
 }
 
+/// The first stated working directory per session, in (source, native session
+/// id) order, with the count of sessions where a later record disagreed.
+///
+/// A transcript may state a different directory mid-session (Claude Code
+/// writes `cwd` on every line); the session keeps the first non-empty value
+/// and every later differing non-empty value marks the session as changed
+/// once, no matter how many lines disagree. The change count is the auditable
+/// witness that the choice was made: it travels in the ingest summary as
+/// `working_directory_changes`.
+pub fn first_working_directories(
+    observed: impl IntoIterator<Item = ((String, String), Option<String>)>,
+) -> (
+    std::collections::BTreeMap<(String, String), Option<String>>,
+    u64,
+) {
+    let mut first: std::collections::BTreeMap<(String, String), Option<String>> =
+        std::collections::BTreeMap::new();
+    let mut changed: std::collections::BTreeSet<(String, String)> =
+        std::collections::BTreeSet::new();
+    for (session, directory) in observed {
+        let directory = directory.filter(|dir| !dir.is_empty());
+        match first.get(&session) {
+            None => {
+                first.insert(session, directory);
+            }
+            Some(stored) => match (stored, &directory) {
+                // A session first seen without a directory adopts the first
+                // stated one; that adoption is not a disagreement.
+                (None, Some(_)) => {
+                    first.insert(session, directory);
+                }
+                (Some(kept), Some(stated)) if kept != stated => {
+                    changed.insert(session.clone());
+                }
+                _ => {}
+            },
+        }
+    }
+    let changes = changed.len() as u64;
+    (first, changes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -132,5 +174,93 @@ mod tests {
         keys.insert(ProjectKey::new(UNKNOWN_PROJECT), 1usize);
         keys.insert(ProjectKey::new("agent-usage-book"), 2usize);
         assert_eq!(keys.len(), 2);
+    }
+
+    fn observed(pairs: &[((&str, &str), Option<&str>)]) -> Vec<((String, String), Option<String>)> {
+        pairs
+            .iter()
+            .map(|((source, native), dir)| {
+                (
+                    (source.to_string(), native.to_string()),
+                    dir.map(str::to_string),
+                )
+            })
+            .collect()
+    }
+
+    /// The first stated directory wins and a later disagreement is counted
+    /// once per session, however many lines disagree.
+    #[test]
+    fn first_stated_directory_wins_and_a_disagreement_counts_once() {
+        let (first, changes) = first_working_directories(observed(&[
+            (("claude-code", "s1"), Some("/tmp/aub-fixture-project")),
+            (
+                ("claude-code", "s1"),
+                Some("/tmp/aub-fixture-project-moved"),
+            ),
+            (
+                ("claude-code", "s1"),
+                Some("/tmp/aub-fixture-project-moved"),
+            ),
+        ]));
+        assert_eq!(
+            first.get(&("claude-code".to_string(), "s1".to_string())),
+            Some(&Some("/tmp/aub-fixture-project".to_string()))
+        );
+        assert_eq!(changes, 1, "one session disagreed, counted once");
+    }
+
+    /// A session seen first without a directory adopts the first stated one,
+    /// and that adoption is not a disagreement.
+    #[test]
+    fn a_session_first_seen_without_a_directory_adopts_the_first_stated_one() {
+        let (first, changes) = first_working_directories(observed(&[
+            (("pi", "s1"), None),
+            (("pi", "s1"), Some("/tmp/aub-fixture-project")),
+        ]));
+        assert_eq!(
+            first
+                .get(&("pi".to_string(), "s1".to_string()))
+                .cloned()
+                .flatten()
+                .as_deref(),
+            Some("/tmp/aub-fixture-project")
+        );
+        assert_eq!(changes, 0);
+    }
+
+    /// Sessions that agree, sessions never stated, and an empty string that
+    /// reads as absent: none of them is a change.
+    #[test]
+    fn agreement_absence_and_empty_strings_are_not_changes() {
+        let (first, changes) = first_working_directories(observed(&[
+            (("codex", "steady"), Some("/tmp/aub-fixture-project")),
+            (("codex", "steady"), Some("/tmp/aub-fixture-project")),
+            (("codex", "absent"), None),
+            (("codex", "absent"), None),
+            (("codex", "empty"), Some("")),
+        ]));
+        assert_eq!(changes, 0);
+        assert_eq!(
+            first
+                .get(&("codex".to_string(), "empty".to_string()))
+                .cloned()
+                .flatten(),
+            None,
+            "an empty directory reads as absent"
+        );
+    }
+
+    /// Two sessions are counted independently: the count is sessions, not lines.
+    #[test]
+    fn the_change_count_is_sessions_not_lines() {
+        let (_, changes) = first_working_directories(observed(&[
+            (("claude-code", "s1"), Some("/a")),
+            (("claude-code", "s1"), Some("/b")),
+            (("claude-code", "s2"), Some("/a")),
+            (("claude-code", "s2"), Some("/c")),
+            (("claude-code", "s2"), Some("/d")),
+        ]));
+        assert_eq!(changes, 2);
     }
 }

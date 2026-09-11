@@ -411,6 +411,7 @@ fn spend_case() -> SeededCommand {
             undated_events: 0,
             events_outside_window: 0,
             events_in_window: 3,
+            working_directory_changes: 0,
         },
     )
     .with_credit_provenance(vec![SpendGroupCreditsProvenance::new(

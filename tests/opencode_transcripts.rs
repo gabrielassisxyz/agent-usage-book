@@ -369,6 +369,24 @@ fn reading_the_same_database_twice_yields_the_same_events() {
     );
 }
 
+/// The session table's directory travels onto every event of that session:
+/// opencode states it per session (`session.directory`), not per message, so
+/// the parser joins the message rows against it.
+#[test]
+fn events_carry_the_session_table_working_directory() {
+    let scratch = ScratchDir::new("directory");
+    let db_path = build_fixture_db(scratch.path(), "opencode.db", None);
+    let output = parse_db(&db_path);
+    assert!(!output.events().is_empty());
+    for event in output.events() {
+        assert_eq!(
+            event.working_directory(),
+            Some("work/fixture-project"),
+            "every event carries its session's stated directory"
+        );
+    }
+}
+
 /// Only the opencode parser reads database files: the text parsers keep the
 /// default seam, so a database file is never misread as text and a text file
 /// is never opened as a database.

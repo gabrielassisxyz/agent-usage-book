@@ -310,6 +310,7 @@ fn seed_spend_report() -> SpendReport {
             undated_events: 0,
             events_outside_window: 0,
             events_in_window: 15,
+            working_directory_changes: 0,
         },
     )
 }

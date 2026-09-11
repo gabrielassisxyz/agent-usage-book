@@ -9,7 +9,10 @@
 //! The row carries no mandatory account column (account assignment belongs to the
 //! marker timeline), and project and repository are stored as typed logical keys,
 //! never as machine paths: the resolver in `crate::sessions` produces the keys, and
-//! this module only ever persists them.
+//! this module only ever persists them. The working directory the transcript
+//! stated sits beside the keys as machine-local evidence: it is what the keys
+//! were resolved from, it never leaves the ledger inside an export, and a later
+//! alias change re-resolves the keys from it without re-reading the transcripts.
 //!
 //! Sessions are rebuildable from usage events, so this repository exposes the
 //! explicit replace path (`replace_all_sessions`) and no immutability trigger guards
@@ -52,6 +55,7 @@ pub struct Session {
     end: Option<UtcTimestamp>,
     project_key: ProjectKey,
     repository_key: RepositoryKey,
+    working_directory: Option<String>,
     run_id: Option<NativeRunId>,
 }
 
@@ -84,6 +88,13 @@ impl Session {
         &self.repository_key
     }
 
+    /// The working directory the transcript stated for this session, when it
+    /// stated one. Machine-local evidence: report identity reads the keys
+    /// above, never this path.
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
+    }
+
     pub fn run_id(&self) -> Option<&NativeRunId> {
         self.run_id.as_ref()
     }
@@ -98,6 +109,7 @@ pub struct NewSession {
     pub end: Option<UtcTimestamp>,
     pub project_key: ProjectKey,
     pub repository_key: RepositoryKey,
+    pub working_directory: Option<String>,
     pub run_id: Option<NativeRunId>,
 }
 
@@ -116,12 +128,13 @@ fn session_from_row(row: &Row<'_>) -> Result<Session, Error> {
         end: get::<Option<i64>>(row, 4)?.map(UtcTimestamp::from_unix_nanos),
         project_key: ProjectKey::new(get::<String>(row, 5)?),
         repository_key: RepositoryKey::new(get::<String>(row, 6)?),
-        run_id: get::<Option<String>>(row, 7)?.map(NativeRunId::new),
+        working_directory: get::<Option<String>>(row, 7)?,
+        run_id: get::<Option<String>>(row, 8)?.map(NativeRunId::new),
     })
 }
 
 const SESSION_COLUMNS: &str = "id, source, native_session_id, start, end, project_key, \
-     repository_key, run_id";
+     repository_key, working_directory, run_id";
 
 /// Inserts one session row. A duplicate (source, native session id) pair fails at
 /// the database rather than being silently merged.
@@ -129,8 +142,9 @@ pub fn insert_session(conn: &Connection, session: &NewSession) -> Result<Session
     let id: i64 = conn
         .query_row(
             "INSERT INTO session (
-                source, native_session_id, start, end, project_key, repository_key, run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                source, native_session_id, start, end, project_key, repository_key,
+                working_directory, run_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
             RETURNING id",
             params![
                 session.source.as_str(),
@@ -139,6 +153,7 @@ pub fn insert_session(conn: &Connection, session: &NewSession) -> Result<Session
                 session.end.map(|t| t.unix_nanos()),
                 session.project_key.as_str(),
                 session.repository_key.as_str(),
+                session.working_directory,
                 session.run_id.as_ref().map(|id| id.as_str()),
             ],
             |row| row.get::<_, i64>(0),
@@ -163,8 +178,9 @@ pub fn replace_all_sessions(
     for session in sessions {
         tx.execute(
             "INSERT INTO session (
-                source, native_session_id, start, end, project_key, repository_key, run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                source, native_session_id, start, end, project_key, repository_key,
+                working_directory, run_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 session.source.as_str(),
                 session.native_session_id.as_str(),
@@ -172,6 +188,7 @@ pub fn replace_all_sessions(
                 session.end.map(|t| t.unix_nanos()),
                 session.project_key.as_str(),
                 session.repository_key.as_str(),
+                session.working_directory,
                 session.run_id.as_ref().map(|id| id.as_str()),
             ],
         )
@@ -230,4 +247,71 @@ pub fn clear_all_sessions(conn: &Connection) -> Result<(), Error> {
     conn.execute("DELETE FROM session", [])
         .map_err(|e| Error::Store(format!("cannot clear session table: {e}")))?;
     Ok(())
+}
+
+/// What one `rebuild sessions` pass did: the sessions it re-resolved and the
+/// ledger generation the rewrite landed as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReresolveOutcome {
+    /// Stored sessions re-resolved, including sessions with no directory
+    /// (which resolve to the unknown buckets).
+    pub sessions: usize,
+    /// The ledger generation after the rewrite advanced it.
+    pub generation: crate::store::ledger_generation::Generation,
+}
+
+/// Re-resolves every stored session's project and repository keys from its
+/// stored working directory through the current alias tables (`aub-4ow0`).
+///
+/// Only the derived keys move: bounds, run ids, the stored directories and
+/// every evidence table stay untouched, so the pass is idempotent and a wrong
+/// alias is fixed by correcting the config and running it again. A session
+/// with no stored directory resolves to the unknown buckets. The ledger
+/// generation advances with the rewrite, so a projection that read the old
+/// keys can tell they moved.
+///
+/// The write lock is taken before anything is touched, so a pass that starts
+/// while another mutating command holds the writer refuses whole rather than
+/// re-resolving partially.
+pub fn reresolve_keys(
+    conn: &mut Connection,
+    projects: &crate::config::AliasTable,
+    repositories: &crate::config::AliasTable,
+) -> Result<ReresolveOutcome, Error> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| {
+            Error::Store(format!(
+                "another writer holds the ledger database; rebuild sessions refuses to \
+                 re-resolve partially: {e}"
+            ))
+        })?;
+    let rows: Vec<(i64, Option<String>)> = {
+        let mut stmt = tx
+            .prepare("SELECT id, working_directory FROM session ORDER BY id")
+            .map_err(|e| Error::Store(format!("cannot prepare the session scan: {e}")))?;
+        stmt.query_map([], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .map_err(|e| Error::Store(format!("cannot scan sessions: {e}")))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| Error::Store(format!("cannot read a session row: {e}")))?
+    };
+    for (id, working_directory) in &rows {
+        let project = crate::sessions::resolve_project(projects, working_directory.as_deref());
+        let repository =
+            crate::sessions::resolve_repository(repositories, working_directory.as_deref());
+        tx.execute(
+            "UPDATE session SET project_key = ?1, repository_key = ?2 WHERE id = ?3",
+            params![project.as_str(), repository.as_str(), id],
+        )
+        .map_err(|e| Error::Store(format!("cannot re-resolve the session row: {e}")))?;
+    }
+    let generation = crate::store::ledger_generation::advance(&tx)?;
+    tx.commit()
+        .map_err(|e| Error::Store(format!("cannot commit the session re-resolve: {e}")))?;
+    Ok(ReresolveOutcome {
+        sessions: rows.len(),
+        generation,
+    })
 }

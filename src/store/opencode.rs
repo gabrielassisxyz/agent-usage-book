@@ -13,6 +13,7 @@
 //! - presentation
 //! - provider adapters
 
+use std::collections::BTreeMap;
 use std::path::Path;
 
 use crate::domain::time::MonotonicDuration;
@@ -83,4 +84,37 @@ pub fn read_message_rows(
     rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
         Error::IngestIncomplete(format!("cannot decode opencode message row: {error}"))
     })
+}
+
+/// The working directories the opencode `session` table states, by session id.
+///
+/// The message rows carry no directory; the session row does
+/// (`session.directory`), so the transcript parser joins them here rather
+/// than guessing. An empty directory reads as absent, the way an absent one
+/// does.
+///
+/// A database without a readable `session` table yields no directories rather
+/// than refusing the parse: the directory is additive context for project
+/// resolution, and its absence must not discard the usage the message table
+/// holds.
+pub fn read_session_directories(connection: &rusqlite::Connection) -> BTreeMap<String, String> {
+    let mut statement = match connection.prepare("SELECT id, directory FROM session") {
+        Ok(statement) => statement,
+        Err(_) => return BTreeMap::new(),
+    };
+    let rows = match statement.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    }) {
+        Ok(rows) => rows,
+        Err(_) => return BTreeMap::new(),
+    };
+    let mut directories = BTreeMap::new();
+    for row in rows {
+        if let Ok((id, directory)) = row
+            && !directory.is_empty()
+        {
+            directories.insert(id, directory);
+        }
+    }
+    directories
 }

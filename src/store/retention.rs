@@ -1747,6 +1747,7 @@ mod tests {
                 repository_key: crate::sessions::RepositoryKey::new(
                     crate::sessions::UNKNOWN_REPOSITORY,
                 ),
+                working_directory: None,
                 run_id: None,
             },
         )
