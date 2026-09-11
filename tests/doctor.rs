@@ -300,8 +300,10 @@ fn check_fails_parser_failures() {
     );
 }
 
+/// `aub-n27.10`: the finalized registry contains no `not-yet-available` entry.
+/// `UnmappedAccounts` is a real check over the persisted attribution segments.
 #[test]
-fn check_reports_not_yet_available_unmapped_accounts() {
+fn registry_contains_no_not_yet_available_entry() {
     let state = StateDir::new();
     let config = test_config(state.path());
     let ctx = DoctorContext {
@@ -313,15 +315,194 @@ fn check_reports_not_yet_available_unmapped_accounts() {
         db_open_error: None,
     };
     let outcomes = build_registry(&ctx);
+    assert_eq!(outcomes.len(), CheckName::EXPECTED.len());
+    assert!(
+        agent_usage_book::doctor::missing_checks(&outcomes).is_empty(),
+        "every expected check must be registered"
+    );
+    for outcome in &outcomes {
+        assert!(
+            !matches!(outcome.status, CheckStatus::NotYetAvailable { .. }),
+            "{:?} must not be not-yet-available in the finalized registry",
+            outcome.name
+        );
+    }
+}
+
+/// `aub-n27.10`: injecting one missing registration names exactly that check,
+/// rather than failing a generic assertion nobody can act on.
+#[test]
+fn injected_missing_registration_names_the_check() {
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let mut outcomes = build_registry(&ctx);
+    outcomes.retain(|o| o.name != CheckName::HeuristicDedupCounts);
+    assert_eq!(
+        agent_usage_book::doctor::missing_checks(&outcomes),
+        vec![CheckName::HeuristicDedupCounts]
+    );
+}
+
+fn seed_attribution_segment(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+    target_kind: &str,
+    logical_account: Option<&str>,
+    evidence_class: &str,
+    input_tokens: i64,
+) {
+    conn.execute(
+        "INSERT INTO account_attribution_segment (
+            session_id, target_kind, logical_account, evidence_class,
+            input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, computed_at
+         ) VALUES (?1, ?2, ?3, ?4, ?5, 0, 0, 0, 1000)",
+        rusqlite::params![
+            session_id,
+            target_kind,
+            logical_account,
+            evidence_class,
+            input_tokens
+        ],
+    )
+    .expect("insert attribution segment");
+}
+
+#[test]
+fn check_fails_unmapped_accounts() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    seed_attribution_segment(
+        &conn,
+        "claude-code:s1",
+        "account",
+        Some("work"),
+        "explicit_launcher_or_hook",
+        60,
+    );
+    seed_attribution_segment(
+        &conn,
+        "claude-code:s1",
+        "unknown_account",
+        None,
+        "unattributed",
+        40,
+    );
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
     let outcome = outcomes
         .iter()
         .find(|o| o.name == CheckName::UnmappedAccounts)
         .expect("UnmappedAccounts present");
+    assert_eq!(outcome.owner_module, "attribution");
     assert_eq!(
-        outcome.status,
-        CheckStatus::NotYetAvailable {
-            owning_bead: "aub-mgv.3"
+        outcome.condition,
+        "no canonical usage sits in the unknown-account bucket"
+    );
+    assert!(
+        !outcome.has_repair,
+        "unmapped accounts must declare has_repair = false: --fix must not reattribute"
+    );
+    match &outcome.status {
+        CheckStatus::Fail(reason) => {
+            assert!(
+                reason.contains("input: 40 unattributed of 100 total"),
+                "the failure must name the stable check evidence, per-kind counts: {reason}"
+            );
+            assert!(
+                !reason.contains(state.path().to_str().unwrap()),
+                "the failure must not expose an absolute path: {reason}"
+            );
         }
+        other => panic!("expected Fail naming the unknown-account counts, got {other:?}"),
+    }
+}
+
+#[test]
+fn unmapped_accounts_passes_when_everything_is_attributed() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    seed_attribution_segment(
+        &conn,
+        "claude-code:s1",
+        "account",
+        Some("work"),
+        "explicit_launcher_or_hook",
+        60,
+    );
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::UnmappedAccounts)
+        .expect("UnmappedAccounts present");
+    assert_eq!(outcome.status, CheckStatus::Pass);
+}
+
+#[test]
+fn unmapped_accounts_is_not_applicable_before_any_segment_exists() {
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx_no_db = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes_no_db = build_registry(&ctx_no_db);
+    let outcome_no_db = outcomes_no_db
+        .iter()
+        .find(|o| o.name == CheckName::UnmappedAccounts)
+        .expect("UnmappedAccounts present");
+    assert_eq!(
+        outcome_no_db.status,
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    );
+
+    let conn = open_ledger(state.path());
+    let ctx_empty_db = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes_empty_db = build_registry(&ctx_empty_db);
+    let outcome_empty_db = outcomes_empty_db
+        .iter()
+        .find(|o| o.name == CheckName::UnmappedAccounts)
+        .expect("UnmappedAccounts present");
+    assert_eq!(
+        outcome_empty_db.status,
+        CheckStatus::NotApplicable("no attribution segments have been recorded yet".to_string())
     );
 }
 
@@ -460,7 +641,7 @@ fn check_fails_backup_age() {
         .find(|o| o.name == CheckName::BackupAge)
         .expect("BackupAge present");
     assert!(
-        matches!(outcome.status, CheckStatus::Fail(ref reason) if reason.contains("no backup found"))
+        matches!(outcome.status, CheckStatus::Fail(ref reason) if reason.contains("no verified backup found"))
     );
 }
 
@@ -2238,5 +2419,626 @@ fn meter_anomalies_report_recent_health_without_hiding_history() {
             assert!(detail.contains("current_observation="), "{detail}");
         }
         other => panic!("expected a recent anomaly to fail the check, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests for aub-n27.10: Finalize the doctor registry
+// ---------------------------------------------------------------------------
+//
+// Assumption recorded on the bead: "stable problem code" is the check's stable
+// kebab-case name (`CheckName::as_str`, distinct per check and identical in
+// human and JSON output), asserted below together with the evidence reference
+// and the repair flag. No new `ProblemCode` taxonomy is added: mapping
+// twenty-four heterogeneous check failures onto twenty-nine provider-oriented
+// codes would invent precision the plan never mandates and would change the
+// versioned JSON contract this bead otherwise leaves untouched.
+//
+// Two checks cannot fail on data by design, and say so here rather than
+// through a fabricated fixture:
+// - `MeterErrorClassifications` is a listing, never a failure; its executable
+//   fail case is the unreadable-ledger path.
+// - `UnexplainedResidual`'s store-loading half is covered by the not-applicable
+//   tests; its verdict-to-failure half is forced below through the pure
+//   `rolling_residual_status` mapping over a real computed discrepancy, because
+//   a store-level discrepancy needs a full calibration, cost-model and usage
+//   chain no single-check fixture can honestly seed.
+
+fn seed_observation_with_window(
+    conn: &rusqlite::Connection,
+) -> (
+    agent_usage_book::store::meter_evidence::ObservationRowId,
+    agent_usage_book::store::meter_evidence::WindowRowId,
+) {
+    use agent_usage_book::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+    use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
+    use agent_usage_book::domain::time::{MeasurementBasis, MonotonicDuration};
+    use agent_usage_book::domain::window::{
+        NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
+        WindowSemanticKey,
+    };
+    use agent_usage_book::store::account::observe_account;
+    use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
+    use agent_usage_book::store::meter_evidence::{
+        NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
+        insert_response_evidence, insert_window,
+    };
+    use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
+    use agent_usage_book::store::sampling_policy_snapshot::{
+        ResolvedSamplingPolicy, resolve_policy_snapshot,
+    };
+
+    const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
+        ordinary_cadence: MonotonicDuration::from_millis(300_000),
+        freshness_horizon: MonotonicDuration::from_millis(900_000),
+        reset_edge_policy: String::new(),
+        retry_backoff_policy: String::new(),
+        command_budget: MonotonicDuration::from_millis(60_000),
+        policy_algorithm_version: String::new(),
+    };
+
+    let account =
+        observe_account(conn, "anthropic", "primary", ts(10)).expect("account must insert");
+    let run = start_sample_run(conn, Trigger::Manual, ts(10), "seed").expect("run must insert");
+    let snapshot = resolve_policy_snapshot(conn, account, ts(10), &POLICY)
+        .expect("policy snapshot must insert");
+    let attempt = start_meter_attempt(
+        conn,
+        &NewMeterAttempt {
+            run_id: run,
+            account_id: account,
+            provider: "anthropic".into(),
+            request_started_at: ts(20),
+            credential_context_id: Some("ctx".into()),
+            policy_snapshot_id: snapshot,
+            due_at: ts(19),
+            due_reason: DueReason::OrdinaryCadence,
+            due_basis: None,
+            provider_contract_id: "endpoint-schema-v3".into(),
+            meter_semantics_id: "account-5h-v2".into(),
+        },
+    )
+    .expect("attempt must insert");
+    let evidence_id = insert_response_evidence(
+        conn,
+        &NewMeterResponseEvidence {
+            attempt_id: attempt,
+            response_classification: "200".into(),
+            received_at: ts(30),
+            provider_observed_at_original: None,
+            evidence_capsule: r#"{"windows":[]}"#.into(),
+            capsule_schema_version: "capsule-v1".into(),
+            sanitizer_version: "sanitizer-v1".into(),
+            capture_truncated: false,
+        },
+    )
+    .expect("evidence must insert");
+    let observation_id = insert_observation(
+        conn,
+        &NewMeterObservation {
+            attempt_id: attempt,
+            evidence_id,
+            account_id: account,
+            provider: "anthropic".into(),
+            provider_observed_at: None,
+            received_at: ts(31),
+            measurement_basis: MeasurementBasis::LocallyReceived,
+            observed_plan: Some("max".into()),
+            observed_tier: None,
+            adapter_version: AdapterVersion::new("adapter-v1"),
+            provider_contract_id: ProviderContractId::new("endpoint-schema-v3"),
+            meter_semantics_id: MeterSemanticsId::new("semantics-v1"),
+            normalized_fingerprint: "fp-1".into(),
+        },
+    )
+    .expect("observation must insert");
+    let window_id = insert_window(
+        conn,
+        &NewMeterWindow {
+            observation_id,
+            semantic_key: WindowSemanticKey::new("five_hour"),
+            scope: WindowScope::AccountWide,
+            quota_used: QuotaUsed::new(QuotaFractionPpm::new(250_000).unwrap()),
+            reported_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+                .unwrap(),
+            quantization: QuantizationSemantics::RoundedToNearest,
+            resets_at: ts(100_000).into(),
+            nominal_duration: NominalWindowDuration::from_nanos(18_000_000_000_000),
+        },
+    )
+    .expect("window must insert");
+    (observation_id, window_id)
+}
+
+#[test]
+fn check_fails_adapter_semantics_comparison_age() {
+    use agent_usage_book::domain::authoritative_comparison::{
+        AuthoritativeComparisonVerdict, DocumentedGranularity,
+    };
+    use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
+    use agent_usage_book::domain::window::WindowSemanticKey;
+    use agent_usage_book::store::adapter_semantics_validation::{
+        NewAuthoritativeSurfaceComparison, insert_comparison,
+    };
+
+    let state = StateDir::new();
+    let toml = format!(
+        "[state]\ndir = {:?}\n\n[adapter_semantics]\nmax_comparison_age = \"30m\"\n",
+        state.path()
+    );
+    let (config, _) = resolve(&Overrides::new(), &RealEnv, Some(&toml), "aub.toml").unwrap();
+    let conn = open_ledger(state.path());
+    let (observation_id, window_id) = seed_observation_with_window(&conn);
+    // One hour before now: past the thirty-minute review horizon.
+    let now = ts(1_700_000_000);
+    insert_comparison(
+        &conn,
+        &NewAuthoritativeSurfaceComparison {
+            observation_id,
+            window_id,
+            semantic_key: WindowSemanticKey::new("five_hour"),
+            authoritative_surface: "test surface".into(),
+            documented_granularity: DocumentedGranularity::new(
+                QuotaFractionPpm::new(10_000).unwrap(),
+            ),
+            adapter_quota_used: QuotaUsed::new(QuotaFractionPpm::new(250_000).unwrap()),
+            authoritative_quota_used: QuotaUsed::new(QuotaFractionPpm::new(250_000).unwrap()),
+            read_at: ts(1_700_000_000 - 3_600),
+            verdict: AuthoritativeComparisonVerdict::AgreesWithinGranularity,
+        },
+    )
+    .expect("comparison must insert");
+
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::AdapterSemanticsComparisonAge)
+        .expect("AdapterSemanticsComparisonAge present");
+    assert_eq!(outcome.owner_module, "store::adapter_semantics_validation");
+    assert!(!outcome.has_repair);
+    match &outcome.status {
+        CheckStatus::Fail(reason) => {
+            assert!(
+                reason.contains("past its 1800s review horizon"),
+                "the failure must name the stable evidence, the aged comparison: {reason}"
+            );
+        }
+        other => panic!("expected Fail naming the stale comparison, got {other:?}"),
+    }
+}
+
+fn seed_account_run_policy_attempt(conn: &rusqlite::Connection, now: UtcTimestamp) {
+    conn.execute(
+        "INSERT INTO account (id, logical_name, provider_key, first_observed_at, last_observed_at)
+         VALUES (1, 'sub-test', 'anthropic', ?1, ?1)",
+        [now.unix_nanos()],
+    )
+    .expect("insert account");
+    conn.execute(
+        "INSERT INTO sample_run (id, trigger, started_at, aub_version, configuration_fingerprint)
+         VALUES (1, 'manual', ?1, '0.1.0', 'cfg')",
+        [now.unix_nanos()],
+    )
+    .expect("insert sample_run");
+    conn.execute(
+        "INSERT INTO sampling_policy_snapshot (
+            id, account_id, effective_at, ordinary_cadence_nanos, freshness_horizon_nanos,
+            reset_edge_policy, retry_backoff_policy, command_budget_nanos, policy_algorithm_version
+         ) VALUES (1, 1, ?1, 60000000000, 300000000000, 'none', 'none', 1000000000, 'v1')",
+        [now.unix_nanos()],
+    )
+    .expect("insert policy");
+    conn.execute(
+        "INSERT INTO meter_attempt (
+            id, run_id, account_id, provider, request_started_at, policy_snapshot_id,
+            due_at, due_reason, provider_contract_id, meter_semantics_id
+         ) VALUES (1, 1, 1, 'anthropic', ?1, 1, ?1, 'ordinary_cadence', 'contract-1', 'meter-1')",
+        [now.unix_nanos()],
+    )
+    .expect("insert meter_attempt");
+}
+
+#[test]
+fn check_fails_subscription_identity_change() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let now = ts(1_700_000_000);
+    seed_account_run_policy_attempt(&conn, now);
+    // A `changed` event with no newer stored observation: readings for this
+    // account are being refused right now.
+    conn.execute(
+        "INSERT INTO meter_subscription_change (
+            account_id, kind, previous_identity, current_identity,
+            detecting_attempt_id, detected_at
+         ) VALUES (1, 'changed', 'anthropic:max:fp-old', 'anthropic:pro:fp-new', 1, ?1)",
+        [now.unix_nanos()],
+    )
+    .expect("insert subscription change");
+
+    let toml = format!(
+        "[state]\ndir = {:?}\n\n[[accounts]]\nname = \"sub-test\"\nprovider = \"anthropic\"\n",
+        state.path()
+    );
+    let (config, _) = resolve(&Overrides::new(), &RealEnv, Some(&toml), "aub.toml").unwrap();
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::SubscriptionIdentityChange)
+        .expect("SubscriptionIdentityChange present");
+    assert_eq!(outcome.owner_module, "store::subscription_identity");
+    assert!(
+        !outcome.has_repair,
+        "a changed subscription needs an operator rename, never a --fix repair"
+    );
+    match &outcome.status {
+        CheckStatus::Fail(reason) => {
+            assert!(
+                reason.contains("sub-test")
+                    && reason.contains("subscription changed")
+                    && reason.contains("readings refused"),
+                "the failure must name the stable check evidence, account and refusal: {reason}"
+            );
+        }
+        other => panic!("expected Fail naming the refused subscription, got {other:?}"),
+    }
+}
+
+#[test]
+fn meter_error_classifications_fails_when_the_ledger_will_not_open() {
+    // By design this check is a listing, never a failure, over readable data
+    // (covered by the per-account listing tests above); its executable fail
+    // case is the ledger that exists but will not open.
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: false,
+        db_open_error: Some("database disk image is malformed".to_string()),
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::MeterErrorClassifications)
+        .expect("MeterErrorClassifications present");
+    assert_eq!(outcome.owner_module, "store::meter_attempt");
+    assert!(
+        matches!(outcome.status, CheckStatus::Fail(ref reason) if reason.contains("database disk image is malformed"))
+    );
+}
+
+#[test]
+fn check_fails_unexplained_residual_on_a_computed_discrepancy() {
+    use agent_usage_book::doctor::checks::rolling_residual_status;
+    use agent_usage_book::reconciliation::compute_rolling_residual_health;
+
+    // Controlled evidence: six intervals with a step change, through the
+    // production classifier, so the discrepancy verdict is computed, not built.
+    let intervals = vec![
+        test_reconciled_interval(100, 200, 10_000, 20_000, -10_000, -15_000, -5_000),
+        test_reconciled_interval(200, 300, 10_000, 20_000, -10_000, -15_000, -5_000),
+        test_reconciled_interval(300, 400, 10_000, 20_000, -10_000, -15_000, -5_000),
+        test_reconciled_interval(400, 500, 120_000, 20_000, 100_000, 95_000, 105_000),
+        test_reconciled_interval(500, 600, 120_000, 20_000, 100_000, 95_000, 105_000),
+        test_reconciled_interval(600, 700, 120_000, 20_000, 100_000, 95_000, 105_000),
+    ];
+    let window = MonotonicDuration::from_seconds(86400 * 30);
+    let health = compute_rolling_residual_health(&intervals, window, 5)
+        .expect("a step change over six eligible intervals is a discrepancy");
+
+    // The registry metadata for this check is fixed by its outcome entry;
+    // read it from a real registry so the test pins the shipped values.
+    let state = StateDir::new();
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let registered = build_registry(&ctx)
+        .into_iter()
+        .find(|o| o.name == CheckName::UnexplainedResidual)
+        .expect("UnexplainedResidual present");
+    assert_eq!(registered.owner_module, "reconciliation");
+    assert_eq!(
+        registered.condition,
+        "rolling residual stays within its explained bound"
+    );
+    assert!(!registered.has_repair);
+
+    match rolling_residual_status(Some(&health)) {
+        CheckStatus::Fail(reason) => {
+            assert!(
+                reason.contains("rolling residual discrepancy")
+                    && reason.contains("[240000 .. 300000]")
+                    && reason.contains("step change")
+                    && reason.contains("aub doctor missing-active-calibrations"),
+                "the failure must name the stable check evidence, interval, pattern and pointer: {reason}"
+            );
+        }
+        other => panic!("expected Fail for a computed discrepancy, got {other:?}"),
+    }
+}
+
+#[test]
+fn human_and_versioned_json_results_agree_on_names_states_reasons_and_repairs() {
+    use agent_usage_book::doctor::{CheckOutcome, DoctorReport};
+    use agent_usage_book::logging::RunId;
+    use agent_usage_book::presentation::{doctor_report_json, render_doctor_report};
+    use agent_usage_book::report::{LedgerGeneration, ReportMetadata};
+
+    let now = ts(1_700_000_000);
+    let outcomes = vec![
+        CheckOutcome {
+            name: CheckName::ConfigurationValidity,
+            owner_module: "config",
+            condition: "the resolved configuration has no invalid or conflicting key",
+            has_repair: false,
+            status: CheckStatus::Pass,
+        },
+        CheckOutcome {
+            name: CheckName::PendingEvidence,
+            owner_module: "store::spool",
+            condition: "no meter evidence is stuck undrained in the pending spool",
+            has_repair: true,
+            status: CheckStatus::Fail("2 pending record(s) undrained".to_string()),
+        },
+        CheckOutcome {
+            name: CheckName::TranscriptRoots,
+            owner_module: "doctor",
+            condition: "every configured transcript root exists and is reachable",
+            has_repair: false,
+            status: CheckStatus::NotApplicable("no transcript sources configured".to_string()),
+        },
+        CheckOutcome {
+            name: CheckName::MeterAnomalies,
+            owner_module: "store::window_anomaly",
+            condition: "no meter window anomaly was recorded inside the configured recent horizon",
+            has_repair: false,
+            status: CheckStatus::PassWithDetail("0 window anomalies recorded".to_string()),
+        },
+    ];
+    let report = DoctorReport {
+        metadata: ReportMetadata::new(now, now, LedgerGeneration::new(1), None),
+        outcomes: outcomes.clone(),
+        residual: None,
+    };
+
+    let text = render_doctor_report(&report);
+    let json = doctor_report_json(&report, RunId::new(now));
+    let value: serde_json::Value = serde_json::from_str(&json).expect("valid json");
+    let checks = value["checks"].as_array().expect("checks array");
+
+    fn text_marker_to_label(marker: &str) -> &str {
+        match marker {
+            "PASS" => "pass",
+            "FAIL" => "fail",
+            "N/A " => "not_applicable",
+            other => panic!("unexpected text marker {other:?}"),
+        }
+    }
+
+    for outcome in &outcomes {
+        let entry = checks
+            .iter()
+            .find(|c| c["name"] == outcome.name.as_str())
+            .unwrap_or_else(|| panic!("JSON must contain {:?}", outcome.name));
+        let expected_label = outcome.status.label();
+        assert_eq!(entry["status"], expected_label);
+        assert_eq!(entry["has_repair"], outcome.has_repair);
+        let expected_reason = match &outcome.status {
+            CheckStatus::Fail(reason)
+            | CheckStatus::NotApplicable(reason)
+            | CheckStatus::PassWithDetail(reason) => Some(reason.as_str()),
+            CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => None,
+        };
+        match expected_reason {
+            Some(reason) => assert_eq!(entry["reason"], reason),
+            None => assert!(entry.get("reason").is_none()),
+        }
+
+        let marker_line = text
+            .lines()
+            .find(|line| line.contains(outcome.name.as_str()))
+            .unwrap_or_else(|| panic!("text must contain {:?}", outcome.name));
+        let marker = &marker_line[3..7];
+        assert_eq!(text_marker_to_label(marker), expected_label);
+        if let Some(reason) = expected_reason {
+            assert!(
+                marker_line.contains(reason),
+                "text line must carry the same reason: {marker_line}"
+            );
+        }
+        if outcome.has_repair {
+            assert!(
+                marker_line.contains("[repairable with --fix]"),
+                "text line must carry the same repair availability: {marker_line}"
+            );
+        }
+    }
+}
+
+#[test]
+fn quarantine_checks_report_counts_never_paths_or_content() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let source_file = state
+        .path()
+        .join("transcripts")
+        .join("secret-project")
+        .join("session.jsonl");
+    conn.execute(
+        "INSERT INTO ingest_quarantine (
+            source_file, parser, failure_class, excerpt_hash, first_observed, last_observed
+         ) VALUES (?1, 'claude-code', 'malformed_json', 'hash1', 1000, 1000)",
+        [source_file.to_str().unwrap()],
+    )
+    .expect("insert parser quarantine");
+    conn.execute(
+        "INSERT INTO ingest_quarantine (
+            source_file, parser, failure_class, excerpt_hash, first_observed, last_observed
+         ) VALUES (?1, 'codex', 'dedup_collision', 'hash2', 1000, 1000)",
+        [source_file.to_str().unwrap()],
+    )
+    .expect("insert dedup quarantine");
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    for name in [CheckName::ParserFailures, CheckName::HeuristicDedupCounts] {
+        let outcome = outcomes
+            .iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("{name:?} present"));
+        match &outcome.status {
+            CheckStatus::Fail(reason) => {
+                assert!(reason.contains("1 record(s) quarantined"), "{reason}");
+                assert!(
+                    !reason.contains("secret-project"),
+                    "quarantine checks must report counts, never source paths: {reason}"
+                );
+                assert!(
+                    !reason.contains(state.path().to_str().unwrap()),
+                    "quarantine checks must not expose absolute paths: {reason}"
+                );
+            }
+            other => panic!("expected Fail for {name:?}, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn doctor_reasons_never_carry_credential_values() {
+    let state = StateDir::new();
+    const VAR: &str = "AUB_N27_10_TEST_CREDENTIAL_VALUE";
+    const SECRET: &str = "e2e-planted-credential-value-9f3c";
+    let toml = format!(
+        "[state]\ndir = {:?}\n\n[[accounts]]\nname = \"cred-test\"\nprovider = \"opencode\"\nopencode_workspace = \"wrk_test\"\ncredential = {{ kind = \"env\", name = {:?} }}\n",
+        state.path(),
+        VAR
+    );
+    let (config, _) = resolve(&Overrides::new(), &RealEnv, Some(&toml), "aub.toml").unwrap();
+    let conn = open_ledger(state.path());
+
+    let ctx = |timestamp: UtcTimestamp| DoctorContext {
+        config: &config,
+        timestamp,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+
+    // SAFETY: VAR is unique to this test and read by no other code in this
+    // crate, so no concurrently running test can observe or race it.
+    unsafe {
+        std::env::set_var(VAR, SECRET);
+    }
+    let with_secret = build_registry(&ctx(ts(1_700_000_000)));
+    unsafe {
+        std::env::remove_var(VAR);
+    }
+    let without_secret = build_registry(&ctx(ts(1_700_000_000)));
+
+    for outcomes in [&with_secret, &without_secret] {
+        for outcome in outcomes {
+            let reason = match &outcome.status {
+                CheckStatus::Fail(reason)
+                | CheckStatus::NotApplicable(reason)
+                | CheckStatus::PassWithDetail(reason) => reason.as_str(),
+                CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => continue,
+            };
+            assert!(
+                !reason.contains(SECRET),
+                "{:?} must never expose a credential value: {reason}",
+                outcome.name
+            );
+        }
+    }
+}
+
+#[test]
+fn registry_reasons_contain_no_absolute_state_path() {
+    // Locks criterion 5 for the check-owned formatting: over a degraded state
+    // exercising every path-carrying check, no reason may contain the state
+    // directory (which lives under the operator's home).
+    let state = StateDir::new();
+    let pending_dir = state.path().join("pending");
+    fs::create_dir_all(&pending_dir).expect("create pending dir");
+    fs::write(pending_dir.join("attempt-1.json"), "{}").expect("write pending record");
+
+    let toml = format!(
+        "[state]\ndir = {:?}\n\n[[transcripts]]\nname = \"ghost\"\nroot = {:?}\npattern = \"**/*.jsonl\"\n\n[backup]\ndestination = {:?}\n",
+        state.path(),
+        state.path().join("does-not-exist"),
+        state.path().join("missing-archive"),
+    );
+    let (config, _) = resolve(&Overrides::new(), &RealEnv, Some(&toml), "aub.toml").unwrap();
+    let conn = open_ledger(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let state_str = state.path().to_str().unwrap();
+    for outcome in &outcomes {
+        let reason = match &outcome.status {
+            CheckStatus::Fail(reason)
+            | CheckStatus::NotApplicable(reason)
+            | CheckStatus::PassWithDetail(reason) => reason.as_str(),
+            CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => continue,
+        };
+        assert!(
+            !reason.contains(state_str),
+            "{:?} must not expose an absolute path: {reason}",
+            outcome.name
+        );
+    }
+    // And the exercised checks do fail, so the scan above is not vacuous.
+    for name in [
+        CheckName::PendingEvidence,
+        CheckName::TranscriptRoots,
+        CheckName::BackupAge,
+    ] {
+        let outcome = outcomes
+            .iter()
+            .find(|o| o.name == name)
+            .unwrap_or_else(|| panic!("{name:?} present"));
+        assert!(
+            matches!(outcome.status, CheckStatus::Fail(_)),
+            "{name:?} must fail in this degraded state"
+        );
     }
 }

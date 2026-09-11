@@ -8,12 +8,15 @@
 //! outside a module; a check written beside the evidence sees the failure the module
 //! itself would flag.
 //!
-//! [`CheckName::EXPECTED`] is the design's full eighteen-condition list, encoded once
+//! [`CheckName::EXPECTED`] is the design's full twenty-four-condition list, encoded once
 //! so the registry can be compared against it rather than trusted by inspection. An
 //! entry with no registered [`CheckOutcome`] is a failing build
-//! ([`missing_checks`]), and an entry whose owning subsystem is not built yet is
-//! registered as [`CheckStatus::NotYetAvailable`] naming the bead that will own it,
-//! never silently omitted.
+//! ([`missing_checks`]). During staged implementation an entry whose owning
+//! subsystem was not built yet could be registered as
+//! [`CheckStatus::NotYetAvailable`] naming the bead that would own it, never
+//! silently omitted; the finalized registry (`aub-n27.10`) contains no such
+//! entry, and the variant survives only so renderers keep handling the state
+//! explicitly rather than through a wildcard.
 //!
 //! May not depend on:
 //! - provider adapters directly (a check reads the store and the config, never a
