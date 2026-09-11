@@ -13,14 +13,14 @@
 //! the field's meaning.
 
 use crate::domain::rate_card::{
-    BillingBasis, CurrencyCode, RateCardDraft, RateCardParseError, ReviewDuePolicy, TokenClass,
-    parse_rate_micros,
+    BillingBasis, CurrencyCode, HoursParseError, RateCardDraft, RateCardParseError,
+    ReviewDuePolicy, Schedule, TokenClass, parse_day_name, parse_hours_utc, parse_rate_micros,
 };
 use crate::domain::time::{UtcDate, UtcTimestamp};
 
 /// The keys a card entry may carry. Anything else is refused, so a field the
 /// importer silently drops is impossible by construction.
-const CARD_KEYS: [&str; 11] = [
+const CARD_KEYS: [&str; 12] = [
     "vendor",
     "model",
     "token_class",
@@ -32,7 +32,11 @@ const CARD_KEYS: [&str; 11] = [
     "published_at",
     "source",
     "review_due",
+    "schedule",
 ];
+
+/// The keys a card's `schedule` table may carry.
+const SCHEDULE_KEYS: [&str; 2] = ["days", "hours_utc"];
 
 /// Why a rate book could not be parsed. The card index (0-based, in file
 /// order) names where, so the operator fixes one entry per message.
@@ -113,7 +117,65 @@ pub fn parse(text: &str) -> Result<RateBook, RateBookError> {
         }
         parsed.push(parse_card(index, card)?);
     }
+    check_consistency(&parsed)?;
     Ok(RateBook { cards: parsed })
+}
+
+/// Refuses a book in which two cards could price the same instant: for every
+/// (vendor, model, class) and every date, at most one unscheduled card, and no
+/// two scheduled cards whose day sets intersect and whose hour ranges overlap.
+/// A default beside its peak rows is the intended shape and always passes: a
+/// scheduled card never conflicts with an unscheduled one.
+fn check_consistency(cards: &[RateCardDraft]) -> Result<(), RateBookError> {
+    for (later, card) in cards.iter().enumerate() {
+        for (earlier, other) in cards[..later].iter().enumerate() {
+            if card.vendor != other.vendor
+                || card.model != other.model
+                || card.token_class != other.token_class
+            {
+                continue;
+            }
+            if !effective_overlap(
+                card.effective_start,
+                card.effective_end,
+                other.effective_start,
+                other.effective_end,
+            ) {
+                continue;
+            }
+            let conflict = match (&card.schedule, &other.schedule) {
+                (None, None) => true,
+                (Some(first), Some(second)) => first.overlaps(second),
+                (None, Some(_)) | (Some(_), None) => false,
+            };
+            if conflict {
+                return Err(RateBookError {
+                    card_index: later,
+                    reason: format!(
+                        "overlaps card {earlier} for {}/{}/{}: both cards are in force on the same date",
+                        card.vendor,
+                        card.model,
+                        card.token_class.as_str(),
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two effective intervals overlap when each starts before the other ends.
+/// `effective_end` is exclusive, so a row starting on another's end day hands
+/// off rather than overlapping.
+fn effective_overlap(
+    first_start: UtcDate,
+    first_end: Option<UtcDate>,
+    second_start: UtcDate,
+    second_end: Option<UtcDate>,
+) -> bool {
+    let first_before_second_end = second_end.is_none_or(|end| first_start < end);
+    let second_before_first_end = first_end.is_none_or(|end| second_start < end);
+    first_before_second_end && second_before_first_end
 }
 
 fn required<'a>(index: usize, card: &'a toml::Table, key: &str) -> Result<&'a str, RateBookError> {
@@ -192,6 +254,10 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
     })?;
     let effective_end = optional_date(card, index, "effective_end")?;
     let review_due = optional_date(card, index, "review_due")?;
+    let schedule = match card.get("schedule") {
+        None => None,
+        Some(value) => Some(parse_schedule(index, value)?),
+    };
     let published_at = match optional_string(card, "published_at") {
         None => None,
         Some(text) => Some(parse_published_at(index, &text)?),
@@ -206,6 +272,7 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
         billing_basis,
         effective_start,
         effective_end,
+        schedule,
         publication: crate::domain::rate_card::Publication {
             source,
             published_at,
@@ -214,6 +281,81 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
             None => ReviewDuePolicy::None,
             Some(date) => ReviewDuePolicy::On(date),
         },
+    })
+}
+
+/// Parses an optional `schedule = { days = [...], hours_utc = "HH:MM-HH:MM" }`
+/// table. Every refusal names the card index and the schedule field, so the
+/// operator fixes one entry per message.
+fn parse_schedule(index: usize, value: &toml::Value) -> Result<Schedule, RateBookError> {
+    let table = value.as_table().ok_or_else(|| RateBookError {
+        card_index: index,
+        reason: "schedule must be a table with days and hours_utc".to_string(),
+    })?;
+    for key in table.keys() {
+        if !SCHEDULE_KEYS.contains(&key.as_str()) {
+            return Err(RateBookError {
+                card_index: index,
+                reason: format!("unknown schedule key {key:?}; known keys are {SCHEDULE_KEYS:?}"),
+            });
+        }
+    }
+    let days_value = table.get("days").ok_or_else(|| RateBookError {
+        card_index: index,
+        reason: "schedule is missing days".to_string(),
+    })?;
+    let days_array = days_value.as_array().ok_or_else(|| RateBookError {
+        card_index: index,
+        reason: "schedule.days must be an array of day names".to_string(),
+    })?;
+    if days_array.is_empty() {
+        return Err(RateBookError {
+            card_index: index,
+            reason: "schedule.days must name at least one day".to_string(),
+        });
+    }
+    let mut days = Vec::with_capacity(days_array.len());
+    for day in days_array {
+        let name = day.as_str().ok_or_else(|| RateBookError {
+            card_index: index,
+            reason: "schedule.days must be an array of day names".to_string(),
+        })?;
+        days.push(parse_day_name(name).ok_or_else(|| RateBookError {
+            card_index: index,
+            reason: format!(
+                "schedule.days {name:?} is not one of mon | tue | wed | thu | fri | sat | sun"
+            ),
+        })?);
+    }
+    let hours_text = table
+        .get("hours_utc")
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| RateBookError {
+            card_index: index,
+            reason: "schedule is missing hours_utc".to_string(),
+        })?;
+    let (start, end) = parse_hours_utc(hours_text).map_err(|error| {
+        let reason = match error {
+            HoursParseError::Malformed(_) => {
+                format!("schedule.hours_utc {hours_text:?} is not HH:MM-HH:MM")
+            }
+            HoursParseError::StartNotBeforeEnd(_) => {
+                format!("schedule.hours_utc {hours_text:?} starts at or after it ends")
+            }
+            HoursParseError::CrossesMidnight(_) => {
+                format!(
+                    "schedule.hours_utc {hours_text:?} crosses midnight; write it as two cards"
+                )
+            }
+        };
+        RateBookError {
+            card_index: index,
+            reason,
+        }
+    })?;
+    Schedule::new(&days, start, end).ok_or_else(|| RateBookError {
+        card_index: index,
+        reason: "schedule.days and schedule.hours_utc do not form a valid window".to_string(),
     })
 }
 
@@ -410,5 +552,141 @@ effective_start = "2026-01-01"
         let error = parse(&MINIMAL_CARD.replace("vendor = \"anthropic\"", "vendor_missing = true"))
             .expect_err("missing vendor must be refused");
         assert!(error.reason.contains("vendor"), "{}", error.reason);
+    }
+
+    const SCHEDULED_CARD: &str = r#"
+[[card]]
+vendor = "ollama"
+model = "deepseek-v4-flash"
+token_class = "input"
+rate = "0.44"
+currency = "USD"
+billing_basis = "per_million_tokens"
+effective_start = "2026-09-07"
+schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:00" }
+"#;
+
+    fn unscheduled_card(model: &str, rate: &str, end: Option<&str>) -> String {
+        let end = match end {
+            None => String::new(),
+            Some(day) => format!("effective_end = \"{day}\"\n"),
+        };
+        format!(
+            "[[card]]\nvendor = \"ollama\"\nmodel = \"{model}\"\ntoken_class = \"input\"\n\
+             rate = \"{rate}\"\ncurrency = \"USD\"\nbilling_basis = \"per_million_tokens\"\n\
+             effective_start = \"2026-09-07\"\n{end}\n"
+        )
+    }
+
+    #[test]
+    fn a_scheduled_card_parses_its_window() {
+        let book = parse_ok(&format!("{MINIMAL_CARD}{SCHEDULED_CARD}"));
+        assert_eq!(book.cards.len(), 2);
+        let scheduled = &book.cards[1];
+        let window = scheduled.schedule.expect("schedule must parse");
+        assert_eq!(window.days_iso(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(window.describe(), "peak mon-fri 12:00-18:00 UTC");
+        assert!(book.cards[0].schedule.is_none());
+    }
+
+    #[test]
+    fn schedule_refusals_name_the_card_index_and_the_field() {
+        let unknown_day = SCHEDULED_CARD.replace("\"tue\"", "\"funday\"");
+        let error = parse(&format!("{MINIMAL_CARD}{unknown_day}"))
+            .expect_err("unknown day must be refused");
+        assert_eq!(error.card_index, 1);
+        assert!(error.reason.contains("schedule.days"), "{}", error.reason);
+        assert!(error.reason.contains("funday"), "{}", error.reason);
+
+        let empty_days = SCHEDULED_CARD.replace(
+            "days = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]",
+            "days = []",
+        );
+        let error = parse(&format!("{MINIMAL_CARD}{empty_days}"))
+            .expect_err("empty days must be refused");
+        assert_eq!(error.card_index, 1);
+        assert!(error.reason.contains("schedule.days"), "{}", error.reason);
+
+        let zero_window = SCHEDULED_CARD.replace("12:00-18:00", "12:00-12:00");
+        let error = parse(&format!("{MINIMAL_CARD}{zero_window}"))
+            .expect_err("start not before end must be refused");
+        assert_eq!(error.card_index, 1);
+        assert!(error.reason.contains("schedule.hours_utc"), "{}", error.reason);
+
+        let overnight = SCHEDULED_CARD.replace("12:00-18:00", "22:00-02:00");
+        let error = parse(&format!("{MINIMAL_CARD}{overnight}"))
+            .expect_err("a window crossing midnight must be refused");
+        assert_eq!(error.card_index, 1);
+        assert!(error.reason.contains("schedule.hours_utc"), "{}", error.reason);
+        assert!(error.reason.contains("two cards"), "{}", error.reason);
+
+        let malformed = SCHEDULED_CARD.replace("12:00-18:00", "noon");
+        let error = parse(&format!("{MINIMAL_CARD}{malformed}"))
+            .expect_err("malformed hours must be refused");
+        assert_eq!(error.card_index, 1);
+        assert!(error.reason.contains("schedule.hours_utc"), "{}", error.reason);
+    }
+
+    #[test]
+    fn a_default_beside_its_peak_rows_is_consistent() {
+        let book = format!(
+            "{}{}{}",
+            unscheduled_card("deepseek-v4-flash", "0.22", None),
+            SCHEDULED_CARD,
+            SCHEDULED_CARD.replace("deepseek-v4-flash", "deepseek-v4-pro"),
+        );
+        assert_eq!(parse(&book).expect("default beside peaks must pass").cards.len(), 3);
+    }
+
+    #[test]
+    fn two_unscheduled_open_ended_rows_for_one_triple_are_refused() {
+        let book = format!(
+            "{}{}",
+            unscheduled_card("deepseek-v4-flash", "0.22", None),
+            unscheduled_card("deepseek-v4-flash", "0.30", None),
+        );
+        let error = parse(&book).expect_err("two open-ended defaults must be refused");
+        assert_eq!(error.card_index, 1);
+        assert!(error.reason.contains("card 0"), "{}", error.reason);
+    }
+
+    #[test]
+    fn two_scheduled_rows_overlapping_on_a_shared_day_are_refused() {
+        let second = SCHEDULED_CARD.replace("12:00-18:00", "17:00-20:00");
+        let book = format!(
+            "{}{}{}",
+            unscheduled_card("deepseek-v4-flash", "0.22", None),
+            SCHEDULED_CARD,
+            second,
+        );
+        let error = parse(&book).expect_err("overlapping peaks must be refused");
+        assert_eq!(error.card_index, 2);
+        assert!(error.reason.contains("card 1"), "{}", error.reason);
+    }
+
+    #[test]
+    fn two_scheduled_rows_sharing_hours_on_disjoint_days_are_accepted() {
+        let weekend = SCHEDULED_CARD.replace(
+            "days = [\"mon\", \"tue\", \"wed\", \"thu\", \"fri\"]",
+            "days = [\"sat\", \"sun\"]",
+        );
+        let book = format!(
+            "{}{}{}",
+            unscheduled_card("deepseek-v4-flash", "0.22", None),
+            SCHEDULED_CARD,
+            weekend,
+        );
+        assert_eq!(parse(&book).expect("disjoint days must pass").cards.len(), 3);
+    }
+
+    #[test]
+    fn a_handoff_between_two_unscheduled_rows_is_not_an_overlap() {
+        let handoff = format!(
+            "{}[[card]]\nvendor = \"ollama\"\nmodel = \"deepseek-v4-flash\"\ntoken_class = \"input\"\n\
+             rate = \"0.30\"\ncurrency = \"USD\"\nbilling_basis = \"per_million_tokens\"\n\
+             effective_start = \"2026-09-07\"\n\n",
+            unscheduled_card("deepseek-v4-flash", "0.22", Some("2026-09-07")),
+        );
+        assert_eq!(parse(&handoff).expect("a handoff must pass").cards.len(), 2);
     }
 }

@@ -128,3 +128,5 @@ quantity, documented here with its reason for exclusion:
 - `Publication`: provenance descriptor for one rate card, a source reference and a publication instant with absence explicit, not a quantity.
 - `RateCardDraft`: the import payload for one rate component, a composite record whose rate is stored as exact integer micros rather than as a measured-quantity newtype; the monetary arithmetic stays in the money module.
 - `RateCard`: a persisted rate card, the storage row identity plus import stamp plus draft; composite record, not a quantity.
+- `Schedule`: the time-of-day window inside which a rate card applies, an ISO weekday set plus a half-open UTC minute window with a validated constructor; a window descriptor, not a quantity.
+- `HoursParseError`: error enum for schedule window parse failures.

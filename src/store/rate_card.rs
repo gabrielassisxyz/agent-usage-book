@@ -249,6 +249,7 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
             billing_basis,
             effective_start,
             effective_end,
+            schedule: None,
             publication: Publication {
                 source,
                 published_at: published_at.map(UtcTimestamp::from_unix_nanos),

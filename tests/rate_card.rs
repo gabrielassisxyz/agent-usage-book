@@ -196,6 +196,7 @@ fn the_effective_book_is_the_one_true_today() {
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-08-31").unwrap(),
         effective_end: None,
+        schedule: None,
         publication: agent_usage_book::domain::rate_card::Publication {
             source: Some("claude-api reference".into()),
             published_at: Some(UtcDate::parse("2026-06-24").unwrap().start()),
