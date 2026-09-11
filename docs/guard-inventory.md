@@ -209,6 +209,9 @@ Beads whose text matched a marker but carry no standing break-proof, with
 the reason. A matched bead must have a row above or an entry here; the
 consistency check enforces exactly that.
 
+- `aub-8av3`: the rule it proves cannot fail yet, which is the bead. Its own
+  acceptance criteria commission the row, so the row arrives with the fix and
+  this entry goes when it does.
 - `aub-lqe.3`: the parser-side mutation criteria run the other way (the
   parser must survive generated mutations, not fail under a removed rule).
   Covered by the parser contract suites, not by a break-proof.
