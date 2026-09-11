@@ -529,6 +529,19 @@ mode_consistency() {
         case "$scope" in shell|cargo|e2e) ;; *) echo "consistency: $guard: bad scope $scope" >&2; fail=1 ;; esac
         case "$mut" in neuter|sed|append|plant|write|delete|replace|python|none|oc56) ;; *) echo "consistency: $guard: bad mutation kind $mut" >&2; fail=1 ;; esac
         case "$sib_expect" in 0|nonzero) ;; *) echo "consistency: $guard: bad sibling expectation $sib_expect" >&2; fail=1 ;; esac
+        # A python row's script is expanded with printf %b like every other
+        # mutation argument, so a \n written inside one of its own string
+        # literals becomes a real newline and truncates the literal. The row
+        # then dies at run time as an unreadable ERROR instead of a verdict,
+        # leaving its guard silently unverified.
+        if [ "$mut" = "python" ]; then
+            local mut_arg
+            mut_arg="$(row_field "$line" 7)"
+            if ! expand_pct_b "$mut_arg" | python3 -c 'import sys; compile(sys.stdin.read(), "<row>", "exec")' 2>/dev/null; then
+                echo "consistency: $guard: python mutation does not compile once escapes are expanded" >&2
+                fail=1
+            fi
+        fi
         if grep -qxF "$guard" "$seen" 2>/dev/null; then
             echo "consistency: duplicate guard id $guard" >&2
             fail=1
