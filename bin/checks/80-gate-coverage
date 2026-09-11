@@ -20,6 +20,7 @@ declared_checks=(
     30-test
     40-audit
     45-boundary-rules
+    46-boundary-rules-selftest
     50-prose-guard
     55-coefficient-tombstone
     60-e2e
@@ -64,6 +65,7 @@ agents_doc_names=(
     "30-test:test"
     "40-audit:dependency audit"
     "45-boundary-rules:boundary rules"
+    "46-boundary-rules-selftest:boundary rules and their selftest"
     "50-prose-guard:prose guard (\`bin/slop-guard\`)"
     "60-e2e:e2e"
     "70-quantity-inventory:quantity inventory"

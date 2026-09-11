@@ -91,7 +91,7 @@ bin/slop-guard
 ```
 
 `bin/ci` is the full gate: toolchain identity, format (`cargo fmt`), lint (`cargo clippy`),
-test, dependency audit, boundary rules, prose guard (`bin/slop-guard`), e2e,
+test, dependency audit, boundary rules and their selftest, prose guard (`bin/slop-guard`), e2e,
 quantity inventory, commit protocol, pane work cycle, batch-verify close, and gate
 coverage. It is the exact thing CI runs, so green locally means green in CI, which is
 true only because the first check refuses to let the rest run under a different compiler.
