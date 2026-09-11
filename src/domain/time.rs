@@ -76,6 +76,24 @@ impl UtcTimestamp {
         UtcDate::from_days_since_epoch(self.0.div_euclid(86_400 * 1_000_000_000))
     }
 
+    /// The RFC 3339 UTC form (`YYYY-MM-DDTHH:MM:SS.nnnnnnnnnZ`), the inverse
+    /// of [`parse_rfc3339`]: whatever renders here parses back to the same
+    /// instant. A timestamp is a label here, not a quantity, so the text is
+    /// produced here rather than through a rendering helper.
+    pub fn to_rfc3339(self) -> String {
+        const DAY_NANOS: i64 = 86_400 * 1_000_000_000;
+        let date = self.utc_date();
+        let day_nanos = self.0.rem_euclid(DAY_NANOS);
+        let hour = day_nanos / 3_600_000_000_000;
+        let minute = day_nanos % 3_600_000_000_000 / 60_000_000_000;
+        let second = day_nanos % 60_000_000_000 / 1_000_000_000;
+        let nanos = day_nanos % 1_000_000_000;
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+            date.year, date.month, date.day, hour, minute, second, nanos
+        )
+    }
+
     /// The absolute difference between two timestamps, in nanoseconds.
     fn abs_diff_nanos(self, other: UtcTimestamp) -> u64 {
         self.0.abs_diff(other.0)
@@ -777,11 +795,44 @@ mod calendar_tests {
         assert_eq!(zulu, plus_zero);
     }
 
+    /// Rendering inverts parsing: fixed instants render to their known text,
+    /// and rendered text parses back to the same instant, including a
+    /// pre-epoch instant and a day boundary.
+    #[test]
+    fn rendered_timestamps_parse_back_to_the_same_instant() {
+        assert_eq!(
+            UtcTimestamp::from_unix_nanos(0).to_rfc3339(),
+            "1970-01-01T00:00:00.000000000Z"
+        );
+        assert_eq!(
+            UtcTimestamp::from_unix_nanos(-1).to_rfc3339(),
+            "1969-12-31T23:59:59.999999999Z"
+        );
+        for text in [
+            "2026-08-30T14:26:29.342Z",
+            "2026-08-30T23:59:59.999999999Z",
+            "2026-02-28T00:00:00Z",
+            "2028-02-29T12:00:00.000000001Z",
+        ] {
+            let parsed = UtcTimestamp::parse_rfc3339(text).unwrap();
+            assert_eq!(
+                UtcTimestamp::parse_rfc3339(&parsed.to_rfc3339()),
+                Some(parsed),
+                "{text} must survive a render round trip"
+            );
+        }
+        // Planted negative: rendering must not drop the fraction, or two
+        // distinct instants a second apart in nanos would print identically.
+        assert_ne!(
+            UtcTimestamp::from_unix_nanos(1).to_rfc3339(),
+            UtcTimestamp::from_unix_nanos(2).to_rfc3339()
+        );
+    }
+
     /// The planted negative: a date-only string, an impossible day and a missing
     /// zone are all refused rather than guessed.
     #[test]
-    fn unreadable_timestamps_are_none_not_guessed() {
-        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30"), None);
+    fn unreadable_timestamps_are_none_not_guessed() {        assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30"), None);
         assert_eq!(UtcTimestamp::parse_rfc3339("2026-02-30T00:00:00Z"), None);
         assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30T14:26:29"), None);
         assert_eq!(UtcTimestamp::parse_rfc3339("2026-08-30T24:00:00Z"), None);
