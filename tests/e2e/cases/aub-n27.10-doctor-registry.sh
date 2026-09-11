@@ -215,7 +215,7 @@ case_assertions() {
     # Step 2: the versioned JSON carries every expected check name.
     assert_exit 0 2
     assert_json_field 2 "command" "doctor"
-    assert_json_field 2 "schema" "4"
+    assert_json_field 2 "schema" "5"
     for name in configuration-validity sqlite-and-schema-health strict-and-constraint-integrity pending-evidence sampling-cadence unresolved-authentication transcript-roots parser-failures unmapped-accounts missing-active-calibrations stale-rate-cards projection-versus-database-generation backup-age meter-anomalies unexplained-residual heuristic-dedup-counts clock-skew local-filesystem-and-wal-suitability accumulated-diagnostic-material adapter-semantics-comparison-age last-sample-tick sampling-failure-counts meter-error-classifications subscription-identity-change; do
         assert_stdout_contains 2 "\"name\":\"$name\""
     done
