@@ -1,13 +1,19 @@
 //! The registered checks: the seven this bead owns (sampling cadence, unresolved
 //! authentication, transcript roots, backup age, projection versus database
-//! generation, clock skew, missing active calibrations), the twelve whose evidence
-//! belongs elsewhere but whose subsystem already exists and is read here (including
-//! `MeterAnomalies`, `aub-eun.14`'s own read of `store::window_anomaly`), and the
-//! one not-yet-available placeholder naming the bead that will own it.
+//! generation, clock skew, missing active calibrations), and the seventeen whose
+//! evidence belongs elsewhere but whose subsystem already exists and is read here
+//! (including `MeterAnomalies`, `aub-eun.14`'s own read of `store::window_anomaly`,
+//! and `UnmappedAccounts`, `aub-mgv.3`'s own read of
+//! `store::account_attribution_segment` through `attribution::quality`).
 //!
 //! Every check is read-only: `doctor` performs no network operation and no check
 //! here writes to the ledger. [`super::fix`] is the only writer, and only under
 //! `--fix`.
+//!
+//! A check's reason names logical identifiers (account names, transcript source
+//! names, counts) and never an absolute path, a credential value, or transcript
+//! content: the state directory and the credential paths live under the
+//! operator's home, so printing them would print the home (PLAN.md 37).
 
 use std::path::PathBuf;
 
@@ -54,15 +60,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         unresolved_authentication(ctx),
         transcript_roots(ctx),
         parser_failures(ctx),
-        CheckOutcome {
-            name: CheckName::UnmappedAccounts,
-            owner_module: "attribution",
-            condition: "every observed account maps to a configured one",
-            has_repair: false,
-            status: CheckStatus::NotYetAvailable {
-                owning_bead: "aub-mgv.3",
-            },
-        },
+        unmapped_accounts(ctx),
         missing_active_calibrations(ctx),
         stale_rate_cards(ctx),
         projection_versus_database_generation(ctx),
@@ -155,7 +153,7 @@ fn condition_of(name: CheckName) -> &'static str {
         CheckName::UnresolvedAuthentication => "every configured account's credential resolves",
         CheckName::TranscriptRoots => "every configured transcript root exists and is reachable",
         CheckName::ParserFailures => "no transcript record is quarantined for a parser failure",
-        CheckName::UnmappedAccounts => "every observed account maps to a configured one",
+        CheckName::UnmappedAccounts => "no canonical usage sits in the unknown-account bucket",
         CheckName::MissingActiveCalibrations => {
             "every scope with a fitted calibration has one currently active"
         }
@@ -207,9 +205,11 @@ fn condition_of(name: CheckName) -> &'static str {
 /// [`CheckName::ParserFailures`] and [`CheckName::HeuristicDedupCounts`], since
 /// both live in the same rebuilt `ingest_quarantine` table
 /// (`store::retention::RebuildGroup::Transcripts`). Clearing expired leases is a
-/// fifth permitted action with no check of its own in the eighteen-item list, so
+/// fifth permitted action with no check of its own in the twenty-four-item list, so
 /// no [`CheckName`] variant claims it; sampling cadence stays `false` because
-/// `--fix` performs no network operation and cannot make an account get sampled.
+/// `--fix` performs no network operation and cannot make an account get sampled;
+/// [`CheckName::UnmappedAccounts`] stays `false` because `--fix` must not
+/// reattribute ambiguous sessions (PLAN.md 36).
 fn has_repair_of(name: CheckName) -> bool {
     matches!(
         name,
@@ -234,10 +234,7 @@ fn outcome(name: CheckName, status: CheckStatus) -> CheckOutcome {
 /// via the same function backup verification runs (`store::backup`).
 fn sqlite_and_schema_health(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
-        CheckStatus::NotApplicable(format!(
-            "no ledger database exists yet at {}",
-            ctx.db_path.display()
-        ))
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
     } else if let Some(error) = &ctx.db_open_error {
         CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
     } else {
@@ -259,10 +256,7 @@ fn sqlite_and_schema_health(ctx: &DoctorContext) -> CheckOutcome {
 /// audit's own doc comment naming this bead as the consumer that renders it.
 fn strict_and_constraint_integrity(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
-        CheckStatus::NotApplicable(format!(
-            "no ledger database exists yet at {}",
-            ctx.db_path.display()
-        ))
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
     } else if let Some(error) = &ctx.db_open_error {
         CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
     } else {
@@ -297,10 +291,7 @@ fn pending_evidence(ctx: &DoctorContext) -> CheckOutcome {
             if count == 0 {
                 CheckStatus::Pass
             } else {
-                CheckStatus::Fail(format!(
-                    "{count} pending record(s) undrained in {}",
-                    pending_dir.display()
-                ))
+                CheckStatus::Fail(format!("{count} pending record(s) undrained"))
             }
         }
     };
@@ -499,7 +490,7 @@ fn transcript_roots(ctx: &DoctorContext) -> CheckOutcome {
             .transcripts
             .iter()
             .filter(|source| std::fs::metadata(&source.root).is_err())
-            .map(|source| format!("{} ({})", source.name, source.root.display()))
+            .map(|source| source.name.clone())
             .collect();
         if missing.is_empty() {
             CheckStatus::Pass
@@ -578,6 +569,64 @@ fn quarantine_count(
         .filter(|group| predicate(&group.failure_class))
         .map(|group| group.count)
         .sum())
+}
+
+/// Canonical usage that landed in the unknown-account bucket (`aub-mgv.3`):
+/// usage before any account marker exists has no marker to justify an account
+/// assignment, so the segmentation records it as unattributed rather than
+/// guessing. Reads the persisted segments through `attribution::quality`'s own
+/// metric, per token kind, so the two cannot disagree about what "unknown"
+/// means without the disagreement being visible as a diff to this function.
+///
+/// A ledger with no segments at all is [`CheckStatus::NotApplicable`] rather
+/// than a pass: nothing has been attributed yet, so there is no coverage to
+/// judge. Any nonzero unknown total fails naming the per-kind counts; the
+/// reason carries counts only, never session ids, paths, or credentials.
+fn unmapped_accounts(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => {
+                match crate::store::account_attribution_segment::attribution_observations(conn) {
+                    Err(error) => {
+                        CheckStatus::Fail(format!("cannot read attribution segments: {error}"))
+                    }
+                    Ok(observations) if observations.is_empty() => CheckStatus::NotApplicable(
+                        "no attribution segments have been recorded yet".to_string(),
+                    ),
+                    Ok(observations) => {
+                        let quality =
+                            crate::attribution::quality::AttributionQuality::over(observations);
+                        let mut unattributed = Vec::new();
+                        for kind in crate::domain::tokens::TokenKind::ALL {
+                            let breakdown = quality.breakdown(kind);
+                            if breakdown.unknown_account() > 0 {
+                                unattributed.push(format!(
+                                    "{}: {} unattributed of {} total",
+                                    kind.label(),
+                                    breakdown.unknown_account(),
+                                    breakdown.total(),
+                                ));
+                            }
+                        }
+                        if unattributed.is_empty() {
+                            CheckStatus::Pass
+                        } else {
+                            CheckStatus::Fail(format!(
+                                "unknown-account usage: {}",
+                                unattributed.join(", ")
+                            ))
+                        }
+                    }
+                }
+            }
+        }
+    };
+    outcome(CheckName::UnmappedAccounts, status)
 }
 
 /// Every scope (provider, plan tier, window) that has ever had a calibration
@@ -739,12 +788,11 @@ fn backup_subcheck(ctx: &DoctorContext) -> SubcheckVerdict {
         ) {
             Err(error) => SubcheckVerdict::Failed(format!("cannot read the backup: {error}")),
             Ok(crate::backup::BackupHealth::Missing) => {
-                SubcheckVerdict::Failed(format!("no backup found at {}", destination.display()))
+                SubcheckVerdict::Failed("no verified backup found".to_string())
             }
-            Ok(crate::backup::BackupHealth::Unverified { .. }) => SubcheckVerdict::Failed(format!(
-                "a backup exists at {} but has not been verified",
-                destination.display()
-            )),
+            Ok(crate::backup::BackupHealth::Unverified { .. }) => {
+                SubcheckVerdict::Failed("a backup exists but has not been verified".to_string())
+            }
             Ok(crate::backup::BackupHealth::Verified {
                 age,
                 review_due: true,
@@ -773,10 +821,9 @@ fn drill_subcheck(ctx: &DoctorContext) -> SubcheckVerdict {
                 Err(error) => {
                     SubcheckVerdict::Failed(format!("cannot read the drill result record: {error}"))
                 }
-                Ok(crate::drill::DrillHealth::Missing) => SubcheckVerdict::Failed(format!(
-                    "no successful drill recorded at {}",
-                    result_path.display()
-                )),
+                Ok(crate::drill::DrillHealth::Missing) => {
+                    SubcheckVerdict::Failed("no successful drill recorded".to_string())
+                }
                 Ok(crate::drill::DrillHealth::Verified {
                     age,
                     review_due: true,
@@ -1014,49 +1061,59 @@ fn unexplained_residual(ctx: &DoctorContext) -> CheckOutcome {
     } else {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
-            Some(_) => match rolling_residual_health(ctx) {
-                None => CheckStatus::NotApplicable(
-                    "no eligible reconciliation intervals in recent window".to_string(),
-                ),
-                Some(health) => match &health.verdict {
-                    crate::reconciliation::RollingResidualVerdict::Suppressed {
-                        eligible_count,
-                        min_eligible,
-                    } => CheckStatus::PassWithDetail(format!(
-                        "{eligible_count} eligible interval(s) in window (below minimum {min_eligible}); verdict suppressed"
-                    )),
-                    crate::reconciliation::RollingResidualVerdict::ReconcilesWithinUncertainty => {
-                        CheckStatus::PassWithDetail(
-                            "rolling residual reconciles within uncertainty".to_string(),
-                        )
-                    }
-                    crate::reconciliation::RollingResidualVerdict::Discrepancy { patterns } => {
-                        if patterns.is_empty() {
-                            CheckStatus::Fail(format!(
-                                "rolling residual discrepancy: interval [{} .. {}] credits",
-                                health.rolling_residual_interval.lower().micros(),
-                                health.rolling_residual_interval.upper().micros(),
-                            ))
-                        } else {
-                            let explanations: Vec<&'static str> =
-                                patterns.iter().map(|p| p.explanation()).collect();
-                            let mut msg = format!(
-                                "rolling residual discrepancy: interval [{} .. {}] credits; {}",
-                                health.rolling_residual_interval.lower().micros(),
-                                health.rolling_residual_interval.upper().micros(),
-                                explanations.join("; "),
-                            );
-                            if let Some(ptr) = health.pointer {
-                                msg.push_str(&format!("; {ptr}"));
-                            }
-                            CheckStatus::Fail(msg)
-                        }
-                    }
-                },
-            },
+            Some(_) => rolling_residual_status(rolling_residual_health(ctx).as_ref()),
         }
     };
     outcome(CheckName::UnexplainedResidual, status)
+}
+
+/// The verdict half of [`unexplained_residual`]: a computed [`RollingResidualHealth`]
+/// to the status the check reports for it, with no store access. Split out so the
+/// discrepancy failure is provable against controlled in-memory evidence without
+/// seeding a full calibration, cost-model and usage chain through the ledger.
+pub fn rolling_residual_status(
+    health: Option<&crate::reconciliation::RollingResidualHealth>,
+) -> CheckStatus {
+    match health {
+        None => CheckStatus::NotApplicable(
+            "no eligible reconciliation intervals in recent window".to_string(),
+        ),
+        Some(health) => match &health.verdict {
+            crate::reconciliation::RollingResidualVerdict::Suppressed {
+                eligible_count,
+                min_eligible,
+            } => CheckStatus::PassWithDetail(format!(
+                "{eligible_count} eligible interval(s) in window (below minimum {min_eligible}); verdict suppressed"
+            )),
+            crate::reconciliation::RollingResidualVerdict::ReconcilesWithinUncertainty => {
+                CheckStatus::PassWithDetail(
+                    "rolling residual reconciles within uncertainty".to_string(),
+                )
+            }
+            crate::reconciliation::RollingResidualVerdict::Discrepancy { patterns } => {
+                if patterns.is_empty() {
+                    CheckStatus::Fail(format!(
+                        "rolling residual discrepancy: interval [{} .. {}] credits",
+                        health.rolling_residual_interval.lower().micros(),
+                        health.rolling_residual_interval.upper().micros(),
+                    ))
+                } else {
+                    let explanations: Vec<&'static str> =
+                        patterns.iter().map(|p| p.explanation()).collect();
+                    let mut msg = format!(
+                        "rolling residual discrepancy: interval [{} .. {}] credits; {}",
+                        health.rolling_residual_interval.lower().micros(),
+                        health.rolling_residual_interval.upper().micros(),
+                        explanations.join("; "),
+                    );
+                    if let Some(ptr) = health.pointer {
+                        msg.push_str(&format!("; {ptr}"));
+                    }
+                    CheckStatus::Fail(msg)
+                }
+            }
+        },
+    }
 }
 
 /// Loads the rolling residual health from the store using the doctor context.
@@ -1455,10 +1512,7 @@ mod tests {
         let outcome = sqlite_and_schema_health(&ctx);
         assert_eq!(
             outcome.status,
-            CheckStatus::NotApplicable(format!(
-                "no ledger database exists yet at {}",
-                ctx.db_path.display()
-            ))
+            CheckStatus::NotApplicable("no ledger database exists yet".to_string())
         );
     }
 
