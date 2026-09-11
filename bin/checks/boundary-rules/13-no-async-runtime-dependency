@@ -2,13 +2,26 @@
 # Boundary: no async runtime may appear in the dependency tree.
 # Design: PLAN.md section 41 and bead aub-eun.2.
 # Detection: scan `cargo tree` output for forbidden async runtime crates.
+# A failed `cargo tree` is not a clean tree (aub-8av3): an unresolvable manifest,
+# an unreachable registry or a missing toolchain leaves the dependency tree
+# unexamined, and the rule fails with cargo's own error rather than reporting
+# the unexamined tree as free of forbidden crates.
 set -uo pipefail
 
 script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
 repo_root="$(cd -- "$script_dir/../../.." && pwd)"
 cd "$repo_root"
 
-forbidden_matches="$(cargo tree 2>/dev/null | grep -E '\b(tokio|async-std|smol|actix-rt)\b' || true)"
+cargo_tree_stderr="$(mktemp)"
+trap 'rm -f "$cargo_tree_stderr"' EXIT
+
+if ! dependency_tree="$(cargo tree 2>"$cargo_tree_stderr")"; then
+    echo "cargo tree failed; the dependency tree was not examined:" >&2
+    cat "$cargo_tree_stderr" >&2
+    exit 1
+fi
+
+forbidden_matches="$(printf '%s\n' "$dependency_tree" | grep -E '\b(tokio|async-std|smol|actix-rt)\b' || true)"
 
 if [ -n "$forbidden_matches" ]; then
     echo "Forbidden async runtime detected in dependency tree:" >&2

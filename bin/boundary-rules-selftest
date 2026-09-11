@@ -44,11 +44,22 @@ assert_contains() {
 
 # A fresh scratch copy of bin/ and src/ with the repo's layout, so the runner and rules
 # resolve their paths from their own location and never touch the live tree.
+# Manifest files travel with every scenario: rule 13 resolves the real dependency
+# graph from the scenario root, and since aub-8av3 a `cargo tree` that cannot run
+# fails the rule instead of passing it. A scenario without the manifest would fail
+# for a reason no scenario planted, so each one carries the graph the gate sees:
+# the manifest, the lock (which keeps resolution off the registry), the toolchain
+# pin, the build script and the path dependency under crates/.
 make_scenario() {
     local dir="$scratch/$1"
     mkdir -p "$dir"
     cp -a "$repo_root/bin" "$dir/bin"
     cp -a "$repo_root/src" "$dir/src"
+    cp -a "$repo_root/Cargo.toml" "$dir/Cargo.toml"
+    cp -a "$repo_root/Cargo.lock" "$dir/Cargo.lock"
+    cp -a "$repo_root/build.rs" "$dir/build.rs"
+    cp -a "$repo_root/rust-toolchain.toml" "$dir/rust-toolchain.toml"
+    cp -a "$repo_root/crates" "$dir/crates"
     printf '%s\n' "$dir"
 }
 
@@ -157,6 +168,28 @@ violation "rule15-flat" "15-status-no-migration" "src/projection.rs" "use crate:
 violation "rule15-cli" "15-status-no-migration" "src/cli.rs" "use crate::store::migrate;"
 violation "rule18-flat" "18-no-system-clock-outside-time" "src/advice.rs" "pub fn bad() { let _ = std::time::SystemTime::now(); }"
 
+# plant_cargo_dependency DIR CRATE VERSION: inserts a dependency line under the
+# single [dependencies] header of the scenario's Cargo.toml, the way the Cargo.toml
+# planters in docs/guard-inventory.md do. A header that is missing or duplicated is
+# scenario staleness, reported by the caller as such, never a rule failure.
+plant_cargo_dependency() {
+    local dir="$1" crate="$2" version="$3"
+    python3 - "$dir/Cargo.toml" "$crate" "$version" <<'PYEOF'
+import sys
+
+path, crate, version = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(path) as f:
+    text = f.read()
+header = "[dependencies]\n"
+count = text.count(header)
+if count != 1:
+    raise SystemExit(f"expected exactly one '[dependencies]' header, found {count}")
+text = text.replace(header, header + f'{crate} = "{version}"\n', 1)
+with open(path, "w") as f:
+    f.write(text)
+PYEOF
+}
+
 # --- rule 19: function-scoped, not flat-file/nested like the rules above, because
 # status shares src/cli.rs with every other command. A store reference planted inside
 # `fn status` itself must be caught ... A planter that cannot locate the declaration
@@ -201,6 +234,37 @@ if planter_out="$(plant_store_edge "$wrap_dir/src/cli.rs" 2>&1)"; then
     assert_contains "rule19-status-wrapped names file" "src/cli.rs" "$out"
 else
     fail_planted_nothing "rule19-status-wrapped" "$planter_out"
+fi
+
+# --- rule 13 (aub-8av3): the rule reads a failed `cargo tree` as an unexamined
+# tree, never as a clean one. Direct invocations over the manifest copies, one
+# scenario per outcome the rule distinguishes: the real graph passes, a resolvable
+# forbidden crate fails naming it, and a manifest cargo cannot resolve fails with
+# the resolution error rather than passing.
+dir="$(make_scenario rule13-clean)"
+out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
+assert_exit "rule13-clean exits 0" 0 "$?"
+
+dir="$(make_scenario rule13-resolvable)"
+if planter_out="$(plant_cargo_dependency "$dir" tokio 1.53.1 2>&1)"; then
+    out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
+    rc=$?
+    assert_exit "rule13-resolvable exits 1" 1 "$rc"
+    assert_contains "rule13-resolvable names verdict" "Forbidden async runtime detected" "$out"
+    assert_contains "rule13-resolvable names crate" "tokio v1.53.1" "$out"
+else
+    fail_planted_nothing "rule13-resolvable" "$planter_out"
+fi
+
+dir="$(make_scenario rule13-unresolvable)"
+if planter_out="$(plant_cargo_dependency "$dir" tokio 1.99.0 2>&1)"; then
+    out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
+    rc=$?
+    assert_exit "rule13-unresolvable exits 1" 1 "$rc"
+    assert_contains "rule13-unresolvable names the unexamined tree" "dependency tree was not examined" "$out"
+    assert_contains "rule13-unresolvable carries cargo's error" "failed to select a version" "$out"
+else
+    fail_planted_nothing "rule13-unresolvable" "$planter_out"
 fi
 
 # ... and the identical reference in an unrelated cli.rs function, outside the status
