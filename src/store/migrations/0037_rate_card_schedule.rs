@@ -217,10 +217,17 @@ mod tests {
         let sibling = rate_card::insert(&conn, std::slice::from_ref(&default), clock.now())
             .expect("the default beside its peak must insert");
         assert_eq!(sibling.cards_added, 1);
+        // Same price and same days, different hours: distinct content too,
+        // which is the half of the index key the hours column owns.
+        let mut evening = peak.clone();
+        evening.schedule = Schedule::new(&[1, 2, 3, 4, 5], 17 * 60, 20 * 60);
+        let shifted = rate_card::insert(&conn, std::slice::from_ref(&evening), clock.now())
+            .expect("a shifted window must insert");
+        assert_eq!(shifted.cards_added, 1);
         assert_eq!(
             rate_card::count(&conn).expect("count must read"),
-            2,
-            "the default and its peak are two records"
+            3,
+            "the default and both windows are three records"
         );
     }
 
