@@ -122,6 +122,7 @@ sh-29	aub-vcx.2	shell	bin/ci-selftest	replace	bin/ci	    echo "==> bin/ci FAILED
 sh-30	aub-mz3u,aub-hhdo	shell	bin/checks/80-batch-verify-close	replace	bin/checks/80-batch-verify-close	wave_close_allows_bead() { # $1 = bead id, $2 = optional repo_dir or INVARIANTS path	wave_close_allows_bead() { # $1 = bead id, $2 = optional repo_dir or INVARIANTS path\n    return 0	unit: wave_close_allows_bead allowed close of	bin/checks/75-commit-protocol	0	commit-protocol
 sh-31	aub-rif.12,aub-qgng	shell	bin/checks/70-quantity-inventory	append	src/domain/rows.rs	pub struct ZzGuardProbeQuantity;		not in docs/domain-quantity-inventory.md: ZzGuardProbeQuantity	bin/checks/45-boundary-rules	0	rules pass
 sh-32	aub-80nm	shell	bin/boundary-rules-selftest	delete	bin/checks/boundary-rules/19-status-no-store-connection			19-status-no-store-connection	printf 'use crate::calibration;\n' >> src/transcripts.rs; bin/checks/45-boundary-rules	nonzero	02-transcripts-no-calibration
+sh-33	aub-8av3	shell	bin/checks/boundary-rules/13-no-async-runtime-dependency	python	Cargo.toml	NL = chr(10)\nt = open("Cargo.toml").read()\nold = "[dependencies]" + NL\nassert t.count(old) == 1, "dependencies header not unique"\nt = t.replace(old, old + 'tokio = "1.99.0"' + NL, 1)\nopen("Cargo.toml", "w").write(t)		failed to select a version	bin/checks/70-quantity-inventory	0	every pub struct/enum
 c-01	aub-vcx.5,aub-71j.1,aub-rif.12,aub-rif.2,aub-rif.8,aub-rif.3,aub-rif.4,aub-rif.9,aub-ai3.2,aub-sth.15,aub-eun.1	cargo	cargo test --test compile_fail compile_fail	write	tests/compile_fail/domain_quantities_no_default.rs	fn main() {}		fail to compile, but it succeeded	cargo test --test compile_fail every_fixture_has_captured_output	0	test result: ok
 c-02	aub-rif.14,aub-ai3.4	cargo	cargo test --test compile_fail compile_fail	append	tests/compile_fail/quota_used_plus_money.rs	\nfn probe_reason() { let _x: () = 1u32; }		EXPECTED	cargo test --test compile_fail every_fixture_has_captured_output	0	test result: ok
 c-03	aub-xus.4	cargo	cargo test --lib problem_code	sed	docs/problem-codes.md	/| DNS_FAILURE |/d		has no row matching	cargo test --lib error	0	test result: ok
@@ -209,9 +210,6 @@ Beads whose text matched a marker but carry no standing break-proof, with
 the reason. A matched bead must have a row above or an entry here; the
 consistency check enforces exactly that.
 
-- `aub-8av3`: the rule it proves cannot fail yet, which is the bead. Its own
-  acceptance criteria commission the row, so the row arrives with the fix and
-  this entry goes when it does.
 - `aub-lqe.3`: the parser-side mutation criteria run the other way (the
   parser must survive generated mutations, not fail under a removed rule).
   Covered by the parser contract suites, not by a break-proof.
