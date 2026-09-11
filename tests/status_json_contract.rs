@@ -441,7 +441,7 @@ fn the_status_document_lists_every_window_with_its_full_field_set() {
     validate_status_report_json(&document).expect("the v3 windows document must validate");
 
     let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
-    assert_eq!(parsed["schema"], 4);
+    assert_eq!(parsed["schema"], 5);
     let windows = parsed["accounts"][0]["windows"].as_array().unwrap();
     assert_eq!(windows.len(), 3);
     let fable = windows
@@ -619,7 +619,7 @@ fn windows_omit_resolution_fields_and_the_schema_moves_with_the_field_set() {
     validate_status_report_json(&document).expect("the document must validate");
 
     let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
-    assert_eq!(parsed["schema"], 4);
+    assert_eq!(parsed["schema"], 5);
     let window = parsed["accounts"][0]["windows"][0].as_object().unwrap();
     let mut keys: Vec<&str> = window.keys().map(String::as_str).collect();
     keys.sort_unstable();

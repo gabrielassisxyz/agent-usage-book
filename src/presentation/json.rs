@@ -37,7 +37,11 @@ use crate::transcripts::TranscriptDriftReport;
 ///
 /// v3: `aub status --format json` carries every quota window under
 /// `accounts[].windows[]`, not only the limiting one.
-pub const SCHEMA_VERSION: u32 = 4;
+///
+/// v5: `aub spend` carries `grouping` values `harness` and `model` and, when the
+/// command line asked for dimension filters, one entry per filter under
+/// `filters[]` naming what it excluded (aub-satk).
+pub const SCHEMA_VERSION: u32 = 5;
 
 /// An error during JSON contract validation or deserialization.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -550,7 +554,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_SPEND_KEYS: [&str; 17] = [
+    const KNOWN_SPEND_KEYS: [&str; 18] = [
         "schema",
         "command",
         "run",
@@ -568,6 +572,7 @@ pub fn validate_spend_report_json(json_str: &str) -> Result<ParsedEnvelope, Json
         "credit_model",
         "window_equivalent_window",
         "unmapped_models",
+        "filters",
     ];
     for key in obj.keys() {
         if !KNOWN_SPEND_KEYS.contains(&key.as_str()) {
@@ -861,6 +866,19 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
             .collect();
         body.push_str(&format!(",\"unmapped_models\":{{{}}}", entries.join(",")));
     }
+    // One entry per active command-line filter, in command-line order, each
+    // carrying what it excluded and how much of that was its dimension's
+    // `unknown-*` bucket. Absent when no filter was asked for, by the same
+    // presence-is-the-signal rule as `unmapped_models` above.
+    if !report.filters.is_empty() {
+        let entries = report
+            .filters
+            .iter()
+            .map(spend_filter_outcome_json)
+            .collect::<Vec<_>>()
+            .join(",");
+        body.push_str(&format!(",\"filters\":[{entries}]"));
+    }
     if explain != ExplainMode::Off {
         // explain_json always yields a `{...}` object; splice the spend-only
         // account_groups array in before its closing brace rather than
@@ -906,6 +924,28 @@ fn account_groups_json(groups: &[crate::report::AccountGroupExplain]) -> String 
         })
         .collect::<Vec<_>>()
         .join(",")
+}
+
+/// One filter's exclusion record, mirroring the human `excluded by` footer so a
+/// consumer reads the same numbers from both surfaces (aub-satk).
+fn spend_filter_outcome_json(outcome: &crate::report::SpendFilterOutcome) -> String {
+    let excluded = &outcome.excluded;
+    let values = outcome
+        .filter
+        .values
+        .iter()
+        .map(|value| json_string(value))
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "{{\"flag\":{},\"dimension\":{},\"values\":[{values}],\"excluded\":{{\"sessions\":{},\"events\":{},\"unknown_sessions\":{},\"unknown_events\":{}}}}}",
+        json_string(outcome.filter.flag),
+        json_string(outcome.filter.dimension.as_str()),
+        excluded.sessions,
+        excluded.events,
+        excluded.unknown_sessions,
+        excluded.unknown_events,
+    )
 }
 
 fn spend_group_json(group: &crate::report::SpendGroup) -> String {
@@ -3324,7 +3364,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 4,
+                "schema": 5,
                 "command": "spend",
                 "error": {
                     "code": "INVALID_USAGE",
@@ -3340,7 +3380,7 @@ mod tests {
         assert_eq!(
             parsed,
             serde_json::json!({
-                "schema": 4,
+                "schema": 5,
                 "error": { "code": "STORE_FAILURE", "message": "disk full", "exit_class": 5 }
             })
         );

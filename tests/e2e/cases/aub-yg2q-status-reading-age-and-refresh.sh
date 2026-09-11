@@ -150,7 +150,7 @@ case_assertions() {
     # positive integer. The freshness verdict stays the stale one the failed
     # refresh produced; the age says how old the reading behind it is.
     assert_exit 0 8
-    assert_json_field 8 "schema" "4"
+    assert_json_field 8 "schema" "5"
     local freshness age_nanos
     freshness="$(jq -r '.accounts[0].freshness' "$(step_dir 8)/stdout.bin")"
     if [ "$freshness" = "stale" ]; then

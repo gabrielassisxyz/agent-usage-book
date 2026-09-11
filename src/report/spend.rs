@@ -42,9 +42,10 @@ use crate::logging::LogicalName;
 use crate::report::models::{
     AccountGroupExplain, AccountMarkerReference, IngestSummary, IngestionGeneration,
     LedgerGeneration, PricedModelRef, ReportMetadata, SpendDiagnostic, SpendDiagnosticProvenance,
-    SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
-    SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport, UNKNOWN_ACCOUNT_LABEL,
-    UNNAMED_MODEL_LABEL, WindowEquivalentDerivation,
+    SpendFilter, SpendFilterExcluded, SpendFilterOutcome, SpendGroup, SpendGroupCreditsProvenance,
+    SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport,
+    UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL, UNKNOWN_MODEL_LABEL, UNNAMED_MODEL_LABEL,
+    WindowEquivalentDerivation,
 };
 use crate::report::provenance::{ProvenanceNode, Unit, ValueArithmetic};
 use crate::store::cost_model::CostModel;
@@ -97,6 +98,33 @@ impl SpendWindow {
             since,
             until: since.plus_days(days),
         })
+    }
+
+    /// The `days` whole UTC days ending at `last`, `last` itself included: the
+    /// window people mean by "the last N days" or by "yesterday". The same
+    /// zero-days refusal as [`SpendWindow::starting`] applies.
+    pub fn ending(last: UtcDate, days: i64) -> Result<Self, Error> {
+        if days < 1 {
+            return Err(Error::Usage("--days must be at least 1".into()));
+        }
+        Ok(Self {
+            since: last.plus_days(-(days - 1)),
+            until: last.next(),
+        })
+    }
+
+    /// The half-open day range `[since, until)`. An empty or reversed range is
+    /// a usage error, because an empty window would report zero events and a
+    /// zero must come from evidence.
+    pub fn between(since: UtcDate, until: UtcDate) -> Result<Self, Error> {
+        if since >= until {
+            return Err(Error::Usage(format!(
+                "--since {} is not before --until {}; the window would be empty",
+                since.iso(),
+                until.iso()
+            )));
+        }
+        Ok(Self { since, until })
     }
 
     fn contains(&self, at: UtcTimestamp) -> bool {
@@ -488,12 +516,14 @@ pub fn assemble_canonical(
         credit_reporting,
         None,
         models,
+        &[],
     )
 }
 
 /// Assembles a canonical spend report with an optional calibrated
-/// window-equivalent conversion. The legacy entry point above deliberately
-/// remains unchanged for callers that did not request the new dimension.
+/// window-equivalent conversion and optional dimension filters. The filters are
+/// applied after the window is read and before grouping, and every one reports
+/// what it excluded so a filter can never silently shrink the report.
 #[allow(clippy::too_many_arguments)]
 pub fn assemble_canonical_with_window_equivalent(
     conn: &rusqlite::Connection,
@@ -506,6 +536,7 @@ pub fn assemble_canonical_with_window_equivalent(
     credit_reporting: CreditReporting<'_>,
     window_resolver: Option<&dyn WindowEquivalentResolver>,
     models: &ModelTable,
+    filters: &[SpendFilter],
 ) -> Result<SpendReport, Error> {
     let grouping = if grouping.is_empty() {
         vec![SpendGrouping::Day]
@@ -522,7 +553,11 @@ pub fn assemble_canonical_with_window_equivalent(
     let replayed_occurrences = diagnostics.replayed_occurrences;
     let heuristic_identities = diagnostics.heuristic_identities;
     let partial = refresh_failure.is_some() || !diagnostics.quarantined_by_class.is_empty();
-    let task_labels = if grouping.contains(&SpendGrouping::Task) {
+    let task_labels = if grouping.contains(&SpendGrouping::Task)
+        || filters
+            .iter()
+            .any(|filter| filter.dimension == SpendGrouping::Task)
+    {
         task_label_map(conn, &events)?
     } else {
         BTreeMap::new()
@@ -531,13 +566,45 @@ pub fn assemble_canonical_with_window_equivalent(
     let mut credit_provenance = Vec::new();
     let mut window_provenance = Vec::new();
     let mut account_explain = Vec::new();
-    let account_of = if grouping.contains(&SpendGrouping::Account) || window_resolver.is_some() {
+    let account_attribution_needed = grouping.contains(&SpendGrouping::Account)
+        || window_resolver.is_some()
+        || filters
+            .iter()
+            .any(|filter| filter.dimension == SpendGrouping::Account);
+    let account_of = if account_attribution_needed {
         let (map, explain) = account_attribution(conn, &events)?;
         account_explain = explain;
         map
     } else {
         BTreeMap::new()
     };
+    // The window counts the ledger read, and the groups sum the filtered
+    // remainder: the difference is exactly what `filters` reports, so a filter
+    // never shrinks the report without naming what it removed.
+    let events_in_window = events.len() as u64;
+    // Counted over the events the window actually holds, so the footer names
+    // the ids an operator can act on today rather than every id the ledger ever
+    // stored. Both describe the window's own content, not what a filter kept.
+    let mut unmapped_models: BTreeMap<String, u64> = BTreeMap::new();
+    for event in &events {
+        if event.vendor.is_none() {
+            let label = match event.model.as_deref() {
+                Some(id) if !id.is_empty() => id.to_string(),
+                _ => UNNAMED_MODEL_LABEL.to_string(),
+            };
+            *unmapped_models.entry(label).or_default() += 1;
+        }
+    }
+    let diagnostic_members = events
+        .iter()
+        .map(|event| EvidenceId::new(event.canonical_id.clone()))
+        .collect::<Vec<_>>();
+    let diagnostic_source_count = events
+        .iter()
+        .flat_map(|event| event.sources.iter())
+        .collect::<BTreeSet<_>>()
+        .len() as u64;
+    let (events, filter_outcomes) = apply_spend_filters(events, filters, &task_labels, &account_of);
     let groups = canonical_groups(
         &events,
         &grouping,
@@ -593,30 +660,8 @@ pub fn assemble_canonical_with_window_equivalent(
         heuristic_identities,
         undated_events: 0,
         events_outside_window: 0,
-        events_in_window: events.len() as u64,
+        events_in_window,
     };
-    // Counted over the events the window actually holds, so the footer names
-    // the ids an operator can act on today rather than every id the ledger ever
-    // stored.
-    let mut unmapped_models: BTreeMap<String, u64> = BTreeMap::new();
-    for event in &events {
-        if event.vendor.is_none() {
-            let label = match event.model.as_deref() {
-                Some(id) if !id.is_empty() => id.to_string(),
-                _ => UNNAMED_MODEL_LABEL.to_string(),
-            };
-            *unmapped_models.entry(label).or_default() += 1;
-        }
-    }
-    let diagnostic_members = events
-        .iter()
-        .map(|event| EvidenceId::new(event.canonical_id.clone()))
-        .collect::<Vec<_>>();
-    let diagnostic_source_count = events
-        .iter()
-        .flat_map(|event| event.sources.iter())
-        .collect::<BTreeSet<_>>()
-        .len() as u64;
     let diagnostic_node = |grouping: &str, count: u64| {
         ProvenanceNode::new(
             diagnostic_members.clone(),
@@ -651,10 +696,11 @@ pub fn assemble_canonical_with_window_equivalent(
     })
     .with_credit_provenance(credit_provenance)
     .with_window_equivalent_provenance(window_provenance)
+    .with_filters(filter_outcomes)
     .with_diagnostics(vec![
         SpendDiagnosticProvenance {
             diagnostic: SpendDiagnostic::CanonicalRecords,
-            node: diagnostic_node("canonical_records", events.len() as u64),
+            node: diagnostic_node("canonical_records", events_in_window),
         },
         SpendDiagnosticProvenance {
             diagnostic: SpendDiagnostic::ReplayedOccurrences,
@@ -1054,7 +1100,71 @@ fn group_value(
             .get(&event.canonical_id)
             .cloned()
             .unwrap_or_else(|| UNKNOWN_ACCOUNT_LABEL.to_string()),
+        // The harness is the transcript namespace the config named, which is
+        // what `session_source` stores; an empty namespace is no namespace, and
+        // reads as the unknown bucket rather than as a harness called "".
+        SpendGrouping::Harness => event
+            .session_source
+            .as_deref()
+            .filter(|namespace| !namespace.is_empty())
+            .unwrap_or(UNKNOWN_HARNESS_LABEL)
+            .to_string(),
+        // The model id as the transcript stored it, `<synthetic>` included: it
+        // is a value the ledger really holds. No id at all is the unknown
+        // bucket, which keeps the unnamed spend visible instead of merged.
+        SpendGrouping::Model => event
+            .model
+            .as_deref()
+            .filter(|id| !id.is_empty())
+            .unwrap_or(UNKNOWN_MODEL_LABEL)
+            .to_string(),
     }
+}
+
+/// Applies the command-line filters in order, returning the surviving events
+/// and one outcome per filter. A filter's exclusion is measured against the
+/// events its predecessors left, so the footer describes the pipeline in
+/// command-line order; the values within one filter are OR-ed and different
+/// filters are AND-ed.
+fn apply_spend_filters(
+    events: Vec<CanonicalSpendEvent>,
+    filters: &[SpendFilter],
+    task_labels: &BTreeMap<String, String>,
+    account_of: &BTreeMap<String, String>,
+) -> (Vec<CanonicalSpendEvent>, Vec<SpendFilterOutcome>) {
+    let mut alive: Vec<bool> = vec![true; events.len()];
+    let mut outcomes = Vec::with_capacity(filters.len());
+    for filter in filters {
+        let unknown_bucket = filter.dimension.unknown_bucket();
+        let mut excluded = SpendFilterExcluded::default();
+        let mut excluded_sessions: BTreeSet<&str> = BTreeSet::new();
+        let mut unknown_excluded_sessions: BTreeSet<&str> = BTreeSet::new();
+        for (index, event) in events.iter().enumerate() {
+            if !alive[index] {
+                continue;
+            }
+            let value = group_value(event, filter.dimension, task_labels, account_of);
+            if filter.values.contains(&value) {
+                continue;
+            }
+            alive[index] = false;
+            excluded.events += 1;
+            excluded_sessions.insert(event.session.as_str());
+            if value == unknown_bucket {
+                excluded.unknown_events += 1;
+                unknown_excluded_sessions.insert(event.session.as_str());
+            }
+        }
+        excluded.sessions = excluded_sessions.len() as u64;
+        excluded.unknown_sessions = unknown_excluded_sessions.len() as u64;
+        outcomes.push(SpendFilterOutcome::new(filter.clone(), excluded));
+    }
+    let kept = events
+        .into_iter()
+        .zip(alive)
+        .filter_map(|(event, alive)| alive.then_some(event))
+        .collect();
+    (kept, outcomes)
 }
 
 fn uniform_account<'a>(
@@ -1377,6 +1487,101 @@ mod tests {
         .unwrap();
     }
 
+    /// A session in a caller-chosen harness namespace, which is the shape the
+    /// harness dimension and its filter read.
+    fn seed_session_in_harness(conn: &rusqlite::Connection, harness: &str, name: &str) {
+        insert_session(
+            conn,
+            &NewSession {
+                source: SourceNamespace::new(harness),
+                native_session_id: crate::domain::ids::NativeSessionId::new(name),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                run_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// One canonical event in a caller-chosen harness namespace, with an
+    /// optional stored model id.
+    #[allow(clippy::too_many_arguments)]
+    fn seed_event_in_harness(
+        conn: &rusqlite::Connection,
+        harness: &str,
+        id: &str,
+        timestamp: i64,
+        session: &str,
+        model_id: Option<&str>,
+        components: &[(&str, u64)],
+    ) {
+        let event = insert_event(
+            conn,
+            &NewUsageEvent {
+                canonical_event_id: id,
+                session_id: Some(session),
+                event_timestamp: Some(UtcTimestamp::from_unix_nanos(timestamp)),
+                model_id,
+                evidence_kind: "reported",
+                source_provenance: "fixture.jsonl",
+                parser_version: "fixture-v1",
+                created_at: UtcTimestamp::from_unix_nanos(timestamp),
+            },
+        )
+        .unwrap();
+        insert_components(conn, event, components).unwrap();
+        let namespace = SourceNamespace::new(harness);
+        let version = ParserVersion::new("fixture-v1");
+        insert_occurrence(
+            conn,
+            &NewUsageOccurrence {
+                source_namespace: &namespace,
+                native_event_id: Some(id),
+                parser_version: &version,
+                heuristic_key: None,
+                source_file: "fixture.jsonl",
+                occurred_at_nanos: Some(timestamp),
+                event_id: Some(event),
+                transcript_file_id: None,
+                source_location: None,
+                canonical_fingerprint: None,
+                identity_strength: None,
+                heuristic_algorithm_version: None,
+                canonical_payload_digest: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_marker_in_harness(
+        conn: &rusqlite::Connection,
+        harness: &str,
+        native: &str,
+        account: &str,
+        observed_nanos: i64,
+    ) {
+        use crate::store::session_account_marker::EvidenceDesignation;
+        crate::store::session_account_marker::insert_marker(
+            conn,
+            &crate::store::session_account_marker::NewSessionAccountMarker {
+                session_id: SessionId::new(
+                    SourceNamespace::new(harness),
+                    crate::domain::ids::NativeSessionId::new(native),
+                ),
+                observed_at: UtcTimestamp::from_unix_nanos(observed_nanos),
+                source_ordering_key: None,
+                logical_account: account.to_owned(),
+                resolved_account_id: None,
+                marker_source: crate::store::session_account_marker::MarkerSource::new("hook"),
+                run_id: None,
+                evidence_designation: EvidenceDesignation::ExplicitLauncherOrHook,
+            },
+        )
+        .unwrap();
+    }
+
     /// `--group-by account` sums per account, keeps the unknown-account bucket
     /// as its own group, carries the marker evidence class per group, and does
     /// not decide attribution itself: its buckets equal a direct
@@ -1539,6 +1744,272 @@ mod tests {
             }
         }
         crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    /// The two new dimensions key off what the ledger already carries, and fall
+    /// to their `unknown-*` buckets when the field is absent or empty; a naive
+    /// implementation that keyed `None` as the empty string would merge every
+    /// unnamed event under one empty key instead of the named bucket
+    /// (aub-satk).
+    #[test]
+    fn harness_and_model_group_keys_fall_to_the_unknown_buckets() {
+        let base = CanonicalSpendEvent {
+            canonical_id: "c1".to_string(),
+            occurred_at: UtcTimestamp::parse_rfc3339("2026-08-25T10:00:00Z").unwrap(),
+            session: "claude-code:s1".to_string(),
+            session_source: Some("claude-code".to_string()),
+            session_native: Some("s1".to_string()),
+            project: "project-a".to_string(),
+            repository: "repository-a".to_string(),
+            evidence_kind: "reported".to_string(),
+            sources: BTreeSet::new(),
+            components: BTreeMap::new(),
+            vendor: None,
+            model: Some("claude-opus-4-8".to_string()),
+            priced_as: None,
+        };
+        let task_labels = BTreeMap::new();
+        let account_of = BTreeMap::new();
+        assert_eq!(
+            group_value(&base, SpendGrouping::Harness, &task_labels, &account_of),
+            "claude-code"
+        );
+        assert_eq!(
+            group_value(&base, SpendGrouping::Model, &task_labels, &account_of),
+            "claude-opus-4-8"
+        );
+        let none = CanonicalSpendEvent {
+            session_source: None,
+            model: None,
+            ..base.clone()
+        };
+        assert_eq!(
+            group_value(&none, SpendGrouping::Harness, &task_labels, &account_of),
+            UNKNOWN_HARNESS_LABEL
+        );
+        assert_eq!(
+            group_value(&none, SpendGrouping::Model, &task_labels, &account_of),
+            UNKNOWN_MODEL_LABEL
+        );
+        // An empty string is no namespace, the same as a missing one.
+        let empty = CanonicalSpendEvent {
+            session_source: Some(String::new()),
+            model: Some(String::new()),
+            ..base
+        };
+        assert_eq!(
+            group_value(&empty, SpendGrouping::Harness, &task_labels, &account_of),
+            UNKNOWN_HARNESS_LABEL
+        );
+        assert_eq!(
+            group_value(&empty, SpendGrouping::Model, &task_labels, &account_of),
+            UNKNOWN_MODEL_LABEL
+        );
+    }
+
+    /// Filters apply in command-line order with AND across dimensions and OR
+    /// within one, and each reports what it excluded and how much of that was
+    /// its dimension's `unknown-*` bucket, measured against the events the
+    /// filters before it left (aub-satk). The planted negative: a filter that
+    /// dropped the unknown split (reporting only a bare excluded count) or
+    /// measured every filter against the unfiltered set would fail the
+    /// `unknown_*` and pipeline-order assertions below.
+    #[test]
+    fn filters_apply_in_order_and_report_the_excluded_counts_and_unknown_split() {
+        use crate::report::SpendFilterExcluded;
+        use crate::store::ingestion_generation;
+
+        let (_root, conn) = canonical_conn("filter-exclusions");
+        // Six sessions across three harnesses: work-a owns the first of each
+        // harness pair, work-b the second, and one session keeps no marker so
+        // its events stay in the unknown-account bucket.
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        let harnesses = ["harness-a", "harness-b", "harness-c"];
+        for (index, harness) in harnesses.iter().enumerate() {
+            seed_session_in_harness(&conn, harness, "s-work-a");
+            seed_session_in_harness(&conn, harness, "s-work-b");
+            seed_session_in_harness(&conn, harness, "s-unknown");
+            seed_marker_in_harness(&conn, harness, "s-work-a", "work-a", day + 1);
+            seed_marker_in_harness(&conn, harness, "s-work-b", "work-b", day + 1);
+            let offset = (index as i64) * 10;
+            seed_event_in_harness(
+                &conn,
+                harness,
+                &format!("e-{harness}-work-a"),
+                day + 10 + offset,
+                "s-work-a",
+                Some("claude-opus-4-8"),
+                &[("input", 10)],
+            );
+            seed_event_in_harness(
+                &conn,
+                harness,
+                &format!("e-{harness}-work-b"),
+                day + 20 + offset,
+                "s-work-b",
+                Some("claude-opus-4-8"),
+                &[("input", 10)],
+            );
+            seed_event_in_harness(
+                &conn,
+                harness,
+                &format!("e-{harness}-unknown"),
+                day + 30 + offset,
+                "s-unknown",
+                None,
+                &[("input", 10)],
+            );
+            // The unknown session carries a second event, so session counts
+            // and event counts come apart in the exclusions: a filter's
+            // session count is not its event count.
+            seed_event_in_harness(
+                &conn,
+                harness,
+                &format!("e-{harness}-unknown-2"),
+                day + 35 + offset,
+                "s-unknown",
+                None,
+                &[("input", 10)],
+            );
+        }
+        ingestion_generation::advance(&conn).unwrap();
+
+        let filter = |flag: &'static str, dimension: SpendGrouping, values: &[&str]| SpendFilter {
+            flag,
+            dimension,
+            values: values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<BTreeSet<_>>(),
+        };
+        let report = |filters: &[SpendFilter]| {
+            assemble_canonical_with_window_equivalent(
+                &conn,
+                window("2026-08-25", 1),
+                now(),
+                vec![SpendGrouping::Day, SpendGrouping::Session],
+                false,
+                None,
+                None,
+                CreditReporting::NotRequested,
+                None,
+                &crate::config::ModelTable::default(),
+                filters,
+            )
+            .unwrap()
+        };
+
+        // No filter: the window holds all twelve events and reports no filter.
+        let unfiltered = report(&[]);
+        assert_eq!(unfiltered.ingest.events_in_window, 12);
+        assert_eq!(unfiltered.groups[0].children.len(), 9);
+        assert!(unfiltered.filters.is_empty());
+
+        // One account filter: three sessions kept, the rest excluded with the
+        // unknown-account usage named in the split. The unknown session lost
+        // two events per harness, so its events and its sessions come apart.
+        let account = report(&[filter("--account", SpendGrouping::Account, &["work-a"])]);
+        assert_eq!(account.filters.len(), 1);
+        assert_eq!(
+            account.filters[0].excluded,
+            SpendFilterExcluded {
+                sessions: 6,
+                events: 9,
+                unknown_sessions: 3,
+                unknown_events: 6,
+            }
+        );
+        let kept: Vec<&str> = account.groups[0]
+            .children
+            .iter()
+            .map(|group| group.key.as_str())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                "day=2026-08-25 / session=harness-a:s-work-a",
+                "day=2026-08-25 / session=harness-b:s-work-a",
+                "day=2026-08-25 / session=harness-c:s-work-a",
+            ]
+        );
+
+        // Both accounts keep their events and exclude only the unknown-account
+        // bucket, whose exclusion is named in the split: the gap stays visible
+        // while the attributed usage is narrowed (aub-satk).
+        let both = report(&[filter(
+            "--account",
+            SpendGrouping::Account,
+            &["work-a", "work-b"],
+        )]);
+        assert_eq!(
+            both.filters[0].excluded,
+            SpendFilterExcluded {
+                sessions: 3,
+                events: 6,
+                unknown_sessions: 3,
+                unknown_events: 6,
+            },
+            "the unknown-account bucket is the only exclusion, and it is counted"
+        );
+        assert_eq!(both.groups[0].children.len(), 6);
+
+        // The harness dimension keys the namespaces the ledger stores.
+        let harness = report(&[filter("--harness", SpendGrouping::Harness, &["harness-b"])]);
+        assert_eq!(
+            harness.filters[0].excluded,
+            SpendFilterExcluded {
+                sessions: 6,
+                events: 8,
+                unknown_sessions: 0,
+                unknown_events: 0,
+            }
+        );
+        assert_eq!(harness.groups[0].children.len(), 3);
+
+        // AND across filters, measured in command-line order: the account
+        // filter sees only what the harness filter left.
+        let combined = report(&[
+            filter("--harness", SpendGrouping::Harness, &["harness-a"]),
+            filter("--account", SpendGrouping::Account, &["work-b"]),
+        ]);
+        assert_eq!(combined.filters[0].excluded.events, 8);
+        assert_eq!(
+            combined.filters[1].excluded,
+            SpendFilterExcluded {
+                sessions: 2,
+                events: 3,
+                unknown_sessions: 1,
+                unknown_events: 2,
+            },
+            "the second filter is measured against the first filter's survivors"
+        );
+        assert_eq!(combined.groups[0].children.len(), 1);
+        assert_eq!(
+            combined.groups[0].children[0].key.as_str(),
+            "day=2026-08-25 / session=harness-a:s-work-b"
+        );
+        // The window count stays the ledger's own read; the filters explain
+        // the difference the groups carry.
+        assert_eq!(combined.ingest.events_in_window, 12);
+        assert_eq!(combined.groups[0].children.len(), 1);
+
+        // The model dimension keys the stored model id, and the events with
+        // none form the unknown-model bucket the split counts.
+        let model = report(&[filter(
+            "--model",
+            SpendGrouping::Model,
+            &["claude-opus-4-8"],
+        )]);
+        assert_eq!(
+            model.filters[0].excluded,
+            SpendFilterExcluded {
+                sessions: 3,
+                events: 6,
+                unknown_sessions: 3,
+                unknown_events: 6,
+            }
+        );
+        assert_eq!(model.groups[0].children.len(), 6);
     }
 
     /// `--group-by account --group-by day` reconciles: each account's day
@@ -1751,6 +2222,7 @@ mod tests {
             CreditReporting::Active(&model),
             Some(&FixtureResolver),
             &crate::config::ModelTable::default(),
+            &[],
         )
         .unwrap();
 

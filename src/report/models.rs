@@ -574,6 +574,11 @@ impl SpendGroup {
 /// dimensions are: it is decided by the session's account-marker timeline, so
 /// the report layer resolves it through [`crate::attribution::account_segment`]
 /// before grouping and never reasons about markers itself (aub-mgv.4).
+///
+/// `Harness` is the transcript namespace the session came from, which is the
+/// `[[transcripts]] name` the config wrote, and `Model` is the model id the
+/// transcript stored. Both are already on [`crate::store::spend::CanonicalSpendEvent`],
+/// so neither dimension reaches past the canonical read model (aub-satk).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum SpendGrouping {
     Day,
@@ -582,6 +587,8 @@ pub enum SpendGrouping {
     Repository,
     Task,
     Account,
+    Harness,
+    Model,
 }
 
 impl SpendGrouping {
@@ -593,6 +600,26 @@ impl SpendGrouping {
             Self::Repository => "repository",
             Self::Task => "task",
             Self::Account => "account",
+            Self::Harness => "harness",
+            Self::Model => "model",
+        }
+    }
+
+    /// The group label that holds usage this dimension could not name: the
+    /// `unknown-*` bucket a filter's exclusion footer counts against. The
+    /// labels for session, project and repository are read from the constants
+    /// their grouping arms use, never copied; `Day` has no filter and no
+    /// unknown bucket, so its arm only satisfies exhaustiveness.
+    pub fn unknown_bucket(self) -> &'static str {
+        match self {
+            Self::Day => "unknown-day",
+            Self::Session => crate::store::spend::UNKNOWN_SESSION,
+            Self::Project => crate::sessions::UNKNOWN_PROJECT,
+            Self::Repository => crate::sessions::UNKNOWN_REPOSITORY,
+            Self::Task => "unknown-task",
+            Self::Account => UNKNOWN_ACCOUNT_LABEL,
+            Self::Harness => UNKNOWN_HARNESS_LABEL,
+            Self::Model => UNKNOWN_MODEL_LABEL,
         }
     }
 }
@@ -601,6 +628,58 @@ impl SpendGrouping {
 /// marker could justify. It is a group in its own right, never omitted and never
 /// merged into an attributed account (PLAN.md 19.2).
 pub const UNKNOWN_ACCOUNT_LABEL: &str = "unknown-account";
+
+/// The harness-dimension group label for an event whose transcript namespace is
+/// absent or empty. Names are the `[[transcripts]] name` values the config
+/// wrote, so an unknown harness is always a ledger event no configured source
+/// claimed (aub-satk).
+pub const UNKNOWN_HARNESS_LABEL: &str = "unknown-harness";
+
+/// The model-dimension group label for an event whose transcript recorded no
+/// model id. Distinct from [`UNNAMED_MODEL_LABEL`], which is the footer label
+/// the unmapped-models line uses: that one names an id the model table could
+/// not price, this one names an id that does not exist at all.
+pub const UNKNOWN_MODEL_LABEL: &str = "unknown-model";
+
+/// One dimension filter the spend command line asked for: the values are group
+/// keys to keep, OR-ed within the filter, and different filters are AND-ed.
+/// `flag` is the spelling the operator typed, carried so the footer names the
+/// flag actually written (`--repo` for the repository dimension) instead of a
+/// re-derived one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendFilter {
+    pub flag: &'static str,
+    pub dimension: SpendGrouping,
+    pub values: BTreeSet<String>,
+}
+
+/// What one active filter removed from the report. `sessions` counts sessions
+/// that lost at least one event to the filter, `events` counts the events; the
+/// `unknown_*` pair counts how much of that was the dimension's `unknown-*`
+/// bucket, which is the attribution gap a filter would otherwise hide.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SpendFilterExcluded {
+    pub sessions: u64,
+    pub events: u64,
+    pub unknown_sessions: u64,
+    pub unknown_events: u64,
+}
+
+/// One filter as the report carries it: the filter and what applying it
+/// excluded. The exclusion is measured against the events that survived the
+/// filters before it, so the footer describes the pipeline in command-line
+/// order rather than a hypothetical each-filter-alone count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpendFilterOutcome {
+    pub filter: SpendFilter,
+    pub excluded: SpendFilterExcluded,
+}
+
+impl SpendFilterOutcome {
+    pub fn new(filter: SpendFilter, excluded: SpendFilterExcluded) -> Self {
+        Self { filter, excluded }
+    }
+}
 
 /// One account group's attribution provenance, surfaced under `--explain`: the
 /// evidence class the marker interval carried and the exact markers that
@@ -846,6 +925,11 @@ pub struct SpendReport {
     /// rather than in the ingest counters, which describe reading the
     /// transcripts and not pricing what they contained.
     pub unmapped_models: BTreeMap<String, u64>,
+    /// One entry per active command-line filter, in command-line order, with
+    /// what applying it excluded and how much of that was the dimension's
+    /// `unknown-*` bucket. Empty when no filter was asked for, so the report
+    /// a filter-free run prints carries nothing to qualify.
+    pub filters: Vec<SpendFilterOutcome>,
 }
 
 /// The key `unmapped_models` uses for an event whose transcript recorded no
@@ -880,7 +964,13 @@ impl SpendReport {
             window_equivalent_window: None,
             account_explain: Vec::new(),
             unmapped_models: BTreeMap::new(),
+            filters: Vec::new(),
         }
+    }
+
+    pub fn with_filters(mut self, filters: Vec<SpendFilterOutcome>) -> Self {
+        self.filters = filters;
+        self
     }
 
     pub fn with_unmapped_models(mut self, unmapped_models: BTreeMap<String, u64>) -> Self {
@@ -2082,12 +2172,20 @@ mod tests {
     /// Fields that hold a quantity without one of those wrappers, each with the
     /// reason it is nonetheless not an unqualified report number. `"*"` covers
     /// every field of the struct.
-    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 11] = [
+    const STRUCTURALLY_QUALIFIED: [(&str, &str, &str); 12] = [
         (
             "IngestSummary",
             "*",
             "operational counters describing what the ingestion run did, not \
              measurements it reports; they exist to say the report is incomplete",
+        ),
+        (
+            "SpendFilterExcluded",
+            "*",
+            "operational counters describing what one command-line filter removed, \
+             not measurements it reports; they exist to keep the unknown buckets \
+             the filter hid visible, and the quantities they qualify are the \
+             group subtotals beside them (aub-satk)",
         ),
         (
             "TaskIngestReport",
@@ -2293,13 +2391,13 @@ mod tests {
         );
     }
 
-    /// The structurally qualified exceptions are exactly the eleven documented
-    /// here, each naming the reason it is not an unqualified number. A twelfth one
-    /// cannot be added without this test being edited, which is the point: the list
-    /// is a decision, not a convenience.
+    /// The structurally qualified exceptions are exactly the twelve documented
+    /// here, each naming the reason it is not an unqualified number. A thirteenth
+    /// one cannot be added without this test being edited, which is the point: the
+    /// list is a decision, not a convenience.
     #[test]
     fn the_structurally_qualified_exceptions_are_documented() {
-        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 11);
+        assert_eq!(STRUCTURALLY_QUALIFIED.len(), 12);
         for (owner, _, reason) in STRUCTURALLY_QUALIFIED {
             assert!(
                 !reason.is_empty(),

@@ -7,6 +7,7 @@
 //! model and hands it to the presentation entry point, never formatting a
 //! quantity itself.
 
+use std::collections::BTreeSet;
 use std::ffi::OsString;
 use std::io;
 use std::io::Read as _;
@@ -45,7 +46,7 @@ use crate::report::{
     CalibrateActivateReport, CalibrateCompareReport, CalibrateCostModelCoverage,
     CalibrateCostModelKindCoverage, CalibrateHistoryEntry, CalibrateHistoryReport,
     CalibrateLifecycleEventView, CalibrateShowEntry, CalibrateShowReport, LedgerGeneration,
-    MeterAccount, NowReport, ReportMetadata, SpendGrouping, StatusReport,
+    MeterAccount, NowReport, ReportMetadata, SpendFilter, SpendGrouping, StatusReport,
 };
 use crate::store::export::ExportKey;
 
@@ -113,7 +114,14 @@ aub_command_enum! {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlagSupport {
     Accepted,
-    Rejected { reason: &'static str },
+    /// Accepted and repeatable: every occurrence belongs to the command's own
+    /// option parser, which owns the value list. Used by `spend`, whose
+    /// `--account` and `--model` are dimension filters with OR-ed values rather
+    /// than the one-value invocation selector `status` keeps (aub-satk).
+    AcceptedRepeated,
+    Rejected {
+        reason: &'static str,
+    },
 }
 
 /// A command's shared-flag policy: which global flags it accepts and which it
@@ -186,12 +194,12 @@ impl Command {
             Command::Spend => FlagPolicy {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
-                account: FlagSupport::Rejected {
-                    reason: "spend groups by account with --group-by account; it has no single-account filter",
-                },
-                model: FlagSupport::Rejected {
-                    reason: "spend has no model dimension until a model selector is needed",
-                },
+                // Spend's account and model flags are its own dimension
+                // filters, repeatable and OR-ed, with the exclusion footer
+                // keeping the unknown buckets visible; they are not the
+                // one-value selector `status` takes.
+                account: FlagSupport::AcceptedRepeated,
+                model: FlagSupport::AcceptedRepeated,
                 no_color: FlagSupport::Rejected {
                     reason: "spend prints no color",
                 },
@@ -675,7 +683,7 @@ impl Command {
         match self {
             Command::Status => Some("render the last known meter reading per configured account"),
             Command::Spend => Some(
-                "canonical token usage grouped by day, session, project, repository, task or account",
+                "canonical token usage grouped and filtered by day, session, project, repository, harness, model, task or account",
             ),
             Command::Config => {
                 Some("print every resolved configuration key with the source that won")
@@ -741,9 +749,9 @@ impl Command {
     pub fn question(self) -> Option<&'static str> {
         match self {
             Command::Status => Some("how much quota does each configured account have left?"),
-            Command::Spend => {
-                Some("how many canonical tokens were used, grouped by the requested dimensions?")
-            }
+            Command::Spend => Some(
+                "how many canonical tokens were used, grouped by the requested dimensions and kept by the requested filters?",
+            ),
             Command::Config => Some("which configuration key resolved from where?"),
             Command::RateCard => Some("what do the immutable dated vendor rate cards contain?"),
             Command::Backup => Some(
@@ -803,7 +811,7 @@ impl Command {
     /// the policy's reason when the command rejects the flag.
     pub fn format_help(self) -> String {
         match self.flag_policy().format {
-            FlagSupport::Accepted => "text | json".to_string(),
+            FlagSupport::Accepted | FlagSupport::AcceptedRepeated => "text | json".to_string(),
             FlagSupport::Rejected { reason } => format!("text only: {reason}"),
         }
     }
@@ -833,7 +841,7 @@ impl Command {
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
-                "--today (default) | --since YYYY-MM-DD | --days N | --group-by day|session|project|repository|task|account (repeatable) | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list",
+                "--today (default) | --yesterday | --since YYYY-MM-DD | --until YYYY-MM-DD | --days N | --group-by day|session|project|repository|harness|model|task|account (repeatable) | filters (repeatable, OR-ed): --harness --account --project --repo --task --model --session NAME | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
             Command::Backup => {
@@ -1005,8 +1013,29 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
             }
             None if arg == "--no-color" => no_color = parse_no_color(command)?,
             None => match (account_value, model_value) {
-                (Some(value), _) => account = Some(parse_account(command, &value)?),
-                (None, Some(value)) => model = Some(parse_model(command, &value)?),
+                (Some(value), _) => match command.flag_policy().account {
+                    FlagSupport::Accepted => account = Some(value),
+                    // The command owns the flag: every occurrence reaches its
+                    // own option parser through `rest`, which is how a
+                    // repeatable OR-ed filter differs from the selector above.
+                    FlagSupport::AcceptedRepeated => rest.push(format!("--account={value}")),
+                    FlagSupport::Rejected { reason } => {
+                        return Err(Error::Usage(format!(
+                            "{} does not accept --account: {reason}; omit the flag",
+                            command.name()
+                        )));
+                    }
+                },
+                (None, Some(value)) => match command.flag_policy().model {
+                    FlagSupport::Accepted => model = Some(value),
+                    FlagSupport::AcceptedRepeated => rest.push(format!("--model={value}")),
+                    FlagSupport::Rejected { reason } => {
+                        return Err(Error::Usage(format!(
+                            "{} does not accept --model: {reason}; omit the flag",
+                            command.name()
+                        )));
+                    }
+                },
                 (None, None) => rest.push(arg),
             },
         }
@@ -1029,6 +1058,13 @@ fn parse_explain(command: Command, value: Option<&str>) -> Result<ExplainMode, E
             "{} does not accept --explain: {reason}; omit the flag",
             command.name()
         ))),
+        // The repeatable routing exists for the account and model dimension
+        // filters; explain is meaningful once, so a policy row asking otherwise
+        // is a defect in the policy, not a parse the parser can serve.
+        FlagSupport::AcceptedRepeated => Err(Error::Internal(format!(
+            "{} declares --explain repeatable, which no command does",
+            command.name()
+        ))),
         FlagSupport::Accepted => match value {
             None | Some("") | Some("summary") => Ok(ExplainMode::Summary),
             Some("full") => Ok(ExplainMode::Full),
@@ -1045,6 +1081,10 @@ fn parse_format(command: Command, value: &str) -> Result<OutputFormat, Error> {
             "{} does not accept --format: {reason}; omit the flag",
             command.name()
         ))),
+        FlagSupport::AcceptedRepeated => Err(Error::Internal(format!(
+            "{} declares --format repeatable, which no command does",
+            command.name()
+        ))),
         FlagSupport::Accepted => match value {
             "json" => Ok(OutputFormat::Json),
             "text" => Ok(OutputFormat::Text),
@@ -1055,30 +1095,14 @@ fn parse_format(command: Command, value: &str) -> Result<OutputFormat, Error> {
     }
 }
 
-fn parse_account(command: Command, value: &str) -> Result<String, Error> {
-    match command.flag_policy().account {
-        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
-            "{} does not accept --account: {reason}; omit the flag",
-            command.name()
-        ))),
-        FlagSupport::Accepted => Ok(value.to_string()),
-    }
-}
-
-fn parse_model(command: Command, value: &str) -> Result<String, Error> {
-    match command.flag_policy().model {
-        FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
-            "{} does not accept --model: {reason}; omit the flag",
-            command.name()
-        ))),
-        FlagSupport::Accepted => Ok(value.to_string()),
-    }
-}
-
 fn parse_no_color(command: Command) -> Result<bool, Error> {
     match command.flag_policy().no_color {
         FlagSupport::Rejected { reason } => Err(Error::Usage(format!(
             "{} does not accept --no-color: {reason}; omit the flag",
+            command.name()
+        ))),
+        FlagSupport::AcceptedRepeated => Err(Error::Internal(format!(
+            "{} declares --no-color repeatable, which no command does",
             command.name()
         ))),
         FlagSupport::Accepted => Ok(true),
@@ -2856,6 +2880,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             .as_ref()
             .map(|resolver| resolver as &dyn WindowEquivalentResolver),
         &config.models,
+        &options.filters,
     )?;
     if let Some(refresh) = refresh_report {
         report.ingest.files_read = refresh.files_parsed;
@@ -3007,22 +3032,139 @@ pub enum SpendValuationMode {
     ApiList,
 }
 
+#[derive(Debug)]
 struct SpendOptions {
     window: SpendWindow,
     grouping: Vec<SpendGrouping>,
+    filters: Vec<SpendFilter>,
     refresh: RefreshPolicy,
     value: Option<SpendValuationMode>,
     credits: bool,
     window_equivalent: Option<String>,
 }
 
+/// The window flags a spend command line carries, before resolution. `--today`
+/// is kept apart from `--since` only to refuse naming two starts; it resolves
+/// exactly as `--since <today>`.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct SpendWindowFlags {
+    today: bool,
+    yesterday: bool,
+    since: Option<UtcDate>,
+    until: Option<UtcDate>,
+    days: Option<i64>,
+}
+
+/// Resolves the window a spend command line asked for. The table the help and
+/// `docs/commands.md` carry, decided on the bead:
+///
+/// | flags | window (UTC days, end exclusive) |
+/// | --- | --- |
+/// | none, `--today` | today |
+/// | `--yesterday` | yesterday |
+/// | `--days N` | the N days ending today, today included |
+/// | `--since D` | D up to and including today |
+/// | `--since D --until E` | D up to E exclusive; `E <= D` is a usage error |
+/// | `--since D --days N` | D forward N days, the reading an explicit start keeps |
+/// | `--until` without `--since` | usage error naming both flags |
+///
+/// `--yesterday` stands alone: the table gives it exactly one day, and
+/// combining it with another anchor or an end flag has no row to resolve under.
+fn resolve_spend_window(
+    flags: &SpendWindowFlags,
+    now: crate::domain::time::UtcTimestamp,
+) -> Result<SpendWindow, Error> {
+    let today = now.utc_date();
+    if flags.yesterday {
+        if flags.today || flags.since.is_some() || flags.days.is_some() || flags.until.is_some() {
+            return Err(Error::Usage(
+                "--yesterday names yesterday alone; it does not combine with --today, --since, --until or --days"
+                    .into(),
+            ));
+        }
+        return SpendWindow::ending(today.plus_days(-1), 1);
+    }
+    if flags.today && flags.since.is_some() {
+        return Err(Error::Usage(
+            "--today and --since name two different starts; give one".into(),
+        ));
+    }
+    if flags.until.is_some() && flags.days.is_some() {
+        return Err(Error::Usage(
+            "--until and --days give the window two ends; give one".into(),
+        ));
+    }
+    let anchored = flags.today || flags.since.is_some();
+    if flags.until.is_some() && !anchored {
+        return Err(Error::Usage(
+            "--until requires --since; use --days N for the last N days or --since D --until E"
+                .into(),
+        ));
+    }
+    if anchored {
+        let anchor = flags.since.unwrap_or(today);
+        if let Some(until) = flags.until {
+            return SpendWindow::between(anchor, until);
+        }
+        match flags.days {
+            Some(days) => SpendWindow::starting(anchor, days),
+            // No end asked: the anchor runs through today, so a start after
+            // today would be an empty window and is refused outright.
+            None => {
+                if anchor > today {
+                    return Err(Error::Usage(format!(
+                        "--since {} is after today ({}); the window would be empty",
+                        anchor.iso(),
+                        today.iso()
+                    )));
+                }
+                SpendWindow::between(anchor, today.next())
+            }
+        }
+    } else {
+        match flags.days {
+            // Bare `--days N` is the reading people say: the N days ending
+            // today, today included.
+            Some(days) => SpendWindow::ending(today, days),
+            None => SpendWindow::between(today, today.next()),
+        }
+    }
+}
+
+/// The seven dimension filters spend accepts, each repeatable with OR-ed
+/// values, combined with AND across flags.
+#[derive(Debug, Default)]
+struct SpendFilterBuilder {
+    filters: Vec<SpendFilter>,
+}
+
+impl SpendFilterBuilder {
+    fn push(&mut self, flag: &'static str, dimension: SpendGrouping, value: &str) {
+        if let Some(existing) = self
+            .filters
+            .iter_mut()
+            .find(|filter| filter.dimension == dimension)
+        {
+            existing.values.insert(value.to_string());
+        } else {
+            let mut values = BTreeSet::new();
+            values.insert(value.to_string());
+            self.filters.push(SpendFilter {
+                flag,
+                dimension,
+                values,
+            });
+        }
+    }
+}
+
 fn spend_options(
     rest: &[String],
     now: crate::domain::time::UtcTimestamp,
 ) -> Result<SpendOptions, Error> {
-    let mut since: Option<UtcDate> = None;
-    let mut days: i64 = 1;
+    let mut window_flags = SpendWindowFlags::default();
     let mut grouping = Vec::new();
+    let mut filters = SpendFilterBuilder::default();
     let mut refresh = RefreshPolicy::Auto;
     let mut value = None;
     let mut credits = false;
@@ -3030,25 +3172,74 @@ fn spend_options(
     let mut args = rest.iter().peekable();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--today" => since = Some(now.utc_date()),
+            "--today" => window_flags.today = true,
+            "--yesterday" => window_flags.yesterday = true,
             "--since" => {
                 let val_str = args
                     .next()
                     .ok_or_else(|| Error::Usage("--since requires YYYY-MM-DD".into()))?;
-                since = Some(parse_date(val_str)?);
+                window_flags.since = Some(parse_date(val_str)?);
+            }
+            "--until" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--until requires YYYY-MM-DD".into()))?;
+                window_flags.until = Some(parse_until(val_str)?);
             }
             "--days" => {
                 let val_str = args
                     .next()
                     .ok_or_else(|| Error::Usage("--days requires a number".into()))?;
-                days = val_str
-                    .parse()
-                    .map_err(|_| Error::Usage(format!("--days must be a number, got {val_str}")))?;
+                window_flags.days = Some(val_str.parse().map_err(|_| {
+                    Error::Usage(format!("--days must be a number, got {val_str}"))
+                })?);
             }
             "--group-by" => grouping
                 .push(parse_spend_grouping(args.next().ok_or_else(|| {
                     Error::Usage("--group-by requires a dimension".into())
                 })?)?),
+            "--harness" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--harness requires a value".into()))?;
+                filters.push("--harness", SpendGrouping::Harness, val_str);
+            }
+            "--account" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--account requires a value".into()))?;
+                filters.push("--account", SpendGrouping::Account, val_str);
+            }
+            "--project" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--project requires a value".into()))?;
+                filters.push("--project", SpendGrouping::Project, val_str);
+            }
+            "--repo" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--repo requires a value".into()))?;
+                filters.push("--repo", SpendGrouping::Repository, val_str);
+            }
+            "--task" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--task requires a value".into()))?;
+                filters.push("--task", SpendGrouping::Task, val_str);
+            }
+            "--model" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--model requires a value".into()))?;
+                filters.push("--model", SpendGrouping::Model, val_str);
+            }
+            "--session" => {
+                let val_str = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--session requires a value".into()))?;
+                filters.push("--session", SpendGrouping::Session, val_str);
+            }
             "--refresh" => {
                 refresh = match args.peek().map(|val_str| val_str.as_str()) {
                     Some("auto" | "never" | "force") => {
@@ -3084,40 +3275,119 @@ fn spend_options(
                 credits = true;
             }
             other => match other.strip_prefix("--since=") {
-                Some(val_str) => since = Some(parse_date(val_str)?),
-                None => match other.strip_prefix("--days=") {
-                    Some(val_str) => {
-                        days = val_str.parse().map_err(|_| {
-                            Error::Usage(format!("--days must be a number, got {val_str}"))
-                        })?
-                    }
-                    None => match other.strip_prefix("--group-by=") {
-                        Some(val_str) => grouping.push(parse_spend_grouping(val_str)?),
-                        None => match other.strip_prefix("--refresh=") {
-                            Some(val_str) => refresh = parse_refresh_policy(val_str)?,
-                            None => match other.strip_prefix("--value=") {
-                                Some("api-list") => value = Some(SpendValuationMode::ApiList),
+                Some(val_str) => window_flags.since = Some(parse_date(val_str)?),
+                None => match other.strip_prefix("--until=") {
+                    Some(val_str) => window_flags.until = Some(parse_until(val_str)?),
+                    None => match other.strip_prefix("--days=") {
+                        Some(val_str) => {
+                            window_flags.days = Some(val_str.parse().map_err(|_| {
+                                Error::Usage(format!("--days must be a number, got {val_str}"))
+                            })?)
+                        }
+                        None => match other.strip_prefix("--group-by=") {
+                            Some(val_str) => grouping.push(parse_spend_grouping(val_str)?),
+                            None => match other.strip_prefix("--harness=") {
                                 Some(val_str) => {
-                                    return Err(Error::Usage(format!(
-                                        "--value must be api-list, got {val_str}"
-                                    )));
+                                    filters.push("--harness", SpendGrouping::Harness, val_str)
                                 }
-                                None => match other.strip_prefix("--window-equivalent=") {
-                                    Some(window) if !window.is_empty() => {
-                                        window_equivalent = Some(window.to_string());
-                                        credits = true;
+                                None => match other.strip_prefix("--account=") {
+                                    Some(val_str) => {
+                                        filters.push("--account", SpendGrouping::Account, val_str);
                                     }
-                                    Some(_) => {
-                                        return Err(Error::Usage(
-                                            "--window-equivalent requires a non-empty window semantic key"
-                                                .into(),
-                                        ));
-                                    }
-                                    None => {
-                                        return Err(Error::Usage(format!(
-                                            "unknown argument: {other}"
-                                        )));
-                                    }
+                                    None => match other.strip_prefix("--project=") {
+                                        Some(val_str) => {
+                                            filters.push(
+                                                "--project",
+                                                SpendGrouping::Project,
+                                                val_str,
+                                            );
+                                        }
+                                        None => match other.strip_prefix("--repo=") {
+                                            Some(val_str) => {
+                                                filters.push(
+                                                    "--repo",
+                                                    SpendGrouping::Repository,
+                                                    val_str,
+                                                );
+                                            }
+                                            None => match other.strip_prefix("--task=") {
+                                                Some(val_str) => {
+                                                    filters.push(
+                                                        "--task",
+                                                        SpendGrouping::Task,
+                                                        val_str,
+                                                    );
+                                                }
+                                                None => match other.strip_prefix("--model=") {
+                                                    Some(val_str) => {
+                                                        filters.push(
+                                                            "--model",
+                                                            SpendGrouping::Model,
+                                                            val_str,
+                                                        );
+                                                    }
+                                                    None => match other.strip_prefix("--session=") {
+                                                        Some(val_str) => {
+                                                            filters.push(
+                                                                "--session",
+                                                                SpendGrouping::Session,
+                                                                val_str,
+                                                            );
+                                                        }
+                                                        None => match other
+                                                            .strip_prefix("--refresh=")
+                                                        {
+                                                            Some(val_str) => {
+                                                                refresh =
+                                                                    parse_refresh_policy(val_str)?
+                                                            }
+                                                            None => match other
+                                                                .strip_prefix("--value=")
+                                                            {
+                                                                Some("api-list") => {
+                                                                    value = Some(
+                                                                        SpendValuationMode::ApiList,
+                                                                    )
+                                                                }
+                                                                Some(val_str) => {
+                                                                    return Err(Error::Usage(
+                                                                        format!(
+                                                                            "--value must be api-list, got {val_str}"
+                                                                        ),
+                                                                    ));
+                                                                }
+                                                                None => match other.strip_prefix(
+                                                                    "--window-equivalent=",
+                                                                ) {
+                                                                    Some(window)
+                                                                        if !window.is_empty() =>
+                                                                    {
+                                                                        window_equivalent = Some(
+                                                                            window.to_string(),
+                                                                        );
+                                                                        credits = true;
+                                                                    }
+                                                                    Some(_) => {
+                                                                        return Err(Error::Usage(
+                                                                            "--window-equivalent requires a non-empty window semantic key"
+                                                                                .into(),
+                                                                        ));
+                                                                    }
+                                                                    None => {
+                                                                        return Err(Error::Usage(
+                                                                            format!(
+                                                                                "unknown argument: {other}"
+                                                                            ),
+                                                                        ));
+                                                                    }
+                                                                },
+                                                            },
+                                                        },
+                                                    },
+                                                },
+                                            },
+                                        },
+                                    },
                                 },
                             },
                         },
@@ -3127,17 +3397,23 @@ fn spend_options(
         }
     }
     Ok(SpendOptions {
-        window: SpendWindow::starting(since.unwrap_or_else(|| now.utc_date()), days)?,
+        window: resolve_spend_window(&window_flags, now)?,
         grouping: if grouping.is_empty() {
             vec![SpendGrouping::Day]
         } else {
             grouping
         },
+        filters: filters.filters,
         refresh,
         value,
         credits,
         window_equivalent,
     })
+}
+
+fn parse_until(value: &str) -> Result<UtcDate, Error> {
+    UtcDate::parse(value)
+        .ok_or_else(|| Error::Usage(format!("--until must be YYYY-MM-DD, got {value}")))
 }
 
 fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
@@ -3147,9 +3423,11 @@ fn parse_spend_grouping(value: &str) -> Result<SpendGrouping, Error> {
         "project" => Ok(SpendGrouping::Project),
         "repository" | "repo" => Ok(SpendGrouping::Repository),
         "account" => Ok(SpendGrouping::Account),
+        "harness" => Ok(SpendGrouping::Harness),
+        "model" => Ok(SpendGrouping::Model),
         "task" => Ok(SpendGrouping::Task),
         _ => Err(Error::Usage(format!(
-            "--group-by must be day, session, project, repository, task or account, got {value}"
+            "--group-by must be day, session, project, repository, harness, model, task or account, got {value}"
         ))),
     }
 }
@@ -8622,7 +8900,7 @@ mod tests {
                     !reason.is_empty(),
                     "{command:?} rejects --explain without a reason"
                 ),
-                FlagSupport::Accepted => {}
+                FlagSupport::Accepted | FlagSupport::AcceptedRepeated => {}
             }
         }
     }
@@ -8653,6 +8931,9 @@ mod tests {
                     }
                     other => panic!("{command:?} rejects --explain but parsed as {other:?}"),
                 },
+                FlagSupport::AcceptedRepeated => {
+                    panic!("{command:?} declares --explain repeatable, which no command does")
+                }
             }
         }
     }
@@ -8710,10 +8991,11 @@ mod tests {
         }
     }
 
-    /// `--account` is a parsed token for every command, and the parser honours the
-    /// policy: a rejection emits the policy's reason, an acceptance lands as the
-    /// invocation's account. Status is the one command that accepts it, and the
-    /// selector is why.
+    /// `--account` is a parsed token for every command, and the parser honours
+    /// the policy: a rejection emits the policy's reason, an acceptance lands as
+    /// the invocation's account, and the repeatable acceptance hands every
+    /// occurrence to the command's own option parser. Status keeps the
+    /// selector; spend owns its repeatable filters (aub-satk).
     #[test]
     fn the_parser_honours_the_account_policy_for_every_command() {
         for command in Command::ALL {
@@ -8725,6 +9007,20 @@ mod tests {
                             invocation.account.as_deref(),
                             Some("work-a"),
                             "{command:?} parsed --account as something other than the value"
+                        );
+                    }
+                    other => panic!("{command:?} accepts --account but parsed as {other:?}"),
+                },
+                FlagSupport::AcceptedRepeated => match result {
+                    Ok(Request::Run(invocation)) => {
+                        assert_eq!(
+                            invocation.account, None,
+                            "{command:?} owns --account, so the selector must stay empty"
+                        );
+                        assert_eq!(
+                            invocation.rest,
+                            vec!["--account=work-a".to_string()],
+                            "{command:?} must hand every --account to its own option parser"
                         );
                     }
                     other => panic!("{command:?} accepts --account but parsed as {other:?}"),
@@ -8771,8 +9067,10 @@ mod tests {
     }
 
     /// `--model` is a parsed token for every command, both the `--model M` and
-    /// `--model=M` spellings, and the parser honours the policy: status is the
-    /// one command that accepts it, and the window selection is why.
+    /// `--model=M` spellings, and the parser honours the policy: status keeps
+    /// the single-value selector, spend hands each occurrence to its own
+    /// option parser as a repeatable filter (aub-satk), and every other
+    /// command rejects with the policy's reason.
     #[test]
     fn the_parser_honours_the_model_policy_for_every_command() {
         for spelling in [
@@ -8804,11 +9102,47 @@ mod tests {
                     }
                     other => panic!("{command:?} rejects --model but parsed as {other:?}"),
                 },
+                FlagSupport::AcceptedRepeated => match result {
+                    Ok(Request::Run(invocation)) => assert_eq!(
+                        invocation.rest,
+                        vec!["--model=m".to_string()],
+                        "{command:?} must hand every --model to its own option parser"
+                    ),
+                    other => panic!("{command:?} accepts --model but parsed as {other:?}"),
+                },
                 FlagSupport::Accepted => {
-                    panic!("{command:?} declares --model accepted but status is the only selector")
+                    panic!(
+                        "{command:?} declares --model accepted as a selector, but status is the only selector"
+                    )
                 }
             }
         }
+    }
+
+    /// Spend's repeated `--account` and `--model` accumulate in its own option
+    /// surface rather than overwriting a selector, which is what makes the
+    /// OR-ed filter possible (aub-satk).
+    #[test]
+    fn spend_account_and_model_occurrences_reach_spend_options() {
+        let parsed = parse_invocation(args(&[
+            "spend",
+            "--account",
+            "work-a",
+            "--model=claude-model-x",
+        ]))
+        .expect("spend accepts the account and model flags");
+        let Request::Run(invocation) = parsed else {
+            panic!("expected Request::Run")
+        };
+        assert_eq!(
+            invocation.rest,
+            vec![
+                "--account=work-a".to_string(),
+                "--model=claude-model-x".to_string()
+            ],
+        );
+        assert_eq!(invocation.account, None);
+        assert_eq!(invocation.model, None);
     }
 
     /// `--no-color` is a parsed token for every command, and the parser honours
@@ -8836,6 +9170,9 @@ mod tests {
                     }
                     other => panic!("{command:?} rejects --no-color but parsed as {other:?}"),
                 },
+                FlagSupport::AcceptedRepeated => {
+                    panic!("{command:?} declares --no-color repeatable, which no command does")
+                }
             }
         }
     }
@@ -8975,6 +9312,9 @@ mod tests {
                     }
                     other => panic!("{command:?} rejects --format but parsed as {other:?}"),
                 },
+                FlagSupport::AcceptedRepeated => {
+                    panic!("{command:?} declares --format repeatable, which no command does")
+                }
             }
         }
     }
@@ -9023,8 +9363,99 @@ mod tests {
         }
     }
 
+    /// The seven dimension filters spend accepts: each flag parses to its
+    /// dimension, repetition ORs the values into one filter, different flags
+    /// stay separate filters, and `--repo` is the repository dimension's flag
+    /// while the `--group-by repository` spelling keeps its `repo` alias
+    /// (aub-satk).
+    #[test]
+    fn spend_filters_parse_every_dimension_with_or_within_and_across() {
+        let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-09-11T15:00:00Z").unwrap();
+        let filters = |args: &[&str]| -> Vec<SpendFilter> {
+            let rest: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+            spend_options(&rest, now)
+                .expect("the flags must parse")
+                .filters
+        };
+        assert_eq!(filters(&[]), Vec::new());
+        let harness = filters(&["--harness", "codex"]);
+        assert_eq!(harness.len(), 1);
+        assert_eq!(harness[0].flag, "--harness");
+        assert_eq!(harness[0].dimension, SpendGrouping::Harness);
+        assert_eq!(harness[0].values, BTreeSet::from(["codex".to_string()]));
+        // The repository flag is --repo; the group-by spelling keeps repo as
+        // its alias.
+        let repository = filters(&["--repo", "org/repo"]);
+        assert_eq!(repository[0].flag, "--repo");
+        assert_eq!(repository[0].dimension, SpendGrouping::Repository);
+        // Repeating one flag ORs the values into the one filter.
+        let repeated = filters(&[
+            "--harness",
+            "codex",
+            "--harness=pi",
+            "--model",
+            "claude-opus-4-8",
+            "--model",
+            "claude-sonnet-4-6",
+        ]);
+        assert_eq!(repeated.len(), 2, "one filter per dimension, in order");
+        assert_eq!(repeated[0].dimension, SpendGrouping::Harness);
+        assert_eq!(
+            repeated[0].values,
+            BTreeSet::from(["codex".to_string(), "pi".to_string()])
+        );
+        assert_eq!(repeated[1].dimension, SpendGrouping::Model);
+        // The flags arrive through the invocation router in normalized form,
+        // which must parse identically.
+        let routed = filters(&["--account=max", "--account=work-a"]);
+        assert_eq!(routed[0].flag, "--account");
+        assert_eq!(
+            routed[0].values,
+            BTreeSet::from(["max".to_string(), "work-a".to_string()])
+        );
+        // Every flag parses, including the near-identical session and task
+        // spellings.
+        let all = filters(&[
+            "--harness",
+            "claude-code",
+            "--account",
+            "max",
+            "--project",
+            "proj-a",
+            "--repo",
+            "repo-a",
+            "--task",
+            "source:t-1",
+            "--model",
+            "claude-opus-4-8",
+            "--session",
+            "claude-code:s-1",
+        ]);
+        assert_eq!(all.len(), 7);
+        assert_eq!(
+            all.iter()
+                .map(|filter| filter.dimension)
+                .collect::<Vec<_>>(),
+            vec![
+                SpendGrouping::Harness,
+                SpendGrouping::Account,
+                SpendGrouping::Project,
+                SpendGrouping::Repository,
+                SpendGrouping::Task,
+                SpendGrouping::Model,
+                SpendGrouping::Session,
+            ]
+        );
+        // A filter flag with no value is a usage error naming the flag.
+        match spend_options(&["--harness".to_string()], now) {
+            Err(Error::Usage(message)) => assert!(message.contains("--harness"), "{message}"),
+            other => panic!("--harness with no value must be a usage error, got {other:?}"),
+        }
+    }
+
     /// The spend window: today by default, `--since` with `--days`, and a malformed
-    /// date refused rather than guessed.
+    /// date refused rather than guessed. The seven-combination table and its
+    /// usage errors live in their own tests below (aub-satk).
     #[test]
     fn spend_options_default_to_the_utc_day_and_read_grouping_and_refresh_flags() {
         let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-08-30T23:30:00Z").unwrap();
@@ -9072,8 +9503,190 @@ mod tests {
                 .grouping,
             vec![SpendGrouping::Task]
         );
-        assert!(spend_options(&["--group-by=model".into()], now).is_err());
+        assert_eq!(
+            spend_options(&["--group-by=model".into()], now)
+                .unwrap()
+                .grouping,
+            vec![SpendGrouping::Model]
+        );
         assert!(spend_options(&["--bogus".into()], now).is_err());
+    }
+
+    /// The seven window combinations of the table on the bead, each with the
+    /// literal window it must produce, plus the two usage errors the table
+    /// names (aub-satk).
+    #[test]
+    fn the_spend_window_table_resolves_every_combination() {
+        let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-09-11T15:00:00Z").unwrap();
+        let window = |args: &[&str]| -> Result<SpendWindow, Error> {
+            let rest: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+            spend_options(&rest, now).map(|options| options.window)
+        };
+        // none and --today: today.
+        assert_eq!(
+            window(&[]).unwrap(),
+            window_between("2026-09-11", "2026-09-12")
+        );
+        assert_eq!(
+            window(&["--today"]).unwrap(),
+            window_between("2026-09-11", "2026-09-12")
+        );
+        // --yesterday: exactly yesterday.
+        assert_eq!(
+            window(&["--yesterday"]).unwrap(),
+            window_between("2026-09-10", "2026-09-11")
+        );
+        // --days N: the N days ending today, today included.
+        assert_eq!(
+            window(&["--days", "3"]).unwrap(),
+            window_between("2026-09-09", "2026-09-12")
+        );
+        // --since D: D up to and including today.
+        assert_eq!(
+            window(&["--since", "2026-09-05"]).unwrap(),
+            window_between("2026-09-05", "2026-09-12")
+        );
+        // --since D --until E: D up to E exclusive.
+        assert_eq!(
+            window(&["--since", "2026-09-05", "--until", "2026-09-09"]).unwrap(),
+            window_between("2026-09-05", "2026-09-09")
+        );
+        // --since D --days N: D forward N days, the reading an explicit start
+        // keeps.
+        assert_eq!(
+            window(&["--since", "2026-09-05", "--days", "3"]).unwrap(),
+            window_between("2026-09-05", "2026-09-08")
+        );
+        // --until without --since: a usage error naming both flags.
+        match window(&["--until", "2026-09-09"]) {
+            Err(Error::Usage(message)) => {
+                assert!(
+                    message.contains("--until") && message.contains("--since"),
+                    "the error must name both flags: {message}"
+                );
+            }
+            other => panic!("--until without --since must be a usage error, got {other:?}"),
+        }
+        // --until E <= D: a usage error.
+        for (since, until) in [("2026-09-05", "2026-09-05"), ("2026-09-09", "2026-09-05")] {
+            match window(&["--since", since, "--until", until]) {
+                Err(Error::Usage(message)) => {
+                    assert!(
+                        message.contains("--until"),
+                        "the error must name the flag that broke: {message}"
+                    );
+                }
+                other => {
+                    panic!(
+                        "--until {until} after --since {since} must be a usage error, got {other:?}"
+                    )
+                }
+            }
+        }
+        // --days 0 is a usage error with an anchor and without one.
+        assert!(window(&["--days", "0"]).is_err());
+        assert!(window(&["--since", "2026-09-05", "--days", "0"]).is_err());
+    }
+
+    /// The combinations the table does not licence are refused rather than
+    /// guessed: two starts, two ends, and --yesterday beside any other window
+    /// flag (aub-satk).
+    #[test]
+    fn the_spend_window_refuses_combinations_the_table_does_not_licence() {
+        let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-09-11T15:00:00Z").unwrap();
+        let window = |args: &[&str]| -> Result<SpendWindow, Error> {
+            let rest: Vec<String> = args.iter().map(|arg| (*arg).to_string()).collect();
+            spend_options(&rest, now).map(|options| options.window)
+        };
+        assert!(window(&["--today", "--since", "2026-09-05"]).is_err());
+        assert!(window(&["--today", "--yesterday"]).is_err());
+        assert!(window(&["--yesterday", "--days", "2"]).is_err());
+        assert!(window(&["--yesterday", "--until", "2026-09-12"]).is_err());
+        assert!(window(&["--yesterday", "--since", "2026-09-05"]).is_err());
+        assert!(
+            window(&[
+                "--since",
+                "2026-09-05",
+                "--days",
+                "2",
+                "--until",
+                "2026-09-09"
+            ])
+            .is_err()
+        );
+        assert!(window(&["--today", "--until", "2026-09-13"]).is_ok());
+        assert!(window(&["--today", "--days", "2"]).is_ok());
+        // A start after today with no end flag would be an empty window.
+        assert!(window(&["--since", "2026-09-12"]).is_err());
+        // A malformed --until names the flag, like --since does.
+        match window(&["--since", "2026-09-05", "--until", "garbage"]) {
+            Err(Error::Usage(message)) => assert!(message.contains("--until"), "{message}"),
+            other => panic!("malformed --until must be a usage error, got {other:?}"),
+        }
+    }
+
+    /// The property the new resolver must hold: every produced window is
+    /// non-empty, and every window produced without an explicit anchor ends
+    /// tomorrow, which is the whole point of the backward reading of `--days`
+    /// (aub-satk). An empty window would print zero and a zero must come from
+    /// evidence.
+    #[test]
+    fn every_resolved_spend_window_is_nonempty_and_derived_windows_end_tomorrow() {
+        let now = crate::domain::time::UtcTimestamp::parse_rfc3339("2026-09-11T00:30:00Z").unwrap();
+        let today = now.utc_date();
+        let tomorrow = today.next();
+        let days_values: Vec<i64> = (1..=10).collect();
+        // Every combination with a --days shaper resolves to a window with a
+        // positive span, anchored or not: no resolver output may be empty,
+        // because an empty window would report zero events.
+        for days in &days_values {
+            for args in [
+                vec!["--days".to_string(), days.to_string()],
+                vec!["--today".into(), "--days".into(), days.to_string()],
+                vec![
+                    "--since".to_string(),
+                    today.iso(),
+                    "--days".to_string(),
+                    days.to_string(),
+                ],
+                vec![
+                    "--since".to_string(),
+                    today.plus_days(-3).iso(),
+                    "--days".to_string(),
+                    days.to_string(),
+                ],
+            ] {
+                let window = spend_options(&args, now)
+                    .expect("the combination must resolve")
+                    .window;
+                assert!(
+                    window.since < window.until,
+                    "{} resolved to an empty window",
+                    args.join(" ")
+                );
+            }
+        }
+        // Without an anchor, the window ends tomorrow: --days N reads backward
+        // from today and the default window is today itself. The anchored
+        // forms are the ones the table pins with literal windows above.
+        for days in &days_values {
+            let window = spend_options(&["--days".to_string(), days.to_string()], now)
+                .expect("bare --days must resolve")
+                .window;
+            assert_eq!(window.until, tomorrow, "bare --days must end tomorrow");
+        }
+        let unanchored = spend_options(&[], now)
+            .expect("the default must resolve")
+            .window;
+        assert_eq!(unanchored.until, tomorrow);
+    }
+
+    fn window_between(since: &str, until: &str) -> SpendWindow {
+        SpendWindow::between(
+            crate::domain::time::UtcDate::parse(since).unwrap(),
+            crate::domain::time::UtcDate::parse(until).unwrap(),
+        )
+        .unwrap()
     }
 
     #[test]
