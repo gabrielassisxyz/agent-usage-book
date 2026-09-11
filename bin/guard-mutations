@@ -159,8 +159,6 @@ import os
 path = os.environ["FILE_STR"]
 old = os.environ["OLD_STR"]
 new = os.environ["NEW_STR"]
-# %b expansion happens before this point; restore the \x1f separator form
-# is unnecessary here because the caller splits mut_arg/mut_arg2 already.
 text = open(path, encoding="utf-8").read()
 if old not in text:
     print("replace: old string not found in %s" % path)
