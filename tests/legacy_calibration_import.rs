@@ -18,6 +18,14 @@ use agent_usage_book::store::migrations::registry;
 use rusqlite::Connection;
 use test_support::StateDir;
 
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Per-call disambiguator for the import scratch directory, so two calls in
+/// one process never share a source path even when the clock reports the same
+/// instant twice. The process id covers the cross-process case and the thread
+/// id names the concurrent caller.
+static LEGACY_CAL_IMPORT_SEQ: AtomicU64 = AtomicU64::new(0);
+
 fn open_migrated_ledger(state: &StateDir) -> Connection {
     let path = state.path().join(LEDGER_DATABASE_FILE);
     let policy = PragmaPolicy {
@@ -49,13 +57,16 @@ fn import_fit(
     conn: &mut Connection,
     source_json: &str,
 ) -> agent_usage_book::store::legacy_meter_import::ImportSummary {
+    let seq = LEGACY_CAL_IMPORT_SEQ.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!(
-        "aub-legacy-cal-import-{}-{}",
+        "aub-legacy-cal-import-{}-{}-{}-{:?}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
-            .as_nanos()
+            .as_nanos(),
+        seq,
+        std::thread::current().id(),
     ));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("source.json");
@@ -68,6 +79,16 @@ fn import_fit(
         UtcTimestamp::from_unix_nanos(2_000_000_000),
     )
     .expect("import must succeed");
+    assert_eq!(
+        summary.imported, 1,
+        "legacy import of digest {} must write one calibration (read {}, quarantined {}), got {summary:?}",
+        parsed.content_digest, parsed.records_read, parsed.records_quarantined,
+    );
+    assert_eq!(
+        summary.quarantined, 0,
+        "legacy import of digest {} must quarantine nothing, got {summary:?}",
+        parsed.content_digest,
+    );
     std::fs::remove_dir_all(&dir).ok();
     summary
 }
