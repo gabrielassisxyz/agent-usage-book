@@ -1677,6 +1677,7 @@ mod tests {
                 billing_basis: BillingBasis::PerMillionTokens,
                 effective_start: now.utc_date(),
                 effective_end: None,
+                schedule: None,
                 publication: crate::domain::rate_card::Publication {
                     source: None,
                     published_at: None,

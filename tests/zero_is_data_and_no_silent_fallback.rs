@@ -232,6 +232,7 @@ fn rate_card(
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse(start).expect("valid start date"),
             effective_end: end.map(|d| UtcDate::parse(d).expect("valid end date")),
+            schedule: None,
             publication: Publication {
                 source: Some("https://pricing.example".to_string()),
                 published_at: None,
@@ -761,7 +762,7 @@ fn rate_card_outside_its_window_is_not_reused_for_a_later_date() {
         &book,
         "vendor",
         "model-a",
-        UtcDate::parse("2024-03-15").unwrap(),
+        UtcDate::parse("2024-03-15").unwrap().start(),
         &priced,
     );
     assert!(
@@ -776,14 +777,17 @@ fn rate_card_outside_its_window_is_not_reused_for_a_later_date() {
         &book,
         "vendor",
         "model-a",
-        UtcDate::parse("2024-12-01").unwrap(),
+        UtcDate::parse("2024-12-01").unwrap().start(),
         &priced,
     );
     match after_window {
         agent_usage_book::valuation::ValuationOutcome::Incomplete { missing_rates, .. } => {
             assert_eq!(missing_rates.len(), 1);
             assert_eq!(missing_rates[0].token_class, "input");
-            assert_eq!(missing_rates[0].date, UtcDate::parse("2024-12-01").unwrap());
+            assert_eq!(
+                missing_rates[0].at,
+                UtcDate::parse("2024-12-01").unwrap().start()
+            );
         }
         other => panic!("an out-of-window date must not reuse the expired card: {other:?}"),
     }

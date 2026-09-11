@@ -148,6 +148,15 @@ each event's stored model id, never by the harness the transcript came from.
 `--explain` names that pair per group, and a footer line names any id nothing
 priced; both are documented under `aub config`.
 
+A card can carry a time-of-day schedule (`schedule = { days = [...],
+hours_utc = "12:00-18:00" }`, weekdays as `mon` through `sun`, the window
+inside one UTC day), and each event values at the card in force at its own
+instant: a weekday afternoon lands on the peak row, the same hour on Saturday
+on the default. `--explain` names each card a group used with its schedule
+(`peak mon-fri 12:00-18:00 UTC` or `default`). An event whose timestamp is a
+heuristic values at the default card and its group reads estimated with the
+schedule-unresolved method, so an unknown hour never silently becomes a peak.
+
 **Refuses:** to guess at an unreadable transcript. A source that cannot be
 normalized leaves the report `IngestIncomplete` rather than silently omitted
 or extrapolated from what did parse. `spend` also refuses to answer a quota
@@ -418,6 +427,11 @@ names the page it was read from and the day it was read, and the file's header
 carries the rules it was written under. The book under
 `tests/fixtures/rate-book/` is test data for the import contract and is
 imported by the test suite alone; it is not a price this machine is billed at.
+
+A book with two cards that could price the same instant is refused at import,
+naming both card indexes: at most one unscheduled card per vendor, model,
+class and date, and no two scheduled cards whose day sets intersect and
+whose hour ranges overlap. A default beside its peak rows always passes.
 
 **Refuses:** to edit history. A rate book is imported into a new, immutable,
 versioned record; correcting a stale price means importing a new version,

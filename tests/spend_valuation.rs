@@ -2,9 +2,10 @@
 
 use std::collections::BTreeMap;
 
+use agent_usage_book::domain::credits::Credits;
 use agent_usage_book::domain::money::{Money, Usd};
 use agent_usage_book::domain::provenance::{
-    DerivationId, EvidenceId, QuerySemantics, RateCardId, WitnessId,
+    CostModelId, DerivationId, EvidenceId, QuerySemantics, RateCardId, WitnessId,
 };
 use agent_usage_book::domain::rate_card::{
     BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, TokenClass,
@@ -13,7 +14,8 @@ use agent_usage_book::domain::time::{UtcDate, UtcTimestamp};
 use agent_usage_book::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, UsageVector,
 };
-use agent_usage_book::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
+use agent_usage_book::evidence::Qualified;
+use agent_usage_book::evidence::{CoverageCompleteness, Derivation, EvidenceQuality, Provenance};
 use agent_usage_book::logging::{LogicalName, RunId};
 use agent_usage_book::presentation::json::{
     spend_json, spend_json_with_explain, validate_spend_report_json,
@@ -22,7 +24,8 @@ use agent_usage_book::presentation::render::{
     ExplainMode, render_spend_report, render_spend_report_with_explain,
 };
 use agent_usage_book::report::{
-    IngestSummary, LedgerGeneration, ReportMetadata, SpendGroup, SpendGroupProvenance, SpendReport,
+    IngestSummary, LedgerGeneration, PricedCardRef, ReportMetadata, SpendGroup,
+    SpendGroupCreditsProvenance, SpendGroupProvenance, SpendReport,
 };
 use agent_usage_book::valuation::{RateBook, ValuationOutcome};
 
@@ -50,6 +53,7 @@ fn helper_card(
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse(start).expect("valid start date"),
             effective_end: end.map(|d| UtcDate::parse(d).expect("valid end date")),
+            schedule: None,
             publication: Publication {
                 source: Some("https://pricing.vendor.example".to_string()),
                 published_at: None,
@@ -256,7 +260,7 @@ fn integration_requested_valuation_unavailable_renders_unavailable_form() {
         &book,
         "anthropic",
         "claude-3-5-sonnet",
-        since,
+        since.start(),
         &usage,
     );
     assert!(matches!(val_outcome, ValuationOutcome::Incomplete { .. }));
@@ -332,7 +336,7 @@ fn unit_rate_card_version_in_metadata_and_under_explain() {
         &book,
         "anthropic",
         "claude-3-5-sonnet",
-        since,
+        since.start(),
         &usage,
     );
     let group = SpendGroup::new(
@@ -469,7 +473,7 @@ fn unit_stale_rate_card_reported_by_doctor_and_noted_on_valued_report() {
 #[test]
 fn integration_grouping_composed_with_valuation_reconciles_totals() {
     let book = sample_rate_book();
-    let date = UtcDate::parse("2026-08-25").unwrap();
+    let date = UtcDate::parse("2026-08-25").unwrap().start();
 
     // Event 1 (session 1, project A): 100k input ($0.30), 10k output ($0.15) => $0.45 (450_000 micros)
     let u1 = helper_usage(100_000, 10_000, 0, 0);
@@ -647,4 +651,114 @@ fn unit_column_header_and_json_field_both_say_api_list_price_equivalent() {
             "JSON output must not contain forbidden term '{forbidden}'"
         );
     }
+}
+
+/// Golden for `aub-pwtn`: `aub spend --explain=full --credits` names, per
+/// group, each card used with its schedule. The group below holds events
+/// from both sides of the peak boundary, so it carries the peak card and
+/// the default card; both surfaces name both, with the exact schedule
+/// spellings, and the JSON still validates.
+#[test]
+fn golden_explain_names_each_card_with_its_schedule() {
+    let now = UtcTimestamp::from_unix_nanos(2_000);
+    let since = UtcDate::parse("2026-09-08").unwrap();
+    let until = UtcDate::parse("2026-09-09").unwrap();
+    let usage = helper_usage(2_000_000, 0, 0, 0);
+
+    let manifest = agent_usage_book::domain::provenance::ProvenanceManifest::new(
+        vec![EvidenceId::new("ev-peak")],
+        vec![WitnessId::RateCard(RateCardId::new("rate-card-2026-09-07"))],
+        QuerySemantics::new("day", "none"),
+    );
+    let derivation_id = DerivationId::from_manifest(&manifest);
+    let key = LogicalName::new("day=2026-09-08");
+    let credits = Derivation::Available(Qualified::new(
+        Credits::from_micros(6_000_000),
+        CoverageCompleteness::Complete,
+        EvidenceQuality::Measured,
+        Provenance::new(["cost-model:fixture".to_string()]),
+    ));
+    let group = SpendGroup::new(
+        key.clone(),
+        usage,
+        Provenance::new(["session.jsonl".to_string()]),
+        derivation_id,
+    )
+    .with_valuation(Some(ValuationOutcome::Complete(
+        agent_usage_book::valuation::ApiListPriceEquivalent::new(Money::<Usd>::from_micros(
+            660_000,
+        )),
+    )))
+    .with_priced_cards(
+        [
+            PricedCardRef {
+                vendor: "ollama".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                token_class: "input".to_string(),
+                schedule: "peak mon-fri 12:00-18:00 UTC".to_string(),
+            },
+            PricedCardRef {
+                vendor: "ollama".to_string(),
+                model: "deepseek-v4-flash".to_string(),
+                token_class: "input".to_string(),
+                schedule: "default".to_string(),
+            },
+        ]
+        .into_iter()
+        .collect(),
+    )
+    .with_credits(credits);
+    let node = agent_usage_book::report::ProvenanceNode::new(
+        vec![EvidenceId::new("ev-peak")],
+        vec![WitnessId::RateCard(RateCardId::new("rate-card-2026-09-07"))],
+        QuerySemantics::new("day", "none"),
+        1,
+        1,
+        agent_usage_book::report::ValueArithmetic::Sum,
+    );
+    let report = SpendReport::new(
+        ReportMetadata::new(now, now, LedgerGeneration::new(1), None)
+            .with_rate_card_version(Some(RateCardId::new("rate-card-2026-09-07"))),
+        since,
+        until,
+        vec![group],
+        vec![SpendGroupProvenance::new(key.clone(), node)],
+        IngestSummary::default(),
+    )
+    .with_credit_model(Some(CostModelId::new("fixture-model")))
+    .with_credit_provenance(vec![SpendGroupCreditsProvenance::new(
+        key,
+        agent_usage_book::report::ProvenanceNode::new(
+            vec![EvidenceId::new("ev-peak")],
+            vec![],
+            QuerySemantics::new("day", "none"),
+            1,
+            1,
+            agent_usage_book::report::ValueArithmetic::Sum,
+        ),
+    )]);
+
+    // Human `--explain=full` names both cards with their schedules.
+    let text = render_spend_report_with_explain(&report, ExplainMode::Full);
+    assert!(
+        text.contains(
+            "day=2026-09-08: rate cards ollama/deepseek-v4-flash/input (default), \
+             ollama/deepseek-v4-flash/input (peak mon-fri 12:00-18:00 UTC)"
+        ),
+        "{text}"
+    );
+
+    // JSON names both cards on the group and still validates.
+    let run = RunId::from_string("run-rate-cards".to_string());
+    let json_str = spend_json_with_explain(&report, run, ExplainMode::Full);
+    assert!(
+        json_str.contains(
+            "\"rate_cards\":[{\"vendor\":\"ollama\",\"model\":\"deepseek-v4-flash\",\
+             \"token_class\":\"input\",\"schedule\":\"default\"},\
+             {\"vendor\":\"ollama\",\"model\":\"deepseek-v4-flash\",\
+             \"token_class\":\"input\",\"schedule\":\"peak mon-fri 12:00-18:00 UTC\"}]"
+        ),
+        "{json_str}"
+    );
+    validate_spend_report_json(&json_str).expect("rate-cards JSON must validate");
 }

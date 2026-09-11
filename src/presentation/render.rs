@@ -26,9 +26,9 @@ use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::{
-    ActiveActivityState, CoverageReport, LivenessGap, NowReport, PricedModelRef, ProvenanceGraph,
-    SpendFilterOutcome, SpendGroup, SpendReport, StatusReport, TaskOverheadReport, TaskReport,
-    WindowEquivalentDerivation,
+    ActiveActivityState, CoverageReport, LivenessGap, NowReport, PricedCardRef, PricedModelRef,
+    ProvenanceGraph, SpendFilterOutcome, SpendGroup, SpendReport, StatusReport, TaskOverheadReport,
+    TaskReport, WindowEquivalentDerivation,
 };
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
@@ -928,6 +928,11 @@ pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMo
             explain_text.push_str("\n\n");
             explain_text.push_str(&priced_text);
         }
+        let cards_text = render_rate_cards_explain(report);
+        if !cards_text.is_empty() {
+            explain_text.push_str("\n\n");
+            explain_text.push_str(&cards_text);
+        }
         if report_text.is_empty() {
             explain_text
         } else {
@@ -964,6 +969,43 @@ fn render_priced_as_explain(report: &SpendReport) -> String {
         return String::new();
     }
     lines.insert(0, "priced as:".to_string());
+    lines.join("\n")
+}
+
+/// Each rate card that valued a group, with the schedule that selected it,
+/// under `--explain` (aub-pwtn).
+///
+/// `priced as` above names which row of the book an event resolved to; this
+/// names which card of that row priced it: `peak mon-fri 12:00-18:00 UTC`
+/// for a scheduled card, `default` for an unscheduled one. Nested groups
+/// are walked so a report with more than one dimension names its leaves
+/// rather than only its roots.
+fn render_rate_cards_explain(report: &SpendReport) -> String {
+    fn walk(group: &SpendGroup, lines: &mut Vec<String>) {
+        if !group.priced_cards.is_empty() {
+            let labels: Vec<String> = group
+                .priced_cards
+                .iter()
+                .map(PricedCardRef::label)
+                .collect();
+            lines.push(format!(
+                "  {}: rate cards {}",
+                group.key.as_str(),
+                labels.join(", ")
+            ));
+        }
+        for child in &group.children {
+            walk(child, lines);
+        }
+    }
+    let mut lines = Vec::new();
+    for group in &report.groups {
+        walk(group, &mut lines);
+    }
+    if lines.is_empty() {
+        return String::new();
+    }
+    lines.insert(0, "rate cards:".to_string());
     lines.join("\n")
 }
 
