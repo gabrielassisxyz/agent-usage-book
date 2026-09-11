@@ -820,7 +820,7 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         .map(json_string)
         .unwrap_or_else(|| "null".to_string());
     let mut body = format!(
-        "\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"grouping\":[{grouping}],\"ingestion_generation\":{ingestion_generation},\"groups\":[{groups}],\"ingest\":{{\"refresh_attempted\":{},\"refresh_failure\":{refresh_failure},\"files_read\":{},\"files_skipped_before_window\":{},\"unreadable_files\":[{unreadable}],\"quarantined\":{{{quarantined}}},\"replayed_occurrences\":{},\"collisions\":{},\"without_identity\":{},\"heuristic_identities\":{},\"undated_events\":{},\"events_outside_window\":{},\"events_in_window\":{}}}",
+        "\"window\":{{\"since\":{},\"until\":{},\"calendar\":\"utc\"}},\"grouping\":[{grouping}],\"ingestion_generation\":{ingestion_generation},\"groups\":[{groups}],\"ingest\":{{\"refresh_attempted\":{},\"refresh_failure\":{refresh_failure},\"files_read\":{},\"files_skipped_before_window\":{},\"unreadable_files\":[{unreadable}],\"quarantined\":{{{quarantined}}},\"replayed_occurrences\":{},\"collisions\":{},\"without_identity\":{},\"heuristic_identities\":{},\"undated_events\":{},\"events_outside_window\":{},\"events_in_window\":{},\"working_directory_changes\":{}}}",
         json_string(&report.since.iso()),
         json_string(&report.until.iso()),
         ingest.refresh_attempted,
@@ -833,6 +833,7 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
         ingest.undated_events,
         ingest.events_outside_window,
         ingest.events_in_window,
+        ingest.working_directory_changes,
     );
     if let Some(rc_ver) = &report.metadata.rate_card_version {
         body.push_str(&format!(

@@ -175,6 +175,7 @@ fn integration_unvalued_spend_with_no_rate_cards_produces_complete_report() {
         undated_events: 0,
         events_outside_window: 0,
         events_in_window: 1,
+        working_directory_changes: 0,
     };
     let report = SpendReport::new(metadata, since, until, vec![group], group_prov, ingest);
 

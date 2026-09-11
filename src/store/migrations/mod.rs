@@ -135,6 +135,9 @@ mod migration_0036;
 #[path = "0037_rate_card_schedule.rs"]
 pub(crate) mod migration_0037;
 
+#[path = "0038_session_working_directory.rs"]
+pub(crate) mod migration_0038;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -178,5 +181,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0035::migration(),
         migration_0036::migration(),
         migration_0037::migration(),
+        migration_0038::migration(),
     ]
 }

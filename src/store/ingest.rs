@@ -332,21 +332,26 @@ pub fn persist_ingest_batch(
 
     // Session bounds merge rather than replace: a pass that sees only part of
     // a session's events narrows nothing, and the stored row keeps the widest
-    // bounds any pass has seen. Attribution columns stay as first recorded.
+    // bounds any pass has seen. Attribution columns stay as first recorded,
+    // and the working directory follows the same rule: the first non-empty
+    // value a pass stated wins, so a later pass that saw no directory never
+    // clears the one an earlier pass stored.
     let mut sessions_upserted: u64 = 0;
     if drained {
         for session in &pass.sessions {
             tx.execute(
                 "INSERT INTO session (
-                    source, native_session_id, start, end, project_key, repository_key, run_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                    source, native_session_id, start, end, project_key, repository_key,
+                    working_directory, run_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
                 ON CONFLICT (source, native_session_id) DO UPDATE SET
                     start = MIN(start, excluded.start),
                     end = CASE
                         WHEN end IS NULL THEN excluded.end
                         WHEN excluded.end IS NULL THEN end
                         ELSE MAX(end, excluded.end)
-                    END",
+                    END,
+                    working_directory = COALESCE(working_directory, excluded.working_directory)",
                 params![
                     session.source.as_str(),
                     session.native_session_id.as_str(),
@@ -354,6 +359,7 @@ pub fn persist_ingest_batch(
                     session.end.map(|t| t.unix_nanos()),
                     session.project_key.as_str(),
                     session.repository_key.as_str(),
+                    session.working_directory,
                     session.run_id.as_ref().map(|id| id.as_str()),
                 ],
             )
@@ -864,6 +870,7 @@ mod tests {
             end: end.map(UtcTimestamp::from_unix_nanos),
             project_key: crate::sessions::ProjectKey::new("p"),
             repository_key: crate::sessions::RepositoryKey::new("r"),
+            working_directory: None,
             run_id: None,
         };
 

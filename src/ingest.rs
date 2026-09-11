@@ -107,6 +107,9 @@ pub struct IngestReport {
     /// collision pairs. What `persist_ingest_batch` actually recorded is its
     /// own count inside `outcome`.
     pub quarantined: u64,
+    /// Sessions whose transcript stated two different working directories, so
+    /// the stored row keeps the first and this count says the choice was made.
+    pub working_directory_changes: u64,
     /// The generation the pass landed as, from the transaction's advance.
     pub generation: crate::store::ingestion_generation::Generation,
     /// Rows landed, as the persistence path counted them, summed over every
@@ -416,6 +419,24 @@ pub fn run(
     let mut collisions = collision_descriptors(&deduplicated.heuristic_collisions, now);
     let quarantined = quarantined_items.len() as u64 + collisions.len() as u64;
 
+    // One first-wins directory per session over the whole pass, so a session
+    // split across two batches still keeps a single directory and the change
+    // count names each session once rather than once per batch.
+    let (session_directories, working_directory_changes) =
+        crate::sessions::first_working_directories(deduplicated.canonical.iter().filter_map(
+            |event| {
+                event.session().map(|session| {
+                    (
+                        (
+                            session.source().as_str().to_string(),
+                            session.native().as_str().to_string(),
+                        ),
+                        event.working_directory().map(str::to_string),
+                    )
+                })
+            },
+        ));
+
     let mut persist_events = Vec::with_capacity(deduplicated.canonical.len());
     for event in &deduplicated.canonical {
         let identity = canonical_identity(event);
@@ -511,7 +532,12 @@ pub fn run(
             })
             .cloned()
             .collect();
-        let chunk_sessions = session_pass(chunk.iter().map(|persist| &persist.event));
+        let chunk_sessions = session_pass(
+            chunk.iter().map(|persist| &persist.event),
+            &session_directories,
+            &config.projects,
+            &config.repositories,
+        );
         let chunk_watermarks = if last {
             std::mem::take(&mut watermarks)
         } else {
@@ -630,6 +656,7 @@ pub fn run(
         files_skipped,
         unreadable_files,
         quarantined,
+        working_directory_changes,
         generation: totals.generation,
         outcome: totals,
         batches,
@@ -791,7 +818,15 @@ fn collision_descriptors(
 /// Session rows the pass's canonical events imply, bounds aggregated over the
 /// given events. A session whose events all lack a timestamp has no bounds to
 /// state, so it produces no row: an invented bound would be a fabricated fact.
-fn session_pass<'a>(events: impl IntoIterator<Item = &'a NormalizedUsageEvent>) -> Vec<NewSession> {
+/// Project and repository resolve from the pass-wide first-wins directories
+/// through the configured alias tables; a session with no stated directory
+/// stays in the unknown buckets.
+fn session_pass<'a>(
+    events: impl IntoIterator<Item = &'a NormalizedUsageEvent>,
+    directories: &BTreeMap<(String, String), Option<String>>,
+    projects: &crate::config::AliasTable,
+    repositories: &crate::config::AliasTable,
+) -> Vec<NewSession> {
     let mut bounds: BTreeMap<(String, String), (Option<UtcTimestamp>, Option<UtcTimestamp>)> =
         BTreeMap::new();
     for event in events {
@@ -811,15 +846,24 @@ fn session_pass<'a>(events: impl IntoIterator<Item = &'a NormalizedUsageEvent>) 
     bounds
         .into_iter()
         .filter_map(|((namespace, native), (start, end))| {
+            let working_directory = directories
+                .get(&(namespace.clone(), native.clone()))
+                .cloned()
+                .flatten();
             Some(NewSession {
                 source: SourceNamespace::new(namespace),
                 native_session_id: crate::domain::ids::NativeSessionId::new(native),
                 start: start?,
                 end,
-                project_key: crate::sessions::ProjectKey::new(crate::sessions::UNKNOWN_PROJECT),
-                repository_key: crate::sessions::RepositoryKey::new(
-                    crate::sessions::UNKNOWN_REPOSITORY,
+                project_key: crate::sessions::resolve_project(
+                    projects,
+                    working_directory.as_deref(),
                 ),
+                repository_key: crate::sessions::resolve_repository(
+                    repositories,
+                    working_directory.as_deref(),
+                ),
+                working_directory,
                 run_id: None,
             })
         })

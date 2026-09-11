@@ -570,6 +570,12 @@ than by convention: `rebuild` can only address rebuildable materialization
 groups, so it has no code path that could delete a meter attempt, an attempt
 result, response evidence, an observation, or a calibration even if asked to.
 
+`aub rebuild sessions` is not a sweep: it re-resolves every stored session's
+project and repository keys from its stored working directory through the
+current `[projects]` and `[repositories]` alias tables, rewriting derived
+keys only. Bounds, run ids and every evidence table stay untouched, so a new
+alias applies to history and not only to sessions ingested after it.
+
 ## `aub doctor`
 
 **Answers:** is the recorded evidence healthy, and does the transcript

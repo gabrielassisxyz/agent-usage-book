@@ -781,6 +781,10 @@ pub struct IngestSummary {
     pub events_outside_window: u64,
     /// Canonical events inside the window, which is what the groups sum.
     pub events_in_window: u64,
+    /// Sessions whose transcript stated two different working directories, so
+    /// the session kept the first and this count says the choice was made.
+    /// Zero on a report that parsed no transcripts, where no choice arose.
+    pub working_directory_changes: u64,
 }
 
 /// Provenance material for one spend group's token count.

@@ -182,12 +182,14 @@ fn extract_usage(
 }
 
 /// The record-level context every source writes beside its counts: the record
-/// timestamp, the session the record belongs to, and the stable event identifier
+/// timestamp, the session the record belongs to, the working directory the
+/// transcript states the session ran in, and the stable event identifier
 /// where the source has one. Each is optional so an absent value stays absent.
 struct RecordContext<'a> {
     event_id: Option<&'a str>,
     occurred_at: Option<UtcTimestamp>,
     session: Option<SessionId>,
+    working_directory: Option<String>,
     model: Option<&'a str>,
 }
 
@@ -211,7 +213,8 @@ fn event(
         EvidenceClassification::Reported,
         Provenance::new(sources),
         parser_version,
-    );
+    )
+    .with_working_directory(context.working_directory);
     if let Some(occurred_at) = context.occurred_at {
         event = event.with_occurred_at(occurred_at);
     }
@@ -227,6 +230,16 @@ fn record_timestamp(value: &Value) -> Option<UtcTimestamp> {
         .get("timestamp")
         .and_then(Value::as_str)
         .and_then(UtcTimestamp::parse_rfc3339)
+}
+
+/// A record's top-level `cwd`, when the source writes one. An empty directory
+/// stays absent: no transcript states an empty directory legitimately.
+fn record_working_directory(value: &Value) -> Option<String> {
+    value
+        .get("cwd")
+        .and_then(Value::as_str)
+        .filter(|dir| !dir.is_empty())
+        .map(str::to_string)
 }
 
 fn session_id(namespace: &str, native: &str) -> SessionId {
@@ -328,6 +341,7 @@ fn parse_claude_line(
             .get("sessionId")
             .and_then(Value::as_str)
             .map(|native| session_id(CLAUDE_CODE_NAMESPACE, native)),
+        working_directory: record_working_directory(&value),
         model: message.get("model").and_then(Value::as_str),
     };
     Ok(Some(event(
@@ -407,6 +421,7 @@ impl ParserAdapter for CodexParser {
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
         let mut last: Option<(UsageCounts, Option<UtcTimestamp>, Option<String>)> = None;
         let mut session: Option<SessionId> = None;
+        let mut working_directory: Option<String> = None;
         let mut model: Option<String> = None;
         let mut quarantined = Vec::new();
         for (index, line) in input.lines().enumerate() {
@@ -424,10 +439,13 @@ impl ParserAdapter for CodexParser {
                 Ok(CodexLine::Usage(usage, occurred_at)) => {
                     last = Some((usage, occurred_at, model.clone()));
                 }
-                Ok(CodexLine::Session(id, header_model)) => {
-                    session = Some(id);
-                    if header_model.is_some() {
-                        model = header_model;
+                Ok(CodexLine::Session(header)) => {
+                    session = Some(header.id);
+                    if header.model.is_some() {
+                        model = header.model;
+                    }
+                    if header.working_directory.is_some() {
+                        working_directory = header.working_directory;
                     }
                 }
                 Ok(CodexLine::TurnContext(turn_model)) => model = Some(turn_model),
@@ -448,6 +466,7 @@ impl ParserAdapter for CodexParser {
                         event_id: None,
                         occurred_at,
                         session,
+                        working_directory,
                         model: model.as_deref(),
                     },
                     self.parser_version(),
@@ -459,12 +478,21 @@ impl ParserAdapter for CodexParser {
     }
 }
 
+/// What a Codex `session_meta` header names: the session, the model when a
+/// rollout states one there, and the working directory the session ran in
+/// (`cwd` in the header payload).
+struct CodexSession {
+    id: SessionId,
+    model: Option<String>,
+    working_directory: Option<String>,
+}
+
 /// What one Codex line contributes: a cumulative usage record, the session
 /// header, a turn context naming the model from here on, or nothing this
 /// parser reads.
 enum CodexLine {
     Usage(UsageCounts, Option<UtcTimestamp>),
-    Session(SessionId, Option<String>),
+    Session(CodexSession),
     TurnContext(String),
     Nothing,
 }
@@ -481,10 +509,21 @@ fn parse_codex_line(line: &str) -> Result<CodexLine, QuarantineClass> {
             .and_then(Value::as_str)
             .filter(|model| !model.is_empty())
             .map(str::to_string);
+        let working_directory = payload
+            .get("cwd")
+            .and_then(Value::as_str)
+            .filter(|dir| !dir.is_empty())
+            .map(str::to_string);
         return Ok(payload
             .get("id")
             .and_then(Value::as_str)
-            .map(|native| CodexLine::Session(session_id(CODEX_NAMESPACE, native), model))
+            .map(|native| {
+                CodexLine::Session(CodexSession {
+                    id: session_id(CODEX_NAMESPACE, native),
+                    model,
+                    working_directory,
+                })
+            })
             .unwrap_or(CodexLine::Nothing));
     }
     if value.get("type").and_then(Value::as_str) == Some("turn_context") {
@@ -544,7 +583,7 @@ impl ParserAdapter for PiParser {
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
         let mut events = Vec::new();
         let mut quarantined = Vec::new();
-        let mut session: Option<SessionId> = None;
+        let mut session: Option<(SessionId, Option<String>)> = None;
         for (index, line) in input.lines().enumerate() {
             let line = line.trim();
             if line.is_empty() {
@@ -559,7 +598,9 @@ impl ParserAdapter for PiParser {
                 self.parser_version(),
             ) {
                 Ok(PiLine::Usage(event)) => events.push(*event),
-                Ok(PiLine::Session(id)) => session = Some(id),
+                Ok(PiLine::Session(id, working_directory)) => {
+                    session = Some((id, working_directory));
+                }
                 Ok(PiLine::Nothing) => {}
                 Err(class) => quarantined.push(QuarantineRecord::new(
                     record_location,
@@ -572,27 +613,28 @@ impl ParserAdapter for PiParser {
     }
 }
 
-/// What one pi line contributes: a usage event, the session header, or nothing
-/// this parser reads.
+/// What one pi line contributes: a usage event, the session header with the
+/// working directory it states, or nothing this parser reads.
 enum PiLine {
     Usage(Box<NormalizedUsageEvent>),
-    Session(SessionId),
+    Session(SessionId, Option<String>),
     Nothing,
 }
 
 fn parse_pi_line(
     line: &str,
     location: &SourceLocation,
-    session: Option<SessionId>,
+    session: Option<(SessionId, Option<String>)>,
     parser_version: ParserVersion,
 ) -> Result<PiLine, QuarantineClass> {
     let value: Value =
         serde_json::from_str(line).map_err(|_| QuarantineClass::TruncatedStructure)?;
     if value.get("type").and_then(Value::as_str) == Some("session") {
+        let working_directory = record_working_directory(&value);
         return Ok(value
             .get("id")
             .and_then(Value::as_str)
-            .map(|native| PiLine::Session(session_id(PI_NAMESPACE, native)))
+            .map(|native| PiLine::Session(session_id(PI_NAMESPACE, native), working_directory))
             .unwrap_or(PiLine::Nothing));
     }
     let Some(message) = value.get("message").and_then(Value::as_object) else {
@@ -602,6 +644,9 @@ fn parse_pi_line(
         return Ok(PiLine::Nothing);
     };
     let counts = extract_usage(usage, &PI_KNOWN, &PI_IGNORED, &["input"])?;
+    let (session, working_directory) = session
+        .map(|(id, dir)| (Some(id), dir))
+        .unwrap_or((None, None));
     let context = RecordContext {
         event_id: message
             .get("id")
@@ -609,6 +654,7 @@ fn parse_pi_line(
             .or_else(|| value.get("id").and_then(Value::as_str)),
         occurred_at: record_timestamp(&value),
         session,
+        working_directory,
         model: message.get("model").and_then(Value::as_str),
     };
     Ok(PiLine::Usage(Box::new(event(
@@ -675,9 +721,12 @@ impl ParserAdapter for OpencodeParser {
     }
 
     fn parse_database_file(&self, path: &Path, location: &SourceLocation) -> ParseOutput {
-        let rows = match crate::store::opencode::open_opencode_database(path)
-            .and_then(|connection| crate::store::opencode::read_message_rows(&connection))
-        {
+        let (rows, directories) = match crate::store::opencode::open_opencode_database(path)
+            .and_then(|connection| {
+                let rows = crate::store::opencode::read_message_rows(&connection)?;
+                let directories = crate::store::opencode::read_session_directories(&connection);
+                Ok((rows, directories))
+            }) {
             Ok(rows) => rows,
             // A file that is not an opencode database is an input this parser
             // does not understand, counted once at the file rather than
@@ -698,7 +747,7 @@ impl ParserAdapter for OpencodeParser {
         for (index, row) in rows.iter().enumerate() {
             let record_location =
                 SourceLocation::new(location.file().to_string(), location.line() + index as u64);
-            match parse_opencode_row(row, &record_location, self.parser_version()) {
+            match parse_opencode_row(row, &directories, &record_location, self.parser_version()) {
                 Ok(Some(event)) => events.push(event),
                 Ok(None) => {}
                 Err(class) => quarantined.push(QuarantineRecord::new(
@@ -714,9 +763,12 @@ impl ParserAdapter for OpencodeParser {
 
 /// Turns one opencode message row into a normalized event: `None` for a user
 /// row, which carries no tokens by shape, or the quarantine class for a row
-/// that should carry usage but cannot be normalized.
+/// that should carry usage but cannot be normalized. The working directory
+/// comes from the session table the caller already read, keyed by the row's
+/// session id; a session the table does not name leaves no directory.
 fn parse_opencode_row(
     row: &crate::store::opencode::OpencodeMessageRow,
+    directories: &std::collections::BTreeMap<String, String>,
     location: &SourceLocation,
     parser_version: ParserVersion,
 ) -> Result<Option<NormalizedUsageEvent>, QuarantineClass> {
@@ -765,6 +817,7 @@ fn parse_opencode_row(
         event_id: Some(row.message_id.as_str()),
         occurred_at,
         session: Some(session_id(OPENCODE_NAMESPACE, row.session_id.as_str())),
+        working_directory: directories.get(&row.session_id).cloned(),
         model: model.as_deref(),
     };
     Ok(Some(event(
@@ -1545,5 +1598,122 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    /// The working-directory fixture directory, beside the catalog fixtures:
+    /// one file per harness carrying the directory the bead's table names.
+    /// These live outside the catalog directory so the corpus audit's
+    /// manifest declaration rule does not apply to them.
+    const WORKING_DIRECTORY_FIXTURE_DIR: &str = "tests/fixtures/transcripts/working-directory";
+
+    fn read_working_directory_fixture(name: &str) -> String {
+        std::fs::read_to_string(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(WORKING_DIRECTORY_FIXTURE_DIR)
+                .join(name),
+        )
+        .expect("working-directory fixture must be readable")
+    }
+
+    /// Claude Code states `cwd` on every line: the event carries each line's
+    /// own value, and first-wins aggregation happens downstream where the
+    /// session is visible as a whole.
+    #[test]
+    fn claude_code_carries_the_per_line_working_directory() {
+        let parser = ClaudeCodeParser;
+        let output = parser.parse(
+            &read_working_directory_fixture("claude-code.jsonl"),
+            &SourceLocation::new("claude-code.jsonl", 1),
+        );
+        assert_eq!(output.events().len(), 2);
+        for event in output.events() {
+            assert_eq!(
+                event.working_directory(),
+                Some("/tmp/aub-fixture-project"),
+                "every line states the same directory"
+            );
+        }
+        // A line without `cwd` leaves no directory rather than an invented one.
+        let bare = parser.parse(
+            r#"{"message":{"id":"m1","usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            &location(),
+        );
+        assert_eq!(bare.events()[0].working_directory(), None);
+    }
+
+    /// Codex states `cwd` in the `session_meta` header payload: the event
+    /// carries it, and a header without one leaves no directory.
+    #[test]
+    fn codex_carries_the_session_meta_working_directory() {
+        let parser = CodexParser;
+        let output = parser.parse(
+            &read_working_directory_fixture("codex.jsonl"),
+            &SourceLocation::new("codex.jsonl", 1),
+        );
+        assert_eq!(output.events().len(), 1);
+        assert_eq!(
+            output.events()[0].working_directory(),
+            Some("/tmp/aub-fixture-project")
+        );
+        let bare = parser.parse(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"s1"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#,
+            ),
+            &location(),
+        );
+        assert_eq!(bare.events()[0].working_directory(), None);
+    }
+
+    /// pi states `cwd` on the `{"type":"session"}` header line: every usage
+    /// event of that session carries it.
+    #[test]
+    fn pi_carries_the_session_header_working_directory() {
+        let parser = PiParser;
+        let output = parser.parse(
+            &read_working_directory_fixture("pi.jsonl"),
+            &SourceLocation::new("pi.jsonl", 1),
+        );
+        assert_eq!(output.events().len(), 1);
+        assert_eq!(
+            output.events()[0].working_directory(),
+            Some("/tmp/aub-fixture-project")
+        );
+        // A usage record before any session header carries no directory: the
+        // header is the only place pi states it.
+        let bare = parser.parse(
+            r#"{"message":{"id":"m1","usage":{"input":10,"output":5}}}"#,
+            &location(),
+        );
+        assert_eq!(bare.events()[0].working_directory(), None);
+    }
+
+    /// Two lines of one session stating different directories: each event
+    /// carries its own line's value, so the downstream first-wins aggregation
+    /// sees both and can count the disagreement. The planted negative is a
+    /// parser that resolved first-wins itself: its second event would carry
+    /// the first directory and this assertion on the stated values would fail.
+    #[test]
+    fn claude_code_events_carry_their_own_line_values_when_the_session_moves() {
+        let parser = ClaudeCodeParser;
+        let output = parser.parse(
+            &read_working_directory_fixture("claude-code-changes.jsonl"),
+            &SourceLocation::new("claude-code-changes.jsonl", 1),
+        );
+        assert_eq!(output.events().len(), 2);
+        let directories: Vec<Option<&str>> = output
+            .events()
+            .iter()
+            .map(|event| event.working_directory())
+            .collect();
+        assert_eq!(
+            directories,
+            vec![
+                Some("/tmp/aub-fixture-project"),
+                Some("/tmp/aub-fixture-project-moved")
+            ],
+            "each event carries what its own line stated"
+        );
     }
 }

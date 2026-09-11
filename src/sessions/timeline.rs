@@ -89,8 +89,10 @@ pub fn count_events_by_project(
 /// The rebuild path: replaces every stored session with rows derived from the given
 /// events, resolving project and repository through the configured aliases.
 ///
-/// Run identifiers are not derivable from usage events, so rebuilt rows carry none;
-/// a run id on a session row is source-stated evidence, not a derived fact. Returns
+/// The stored row keeps the directory the map states for the session, so the
+/// evidence the keys were resolved from survives the rebuild. Run identifiers
+/// are not derivable from usage events, so rebuilt rows carry none; a run id
+/// on a session row is source-stated evidence, not a derived fact. Returns
 /// the number of sessions written.
 pub fn rebuild_sessions(
     conn: &mut rusqlite::Connection,
@@ -105,14 +107,17 @@ pub fn rebuild_sessions(
         .map(|timeline| {
             let working_dir = working_dirs
                 .get(&timeline.session)
-                .and_then(|dir| dir.as_deref());
+                .cloned()
+                .flatten()
+                .filter(|dir| !dir.is_empty());
             NewSession {
                 source: timeline.session.source().clone(),
                 native_session_id: NativeSessionId::new(timeline.session.native().as_str()),
                 start: timeline.start,
                 end: timeline.end,
-                project_key: resolve_project(project_aliases, working_dir),
-                repository_key: resolve_repository(repository_aliases, working_dir),
+                project_key: resolve_project(project_aliases, working_dir.as_deref()),
+                repository_key: resolve_repository(repository_aliases, working_dir.as_deref()),
+                working_directory: working_dir,
                 run_id: None,
             }
         })

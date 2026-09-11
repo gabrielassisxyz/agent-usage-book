@@ -284,12 +284,16 @@ impl QuarantineRecord {
 pub const STRONG_IDENTITY_PREFIX: &str = "event-id:";
 
 /// A normalized usage event: a usage vector, its evidence classification, the source
-/// provenance, and the parser version that produced it, plus the record timestamp
-/// and the session the source attributes it to where the source writes them.
+/// provenance, and the parser version that produced it, plus the record timestamp,
+/// the session the source attributes it to, and the working directory the
+/// transcript states the session ran in, where the source writes them.
 ///
 /// The timestamp and the session are optional because a source may omit them, and
 /// an absent value must stay absent: a report that cannot place an event in a day
-/// counts it as undated rather than inventing a day for it.
+/// counts it as undated rather than inventing a day for it. The working directory
+/// is optional for the same reason: a source that states none leaves no directory
+/// to resolve, and the session lands in the unknown project bucket rather than
+/// in an invented one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedUsageEvent {
     usage: UsageVector,
@@ -298,6 +302,7 @@ pub struct NormalizedUsageEvent {
     parser_version: ParserVersion,
     occurred_at: Option<UtcTimestamp>,
     session: Option<SessionId>,
+    working_directory: Option<String>,
     /// A source-provided sequence number for the record, when the source
     /// writes one. The strongest available ordering discriminator for a
     /// cumulative series: a sequence survives clock skew and identical
@@ -321,6 +326,7 @@ impl NormalizedUsageEvent {
             parser_version,
             occurred_at: None,
             session: None,
+            working_directory: None,
             sequence: None,
         }
     }
@@ -334,6 +340,15 @@ impl NormalizedUsageEvent {
     /// The same event attributed to the session its source names.
     pub fn with_session(mut self, session: SessionId) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// The same event carrying the working directory its transcript states.
+    /// An empty directory is stored as absent: no transcript states an empty
+    /// directory legitimately, and an empty string would resolve against no
+    /// alias while reading as a stated value.
+    pub fn with_working_directory(mut self, working_directory: Option<String>) -> Self {
+        self.working_directory = working_directory.filter(|dir| !dir.is_empty());
         self
     }
 
@@ -354,6 +369,14 @@ impl NormalizedUsageEvent {
 
     pub fn session(&self) -> Option<&SessionId> {
         self.session.as_ref()
+    }
+
+    /// The working directory the transcript states the session ran in, when
+    /// the source wrote one. The alias tables resolve this path to the logical
+    /// project and repository identities; the path itself never leaves the
+    /// machine-local ledger.
+    pub fn working_directory(&self) -> Option<&str> {
+        self.working_directory.as_deref()
     }
 
     /// The source-provided stable identifier, when the source wrote one.

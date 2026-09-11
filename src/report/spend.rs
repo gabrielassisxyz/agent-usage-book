@@ -201,6 +201,19 @@ pub fn assemble(
         }
     }
 
+    let (_, working_directory_changes) =
+        crate::sessions::first_working_directories(events.iter().filter_map(|(_, event)| {
+            event.session().map(|session| {
+                (
+                    (
+                        session.source().as_str().to_string(),
+                        session.native().as_str().to_string(),
+                    ),
+                    event.working_directory().map(str::to_string),
+                )
+            })
+        }));
+    summary.working_directory_changes = working_directory_changes;
     let groups = group_events(events, window, &mut summary, &cumulative_parsers);
     let metadata = ReportMetadata::new(generated_at, generated_at, LedgerGeneration::new(0), None);
     let (groups, provenance): (Vec<SpendGroup>, Vec<SpendGroupProvenance>) =
@@ -661,6 +674,9 @@ pub fn assemble_canonical_with_window_equivalent(
         undated_events: 0,
         events_outside_window: 0,
         events_in_window,
+        // The ledger path reads stored sessions, never transcripts: no
+        // mid-session directory choice arises here.
+        working_directory_changes: 0,
     };
     let diagnostic_node = |grouping: &str, count: u64| {
         ProvenanceNode::new(
@@ -1547,6 +1563,7 @@ mod tests {
                 end: None,
                 project_key: ProjectKey::new("project-a"),
                 repository_key: RepositoryKey::new("repository-a"),
+                working_directory: None,
                 run_id: None,
             },
         )
@@ -1591,6 +1608,7 @@ mod tests {
                 end: None,
                 project_key: ProjectKey::new("project-a"),
                 repository_key: RepositoryKey::new("repository-a"),
+                working_directory: None,
                 run_id: None,
             },
         )

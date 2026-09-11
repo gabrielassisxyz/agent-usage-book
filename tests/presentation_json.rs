@@ -149,6 +149,7 @@ fn contract_spend_json_matches_golden_fixture() {
         undated_events: 0,
         events_outside_window: 0,
         events_in_window: 1,
+        working_directory_changes: 0,
     };
     let report = SpendReport::new(test_metadata(), since, until, groups, vec![], ingest);
 
@@ -221,6 +222,7 @@ fn contract_spend_filtered_harness_json_matches_golden_fixture() {
         undated_events: 0,
         events_outside_window: 0,
         events_in_window: 3,
+        working_directory_changes: 2,
     };
     let filters = vec![SpendFilterOutcome::new(
         SpendFilter {
