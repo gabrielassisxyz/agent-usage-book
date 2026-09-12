@@ -13,5 +13,6 @@ pub mod conversion;
 pub mod fitter;
 pub mod health;
 pub mod multivariate;
+pub mod multivariate_fit;
 pub mod passive;
 pub mod settlement;

@@ -1,0 +1,95 @@
+{
+  "description": "Four arms, each at three magnitudes, each holding the other kinds near zero: cache write varies position (fresh prefix per block), cache read repeats a warm prefix, output fills a ceiling from a small prompt, input sends a large uncached prompt. Every block is followed by readings until the meter settles.",
+  "truth_ppm_per_token": {
+    "input": 0.5,
+    "output": 1.0,
+    "cache_read": 0.05,
+    "cache_write": 0.6
+  },
+  "blocks": [
+    {
+      "arm": "cache_write",
+      "input": 0,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 20000
+    },
+    {
+      "arm": "cache_write",
+      "input": 0,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 40000
+    },
+    {
+      "arm": "cache_write",
+      "input": 0,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 60000
+    },
+    {
+      "arm": "cache_read",
+      "input": 0,
+      "output": 20,
+      "cache_read": 20000,
+      "cache_write": 0
+    },
+    {
+      "arm": "cache_read",
+      "input": 0,
+      "output": 20,
+      "cache_read": 40000,
+      "cache_write": 0
+    },
+    {
+      "arm": "cache_read",
+      "input": 0,
+      "output": 20,
+      "cache_read": 60000,
+      "cache_write": 0
+    },
+    {
+      "arm": "output",
+      "input": 30,
+      "output": 20000,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "output",
+      "input": 30,
+      "output": 40000,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "output",
+      "input": 30,
+      "output": 60000,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "input",
+      "input": 20000,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "input",
+      "input": 40000,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "input",
+      "input": 60000,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 0
+    }
+  ]
+}

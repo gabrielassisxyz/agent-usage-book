@@ -7286,7 +7286,35 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
         }
     }
 
-    let conn = open_ledger(clock)?;
+    let mut conn = open_ledger(clock)?;
+
+    // The premise recorded at `begin` decides the fitter. Only a controlled
+    // run carries one; an experiment with no controlled premise, or a premise
+    // naming a single kind, keeps the univariate path exactly as it was.
+    let controlled_run = match experiment_id.as_ref() {
+        Some(id) => crate::store::calibration_controlled::load_by_experiment_id(
+            &conn,
+            &crate::store::calibration_controlled::ControlledExperimentId::new(id.as_str()),
+        )?,
+        None => None,
+    };
+    let premise = controlled_run
+        .as_ref()
+        .map(|run| run.expected_token_kinds.as_slice());
+    if let (crate::calibration::multivariate_fit::FitPath::Multivariate, Some(run)) = (
+        crate::calibration::multivariate_fit::fit_path_for_premise(premise),
+        controlled_run.as_ref(),
+    ) {
+        let outcome = crate::calibration::multivariate_fit::fit_controlled_run_and_record(
+            &mut conn, run, clock,
+        )?;
+        match invocation.format {
+            OutputFormat::Text => print!("{}", render_calibrate_fit_multivariate(&outcome)),
+            OutputFormat::Json => println!("{}", calibrate_fit_multivariate_json(&outcome)),
+        }
+        return Ok(());
+    }
+
     let fit_result =
         crate::calibration::fitter::fit_and_record_candidate(&conn, experiment_id.as_ref(), clock)?;
 
@@ -7382,6 +7410,132 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
         }
     }
     Ok(())
+}
+
+/// The text report of a multivariate fit: one line per fitted kind, then the
+/// identifiability figures the candidate was accepted under.
+fn render_calibrate_fit_multivariate(
+    outcome: &crate::calibration::multivariate_fit::MultivariateFitOutcome,
+) -> String {
+    let candidate = &outcome.candidate;
+    let kinds = candidate
+        .kinds()
+        .iter()
+        .map(|kind| kind.label())
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut out = String::new();
+    out.push_str(&format!("Candidate ID: {}\n", candidate.id.as_str()));
+    out.push_str(&format!(
+        "Experiment:   {}\n",
+        candidate.experiment.as_str()
+    ));
+    out.push_str(&format!("Provider:     {}\n", candidate.provider.as_str()));
+    out.push_str(&format!("Plan Tier:    {}\n", candidate.plan_tier.as_str()));
+    out.push_str(&format!(
+        "Window:       {}\n",
+        candidate.window_semantic_key.as_str()
+    ));
+    out.push_str(&format!("Fit:          multivariate over {kinds}\n"));
+    for coefficient in outcome.result.coefficients() {
+        out.push_str(&format!(
+            "  {:<12} {:.6} ppm/token (std error {:.6}, 95% [{:.6}, {:.6}])\n",
+            format!("{}:", coefficient.kind().label()),
+            coefficient.estimate_ppm_per_token(),
+            coefficient.std_error_ppm_per_token(),
+            coefficient.interval_low_ppm_per_token(),
+            coefficient.interval_high_ppm_per_token(),
+        ));
+    }
+    out.push_str(&format!(
+        "Condition:    {:.4} (threshold {:.2})\n",
+        outcome.result.condition_number(),
+        outcome.result.condition_number_threshold()
+    ));
+    for pair in outcome.result.pairwise_correlations() {
+        out.push_str(&format!(
+            "  r({}, {}) = {:.4}\n",
+            pair.first().label(),
+            pair.second().label(),
+            pair.correlation()
+        ));
+    }
+    out.push_str(&format!("Residual:     {:.1} ppm\n", outcome.residual_ppm));
+    out.push_str(&format!(
+        "Method:       {}\n",
+        outcome.result.statistical_method()
+    ));
+    out.push_str(&format!(
+        "Parameters:   {}\n",
+        outcome.result.statistical_parameters()
+    ));
+    out.push_str(&format!("Design:       {}\n", candidate.phase_design));
+    out.push_str(&format!("Usable Obs:   {}\n", outcome.usable_observations));
+    out.push_str(&format!(
+        "Excluded:     {}\n",
+        outcome.excluded_samples.len()
+    ));
+    for excluded in &outcome.excluded_samples {
+        out.push_str(&format!(
+            "  - {}: {}\n",
+            excluded.sample_ref(),
+            excluded.reason()
+        ));
+    }
+    out.push_str("Activation:   not performed; activate with `aub calibrate activate`\n");
+    out
+}
+
+/// The JSON contract of a multivariate fit, documented in `docs/commands.md`
+/// under `aub calibrate`.
+fn calibrate_fit_multivariate_json(
+    outcome: &crate::calibration::multivariate_fit::MultivariateFitOutcome,
+) -> serde_json::Value {
+    let candidate = &outcome.candidate;
+    serde_json::json!({
+        "fit_kind": "multivariate",
+        "candidate_id": candidate.id.as_str(),
+        "experiment_id": candidate.experiment.as_str(),
+        "provider": candidate.provider.as_str(),
+        "plan_tier": candidate.plan_tier.as_str(),
+        "window_semantic_key": candidate.window_semantic_key.as_str(),
+        "token_kinds": candidate.kinds().iter().map(|kind| kind.label()).collect::<Vec<_>>(),
+        "coefficients": outcome.result.coefficients().iter().map(|c| {
+            serde_json::json!({
+                "token_kind": c.kind().label(),
+                "estimate_ppm_per_token": c.estimate_ppm_per_token(),
+                "std_error_ppm_per_token": c.std_error_ppm_per_token(),
+                "interval_low_ppm_per_token": c.interval_low_ppm_per_token(),
+                "interval_high_ppm_per_token": c.interval_high_ppm_per_token(),
+            })
+        }).collect::<Vec<_>>(),
+        "condition_number": outcome.result.condition_number(),
+        "condition_number_threshold": outcome.result.condition_number_threshold(),
+        "condition_number_micros": candidate.condition_number.micros(),
+        "pairwise_correlations": outcome.result.pairwise_correlations().iter().map(|pair| {
+            serde_json::json!({
+                "first": pair.first().label(),
+                "second": pair.second().label(),
+                "correlation": pair.correlation(),
+            })
+        }).collect::<Vec<_>>(),
+        "fit_residual_ppm": outcome.residual_ppm,
+        "residual_percentage_points": outcome.residual_ppm / 10_000.0,
+        "statistical_method": outcome.result.statistical_method(),
+        "statistical_parameters": outcome.result.statistical_parameters(),
+        "phase_design": candidate.phase_design,
+        "usable_observations": outcome.usable_observations,
+        "sample_count": candidate.sample_count,
+        "inputs_digest": format!("{:016x}", candidate.inputs.digest()),
+        "inputs_count": candidate.inputs.count(),
+        "excluded_samples": outcome.excluded_samples.iter().map(|ex| {
+            serde_json::json!({
+                "sample_ref": ex.sample_ref(),
+                "reason": ex.reason(),
+            })
+        }).collect::<Vec<_>>(),
+        "activated": false,
+    })
 }
 
 fn calibrate_passive_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {

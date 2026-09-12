@@ -27,8 +27,8 @@ use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, Derivation, EvidenceQuality};
 use crate::store::calibration::{
     CandidateId, CoefficientUncertainty, EvidenceDigest, ExcludedSample, ExperimentId, LagHandling,
-    WindowCalibrationCandidate, insert_candidate, load_candidate, load_experiment,
-    load_experiment_observations, load_experiment_usage, load_latest_experiment,
+    StoredUsageEvent, WindowCalibrationCandidate, insert_candidate, load_candidate,
+    load_experiment, load_experiment_observations, load_experiment_usage, load_latest_experiment,
 };
 use crate::store::cost_model::load_active_at as load_active_cost_model_at;
 
@@ -351,22 +351,13 @@ pub struct FitResult {
     pub diagnostic_findings: Vec<DiagnosticFinding>,
 }
 
-/// Fits a candidate calibration over quantized provider observations.
-///
-/// Readings enter the fit as admissible intervals rather than scalars.
-/// The regression uses Theil-Sen median initialization and Huber loss minimization
-/// over interval residuals to remain robust to quantization plateaus and batched updates.
-pub fn fit(
+/// Orders observations by time and drops the ones no fit may use: out-of-order
+/// and duplicate timestamps, and everything from a quota reset crossing
+/// onward, each with its reason recorded. Shared by the univariate and the
+/// multivariate paths so a reset is recognised the same way on both.
+pub fn partition_usable_observations(
     observations: &[FitObservation],
-    experiment: &crate::store::calibration::CalibrationExperiment,
-) -> Result<FitResult, FitRejection> {
-    if observations.len() < 2 {
-        return Err(FitRejection::InsufficientObservations {
-            found: observations.len(),
-            required: 2,
-        });
-    }
-
+) -> (Vec<FitObservation>, Vec<ExcludedSample>) {
     let mut sorted = observations.to_vec();
     sorted.sort_by_key(|o| (o.at, o.evidence_id.as_str().to_string()));
 
@@ -426,6 +417,27 @@ pub fn fit(
         prev_used_ppm = Some(obs.quota_used_ppm);
         usable.push(obs.clone());
     }
+
+    (usable, excluded_samples)
+}
+
+/// Fits a candidate calibration over quantized provider observations.
+///
+/// Readings enter the fit as admissible intervals rather than scalars.
+/// The regression uses Theil-Sen median initialization and Huber loss minimization
+/// over interval residuals to remain robust to quantization plateaus and batched updates.
+pub fn fit(
+    observations: &[FitObservation],
+    experiment: &crate::store::calibration::CalibrationExperiment,
+) -> Result<FitResult, FitRejection> {
+    if observations.len() < 2 {
+        return Err(FitRejection::InsufficientObservations {
+            found: observations.len(),
+            required: 2,
+        });
+    }
+
+    let (usable, excluded_samples) = partition_usable_observations(observations);
 
     if usable.len() < 2 {
         return Err(FitRejection::InsufficientObservations {
@@ -760,46 +772,13 @@ pub fn fit_scalar_for_comparison(
     Ok((slope, mean_scalar_residual))
 }
 
-/// Executes fitting from the database and inserts the resulting candidate row immutably.
-///
-/// Never activates the candidate (creates no `calibration_lifecycle` entry).
-pub fn fit_and_record_candidate(
-    conn: &Connection,
-    experiment_id: Option<&ExperimentId>,
-    clock: &impl Clock,
-) -> Result<FitResult, Error> {
-    let experiment = match experiment_id {
-        Some(id) => load_experiment(conn, id)?.ok_or_else(|| {
-            Error::InsufficientEvidence(format!("no calibration experiment '{}'", id.as_str()))
-        })?,
-        None => load_latest_experiment(conn)?.ok_or_else(|| {
-            Error::InsufficientEvidence("no calibration experiment found in ledger".into())
-        })?,
-    };
-
-    let stored_obs = load_experiment_observations(conn, &experiment)?;
-    if stored_obs.is_empty() {
-        return Err(Error::InsufficientEvidence(format!(
-            "no meter observations found for experiment '{}'",
-            experiment.id.as_str()
-        )));
-    }
-
-    let cost_model = load_active_cost_model_at(conn, experiment.validity.valid_from())?
-        .ok_or_else(|| {
-            Error::InsufficientEvidence(format!(
-                "no active cost model found for experiment '{}'",
-                experiment.id.as_str()
-            ))
-        })?;
-
-    let usage_events = load_experiment_usage(
-        conn,
-        experiment.validity.valid_from(),
-        experiment.validity.valid_until(),
-    )?;
-
-    // Aggregate tokens per usage event
+/// Folds the per-class component rows of every usage event into one token
+/// vector per event, keyed by the canonical event id and carrying the event's
+/// timestamp. An unknown token class is refused rather than dropped, since a
+/// dropped class would fit as if the tokens were never spent.
+pub fn aggregate_event_tokens(
+    usage_events: Vec<StoredUsageEvent>,
+) -> Result<BTreeMap<String, (UtcTimestamp, KnownTokenVector)>, Error> {
     let mut event_tokens: BTreeMap<String, (UtcTimestamp, KnownTokenVector)> = BTreeMap::new();
     for event in usage_events {
         let entry = event_tokens
@@ -857,6 +836,50 @@ pub fn fit_and_record_candidate(
         };
         entry.1 = new_known;
     }
+
+    Ok(event_tokens)
+}
+
+/// Executes fitting from the database and inserts the resulting candidate row immutably.
+///
+/// Never activates the candidate (creates no `calibration_lifecycle` entry).
+pub fn fit_and_record_candidate(
+    conn: &Connection,
+    experiment_id: Option<&ExperimentId>,
+    clock: &impl Clock,
+) -> Result<FitResult, Error> {
+    let experiment = match experiment_id {
+        Some(id) => load_experiment(conn, id)?.ok_or_else(|| {
+            Error::InsufficientEvidence(format!("no calibration experiment '{}'", id.as_str()))
+        })?,
+        None => load_latest_experiment(conn)?.ok_or_else(|| {
+            Error::InsufficientEvidence("no calibration experiment found in ledger".into())
+        })?,
+    };
+
+    let stored_obs = load_experiment_observations(conn, &experiment)?;
+    if stored_obs.is_empty() {
+        return Err(Error::InsufficientEvidence(format!(
+            "no meter observations found for experiment '{}'",
+            experiment.id.as_str()
+        )));
+    }
+
+    let cost_model = load_active_cost_model_at(conn, experiment.validity.valid_from())?
+        .ok_or_else(|| {
+            Error::InsufficientEvidence(format!(
+                "no active cost model found for experiment '{}'",
+                experiment.id.as_str()
+            ))
+        })?;
+
+    let usage_events = load_experiment_usage(
+        conn,
+        experiment.validity.valid_from(),
+        experiment.validity.valid_until(),
+    )?;
+
+    let event_tokens = aggregate_event_tokens(usage_events)?;
 
     // Convert each usage event to Credits via the active CostModel
     let mut event_credits: Vec<(UtcTimestamp, Credits)> = Vec::new();

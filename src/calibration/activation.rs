@@ -968,6 +968,59 @@ mod tests {
         }
     }
 
+    /// The condition bound is inclusive at the boundary: a recorded condition
+    /// number equal to the policy's maximum is accepted, and one micro over
+    /// it is refused naming both figures.
+    #[test]
+    fn condition_bound_accepts_at_the_boundary_and_refuses_one_micro_over() {
+        let training = evidence(&["t-1", "t-2"]);
+        let validation = evidence(&["v-1"]);
+        let (actor, test_policy, verdict) = passing_parts();
+        let at_bound = recorded(
+            "ap-v1",
+            &training,
+            &validation,
+            Some(Credits::from_micros(0)),
+            Some(ConditionNumber::from_micros(30_000_000)),
+        );
+        check_activation(
+            &request(&actor, &test_policy, &training, &validation, &verdict),
+            &at_bound,
+        )
+        .expect("a condition number equal to the bound is accepted");
+
+        let over = recorded(
+            "ap-v1",
+            &training,
+            &validation,
+            Some(Credits::from_micros(0)),
+            Some(ConditionNumber::from_micros(30_000_001)),
+        );
+        let refusal = check_activation(
+            &request(&actor, &test_policy, &training, &validation, &verdict),
+            &over,
+        )
+        .unwrap_err();
+        match refusal {
+            ActivationRefusal::IllConditioned {
+                condition_number,
+                threshold,
+            } => {
+                assert_eq!(condition_number.micros(), 30_000_001);
+                assert_eq!(threshold.micros(), 30_000_000);
+            }
+            other @ (ActivationRefusal::PolicyVersionMismatch { .. }
+            | ActivationRefusal::EvidenceMismatch { .. }
+            | ActivationRefusal::OverlappingEvidence { .. }
+            | ActivationRefusal::Contaminated { .. }
+            | ActivationRefusal::MissingHeldOutResidual
+            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
+                panic!("wrong refusal: {other}")
+            }
+        }
+    }
+
     fn fit_observation(
         id: &str,
         at_nanos: i64,

@@ -1,0 +1,95 @@
+{
+  "description": "Twelve blocks whose four kinds keep one fixed proportion up to a jitter under one percent, the shape organic traffic has: no amount of this data separates the coefficients, and the identifiability gate must refuse it by name with a finite condition number.",
+  "truth_ppm_per_token": {
+    "input": 0.5,
+    "output": 1.0,
+    "cache_read": 0.05,
+    "cache_write": 0.6
+  },
+  "blocks": [
+    {
+      "arm": "organic",
+      "input": 1003,
+      "output": 997,
+      "cache_read": 4006,
+      "cache_write": 1997
+    },
+    {
+      "arm": "organic",
+      "input": 1995,
+      "output": 2005,
+      "cache_read": 7990,
+      "cache_write": 4005
+    },
+    {
+      "arm": "organic",
+      "input": 3007,
+      "output": 2993,
+      "cache_read": 12014,
+      "cache_write": 5993
+    },
+    {
+      "arm": "organic",
+      "input": 3998,
+      "output": 4002,
+      "cache_read": 15996,
+      "cache_write": 8002
+    },
+    {
+      "arm": "organic",
+      "input": 5004,
+      "output": 4996,
+      "cache_read": 20008,
+      "cache_write": 9996
+    },
+    {
+      "arm": "organic",
+      "input": 5994,
+      "output": 6006,
+      "cache_read": 23988,
+      "cache_write": 12006
+    },
+    {
+      "arm": "organic",
+      "input": 7001,
+      "output": 6999,
+      "cache_read": 28002,
+      "cache_write": 13999
+    },
+    {
+      "arm": "organic",
+      "input": 7997,
+      "output": 8003,
+      "cache_read": 31994,
+      "cache_write": 16003
+    },
+    {
+      "arm": "organic",
+      "input": 9005,
+      "output": 8995,
+      "cache_read": 36010,
+      "cache_write": 17995
+    },
+    {
+      "arm": "organic",
+      "input": 9993,
+      "output": 10007,
+      "cache_read": 39986,
+      "cache_write": 20007
+    },
+    {
+      "arm": "organic",
+      "input": 11002,
+      "output": 10998,
+      "cache_read": 44004,
+      "cache_write": 21998
+    },
+    {
+      "arm": "organic",
+      "input": 11996,
+      "output": 12004,
+      "cache_read": 47992,
+      "cache_write": 24004
+    }
+  ]
+}
