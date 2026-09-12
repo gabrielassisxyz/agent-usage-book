@@ -71,9 +71,9 @@ which is how this particular damage announces itself and what to do with
 the file before the restore starts.
 
 The symptom is a ledger whose first page is not a SQLite header. `aub doctor`
-reports `sqlite-and-schema-health` failing with `page 1 integrity probe
-failed`, and every other subcommand refuses to open the ledger with the same
-message. It happened twice on 2026-09-11, and both times the file was set
+reports `sqlite-and-schema-health` failing with
+`page 1 integrity probe failed`, and every other subcommand refuses to open
+the ledger with the same message. It happened twice on 2026-09-11, and both times the file was set
 aside by hand at midnight, which is what this section exists to replace.
 
 Stop the cadence first, so nothing writes while the directory is moved:
