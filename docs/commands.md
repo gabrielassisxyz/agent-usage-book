@@ -567,6 +567,40 @@ mean absolute block residual), `residual_percentage_points`, `statistical_method
 `window_calibration_multivariate_coefficient`, immutable like every other
 calibration record (Invariant 29). `activate` takes `--max-condition-micros` and
 refuses a recorded condition number over it, naming both figures.
+`promote CANDIDATE --training E,... --validation E,...` is the step between a
+fitted candidate and an active calibration: it records a `window_calibration_result`
+from the candidate, supplying the validation half a candidate does not carry. The
+coefficient, its uncertainty and its sample count are the candidate's own, and
+promotion never refits them; what it adds is the held-out residual computed over
+the validation evidence, the two evidence fingerprints `activate` reproduces, the
+validation method and version, the settling policy of the source experiment, and
+the activation policy version (`promote-v1` unless `--policy-version` names
+another), so `activate` with no `--policy-version` judges the result under the
+policy the promotion recorded. The result's id is `promoted-<candidate-id>`,
+derived rather than generated, because one fit has one identity.
+
+`--training` names the evidence the candidate was fitted from, and the command
+refuses a set whose digest is not the candidate's own, naming both digests: the
+row would otherwise claim to have been fitted from evidence it was not. The
+validation evidence is held out of the fit, so it lies outside the source
+experiment's validity window; `--validation` is refused when it is empty, when it
+overlaps the training set (the overlap is named), and when the ledger holds no
+observation of the experiment's provider and window for one of its ids. Promoting
+one candidate twice is refused naming the result already recorded, since a result
+is immutable and a second row would be a second identity for one fit. A joint
+multivariate candidate is refused outright: a result carries one scalar
+coefficient and a joint fit has one per token kind, and reducing them through a
+cost model would reintroduce the assumption the joint fit exists to test.
+
+Promotion records evidence and never activates (Invariant 14): it writes no
+`calibration_lifecycle` row, `calibrate history` lists the new result with no
+lifecycle event, and the operator activates it explicitly afterwards. With
+`--format json` the report carries `result_id`, `candidate_id`, `experiment_id`,
+`provider`, `plan_tier`, `window_semantic_key`, `fitted`, `fit_residual`,
+`held_out_residual`, `validation_observations`, `fitting_evidence_digest`,
+`validation_evidence_digest`, `validation_method`, `validation_version`,
+`activation_policy_version`, `uncertainty`, and `activated` (always `false`).
+
 Subcommand `passive` generates candidates from
 uncontrolled, recorded observations across clean intervals under strict
 eligibility rules. Intervals are eligible only when the account's configured
