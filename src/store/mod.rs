@@ -23,6 +23,7 @@ pub mod backup;
 pub mod calibrate_cli_test_ledger;
 pub mod calibration;
 pub mod calibration_controlled;
+pub mod calibration_multivariate;
 pub mod connection;
 pub mod cost_model;
 pub mod export;

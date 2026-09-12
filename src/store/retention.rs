@@ -93,6 +93,8 @@ pub enum DurableClass {
     MeterWindow,
     MeterObservationPreference,
     WindowCalibrationCandidate,
+    WindowCalibrationMultivariateCandidate,
+    WindowCalibrationMultivariateCoefficient,
     WindowCalibrationResult,
     WindowCalibrationSourceExperiment,
     CalibrationLifecycle,
@@ -161,6 +163,8 @@ impl DurableClass {
             | Self::MeterWindow
             | Self::MeterObservationPreference
             | Self::WindowCalibrationCandidate
+            | Self::WindowCalibrationMultivariateCandidate
+            | Self::WindowCalibrationMultivariateCoefficient
             | Self::WindowCalibrationResult
             | Self::WindowCalibrationSourceExperiment
             | Self::CalibrationLifecycle => DurableClassCategory::VersionedInterpretation,
@@ -208,6 +212,8 @@ impl DurableClass {
             | Self::MeterWindow
             | Self::MeterObservationPreference
             | Self::WindowCalibrationCandidate
+            | Self::WindowCalibrationMultivariateCandidate
+            | Self::WindowCalibrationMultivariateCoefficient
             | Self::WindowCalibrationResult
             | Self::WindowCalibrationSourceExperiment
             | Self::CalibrationLifecycle
@@ -288,6 +294,12 @@ impl DurableClass {
             Self::Session => Some("session"),
             Self::CalibrationExperiment => Some("calibration_experiment"),
             Self::WindowCalibrationCandidate => Some("window_calibration_candidate"),
+            Self::WindowCalibrationMultivariateCandidate => {
+                Some("window_calibration_multivariate_candidate")
+            }
+            Self::WindowCalibrationMultivariateCoefficient => {
+                Some("window_calibration_multivariate_coefficient")
+            }
             Self::WindowCalibrationResult => Some("window_calibration_result"),
             Self::WindowCalibrationSourceExperiment => Some("window_calibration_source_experiment"),
             Self::CalibrationLifecycle => Some("calibration_lifecycle"),
@@ -385,6 +397,8 @@ impl DurableClass {
             | Self::MeterWindow
             | Self::MeterObservationPreference
             | Self::WindowCalibrationCandidate
+            | Self::WindowCalibrationMultivariateCandidate
+            | Self::WindowCalibrationMultivariateCoefficient
             | Self::WindowCalibrationResult
             | Self::WindowCalibrationSourceExperiment
             | Self::CalibrationLifecycle
@@ -433,6 +447,8 @@ impl DurableClass {
             Self::Session,
             Self::CalibrationExperiment,
             Self::WindowCalibrationCandidate,
+            Self::WindowCalibrationMultivariateCandidate,
+            Self::WindowCalibrationMultivariateCoefficient,
             Self::WindowCalibrationResult,
             Self::WindowCalibrationSourceExperiment,
             Self::CalibrationLifecycle,
@@ -487,6 +503,8 @@ impl DurableClass {
             Self::Session,
             Self::CalibrationExperiment,
             Self::WindowCalibrationCandidate,
+            Self::WindowCalibrationMultivariateCandidate,
+            Self::WindowCalibrationMultivariateCoefficient,
             Self::WindowCalibrationResult,
             Self::WindowCalibrationSourceExperiment,
             Self::CalibrationLifecycle,

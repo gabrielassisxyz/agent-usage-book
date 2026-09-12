@@ -268,6 +268,14 @@ const POPULATION: &[(&str, Populate)] = &[
         "calibration_controlled_run",
         populate_calibration_controlled_run,
     ),
+    (
+        "window_calibration_multivariate_candidate",
+        populate_window_calibration_multivariate_candidate,
+    ),
+    (
+        "window_calibration_multivariate_coefficient",
+        populate_window_calibration_multivariate_coefficient,
+    ),
     ("attribution_segment", populate_attribution_segment),
     ("ingest_quarantine", populate_ingest_quarantine),
     ("ingestion_generation", populate_ingestion_generation),
@@ -704,6 +712,36 @@ fn populate_calibration_lifecycle(conn: &rusqlite::Connection) -> Result<(), Str
         "calibration_lifecycle",
         "INSERT INTO calibration_lifecycle (id, calibration_result_id, event_kind, event_at, supersedes_result_id) VALUES
             (1, 1, 'activation', 30, NULL)",
+    )
+}
+
+fn populate_window_calibration_multivariate_candidate(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    // Condition number exactly at its floor of one, threshold one micro above
+    // the floor, zero residual, zero counts, and a sixteen-character digest:
+    // every CHECK on its boundary at once. Run 2 is the ended run.
+    exec(
+        conn,
+        "window_calibration_multivariate_candidate",
+        "INSERT INTO window_calibration_multivariate_candidate (id, candidate_id, calibration_controlled_run_id, provider, plan_tier, window_semantic_key, condition_number_micros, condition_number_threshold_micros, fit_residual_ppm, sample_count, inputs_digest, inputs_count, statistical_method, statistical_parameters, phase_design, valid_from, valid_until, knowledge_time) VALUES
+            (1, 'matrix-mv-candidate-1', 2, 'anthropic', 'pro', 'matrix-key-1', 1000000, 1000001, 0, 0, '0123456789abcdef', 0, 'ols-through-origin', '{}', 'matrix-design', 700, 700, 710)",
+    )
+}
+
+fn populate_window_calibration_multivariate_coefficient(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    // One row per kind on the estimate floor (one micro-ppm), zero standard
+    // error, and a degenerate interval whose ends coincide.
+    exec(
+        conn,
+        "window_calibration_multivariate_coefficient",
+        "INSERT INTO window_calibration_multivariate_coefficient (id, window_calibration_multivariate_candidate_id, token_kind, estimate_micro_ppm_per_token, std_error_micro_ppm_per_token, interval_low_micro_ppm_per_token, interval_high_micro_ppm_per_token) VALUES
+            (1, 1, 'input', 1, 0, 1, 1),
+            (2, 1, 'output', 1, 0, 1, 1),
+            (3, 1, 'cache_read', 1, 0, 1, 1),
+            (4, 1, 'cache_write', 1, 0, 1, 1)",
     )
 }
 
