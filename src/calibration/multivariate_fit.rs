@@ -31,7 +31,9 @@ use std::collections::BTreeSet;
 
 use rusqlite::Connection;
 
-use super::fitter::{FitObservation, aggregate_event_tokens, partition_usable_observations};
+use super::fitter::{
+    FitObservation, aggregate_event_tokens, partition_usable_observations, still_running_refusal,
+};
 use super::multivariate::{
     MultivariateFitConfig, MultivariateFitObservation, MultivariateFitResult, fit_multivariate,
 };
@@ -177,12 +179,9 @@ pub fn fit_controlled_run_and_record(
     run: &ControlledExperimentRun,
     clock: &impl Clock,
 ) -> Result<MultivariateFitOutcome, Error> {
-    let ended_at = run.ended_at.ok_or_else(|| {
-        Error::InsufficientEvidence(format!(
-            "controlled experiment '{}' is still running; record `aub calibrate end` before fitting",
-            run.id.as_str()
-        ))
-    })?;
+    let ended_at = run
+        .ended_at
+        .ok_or_else(|| still_running_refusal(run.id.as_str()))?;
     let now = clock.now();
     let stored = observations_for_run(conn, run, now)?;
     if stored.is_empty() {

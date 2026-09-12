@@ -14,8 +14,10 @@ use std::fmt;
 
 use rusqlite::Connection;
 
+use crate::calibration::settlement::SettlementPolicy;
 use crate::cost_model::convert as convert_usage;
 use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
+use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
 use crate::domain::provenance::EvidenceId;
 use crate::domain::time::{Clock, UtcTimestamp};
 use crate::domain::tokens::{
@@ -26,11 +28,15 @@ use crate::domain::window::QuantizationSemantics;
 use crate::error::Error;
 use crate::evidence::{CoverageCompleteness, Derivation, EvidenceQuality};
 use crate::store::calibration::{
-    CandidateId, CoefficientUncertainty, EvidenceDigest, ExcludedSample, ExperimentId, LagHandling,
-    StoredUsageEvent, WindowCalibrationCandidate, insert_candidate, load_candidate,
-    load_experiment, load_experiment_observations, load_experiment_usage, load_latest_experiment,
+    CalibrationExperiment, CandidateId, CoefficientUncertainty, EvidenceDigest, ExcludedSample,
+    ExperimentId, LagHandling, StoredUsageEvent, WindowCalibrationCandidate, insert_candidate,
+    insert_experiment, load_candidate, load_experiment, load_experiment_observations,
+    load_experiment_usage, load_latest_experiment,
 };
-use crate::store::cost_model::load_active_at as load_active_cost_model_at;
+use crate::store::calibration_controlled::ControlledExperimentRun;
+use crate::store::calibration_multivariate::observations_for_run;
+use crate::store::cost_model::{ValidityInterval, load_active_at as load_active_cost_model_at};
+use crate::store::meter_evidence::observation_by_row_id;
 
 /// Possible causes for a large fitted intercept diagnostic finding.
 pub const INTERCEPT_POSSIBLE_CAUSES: [&str; 3] =
@@ -858,6 +864,104 @@ pub fn fit_and_record_candidate(
     };
 
     let stored_obs = load_experiment_observations(conn, &experiment)?;
+    fit_observations_and_record(conn, &experiment, stored_obs, clock)
+}
+
+/// The refusal a controlled run that has not recorded `end` earns, shared by
+/// both fitters so the two paths cannot drift into two wordings of it.
+pub fn still_running_refusal(run_id: &str) -> Error {
+    Error::InsufficientEvidence(format!(
+        "controlled experiment '{run_id}' is still running; record `aub calibrate end` before fitting"
+    ))
+}
+
+/// Reads a controlled run as the experiment the univariate fitter takes.
+///
+/// The run and the experiment carry the same facts under two schemas: the
+/// scope is the run's own, the validity is the spend window `begin` and `end`
+/// bracket, and the settlement policy is the built-in conservative one, which
+/// is the policy `status` already judges the same run's plateaus under. The
+/// two semantics identifiers are the only fields a run does not carry, so the
+/// caller supplies them from the evidence that does: the baseline reading and
+/// the cost model in force when the run started.
+pub fn experiment_from_controlled_run(
+    run: &ControlledExperimentRun,
+    meter_semantics_id: MeterSemanticsId,
+    billing_semantics_id: BillingSemanticsId,
+) -> Result<CalibrationExperiment, Error> {
+    let ended_at = run
+        .ended_at
+        .ok_or_else(|| still_running_refusal(run.id.as_str()))?;
+    Ok(CalibrationExperiment {
+        id: ExperimentId::new(run.id.as_str()),
+        provider: run.provider.clone(),
+        plan_tier: run.plan_tier.clone(),
+        window_semantic_key: run.window_semantic_key.clone(),
+        meter_semantics_id,
+        billing_semantics_id,
+        settlement_policy: SettlementPolicy::conservative_default(run.baseline_resolution),
+        validity: ValidityInterval::new(run.started_at, ended_at)?,
+        knowledge_time: ended_at,
+    })
+}
+
+/// Fits the univariate candidate of a controlled run whose premise names a
+/// single token kind, over that run's own observations.
+///
+/// The run's observations are the ones its account and window carry from the
+/// baseline reading onward, which is the frame the joint path already reads;
+/// the provider-wide frame `load_experiment_observations` uses would take in
+/// another account's readings on the same provider.
+///
+/// The `calibration_experiment` row is written here rather than at `calibrate
+/// end`, because the candidate's foreign key needs it and a run that ended
+/// before this path existed would otherwise never become fittable. Writing it
+/// on the first fit is idempotent: the row is looked up by the run's own
+/// identifier and inserted only when absent.
+///
+/// Never activates the candidate (creates no `calibration_lifecycle` entry).
+pub fn fit_controlled_run_univariate_and_record(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    clock: &impl Clock,
+) -> Result<FitResult, Error> {
+    if run.ended_at.is_none() {
+        return Err(still_running_refusal(run.id.as_str()));
+    }
+    let baseline = observation_by_row_id(conn, run.baseline_observation_id)?.ok_or_else(|| {
+        Error::InsufficientEvidence(format!(
+            "the baseline reading of controlled experiment '{}' is no longer in the ledger",
+            run.id.as_str()
+        ))
+    })?;
+    let cost_model = load_active_cost_model_at(conn, run.started_at)?.ok_or_else(|| {
+        Error::InsufficientEvidence(format!(
+            "no active cost model found for experiment '{}'",
+            run.id.as_str()
+        ))
+    })?;
+    let experiment = experiment_from_controlled_run(
+        run,
+        baseline.meter_semantics_id.clone(),
+        cost_model.billing_semantics_id().clone(),
+    )?;
+    if load_experiment(conn, &experiment.id)?.is_none() {
+        insert_experiment(conn, &experiment)?;
+    }
+
+    let stored_obs = observations_for_run(conn, run, clock.now())?;
+    fit_observations_and_record(conn, &experiment, stored_obs, clock)
+}
+
+/// Turns stored readings into a candidate: the usage the experiment's validity
+/// brackets becomes cumulative credits under the cost model in force at its
+/// start, the fit runs over the pairs, and the candidate is recorded once.
+fn fit_observations_and_record(
+    conn: &Connection,
+    experiment: &CalibrationExperiment,
+    stored_obs: Vec<crate::store::calibration::StoredFitObservation>,
+    clock: &impl Clock,
+) -> Result<FitResult, Error> {
     if stored_obs.is_empty() {
         return Err(Error::InsufficientEvidence(format!(
             "no meter observations found for experiment '{}'",
@@ -930,7 +1034,7 @@ pub fn fit_and_record_candidate(
     }
 
     // Execute fit
-    let mut result = fit(&fit_observations, &experiment).map_err(|rej| rej.into_error())?;
+    let mut result = fit(&fit_observations, experiment).map_err(|rej| rej.into_error())?;
 
     // Update knowledge time with the clock
     result.candidate.knowledge_time = clock.now();
@@ -1480,6 +1584,76 @@ mod tests {
         assert_eq!(
             run_1.residual_percentage_points,
             run_2.residual_percentage_points
+        );
+    }
+
+    fn controlled_run(ended_at: Option<UtcTimestamp>) -> ControlledExperimentRun {
+        ControlledExperimentRun {
+            id: crate::store::calibration_controlled::ControlledExperimentId::new("exp-derived"),
+            account: "work".into(),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("max-5x"),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+            cost_model_id: crate::domain::provenance::CostModelId::new(
+                "anthropic-claude-messages-v1",
+            ),
+            expected_token_kinds: vec![TokenKind::Output],
+            baseline_observation_id: crate::store::meter_evidence::ObservationRowId::new(7),
+            baseline_quota_used: crate::domain::quota::QuotaUsed::new(
+                QuotaFractionPpm::new(100_000).unwrap(),
+            ),
+            baseline_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+                .unwrap(),
+            baseline_observed_at: UtcTimestamp::from_unix_nanos(1_000_000_000),
+            baseline_plateau_started_at: UtcTimestamp::from_unix_nanos(1_000_000_000),
+            contamination_thresholds:
+                crate::calibration::contamination::ContaminationThresholds::conservative_default(),
+            started_at: UtcTimestamp::from_unix_nanos(2_000_000_000),
+            ended_at,
+            exclusivity_assertion: "account work reserved".into(),
+        }
+    }
+
+    /// The derivation carries the run's own scope and brackets its validity by
+    /// the spend window, and refuses a run that never recorded `end` with the
+    /// message the joint path uses.
+    #[test]
+    fn the_derived_experiment_takes_the_runs_scope_and_refuses_while_it_runs() {
+        let ended = UtcTimestamp::from_unix_nanos(9_000_000_000);
+        let experiment = experiment_from_controlled_run(
+            &controlled_run(Some(ended)),
+            MeterSemanticsId::new("semantics-v1"),
+            BillingSemanticsId::new("billing-v1"),
+        )
+        .expect("an ended run derives an experiment");
+
+        assert_eq!(experiment.id.as_str(), "exp-derived");
+        assert_eq!(experiment.provider.as_str(), "anthropic");
+        assert_eq!(experiment.plan_tier.as_str(), "max-5x");
+        assert_eq!(experiment.window_semantic_key.as_str(), "five_hour");
+        assert_eq!(experiment.meter_semantics_id.as_str(), "semantics-v1");
+        assert_eq!(experiment.billing_semantics_id.as_str(), "billing-v1");
+        assert_eq!(
+            experiment.validity.valid_from(),
+            UtcTimestamp::from_unix_nanos(2_000_000_000),
+            "the usage frame opens at the run's own start, never at its baseline reading"
+        );
+        assert_eq!(experiment.validity.valid_until(), ended);
+        assert_eq!(experiment.knowledge_time, ended);
+
+        let refusal = experiment_from_controlled_run(
+            &controlled_run(None),
+            MeterSemanticsId::new("semantics-v1"),
+            BillingSemanticsId::new("billing-v1"),
+        )
+        .expect_err("a run still in flight has no validity interval to derive");
+        assert!(
+            refusal.to_string().contains("is still running"),
+            "{refusal}"
+        );
+        assert_eq!(
+            refusal.to_string(),
+            still_running_refusal("exp-derived").to_string()
         );
     }
 }
