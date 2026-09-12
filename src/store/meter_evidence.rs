@@ -22,6 +22,7 @@
 
 use rusqlite::{OptionalExtension, params};
 
+use crate::domain::attempt::AttemptOutcome;
 use crate::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
 use crate::domain::rows::RowCount;
 use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
@@ -259,25 +260,119 @@ pub fn evidence_by_row_id(
     })
 }
 
-/// Reads the newest evidence row of one attempt, or `None` when the attempt
-/// carries no evidence (a failure that never received a response). The rowid
-/// order is the insert order; one attempt's evidence arrives in one commit.
-pub fn newest_evidence_for_attempt(
+/// Which observations of one contract the per-account newest-observation read
+/// wants. Two arms rather than a bare SQL operator string, so a caller cannot
+/// pass an arbitrary fragment into the query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContractObservationFilter {
+    /// The observation whose provider contract is not this one: the
+    /// full-window reading beside a status-line subset.
+    Excluding,
+    /// The observation whose provider contract is exactly this one: the
+    /// status-line subset an account falls back to when it has no full
+    /// reading.
+    Matching,
+}
+
+/// The SQL behind the per-account newest-observation read (`aub-hgsv`): the
+/// newest successful attempt of the account, its newest evidence row, and the
+/// interpretation the preference selector names current for that evidence row
+/// under the attempt's own semantics version, filtered on the observation's
+/// provider contract. The evidence table is touched only through its attempt
+/// index (migration 0040), so the read is two index seeks deep regardless of
+/// how much history the account has.
+const NEWEST_CONTRACT_OBSERVATION: &str = "
+    SELECT meter_observation.id AS id,
+           meter_observation.attempt_id AS attempt_id,
+           meter_observation.evidence_id AS evidence_id,
+           meter_observation.account_id AS account_id,
+           meter_observation.provider AS provider,
+           meter_observation.provider_observed_at AS provider_observed_at,
+           meter_observation.received_at AS received_at,
+           meter_observation.measurement_basis AS measurement_basis,
+           meter_observation.observed_plan AS observed_plan,
+           meter_observation.observed_tier AS observed_tier,
+           meter_observation.adapter_version AS adapter_version,
+           meter_observation.provider_contract_id AS provider_contract_id,
+           meter_observation.meter_semantics_id AS meter_semantics_id,
+           meter_observation.normalized_fingerprint AS normalized_fingerprint
+    FROM meter_attempt
+    JOIN meter_attempt_result ON meter_attempt_result.attempt_id = meter_attempt.id
+    JOIN meter_observation_preference
+      ON meter_observation_preference.evidence_id =
+         (SELECT MAX(newest_evidence.id) FROM meter_response_evidence AS newest_evidence
+          WHERE newest_evidence.attempt_id = meter_attempt.id)
+     AND meter_observation_preference.meter_semantics_id =
+         meter_attempt.meter_semantics_id
+    JOIN meter_observation
+      ON meter_observation.id = meter_observation_preference.current_observation_id
+    WHERE meter_attempt.account_id = ?1
+      AND meter_attempt_result.outcome = ?2
+      AND meter_observation.provider_contract_id {COMPARISON} ?3
+    ORDER BY meter_attempt.id DESC
+    LIMIT 1";
+
+fn newest_contract_observation(
     conn: &rusqlite::Connection,
-    attempt_id: MeterAttemptRowId,
-) -> Result<Option<EvidenceRowId>, Error> {
+    account_id: AccountId,
+    filter: ContractObservationFilter,
+    contract: &ProviderContractId,
+) -> Result<Option<StoredMeterObservation>, Error> {
+    let success_sql = crate::store::meter_attempt::attempt_outcome_as_sql(&AttemptOutcome::Success);
+    let comparison = match filter {
+        ContractObservationFilter::Excluding => "<>",
+        ContractObservationFilter::Matching => "=",
+    };
+    let sql = NEWEST_CONTRACT_OBSERVATION.replace("{COMPARISON}", comparison);
     conn.query_row(
-        "SELECT id FROM meter_response_evidence WHERE attempt_id = ?1 ORDER BY id DESC LIMIT 1",
-        params![attempt_id.value()],
-        |row| row.get::<_, i64>(0).map(EvidenceRowId::new),
+        &sql,
+        params![account_id.value(), success_sql, contract.as_str()],
+        row_to_observation,
     )
     .optional()
     .map_err(|e| {
         Error::Store(format!(
-            "cannot read the evidence of attempt {}: {e}",
-            attempt_id.value()
+            "cannot read the newest contract observation of account {}: {e}",
+            account_id.value()
         ))
     })
+}
+
+/// The newest successful attempt's current observation of `account_id` whose
+/// provider contract is not `contract`, or `None` when the account has no
+/// such reading. The bounded replacement for walking every successful attempt
+/// and looking up each attempt's evidence in turn (`aub-hgsv`): one indexed
+/// query takes the row the walk's first non-matching step would have
+/// returned, in the same attempt-then-evidence order.
+pub fn newest_observation_for_account_excluding_contract(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    contract: &ProviderContractId,
+) -> Result<Option<StoredMeterObservation>, Error> {
+    newest_contract_observation(
+        conn,
+        account_id,
+        ContractObservationFilter::Excluding,
+        contract,
+    )
+}
+
+/// The newest successful attempt's current observation of `account_id` whose
+/// provider contract is exactly `contract`, or `None` when the account has
+/// no such reading. The bounded fallback for an account that has only
+/// status-line observations: the row the walk's newest matching step would
+/// have kept while it searched for a fuller one.
+pub fn newest_observation_for_account_with_contract(
+    conn: &rusqlite::Connection,
+    account_id: AccountId,
+    contract: &ProviderContractId,
+) -> Result<Option<StoredMeterObservation>, Error> {
+    newest_contract_observation(
+        conn,
+        account_id,
+        ContractObservationFilter::Matching,
+        contract,
+    )
 }
 
 /// The single database spelling of a measurement basis, and back. One
@@ -909,6 +1004,10 @@ mod tests {
         command_budget: MonotonicDuration::from_millis(60_000),
         policy_algorithm_version: String::new(),
     };
+
+    /// The status-line subset contract, named by the tests only: production
+    /// code receives it from the projection layer, which owns the spelling.
+    const ANTHROPIC_STATUSLINE_CONTRACT: &str = "anthropic-statusline-rate-limits-v1";
 
     /// A connection migrated through the full registry, holding one account,
     /// one sample run, one policy snapshot and one started attempt the
@@ -1860,5 +1959,169 @@ mod tests {
             crate::domain::window::WindowScopeKind::ModelGroup
         );
         assert_eq!(read.scope.scoped_model(), None, "a group is not a model");
+    }
+
+    /// Seeds one more attempt with a terminal success, its evidence row and
+    /// its one current observation, so the per-account read has real history
+    /// to answer over.
+    fn seed_successful_reading(
+        conn: &rusqlite::Connection,
+        run: crate::store::sample_run::SampleRunId,
+        account: AccountId,
+        snapshot: crate::store::sampling_policy_snapshot::SamplingPolicySnapshotId,
+        started_at_nanos: i64,
+        semantics: &str,
+        observation_contract: &str,
+    ) -> MeterAttemptRowId {
+        let attempt = start_meter_attempt(
+            conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "test-provider".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(started_at_nanos),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(started_at_nanos),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: semantics.into(),
+            },
+        )
+        .expect("the seeded attempt must insert");
+        crate::store::meter_attempt::record_meter_attempt_result(
+            conn,
+            &crate::store::meter_attempt::NewMeterAttemptResult {
+                attempt_id: attempt,
+                completed_at: UtcTimestamp::from_unix_nanos(started_at_nanos + 500),
+                elapsed: MonotonicDuration::from_nanos(1),
+                outcome: AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .expect("the seeded result must insert");
+        let evidence_id = insert_response_evidence(conn, &evidence(attempt))
+            .expect("the seeded evidence must insert");
+        insert_observation(
+            conn,
+            &NewMeterObservation {
+                attempt_id: attempt,
+                evidence_id,
+                account_id: account,
+                provider: "test-provider".into(),
+                provider_observed_at: Some(UtcTimestamp::from_unix_nanos(started_at_nanos + 500)),
+                received_at: UtcTimestamp::from_unix_nanos(started_at_nanos + 600),
+                measurement_basis: MeasurementBasis::ProviderObserved,
+                observed_plan: Some("max".into()),
+                observed_tier: None,
+                adapter_version: AdapterVersion::new("adapter-v1"),
+                provider_contract_id: ProviderContractId::new(observation_contract),
+                meter_semantics_id: MeterSemanticsId::new(semantics),
+                normalized_fingerprint: "fingerprint-v1".into(),
+            },
+        )
+        .expect("the seeded observation must insert");
+        attempt
+    }
+
+    /// The query plans behind the per-account newest-observation read: the
+    /// evidence table is reached only through its attempt index, never by a
+    /// scan, whatever the account's history looks like (aub-hgsv).
+    #[test]
+    fn the_per_account_observation_reads_search_the_attempt_index_instead_of_scanning_it() {
+        let (scratch, conn, run, account, snapshot, _attempt) = fixture();
+        let subset = ProviderContractId::new(ANTHROPIC_STATUSLINE_CONTRACT);
+        let full_contract = "endpoint-schema-v3";
+
+        // An older full reading and a newer status-line subset, plus a newer
+        // still successful attempt with no evidence at all: every corner the
+        // joined query has to survive.
+        let older = seed_successful_reading(
+            &conn,
+            run,
+            account,
+            snapshot,
+            40_000,
+            "account-5h-v2",
+            full_contract,
+        );
+        let newer_subset = seed_successful_reading(
+            &conn,
+            run,
+            account,
+            snapshot,
+            50_000,
+            "account-5h-v2",
+            ANTHROPIC_STATUSLINE_CONTRACT,
+        );
+        let bare = start_meter_attempt(
+            &conn,
+            &NewMeterAttempt {
+                run_id: run,
+                account_id: account,
+                provider: "test-provider".into(),
+                request_started_at: UtcTimestamp::from_unix_nanos(60_000),
+                credential_context_id: Some("ctx-1".into()),
+                policy_snapshot_id: snapshot,
+                due_at: UtcTimestamp::from_unix_nanos(60_000),
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "endpoint-schema-v3".into(),
+                meter_semantics_id: "account-5h-v2".into(),
+            },
+        )
+        .expect("the evidence-less attempt must insert");
+        let _ = scratch;
+        let _ = bare;
+
+        for filter in [
+            ContractObservationFilter::Excluding,
+            ContractObservationFilter::Matching,
+        ] {
+            let comparison = match filter {
+                ContractObservationFilter::Excluding => "<>",
+                ContractObservationFilter::Matching => "=",
+            };
+            let sql = NEWEST_CONTRACT_OBSERVATION.replace("{COMPARISON}", comparison);
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .expect("the plan must prepare")
+                .query_map(
+                    params![account.value(), "success", subset.as_str()],
+                    |row| row.get::<_, String>(3),
+                )
+                .expect("the plan must query")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("the plan must read");
+            for line in &plan {
+                let on_evidence =
+                    line.contains("meter_response_evidence") || line.contains("newest_evidence");
+                if on_evidence {
+                    assert!(
+                        line.contains("idx_meter_response_evidence_attempt"),
+                        "the evidence table is searched through its attempt index, \
+                         never scanned: {line}"
+                    );
+                }
+            }
+        }
+
+        let newest_full =
+            newest_observation_for_account_excluding_contract(&conn, account, &subset)
+                .expect("the full read must answer")
+                .expect("the account has one full reading");
+        assert_eq!(newest_full.attempt_id, older);
+        assert_eq!(newest_full.provider_contract_id.as_str(), full_contract);
+        let newest_subset = newest_observation_for_account_with_contract(&conn, account, &subset)
+            .expect("the subset read must answer")
+            .expect("the account has one subset reading");
+        assert_eq!(newest_subset.attempt_id, newer_subset);
+        assert_eq!(
+            newest_subset.provider_contract_id.as_str(),
+            ANTHROPIC_STATUSLINE_CONTRACT
+        );
     }
 }

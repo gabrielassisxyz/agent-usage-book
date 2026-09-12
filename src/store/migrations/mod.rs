@@ -141,6 +141,9 @@ pub(crate) mod migration_0038;
 #[path = "0039_multivariate_candidate.rs"]
 pub(crate) mod migration_0039;
 
+#[path = "0040_meter_evidence_attempt_index.rs"]
+mod migration_0040;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -186,5 +189,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0037::migration(),
         migration_0038::migration(),
         migration_0039::migration(),
+        migration_0040::migration(),
     ]
 }

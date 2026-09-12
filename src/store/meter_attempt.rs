@@ -613,34 +613,6 @@ pub fn newest_successful_attempt_for_account(
     .map_err(|e| Error::Store(format!("cannot read the latest successful attempt: {e}")))
 }
 
-/// Reads successful attempts for one account from newest to oldest.
-///
-/// Consumers that need more than the newest attempt must keep the ordering in
-/// this store boundary rather than recreating the success predicate elsewhere.
-pub fn successful_attempts_for_account(
-    conn: &rusqlite::Connection,
-    account_id: crate::store::account::AccountId,
-) -> Result<Vec<StoredMeterAttempt>, Error> {
-    let success_sql = attempt_outcome_as_sql(&AttemptOutcome::Success);
-    let mut statement = conn
-        .prepare(&format!(
-            "SELECT {SELECT_ATTEMPT_COLUMNS} FROM meter_attempt
-             JOIN meter_attempt_result ON meter_attempt_result.attempt_id = meter_attempt.id
-             WHERE meter_attempt.account_id = ?1 AND meter_attempt_result.outcome = ?2
-             ORDER BY meter_attempt.id DESC"
-        ))
-        .map_err(|e| {
-            Error::Store(format!(
-                "cannot prepare successful meter attempts read: {e}"
-            ))
-        })?;
-    let rows = statement
-        .query_map(params![account_id.value(), success_sql], row_to_attempt)
-        .map_err(|e| Error::Store(format!("cannot read successful meter attempts: {e}")))?;
-    rows.collect::<Result<Vec<_>, _>>()
-        .map_err(|e| Error::Store(format!("cannot decode successful meter attempts: {e}")))
-}
-
 const SELECT_RESULT_COLUMNS: &str = "
     attempt_id, completed_at, elapsed_nanos, outcome, failure_class,
     retry_after_nanos, sanitized_error_classification, retry_index, clock_anomaly";

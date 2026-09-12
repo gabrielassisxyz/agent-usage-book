@@ -28,12 +28,12 @@
 
 use rusqlite::Connection;
 
-use crate::domain::ids::MeterSemanticsId;
+use crate::domain::ids::ProviderContractId;
 use crate::error::Error;
 
 use super::account::{Account, AccountId, all_accounts};
 use super::meter_attempt::{self, StoredMeterAttempt, StoredMeterAttemptResult};
-use super::meter_evidence::{self, EvidenceRowId, StoredMeterObservation, StoredMeterWindow};
+use super::meter_evidence::{self, StoredMeterObservation, StoredMeterWindow};
 
 const ANTHROPIC_STATUSLINE_CONTRACT_ID: &str = "anthropic-statusline-rate-limits-v1";
 
@@ -92,51 +92,43 @@ fn latest_attempt_with_result(
     Ok(Some(LatestAttemptState { attempt, result }))
 }
 
+/// The last successful observation of the account, read in bounded work
+/// (`aub-hgsv`): the newest successful attempt whose newest evidence carries
+/// a current observation that is not the status-line subset, taken by one
+/// indexed query instead of walking every successful attempt the account
+/// ever had and looking up each attempt's evidence in turn. Only when the
+/// account has no such reading does a second query take its newest
+/// status-line observation, which is what the walk kept while it searched.
+/// The windows travel with the observation, read through the same store
+/// boundary as before.
 fn last_successful_observation(
     conn: &Connection,
     account_id: AccountId,
 ) -> Result<Option<SuccessfulObservation>, Error> {
-    let mut newest_subset = None;
-    for attempt in meter_attempt::successful_attempts_for_account(conn, account_id)? {
-        let Some(evidence_id) = meter_evidence::newest_evidence_for_attempt(conn, attempt.row_id)?
-        else {
-            continue;
-        };
-        let Some(observation) = current_observation(
+    let subset_contract = ProviderContractId::new(ANTHROPIC_STATUSLINE_CONTRACT_ID);
+    let full = meter_evidence::newest_observation_for_account_excluding_contract(
+        conn,
+        account_id,
+        &subset_contract,
+    )?;
+    let observation = match full {
+        Some(observation) => observation,
+        // An account with no full observation renders the newest status-line
+        // subset it reported, exactly the row the walk's newest matching step
+        // kept while it searched for a fuller one.
+        None => match meter_evidence::newest_observation_for_account_with_contract(
             conn,
-            evidence_id,
-            &MeterSemanticsId::new(attempt.meter_semantics_id.clone()),
-        )?
-        else {
-            continue;
-        };
-        let selected = SuccessfulObservation {
-            windows: meter_evidence::windows_by_observation(conn, observation.row_id)?,
-            observation,
-        };
-        if selected.observation.provider_contract_id.as_str() != ANTHROPIC_STATUSLINE_CONTRACT_ID {
-            return Ok(Some(selected));
-        }
-        if newest_subset.is_none() {
-            newest_subset = Some(selected);
-        }
-    }
-    Ok(newest_subset)
-}
-
-/// The interpretation the preference selector names current for one evidence
-/// row under one semantics version. The write path always names one, so
-/// absence is a durable anomaly; the projection reports no last-good
-/// observation rather than guessing at a substitute interpretation.
-fn current_observation(
-    conn: &Connection,
-    evidence_id: EvidenceRowId,
-    semantics: &MeterSemanticsId,
-) -> Result<Option<StoredMeterObservation>, Error> {
-    let Some(row_id) = meter_evidence::current_observation_id(conn, evidence_id, semantics)? else {
-        return Ok(None);
+            account_id,
+            &subset_contract,
+        )? {
+            Some(observation) => observation,
+            None => return Ok(None),
+        },
     };
-    meter_evidence::observation_by_row_id(conn, row_id)
+    Ok(Some(SuccessfulObservation {
+        windows: meter_evidence::windows_by_observation(conn, observation.row_id)?,
+        observation,
+    }))
 }
 
 /// Test support shared by this module's tests and by the projection module's
@@ -431,7 +423,11 @@ mod tests {
     use super::*;
     use crate::domain::attempt::AttemptOutcome;
     use crate::domain::failure::FailureClass;
-    use crate::domain::time::{MeasurementBasis, UtcTimestamp};
+    use crate::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
+    use crate::store::meter_attempt::{
+        DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
+        start_meter_attempt,
+    };
     use crate::store::meter_evidence::measurement_basis_sql;
     use crate::store::projection_source::test_support::fixture;
 
@@ -624,5 +620,100 @@ mod tests {
             "the windows travel with the observation"
         );
         let _ = MeasurementBasis::ProviderObserved;
+    }
+
+    /// An account whose whole history is status-line subsets and whose newest
+    /// reading is therefore a subset: the read answers with the newest one,
+    /// in the same bounded shape the plan test in `meter_evidence` pins for
+    /// both queries. A thousand readings is a live-ledger-sized history; the
+    /// walk this replaces would have looked up the evidence table once per
+    /// reading, unindexed.
+    #[test]
+    fn a_thousand_statusline_subsets_with_no_full_reading_return_the_newest_one_in_bounded_work() {
+        let mut fixture = fixture("thousand-subsets");
+        let transaction = fixture.conn.transaction().unwrap();
+        let mut newest_attempt = None;
+        for index in 0..1_000i64 {
+            let started_at = UtcTimestamp::from_unix_nanos(1_000_000 + index * 1_000);
+            let attempt = start_meter_attempt(
+                &transaction,
+                &NewMeterAttempt {
+                    run_id: fixture.run_id,
+                    account_id: fixture.account_id,
+                    provider: "anthropic".into(),
+                    request_started_at: started_at,
+                    credential_context_id: Some("credential-context-v1".into()),
+                    policy_snapshot_id: fixture.policy_snapshot_id,
+                    due_at: started_at,
+                    due_reason: DueReason::OrdinaryCadence,
+                    due_basis: None,
+                    provider_contract_id: "contract-v1".into(),
+                    meter_semantics_id: "semantics-v1".into(),
+                },
+            )
+            .unwrap();
+            record_meter_attempt_result(
+                &transaction,
+                &NewMeterAttemptResult {
+                    attempt_id: attempt,
+                    completed_at: UtcTimestamp::from_unix_nanos(started_at.unix_nanos() + 500),
+                    elapsed: MonotonicDuration::from_nanos(1),
+                    outcome: AttemptOutcome::Success,
+                    sanitized_error_classification: None,
+                    retry_index: None,
+                    clock_anomaly: false,
+                },
+            )
+            .unwrap();
+            let evidence_id = meter_evidence::insert_response_evidence(
+                &transaction,
+                &meter_evidence::NewMeterResponseEvidence {
+                    attempt_id: attempt,
+                    response_classification: "200".into(),
+                    received_at: started_at,
+                    provider_observed_at_original: None,
+                    evidence_capsule: "{\"five_hour\":\"25.0\"}".into(),
+                    capsule_schema_version: "capsule-v1".into(),
+                    sanitizer_version: "sanitizer-v1".into(),
+                    capture_truncated: false,
+                },
+            )
+            .unwrap();
+            meter_evidence::insert_observation(
+                &transaction,
+                &meter_evidence::NewMeterObservation {
+                    attempt_id: attempt,
+                    evidence_id,
+                    account_id: fixture.account_id,
+                    provider: "anthropic".into(),
+                    provider_observed_at: Some(started_at),
+                    received_at: started_at,
+                    measurement_basis: MeasurementBasis::ProviderObserved,
+                    observed_plan: Some("max".into()),
+                    observed_tier: None,
+                    adapter_version: crate::domain::ids::AdapterVersion::new("adapter-v1"),
+                    provider_contract_id: crate::domain::ids::ProviderContractId::new(
+                        ANTHROPIC_STATUSLINE_CONTRACT_ID,
+                    ),
+                    meter_semantics_id: crate::domain::ids::MeterSemanticsId::new("semantics-v1"),
+                    normalized_fingerprint: "fingerprint-v1".into(),
+                },
+            )
+            .unwrap();
+            newest_attempt = Some(attempt);
+        }
+        transaction.commit().unwrap();
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        let success = states[0].last_success.as_ref().expect("a subset exists");
+        assert_eq!(
+            success.observation.attempt_id,
+            newest_attempt.unwrap(),
+            "the newest subset is the one the walk kept while it searched"
+        );
+        assert_eq!(
+            success.observation.provider_contract_id.as_str(),
+            ANTHROPIC_STATUSLINE_CONTRACT_ID
+        );
     }
 }

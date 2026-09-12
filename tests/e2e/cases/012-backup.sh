@@ -48,9 +48,10 @@ case_assertions() {
     assert_exit 0 1
     assert_stdout_contains 1 "added=185 unchanged=0"
 
-    # The archive is verified the moment it is created: schema version 38 is
-    # what the ledger migration chain produces today, and the ledger
-    # generation starts at 0 because nothing meter-related has written yet.
+    # The archive is verified the moment it is created: the schema version
+    # pinned below is what the ledger migration chain produces today, and the
+    # ledger generation starts at 0 because nothing meter-related has written
+    # yet.
     #
     # The trailing " generation=" is load-bearing, not decoration. These are
     # substring assertions, so a bare "schema=1" matched every version from 10
@@ -60,7 +61,7 @@ case_assertions() {
     # that adds a migration bumps this number, and now it will say so.
     assert_exit 0 2
     assert_stdout_contains 2 "verified=true"
-    assert_stdout_contains 2 "schema=39 generation="
+    assert_stdout_contains 2 "schema=40 generation="
     assert_stdout_contains 2 "generation=0"
     assert_stdout_contains 2 "pending=0"
     assert_stdout_contains 2 "drain_completed=true"
@@ -70,7 +71,7 @@ case_assertions() {
     # result rather than a stale cached one.
     assert_exit 0 3
     assert_stdout_contains 3 "verified=true"
-    assert_stdout_contains 3 "schema=39 generation="
+    assert_stdout_contains 3 "schema=40 generation="
     assert_stdout_contains 3 "generation=0"
     assert_stdout_contains 3 "pending=0"
 
