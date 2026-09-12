@@ -144,6 +144,9 @@ pub(crate) mod migration_0039;
 #[path = "0040_meter_evidence_attempt_index.rs"]
 mod migration_0040;
 
+#[path = "0041_meter_attempt_account_newest_index.rs"]
+mod migration_0041;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -190,5 +193,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0038::migration(),
         migration_0039::migration(),
         migration_0040::migration(),
+        migration_0041::migration(),
     ]
 }

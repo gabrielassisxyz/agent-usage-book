@@ -20,6 +20,8 @@
 //! - HTTP or provider semantics
 //! - presentation
 
+use std::ops::ControlFlow;
+
 use rusqlite::{OptionalExtension, params};
 
 use crate::domain::attempt::AttemptOutcome;
@@ -260,28 +262,21 @@ pub fn evidence_by_row_id(
     })
 }
 
-/// Which observations of one contract the per-account newest-observation read
-/// wants. Two arms rather than a bare SQL operator string, so a caller cannot
-/// pass an arbitrary fragment into the query.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ContractObservationFilter {
-    /// The observation whose provider contract is not this one: the
-    /// full-window reading beside a status-line subset.
-    Excluding,
-    /// The observation whose provider contract is exactly this one: the
-    /// status-line subset an account falls back to when it has no full
-    /// reading.
-    Matching,
-}
-
-/// The SQL behind the per-account newest-observation read (`aub-hgsv`): the
-/// newest successful attempt of the account, its newest evidence row, and the
-/// interpretation the preference selector names current for that evidence row
-/// under the attempt's own semantics version, filtered on the observation's
-/// provider contract. The evidence table is touched only through its attempt
-/// index (migration 0040), so the read is two index seeks deep regardless of
-/// how much history the account has.
-const NEWEST_CONTRACT_OBSERVATION: &str = "
+/// The SQL behind the per-account newest-observation read (`aub-hgsv`): one
+/// row per successful attempt of the account, newest attempt first, carrying
+/// the interpretation the preference selector names current for that
+/// attempt's newest evidence row under the attempt's own semantics version.
+///
+/// Two indexes decide what this costs, and both are load-bearing. The attempt
+/// index (migration 0041) serves `ORDER BY meter_attempt.id DESC` under the
+/// `account_id` equality, so rows arrive in order without a sort and a reader
+/// that wants the first one pays for the first one; the evidence index
+/// (migration 0040) turns the newest-evidence subquery into a seek instead of
+/// a scan of the evidence table. Without the first index the plan carries
+/// `USE TEMP B-TREE FOR ORDER BY`, and then every successful attempt of the
+/// account is joined and materialised before a single row comes back, which no
+/// `LIMIT` on this statement bounds.
+const NEWEST_ACCOUNT_OBSERVATIONS: &str = "
     SELECT meter_observation.id AS id,
            meter_observation.attempt_id AS attempt_id,
            meter_observation.evidence_id AS evidence_id,
@@ -308,71 +303,59 @@ const NEWEST_CONTRACT_OBSERVATION: &str = "
       ON meter_observation.id = meter_observation_preference.current_observation_id
     WHERE meter_attempt.account_id = ?1
       AND meter_attempt_result.outcome = ?2
-      AND meter_observation.provider_contract_id {COMPARISON} ?3
     ORDER BY meter_attempt.id DESC
-    LIMIT 1";
+    LIMIT ?3";
 
-fn newest_contract_observation(
+/// Visits the current observation of each successful attempt of `account_id`,
+/// newest attempt first, at most `cap` of them, and stops early the moment
+/// `visit` breaks.
+///
+/// Which of those observations a reader wants is the reader's definition and
+/// not the store's, so the contract filter lives in the caller; what the store
+/// owns is the order and the bound. Rows are decoded one at a time as the
+/// statement steps, so a caller that breaks on the first row pays for one row
+/// rather than for the account's history.
+pub fn visit_newest_observations_for_account<F>(
     conn: &rusqlite::Connection,
     account_id: AccountId,
-    filter: ContractObservationFilter,
-    contract: &ProviderContractId,
-) -> Result<Option<StoredMeterObservation>, Error> {
+    cap: u32,
+    mut visit: F,
+) -> Result<(), Error>
+where
+    F: FnMut(StoredMeterObservation) -> ControlFlow<()>,
+{
     let success_sql = crate::store::meter_attempt::attempt_outcome_as_sql(&AttemptOutcome::Success);
-    let comparison = match filter {
-        ContractObservationFilter::Excluding => "<>",
-        ContractObservationFilter::Matching => "=",
-    };
-    let sql = NEWEST_CONTRACT_OBSERVATION.replace("{COMPARISON}", comparison);
-    conn.query_row(
-        &sql,
-        params![account_id.value(), success_sql, contract.as_str()],
-        row_to_observation,
-    )
-    .optional()
-    .map_err(|e| {
+    let mut statement = conn.prepare(NEWEST_ACCOUNT_OBSERVATIONS).map_err(|e| {
         Error::Store(format!(
-            "cannot read the newest contract observation of account {}: {e}",
+            "cannot prepare the newest observation read of account {}: {e}",
             account_id.value()
         ))
-    })
-}
-
-/// The newest successful attempt's current observation of `account_id` whose
-/// provider contract is not `contract`, or `None` when the account has no
-/// such reading. The bounded replacement for walking every successful attempt
-/// and looking up each attempt's evidence in turn (`aub-hgsv`): one indexed
-/// query takes the row the walk's first non-matching step would have
-/// returned, in the same attempt-then-evidence order.
-pub fn newest_observation_for_account_excluding_contract(
-    conn: &rusqlite::Connection,
-    account_id: AccountId,
-    contract: &ProviderContractId,
-) -> Result<Option<StoredMeterObservation>, Error> {
-    newest_contract_observation(
-        conn,
-        account_id,
-        ContractObservationFilter::Excluding,
-        contract,
-    )
-}
-
-/// The newest successful attempt's current observation of `account_id` whose
-/// provider contract is exactly `contract`, or `None` when the account has
-/// no such reading. The bounded fallback for an account that has only
-/// status-line observations: the row the walk's newest matching step would
-/// have kept while it searched for a fuller one.
-pub fn newest_observation_for_account_with_contract(
-    conn: &rusqlite::Connection,
-    account_id: AccountId,
-    contract: &ProviderContractId,
-) -> Result<Option<StoredMeterObservation>, Error> {
-    newest_contract_observation(
-        conn,
-        account_id,
-        ContractObservationFilter::Matching,
-        contract,
-    )
+    })?;
+    let mut rows = statement
+        .query(params![account_id.value(), success_sql, i64::from(cap)])
+        .map_err(|e| {
+            Error::Store(format!(
+                "cannot read the newest observations of account {}: {e}",
+                account_id.value()
+            ))
+        })?;
+    while let Some(row) = rows.next().map_err(|e| {
+        Error::Store(format!(
+            "cannot read the newest observations of account {}: {e}",
+            account_id.value()
+        ))
+    })? {
+        let observation = row_to_observation(row).map_err(|e| {
+            Error::Store(format!(
+                "cannot decode the newest observations of account {}: {e}",
+                account_id.value()
+            ))
+        })?;
+        if visit(observation).is_break() {
+            break;
+        }
+    }
+    Ok(())
 }
 
 /// The single database spelling of a measurement basis, and back. One
@@ -2027,13 +2010,19 @@ mod tests {
         attempt
     }
 
-    /// The query plans behind the per-account newest-observation read: the
-    /// evidence table is reached only through its attempt index, never by a
-    /// scan, whatever the account's history looks like (aub-hgsv).
+    /// The plan behind the per-account newest-observation read, and the one
+    /// line that decides whether this bead is met (aub-hgsv): a plan carrying
+    /// `USE TEMP B-TREE FOR ORDER BY` has joined and sorted every successful
+    /// attempt of the account before returning a row, so the read is bounded
+    /// by nothing the caller can do. The absence of a scan is not the same
+    /// property and does not imply it: the first pass at this bead delivered a
+    /// plan with no `SCAN` in it at all, whose per-account read still visited
+    /// the whole history. Both index names are asserted too, because the
+    /// planner reaching the ordering some other way would leave this test
+    /// green over a plan nobody chose.
     #[test]
-    fn the_per_account_observation_reads_search_the_attempt_index_instead_of_scanning_it() {
+    fn the_per_account_observation_read_orders_through_the_attempt_index_without_sorting() {
         let (scratch, conn, run, account, snapshot, _attempt) = fixture();
-        let subset = ProviderContractId::new(ANTHROPIC_STATUSLINE_CONTRACT);
         let full_contract = "endpoint-schema-v3";
 
         // An older full reading and a newer status-line subset, plus a newer
@@ -2077,51 +2066,86 @@ mod tests {
         let _ = scratch;
         let _ = bare;
 
-        for filter in [
-            ContractObservationFilter::Excluding,
-            ContractObservationFilter::Matching,
-        ] {
-            let comparison = match filter {
-                ContractObservationFilter::Excluding => "<>",
-                ContractObservationFilter::Matching => "=",
-            };
-            let sql = NEWEST_CONTRACT_OBSERVATION.replace("{COMPARISON}", comparison);
-            let plan: Vec<String> = conn
-                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
-                .expect("the plan must prepare")
-                .query_map(
-                    params![account.value(), "success", subset.as_str()],
-                    |row| row.get::<_, String>(3),
-                )
-                .expect("the plan must query")
-                .collect::<Result<Vec<_>, _>>()
-                .expect("the plan must read");
-            for line in &plan {
-                let on_evidence =
-                    line.contains("meter_response_evidence") || line.contains("newest_evidence");
-                if on_evidence {
-                    assert!(
-                        line.contains("idx_meter_response_evidence_attempt"),
-                        "the evidence table is searched through its attempt index, \
-                         never scanned: {line}"
-                    );
-                }
-            }
-        }
+        let plan: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {NEWEST_ACCOUNT_OBSERVATIONS}"))
+            .expect("the plan must prepare")
+            .query_map(params![account.value(), "success", 64i64], |row| {
+                row.get::<_, String>(3)
+            })
+            .expect("the plan must query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the plan must read");
+        let rendered = plan.join("\n");
+        assert!(
+            !rendered.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "the attempt index serves the ordering, so the read stops at the \
+             first row it wants instead of sorting the account's history: \
+             {rendered}"
+        );
+        assert!(
+            rendered.contains("idx_meter_attempt_account_newest"),
+            "the ordering comes from the attempt index this bead added: {rendered}"
+        );
+        assert!(
+            rendered.contains("idx_meter_response_evidence_attempt"),
+            "the newest-evidence lookup is a seek on the evidence attempt \
+             index, never a scan: {rendered}"
+        );
 
-        let newest_full =
-            newest_observation_for_account_excluding_contract(&conn, account, &subset)
-                .expect("the full read must answer")
-                .expect("the account has one full reading");
-        assert_eq!(newest_full.attempt_id, older);
-        assert_eq!(newest_full.provider_contract_id.as_str(), full_contract);
-        let newest_subset = newest_observation_for_account_with_contract(&conn, account, &subset)
-            .expect("the subset read must answer")
-            .expect("the account has one subset reading");
-        assert_eq!(newest_subset.attempt_id, newer_subset);
+        // The rows the plan describes, in the order the reader depends on.
+        let mut seen = Vec::new();
+        visit_newest_observations_for_account(&conn, account, 64, |observation| {
+            seen.push(observation);
+            ControlFlow::Continue(())
+        })
+        .expect("the read must answer");
         assert_eq!(
-            newest_subset.provider_contract_id.as_str(),
+            seen.iter().map(|o| o.attempt_id).collect::<Vec<_>>(),
+            vec![newer_subset, older],
+            "newest successful attempt first, and the attempt with no evidence \
+             contributes no row"
+        );
+        assert_eq!(
+            seen[0].provider_contract_id.as_str(),
             ANTHROPIC_STATUSLINE_CONTRACT
         );
+        assert_eq!(seen[1].provider_contract_id.as_str(), full_contract);
+    }
+
+    /// The bound, asserted where it is enforced: `cap` limits how many rows
+    /// the statement can produce, and a visitor that breaks stops the read
+    /// before the cap. A reader that wants one row must be able to take one
+    /// row; that is the whole reason the contract filter is not in the SQL.
+    #[test]
+    fn the_read_stops_at_the_cap_and_earlier_still_when_the_visitor_breaks() {
+        let (scratch, conn, run, account, snapshot, _attempt) = fixture();
+        for index in 0..6i64 {
+            seed_successful_reading(
+                &conn,
+                run,
+                account,
+                snapshot,
+                40_000 + index * 1_000,
+                "account-5h-v2",
+                ANTHROPIC_STATUSLINE_CONTRACT,
+            );
+        }
+        let _ = scratch;
+
+        let mut capped = 0usize;
+        visit_newest_observations_for_account(&conn, account, 2, |_| {
+            capped += 1;
+            ControlFlow::Continue(())
+        })
+        .expect("the capped read must answer");
+        assert_eq!(capped, 2, "the cap bounds the rows the statement produces");
+
+        let mut visited = 0usize;
+        visit_newest_observations_for_account(&conn, account, 64, |_| {
+            visited += 1;
+            ControlFlow::Break(())
+        })
+        .expect("the broken read must answer");
+        assert_eq!(visited, 1, "a visitor that breaks reads one row");
     }
 }

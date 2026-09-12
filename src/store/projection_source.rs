@@ -26,9 +26,10 @@
 //! - HTTP or provider semantics
 //! - presentation
 
+use std::ops::ControlFlow;
+
 use rusqlite::Connection;
 
-use crate::domain::ids::ProviderContractId;
 use crate::error::Error;
 
 use super::account::{Account, AccountId, all_accounts};
@@ -92,38 +93,59 @@ fn latest_attempt_with_result(
     Ok(Some(LatestAttemptState { attempt, result }))
 }
 
-/// The last successful observation of the account, read in bounded work
-/// (`aub-hgsv`): the newest successful attempt whose newest evidence carries
-/// a current observation that is not the status-line subset, taken by one
-/// indexed query instead of walking every successful attempt the account
-/// ever had and looking up each attempt's evidence in turn. Only when the
-/// account has no such reading does a second query take its newest
-/// status-line observation, which is what the walk kept while it searched.
+/// How many of an account's newest successful readings the walk below looks
+/// at before it stops (`aub-hgsv`). The walk is over readings, not over the
+/// account's whole history, so the bound has to be stated somewhere: past this
+/// many consecutive status-line subsets the read reports the newest subset
+/// rather than continuing to look for a fuller reading behind them. That is
+/// the same answer an account with no full reading at all gets, and it is the
+/// conservative one: the projection renders a real reading it can justify,
+/// with exactly the subset of windows the source reported, rather than paying
+/// an unbounded read per account on every publish. Sixty four matches the
+/// authentication-backoff streak's bound for the same reason: an account whose
+/// last sixty four readings are all subsets is one whose full readings are
+/// long stale, and a longer walk changes which stale row is shown, not whether
+/// it is stale.
+const SUCCESSFUL_OBSERVATION_SCAN_CAP: u32 = 64;
+
+/// The last successful observation of the account: the newest full-window
+/// reading among its newest successful attempts, and its newest status-line
+/// subset when it has no full reading among them.
+///
+/// The preference is the one this module's header defines and `aub-w4rv`
+/// fixed, and it is applied here rather than in the store because it is the
+/// projection's definition. What changed in `aub-hgsv` is the work underneath
+/// it: the store now streams one row per successful attempt, newest first,
+/// each already carrying the interpretation the preference selector names
+/// current for that attempt's newest evidence row, so the walk stops at the
+/// first full reading instead of looking the evidence up once per attempt
+/// against an unindexed column, and it stops at
+/// `SUCCESSFUL_OBSERVATION_SCAN_CAP` rows in the worst case instead of never.
 /// The windows travel with the observation, read through the same store
 /// boundary as before.
 fn last_successful_observation(
     conn: &Connection,
     account_id: AccountId,
 ) -> Result<Option<SuccessfulObservation>, Error> {
-    let subset_contract = ProviderContractId::new(ANTHROPIC_STATUSLINE_CONTRACT_ID);
-    let full = meter_evidence::newest_observation_for_account_excluding_contract(
+    let mut full = None;
+    let mut newest_subset = None;
+    meter_evidence::visit_newest_observations_for_account(
         conn,
         account_id,
-        &subset_contract,
-    )?;
-    let observation = match full {
-        Some(observation) => observation,
-        // An account with no full observation renders the newest status-line
-        // subset it reported, exactly the row the walk's newest matching step
-        // kept while it searched for a fuller one.
-        None => match meter_evidence::newest_observation_for_account_with_contract(
-            conn,
-            account_id,
-            &subset_contract,
-        )? {
-            Some(observation) => observation,
-            None => return Ok(None),
+        SUCCESSFUL_OBSERVATION_SCAN_CAP,
+        |observation| {
+            if observation.provider_contract_id.as_str() != ANTHROPIC_STATUSLINE_CONTRACT_ID {
+                full = Some(observation);
+                return ControlFlow::Break(());
+            }
+            if newest_subset.is_none() {
+                newest_subset = Some(observation);
+            }
+            ControlFlow::Continue(())
         },
+    )?;
+    let Some(observation) = full.or(newest_subset) else {
+        return Ok(None);
     };
     Ok(Some(SuccessfulObservation {
         windows: meter_evidence::windows_by_observation(conn, observation.row_id)?,
@@ -429,7 +451,7 @@ mod tests {
         start_meter_attempt,
     };
     use crate::store::meter_evidence::measurement_basis_sql;
-    use crate::store::projection_source::test_support::fixture;
+    use crate::store::projection_source::test_support::{Fixture, fixture};
 
     #[test]
     fn an_account_with_no_attempts_reads_with_neither_success_nor_latest_attempt() {
@@ -622,85 +644,119 @@ mod tests {
         let _ = MeasurementBasis::ProviderObserved;
     }
 
-    /// An account whose whole history is status-line subsets and whose newest
-    /// reading is therefore a subset: the read answers with the newest one,
-    /// in the same bounded shape the plan test in `meter_evidence` pins for
-    /// both queries. A thousand readings is a live-ledger-sized history; the
-    /// walk this replaces would have looked up the evidence table once per
-    /// reading, unindexed.
+    /// The fixture identities one seeded reading needs, taken by value so the
+    /// caller can hold a write transaction on the fixture's own connection at
+    /// the same time.
+    #[derive(Clone, Copy)]
+    struct SeedIdentities {
+        run_id: crate::store::sample_run::SampleRunId,
+        account_id: AccountId,
+        policy_snapshot_id: crate::store::sampling_policy_snapshot::SamplingPolicySnapshotId,
+    }
+
+    impl SeedIdentities {
+        fn of(fixture: &Fixture) -> Self {
+            Self {
+                run_id: fixture.run_id,
+                account_id: fixture.account_id,
+                policy_snapshot_id: fixture.policy_snapshot_id,
+            }
+        }
+    }
+
+    /// Seeds one successful attempt with a terminal result, its evidence row
+    /// and its one observation under `contract`, and answers with the attempt
+    /// it created. Used to build the histories the cap is asserted against.
+    fn seed_reading(
+        conn: &rusqlite::Connection,
+        fixture: SeedIdentities,
+        started_at_nanos: i64,
+        contract: &str,
+    ) -> crate::store::meter_attempt::MeterAttemptRowId {
+        let started_at = UtcTimestamp::from_unix_nanos(started_at_nanos);
+        let attempt = start_meter_attempt(
+            conn,
+            &NewMeterAttempt {
+                run_id: fixture.run_id,
+                account_id: fixture.account_id,
+                provider: "anthropic".into(),
+                request_started_at: started_at,
+                credential_context_id: Some("credential-context-v1".into()),
+                policy_snapshot_id: fixture.policy_snapshot_id,
+                due_at: started_at,
+                due_reason: DueReason::OrdinaryCadence,
+                due_basis: None,
+                provider_contract_id: "contract-v1".into(),
+                meter_semantics_id: "semantics-v1".into(),
+            },
+        )
+        .unwrap();
+        record_meter_attempt_result(
+            conn,
+            &NewMeterAttemptResult {
+                attempt_id: attempt,
+                completed_at: UtcTimestamp::from_unix_nanos(started_at.unix_nanos() + 500),
+                elapsed: MonotonicDuration::from_nanos(1),
+                outcome: AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .unwrap();
+        let evidence_id = meter_evidence::insert_response_evidence(
+            conn,
+            &meter_evidence::NewMeterResponseEvidence {
+                attempt_id: attempt,
+                response_classification: "200".into(),
+                received_at: started_at,
+                provider_observed_at_original: None,
+                evidence_capsule: "{\"five_hour\":\"25.0\"}".into(),
+                capsule_schema_version: "capsule-v1".into(),
+                sanitizer_version: "sanitizer-v1".into(),
+                capture_truncated: false,
+            },
+        )
+        .unwrap();
+        meter_evidence::insert_observation(
+            conn,
+            &meter_evidence::NewMeterObservation {
+                attempt_id: attempt,
+                evidence_id,
+                account_id: fixture.account_id,
+                provider: "anthropic".into(),
+                provider_observed_at: Some(started_at),
+                received_at: started_at,
+                measurement_basis: MeasurementBasis::ProviderObserved,
+                observed_plan: Some("max".into()),
+                observed_tier: None,
+                adapter_version: crate::domain::ids::AdapterVersion::new("adapter-v1"),
+                provider_contract_id: crate::domain::ids::ProviderContractId::new(contract),
+                meter_semantics_id: crate::domain::ids::MeterSemanticsId::new("semantics-v1"),
+                normalized_fingerprint: "fingerprint-v1".into(),
+            },
+        )
+        .unwrap();
+        attempt
+    }
+
+    /// An account whose whole history is status-line subsets: the read answers
+    /// with the newest one. A thousand readings is a live-ledger-sized history,
+    /// and the walk this replaces looked the evidence table up once per reading
+    /// against an unindexed column to reach the same answer.
     #[test]
-    fn a_thousand_statusline_subsets_with_no_full_reading_return_the_newest_one_in_bounded_work() {
+    fn a_thousand_statusline_subsets_with_no_full_reading_return_the_newest_one() {
         let mut fixture = fixture("thousand-subsets");
+        let identities = SeedIdentities::of(&fixture);
         let transaction = fixture.conn.transaction().unwrap();
         let mut newest_attempt = None;
         for index in 0..1_000i64 {
-            let started_at = UtcTimestamp::from_unix_nanos(1_000_000 + index * 1_000);
-            let attempt = start_meter_attempt(
+            newest_attempt = Some(seed_reading(
                 &transaction,
-                &NewMeterAttempt {
-                    run_id: fixture.run_id,
-                    account_id: fixture.account_id,
-                    provider: "anthropic".into(),
-                    request_started_at: started_at,
-                    credential_context_id: Some("credential-context-v1".into()),
-                    policy_snapshot_id: fixture.policy_snapshot_id,
-                    due_at: started_at,
-                    due_reason: DueReason::OrdinaryCadence,
-                    due_basis: None,
-                    provider_contract_id: "contract-v1".into(),
-                    meter_semantics_id: "semantics-v1".into(),
-                },
-            )
-            .unwrap();
-            record_meter_attempt_result(
-                &transaction,
-                &NewMeterAttemptResult {
-                    attempt_id: attempt,
-                    completed_at: UtcTimestamp::from_unix_nanos(started_at.unix_nanos() + 500),
-                    elapsed: MonotonicDuration::from_nanos(1),
-                    outcome: AttemptOutcome::Success,
-                    sanitized_error_classification: None,
-                    retry_index: None,
-                    clock_anomaly: false,
-                },
-            )
-            .unwrap();
-            let evidence_id = meter_evidence::insert_response_evidence(
-                &transaction,
-                &meter_evidence::NewMeterResponseEvidence {
-                    attempt_id: attempt,
-                    response_classification: "200".into(),
-                    received_at: started_at,
-                    provider_observed_at_original: None,
-                    evidence_capsule: "{\"five_hour\":\"25.0\"}".into(),
-                    capsule_schema_version: "capsule-v1".into(),
-                    sanitizer_version: "sanitizer-v1".into(),
-                    capture_truncated: false,
-                },
-            )
-            .unwrap();
-            meter_evidence::insert_observation(
-                &transaction,
-                &meter_evidence::NewMeterObservation {
-                    attempt_id: attempt,
-                    evidence_id,
-                    account_id: fixture.account_id,
-                    provider: "anthropic".into(),
-                    provider_observed_at: Some(started_at),
-                    received_at: started_at,
-                    measurement_basis: MeasurementBasis::ProviderObserved,
-                    observed_plan: Some("max".into()),
-                    observed_tier: None,
-                    adapter_version: crate::domain::ids::AdapterVersion::new("adapter-v1"),
-                    provider_contract_id: crate::domain::ids::ProviderContractId::new(
-                        ANTHROPIC_STATUSLINE_CONTRACT_ID,
-                    ),
-                    meter_semantics_id: crate::domain::ids::MeterSemanticsId::new("semantics-v1"),
-                    normalized_fingerprint: "fingerprint-v1".into(),
-                },
-            )
-            .unwrap();
-            newest_attempt = Some(attempt);
+                identities,
+                1_000_000 + index * 1_000,
+                ANTHROPIC_STATUSLINE_CONTRACT_ID,
+            ));
         }
         transaction.commit().unwrap();
 
@@ -710,6 +766,78 @@ mod tests {
             success.observation.attempt_id,
             newest_attempt.unwrap(),
             "the newest subset is the one the walk kept while it searched"
+        );
+        assert_eq!(
+            success.observation.provider_contract_id.as_str(),
+            ANTHROPIC_STATUSLINE_CONTRACT_ID
+        );
+    }
+
+    /// The `aub-w4rv` preference, at the far edge of where the cap still lets
+    /// it apply: a full reading with the cap's own count of status-line
+    /// subsets stacked on top of it is still the reading the projection shows.
+    /// This is the positive half of the bound, and it is what a cap chosen too
+    /// small would break.
+    #[test]
+    fn a_full_reading_at_the_edge_of_the_cap_still_outranks_the_newer_subsets() {
+        let mut fixture = fixture("full-inside-cap");
+        let identities = SeedIdentities::of(&fixture);
+        let transaction = fixture.conn.transaction().unwrap();
+        let full = seed_reading(&transaction, identities, 1_000_000, "endpoint-schema-v3");
+        for index in 1..SUCCESSFUL_OBSERVATION_SCAN_CAP as i64 {
+            seed_reading(
+                &transaction,
+                identities,
+                1_000_000 + index * 1_000,
+                ANTHROPIC_STATUSLINE_CONTRACT_ID,
+            );
+        }
+        transaction.commit().unwrap();
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        let success = states[0].last_success.as_ref().expect("a reading exists");
+        assert_eq!(
+            success.observation.attempt_id, full,
+            "the full reading is the last one inside the cap, so it still wins"
+        );
+        assert_eq!(
+            success.observation.provider_contract_id.as_str(),
+            "endpoint-schema-v3"
+        );
+    }
+
+    /// The cap itself, asserted where it changes the answer: one row further
+    /// back than the edge case above, the full reading is outside the window
+    /// the read looks at, and the projection falls back to the newest subset.
+    /// This is the fallback the cap's comment states, and the only assertion
+    /// that can tell a bounded walk from an unbounded one.
+    #[test]
+    fn a_full_reading_past_the_cap_yields_to_the_newest_statusline_subset() {
+        let mut fixture = fixture("full-past-cap");
+        let identities = SeedIdentities::of(&fixture);
+        let transaction = fixture.conn.transaction().unwrap();
+        let full = seed_reading(&transaction, identities, 1_000_000, "endpoint-schema-v3");
+        let mut newest_subset = None;
+        for index in 1..=SUCCESSFUL_OBSERVATION_SCAN_CAP as i64 {
+            newest_subset = Some(seed_reading(
+                &transaction,
+                identities,
+                1_000_000 + index * 1_000,
+                ANTHROPIC_STATUSLINE_CONTRACT_ID,
+            ));
+        }
+        transaction.commit().unwrap();
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        let success = states[0].last_success.as_ref().expect("a reading exists");
+        assert_ne!(
+            success.observation.attempt_id, full,
+            "the read stops at the cap and never reaches the full reading"
+        );
+        assert_eq!(
+            success.observation.attempt_id,
+            newest_subset.unwrap(),
+            "past the cap the newest subset is what the projection shows"
         );
         assert_eq!(
             success.observation.provider_contract_id.as_str(),
