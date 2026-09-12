@@ -64,44 +64,46 @@ an actual incident.
 
 ### Setting aside a corrupt ledger and restoring from verified archive
 
-When the ledger file is corrupted (for example, if `aub doctor` reports
-`sqlite-and-schema-health` failure with `page 1 integrity probe failed`),
-perform the recovery sequence in order:
+`docs/recovery.md` holds the restore procedure and stays its only copy: an
+incident is the worst moment to find out that two runbooks disagree about
+step order. What belongs here is the part that procedure does not cover,
+which is how this particular damage announces itself and what to do with
+the file before the restore starts.
 
-1. Stop every mutating invocation to prevent writes against the damaged state:
-   ```sh
-   systemctl --user stop aub-sample.timer aub-meter-capture.timer
-   ```
-2. Preserve the damaged state directory by moving it to a timestamped forensic copy:
-   ```sh
-   mv ~/.local/state/aub ~/.local/state/aub.corrupt-$(date +%Y%m%dT%H%M)
-   ```
-3. Locate the newest verified archive:
-   The configured backup destination directory (e.g. `/tank/backups/aub/` or
-   `backup.destination`) maintains a `newest-verified` pointer file
-   referencing the newest archive:
-   ```sh
-   NEWEST_ARCHIVE="$(cat /tank/backups/aub/newest-verified)"
-   ARCHIVE_PATH="/tank/backups/aub/$NEWEST_ARCHIVE"
-   ```
-4. Verify the archive before restoring:
-   ```sh
-   /home/gabriel/.local/bin/aub backup verify "$ARCHIVE_PATH"
-   ```
-5. Restore from the verified archive into the fresh state directory, replaying any surviving spool:
-   ```sh
-   /home/gabriel/.local/bin/aub backup restore "$ARCHIVE_PATH" ~/.local/state/aub --surviving ~/.local/state/aub.corrupt-*
-   ```
-   Note: `aub backup restore` mechanically refuses an existing destination directory,
-   enforcing that the damaged directory was preserved and set aside rather than overwritten.
-6. Verify doctor passes on the restored state:
-   ```sh
-   /home/gabriel/.local/bin/aub doctor
-   ```
-7. Restart the sampling cadence:
-   ```sh
-   systemctl --user start aub-sample.timer aub-meter-capture.timer
-   ```
+The symptom is a ledger whose first page is not a SQLite header. `aub doctor`
+reports `sqlite-and-schema-health` failing with `page 1 integrity probe
+failed`, and every other subcommand refuses to open the ledger with the same
+message. It happened twice on 2026-09-11, and both times the file was set
+aside by hand at midnight, which is what this section exists to replace.
+
+Stop the cadence first, so nothing writes while the directory is moved:
+
+```sh
+systemctl --user stop aub-sample.timer aub-meter-capture.timer
+```
+
+Move the damaged state directory aside under a name carrying the minute it
+was set aside. Do not delete it: it is the only evidence of what happened,
+and `aub backup restore` reads its surviving spool.
+
+```sh
+mv ~/.local/state/aub ~/.local/state/aub.corrupt-$(date +%Y%m%dT%H%M)
+```
+
+The archive to restore from is named by the `newest-verified` pointer file at
+the root of the configured backup destination (`backup.destination`, which
+`aub config` prints):
+
+```sh
+cat "$BACKUP_DESTINATION/newest-verified"
+```
+
+From there follow `docs/recovery.md` in order, starting at its step 3. Restart
+the cadence only after `aub doctor` passes against the restored directory:
+
+```sh
+systemctl --user start aub-sample.timer aub-meter-capture.timer
+```
 
 
 ## 7. Read a failure by its exit code and problem code first
