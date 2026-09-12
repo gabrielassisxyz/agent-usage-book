@@ -5056,6 +5056,9 @@ The critical invariants are:
     interval, never from current configuration.
 28. At most one rate card is in force per vendor, model, token class and
     instant.
+29. A multivariate coefficient is only ever recorded as a candidate, one per
+    token kind the experiment premise named, and never activated by the fit
+    command.
 
 These are more important than most implementation choices.
 

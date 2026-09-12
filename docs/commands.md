@@ -536,7 +536,38 @@ no sampled baseline yet, and when the account already runs an experiment;
 `end` records the end of controlled work and never declares the meter
 settled. `fit` and `passive` refuse to activate candidate calibrations automatically:
 candidates are written immutably and never promoted to active status by the
-fitter (Invariant 14). Subcommand `passive` generates candidates from
+fitter (Invariant 14).
+
+`fit` follows the experiment's premise. `fit --experiment ID` naming a controlled
+experiment whose `--expect-kinds` premise names two or more token kinds fits them
+jointly, one coefficient per named kind, regressed directly on the recorded
+`usage_component` counts with no rate book in between; a premise naming one kind,
+or an experiment with no controlled premise, takes the univariate path and its
+output is unchanged. The joint fit reads the observations in settled blocks: the
+readings between one usage event and the next form one block whose quota delta is
+taken at the last reading before the next spend, so a meter that lags is read after
+it caught up rather than on the reading that followed the spend. A design whose
+kinds cannot be separated is refused before anything is written: the message names
+the collinear pair, its correlation, and the condition number against the bound
+(30, the Belsley, Kuh and Welsch threshold), the exit status is the
+insufficient-evidence class, and `calibrate show` reports no new candidate. Either
+outcome closes a controlled burst; the refusal is itself the answer to whether the
+arms separated. A run must have recorded `end` before it can be fitted. With
+`--format json` the joint fit carries `fit_kind` (`"multivariate"`), `token_kinds`
+(the premise, in stable order), `coefficients` (one object per kind with
+`token_kind`, `estimate_ppm_per_token`, `std_error_ppm_per_token`,
+`interval_low_ppm_per_token`, `interval_high_ppm_per_token`), `condition_number`,
+`condition_number_threshold`, `condition_number_micros` (the figure as stored),
+`pairwise_correlations` (`first`, `second`, `correlation`), `fit_residual_ppm` (the
+mean absolute block residual), `residual_percentage_points`, `statistical_method`,
+`statistical_parameters`, `phase_design`, `usable_observations`, `sample_count`,
+`inputs_digest`, `inputs_count`, `excluded_samples`, and `activated` (always
+`false`). The candidate and its coefficients live in
+`window_calibration_multivariate_candidate` and
+`window_calibration_multivariate_coefficient`, immutable like every other
+calibration record (Invariant 29). `activate` takes `--max-condition-micros` and
+refuses a recorded condition number over it, naming both figures.
+Subcommand `passive` generates candidates from
 uncontrolled, recorded observations across clean intervals under strict
 eligibility rules. Intervals are eligible only when the account's configured
 exclusivity policy explicitly permits passive fitting (`exclusivity_policy = "permit_passive"`
