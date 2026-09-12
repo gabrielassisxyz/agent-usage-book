@@ -840,6 +840,105 @@ pub fn aggregate_event_tokens(
     Ok(event_tokens)
 }
 
+/// The credits spent locally in an interval, one entry per usage event, sorted
+/// by time. Shared by the fitter and by promotion so a held-out residual is
+/// computed against the same credit arithmetic the coefficient was fitted on.
+fn credit_series(
+    conn: &Connection,
+    cost_model: &crate::store::cost_model::CostModel,
+    from: UtcTimestamp,
+    until: UtcTimestamp,
+) -> Result<Vec<(UtcTimestamp, Credits)>, Error> {
+    let event_tokens = aggregate_event_tokens(load_experiment_usage(conn, from, until)?)?;
+    let mut event_credits: Vec<(UtcTimestamp, Credits)> = Vec::new();
+    for (_event_id, (ts, known)) in event_tokens {
+        let usage = UsageVector::new(
+            known,
+            BTreeMap::new(),
+            CoverageCompleteness::Complete,
+            EvidenceQuality::Measured,
+        );
+        match convert_usage(cost_model, &usage) {
+            Derivation::Available(qualified) => {
+                let (credits, _, _, _) = qualified.into_parts();
+                event_credits.push((ts, credits));
+            }
+            Derivation::Unavailable { missing, .. } => {
+                let facts = missing
+                    .into_iter()
+                    .map(|f| format!("{f:?}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                return Err(Error::InsufficientEvidence(format!(
+                    "incomplete cost model: missing facts [{facts}]"
+                )));
+            }
+        }
+    }
+    event_credits.sort_by_key(|(ts, _)| *ts);
+    Ok(event_credits)
+}
+
+/// Pairs each stored reading with the credits spent up to its timestamp.
+fn observations_with_cumulative_credits(
+    stored: Vec<crate::store::calibration::StoredFitObservation>,
+    series: &[(UtcTimestamp, Credits)],
+) -> Vec<FitObservation> {
+    stored
+        .into_iter()
+        .map(|obs| {
+            let cumulative_micros: i64 = series
+                .iter()
+                .filter(|(ts, _)| *ts <= obs.at)
+                .map(|(_, credits)| credits.micros())
+                .sum();
+            FitObservation::new(
+                obs.evidence_id,
+                obs.at,
+                obs.quota_used_ppm,
+                obs.reported_resolution_ppm,
+                obs.quantization,
+                Credits::from_micros(cumulative_micros),
+            )
+        })
+        .collect()
+}
+
+/// The active cost model an experiment is fitted or validated under.
+fn experiment_cost_model(
+    conn: &Connection,
+    experiment: &crate::store::calibration::CalibrationExperiment,
+) -> Result<crate::store::cost_model::CostModel, Error> {
+    load_active_cost_model_at(conn, experiment.validity.valid_from())?.ok_or_else(|| {
+        Error::InsufficientEvidence(format!(
+            "no active cost model found for experiment '{}'",
+            experiment.id.as_str()
+        ))
+    })
+}
+
+/// The experiment's own observations as fit inputs.
+fn experiment_fit_observations(
+    conn: &Connection,
+    experiment: &crate::store::calibration::CalibrationExperiment,
+    cost_model: &crate::store::cost_model::CostModel,
+) -> Result<Vec<FitObservation>, Error> {
+    let stored_obs = load_experiment_observations(conn, experiment)?;
+    if stored_obs.is_empty() {
+        return Err(Error::InsufficientEvidence(format!(
+            "no meter observations found for experiment '{}'",
+            experiment.id.as_str()
+        )));
+    }
+    let series = credit_series(
+        conn,
+        cost_model,
+        experiment.validity.valid_from(),
+        experiment.validity.valid_until(),
+    )?;
+    Ok(observations_with_cumulative_credits(stored_obs, &series))
+}
+
 /// Executes fitting from the database and inserts the resulting candidate row immutably.
 ///
 /// Never activates the candidate (creates no `calibration_lifecycle` entry).
@@ -857,77 +956,8 @@ pub fn fit_and_record_candidate(
         })?,
     };
 
-    let stored_obs = load_experiment_observations(conn, &experiment)?;
-    if stored_obs.is_empty() {
-        return Err(Error::InsufficientEvidence(format!(
-            "no meter observations found for experiment '{}'",
-            experiment.id.as_str()
-        )));
-    }
-
-    let cost_model = load_active_cost_model_at(conn, experiment.validity.valid_from())?
-        .ok_or_else(|| {
-            Error::InsufficientEvidence(format!(
-                "no active cost model found for experiment '{}'",
-                experiment.id.as_str()
-            ))
-        })?;
-
-    let usage_events = load_experiment_usage(
-        conn,
-        experiment.validity.valid_from(),
-        experiment.validity.valid_until(),
-    )?;
-
-    let event_tokens = aggregate_event_tokens(usage_events)?;
-
-    // Convert each usage event to Credits via the active CostModel
-    let mut event_credits: Vec<(UtcTimestamp, Credits)> = Vec::new();
-    for (_event_id, (ts, known)) in event_tokens {
-        let usage = UsageVector::new(
-            known,
-            BTreeMap::new(),
-            CoverageCompleteness::Complete,
-            EvidenceQuality::Measured,
-        );
-        match convert_usage(&cost_model, &usage) {
-            Derivation::Available(qualified) => {
-                let (credits, _, _, _) = qualified.into_parts();
-                event_credits.push((ts, credits));
-            }
-            Derivation::Unavailable { missing, .. } => {
-                let facts = missing
-                    .into_iter()
-                    .map(|f| format!("{f:?}"))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                return Err(Error::InsufficientEvidence(format!(
-                    "incomplete cost model: missing facts [{facts}]"
-                )));
-            }
-        }
-    }
-
-    event_credits.sort_by_key(|(ts, _)| *ts);
-
-    // Build FitObservations with cumulative credits up to observation timestamp
-    let mut fit_observations = Vec::new();
-    for obs in stored_obs {
-        let cumulative_micros: i64 = event_credits
-            .iter()
-            .filter(|(ts, _)| *ts <= obs.at)
-            .map(|(_, credits)| credits.micros())
-            .sum();
-
-        fit_observations.push(FitObservation::new(
-            obs.evidence_id,
-            obs.at,
-            obs.quota_used_ppm,
-            obs.reported_resolution_ppm,
-            obs.quantization,
-            Credits::from_micros(cumulative_micros),
-        ));
-    }
+    let cost_model = experiment_cost_model(conn, &experiment)?;
+    let fit_observations = experiment_fit_observations(conn, &experiment, &cost_model)?;
 
     // Execute fit
     let mut result = fit(&fit_observations, &experiment).map_err(|rej| rej.into_error())?;
@@ -941,6 +971,288 @@ pub fn fit_and_record_candidate(
     }
 
     Ok(result)
+}
+
+/// The validation procedure a promoted result records: the held-out interval
+/// residual of [`crate::calibration::activation::held_out_residual`], computed
+/// over evidence disjoint from the fit.
+pub const PROMOTION_VALIDATION_METHOD: &str = "held-out-interval-residual";
+
+/// The version of that procedure, recorded on the result so a later change to
+/// how the diagnostic is computed is visible on rows produced before it.
+pub const PROMOTION_VALIDATION_VERSION: &str = "v1";
+
+/// The default activation policy version a promoted result is recorded under,
+/// so `aub calibrate activate` with no `--policy-version` judges the result
+/// under the policy the promotion named.
+pub const PROMOTION_ACTIVATION_POLICY_VERSION: &str = "promote-v1";
+
+/// The bead that owns giving a joint multivariate candidate a result shape.
+const MULTIVARIATE_RESULT_SHAPE_BEAD: &str = "aub-multivariate-result-shape-2hvt";
+
+/// What a promotion was asked to record: which candidate, judged against which
+/// training and validation evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CandidatePromotion<'a> {
+    pub candidate_id: &'a CandidateId,
+    pub training: &'a BTreeSet<EvidenceId>,
+    pub validation: &'a BTreeSet<EvidenceId>,
+    pub activation_policy_version: &'a str,
+}
+
+/// What promotion recorded, in the units the row carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotedCandidate {
+    pub result_id: String,
+    pub candidate_id: String,
+    pub experiment_id: String,
+    pub provider: String,
+    pub plan_tier: String,
+    pub window_semantic_key: String,
+    pub fitted_micros_per_point: i64,
+    pub fit_residual_micros: i64,
+    pub held_out_residual_micros: i64,
+    pub validation_observations: u32,
+    pub fitting_evidence_digest_hex: String,
+    pub validation_evidence_digest_hex: String,
+    pub validation_method: String,
+    pub validation_version: String,
+    pub activation_policy_version: String,
+    pub uncertainty_low_micros_per_point: i64,
+    pub uncertainty_high_micros_per_point: i64,
+}
+
+/// Records a `window_calibration_result` from a fitted candidate, supplying the
+/// validation half a candidate does not carry: the held-out residual over
+/// evidence disjoint from the fit, the two evidence fingerprints the activation
+/// gate reproduces, and the method, policy and build identifiers a result must
+/// state.
+///
+/// Never activates: no `calibration_lifecycle` row is written here (invariant
+/// 14). Promotion is refused rather than approximated whenever the recorded
+/// figures would not be the candidate's own: a training set that is not the
+/// evidence the candidate was fitted from, a validation set that overlaps it,
+/// or a candidate whose recorded coefficient no longer reproduces from the
+/// evidence still in the ledger.
+pub fn promote_candidate(
+    conn: &mut Connection,
+    promotion: &CandidatePromotion<'_>,
+    clock: &impl Clock,
+) -> Result<PromotedCandidate, Error> {
+    use crate::store::calibration::{
+        EvidenceFingerprint, WindowCalibration, WindowCalibrationFields, insert_result,
+        load_observations_by_evidence, load_result, promoted_result_id,
+    };
+
+    let candidate = match load_candidate(conn, promotion.candidate_id)? {
+        Some(candidate) => candidate,
+        None => return Err(missing_candidate_error(conn, promotion.candidate_id)?),
+    };
+
+    if promotion.training.is_empty() {
+        return Err(Error::Usage(format!(
+            "promote '{}': --training names no evidence; a result records the evidence its coefficient was fitted from",
+            promotion.candidate_id.as_str()
+        )));
+    }
+    if promotion.validation.is_empty() {
+        return Err(Error::Usage(format!(
+            "promote '{}': --validation names no evidence; there is no held-out residual to compute and activation refuses a result without one",
+            promotion.candidate_id.as_str()
+        )));
+    }
+    crate::calibration::activation::check_evidence_disjoint(
+        promotion.training,
+        promotion.validation,
+    )
+    .map_err(|refusal| {
+        Error::Usage(format!(
+            "promote '{}': {refusal}",
+            promotion.candidate_id.as_str()
+        ))
+    })?;
+
+    // The recorded fitting evidence is the set the caller named, so it is only
+    // honest if that set is the one the candidate was fitted from. The digest
+    // carries a count as well as a hash, so a subset does not pass.
+    let training_digest = EvidenceDigest::from_inputs(promotion.training);
+    if training_digest != candidate.inputs {
+        return Err(Error::Usage(format!(
+            "promote '{}': --training names {} evidence ids digesting to {:016x}, and the candidate was fitted from {} digesting to {:016x}",
+            promotion.candidate_id.as_str(),
+            training_digest.count(),
+            training_digest.digest(),
+            candidate.inputs.count(),
+            candidate.inputs.digest(),
+        )));
+    }
+
+    let result_id = promoted_result_id(&candidate.id);
+    if load_result(conn, &result_id)?.is_some() {
+        return Err(Error::Usage(format!(
+            "promote '{}': already promoted as result '{}'; a result is immutable, and a second row would be a second identity for one fit",
+            promotion.candidate_id.as_str(),
+            result_id.as_str()
+        )));
+    }
+
+    let experiment = load_experiment(conn, &candidate.experiment)?.ok_or_else(|| {
+        Error::InsufficientEvidence(format!(
+            "no calibration experiment '{}' behind candidate '{}'",
+            candidate.experiment.as_str(),
+            candidate.id.as_str()
+        ))
+    })?;
+    let cost_model = experiment_cost_model(conn, &experiment)?;
+
+    // A candidate row records the coefficient but not the method that produced
+    // it, and a result must state both. Refitting the experiment recovers the
+    // method, its parameters, the lag handling and the excluded samples, and
+    // makes the promotion refuse a candidate that no longer reproduces rather
+    // than dress a stale number in fresh validation metadata.
+    let training_observations = experiment_fit_observations(conn, &experiment, &cost_model)?;
+    let refit =
+        fit(&training_observations, &experiment).map_err(|rejection| rejection.into_error())?;
+    if refit.candidate.fitted != candidate.fitted || refit.candidate.inputs != candidate.inputs {
+        return Err(Error::InsufficientEvidence(format!(
+            "promote '{}': the recorded candidate fits {} micros/point over {} observations, and the evidence in the ledger now fits {} over {}",
+            candidate.id.as_str(),
+            candidate.fitted.micros_per_point(),
+            candidate.inputs.count(),
+            refit.candidate.fitted.micros_per_point(),
+            refit.candidate.inputs.count(),
+        )));
+    }
+
+    let stored_validation = load_observations_by_evidence(
+        conn,
+        &experiment.provider,
+        &experiment.window_semantic_key,
+        promotion.validation,
+    )?;
+    let found: BTreeSet<EvidenceId> = stored_validation
+        .iter()
+        .map(|obs| obs.evidence_id.clone())
+        .collect();
+    let missing: Vec<&str> = promotion
+        .validation
+        .iter()
+        .filter(|id| !found.contains(*id))
+        .map(EvidenceId::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::InsufficientEvidence(format!(
+            "promote '{}': the ledger holds no observation of provider '{}' window '{}' for validation evidence [{}]",
+            candidate.id.as_str(),
+            experiment.provider.as_str(),
+            experiment.window_semantic_key.as_str(),
+            missing.join(", "),
+        )));
+    }
+
+    // The validation series is held out of the fit, so it lies outside the
+    // experiment's own validity window; the credit series has to reach it for
+    // the held-out observations to carry the spend that moved the meter.
+    let validation_until = stored_validation
+        .iter()
+        .map(|obs| obs.at)
+        .max()
+        .unwrap_or_else(|| experiment.validity.valid_until())
+        .max(experiment.validity.valid_until());
+    let series = credit_series(
+        conn,
+        &cost_model,
+        experiment.validity.valid_from(),
+        validation_until,
+    )?;
+    let validation_observations = observations_with_cumulative_credits(stored_validation, &series);
+    let held_out = crate::calibration::activation::held_out_residual(
+        candidate.fitted,
+        &validation_observations,
+    )?;
+
+    let fitting_evidence = EvidenceFingerprint::from_inputs(promotion.training);
+    let validation_evidence = EvidenceFingerprint::from_inputs(promotion.validation);
+    let now = clock.now();
+    let calibration = WindowCalibration::from_fields(WindowCalibrationFields {
+        id: result_id.clone(),
+        provider: experiment.provider.clone(),
+        plan_tier: experiment.plan_tier.clone(),
+        window_semantic_key: experiment.window_semantic_key.clone(),
+        meter_semantics_id: experiment.meter_semantics_id.clone(),
+        billing_semantics_id: experiment.billing_semantics_id.clone(),
+        cost_model_id: cost_model.id().clone(),
+        fitted: candidate.fitted,
+        equivalent_full_window_capacity: candidate.equivalent_full_window_capacity,
+        fit_residual: candidate.fit_residual,
+        uncertainty: candidate.uncertainty,
+        lag_estimate: None,
+        lag_handling: refit.lag_handling.clone(),
+        sample_count: candidate.sample_count,
+        fit_timestamp: candidate.knowledge_time,
+        inputs: candidate.inputs,
+        fitting_evidence,
+        validation_evidence,
+        validation_method: PROMOTION_VALIDATION_METHOD.to_string(),
+        validation_version: PROMOTION_VALIDATION_VERSION.to_string(),
+        out_of_sample_residual: Some(held_out),
+        statistical_method: refit.statistical_method.clone(),
+        statistical_parameters: refit.statistical_parameters.clone(),
+        condition_number: None,
+        observation_coverage_requirement: format!(
+            "held-out validation over {} observations disjoint from the fit",
+            validation_observations.len()
+        ),
+        settling_policy: experiment.settlement_policy.version().to_string(),
+        excluded_samples: refit.excluded_samples.clone(),
+        activation_policy_version: promotion.activation_policy_version.to_string(),
+        aub_version: crate::build_info::crate_version().to_string(),
+        source_revision: crate::build_info::source_revision().to_string(),
+        validity: candidate.validity,
+        knowledge_time: now,
+    })?;
+    insert_result(conn, &calibration, std::slice::from_ref(&experiment.id))?;
+
+    Ok(PromotedCandidate {
+        result_id: result_id.as_str().to_string(),
+        candidate_id: candidate.id.as_str().to_string(),
+        experiment_id: experiment.id.as_str().to_string(),
+        provider: experiment.provider.as_str().to_string(),
+        plan_tier: experiment.plan_tier.as_str().to_string(),
+        window_semantic_key: experiment.window_semantic_key.as_str().to_string(),
+        fitted_micros_per_point: candidate.fitted.micros_per_point(),
+        fit_residual_micros: candidate.fit_residual.micros(),
+        held_out_residual_micros: held_out.micros(),
+        validation_observations: u32::try_from(validation_observations.len())
+            .map_err(|_| Error::Internal("validation observation count out of u32 range".into()))?,
+        fitting_evidence_digest_hex: format!("{:016x}", fitting_evidence.as_u64()),
+        validation_evidence_digest_hex: format!("{:016x}", validation_evidence.as_u64()),
+        validation_method: PROMOTION_VALIDATION_METHOD.to_string(),
+        validation_version: PROMOTION_VALIDATION_VERSION.to_string(),
+        activation_policy_version: promotion.activation_policy_version.to_string(),
+        uncertainty_low_micros_per_point: candidate.uncertainty.lower().micros_per_point(),
+        uncertainty_high_micros_per_point: candidate.uncertainty.upper().micros_per_point(),
+    })
+}
+
+/// The refusal for an id that names no univariate candidate: a joint fit is a
+/// different refusal from a typo, because the joint candidate exists and has
+/// no scalar result shape to promote it into (PLAN.md 22.1).
+fn missing_candidate_error(conn: &Connection, id: &CandidateId) -> Result<Error, Error> {
+    let multivariate = crate::store::calibration_multivariate::load_multivariate_candidate(
+        conn,
+        &crate::store::calibration_multivariate::MultivariateCandidateId::new(id.as_str()),
+    )?;
+    if multivariate.is_some() {
+        return Ok(Error::Usage(format!(
+            "promote '{}': a joint candidate has no scalar result shape yet, because a result records one coefficient and a joint fit has one per token kind; reducing them through a cost model would reintroduce the assumption the joint fit exists to test. Tracked by {MULTIVARIATE_RESULT_SHAPE_BEAD}",
+            id.as_str()
+        )));
+    }
+    Ok(Error::Usage(format!(
+        "no calibration candidate '{}'; fit one with `aub calibrate fit`",
+        id.as_str()
+    )))
 }
 
 #[cfg(test)]

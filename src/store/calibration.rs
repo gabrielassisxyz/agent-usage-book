@@ -1136,6 +1136,90 @@ pub fn load_candidate(
     })
 }
 
+/// The identifier a promoted candidate's result row carries.
+///
+/// Derived from the candidate rather than generated, so one fit has exactly one
+/// result identity: a second promotion of the same candidate collides with the
+/// row already there instead of minting a second name for one number.
+pub fn promoted_result_id(candidate: &CandidateId) -> WindowCalibrationId {
+    WindowCalibrationId::new(format!("promoted-{}", candidate.as_str()))
+}
+
+/// Loads the meter observations named by evidence id, restricted to one
+/// provider and window semantic key, ordered by observation time.
+///
+/// Unlike [`load_experiment_observations`] this is not bounded by a validity
+/// interval: held-out validation evidence is disjoint from the fit by
+/// construction, so it lies outside the fitted experiment's own window.
+/// Evidence the ledger does not hold is simply absent from the result; the
+/// caller names the gap, because only it knows what the missing identifier
+/// was meant to prove.
+pub fn load_observations_by_evidence(
+    conn: &Connection,
+    provider: &ProviderKey,
+    window_semantic_key: &WindowSemanticKey,
+    evidence: &BTreeSet<EvidenceId>,
+) -> Result<Vec<StoredFitObservation>, Error> {
+    let mut observations = Vec::new();
+    let mut stmt = conn
+        .prepare(
+            "SELECT
+                re.content_hash,
+                mo.received_at,
+                mw.quota_used_ppm,
+                mw.reported_resolution_ppm,
+                mw.quantization,
+                mw.resets_at
+             FROM meter_observation mo
+             JOIN meter_window mw ON mw.observation_id = mo.id
+             JOIN meter_response_evidence re ON re.id = mo.evidence_id
+             WHERE mo.provider = ?1
+               AND mw.semantic_key = ?2
+               AND re.content_hash = ?3
+             ORDER BY mo.received_at ASC, mo.id ASC",
+        )
+        .map_err(|e| Error::Store(format!("cannot prepare evidence observations query: {e}")))?;
+    for id in evidence {
+        let rows = stmt
+            .query_map(
+                params![provider.as_str(), window_semantic_key.as_str(), id.as_str()],
+                |row| {
+                    let hash: String = row.get(0)?;
+                    let received_at_nanos: i64 = row.get(1)?;
+                    let quota_used_ppm: i64 = row.get(2)?;
+                    let reported_resolution_ppm: i64 = row.get(3)?;
+                    let quantization_str: String = row.get(4)?;
+                    let resets_at_nanos: i64 = row.get(5)?;
+                    Ok((
+                        hash,
+                        received_at_nanos,
+                        quota_used_ppm,
+                        reported_resolution_ppm,
+                        quantization_str,
+                        resets_at_nanos,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Store(format!("cannot query evidence observations: {e}")))?;
+        for row_res in rows {
+            let (hash, rec_nanos, used_ppm, res_ppm, quant_str, resets_nanos) =
+                row_res.map_err(|e| Error::Store(format!("cannot read observation row: {e}")))?;
+            let quantization =
+                crate::store::meter_evidence::quantization_sql::from_sql(&quant_str)?;
+            observations.push(StoredFitObservation {
+                evidence_id: EvidenceId::new(hash),
+                at: UtcTimestamp::from_unix_nanos(rec_nanos),
+                quota_used_ppm: used_ppm,
+                reported_resolution_ppm: res_ppm,
+                quantization,
+                resets_at: UtcTimestamp::from_unix_nanos(resets_nanos),
+            });
+        }
+    }
+    observations.sort_by_key(|o| (o.at, o.evidence_id.as_str().to_string()));
+    Ok(observations)
+}
+
 /// Attempts an update on a candidate row. Always fails because `window_calibration_candidate` is immutable.
 pub fn try_update_candidate(conn: &Connection, id: &CandidateId) -> Result<(), Error> {
     conn.execute(
