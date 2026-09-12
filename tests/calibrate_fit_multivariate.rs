@@ -24,7 +24,7 @@ use agent_usage_book::store::calibration::PlanTier;
 use agent_usage_book::store::calibration_controlled::{
     ControlledExperimentId, ControlledExperimentRun, insert_begin, record_end,
 };
-use agent_usage_book::store::cost_model::ProviderKey;
+use agent_usage_book::store::cost_model::{ProviderKey, seed_initial_cost_model};
 use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, NewMeterAttemptResult};
 use agent_usage_book::store::meter_evidence::{
     NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, ObservationRowId,
@@ -45,6 +45,15 @@ const EXPERIMENT: &str = "exp-multivariate";
 const ACCOUNT: &str = "bianca";
 const WINDOW: &str = "five_hour";
 const BASELINE_PPM: i64 = 100_000;
+const SINGLE_KIND_EXPERIMENT: &str = "exp-single-kind";
+const SINGLE_KIND_BLOCKS: usize = 4;
+/// The baseline reading plus one settled reading per block.
+const SINGLE_KIND_READINGS: usize = SINGLE_KIND_BLOCKS + 1;
+/// Priced at 15 credits per million output tokens, this is 3 credits a block.
+const OUTPUT_TOKENS_PER_BLOCK: u64 = 200_000;
+const CREDITS_PER_BLOCK: i64 = 3;
+const PPM_PER_BLOCK: i64 = 30_000;
+const SEEDED_MICROS_PER_POINT: i64 = 1_000_000 / (PPM_PER_BLOCK / CREDITS_PER_BLOCK);
 
 const INDEPENDENT_ARMS: &str =
     include_str!("fixtures/calibration/multivariate-independent-arms.json");
@@ -123,8 +132,12 @@ struct MeterChain {
 }
 
 fn meter_chain(conn: &Connection) -> MeterChain {
+    meter_chain_for(conn, ACCOUNT)
+}
+
+fn meter_chain_for(conn: &Connection, account: &str) -> MeterChain {
     let at = UtcTimestamp::from_unix_nanos(100 * SECOND);
-    let account_id = account_store::observe_account(conn, "anthropic", ACCOUNT, at).unwrap();
+    let account_id = account_store::observe_account(conn, "anthropic", account, at).unwrap();
     let run_id = run_store::start_sample_run(conn, run_store::Trigger::Manual, at, "seed").unwrap();
     let snapshot_id = snapshot_store::resolve_policy_snapshot(
         conn,
@@ -554,26 +567,275 @@ fn proportional_arms_are_refused_by_name_and_record_nothing() {
     assert_eq!(entries(&show_after), serde_json::json!([]));
 }
 
-/// A controlled run whose premise names one kind is not the joint path: the
-/// command falls through to the univariate fitter exactly as before, which
-/// on a run with no univariate experiment row is its existing refusal.
-#[test]
-fn a_single_kind_premise_keeps_the_univariate_path() {
-    let state = StateDir::new();
-    let fixture = parse_fixture(INDEPENDENT_ARMS);
-    seed_burst(&state, &fixture, vec![TokenKind::Output]);
+/// The keys the univariate JSON report carries, in the shape
+/// `tests/calibrate_fit_command.rs` pins for an experiment-table fit. A
+/// controlled run reports through the same renderer, so this set is what says
+/// the two are one contract and not two that happen to agree today.
+const UNIVARIATE_JSON_KEYS: [&str; 20] = [
+    "candidate_id",
+    "diagnostic_findings",
+    "equivalent_full_window_capacity_micros",
+    "excluded_samples",
+    "experiment_id",
+    "fit_residual_micros",
+    "fitted_micros_per_point",
+    "inputs_count",
+    "inputs_digest",
+    "lag_handling",
+    "plan_tier",
+    "provider",
+    "residual_percentage_points",
+    "sample_count",
+    "statistical_method",
+    "statistical_parameters",
+    "uncertainty_high_micros",
+    "uncertainty_low_micros",
+    "usable_observations",
+    "window_semantic_key",
+];
 
-    let output = run_aub(&state, &["calibrate", "fit", "--experiment", EXPERIMENT]);
+fn spend_output(conn: &Connection, at_nanos: i64, index: usize, tokens: u64) {
+    let ts = UtcTimestamp::from_unix_nanos(at_nanos);
+    let event_id = event_store::insert_event(
+        conn,
+        &NewUsageEvent {
+            canonical_event_id: &format!("single-kind-block-{index}"),
+            session_id: Some("burst-session"),
+            event_timestamp: Some(ts),
+            model_id: Some("claude-opus"),
+            evidence_kind: "transcript",
+            source_provenance: "test",
+            parser_version: "v1",
+            created_at: ts,
+        },
+    )
+    .unwrap();
+    component_store::insert_component(
+        conn,
+        &NewUsageComponent {
+            event_id,
+            token_class: TokenKind::Output.label(),
+            count: tokens,
+        },
+    )
+    .unwrap();
+}
+
+/// Seeds a controlled run whose premise names output alone: the baseline
+/// reading, `begin`, then one output-only spend per block each followed by
+/// the settled reading it moved the meter to, and `end`.
+///
+/// The truth is exact by construction. Each block spends
+/// `OUTPUT_TOKENS_PER_BLOCK` output tokens, which the built-in cost model
+/// prices at `CREDITS_PER_BLOCK` credits, and moves the meter
+/// `PPM_PER_BLOCK`, so the seeded coefficient is
+/// `1_000_000 / (PPM_PER_BLOCK / CREDITS_PER_BLOCK)` micros per point.
+fn seed_single_kind_burst(state: &StateDir, end_the_run: bool, decoy_account: bool) {
+    let mut conn = open_test_ledger(state);
+    seed_initial_cost_model(&mut conn, UtcTimestamp::from_unix_nanos(500 * SECOND)).unwrap();
+    let chain = meter_chain(&conn);
+    let t0 = 1_000 * SECOND;
+    let baseline = reading(&conn, &chain, t0, BASELINE_PPM);
+    let run = ControlledExperimentRun {
+        id: ControlledExperimentId::new(SINGLE_KIND_EXPERIMENT),
+        account: ACCOUNT.into(),
+        provider: ProviderKey::new("anthropic"),
+        plan_tier: PlanTier::new("max-5x"),
+        window_semantic_key: WindowSemanticKey::new(WINDOW),
+        cost_model_id: CostModelId::new("anthropic-claude-messages-v1"),
+        expected_token_kinds: vec![TokenKind::Output],
+        baseline_observation_id: baseline,
+        baseline_quota_used: QuotaUsed::new(
+            QuotaFractionPpm::new(i32::try_from(BASELINE_PPM).unwrap()).unwrap(),
+        ),
+        baseline_resolution: ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap())
+            .unwrap(),
+        baseline_observed_at: UtcTimestamp::from_unix_nanos(t0),
+        baseline_plateau_started_at: UtcTimestamp::from_unix_nanos(t0),
+        contamination_thresholds: ContaminationThresholds::conservative_default(),
+        started_at: UtcTimestamp::from_unix_nanos(t0 + SECOND),
+        ended_at: None,
+        exclusivity_assertion: format!("account {ACCOUNT} reserved for {SINGLE_KIND_EXPERIMENT}"),
+    };
+    insert_begin(&conn, &run).unwrap();
+
+    let mut t = t0 + 60 * SECOND;
+    let mut used_ppm = BASELINE_PPM;
+    for index in 0..SINGLE_KIND_BLOCKS {
+        spend_output(&conn, t, index, OUTPUT_TOKENS_PER_BLOCK);
+        used_ppm += PPM_PER_BLOCK;
+        reading(&conn, &chain, t + 30 * SECOND, used_ppm);
+        t += 60 * SECOND;
+    }
+    if decoy_account {
+        // Another account of the same provider, reporting its own window
+        // between two of the run's readings. It belongs to no controlled run
+        // and a fit that took the provider's readings would swallow it.
+        let other = meter_chain_for(&conn, "someone-else");
+        reading(&conn, &other, t0 + 75 * SECOND, 900_000);
+    }
+    if end_the_run {
+        record_end(&conn, &run.id, UtcTimestamp::from_unix_nanos(t)).unwrap();
+    }
+    std::fs::write(state.path().join("aub.toml"), "").unwrap();
+}
+
+fn json_keys(value: &serde_json::Value) -> Vec<String> {
+    let mut keys: Vec<String> = value
+        .as_object()
+        .expect("the report must be a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
+}
+
+/// A controlled run whose premise names one kind fits univariately over that
+/// run's own observations: the candidate names the run, its coefficient is the
+/// seeded truth, its validity is the run's spend window, and the report is the
+/// univariate one key for key.
+#[test]
+fn a_single_kind_premise_fits_the_univariate_candidate_from_the_run() {
+    let state = StateDir::new();
+    seed_single_kind_burst(&state, true, true);
+
+    let output = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "fit",
+            "--experiment",
+            SINGLE_KIND_EXPERIMENT,
+            "--format",
+            "json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-    assert_eq!(output.status.code(), Some(6), "stderr: {stderr}");
-    assert!(stderr.contains("no calibration experiment"), "{stderr}");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout must be JSON");
+
+    assert_eq!(
+        json_keys(&json),
+        UNIVARIATE_JSON_KEYS.to_vec(),
+        "the controlled-run fit reports the univariate contract, with no key added or removed"
+    );
+    assert_eq!(json["experiment_id"], SINGLE_KIND_EXPERIMENT);
+    assert_eq!(json["provider"], "anthropic");
+    assert_eq!(json["plan_tier"], "max-5x");
+    assert_eq!(json["window_semantic_key"], WINDOW);
+    assert_eq!(
+        json["fitted_micros_per_point"], SEEDED_MICROS_PER_POINT,
+        "the coefficient must be the seeded truth"
+    );
+    let low = json["uncertainty_low_micros"].as_i64().unwrap();
+    let high = json["uncertainty_high_micros"].as_i64().unwrap();
+    assert!(
+        low <= SEEDED_MICROS_PER_POINT && SEEDED_MICROS_PER_POINT <= high,
+        "the seeded truth must lie inside [{low}, {high}]"
+    );
+    assert_eq!(
+        json["sample_count"], SINGLE_KIND_READINGS,
+        "the baseline reading and every reading after it are the run's own"
+    );
+    assert_eq!(json["usable_observations"], SINGLE_KIND_READINGS);
+
     let conn = open_test_ledger(&state);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM window_calibration_candidate"),
+        1
+    );
     assert_eq!(
         count(
             &conn,
             "SELECT COUNT(*) FROM window_calibration_multivariate_candidate"
         ),
+        0,
+        "a one-kind premise records no joint candidate"
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM calibration_lifecycle"),
+        0,
+        "the fit never activates"
+    );
+    let (experiment_id, valid_from, valid_until): (String, i64, i64) = conn
+        .query_row(
+            "SELECT e.experiment_id, c.valid_from, c.valid_until
+             FROM window_calibration_candidate c
+             JOIN calibration_experiment e ON e.id = c.experiment_id",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("the candidate must resolve to the experiment row it names");
+    assert_eq!(experiment_id, SINGLE_KIND_EXPERIMENT);
+    assert_eq!(
+        valid_from,
+        1_001 * SECOND,
+        "the candidate's usage frame opens at the run's started_at"
+    );
+    assert_eq!(
+        valid_until,
+        1_000 * SECOND + 60 * SECOND * (SINGLE_KIND_BLOCKS as i64 + 1),
+        "the candidate's usage frame closes at the run's ended_at"
+    );
+
+    // The same evidence fitted again records nothing further.
+    let again = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "fit",
+            "--experiment",
+            SINGLE_KIND_EXPERIMENT,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(again.status.code(), Some(0));
+    let json_again: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&again.stdout).trim()).unwrap();
+    assert_eq!(json_again["candidate_id"], json["candidate_id"]);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM window_calibration_candidate"),
+        1
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM calibration_experiment"),
+        1,
+        "the run's experiment row is written once, however often it is fitted"
+    );
+}
+
+/// A one-kind run that has not recorded `end` is refused by the univariate
+/// path in the joint path's words, and records nothing.
+#[test]
+fn a_running_single_kind_experiment_is_refused_before_fitting() {
+    let state = StateDir::new();
+    seed_single_kind_burst(&state, false, false);
+
+    let output = run_aub(
+        &state,
+        &["calibrate", "fit", "--experiment", SINGLE_KIND_EXPERIMENT],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(output.status.code(), Some(6), "stderr: {stderr}");
+    assert!(stderr.contains("is still running"), "{stderr}");
+    assert!(stderr.contains("aub calibrate end"), "{stderr}");
+
+    let conn = open_test_ledger(&state);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM window_calibration_candidate"),
         0
+    );
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM calibration_experiment"),
+        0,
+        "a refusal writes no experiment row either"
     );
 }
 

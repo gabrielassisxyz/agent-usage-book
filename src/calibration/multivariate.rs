@@ -409,13 +409,38 @@ pub fn fit_multivariate(
     }
     entangled.sort_by(|a, b| b.correlation().abs().total_cmp(&a.correlation().abs()));
 
+    // The gate is computed on unit-norm columns, which is how Belsley, Kuh
+    // and Welsch define the condition index whose threshold this module
+    // cites. On raw counts the smallest and largest eigenvalues of an
+    // orthogonal design are the squared column norms, so the "condition
+    // number" of a perfectly separable experiment would equal the ratio of
+    // its kinds' magnitudes: a cache-read arm at 100,000 tokens beside an
+    // output arm at 2,000 reads as 50, over the threshold, with the message
+    // naming a pair that was varied independently. Scaling removes the
+    // units from the figure and leaves the dependence, which is the thing
+    // the gate exists to judge. Estimates and their errors are transformed
+    // back below so every reported figure stays in ppm per token.
+    // A kind with no usage at all has norm zero; it is left unscaled so the
+    // gram keeps its zero eigenvalue and the gate refuses it by name as an
+    // ill-conditioned design, the same verdict it always gave.
+    let norms: Vec<f64> = columns
+        .iter()
+        .map(|column| column.iter().map(|x| x * x).sum::<f64>().sqrt())
+        .map(|norm| if norm > 0.0 { norm } else { 1.0 })
+        .collect();
+    let scaled: Vec<Vec<f64>> = columns
+        .iter()
+        .zip(norms.iter())
+        .map(|(column, norm)| column.iter().map(|x| x / norm).collect())
+        .collect();
+
     let mut gram: Vec<Vec<f64>> = (0..selected.len())
         .map(|i| {
             (0..selected.len())
                 .map(|j| {
-                    columns[i]
+                    scaled[i]
                         .iter()
-                        .zip(columns[j].iter())
+                        .zip(scaled[j].iter())
                         .map(|(x, y)| x * y)
                         .sum()
                 })
@@ -455,16 +480,25 @@ pub fn fit_multivariate(
 
     let projected: Vec<f64> = (0..selected.len())
         .map(|i| {
-            columns[i]
+            scaled[i]
                 .iter()
                 .zip(response.iter())
                 .map(|(x, y)| x * y)
                 .sum()
         })
         .collect();
+    // A coefficient on a unit-norm column is the per-token coefficient
+    // times that column's norm; dividing restores per-token units.
     let estimates: Vec<f64> = inverse
         .iter()
-        .map(|row| row.iter().zip(projected.iter()).map(|(a, b)| a * b).sum())
+        .zip(norms.iter())
+        .map(|(row, norm)| {
+            row.iter()
+                .zip(projected.iter())
+                .map(|(a, b)| a * b)
+                .sum::<f64>()
+                / norm
+        })
         .collect();
 
     for (kind, estimate) in selected.iter().zip(estimates.iter()) {
@@ -498,7 +532,10 @@ pub fn fit_multivariate(
         .zip(estimates.iter())
         .enumerate()
         .map(|(i, (kind, estimate))| {
-            let variance = (residual_variance * inverse[i][i]).max(0.0);
+            // The scaled inverse's diagonal is the variance factor of the
+            // scaled coefficient; the per-token one is that over the
+            // squared norm, the same transformation the estimate took.
+            let variance = (residual_variance * inverse[i][i] / (norms[i] * norms[i])).max(0.0);
             let std_error = variance.sqrt();
             FittedTokenKindCoefficient {
                 kind: *kind,
@@ -545,7 +582,7 @@ pub fn fit_multivariate(
     };
     let kind_labels: Vec<&str> = selected.iter().map(|kind| kind.label()).collect();
     let statistical_parameters = format!(
-        "kinds=[{}];n={};p={};dof={};residual_variance_ppm2={:.3};ridge_penalty={};intervals=normal-approx-1.96",
+        "kinds=[{}];n={};p={};dof={};residual_variance_ppm2={:.3};ridge_penalty={};intervals=normal-approx-1.96;columns=unit-norm",
         kind_labels.join(","),
         usable.len(),
         selected.len(),
@@ -779,6 +816,105 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    /// Two kinds varied independently at magnitudes a hundred apart: the
+    /// unscaled gate read the norm ratio as collinearity and refused this
+    /// design at 30; on unit-norm columns it is the near-orthogonal design
+    /// it is, and every coefficient lands inside its own interval.
+    #[test]
+    fn independent_kinds_a_hundredfold_apart_in_magnitude_are_accepted() {
+        let rows: [(u64, u64, f64); 6] = [
+            (100_000, 0, 2.0),
+            (200_000, 0, -1.0),
+            (300_000, 0, 1.0),
+            (0, 1_000, -2.0),
+            (0, 2_000, 1.0),
+            (0, 3_000, -1.0),
+        ];
+        let observations: Vec<MultivariateFitObservation> = rows
+            .iter()
+            .enumerate()
+            .map(|(i, (input, cache, noise))| {
+                observation(
+                    &format!("ev-hundredfold-{i}"),
+                    *input,
+                    *cache,
+                    exact_delta(*input, *cache) + noise,
+                )
+            })
+            .collect();
+        let result = fit_multivariate(
+            &observations,
+            &kinds(),
+            &config(30.0, 4),
+            "two-arms-hundredfold",
+        )
+        .expect("an independent design is accepted whatever its magnitudes");
+        assert!(
+            result.condition_number() < 2.0,
+            "orthogonal arms condition near one, got {}",
+            result.condition_number()
+        );
+        for (coefficient, truth) in result
+            .coefficients()
+            .iter()
+            .zip([INPUT_TRUTH_PPM_PER_TOKEN, CACHE_READ_TRUTH_PPM_PER_TOKEN])
+        {
+            assert!(
+                coefficient.interval_low_ppm_per_token() <= truth
+                    && truth <= coefficient.interval_high_ppm_per_token(),
+                "{} interval [{}, {}] must contain {truth}",
+                coefficient.kind().label(),
+                coefficient.interval_low_ppm_per_token(),
+                coefficient.interval_high_ppm_per_token()
+            );
+        }
+        assert!(
+            result
+                .statistical_parameters()
+                .contains("columns=unit-norm"),
+            "the scaling is named on the result: {}",
+            result.statistical_parameters()
+        );
+    }
+
+    /// Multiplying one kind's counts by a thousand leaves the condition
+    /// number where it was and divides that kind's coefficient by a
+    /// thousand: the gate judges dependence, the estimate keeps its units.
+    #[test]
+    fn scaling_one_column_moves_its_coefficient_and_not_the_gate() {
+        let base = varied_observations();
+        let scaled: Vec<MultivariateFitObservation> = base
+            .iter()
+            .enumerate()
+            .map(|(i, obs)| {
+                observation(
+                    &format!("ev-scaled-{i}"),
+                    obs.tokens().input().value(),
+                    obs.tokens().cache_read().value() * 1_000,
+                    obs.quota_delta_ppm(),
+                )
+            })
+            .collect();
+        let before = fit_multivariate(&base, &kinds(), &config(30.0, 4), "base")
+            .expect("base design accepted");
+        let after = fit_multivariate(&scaled, &kinds(), &config(30.0, 4), "scaled")
+            .expect("scaled design accepted");
+        let relative = (before.condition_number() - after.condition_number()).abs()
+            / before.condition_number();
+        assert!(
+            relative < 1e-6,
+            "condition number must be scale invariant: {} vs {}",
+            before.condition_number(),
+            after.condition_number()
+        );
+        let cache_before = before.coefficients()[1].estimate_ppm_per_token();
+        let cache_after = after.coefficients()[1].estimate_ppm_per_token();
+        assert!(
+            (cache_before / 1_000.0 - cache_after).abs() < 1e-9,
+            "cache coefficient must scale down by the same factor: {cache_before} vs {cache_after}"
+        );
     }
 
     /// A synthetic experiment with perfectly collinear token kinds is rejected,

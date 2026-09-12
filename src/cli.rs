@@ -7303,22 +7303,34 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
     let premise = controlled_run
         .as_ref()
         .map(|run| run.expected_token_kinds.as_slice());
-    if let (crate::calibration::multivariate_fit::FitPath::Multivariate, Some(run)) = (
+    let fit_result = match (
         crate::calibration::multivariate_fit::fit_path_for_premise(premise),
         controlled_run.as_ref(),
     ) {
-        let outcome = crate::calibration::multivariate_fit::fit_controlled_run_and_record(
-            &mut conn, run, clock,
-        )?;
-        match invocation.format {
-            OutputFormat::Text => print!("{}", render_calibrate_fit_multivariate(&outcome)),
-            OutputFormat::Json => println!("{}", calibrate_fit_multivariate_json(&outcome)),
+        (crate::calibration::multivariate_fit::FitPath::Multivariate, Some(run)) => {
+            let outcome = crate::calibration::multivariate_fit::fit_controlled_run_and_record(
+                &mut conn, run, clock,
+            )?;
+            match invocation.format {
+                OutputFormat::Text => print!("{}", render_calibrate_fit_multivariate(&outcome)),
+                OutputFormat::Json => println!("{}", calibrate_fit_multivariate_json(&outcome)),
+            }
+            return Ok(());
         }
-        return Ok(());
-    }
-
-    let fit_result =
-        crate::calibration::fitter::fit_and_record_candidate(&conn, experiment_id.as_ref(), clock)?;
+        // A one-kind premise is still the univariate fit, but on a controlled
+        // run the observations are that run's own rather than the provider's.
+        (crate::calibration::multivariate_fit::FitPath::Univariate, Some(run)) => {
+            crate::calibration::fitter::fit_controlled_run_univariate_and_record(&conn, run, clock)?
+        }
+        (crate::calibration::multivariate_fit::FitPath::Univariate, None)
+        | (crate::calibration::multivariate_fit::FitPath::Multivariate, None) => {
+            crate::calibration::fitter::fit_and_record_candidate(
+                &conn,
+                experiment_id.as_ref(),
+                clock,
+            )?
+        }
+    };
 
     match invocation.format {
         OutputFormat::Text => {

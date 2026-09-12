@@ -1,5 +1,5 @@
 {
-  "description": "Four arms, each at three magnitudes, each holding the other kinds near zero: cache write varies position (fresh prefix per block), cache read repeats a warm prefix, output fills a ceiling from a small prompt, input sends a large uncached prompt. Every block is followed by readings until the meter settles.",
+  "description": "Four arms, each at three magnitudes, each holding the other kinds near zero, at the magnitudes a real burst has: cache write and cache read in the hundreds of thousands of tokens (a fresh prefix per block, then the same prefix warm), output in the low thousands (a small prompt filling a ceiling), input in the tens of thousands (a large uncached prompt). The kinds differ in magnitude by two orders, which is what the identifiability gate must not mistake for collinearity.",
   "truth_ppm_per_token": {
     "input": 0.5,
     "output": 1.0,
@@ -12,61 +12,61 @@
       "input": 0,
       "output": 20,
       "cache_read": 0,
-      "cache_write": 20000
+      "cache_write": 100000
     },
     {
       "arm": "cache_write",
       "input": 0,
       "output": 20,
       "cache_read": 0,
-      "cache_write": 40000
+      "cache_write": 200000
     },
     {
       "arm": "cache_write",
       "input": 0,
       "output": 20,
       "cache_read": 0,
-      "cache_write": 60000
+      "cache_write": 300000
     },
     {
       "arm": "cache_read",
       "input": 0,
       "output": 20,
-      "cache_read": 20000,
+      "cache_read": 100000,
       "cache_write": 0
     },
     {
       "arm": "cache_read",
       "input": 0,
       "output": 20,
-      "cache_read": 40000,
+      "cache_read": 200000,
       "cache_write": 0
     },
     {
       "arm": "cache_read",
       "input": 0,
       "output": 20,
-      "cache_read": 60000,
+      "cache_read": 300000,
       "cache_write": 0
     },
     {
       "arm": "output",
       "input": 30,
-      "output": 20000,
+      "output": 1000,
       "cache_read": 0,
       "cache_write": 0
     },
     {
       "arm": "output",
       "input": 30,
-      "output": 40000,
+      "output": 2000,
       "cache_read": 0,
       "cache_write": 0
     },
     {
       "arm": "output",
       "input": 30,
-      "output": 60000,
+      "output": 3000,
       "cache_read": 0,
       "cache_write": 0
     },
