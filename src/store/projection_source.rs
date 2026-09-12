@@ -773,18 +773,24 @@ mod tests {
         );
     }
 
-    /// The `aub-w4rv` preference, at the far edge of where the cap still lets
-    /// it apply: a full reading with the cap's own count of status-line
-    /// subsets stacked on top of it is still the reading the projection shows.
-    /// This is the positive half of the bound, and it is what a cap chosen too
-    /// small would break.
+    /// The `aub-w4rv` preference, at the last position where the cap still lets
+    /// it apply: a full reading with sixty three newer status-line subsets on
+    /// top of it sits at row sixty four, the last row a cap of sixty four
+    /// reaches, and it is still the reading the projection shows.
+    ///
+    /// The count is written out rather than derived from
+    /// `SUCCESSFUL_OBSERVATION_SCAN_CAP` on purpose. A fixture sized by the
+    /// constant moves with it, so raising or lowering the cap would leave both
+    /// this test and its negative below green over a bound nobody chose; with
+    /// the literal here, a cap of sixty three fails this test and a cap of
+    /// sixty five fails the next one.
     #[test]
     fn a_full_reading_at_the_edge_of_the_cap_still_outranks_the_newer_subsets() {
         let mut fixture = fixture("full-inside-cap");
         let identities = SeedIdentities::of(&fixture);
         let transaction = fixture.conn.transaction().unwrap();
         let full = seed_reading(&transaction, identities, 1_000_000, "endpoint-schema-v3");
-        for index in 1..SUCCESSFUL_OBSERVATION_SCAN_CAP as i64 {
+        for index in 1..=63i64 {
             seed_reading(
                 &transaction,
                 identities,
@@ -810,7 +816,7 @@ mod tests {
     /// back than the edge case above, the full reading is outside the window
     /// the read looks at, and the projection falls back to the newest subset.
     /// This is the fallback the cap's comment states, and the only assertion
-    /// that can tell a bounded walk from an unbounded one.
+    /// here that can tell a bounded walk from an unbounded one.
     #[test]
     fn a_full_reading_past_the_cap_yields_to_the_newest_statusline_subset() {
         let mut fixture = fixture("full-past-cap");
@@ -818,7 +824,7 @@ mod tests {
         let transaction = fixture.conn.transaction().unwrap();
         let full = seed_reading(&transaction, identities, 1_000_000, "endpoint-schema-v3");
         let mut newest_subset = None;
-        for index in 1..=SUCCESSFUL_OBSERVATION_SCAN_CAP as i64 {
+        for index in 1..=64i64 {
             newest_subset = Some(seed_reading(
                 &transaction,
                 identities,

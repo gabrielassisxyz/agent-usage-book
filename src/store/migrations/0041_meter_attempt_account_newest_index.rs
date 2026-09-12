@@ -1,33 +1,34 @@
 //! Schema step: one index on `meter_attempt(account_id, id)`, the ordering the
-//! projection's per-account reads need so that their `LIMIT 1` stops at the
-//! first row instead of sorting the account's whole history (`aub-hgsv`).
+//! per-account attempt reads need so that their `LIMIT` bounds the work and not
+//! only the result (`aub-hgsv`).
 //!
-//! Three reads take the newest attempt of one account: the projection's latest
-//! attempt, its newest successful observation, and the authentication-backoff
-//! streak. All three constrain `account_id` by equality and order by
-//! `meter_attempt.id` descending, and the only index on that column pair was
+//! Three reads take the newest attempts of one account: the projection's latest
+//! attempt, the authentication-backoff streak, and the newest successful
+//! attempt that anchors the last observation. All three constrain `account_id`
+//! by equality and order by `meter_attempt.id` descending, and the only index
+//! on that column pair was
 //! `idx_meter_attempt_open (account_id, request_started_at)`, whose key order
 //! says nothing about `id`. SQLite therefore answered each of them with
-//! `USE TEMP B-TREE FOR ORDER BY`: every successful attempt of the account was
-//! joined, materialised and sorted before one row came back, so the `LIMIT 1`
-//! bounded the result and not the work. Measured on a copy of the live ledger
-//! (370 MB, 13k observations), one `aub sample --account` tick read
-//! `meter_attempt` 39,772 times, which did not move when the evidence lookup
-//! beside it was indexed in migration 0040.
+//! `USE TEMP B-TREE FOR ORDER BY`: every attempt of the account was read,
+//! materialised and sorted before the first row came back, so `LIMIT 1` and
+//! `LIMIT 64` bounded the answer and not the work. Measured on a copy of the
+//! live ledger (370 MB, 13k observations), one `aub sample --account` tick read
+//! `meter_attempt` 39,772 times, and that figure did not move when the evidence
+//! lookup beside it was indexed in migration 0040.
 //!
 //! With `(account_id, id)` the same reads become a reverse seek on the index
-//! and stop at the first row that satisfies the joins, which is what makes the
+//! and stop at the first row that satisfies their joins, which is what makes the
 //! per-account read bounded rather than merely un-scanned.
 //!
-//! `idx_meter_attempt_open` stays: it serves the request-started-at ordering
-//! that the run and window reads use, which this index does not answer.
+//! `idx_meter_attempt_open` stays: it serves the request-started-at ordering the
+//! run and coverage reads use, which this index does not answer.
 //!
 //! Additive only: no row changes, no table is rebuilt.
 //!
 //! Recovery: the framework is forward-only, so there is no down step to run.
 //! The manual reversal below drops the index again; it is exercised by this
-//! module's round-trip test, never by production code. Dropping it restores
-//! the sort this step came to remove and nothing else.
+//! module's round-trip test, never by production code. Dropping it restores the
+//! sort this step came to remove and nothing else.
 
 use crate::error::Error;
 use crate::store::migrate::Migration;
@@ -164,39 +165,47 @@ mod tests {
         );
     }
 
-    /// The ordering the step exists for: with the index present the newest
-    /// attempt of one account is a reverse seek, and with it dropped SQLite
-    /// falls back to sorting the account's whole history. The plan line that
-    /// decides this is `USE TEMP B-TREE FOR ORDER BY`, because that is the
-    /// line that says `LIMIT 1` bounded the result and not the work.
+    /// The ordering the step exists for, asserted where it is decided: with the
+    /// index present the newest attempt of one account is a reverse seek, and
+    /// with it dropped SQLite sorts the account's whole history. The plan line
+    /// that tells those apart is `USE TEMP B-TREE FOR ORDER BY`, because that is
+    /// the line that says `LIMIT 1` bounded the result and not the work.
+    ///
+    /// The reads themselves are pinned in `meter_attempt`; this test is about
+    /// the index, so it keeps the simplest statement that depends on it.
     #[test]
     fn the_newest_attempt_of_an_account_orders_through_the_index_and_sorts_without_it() {
         let (_scratch, conn) = open_migrated();
         let newest_attempt_sql = "SELECT id FROM meter_attempt \
              WHERE account_id = ?1 ORDER BY id DESC LIMIT 1";
 
+        let planned = plan_of(&conn, newest_attempt_sql);
         assert!(
-            !sorts_in_a_temp_btree(&conn, newest_attempt_sql),
-            "the index serves the ordering, so no sort is planned"
+            !planned.contains("USE TEMP B-TREE FOR ORDER BY"),
+            "the index serves the ordering, so no sort is planned: {planned}"
+        );
+        assert!(
+            planned.contains("idx_meter_attempt_account_newest"),
+            "the ordering is served by this step's index: {planned}"
         );
 
         conn.execute_batch(DROP_METER_ATTEMPT_ACCOUNT_NEWEST_INDEX)
             .expect("the manual reversal must run");
+        let unplanned = plan_of(&conn, newest_attempt_sql);
         assert!(
-            sorts_in_a_temp_btree(&conn, newest_attempt_sql),
+            unplanned.contains("USE TEMP B-TREE FOR ORDER BY"),
             "without the index the planner sorts the account's history, \
-             which is the cost this step removes"
+             which is the cost this step removes: {unplanned}"
         );
     }
 
-    fn sorts_in_a_temp_btree(conn: &rusqlite::Connection, sql: &str) -> bool {
+    fn plan_of(conn: &rusqlite::Connection, sql: &str) -> String {
         conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
             .expect("the plan must prepare")
             .query_map(rusqlite::params![1i64], |row| row.get::<_, String>(3))
             .expect("the plan must query")
             .collect::<Result<Vec<String>, _>>()
             .expect("the plan must read")
-            .iter()
-            .any(|line| line.contains("USE TEMP B-TREE FOR ORDER BY"))
+            .join("\n")
     }
 }

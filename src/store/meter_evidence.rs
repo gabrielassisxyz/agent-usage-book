@@ -271,11 +271,13 @@ pub fn evidence_by_row_id(
 /// index (migration 0041) serves `ORDER BY meter_attempt.id DESC` under the
 /// `account_id` equality, so rows arrive in order without a sort and a reader
 /// that wants the first one pays for the first one; the evidence index
-/// (migration 0040) turns the newest-evidence subquery into a seek instead of
-/// a scan of the evidence table. Without the first index the plan carries
+/// (migration 0040) turns the newest-evidence subquery into a seek instead of a
+/// scan of the evidence table. Take the attempt index away and the plan carries
 /// `USE TEMP B-TREE FOR ORDER BY`, and then every successful attempt of the
 /// account is joined and materialised before a single row comes back, which no
-/// `LIMIT` on this statement bounds.
+/// `LIMIT` on this statement bounds. That is the shape the first pass at
+/// `aub-hgsv` shipped, and it cost more than the walk it replaced, because the
+/// walk at least stopped at the first full reading it found.
 const NEWEST_ACCOUNT_OBSERVATIONS: &str = "
     SELECT meter_observation.id AS id,
            meter_observation.attempt_id AS attempt_id,

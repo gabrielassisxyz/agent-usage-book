@@ -531,6 +531,13 @@ pub fn attempt_by_row_id(
 /// Reads the newest attempt row of one account, or `None` before its first
 /// attempt. Newest by rowid: insertion order is the attempt order the rest of
 /// this schema is written in.
+///
+/// The ordering is served by `idx_meter_attempt_account_newest
+/// (account_id, id)` (migration 0041), and before that index existed this read
+/// was answered with `USE TEMP B-TREE FOR ORDER BY`: every attempt of the
+/// account was read and sorted to return one row, so the `LIMIT 1` bounded the
+/// result and not the work (`aub-hgsv`). The plan test in this module is what
+/// holds that, because the sort is invisible in the answer.
 pub fn latest_attempt_for_account(
     conn: &rusqlite::Connection,
     account_id: crate::store::account::AccountId,
@@ -554,6 +561,10 @@ pub fn latest_attempt_for_account(
 /// too, because consecutiveness is a fact about terminal outcomes. The
 /// walk is bounded: once the hold saturates at the cap, a longer exact
 /// count changes nothing, so 64 entries are more than enough.
+///
+/// Bounded in the result is not bounded in the work: until migration 0041 gave
+/// this ordering an index, the sixty four rows were taken off a sort of every
+/// attempt the account ever made (`aub-hgsv`).
 pub fn consecutive_auth_failures_for_account(
     conn: &rusqlite::Connection,
     account_id: crate::store::account::AccountId,
@@ -1588,5 +1599,139 @@ mod coverage_query_tests {
         )
         .expect("the empty-window read must succeed");
         assert!(empty.is_empty(), "an interval with no attempts reads empty");
+    }
+}
+
+/// The query plans behind the per-account attempt reads a `sample` tick runs on
+/// every account (`aub-hgsv`). They live in their own module because what they
+/// assert is a property of the migrated schema plus the statement text, and
+/// neither needs a seeded row.
+#[cfg(test)]
+mod per_account_plan_tests {
+    use super::*;
+    use crate::store::connection::PragmaPolicy;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static PLAN_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// A scratch directory under the system temp dir, removed on drop.
+    struct PlanScratchDir(PathBuf);
+
+    impl PlanScratchDir {
+        fn new() -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "aub-meter-attempt-plan-{}-{}",
+                std::process::id(),
+                PLAN_COUNTER.fetch_add(1, Ordering::Relaxed),
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+    }
+
+    impl Drop for PlanScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn migrated() -> (PlanScratchDir, rusqlite::Connection) {
+        let scratch = PlanScratchDir::new();
+        let policy = PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let conn = crate::store::test_schema::open_migrated(&scratch.0.join("meter.db"), &policy);
+        (scratch, conn)
+    }
+
+    fn plan_of(conn: &rusqlite::Connection, sql: &str) -> String {
+        conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .expect("the plan must prepare")
+            .query_map(params![1i64], |row| row.get::<_, String>(3))
+            .expect("the plan must query")
+            .collect::<Result<Vec<String>, _>>()
+            .expect("the plan must read")
+            .join("\n")
+    }
+
+    /// The one plan line that decides what these reads cost: a plan carrying
+    /// `USE TEMP B-TREE FOR ORDER BY` has read and sorted every attempt the
+    /// account ever made before returning its one or its sixty four rows, so
+    /// the `LIMIT` bounds the result and not the work. All three ran that way
+    /// until this bead, and that is where the tick's `meter_attempt` page reads
+    /// came from.
+    ///
+    /// Asserted on the plan rather than on the rows because the defect is
+    /// invisible in the answer: each of these returned the right row while
+    /// sorting the whole history to find it.
+    #[test]
+    fn the_per_account_attempt_reads_need_no_sort() {
+        let (_scratch, conn) = migrated();
+        let success_sql = attempt_outcome_as_sql(&AttemptOutcome::Success);
+
+        for (label, sql) in per_account_attempt_reads(success_sql) {
+            let plan = plan_of(&conn, &sql);
+            assert!(
+                !plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "{label} is answered without sorting the account's history: {plan}"
+            );
+            assert!(
+                plan.contains("idx_meter_attempt_account_newest"),
+                "{label} reaches its order through the attempt index: {plan}"
+            );
+        }
+    }
+
+    /// The planted negative, and the only thing that shows the index is what
+    /// removes the sort rather than the planner never sorting anything on this
+    /// schema: drop the index and all three reads go back to sorting the
+    /// account's history. The drop is on this test's own copy of the template.
+    #[test]
+    fn dropping_the_attempt_index_puts_every_one_of_those_reads_back_on_a_sort() {
+        let (_scratch, conn) = migrated();
+        let success_sql = attempt_outcome_as_sql(&AttemptOutcome::Success);
+        conn.execute_batch("DROP INDEX idx_meter_attempt_account_newest")
+            .expect("the drop must run");
+
+        for (label, sql) in per_account_attempt_reads(success_sql) {
+            let plan = plan_of(&conn, &sql);
+            assert!(
+                plan.contains("USE TEMP B-TREE FOR ORDER BY"),
+                "without the index {label} sorts the account's history: {plan}"
+            );
+        }
+    }
+
+    /// The three statements, spelled once so the positive and its negative
+    /// cannot drift apart.
+    fn per_account_attempt_reads(success_sql: &str) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "the newest attempt",
+                format!(
+                    "SELECT {SELECT_ATTEMPT_COLUMNS} FROM meter_attempt
+                     WHERE account_id = ?1 ORDER BY id DESC LIMIT 1"
+                ),
+            ),
+            (
+                "the newest successful attempt",
+                format!(
+                    "SELECT {SELECT_ATTEMPT_COLUMNS} FROM meter_attempt
+                     JOIN meter_attempt_result
+                       ON meter_attempt_result.attempt_id = meter_attempt.id
+                     WHERE meter_attempt.account_id = ?1
+                       AND meter_attempt_result.outcome = '{success_sql}'
+                     ORDER BY meter_attempt.id DESC LIMIT 1"
+                ),
+            ),
+            (
+                "the authentication streak",
+                "SELECT mar.outcome FROM meter_attempt ma
+                 JOIN meter_attempt_result mar ON mar.attempt_id = ma.id
+                 WHERE ma.account_id = ?1 ORDER BY ma.id DESC LIMIT 64"
+                    .to_string(),
+            ),
+        ]
     }
 }
