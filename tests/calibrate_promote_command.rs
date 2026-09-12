@@ -223,9 +223,11 @@ fn insert_spend(conn: &Connection, at_nanos: i64, event_id: &str) {
 }
 
 /// Seeds one experiment whose four readings move 10,000 ppm per credit (100
-/// micros per point), then three further readings of the same physics after the
-/// experiment closed: the held-out series promotion validates against.
-fn seed_ledger(state: &StateDir) {
+/// micros per point), then three further readings after the experiment closed:
+/// the held-out series promotion validates against. `holdout_step_ppm` is how
+/// far the meter moves per 3 credits of held-out spend, so a caller can seed a
+/// series the fitted coefficient does not predict.
+fn seed_ledger(state: &StateDir, holdout_step_ppm: i32) {
     let mut conn = open_test_ledger(state);
 
     calibration_store::insert_experiment(&conn, &test_experiment()).unwrap();
@@ -283,8 +285,12 @@ fn seed_ledger(state: &StateDir) {
 
     for (ts_nanos, used_ppm, tag) in [
         (110_000 * SECOND, 190_000, "ev-holdout-1"),
-        (120_000 * SECOND, 220_000, "ev-holdout-2"),
-        (130_000 * SECOND, 250_000, "ev-holdout-3"),
+        (120_000 * SECOND, 190_000 + holdout_step_ppm, "ev-holdout-2"),
+        (
+            130_000 * SECOND,
+            190_000 + 2 * holdout_step_ppm,
+            "ev-holdout-3",
+        ),
     ] {
         insert_reading(&conn, &seeding, ts_nanos, used_ppm, tag);
     }
@@ -334,8 +340,14 @@ struct Seeded {
 /// Seeds the ledger and runs the real `aub calibrate fit`, returning the
 /// candidate it recorded and the two evidence sets promotion will be given.
 fn seed_and_fit() -> Seeded {
+    seed_and_fit_with_holdout(30_000)
+}
+
+/// The same chain over a held-out series whose meter moves `holdout_step_ppm`
+/// per three credits, so a caller can seed evidence the fit does not predict.
+fn seed_and_fit_with_holdout(holdout_step_ppm: i32) -> Seeded {
     let state = StateDir::new();
-    seed_ledger(&state);
+    seed_ledger(&state, holdout_step_ppm);
 
     let output = run_aub(&state, &["calibrate", "fit", "--experiment", EXPERIMENT_ID]);
     assert_eq!(
@@ -667,5 +679,79 @@ fn an_unknown_candidate_is_refused_by_name() {
     assert!(
         stderr.contains("cand-does-not-exist"),
         "the refusal must name the candidate asked for: {stderr}"
+    );
+}
+
+/// The exit criterion the whole validation half exists for: a candidate that
+/// fits its own training evidence and fails held-out evidence is promoted, so
+/// the failure is recorded rather than hidden, and then refused by activation
+/// on the residual that promotion computed.
+#[test]
+fn a_candidate_that_fails_its_held_out_evidence_cannot_be_activated() {
+    // Half the fitted movement per credit: the coefficient over-predicts the
+    // held-out series, and the residual is the size of that error.
+    let seeded = seed_and_fit_with_holdout(15_000);
+    let promote = run_aub(
+        &seeded.state,
+        &[
+            "calibrate",
+            "promote",
+            &seeded.candidate_id,
+            "--training",
+            &seeded.training,
+            "--validation",
+            &seeded.validation,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        promote.status.code(),
+        Some(0),
+        "promotion records the failure: {}",
+        String::from_utf8_lossy(&promote.stderr)
+    );
+    let json: serde_json::Value = serde_json::from_slice(&promote.stdout).unwrap();
+    let residual: i64 = json["held_out_residual"]["value"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        residual > 100_000,
+        "a series moving half as fast must leave a large held-out residual, got {residual}"
+    );
+
+    let result_id = format!("promoted-{}", seeded.candidate_id);
+    let activate = run_aub(
+        &seeded.state,
+        &[
+            "calibrate",
+            "activate",
+            &result_id,
+            "--actor",
+            "operator",
+            "--training",
+            &seeded.training,
+            "--validation",
+            &seeded.validation,
+            "--max-residual-micros",
+            "1000",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&activate.stderr).into_owned();
+    assert_ne!(
+        activate.status.code(),
+        Some(0),
+        "activation must refuse a result whose held-out residual exceeds the policy"
+    );
+    assert!(
+        stderr.contains("held-out") || stderr.contains("residual"),
+        "the refusal must name the held-out residual: {stderr}"
+    );
+    assert_eq!(
+        lifecycle_count(&seeded.state),
+        0,
+        "a refused activation writes no lifecycle event"
     );
 }
