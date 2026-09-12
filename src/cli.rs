@@ -26,13 +26,14 @@ use crate::presentation::boxed::{
     boxed_blank, boxed_body, boxed_bottom, boxed_content_area, boxed_top, boxed_width,
 };
 use crate::presentation::json::{
-    calibrate_activate_json, calibrate_compare_json, calibrate_history_json, calibrate_show_json,
-    coverage_json, now_json_with_explain, spend_json_with_explain, status_json_with_explain,
+    calibrate_activate_json, calibrate_compare_json, calibrate_history_json,
+    calibrate_promote_json, calibrate_show_json, coverage_json, now_json_with_explain,
+    spend_json_with_explain, status_json_with_explain,
 };
 use crate::presentation::render::{
     render_calibrate_activate_report, render_calibrate_compare_report,
-    render_calibrate_history_report, render_calibrate_show_report, render_coverage_report,
-    render_coverage_threshold_message, render_now_report_with_explain,
+    render_calibrate_history_report, render_calibrate_promote_report, render_calibrate_show_report,
+    render_coverage_report, render_coverage_threshold_message, render_now_report_with_explain,
     render_spend_report_with_explain, render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
@@ -871,7 +872,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
+                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status => Some("--refresh"),
@@ -6713,9 +6714,10 @@ fn calibrate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), 
         Some("show") => calibrate_show_command(clock, invocation),
         Some("history") => calibrate_history_command(clock, invocation),
         Some("compare") => calibrate_compare_command(clock, invocation),
+        Some("promote") => calibrate_promote_command(clock, invocation),
         Some("activate") => calibrate_activate_command(clock, invocation),
         other => Err(Error::Usage(format!(
-            "calibrate requires a subcommand (begin | status | end | fit | passive | show | history | compare | activate), got {other:?}"
+            "calibrate requires a subcommand (begin | status | end | fit | passive | show | history | compare | promote | activate), got {other:?}"
         ))),
     }
 }
@@ -7951,6 +7953,144 @@ fn calibrate_compare_command(clock: &impl Clock, invocation: &Invocation) -> Res
     match invocation.format {
         OutputFormat::Text => println!("{}", render_calibrate_compare_report(&report)),
         OutputFormat::Json => println!("{}", calibrate_compare_json(&report, RunId::new(now))),
+    }
+    Ok(())
+}
+
+/// The `calibrate promote` arguments: the candidate to promote and the two
+/// evidence sets its result records, which is also what `calibrate activate`
+/// will later have to reproduce.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CalibratePromoteArgs {
+    pub candidate_id: String,
+    pub training: Vec<String>,
+    pub validation: Vec<String>,
+    pub policy_version: String,
+}
+
+fn calibrate_parse_promote(rest: &[String]) -> Result<CalibratePromoteArgs, Error> {
+    let usage = "calibrate promote requires CANDIDATE --training E,... --validation E,... [--policy-version V]";
+    let mut args = CalibratePromoteArgs {
+        candidate_id: String::new(),
+        training: Vec::new(),
+        validation: Vec::new(),
+        policy_version: crate::calibration::fitter::PROMOTION_ACTIVATION_POLICY_VERSION.to_string(),
+    };
+    let mut rest = rest.iter();
+    let mut positionals = 0;
+    while let Some(arg) = rest.next() {
+        match arg.as_str() {
+            "--training" => {
+                args.training =
+                    calibrate_split_evidence(&calibrate_next_arg(&mut rest, "--training")?);
+            }
+            "--validation" => {
+                args.validation =
+                    calibrate_split_evidence(&calibrate_next_arg(&mut rest, "--validation")?);
+            }
+            "--policy-version" => {
+                args.policy_version = calibrate_next_arg(&mut rest, "--policy-version")?;
+            }
+            other if other.starts_with("--") => {
+                return Err(Error::Usage(format!(
+                    "calibrate promote: unknown argument {other:?}; {usage}"
+                )));
+            }
+            other => {
+                positionals += 1;
+                if positionals > 1 {
+                    return Err(Error::Usage(format!(
+                        "calibrate promote takes one CANDIDATE, got a second positional {other:?}; {usage}"
+                    )));
+                }
+                args.candidate_id = other.to_string();
+            }
+        }
+    }
+    if args.candidate_id.is_empty() {
+        return Err(Error::Usage(format!(
+            "calibrate promote requires CANDIDATE: the candidate id `aub calibrate fit` reported; {usage}"
+        )));
+    }
+    if args.training.is_empty() {
+        return Err(Error::Usage(
+            "calibrate promote requires --training E,...: the evidence ids the candidate was fitted from, so the result records the fit's own evidence rather than a substitute set".into(),
+        ));
+    }
+    if args.validation.is_empty() {
+        return Err(Error::Usage(
+            "calibrate promote requires --validation E,...: the held-out evidence the result's residual is computed over".into(),
+        ));
+    }
+    Ok(args)
+}
+
+/// Splits a comma-separated evidence list, dropping the empty fragments a
+/// trailing or doubled comma leaves behind.
+fn calibrate_split_evidence(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// The testable core of `calibrate promote`: records a result from a fitted
+/// candidate and never activates it (invariant 14).
+pub(crate) fn calibrate_promote_validated(
+    conn: &mut rusqlite::Connection,
+    args: &CalibratePromoteArgs,
+    clock: &impl Clock,
+    now: UtcTimestamp,
+) -> Result<crate::report::CalibratePromoteReport, Error> {
+    let candidate_id = crate::store::calibration::CandidateId::new(&args.candidate_id);
+    let training: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
+        .training
+        .iter()
+        .map(crate::domain::provenance::EvidenceId::new)
+        .collect();
+    let validation: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
+        .validation
+        .iter()
+        .map(crate::domain::provenance::EvidenceId::new)
+        .collect();
+    let promotion = crate::calibration::fitter::CandidatePromotion {
+        candidate_id: &candidate_id,
+        training: &training,
+        validation: &validation,
+        activation_policy_version: &args.policy_version,
+    };
+    let promoted = crate::calibration::fitter::promote_candidate(conn, &promotion, clock)?;
+    Ok(crate::report::CalibratePromoteReport {
+        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+        result_id: promoted.result_id,
+        candidate_id: promoted.candidate_id,
+        experiment_id: promoted.experiment_id,
+        provider: promoted.provider,
+        plan_tier: promoted.plan_tier,
+        window_semantic_key: promoted.window_semantic_key,
+        fitted_micros_per_point: promoted.fitted_micros_per_point,
+        fit_residual_micros: promoted.fit_residual_micros,
+        held_out_residual_micros: promoted.held_out_residual_micros,
+        validation_observations: promoted.validation_observations,
+        fitting_evidence_digest_hex: promoted.fitting_evidence_digest_hex,
+        validation_evidence_digest_hex: promoted.validation_evidence_digest_hex,
+        validation_method: promoted.validation_method,
+        validation_version: promoted.validation_version,
+        activation_policy_version: promoted.activation_policy_version,
+        uncertainty_low_micros_per_point: promoted.uncertainty_low_micros_per_point,
+        uncertainty_high_micros_per_point: promoted.uncertainty_high_micros_per_point,
+    })
+}
+
+fn calibrate_promote_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
+    let args = calibrate_parse_promote(&invocation.rest[1..])?;
+    let mut conn = open_ledger(clock)?;
+    let now = clock.now();
+    let report = calibrate_promote_validated(&mut conn, &args, clock, now)?;
+    match invocation.format {
+        OutputFormat::Text => print!("{}", render_calibrate_promote_report(&report)),
+        OutputFormat::Json => println!("{}", calibrate_promote_json(&report, RunId::new(now))),
     }
     Ok(())
 }

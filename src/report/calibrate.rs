@@ -179,6 +179,32 @@ pub fn format_calibrate_difference_percent(difference_bps: i64) -> String {
     format!("{sign}{}.{}%", magnitude / 100, (magnitude % 100) / 10)
 }
 
+/// The `calibrate promote` report: the result just recorded from a fitted
+/// candidate, with the validation figures the activation gate will read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibratePromoteReport {
+    pub metadata: ReportMetadata,
+    pub result_id: String,
+    pub candidate_id: String,
+    pub experiment_id: String,
+    pub provider: String,
+    pub plan_tier: String,
+    pub window_semantic_key: String,
+    pub fitted_micros_per_point: i64,
+    pub fit_residual_micros: i64,
+    /// The held-out residual computed over the validation evidence: the figure
+    /// activation judges against its policy bound.
+    pub held_out_residual_micros: i64,
+    pub validation_observations: u32,
+    pub fitting_evidence_digest_hex: String,
+    pub validation_evidence_digest_hex: String,
+    pub validation_method: String,
+    pub validation_version: String,
+    pub activation_policy_version: String,
+    pub uncertainty_low_micros_per_point: i64,
+    pub uncertainty_high_micros_per_point: i64,
+}
+
 /// The `calibrate activate` report: the explicit activation just recorded.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalibrateActivateReport {

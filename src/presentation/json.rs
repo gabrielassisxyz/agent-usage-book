@@ -2452,6 +2452,38 @@ pub fn calibrate_compare_json(
     JsonEnvelope::new("calibrate-compare", run, report.metadata.clone()).to_json_with(&body)
 }
 
+/// Serializes a `calibrate promote` report under the JSON envelope.
+pub fn calibrate_promote_json(
+    report: &crate::report::CalibratePromoteReport,
+    run: RunId,
+) -> String {
+    let body = format!(
+        "\"result_id\":{},\"candidate_id\":{},\"experiment_id\":{},\"provider\":{},\"plan_tier\":{},\"window_semantic_key\":{},\"fitted\":{},\"fit_residual\":{},\"held_out_residual\":{},\"validation_observations\":{},\"fitting_evidence_digest\":{},\"validation_evidence_digest\":{},\"validation_method\":{},\"validation_version\":{},\"activation_policy_version\":{},\"uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}},\"activated\":false",
+        json_string(&report.result_id),
+        json_string(&report.candidate_id),
+        json_string(&report.experiment_id),
+        json_string(&report.provider),
+        json_string(&report.plan_tier),
+        json_string(&report.window_semantic_key),
+        quantity_json(
+            &report.fitted_micros_per_point.to_string(),
+            "micros_per_point"
+        ),
+        quantity_json(&report.fit_residual_micros.to_string(), "credits"),
+        quantity_json(&report.held_out_residual_micros.to_string(), "credits"),
+        report.validation_observations,
+        json_string(&report.fitting_evidence_digest_hex),
+        json_string(&report.validation_evidence_digest_hex),
+        json_string(&report.validation_method),
+        json_string(&report.validation_version),
+        json_string(&report.activation_policy_version),
+        json_string(&report.uncertainty_low_micros_per_point.to_string()),
+        json_string(&report.uncertainty_high_micros_per_point.to_string()),
+        json_string("micros_per_point")
+    );
+    JsonEnvelope::new("calibrate-promote", run, report.metadata.clone()).to_json_with(&body)
+}
+
 /// Serializes a `calibrate activate` report under the JSON envelope.
 pub fn calibrate_activate_json(
     report: &crate::report::CalibrateActivateReport,

@@ -2726,6 +2726,40 @@ pub fn render_calibrate_compare_report(report: &crate::report::CalibrateCompareR
     out
 }
 
+/// Renders the `calibrate promote` report: the recorded result, the held-out
+/// residual activation will judge, and the explicit statement that nothing was
+/// activated (invariant 14).
+pub fn render_calibrate_promote_report(report: &crate::report::CalibratePromoteReport) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "calibration {} recorded from candidate {} of experiment {}\n",
+        report.result_id, report.candidate_id, report.experiment_id
+    ));
+    out.push_str(&format!(
+        "scope: provider {} tier {} window {}\n",
+        report.provider, report.plan_tier, report.window_semantic_key
+    ));
+    out.push_str(&format!(
+        "fitted: {} micros/point; residual: {} micros; uncertainty: [{}..={}] micros/point\n",
+        report.fitted_micros_per_point,
+        report.fit_residual_micros,
+        report.uncertainty_low_micros_per_point,
+        report.uncertainty_high_micros_per_point
+    ));
+    out.push_str(&format!(
+        "held-out residual: {} micros over {} validation observations ({} {})\n",
+        report.held_out_residual_micros,
+        report.validation_observations,
+        report.validation_method,
+        report.validation_version
+    ));
+    out.push_str(&format!(
+        "not activated; activate with `aub calibrate activate {} --policy-version {}`\n",
+        report.result_id, report.activation_policy_version
+    ));
+    out
+}
+
 /// Renders the `calibrate activate` report: the explicit activation just
 /// recorded, with the activated coefficient, its residual and its
 /// uncertainty.
