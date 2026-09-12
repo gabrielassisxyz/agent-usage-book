@@ -244,6 +244,62 @@ pub(crate) fn hold_writer_slot(conn: &mut rusqlite::Connection) -> rusqlite::Tra
         .expect("a connection with the writer slot free must be able to take it")
 }
 
+/// Standard 16-byte SQLite database magic header string (`SQLite format 3\0`).
+pub const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
+
+/// Probes the page-1 header of an existing SQLite database file before passing it
+/// to SQLite. Refuses when the file is non-empty and does not begin with the
+/// standard 16-byte SQLite magic string (`SQLite format 3\0`), such as when a
+/// leaf or interior b-tree page has been written at offset 0.
+pub fn probe_database_header(path: &Path) -> Result<(), Error> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(Error::Store(format!("cannot stat database {path:?}: {e}"))),
+    };
+    if metadata.len() == 0 {
+        return Ok(());
+    }
+    if metadata.len() < 16 {
+        return Err(Error::Store(format!(
+            "page 1 integrity probe failed: database {path:?} is truncated ({} bytes, smaller than SQLite header)",
+            metadata.len()
+        )));
+    }
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(Error::Store(format!(
+                "cannot open database {path:?} for header probe: {e}"
+            )));
+        }
+    };
+    use std::io::Read;
+    let mut header = [0u8; 16];
+    file.read_exact(&mut header).map_err(|e| {
+        Error::Store(format!(
+            "cannot read page 1 header of database {path:?}: {e}"
+        ))
+    })?;
+    if &header != SQLITE_MAGIC_HEADER {
+        let classification = match header[0] {
+            0x0d => "leaf table b-tree page (type 0x0d at offset 0)",
+            0x05 => "interior table b-tree page (type 0x05 at offset 0)",
+            0x0a => "leaf index b-tree page (type 0x0a at offset 0)",
+            0x02 => "interior index b-tree page (type 0x02 at offset 0)",
+            _ => "invalid SQLite magic header bytes",
+        };
+        return Err(Error::Store(format!(
+            "page 1 integrity probe failed: database {path:?} header is corrupt: expected 'SQLite format 3\\0', found {classification}"
+        )));
+    }
+    Ok(())
+}
+
 pub fn open(
     path: &Path,
     mode: AccessMode,
@@ -263,6 +319,7 @@ pub fn open(
     if mode == AccessMode::ReadWrite {
         create_file_mode_0600(path)?;
     }
+    probe_database_header(path)?;
     let conn = if mode == AccessMode::ArchiveImmutable {
         let uri = archive_immutable_uri(path);
         rusqlite::Connection::open_with_flags(Path::new(&uri), flags)
@@ -1077,5 +1134,56 @@ mod tests {
                 "a verification failure must name the malformation: {error}"
             ),
         }
+    }
+
+    #[test]
+    fn probe_database_header_refuses_leaf_btree_page_at_offset_zero() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("corrupt_page_one.db");
+
+        // Reproduce the exact signature from 2026-09-11: a leaf table b-tree page header
+        // written at byte 0 (0x0d 0x00 ...) where SQLite format 3\0 belongs.
+        let mut leaf_page = vec![0u8; 4096];
+        leaf_page[0] = 0x0d;
+        leaf_page[4] = 0x01;
+        std::fs::write(&db_path, leaf_page).unwrap();
+
+        let err = probe_database_header(&db_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("page 1 integrity probe failed"),
+            "expected page 1 integrity probe failure, got: {msg}"
+        );
+        assert!(
+            msg.contains("leaf table b-tree page (type 0x0d at offset 0)"),
+            "expected leaf table b-tree page classification, got: {msg}"
+        );
+
+        // All connection open modes must refuse before SQLite attempts to run queries
+        let policy = policy();
+        assert!(open(&db_path, AccessMode::ReadOnly, &policy).is_err());
+        assert!(open(&db_path, AccessMode::ReadWrite, &policy).is_err());
+        assert!(open(&db_path, AccessMode::ArchiveImmutable, &policy).is_err());
+    }
+
+    #[test]
+    fn probe_database_header_passes_clean_and_empty() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("clean.db");
+
+        // Non-existent path passes (SQLite creation will initialize it)
+        assert!(probe_database_header(&db_path).is_ok());
+
+        // Empty file passes
+        std::fs::write(&db_path, b"").unwrap();
+        assert!(probe_database_header(&db_path).is_ok());
+
+        // Valid SQLite database passes
+        let policy = policy();
+        let conn = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
+        conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+            .unwrap();
+        drop(conn);
+        assert!(probe_database_header(&db_path).is_ok());
     }
 }

@@ -134,6 +134,75 @@ fn check_fails_sqlite_and_schema_health() {
 }
 
 #[test]
+fn check_fails_sqlite_and_schema_health_on_page_one_corruption() {
+    let state = StateDir::new();
+    let db_path = state.path().join(connection::LEDGER_DATABASE_FILE);
+
+    // Reproduce the exact corruption from 2026-09-11: page 1 overwritten by a leaf table
+    // b-tree page (0x0d 0x00 ...) where SQLite format 3\0 belongs.
+    let mut page = vec![0u8; 4096];
+    page[0] = 0x0d;
+    page[4] = 0x01;
+    std::fs::write(&db_path, page).unwrap();
+
+    let config = test_config(state.path());
+    let err = connection::open(
+        &db_path,
+        connection::AccessMode::ReadOnly,
+        &connection::PragmaPolicy {
+            busy_timeout: agent_usage_book::domain::time::MonotonicDuration::from_millis(100),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("page 1 integrity probe failed"));
+    assert!(err.to_string().contains("leaf table b-tree page"));
+
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_000),
+        db_path: db_path.clone(),
+        db: None,
+        db_missing: false,
+        db_open_error: Some(err.to_string()),
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|o| o.name == CheckName::SqliteAndSchemaHealth)
+        .expect("SqliteAndSchemaHealth present");
+    assert!(
+        matches!(outcome.status, CheckStatus::Fail(ref reason) if reason.contains("page 1 integrity probe failed") && reason.contains("leaf table b-tree page")),
+        "expected doctor to fail naming the page 1 integrity probe and leaf page classification, got: {:?}",
+        outcome.status
+    );
+}
+
+#[test]
+fn operations_doc_contains_corrupt_ledger_recovery_runbook() {
+    let doc = std::fs::read_to_string("docs/operations.md").expect("docs/operations.md must exist");
+    assert!(
+        doc.contains("Setting aside a corrupt ledger and restoring from verified archive"),
+        "operations doc must contain the section for recovering from corrupt ledger"
+    );
+    assert!(
+        doc.contains("page 1 integrity probe failed"),
+        "operations doc must mention page 1 integrity probe failure"
+    );
+    assert!(
+        doc.contains("aub backup restore"),
+        "operations doc must contain aub backup restore command"
+    );
+    assert!(
+        doc.contains("newest-verified"),
+        "operations doc must instruct finding the newest-verified archive"
+    );
+    assert!(
+        doc.contains("aub doctor"),
+        "operations doc must instruct running aub doctor after restore"
+    );
+}
+
+#[test]
 fn check_fails_strict_and_constraint_integrity() {
     let state = StateDir::new();
     let conn = open_ledger(state.path());

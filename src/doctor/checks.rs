@@ -145,7 +145,7 @@ fn condition_of(name: CheckName) -> &'static str {
             "the resolved configuration has no invalid or conflicting key"
         }
         CheckName::SqliteAndSchemaHealth => {
-            "the ledger database passes SQLite's own integrity and foreign-key checks"
+            "the ledger database passes the page-1 integrity probe, SQLite's own integrity, and foreign-key checks"
         }
         CheckName::StrictAndConstraintIntegrity => {
             "every table is STRICT and every quantity column is constrained"

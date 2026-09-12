@@ -62,6 +62,48 @@ procedure is "preserve the damaged state directory", which is the opposite
 instinct from cleaning up a mess, and the moment to learn that is not during
 an actual incident.
 
+### Setting aside a corrupt ledger and restoring from verified archive
+
+When the ledger file is corrupted (for example, if `aub doctor` reports
+`sqlite-and-schema-health` failure with `page 1 integrity probe failed`),
+perform the recovery sequence in order:
+
+1. Stop every mutating invocation to prevent writes against the damaged state:
+   ```sh
+   systemctl --user stop aub-sample.timer aub-meter-capture.timer
+   ```
+2. Preserve the damaged state directory by moving it to a timestamped forensic copy:
+   ```sh
+   mv ~/.local/state/aub ~/.local/state/aub.corrupt-$(date +%Y%m%dT%H%M)
+   ```
+3. Locate the newest verified archive:
+   The configured backup destination directory (e.g. `/tank/backups/aub/` or
+   `backup.destination`) maintains a `newest-verified` pointer file
+   referencing the newest archive:
+   ```sh
+   NEWEST_ARCHIVE="$(cat /tank/backups/aub/newest-verified)"
+   ARCHIVE_PATH="/tank/backups/aub/$NEWEST_ARCHIVE"
+   ```
+4. Verify the archive before restoring:
+   ```sh
+   /home/gabriel/.local/bin/aub backup verify "$ARCHIVE_PATH"
+   ```
+5. Restore from the verified archive into the fresh state directory, replaying any surviving spool:
+   ```sh
+   /home/gabriel/.local/bin/aub backup restore "$ARCHIVE_PATH" ~/.local/state/aub --surviving ~/.local/state/aub.corrupt-*
+   ```
+   Note: `aub backup restore` mechanically refuses an existing destination directory,
+   enforcing that the damaged directory was preserved and set aside rather than overwritten.
+6. Verify doctor passes on the restored state:
+   ```sh
+   /home/gabriel/.local/bin/aub doctor
+   ```
+7. Restart the sampling cadence:
+   ```sh
+   systemctl --user start aub-sample.timer aub-meter-capture.timer
+   ```
+
+
 ## 7. Read a failure by its exit code and problem code first
 
 A script or a timer should never need to parse prose to learn what went
