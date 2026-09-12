@@ -617,3 +617,68 @@ fn a_running_experiment_is_refused_before_fitting() {
     assert_eq!(output.status.code(), Some(6), "stderr: {stderr}");
     assert!(stderr.contains("is still running"), "{stderr}");
 }
+
+/// A joint candidate has one coefficient per token kind and the result table
+/// carries a single scalar, so promotion refuses rather than reducing the
+/// coefficients through a cost model, which would reintroduce the assumption
+/// the joint fit exists to test. The refusal names the bead that owns the
+/// multivariate result shape.
+#[test]
+fn promoting_a_joint_candidate_is_refused_naming_the_successor_bead() {
+    let state = StateDir::new();
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    seed_burst(&state, &fixture, TokenKind::ALL.to_vec());
+
+    let fit = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "fit",
+            "--experiment",
+            EXPERIMENT,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(fit.status.code(), Some(0));
+    let json: serde_json::Value =
+        serde_json::from_str(String::from_utf8_lossy(&fit.stdout).trim()).unwrap();
+    let candidate_id = json["candidate_id"]
+        .as_str()
+        .expect("a candidate id")
+        .to_string();
+
+    let promote = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "promote",
+            &candidate_id,
+            "--training",
+            "ev-training",
+            "--validation",
+            "ev-validation",
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&promote.stderr).into_owned();
+    assert_ne!(
+        promote.status.code(),
+        Some(0),
+        "a joint candidate must not be promoted"
+    );
+    assert!(
+        stderr.contains("no scalar result shape yet"),
+        "the refusal must state why a joint candidate cannot be promoted: {stderr}"
+    );
+    assert!(
+        stderr.contains("aub-multivariate-result-shape-2hvt"),
+        "the refusal must name the bead that owns the multivariate result shape: {stderr}"
+    );
+
+    let conn = open_test_ledger(&state);
+    assert_eq!(
+        count(&conn, "SELECT COUNT(*) FROM window_calibration_result"),
+        0,
+        "a refused promotion records no result"
+    );
+}
