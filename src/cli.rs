@@ -6805,14 +6805,17 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
     if args.window.trim().is_empty() || args.cost_model.trim().is_empty() {
         return Err(Error::Usage(usage.into()));
     }
-    if args
-        .plan_tier
-        .as_deref()
-        .is_some_and(|tier| tier.trim().is_empty())
-    {
-        return Err(Error::Usage(
-            "--plan-tier requires a non-empty value".into(),
-        ));
+    if let Some(tier) = args.plan_tier.as_mut() {
+        let trimmed = tier.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Usage(
+                "--plan-tier requires a non-empty value".into(),
+            ));
+        }
+        // Trimmed here, like the configured tier, so a given " pro" and a
+        // configured "pro" are one tier instead of a mismatch whose message
+        // names the same word twice.
+        *tier = trimmed.to_string();
     }
     if !args.assert_exclusive {
         return Err(Error::Usage(
@@ -11251,6 +11254,30 @@ usage_evidence = "measured"
             ),
             other => panic!("expected Error::Usage, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn calibrate_begin_trims_the_plan_tier_flag() {
+        let rest: Vec<String> = [
+            "--plan-tier= pro ",
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "cm-1",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        assert_eq!(args.plan_tier.as_deref(), Some("pro"));
+        // And the trimmed flag agrees with the configured tier rather than
+        // refusing against a value that prints the same.
+        assert_eq!(
+            resolve_calibrate_begin_plan_tier("bianca", Some("pro"), args.plan_tier.as_deref())
+                .unwrap(),
+            "pro"
+        );
     }
 
     #[test]

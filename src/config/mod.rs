@@ -1831,7 +1831,11 @@ pub fn resolve(
                                         .unwrap_or_default(),
                                 )));
                             }
-                            Some(raw.to_string())
+                            // Stored trimmed: a tier is compared against the
+                            // `--plan-tier` flag, and surrounding whitespace
+                            // would read as a disagreement between two values
+                            // that print identically in the refusal.
+                            Some(raw.trim().to_string())
                         }
                         None => None,
                     };
@@ -3501,6 +3505,24 @@ plan_tier = "pro"
                 .iter()
                 .all(|row| row.key != "accounts[0].plan_tier")
         );
+    }
+
+    /// A tier written with surrounding whitespace resolves to the tier itself
+    /// (aub-ai1j): it is compared against `--plan-tier`, and `" pro"` against
+    /// `"pro"` would refuse with a message naming the same word twice.
+    #[test]
+    fn plan_tier_trims_surrounding_whitespace() {
+        let padded =
+            "[[accounts]]\nname = \"bianca\"\nprovider = \"anthropic\"\nplan_tier = \"  pro \"\n";
+        let (config, provenance) =
+            resolve_with(Overrides::new(), plain_env(), Some(padded)).unwrap();
+        assert_eq!(config.accounts[0].plan_tier.as_deref(), Some("pro"));
+        let rows = config.provenance_rows(&provenance);
+        let tier = rows
+            .iter()
+            .find(|row| row.key == "accounts[0].plan_tier")
+            .expect("the tier prints as its own row");
+        assert_eq!(tier.value, "pro");
     }
 
     /// An empty `plan_tier` is a usage error naming the key and the account,

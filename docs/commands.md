@@ -545,7 +545,9 @@ value it passes as a cross-check. Two mismatches are refused with the usage
 exit class before anything is recorded: a flag that disagrees with the
 configured tier, naming the account and both tiers, and an omitted flag with
 no tier configured for the account, naming the account and the `plan_tier`
-key. With no configured tier the flag records its value as before.
+key. With no configured tier the flag records its value as before. Both the
+configured tier and the flag are trimmed, so surrounding whitespace never makes
+two identical tiers disagree.
 
 `fit` follows the experiment's premise. `fit --experiment ID` naming a controlled
 experiment whose `--expect-kinds` premise names two or more token kinds fits them
