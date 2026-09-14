@@ -45,12 +45,25 @@ PAYLOAD_EOF
 statusline_step() {
     # $1: step name, $2: payload file, $3: SHALLOW_PROFILE or "none".
     local name="$1" payload="$2" profile="$3"
-    local -a env_args=(env
-        "HOME=$STATE_DIR/home"
-        "AUB_CONFIG_FILE=$STATE_DIR/aub.toml"
-        "AUB_STATE_DIR=$STATE_DIR")
+    local -a env_args
     if [ -n "$profile" ]; then
-        env_args+=("SHALLOW_PROFILE=$profile")
+        env_args=(env
+            "HOME=$STATE_DIR/home"
+            "AUB_CONFIG_FILE=$STATE_DIR/aub.toml"
+            "AUB_STATE_DIR=$STATE_DIR"
+            "SHALLOW_PROFILE=$profile")
+    else
+        # Not naming the variable is not enough: env passes the calling
+        # shell's own SHALLOW_PROFILE through, and the profile-less render
+        # would be tested against the operator's environment instead of the
+        # case. Unset it explicitly. -u goes before the assignments: after
+        # the first NAME=VALUE, env reads every remaining word as the
+        # command to run.
+        env_args=(env
+            -u SHALLOW_PROFILE
+            "HOME=$STATE_DIR/home"
+            "AUB_CONFIG_FILE=$STATE_DIR/aub.toml"
+            "AUB_STATE_DIR=$STATE_DIR")
     fi
     step "$name" "${env_args[@]}" sh -c 'cat "$1" | "$2" statusline' _ "$payload" "$AUB_BIN"
 }
