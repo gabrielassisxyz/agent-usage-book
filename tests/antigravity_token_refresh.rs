@@ -97,6 +97,43 @@ impl Environment {
         )
     }
 
+    /// Runs the same command as `run` and returns its resident-set high-water
+    /// mark in kilobytes, read by `wait4` for that child alone, so no other test
+    /// running in this binary moves the figure.
+    fn run_measuring_peak_kb(&self, quota_url: &str, token_url: &str) -> (i32, i64, String) {
+        let stderr_path = self.root.join("stderr.txt");
+        #[allow(
+            clippy::zombie_processes,
+            reason = "reaped by the wait4 below, which is what returns its rusage"
+        )]
+        let child = Command::new(env!("CARGO_BIN_EXE_aub"))
+            .env("HOME", self.root.join("home"))
+            .env("AUB_CONFIG_FILE", self.root.join("aub.toml"))
+            .env("AUB_AGY_ENDPOINT", quota_url)
+            .env("AUB_AGY_TOKEN_ENDPOINT", token_url)
+            .env("AUB_AGY_BINARY", self.root.join("fake-agy-binary"))
+            .args(["-v", "now", "--account", "agy-a"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::fs::File::create(&stderr_path).unwrap())
+            .spawn()
+            .expect("aub must run");
+        let pid = libc::pid_t::try_from(child.id()).unwrap();
+        let mut status: libc::c_int = 0;
+        // SAFETY: an all-zero rusage is a valid value of that plain C struct.
+        let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+        // SAFETY: `pid` is this process's own unreaped child, and both out
+        // pointers are live locals for the duration of the call.
+        let reaped = unsafe { libc::wait4(pid, &mut status, 0, &mut usage) };
+        assert_eq!(reaped, pid, "wait4 must reap the aub child");
+        let code = if libc::WIFEXITED(status) {
+            libc::WEXITSTATUS(status)
+        } else {
+            -1
+        };
+        let stderr = std::fs::read_to_string(stderr_path).unwrap_or_default();
+        (code, usage.ru_maxrss, stderr)
+    }
+
     fn evidence_capsules(&self) -> Vec<String> {
         let conn = rusqlite::Connection::open(self.db_path()).expect("open ledger");
         let mut stmt = conn
@@ -312,4 +349,57 @@ fn a_rejected_client_pairing_records_refresh_configuration_failed() {
         )
         .unwrap();
     assert_eq!(classification, "refresh_configuration_failed");
+}
+
+/// aub-i2i9: the client material is extracted from an `agy` binary of about
+/// 200 MB on every tick whose stored token is expired, and one that stays
+/// expired (the endpoint keeps refusing the refresh) makes that every tick.
+/// Reading the binary whole and copying it into a lossy UTF-8 string peaked
+/// those ticks near 500 MB. This fake binary is 64 MB of bytes that are not
+/// UTF-8 with the material at its end, so the whole-file read would peak near
+/// 64 MB plus a lossy copy of about 192 MB; a streaming scan stays at what a
+/// tick needs without it. The request body proves the material was still
+/// found behind the 64 MB.
+#[test]
+fn extracting_client_material_from_a_large_binary_does_not_hold_it_in_memory() {
+    const FILLER_BYTES: usize = 64 * 1024 * 1024;
+    const PEAK_BOUND_KB: i64 = 48 * 1024;
+    let env = Environment::new(
+        "large-binary",
+        &credential_json(OLD_REFRESH, "2020-01-01T00:00:00Z"),
+    );
+    // Written a megabyte at a time: `ru_maxrss` of a child started through
+    // `posix_spawn` carries the parent's own high-water mark, so a 64 MB buffer
+    // held here would be counted against aub.
+    {
+        use std::io::Write;
+        let mut binary = std::fs::File::create(env.root.join("fake-agy-binary")).unwrap();
+        let megabyte = vec![0xFF_u8; 1024 * 1024];
+        for _ in 0..FILLER_BYTES / megabyte.len() {
+            binary.write_all(&megabyte).unwrap();
+        }
+        binary.write_all(&fake_agy_binary()).unwrap();
+    }
+
+    let quota = SyntheticServer::start(vec![ScriptedOutcome::Unauthorized401]).unwrap();
+    let token = SyntheticServer::start(vec![ScriptedOutcome::Response {
+        status: 401,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body: br#"{"error":"invalid_client"}"#.to_vec(),
+    }])
+    .unwrap();
+
+    let (_code, peak_kb, stderr) = env.run_measuring_peak_kb(&quota.url(), &token.url());
+
+    assert_eq!(token.request_count(), 1, "stderr: {stderr}");
+    let refresh_body = String::from_utf8_lossy(&token.requests()[0].body).into_owned();
+    assert!(
+        refresh_body.contains("107222333444-fakeclientidabcXYZ.apps.googleusercontent.com")
+            && refresh_body.contains(&format!("GOCSPX-{}", "B".repeat(28))),
+        "the material behind the filler must still be extracted: {refresh_body}"
+    );
+    assert!(
+        peak_kb < PEAK_BOUND_KB,
+        "aub peaked at {peak_kb} kB extracting client material from a {FILLER_BYTES}-byte binary; bound {PEAK_BOUND_KB} kB"
+    );
 }

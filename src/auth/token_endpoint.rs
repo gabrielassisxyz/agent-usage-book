@@ -5,6 +5,8 @@
 //! not acquire the port must not name the transport at all, even for a refresh
 //! that runs before sampling.
 
+use std::io::Read;
+
 use crate::domain::time::{MonotonicDuration, RealClock};
 
 /// The Antigravity refresh endpoint. Its OAuth client material is extracted
@@ -29,30 +31,29 @@ impl AntigravityTokenEndpoint {
     fn client_material(
         &self,
     ) -> Result<(String, String), crate::auth::antigravity_credentials::RefreshError> {
-        let bytes = std::fs::read(&self.binary).map_err(|error| {
+        let unreadable = |error: std::io::Error| {
             crate::auth::antigravity_credentials::RefreshError::Configuration(format!(
                 "could not read agy binary '{}': {error}",
                 self.binary.display()
             ))
-        })?;
-        let text = String::from_utf8_lossy(&bytes);
-        let ids = strings_with_prefix(&text, "107", ".apps.googleusercontent.com");
-        let secrets = antigravity_gocspx_secrets(&text);
-        let Some(client_id) = ids.first() else {
+        };
+        let binary = std::fs::File::open(&self.binary).map_err(unreadable)?;
+        let found = scan_agy_client_material(binary, AGY_SCAN_CHUNK_BYTES).map_err(unreadable)?;
+        let Some(client_id) = found.client_id else {
             return Err(
                 crate::auth::antigravity_credentials::RefreshError::Configuration(
                     "agy binary did not contain an OAuth client id".into(),
                 ),
             );
         };
-        let Some(client_secret) = secrets.get(1) else {
+        let Some(client_secret) = found.secrets.into_iter().nth(1) else {
             return Err(
                 crate::auth::antigravity_credentials::RefreshError::Configuration(
                     "agy binary did not contain the expected second OAuth client secret".into(),
                 ),
             );
         };
-        Ok((client_id.clone(), client_secret.clone()))
+        Ok((client_id, client_secret))
     }
 }
 
@@ -66,42 +67,109 @@ fn agy_binary_path() -> std::path::PathBuf {
         .unwrap_or_else(|| std::path::PathBuf::from("agy"))
 }
 
-fn strings_with_prefix(text: &str, prefix: &str, suffix: &str) -> Vec<String> {
-    text.match_indices(prefix)
-        .filter_map(|(start, _)| {
-            let rest = &text[start..];
-            let suffix_offset = rest.find(suffix)?;
-            let candidate = &rest[..suffix_offset + suffix.len()];
-            candidate
-                .chars()
-                .all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
-                })
-                .then(|| candidate.to_string())
-        })
-        .collect()
-}
-
+/// How much of the `agy` binary is held in memory at once. The binary is over
+/// 200 MB, and while a stored token stays expired the refresh runs on every
+/// sampling tick: reading it whole and copying it into a lossy UTF-8 string put
+/// about 500 MB of anonymous memory on each of those ticks (aub-i2i9), where a
+/// tick otherwise peaks under 10 MB.
+const AGY_SCAN_CHUNK_BYTES: usize = 1 << 20;
+const AGY_CLIENT_ID_PREFIX: &[u8] = b"107";
+const AGY_CLIENT_ID_SUFFIX: &[u8] = b".apps.googleusercontent.com";
+/// The longest client id recognised, suffix included. A Google OAuth client id
+/// is about 75 bytes; the bound is what lets a match span chunks with a fixed
+/// carry-over instead of an arbitrarily long run of identifier bytes.
+const AGY_CLIENT_ID_MAX_BYTES: usize = 256;
 /// Google OAuth client secrets packed in the `agy` binary: `GOCSPX-` plus
 /// exactly 28 `[A-Za-z0-9_-]` characters. The tail is a fixed width, never a
 /// run to the next terminator, because the binary packs the next string table
 /// entry directly against the secret with no separator.
-fn antigravity_gocspx_secrets(text: &str) -> Vec<String> {
-    const PREFIX: &str = "GOCSPX-";
-    const TAIL_LEN: usize = 28;
-    text.match_indices(PREFIX)
-        .filter_map(|(start, _)| {
-            let tail: String = text[start + PREFIX.len()..]
-                .chars()
-                .take(TAIL_LEN)
-                .collect();
-            (tail.len() == TAIL_LEN
-                && tail.chars().all(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                }))
-            .then(|| format!("{PREFIX}{tail}"))
-        })
-        .collect()
+const AGY_SECRET_PREFIX: &[u8] = b"GOCSPX-";
+const AGY_SECRET_TAIL_BYTES: usize = 28;
+
+#[derive(Debug, Default)]
+struct AgyClientMaterial {
+    client_id: Option<String>,
+    secrets: Vec<String>,
+}
+
+impl AgyClientMaterial {
+    /// The refresh uses the first client id and the second secret, so nothing
+    /// after both have been seen can change its result.
+    fn complete(&self) -> bool {
+        self.client_id.is_some() && self.secrets.len() >= 2
+    }
+
+    fn inspect(&mut self, from: &[u8]) {
+        if self.client_id.is_none() {
+            self.client_id = agy_client_id_at(from);
+        }
+        if let Some(secret) = agy_secret_at(from) {
+            self.secrets.push(secret);
+        }
+    }
+}
+
+/// Reads `reader` in `chunk_bytes` pieces, carrying over only the bytes a match
+/// can still span, and stops once the material is complete.
+fn scan_agy_client_material(
+    mut reader: impl Read,
+    chunk_bytes: usize,
+) -> std::io::Result<AgyClientMaterial> {
+    let carry = AGY_CLIENT_ID_MAX_BYTES.max(AGY_SECRET_PREFIX.len() + AGY_SECRET_TAIL_BYTES);
+    let mut found = AgyClientMaterial::default();
+    let mut window: Vec<u8> = Vec::with_capacity(chunk_bytes + carry);
+    let mut chunk = vec![0u8; chunk_bytes];
+    loop {
+        let read = match reader.read(&mut chunk) {
+            Ok(read) => read,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        window.extend_from_slice(&chunk[..read]);
+        let at_end = read == 0;
+        let decided = if at_end {
+            window.len()
+        } else {
+            window.len().saturating_sub(carry)
+        };
+        for start in 0..decided {
+            if window[start] != AGY_CLIENT_ID_PREFIX[0] && window[start] != AGY_SECRET_PREFIX[0] {
+                continue;
+            }
+            found.inspect(&window[start..]);
+            if found.complete() {
+                return Ok(found);
+            }
+        }
+        if at_end {
+            return Ok(found);
+        }
+        window.drain(..decided);
+    }
+}
+
+fn agy_client_id_at(from: &[u8]) -> Option<String> {
+    if !from.starts_with(AGY_CLIENT_ID_PREFIX) {
+        return None;
+    }
+    let bounded = &from[..from.len().min(AGY_CLIENT_ID_MAX_BYTES)];
+    let run_end = bounded
+        .iter()
+        .position(|byte| !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')))
+        .unwrap_or(bounded.len());
+    let suffix_at = bounded[..run_end]
+        .windows(AGY_CLIENT_ID_SUFFIX.len())
+        .position(|candidate| candidate == AGY_CLIENT_ID_SUFFIX)?;
+    let id = &bounded[..suffix_at + AGY_CLIENT_ID_SUFFIX.len()];
+    Some(String::from_utf8_lossy(id).into_owned())
+}
+
+fn agy_secret_at(from: &[u8]) -> Option<String> {
+    let secret = from.get(..AGY_SECRET_PREFIX.len() + AGY_SECRET_TAIL_BYTES)?;
+    let tail = secret.strip_prefix(AGY_SECRET_PREFIX)?;
+    tail.iter()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        .then(|| String::from_utf8_lossy(secret).into_owned())
 }
 
 impl crate::auth::antigravity_credentials::TokenEndpoint for AntigravityTokenEndpoint {
@@ -275,7 +343,10 @@ impl crate::auth::credentials_lock::OAuthRefreshEndpoint for AnthropicTokenEndpo
 
 #[cfg(test)]
 mod antigravity_client_material_tests {
-    use super::{antigravity_gocspx_secrets, strings_with_prefix};
+    use super::{
+        AGY_CLIENT_ID_MAX_BYTES, AGY_SCAN_CHUNK_BYTES, AGY_SECRET_PREFIX, AGY_SECRET_TAIL_BYTES,
+        AgyClientMaterial, scan_agy_client_material,
+    };
 
     const TERMINATED_CLIENT_ID: &str = "107222333444-fakeclientidabcXYZ.apps.googleusercontent.com";
     const PACKED_CLIENT_ID: &str = "107999888777-fakepackedclientidxyz.apps.googleusercontent.com";
@@ -286,16 +357,19 @@ mod antigravity_client_material_tests {
         format!("GOCSPX-{}", fill.repeat(28))
     }
 
+    fn scan(bytes: &[u8], chunk_bytes: usize) -> AgyClientMaterial {
+        scan_agy_client_material(bytes, chunk_bytes).expect("an in-memory reader cannot fail")
+    }
+
     #[test]
     fn terminated_id_and_secrets_extract_exactly() {
         let (first, second) = (secret("A"), secret("B"));
         let text = format!(
             "prefix\nclient_id={TERMINATED_CLIENT_ID}\nsecret1={first}\nsecret2={second}\n"
         );
-        let ids = strings_with_prefix(&text, "107", ".apps.googleusercontent.com");
-        assert_eq!(ids, vec![TERMINATED_CLIENT_ID.to_string()]);
-        let secrets = antigravity_gocspx_secrets(&text);
-        assert_eq!(secrets, vec![first.clone(), second.clone()]);
+        let found = scan(text.as_bytes(), AGY_SCAN_CHUNK_BYTES);
+        assert_eq!(found.client_id.as_deref(), Some(TERMINATED_CLIENT_ID));
+        assert_eq!(found.secrets, vec![first, second]);
     }
 
     #[test]
@@ -304,9 +378,78 @@ mod antigravity_client_material_tests {
         let text = format!(
             "prefix{PACKED_CLIENT_ID}handleProgress{first}{second}https://cloudcode-pa.googleapis.com"
         );
-        let ids = strings_with_prefix(&text, "107", ".apps.googleusercontent.com");
-        assert_eq!(ids, vec![PACKED_CLIENT_ID.to_string()]);
-        let secrets = antigravity_gocspx_secrets(&text);
-        assert_eq!(secrets, vec![first.clone(), second.clone()]);
+        let found = scan(text.as_bytes(), AGY_SCAN_CHUNK_BYTES);
+        assert_eq!(found.client_id.as_deref(), Some(PACKED_CLIENT_ID));
+        assert_eq!(found.secrets, vec![first, second]);
+    }
+
+    /// Every chunk size from one byte up puts some chunk boundary inside the id
+    /// and inside each secret, surrounded by bytes that are not UTF-8, which is
+    /// what the binary around the material looks like.
+    #[test]
+    fn material_straddling_every_chunk_boundary_extracts_exactly() {
+        let (first, second) = (secret("A"), secret("B"));
+        let mut bytes = vec![0xFF_u8; 1000];
+        bytes.extend_from_slice(PACKED_CLIENT_ID.as_bytes());
+        bytes.push(0xC3);
+        bytes.extend_from_slice(first.as_bytes());
+        bytes.extend_from_slice(second.as_bytes());
+        bytes.extend(std::iter::repeat_n(0xFE_u8, 700));
+        for chunk_bytes in 1..=97 {
+            let found = scan(&bytes, chunk_bytes);
+            assert_eq!(
+                found.client_id.as_deref(),
+                Some(PACKED_CLIENT_ID),
+                "chunk {chunk_bytes}"
+            );
+            assert_eq!(found.secrets, vec![first.clone(), second.clone()]);
+        }
+    }
+
+    /// Planted negatives next to their positives: a byte outside the identifier
+    /// set inside the id, and a secret one character short of its fixed width,
+    /// are both refused, as the lossy-text extraction refused them.
+    #[test]
+    fn a_broken_id_and_a_short_secret_are_not_material() {
+        let broken_id = PACKED_CLIENT_ID.replacen("fake", "fa\u{00e9}ke", 1);
+        let short = &secret("A")[..AGY_SECRET_PREFIX.len() + AGY_SECRET_TAIL_BYTES - 1];
+        let text = format!("{broken_id}\n{short}\n");
+        let found = scan(text.as_bytes(), 8);
+        assert_eq!(found.client_id, None);
+        assert!(found.secrets.is_empty(), "{:?}", found.secrets);
+    }
+
+    /// The scan stops reading at the end of the second secret once the id is
+    /// known: a reader that fails past that point is never read again.
+    #[test]
+    fn the_scan_stops_reading_once_the_material_is_complete() {
+        struct FailsAfter<'a> {
+            bytes: &'a [u8],
+        }
+        impl std::io::Read for FailsAfter<'_> {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.bytes.is_empty() {
+                    return Err(std::io::Error::other("read past the material"));
+                }
+                let n = buf.len().min(self.bytes.len());
+                buf[..n].copy_from_slice(&self.bytes[..n]);
+                self.bytes = &self.bytes[n..];
+                Ok(n)
+            }
+        }
+        let text = format!(
+            "{TERMINATED_CLIENT_ID}\n{}{}{}",
+            secret("A"),
+            secret("B"),
+            " ".repeat(AGY_CLIENT_ID_MAX_BYTES)
+        );
+        let found = scan_agy_client_material(
+            FailsAfter {
+                bytes: text.as_bytes(),
+            },
+            16,
+        )
+        .expect("the scan must not read past complete material");
+        assert!(found.complete());
     }
 }
