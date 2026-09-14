@@ -92,8 +92,11 @@ JSON
 JSON
 
     # Degradation: durable sampler failure counts (not repairable by --fix).
-    cat > "$STATE_ROOT_DIR/sampling-failure-counts.json" <<'JSON'
-{"schema_version":1,"failures":[{"category":"due_lookup_failed","reason":"database disk image is malformed","count":2}]}
+    # last_seen_unix_nanos is now, so the entry is inside the 24h window
+    # (aub-ahyc); without it the entry counts as already expired.
+    NOW_NANOS="$((NOW_SECS * 1000000000))"
+    cat > "$STATE_ROOT_DIR/sampling-failure-counts.json" <<JSON
+{"schema_version":1,"failures":[{"category":"due_lookup_failed","reason":"database disk image is malformed","count":2,"last_seen_unix_nanos":$NOW_NANOS}]}
 JSON
 
     # Degradation: retained diagnostic bodies (cleared only by operator command).
