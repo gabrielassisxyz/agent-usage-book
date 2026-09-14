@@ -695,6 +695,35 @@ pub fn open_attempt_row_ids(conn: &rusqlite::Connection) -> Result<Vec<MeterAtte
         .map_err(|e| Error::Store(format!("cannot read open meter attempts: {e}")))
 }
 
+/// Counts started attempts whose stored command horizon has elapsed without a
+/// terminal result. A newer attempt may still be running, so the absence alone
+/// is not enough: the policy snapshot recorded with that attempt supplies the
+/// historical command budget that turns it into collector interruption.
+pub fn interrupted_attempt_count_at(
+    conn: &rusqlite::Connection,
+    now: UtcTimestamp,
+) -> Result<u64, Error> {
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*)
+             FROM meter_attempt ma
+             JOIN sampling_policy_snapshot policy ON policy.id = ma.policy_snapshot_id
+             WHERE ma.request_started_at < ?1
+               AND (?1 - ma.request_started_at) > policy.command_budget_nanos
+               AND NOT EXISTS (
+                   SELECT 1 FROM meter_attempt_result result WHERE result.attempt_id = ma.id
+               )",
+            params![now.unix_nanos()],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|e| Error::Store(format!("cannot count interrupted meter attempts: {e}")))?;
+    u64::try_from(count).map_err(|_| {
+        Error::Store(format!(
+            "interrupted meter attempt count is negative: {count}"
+        ))
+    })
+}
+
 /// One started attempt reduced to what the coverage command reads: when it
 /// started, and its terminal outcome when one exists. A start with `None` is
 /// the collector-interruption state, which the coverage engine reports
@@ -1255,6 +1284,50 @@ mod tests {
             })
         );
         assert_eq!(stored.retry_index, Some(1));
+    }
+
+    #[test]
+    fn resultless_attempt_becomes_interrupted_only_after_its_stored_command_horizon() {
+        let (_scratch, conn, run, account, snapshot) = fixture();
+        let attempt = start_meter_attempt(&conn, &attempt_start(run, account, snapshot))
+            .expect("the attempt must insert");
+        let horizon_end = UtcTimestamp::from_unix_nanos(
+            20_000 + i64::try_from(POLICY.command_budget.as_nanos()).unwrap(),
+        );
+
+        assert_eq!(interrupted_attempt_count_at(&conn, horizon_end).unwrap(), 0);
+        assert_eq!(
+            interrupted_attempt_count_at(
+                &conn,
+                UtcTimestamp::from_unix_nanos(horizon_end.unix_nanos() + 1),
+            )
+            .unwrap(),
+            1,
+            "absence becomes interruption only after the attempt's own horizon"
+        );
+
+        record_meter_attempt_result(
+            &conn,
+            &NewMeterAttemptResult {
+                attempt_id: attempt,
+                completed_at: horizon_end,
+                elapsed: POLICY.command_budget,
+                outcome: AttemptOutcome::Success,
+                sanitized_error_classification: None,
+                retry_index: None,
+                clock_anomaly: false,
+            },
+        )
+        .expect("the terminal result must insert");
+        assert_eq!(
+            interrupted_attempt_count_at(
+                &conn,
+                UtcTimestamp::from_unix_nanos(horizon_end.unix_nanos() + 1),
+            )
+            .unwrap(),
+            0,
+            "a terminal result keeps an old attempt out of the interruption count"
+        );
     }
 
     /// The classification column round-trips through the store's insert and

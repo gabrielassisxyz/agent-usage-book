@@ -134,6 +134,55 @@ fn check_fails_sqlite_and_schema_health() {
 }
 
 #[test]
+fn sqlite_health_reports_resultless_attempts_as_interrupted_without_synthesizing_results() {
+    let state = StateDir::new();
+    let conn = open_ledger(state.path());
+    let started_at = ts(1_700_000_000);
+    seed_account_run_policy_attempt(&conn, started_at);
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM meter_attempt_result", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0,
+        "the fixture must contain a durable start and no invented result"
+    );
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_002),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: Some(&conn),
+        db_missing: false,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.name == CheckName::SqliteAndSchemaHealth)
+        .expect("SqliteAndSchemaHealth present");
+    assert!(
+        matches!(
+            outcome.status,
+            CheckStatus::PassWithDetail(ref detail)
+                if detail.contains("1 meter attempt(s)")
+                    && detail.contains("collector interruption")
+        ),
+        "a valid resultless attempt must be a passing health detail: {:?}",
+        outcome.status
+    );
+    assert_eq!(
+        conn.query_row("SELECT COUNT(*) FROM meter_attempt_result", [], |row| {
+            row.get::<_, i64>(0)
+        })
+        .unwrap(),
+        0,
+        "doctor must remain read-only and must not synthesize a result"
+    );
+}
+
+#[test]
 fn check_fails_sqlite_and_schema_health_on_page_one_corruption() {
     let state = StateDir::new();
     let db_path = state.path().join(connection::LEDGER_DATABASE_FILE);
@@ -1193,7 +1242,7 @@ fn check_fails_last_sample_tick_when_the_last_recorded_tick_was_refused() {
 // counted durably by reason ---------------------------------------------------
 
 #[test]
-fn sampling_failure_counts_passes_when_no_failure_has_ever_been_recorded() {
+fn sampling_failure_counts_passes_when_no_failure_is_current() {
     let state = StateDir::new();
     let config = test_config(state.path());
     let ctx = DoctorContext {
@@ -1217,19 +1266,17 @@ fn sampling_failure_counts_passes_when_no_failure_has_ever_been_recorded() {
 /// without reading the scheduler's journal by hand.
 #[test]
 fn check_fails_sampling_failure_counts_and_names_the_recurring_reason() {
-    use agent_usage_book::store::sampling_failure_counts::record_sampling_failure;
+    use agent_usage_book::store::sampling_failure_counts::reconcile_sampling_failure_counts;
 
     let state = StateDir::new();
-    record_sampling_failure(
+    reconcile_sampling_failure_counts(
         state.path(),
-        "due_lookup_failed",
-        "database disk image is malformed",
+        &[("due_lookup_failed", "database disk image is malformed")],
     )
     .unwrap();
-    record_sampling_failure(
+    reconcile_sampling_failure_counts(
         state.path(),
-        "due_lookup_failed",
-        "database disk image is malformed",
+        &[("due_lookup_failed", "database disk image is malformed")],
     )
     .unwrap();
 
@@ -1257,6 +1304,45 @@ fn check_fails_sampling_failure_counts_and_names_the_recurring_reason() {
         "{:?}",
         outcome.status
     );
+}
+
+#[test]
+fn sampling_failure_counts_passes_after_a_newer_clean_tick_settles_the_failure() {
+    use agent_usage_book::store::sample_tick::{LastSampleTick, TickOutcome, record_last_tick};
+    use agent_usage_book::store::sampling_failure_counts::reconcile_sampling_failure_counts;
+
+    let state = StateDir::new();
+    reconcile_sampling_failure_counts(
+        state.path(),
+        &[("due_lookup_failed", "database disk image is malformed")],
+    )
+    .unwrap();
+
+    record_last_tick(
+        state.path(),
+        &LastSampleTick {
+            started_at: ts(1_700_000_001),
+            outcome: TickOutcome::Success,
+        },
+    )
+    .unwrap();
+    reconcile_sampling_failure_counts(state.path(), &[]).unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: ts(1_700_000_002),
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcomes = build_registry(&ctx);
+    let outcome = outcomes
+        .iter()
+        .find(|outcome| outcome.name == CheckName::SamplingFailureCounts)
+        .expect("SamplingFailureCounts present");
+    assert_eq!(outcome.status, CheckStatus::Pass);
 }
 
 // --- aub-rfot: the provider error classifications a day of failures stored ---

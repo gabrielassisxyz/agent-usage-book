@@ -145,7 +145,7 @@ fn condition_of(name: CheckName) -> &'static str {
             "the resolved configuration has no invalid or conflicting key"
         }
         CheckName::SqliteAndSchemaHealth => {
-            "the ledger database passes the page-1 integrity probe, SQLite's own integrity, and foreign-key checks"
+            "the ledger database passes the page-1 integrity probe, SQLite's own integrity, and foreign-key checks; resultless attempts past their command horizon remain explicit collector interruptions"
         }
         CheckName::StrictAndConstraintIntegrity => {
             "every table is STRICT and every quantity column is constrained"
@@ -189,7 +189,7 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::LastSampleTick => "the last aub sample invocation succeeded",
         CheckName::SamplingFailureCounts => {
-            "no persist-failed or due-lookup-failed sampler disposition has ever been recorded"
+            "the newest completed sampling tick has no persist-failed or due-lookup-failed disposition"
         }
         CheckName::MeterErrorClassifications => {
             "every failed attempt in the recent window carries the provider error              classification the sampler stored for it"
@@ -236,7 +236,10 @@ fn outcome(name: CheckName, status: CheckStatus) -> CheckOutcome {
 }
 
 /// SQLite's own health: pragma integrity_check and pragma foreign_key_check,
-/// via the same function backup verification runs (`store::backup`).
+/// via the same function backup verification runs (`store::backup`). A healthy
+/// ledger can still contain resultless attempt starts: once their own stored
+/// command horizon passes, report them as collector interruption evidence
+/// without turning a valid state into a health failure (`aub-7xlf`).
 fn sqlite_and_schema_health(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.db_missing {
         CheckStatus::NotApplicable("no ledger database exists yet".to_string())
@@ -246,7 +249,18 @@ fn sqlite_and_schema_health(ctx: &DoctorContext) -> CheckOutcome {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
             Some(conn) => match crate::store::backup::verify_database_on_connection(conn) {
-                Ok(Ok(_)) => CheckStatus::Pass,
+                Ok(Ok(_)) => match crate::store::meter_attempt::interrupted_attempt_count_at(
+                    conn,
+                    ctx.timestamp,
+                ) {
+                    Ok(0) => CheckStatus::Pass,
+                    Ok(count) => CheckStatus::PassWithDetail(format!(
+                        "{count} meter attempt(s) started without a terminal result past their command horizon; retained as collector interruption evidence"
+                    )),
+                    Err(error) => CheckStatus::Fail(format!(
+                        "database is healthy but interrupted attempts cannot be read: {error}"
+                    )),
+                },
                 Ok(Err(failure)) => {
                     CheckStatus::Fail(format!("{}: {}", failure.stage.as_str(), failure.detail))
                 }
@@ -1232,13 +1246,11 @@ fn last_sample_tick(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::LastSampleTick, status)
 }
 
-/// Every persist-failed and due-lookup-failed sampler disposition ever
-/// recorded, by reason (`aub-b0w6`), read from
+/// Every persist-failed and due-lookup-failed sampler disposition still
+/// present in the newest completed batch, by reason (`aub-b0w6`, `aub-7xlf`), read from
 /// `crate::store::sampling_failure_counts` rather than the ledger or the
-/// scheduler's journal. Cumulative and never self-clearing, the same shape as
-/// [`accumulated_diagnostic_material`]'s retained rows: a nonzero total is a
-/// recurrence worth a human's attention, so it stays a `Fail` until whoever
-/// reads it acts on it, not until the next tick happens to succeed.
+/// scheduler's journal. A continuing recurrence stays a `Fail` and its count
+/// grows; a later completed tick that no longer carries the reason settles it.
 fn sampling_failure_counts(ctx: &DoctorContext) -> CheckOutcome {
     let status = match crate::store::sampling_failure_counts::read_sampling_failure_counts(
         &ctx.config.state.dir,
