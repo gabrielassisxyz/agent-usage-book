@@ -552,7 +552,18 @@ the collinear pair, its correlation, and the condition number against the bound
 (30, the Belsley, Kuh and Welsch threshold), the exit status is the
 insufficient-evidence class, and `calibrate show` reports no new candidate. Either
 outcome closes a controlled burst; the refusal is itself the answer to whether the
-arms separated. A run must have recorded `end` before it can be fitted. With
+arms separated. Two more outcomes sit beside those. A kind whose count was the same
+in every usable block is refused before any coefficient is computed, naming the kind
+and its token count and saying its column never varied, because through the origin
+such a column is an intercept and fits to an arbitrary number of either sign. A kind
+that costs nothing is recorded, not refused: its coefficient is reported as fitted,
+at or a hair below zero, and a fit is refused for a coefficient's sign only when its
+estimate plus two standard errors is below zero, a message naming the kind, the
+estimate and the error. The joint fit reads only the usage the session account
+markers place on the run's own account; usage from other accounts' sessions in the
+same window never enters a block, and usage no marker places on any account is left
+out and listed under `excluded_samples` by session. A run must have recorded `end`
+before it can be fitted. With
 `--format json` the joint fit carries `fit_kind` (`"multivariate"`), `token_kinds`
 (the premise, in stable order), `coefficients` (one object per kind with
 `token_kind`, `estimate_ppm_per_token`, `std_error_ppm_per_token`,
