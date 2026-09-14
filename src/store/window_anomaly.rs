@@ -625,12 +625,14 @@ pub fn detect_and_persist(
                     // is not persisted per row, so the current commit's
                     // bundle carries it for the pair.
                     reset_precision,
+                    nominal_duration: Some(previous_window.nominal_duration),
                 };
                 let current_reading = WindowReading {
                     quota_used: current_window.quota_used,
                     resets_at: current_window.resets_at,
                     observed_at: current_instant,
                     reset_precision,
+                    nominal_duration: Some(current_window.nominal_duration),
                 };
                 if let Some(kind) = classify_window_transition(previous_reading, current_reading) {
                     let detail = format!(
