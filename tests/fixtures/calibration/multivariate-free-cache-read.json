@@ -1,0 +1,95 @@
+{
+  "description": "The independent four-arm design with cache read free: every cache-read block moves the meter only by the output it carries. This is the result the 2026-09-14 burst on a real subscription produced, and the fit must record it as a coefficient at zero rather than refuse it.",
+  "truth_ppm_per_token": {
+    "input": 0.5,
+    "output": 1.0,
+    "cache_read": 0.0,
+    "cache_write": 0.6
+  },
+  "blocks": [
+    {
+      "arm": "cache_write",
+      "input": 0,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 100000
+    },
+    {
+      "arm": "cache_write",
+      "input": 0,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 200000
+    },
+    {
+      "arm": "cache_write",
+      "input": 0,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 300000
+    },
+    {
+      "arm": "cache_read",
+      "input": 0,
+      "output": 20,
+      "cache_read": 100000,
+      "cache_write": 0
+    },
+    {
+      "arm": "cache_read",
+      "input": 0,
+      "output": 20,
+      "cache_read": 200000,
+      "cache_write": 0
+    },
+    {
+      "arm": "cache_read",
+      "input": 0,
+      "output": 20,
+      "cache_read": 300000,
+      "cache_write": 0
+    },
+    {
+      "arm": "output",
+      "input": 30,
+      "output": 1000,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "output",
+      "input": 30,
+      "output": 2000,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "output",
+      "input": 30,
+      "output": 3000,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "input",
+      "input": 20000,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "input",
+      "input": 40000,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 0
+    },
+    {
+      "arm": "input",
+      "input": 60000,
+      "output": 20,
+      "cache_read": 0,
+      "cache_write": 0
+    }
+  ]
+}

@@ -352,16 +352,9 @@ pub fn fit_controlled_run_and_record(
     let residual_ppm = mean_absolute_residual_ppm(&result, &blocks);
     let mut coefficients = Vec::with_capacity(result.coefficients().len());
     for coefficient in result.coefficients() {
-        let estimate = to_micro(coefficient.estimate_ppm_per_token());
-        if estimate <= 0 {
-            return Err(Error::InsufficientEvidence(format!(
-                "fit rejected: the {} coefficient rounds to zero micro-ppm per token and cannot be recorded",
-                coefficient.kind().label()
-            )));
-        }
         coefficients.push(StoredKindCoefficient {
             kind: coefficient.kind(),
-            estimate_micro_ppm_per_token: estimate,
+            estimate_micro_ppm_per_token: to_micro(coefficient.estimate_ppm_per_token()),
             std_error_micro_ppm_per_token: to_micro(coefficient.std_error_ppm_per_token()).max(0),
             interval_low_micro_ppm_per_token: to_micro(coefficient.interval_low_ppm_per_token()),
             interval_high_micro_ppm_per_token: to_micro(coefficient.interval_high_ppm_per_token()),

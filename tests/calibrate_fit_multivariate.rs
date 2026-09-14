@@ -1108,3 +1108,67 @@ fn unattributed_usage_in_the_run_window_is_excluded_by_session() {
     );
     assert_eq!(json["usable_observations"], 12);
 }
+
+const FREE_CACHE_READ: &str =
+    include_str!("fixtures/calibration/multivariate-free-cache-read.json");
+const FREE_CACHE_READ_GOLDEN: &str = "tests/fixtures/calibration/fit-free-cache-read.golden.json";
+
+/// Fields whose value is the moment the fit ran rather than what it found.
+const VOLATILE_FIT_FIELDS: [&str; 2] = ["knowledge_time", "run_id"];
+
+/// A kind that costs nothing is the finding, not a defect: the fit exits 0,
+/// records all four coefficients with cache read at zero within its error,
+/// and the report matches its golden once the fit's own timestamp is removed.
+#[test]
+fn a_free_kind_is_recorded_as_a_coefficient_at_zero() {
+    let state = StateDir::new();
+    let fixture = parse_fixture(FREE_CACHE_READ);
+    seed_burst(&state, &fixture, TokenKind::ALL.to_vec());
+    let mut json = fit_json(&state);
+
+    let coefficients = json["coefficients"].as_array().unwrap();
+    assert_eq!(coefficients.len(), 4);
+    for row in coefficients {
+        let estimate = row["estimate_ppm_per_token"].as_f64().unwrap();
+        let error = row["std_error_ppm_per_token"].as_f64().unwrap();
+        if row["token_kind"] == "cache_read" {
+            assert!(estimate.abs() <= error, "cache_read {estimate} +- {error}");
+        } else {
+            assert!(estimate > 0.0, "{row}");
+        }
+    }
+    let conn = open_test_ledger(&state);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM window_calibration_multivariate_coefficient"
+        ),
+        4
+    );
+
+    for field in VOLATILE_FIT_FIELDS {
+        json.as_object_mut().unwrap().remove(field);
+    }
+    round_floats(&mut json);
+    let golden_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(FREE_CACHE_READ_GOLDEN);
+    let golden: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&golden_path).expect("the golden must exist"),
+    )
+    .expect("the golden must parse");
+    assert_eq!(json, golden, "fit JSON must match {FREE_CACHE_READ_GOLDEN}");
+}
+
+/// Rounds every float to nine decimal places, so the golden pins what the fit
+/// found rather than the last bits of its arithmetic; an exact design leaves
+/// errors near 1e-16 whose trailing digits carry no meaning.
+fn round_floats(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Number(number) if number.is_f64() => {
+            let rounded = (number.as_f64().unwrap() * 1e9).round() / 1e9 + 0.0;
+            *value = serde_json::json!(rounded);
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(round_floats),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(round_floats),
+        _ => {}
+    }
+}

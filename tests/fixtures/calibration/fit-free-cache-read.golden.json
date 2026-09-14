@@ -1,0 +1,90 @@
+{
+  "activated": false,
+  "candidate_id": "mvcand-exp-multivariate-25040f0d2e95020e",
+  "coefficients": [
+    {
+      "estimate_ppm_per_token": 0.5,
+      "interval_high_ppm_per_token": 0.5,
+      "interval_low_ppm_per_token": 0.5,
+      "std_error_ppm_per_token": 0.0,
+      "token_kind": "input"
+    },
+    {
+      "estimate_ppm_per_token": 1.0,
+      "interval_high_ppm_per_token": 1.0,
+      "interval_low_ppm_per_token": 1.0,
+      "std_error_ppm_per_token": 0.0,
+      "token_kind": "output"
+    },
+    {
+      "estimate_ppm_per_token": 0.0,
+      "interval_high_ppm_per_token": 0.0,
+      "interval_low_ppm_per_token": 0.0,
+      "std_error_ppm_per_token": 0.0,
+      "token_kind": "cache_read"
+    },
+    {
+      "estimate_ppm_per_token": 0.6,
+      "interval_high_ppm_per_token": 0.6,
+      "interval_low_ppm_per_token": 0.6,
+      "std_error_ppm_per_token": 0.0,
+      "token_kind": "cache_write"
+    }
+  ],
+  "condition_number": 1.015342071,
+  "condition_number_micros": 1015342,
+  "condition_number_threshold": 30.0,
+  "excluded_samples": [],
+  "experiment_id": "exp-multivariate",
+  "fit_kind": "multivariate",
+  "fit_residual_ppm": 0.0,
+  "inputs_count": 38,
+  "inputs_digest": "25040f0d2e95020e",
+  "pairwise_correlations": [
+    {
+      "correlation": -0.272987599,
+      "first": "input",
+      "second": "cache_read"
+    },
+    {
+      "correlation": -0.272987599,
+      "first": "input",
+      "second": "cache_write"
+    },
+    {
+      "correlation": -0.272727273,
+      "first": "cache_read",
+      "second": "cache_write"
+    },
+    {
+      "correlation": -0.272225256,
+      "first": "output",
+      "second": "cache_read"
+    },
+    {
+      "correlation": -0.272225256,
+      "first": "output",
+      "second": "cache_write"
+    },
+    {
+      "correlation": -0.271668261,
+      "first": "input",
+      "second": "output"
+    }
+  ],
+  "phase_design": "controlled-run=exp-multivariate;kinds=input,output,cache_read,cache_write;frame=settled-blocks",
+  "plan_tier": "max-5x",
+  "provider": "anthropic",
+  "residual_percentage_points": 0.0,
+  "sample_count": 12,
+  "statistical_method": "multivariate-ols-through-origin",
+  "statistical_parameters": "kinds=[input,output,cache_read,cache_write];n=12;p=4;dof=8;residual_variance_ppm2=0.000;ridge_penalty=0;intervals=normal-approx-1.96;columns=unit-norm",
+  "token_kinds": [
+    "input",
+    "output",
+    "cache_read",
+    "cache_write"
+  ],
+  "usable_observations": 12,
+  "window_semantic_key": "five_hour"
+}

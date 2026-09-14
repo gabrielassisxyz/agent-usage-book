@@ -285,8 +285,8 @@ mod tests {
             "an unknown kind must be refused"
         );
         assert!(
-            insert("output", 0).is_err(),
-            "a zero estimate must be refused"
+            insert("output", -1).is_err(),
+            "a negative estimate with no error must be refused (0042 admits zero)"
         );
         assert!(
             insert("input", 7).is_err(),

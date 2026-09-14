@@ -147,6 +147,9 @@ mod migration_0040;
 #[path = "0041_meter_attempt_account_newest_index.rs"]
 mod migration_0041;
 
+#[path = "0042_multivariate_coefficient_sign.rs"]
+mod migration_0042;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -194,5 +197,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0039::migration(),
         migration_0040::migration(),
         migration_0041::migration(),
+        migration_0042::migration(),
     ]
 }
