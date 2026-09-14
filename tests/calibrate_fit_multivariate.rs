@@ -12,6 +12,7 @@ use std::process::Command;
 use agent_usage_book::calibration::contamination::ContaminationThresholds;
 use agent_usage_book::domain::attempt::AttemptOutcome;
 use agent_usage_book::domain::ids::{AdapterVersion, MeterSemanticsId, ProviderContractId};
+use agent_usage_book::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
 use agent_usage_book::domain::provenance::CostModelId;
 use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
@@ -29,14 +30,19 @@ use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, NewMete
 use agent_usage_book::store::meter_evidence::{
     NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, ObservationRowId,
 };
+use agent_usage_book::store::session_account_marker::{
+    EvidenceDesignation, MarkerSource, NewSessionAccountMarker, insert_marker,
+};
 use agent_usage_book::store::usage_component::NewUsageComponent;
 use agent_usage_book::store::usage_event::NewUsageEvent;
+use agent_usage_book::store::usage_occurrence::{NewUsageOccurrence, insert_occurrence};
 use agent_usage_book::store::{
     account as account_store, connection, meter_attempt as attempt_store,
     meter_evidence as evidence_store, migrate, migrations, sample_run as run_store,
     sampling_policy_snapshot as snapshot_store, usage_component as component_store,
     usage_event as event_store,
 };
+use agent_usage_book::transcripts::parser::ParserVersion;
 use rusqlite::Connection;
 use test_support::StateDir;
 
@@ -44,6 +50,8 @@ const SECOND: i64 = 1_000_000_000;
 const EXPERIMENT: &str = "exp-multivariate";
 const ACCOUNT: &str = "bianca";
 const WINDOW: &str = "five_hour";
+const SESSION_SOURCE: &str = "claude-code";
+const BURST_SESSION: &str = "burst-session";
 const BASELINE_PPM: i64 = 100_000;
 const SINGLE_KIND_EXPERIMENT: &str = "exp-single-kind";
 const SINGLE_KIND_BLOCKS: usize = 4;
@@ -250,13 +258,43 @@ fn reading(
     observation_id
 }
 
-fn spend(conn: &Connection, at_nanos: i64, index: usize, block: &ArmBlock) {
+/// Places `native` on `account` from `at_nanos` onward, the way a launcher
+/// hook records which subscription a session runs on.
+fn attribute_session(conn: &Connection, native: &str, account: &str, at_nanos: i64) {
+    insert_marker(
+        conn,
+        &NewSessionAccountMarker {
+            session_id: SessionId::new(
+                SourceNamespace::new(SESSION_SOURCE),
+                NativeSessionId::new(native),
+            ),
+            observed_at: UtcTimestamp::from_unix_nanos(at_nanos),
+            source_ordering_key: None,
+            logical_account: account.to_string(),
+            resolved_account_id: None,
+            marker_source: MarkerSource::new("hook"),
+            run_id: None,
+            evidence_designation: EvidenceDesignation::ExplicitLauncherOrHook,
+        },
+    )
+    .unwrap();
+}
+
+/// Inserts one usage event of `native`'s session with its transcript
+/// occurrence, which is where the session's source namespace is recorded.
+fn usage_event(
+    conn: &Connection,
+    native: &str,
+    canonical_id: &str,
+    at_nanos: i64,
+    counts: &[(TokenKind, u64)],
+) {
     let ts = UtcTimestamp::from_unix_nanos(at_nanos);
     let event_id = event_store::insert_event(
         conn,
         &NewUsageEvent {
-            canonical_event_id: &format!("burst-block-{index}"),
-            session_id: Some("burst-session"),
+            canonical_event_id: canonical_id,
+            session_id: Some(native),
             event_timestamp: Some(ts),
             model_id: Some("claude-opus"),
             evidence_kind: "transcript",
@@ -266,17 +304,46 @@ fn spend(conn: &Connection, at_nanos: i64, index: usize, block: &ArmBlock) {
         },
     )
     .unwrap();
-    for (kind, count) in block.counts {
+    for (kind, count) in counts {
         component_store::insert_component(
             conn,
             &NewUsageComponent {
                 event_id,
                 token_class: kind.label(),
-                count,
+                count: *count,
             },
         )
         .unwrap();
     }
+    insert_occurrence(
+        conn,
+        &NewUsageOccurrence {
+            source_namespace: &SourceNamespace::new(SESSION_SOURCE),
+            native_event_id: Some(canonical_id),
+            parser_version: &ParserVersion::new("claude-code-1"),
+            heuristic_key: None,
+            source_file: &format!("corpus/{native}.jsonl"),
+            occurred_at_nanos: Some(at_nanos),
+            event_id: Some(event_id),
+            transcript_file_id: None,
+            source_location: None,
+            canonical_fingerprint: None,
+            identity_strength: None,
+            heuristic_algorithm_version: None,
+            canonical_payload_digest: None,
+        },
+    )
+    .unwrap();
+}
+
+fn spend(conn: &Connection, at_nanos: i64, index: usize, block: &ArmBlock) {
+    usage_event(
+        conn,
+        BURST_SESSION,
+        &format!("burst-block-{index}"),
+        at_nanos,
+        &block.counts,
+    );
 }
 
 /// Seeds a whole controlled burst from an arm fixture: the baseline reading,
@@ -309,6 +376,7 @@ fn seed_burst(state: &StateDir, fixture: &ArmFixture, expected_kinds: Vec<TokenK
         exclusivity_assertion: format!("account {ACCOUNT} reserved for {EXPERIMENT}"),
     };
     insert_begin(&conn, &run).unwrap();
+    attribute_session(&conn, BURST_SESSION, ACCOUNT, t0);
 
     let mut cumulative_ppm = BASELINE_PPM as f64;
     let mut t = t0 + 60 * SECOND;
@@ -595,30 +663,13 @@ const UNIVARIATE_JSON_KEYS: [&str; 20] = [
 ];
 
 fn spend_output(conn: &Connection, at_nanos: i64, index: usize, tokens: u64) {
-    let ts = UtcTimestamp::from_unix_nanos(at_nanos);
-    let event_id = event_store::insert_event(
+    usage_event(
         conn,
-        &NewUsageEvent {
-            canonical_event_id: &format!("single-kind-block-{index}"),
-            session_id: Some("burst-session"),
-            event_timestamp: Some(ts),
-            model_id: Some("claude-opus"),
-            evidence_kind: "transcript",
-            source_provenance: "test",
-            parser_version: "v1",
-            created_at: ts,
-        },
-    )
-    .unwrap();
-    component_store::insert_component(
-        conn,
-        &NewUsageComponent {
-            event_id,
-            token_class: TokenKind::Output.label(),
-            count: tokens,
-        },
-    )
-    .unwrap();
+        BURST_SESSION,
+        &format!("single-kind-block-{index}"),
+        at_nanos,
+        &[(TokenKind::Output, tokens)],
+    );
 }
 
 /// Seeds a controlled run whose premise names output alone: the baseline
@@ -943,4 +994,117 @@ fn promoting_a_joint_candidate_is_refused_naming_the_successor_bead() {
         0,
         "a refused promotion records no result"
     );
+}
+
+fn fit_json(state: &StateDir) -> serde_json::Value {
+    let output = run_aub(
+        state,
+        &[
+            "calibrate",
+            "fit",
+            "--experiment",
+            EXPERIMENT,
+            "--format",
+            "json",
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout: {stdout}\nstderr: {stderr}"
+    );
+    serde_json::from_str(stdout.trim()).expect("stdout must be JSON")
+}
+
+/// The first block of `seed_burst` spends at this instant; a foreign event a
+/// few seconds later lands inside that block's interval.
+const FIRST_BLOCK_AT: i64 = 1_060 * SECOND;
+
+/// A session on another account spending millions of cache-read tokens in
+/// the middle of the run is the machine the burst ran on, not the run. The
+/// coefficients fitted with it present are the ones fitted without it.
+#[test]
+fn usage_of_another_account_in_the_run_window_never_enters_the_fit() {
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    let clean = StateDir::new();
+    seed_burst(&clean, &fixture, TokenKind::ALL.to_vec());
+    let clean_json = fit_json(&clean);
+
+    let contaminated = StateDir::new();
+    seed_burst(&contaminated, &fixture, TokenKind::ALL.to_vec());
+    let conn = open_test_ledger(&contaminated);
+    attribute_session(&conn, "orchestrator-session", "someone-else", 900 * SECOND);
+    usage_event(
+        &conn,
+        "orchestrator-session",
+        "orchestrator-turn",
+        FIRST_BLOCK_AT + 5 * SECOND,
+        &[
+            (TokenKind::CacheRead, 3_400_000),
+            (TokenKind::Output, 3_300),
+        ],
+    );
+    drop(conn);
+    let contaminated_json = fit_json(&contaminated);
+
+    for kind in TokenKind::ALL {
+        let estimate = |json: &serde_json::Value| {
+            json["coefficients"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["token_kind"] == kind.label())
+                .map(|c| c["estimate_ppm_per_token"].clone())
+                .unwrap()
+        };
+        assert_eq!(
+            estimate(&contaminated_json),
+            estimate(&clean_json),
+            "{} moved when a foreign account's usage was added",
+            kind.label()
+        );
+    }
+    assert_eq!(
+        contaminated_json["excluded_samples"],
+        clean_json["excluded_samples"]
+    );
+}
+
+/// Usage no marker places on any account is left out and named, so a run
+/// whose own sessions lost their markers shows up instead of fitting blind.
+#[test]
+fn unattributed_usage_in_the_run_window_is_excluded_by_session() {
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    let state = StateDir::new();
+    seed_burst(&state, &fixture, TokenKind::ALL.to_vec());
+    let conn = open_test_ledger(&state);
+    usage_event(
+        &conn,
+        "orphan-session",
+        "orphan-turn",
+        FIRST_BLOCK_AT + 5 * SECOND,
+        &[(TokenKind::CacheRead, 3_400_000)],
+    );
+    drop(conn);
+
+    let json = fit_json(&state);
+    let clean = StateDir::new();
+    seed_burst(&clean, &fixture, TokenKind::ALL.to_vec());
+    assert_eq!(
+        json["coefficients"],
+        fit_json(&clean)["coefficients"],
+        "unattributed usage must not reach the blocks"
+    );
+    let excluded = json["excluded_samples"].as_array().unwrap();
+    let orphan = excluded
+        .iter()
+        .find(|sample| sample["sample_ref"] == "session:claude-code/orphan-session")
+        .unwrap_or_else(|| panic!("orphan session not excluded: {excluded:?}"));
+    assert!(
+        orphan["reason"].as_str().unwrap().contains("unattributed"),
+        "{orphan}"
+    );
+    assert_eq!(json["usable_observations"], 12);
 }

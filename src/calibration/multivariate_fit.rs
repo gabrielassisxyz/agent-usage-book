@@ -27,7 +27,7 @@
 //! - transcripts (the calibration layer never parses transcripts)
 //! - presentation
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::Connection;
 
@@ -37,21 +37,26 @@ use super::fitter::{
 use super::multivariate::{
     MultivariateFitConfig, MultivariateFitObservation, MultivariateFitResult, fit_multivariate,
 };
+use crate::attribution::account_segment::{
+    self, AccountMarkerBoundary, AccountSegmentTarget, AccountSegmentationInputs, AccountUsageEvent,
+};
 use crate::domain::credits::Credits;
+use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
 use crate::domain::provenance::EvidenceId;
 use crate::domain::time::{Clock, UtcTimestamp};
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenKind,
 };
 use crate::error::Error;
-use crate::store::calibration::load_experiment_usage;
 use crate::store::calibration::{ConditionNumber, EvidenceDigest, ExcludedSample};
+use crate::store::calibration::{StoredUsageEvent, load_experiment_usage};
 use crate::store::calibration_controlled::ControlledExperimentRun;
 use crate::store::calibration_multivariate::{
     MultivariateCandidate, MultivariateCandidateId, StoredKindCoefficient,
     insert_multivariate_candidate, load_multivariate_candidate, observations_for_run,
 };
 use crate::store::cost_model::ValidityInterval;
+use crate::store::session_account_marker::markers_for_session;
 
 /// Which fitter `calibrate fit` runs for an experiment, decided by its premise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -164,6 +169,105 @@ fn settled_blocks(
     blocks
 }
 
+/// The account-marker timeline of every session the usage rows name.
+fn markers_by_session(
+    conn: &Connection,
+    usage: &[StoredUsageEvent],
+) -> Result<BTreeMap<(String, String), Vec<AccountMarkerBoundary>>, Error> {
+    let mut markers = BTreeMap::new();
+    for (source, native) in usage.iter().filter_map(|row| row.session.as_ref()) {
+        if markers.contains_key(&(source.clone(), native.clone())) {
+            continue;
+        }
+        let session_id = SessionId::new(
+            SourceNamespace::new(source.clone()),
+            NativeSessionId::new(native.clone()),
+        );
+        let boundaries = markers_for_session(conn, &session_id)?
+            .iter()
+            .map(|marker| marker.boundary())
+            .collect();
+        markers.insert((source.clone(), native.clone()), boundaries);
+    }
+    Ok(markers)
+}
+
+/// Keeps the usage rows of the events [`account_segment::assign`] places on
+/// `account`. `calibrate begin --assert-exclusive` can only promise that
+/// nothing else spends the account; the machine driving the burst always runs
+/// other sessions on other accounts, and their tokens are not the run's. Rows
+/// no marker places on any account are left out too, one excluded sample per
+/// session, so a run whose own sessions lost their markers is visible rather
+/// than fitted to empty blocks.
+fn retain_account_usage(
+    usage: Vec<StoredUsageEvent>,
+    markers: &BTreeMap<(String, String), Vec<AccountMarkerBoundary>>,
+    account: &str,
+) -> Result<(Vec<StoredUsageEvent>, Vec<ExcludedSample>), Error> {
+    let mut event_times: BTreeMap<Option<(String, String)>, BTreeMap<String, UtcTimestamp>> =
+        BTreeMap::new();
+    for row in &usage {
+        event_times
+            .entry(row.session.clone())
+            .or_default()
+            .insert(row.canonical_event_id.clone(), row.timestamp);
+    }
+
+    let mut kept_events: BTreeSet<String> = BTreeSet::new();
+    let mut unattributed = Vec::new();
+    for (session, times) in &event_times {
+        let boundaries = session
+            .as_ref()
+            .and_then(|key| markers.get(key))
+            .cloned()
+            .unwrap_or_default();
+        let ids: Vec<&String> = times.keys().collect();
+        let assigned = account_segment::assign(&AccountSegmentationInputs {
+            markers: boundaries,
+            usage: times
+                .values()
+                .map(|at| AccountUsageEvent {
+                    occurred_at: *at,
+                    usage: KnownTokenVector::new(
+                        InputTokens::new(0),
+                        OutputTokens::new(0),
+                        CacheReadTokens::new(0),
+                        CacheWriteTokens::new(0),
+                    ),
+                })
+                .collect(),
+        });
+        let mut unplaced = 0usize;
+        for (id, (target, _)) in ids.into_iter().zip(assigned) {
+            match target {
+                AccountSegmentTarget::Account(owner) if owner == account => {
+                    kept_events.insert(id.clone());
+                }
+                AccountSegmentTarget::Account(_) => {}
+                AccountSegmentTarget::UnknownAccount => unplaced += 1,
+            }
+        }
+        if unplaced > 0 {
+            let reference = match session {
+                Some((source, native)) => format!("session:{source}/{native}"),
+                None => "session:none".to_string(),
+            };
+            unattributed.push(ExcludedSample::new(
+                reference,
+                format!(
+                    "excluded: {unplaced} usage events unattributed to any account by session markers"
+                ),
+            )?);
+        }
+    }
+
+    let own = usage
+        .into_iter()
+        .filter(|row| kept_events.contains(&row.canonical_event_id))
+        .collect();
+    Ok((own, unattributed))
+}
+
 fn to_micro(value: f64) -> i64 {
     (value * MICRO).round() as i64
 }
@@ -205,10 +309,11 @@ pub fn fit_controlled_run_and_record(
         .collect();
     let (usable, excluded_samples) = partition_usable_observations(&observations);
 
+    let usage = load_experiment_usage(conn, run.started_at, ended_at)?;
+    let markers = markers_by_session(conn, &usage)?;
+    let (own_usage, unattributed) = retain_account_usage(usage, &markers, &run.account)?;
     let mut events: Vec<(UtcTimestamp, KnownTokenVector)> =
-        aggregate_event_tokens(load_experiment_usage(conn, run.started_at, ended_at)?)?
-            .into_values()
-            .collect();
+        aggregate_event_tokens(own_usage)?.into_values().collect();
     events.sort_by_key(|(at, _)| *at);
 
     let blocks = settled_blocks(&usable, &events);
@@ -296,6 +401,7 @@ pub fn fit_controlled_run_and_record(
     }
 
     let mut all_excluded = excluded_samples;
+    all_excluded.extend(unattributed);
     all_excluded.extend(result.excluded_samples().iter().cloned());
     Ok(MultivariateFitOutcome {
         usable_observations: result.usable_observations(),
@@ -415,6 +521,59 @@ mod tests {
         assert_eq!(blocks[1].tokens.output().value(), 1_000);
         assert_eq!(blocks[1].delta_ppm, 10_000.0);
         assert_eq!(blocks[1].evidence_id.as_str(), "r6");
+    }
+
+    fn usage_row(id: &str, session: &str, at: i64, cache_read: u64) -> StoredUsageEvent {
+        StoredUsageEvent {
+            canonical_event_id: id.to_string(),
+            timestamp: UtcTimestamp::from_unix_nanos(at),
+            model_id: None,
+            token_class: "cache_read".to_string(),
+            count: cache_read,
+            session: Some(("claude-code".to_string(), session.to_string())),
+        }
+    }
+
+    /// A session that switches accounts mid-way contributes only its events
+    /// after the switch to the new account; a session on another account
+    /// contributes nothing; a session with no marker is reported, not kept.
+    #[test]
+    fn only_usage_placed_on_the_run_account_is_kept() {
+        use crate::attribution::account_segment::AccountEvidenceClass;
+        let boundary = |account: &str, at: i64| {
+            AccountMarkerBoundary::new(
+                account,
+                UtcTimestamp::from_unix_nanos(at),
+                None,
+                AccountEvidenceClass::ExplicitLauncherOrHook,
+                true,
+            )
+        };
+        let mut markers = BTreeMap::new();
+        markers.insert(
+            ("claude-code".to_string(), "switching".to_string()),
+            vec![boundary("other", 0), boundary("bianca", 100)],
+        );
+        markers.insert(
+            ("claude-code".to_string(), "foreign".to_string()),
+            vec![boundary("other", 0)],
+        );
+        let usage = vec![
+            usage_row("before-switch", "switching", 50, 1),
+            usage_row("after-switch", "switching", 150, 2),
+            usage_row("foreign-turn", "foreign", 150, 4),
+            usage_row("orphan-turn", "orphan", 150, 8),
+        ];
+
+        let (kept, excluded) = retain_account_usage(usage, &markers, "bianca").unwrap();
+
+        let kept_ids: Vec<&str> = kept
+            .iter()
+            .map(|row| row.canonical_event_id.as_str())
+            .collect();
+        assert_eq!(kept_ids, vec!["after-switch"]);
+        assert_eq!(excluded.len(), 1);
+        assert_eq!(excluded[0].sample_ref(), "session:claude-code/orphan");
     }
 
     /// Readings with no spend between them open no block at all.

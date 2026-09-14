@@ -1007,6 +1007,9 @@ pub struct StoredUsageEvent {
     pub model_id: Option<String>,
     pub token_class: String,
     pub count: u64,
+    /// The event's session as `(source namespace, native id)`, when both are
+    /// known; the key its account markers are read by.
+    pub session: Option<(String, String)>,
 }
 
 /// Loads all usage events within a time interval for calculating cumulative credits.
@@ -1022,7 +1025,9 @@ pub fn load_experiment_usage(
                 ue.event_timestamp,
                 ue.model_id,
                 uc.token_class,
-                uc.count
+                uc.count,
+                ue.session_id,
+                (SELECT MIN(o.source_namespace) FROM usage_occurrence o WHERE o.event_id = ue.id)
              FROM usage_event ue
              JOIN usage_component uc ON uc.event_id = ue.id
              WHERE ue.event_timestamp >= ?1 AND ue.event_timestamp <= ?2
@@ -1037,13 +1042,15 @@ pub fn load_experiment_usage(
             let model: Option<String> = row.get(2)?;
             let token_class: String = row.get(3)?;
             let count: i64 = row.get(4)?;
-            Ok((id, ts, model, token_class, count))
+            let native: Option<String> = row.get(5)?;
+            let source: Option<String> = row.get(6)?;
+            Ok((id, ts, model, token_class, count, source.zip(native)))
         })
         .map_err(|e| Error::Store(format!("cannot query experiment usage: {e}")))?;
 
     let mut events = Vec::new();
     for row_res in rows {
-        let (id, ts, model, token_class, count) =
+        let (id, ts, model, token_class, count, session) =
             row_res.map_err(|e| Error::Store(format!("cannot read usage row: {e}")))?;
         let count_u64 = u64::try_from(count)
             .map_err(|_| Error::Store("stored token count is negative".into()))?;
@@ -1053,6 +1060,7 @@ pub fn load_experiment_usage(
             model_id: model,
             token_class,
             count: count_u64,
+            session,
         });
     }
     Ok(events)
