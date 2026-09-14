@@ -772,6 +772,7 @@ Named here because the rules above are useless to a reader who cannot find them.
 | A clone has no hooks until `bin/install-hooks` runs, so the secret scan is off on a fresh checkout | prose | run it once after cloning |
 | An aggregated test command that aborts early on a compile error reports a misleadingly green prefix as if it were the total | tripwire | fix compile errors first; only a fully compiling run yields a true count |
 | A rate-limit message persists in a pane buffer after the limit has lifted, and the CLI does not retry by itself | prose | nudge the pane and confirm before idling it |
+| `cargo install --path .` without the machine's `--root` writes a second `aub` to `~/.cargo/bin`, which usually sits ahead on `PATH`, while the scheduler keeps running the build at the path its unit names. Scripts and the scheduler then run different commits and nothing says so | prose | installing is an operator step, not a bead step; reinstall with the same `--root` the unit's path came from (docs/operations.md, section 1) |
 
 **A hurdle promoted to a gate is deleted from this table, not duplicated.** The gate is the
 instruction; a line here restating it only dilutes the ones still unguarded.

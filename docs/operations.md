@@ -14,6 +14,19 @@ it from source with `cargo install --path .` (see
 read an interactive shell's `PATH`, so every example from here on names that
 path explicitly.
 
+A reinstall has to write the same path the unit names. `cargo install --path .`
+writes to `~/.cargo/bin/aub`; if the unit was pointed at another install root,
+for example `~/.local/bin/aub` from `cargo install --path . --root ~/.local`, a
+later plain `cargo install` leaves the scheduler on the old build while every
+shell and script that resolves `aub` through `PATH` runs the new one. Nothing
+reports the split, and because any `aub` command applies pending migrations
+when it opens the ledger, the newer binary can move the schema past the one the
+scheduler runs. Pick one install root, pass the same `--root` on every
+reinstall, and have scripts name the absolute path as well. A build that adds a
+migration is worth running first against a copy of the state directory
+(`AUB_STATE_DIR=<copy> aub account list` opens it, and so migrates it, then
+`aub doctor` against the same copy reads the result).
+
 ## 2. Configure
 
 Write `$HOME/.config/aub/config.toml` (or point `AUB_CONFIG_FILE` at another
