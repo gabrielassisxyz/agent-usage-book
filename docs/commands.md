@@ -574,7 +574,14 @@ estimate and the error. The joint fit reads only the usage the session account
 markers place on the run's own account; usage from other accounts' sessions in the
 same window never enters a block, and usage no marker places on any account is left
 out and listed under `excluded_samples` by session. A run must have recorded `end`
-before it can be fitted. With
+before it can be fitted. The last block has no next spend to close it, so the fit
+reads no reading taken after the settlement bound: `end` plus the post-settlement
+grace recorded at `begin` (one hour by default), or, when the markers place usage on
+the run's own account after `end` and inside that grace, the instant before the
+first such event. Readings between `end` and the bound still settle the last block;
+anything past it measures the window after the run and changes neither the blocks
+nor the inputs digest. Usage no marker places on any account does not move the
+bound. With
 `--format json` the joint fit carries `fit_kind` (`"multivariate"`), `token_kinds`
 (the premise, in stable order), `coefficients` (one object per kind with
 `token_kind`, `estimate_ppm_per_token`, `std_error_ppm_per_token`,
