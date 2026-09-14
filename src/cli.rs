@@ -1748,9 +1748,9 @@ pub(crate) fn sample_command(
 
     // A malformed-database recurrence (`aub-lz0k`) surfaces as a `PersistFailed`
     // or `DueLookupFailed` disposition, not as an `Err` from `run_result` above,
-    // so it is invisible to `sample_tick`'s single latest-tick record. Counted
-    // here, durably and by reason, so a second occurrence of the same reason is
-    // a number that grew rather than a line that scrolled past in the journal.
+    // so it is invisible to `sample_tick`'s single latest-tick record. Reconcile
+    // the durable counts from the completed batch: a continuing failure grows,
+    // while a reason absent from this successful tick is settled (`aub-7xlf`).
     // A count-write failure is a diagnostic-aid failure, same as the tick
     // marker above, so it never masks or replaces the tick's own result.
     let _ = record_sampling_failure_counts(&config.state.dir, &batch_report.accounts);
@@ -2288,40 +2288,31 @@ fn sampling_disposition_error(
     Ok(())
 }
 
-/// Counts every `PersistFailed` and `DueLookupFailed` disposition in `accounts`
-/// by its own reason, durably (`aub-b0w6`). Called once per `sample` tick with
-/// that tick's accounts; a tick with none of the two dispositions increments
-/// nothing, which is what keeps a later success from resetting an earlier
-/// failure's count, unlike `crate::store::sample_tick`'s single latest-tick
-/// record.
+/// Reconciles every `PersistFailed` and `DueLookupFailed` disposition in one
+/// completed tick with the durable per-reason counts (`aub-b0w6`, `aub-7xlf`).
+/// A failure present again increments; a failure absent from this tick is no
+/// longer current and is removed.
 fn record_sampling_failure_counts(
     state_dir: &Path,
     accounts: &[crate::meter::sampler::AccountReport],
 ) -> Result<(), Error> {
-    for report in accounts {
-        match &report.disposition {
+    let failures = accounts
+        .iter()
+        .filter_map(|report| match &report.disposition {
             crate::meter::sampler::AccountDisposition::PersistFailed { reason, .. } => {
-                crate::store::sampling_failure_counts::record_sampling_failure(
-                    state_dir,
-                    "persist_failed",
-                    reason,
-                )?;
+                Some(("persist_failed", reason.as_str()))
             }
             crate::meter::sampler::AccountDisposition::DueLookupFailed { reason } => {
-                crate::store::sampling_failure_counts::record_sampling_failure(
-                    state_dir,
-                    "due_lookup_failed",
-                    reason,
-                )?;
+                Some(("due_lookup_failed", reason.as_str()))
             }
             crate::meter::sampler::AccountDisposition::NotYet { .. }
             | crate::meter::sampler::AccountDisposition::LeaseHeld { .. }
             | crate::meter::sampler::AccountDisposition::EligibilityFailed { .. }
             | crate::meter::sampler::AccountDisposition::Sampled(_)
-            | crate::meter::sampler::AccountDisposition::Spooled { .. } => {}
-        }
-    }
-    Ok(())
+            | crate::meter::sampler::AccountDisposition::Spooled { .. } => None,
+        })
+        .collect::<Vec<_>>();
+    crate::store::sampling_failure_counts::reconcile_sampling_failure_counts(state_dir, &failures)
 }
 
 /// Writes the `now` report in the requested format. One freshness variant per
@@ -10820,16 +10811,13 @@ usage_evidence = "measured"
         }
     }
 
-    /// `record_sampling_failure_counts` is the glue between the disposition a
-    /// tick produced and the durable per-reason counter (`aub-b0w6`): a
+    /// `record_sampling_failure_counts` is the glue between one completed
+    /// tick and the durable per-reason counter (`aub-b0w6`, `aub-7xlf`). A
     /// `PersistFailed` and a `DueLookupFailed` each add one to their own
-    /// category's count, and every other disposition, including a successful
-    /// `Sampled` one, adds nothing. The planted negative is the second call
-    /// below: a tick with no failing disposition must leave the first tick's
-    /// count exactly as it was, never resetting it the way `sample_tick`'s
-    /// single latest-tick record would.
+    /// category's count. The next tick retains only a failure that recurs,
+    /// then a clean tick settles it too.
     #[test]
-    fn record_sampling_failure_counts_counts_failures_by_reason_and_ignores_success() {
+    fn record_sampling_failure_counts_reconciles_each_completed_tick() {
         use crate::domain::attempt::{AttemptId, AttemptOutcome};
         use crate::meter::sampler::{AccountDisposition, AccountReport, SampledAttempt};
         use crate::store::sampling_lease::AccountName;
@@ -10883,6 +10871,29 @@ usage_evidence = "measured"
             ]
         );
 
+        let due_lookup_failed_again = AccountReport {
+            name: AccountName::new("work-b"),
+            disposition: AccountDisposition::DueLookupFailed {
+                reason: "database disk image is malformed".to_string(),
+            },
+        };
+        record_sampling_failure_counts(&state_dir, &[due_lookup_failed_again]).unwrap();
+
+        let counts_after_recurrence =
+            crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
+                .unwrap();
+        assert_eq!(
+            counts_after_recurrence,
+            vec![
+                crate::store::sampling_failure_counts::SamplingFailureCount {
+                    category: "due_lookup_failed".to_string(),
+                    reason: "database disk image is malformed".to_string(),
+                    count: 2,
+                },
+            ],
+            "the current failure keeps accumulating while the absent one is settled"
+        );
+
         let sampled = AccountReport {
             name: AccountName::new("work-a"),
             disposition: AccountDisposition::Sampled(SampledAttempt {
@@ -10897,14 +10908,13 @@ usage_evidence = "measured"
         };
         record_sampling_failure_counts(&state_dir, &[sampled]).unwrap();
 
-        let counts_after_success =
+        let counts_after_clean_tick =
             crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
                 .unwrap();
-        let mut counts_after_success = counts_after_success;
-        counts_after_success.sort_by(|a, b| a.category.cmp(&b.category));
         assert_eq!(
-            counts_after_success, counts,
-            "a successful tick must not reset the earlier failures' count"
+            counts_after_clean_tick,
+            Vec::<crate::store::sampling_failure_counts::SamplingFailureCount>::new(),
+            "a clean completed tick must settle every earlier failure"
         );
 
         std::fs::remove_dir_all(&state_dir).unwrap();

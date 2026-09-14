@@ -1,5 +1,5 @@
-//! Durable, accumulating counts of `aub sample` disposition failures by
-//! reason (`aub-b0w6`).
+//! Durable counts of currently recurring `aub sample` disposition failures
+//! by reason (`aub-b0w6`, `aub-7xlf`).
 //!
 //! `crate::store::sample_tick` records only the *last* tick's outcome and
 //! replaces it on every write, so a lone `persist-failed` or
@@ -8,9 +8,10 @@
 //! (`aub-lz0k`) was exactly that: a `SQLITE_CORRUPT` surfacing once, self-
 //! healing, and visible afterwards only in the scheduler's own journal. This
 //! module is the counter that survives it: every occurrence of a given
-//! `(category, reason)` pair adds to a running total that a later success
-//! never resets, so a recurrence of the same reason is a number that grew
-//! rather than a line that scrolled past.
+//! `(category, reason)` pair adds to a running total while that failure keeps
+//! appearing. Each completed batch reconciles the file to the failures in
+//! that batch, so a later clean tick settles the old diagnostic instead of
+//! reporting it forever.
 //!
 //! May not depend on:
 //! - presentation
@@ -46,25 +47,44 @@ pub fn sampling_failure_counts_path(state_dir: &Path) -> PathBuf {
     state_dir.join(SAMPLING_FAILURE_COUNTS_FILE_NAME)
 }
 
-/// Increments the count for `(category, reason)` by one, leaving every other
-/// pair's count untouched. Reads the existing file first, so this adds to a
-/// running total rather than replacing it the way `sample_tick` replaces its
-/// single latest-tick record.
-pub fn record_sampling_failure(
+/// Reconciles the counts with one completed sample batch.
+///
+/// Every occurrence in `failures` increments its pair's prior count. A pair
+/// absent from the completed batch is removed: its last occurrence predates
+/// the newest successful tick and is no longer an active diagnostic. An empty
+/// batch therefore writes an empty map rather than leaving stale failures on
+/// disk.
+pub fn reconcile_sampling_failure_counts(
     state_dir: &Path,
-    category: &str,
-    reason: &str,
+    failures: &[(&str, &str)],
 ) -> Result<(), Error> {
     ensure_dir_mode_0700(state_dir)?;
-    let mut counts = read_counts_map(state_dir)?;
-    *counts
-        .entry((category.to_string(), reason.to_string()))
-        .or_insert(0) += 1;
-    write_counts_map(state_dir, &counts)
+    let prior = read_counts_map(state_dir)?;
+    let mut current = BTreeMap::new();
+    for (category, reason) in failures {
+        let key = ((*category).to_string(), (*reason).to_string());
+        let occurrences = current.entry(key).or_insert(0u64);
+        *occurrences = occurrences.checked_add(1).ok_or_else(|| {
+            Error::Store("sampling failure occurrence count overflowed u64".to_string())
+        })?;
+    }
+
+    let mut reconciled = BTreeMap::new();
+    for (key, occurrences) in current {
+        let previous = prior.get(&key).copied().unwrap_or(0);
+        let count = previous.checked_add(occurrences).ok_or_else(|| {
+            Error::Store(format!(
+                "sampling failure count overflowed u64 for {}/{}",
+                key.0, key.1
+            ))
+        })?;
+        reconciled.insert(key, count);
+    }
+    write_counts_map(state_dir, &reconciled)
 }
 
-/// Reads every recorded `(category, reason)` count, sorted for a
-/// deterministic report. Empty when no failure has ever been recorded.
+/// Reads every currently recurring `(category, reason)` count, sorted for a
+/// deterministic report. Empty after a completed batch with no failures.
 pub fn read_sampling_failure_counts(state_dir: &Path) -> Result<Vec<SamplingFailureCount>, Error> {
     let counts = read_counts_map(state_dir)?;
     Ok(counts
@@ -259,7 +279,8 @@ mod tests {
     #[test]
     fn one_recorded_failure_counts_once() {
         let scratch = ScratchDir::new();
-        record_sampling_failure(scratch.path(), "persist_failed", "disk full").unwrap();
+        reconcile_sampling_failure_counts(scratch.path(), &[("persist_failed", "disk full")])
+            .unwrap();
         let counts = read_sampling_failure_counts(scratch.path()).unwrap();
         assert_eq!(
             counts,
@@ -278,16 +299,14 @@ mod tests {
     #[test]
     fn the_same_reason_recurring_accumulates_rather_than_replacing() {
         let scratch = ScratchDir::new();
-        record_sampling_failure(
+        reconcile_sampling_failure_counts(
             scratch.path(),
-            "due_lookup_failed",
-            "database disk image is malformed",
+            &[("due_lookup_failed", "database disk image is malformed")],
         )
         .unwrap();
-        record_sampling_failure(
+        reconcile_sampling_failure_counts(
             scratch.path(),
-            "due_lookup_failed",
-            "database disk image is malformed",
+            &[("due_lookup_failed", "database disk image is malformed")],
         )
         .unwrap();
         let counts = read_sampling_failure_counts(scratch.path()).unwrap();
@@ -304,9 +323,15 @@ mod tests {
     #[test]
     fn distinct_reasons_are_counted_separately() {
         let scratch = ScratchDir::new();
-        record_sampling_failure(scratch.path(), "persist_failed", "disk full").unwrap();
-        record_sampling_failure(scratch.path(), "persist_failed", "disk full").unwrap();
-        record_sampling_failure(scratch.path(), "due_lookup_failed", "disk full").unwrap();
+        reconcile_sampling_failure_counts(
+            scratch.path(),
+            &[
+                ("persist_failed", "disk full"),
+                ("persist_failed", "disk full"),
+                ("due_lookup_failed", "disk full"),
+            ],
+        )
+        .unwrap();
         let mut counts = read_sampling_failure_counts(scratch.path()).unwrap();
         counts.sort_by(|a, b| a.category.cmp(&b.category));
         assert_eq!(
@@ -323,6 +348,41 @@ mod tests {
                     count: 2,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn a_completed_batch_removes_failures_absent_from_that_batch() {
+        let scratch = ScratchDir::new();
+        reconcile_sampling_failure_counts(
+            scratch.path(),
+            &[
+                ("persist_failed", "disk full"),
+                ("due_lookup_failed", "database disk image is malformed"),
+            ],
+        )
+        .unwrap();
+
+        reconcile_sampling_failure_counts(
+            scratch.path(),
+            &[("due_lookup_failed", "database disk image is malformed")],
+        )
+        .unwrap();
+        assert_eq!(
+            read_sampling_failure_counts(scratch.path()).unwrap(),
+            vec![SamplingFailureCount {
+                category: "due_lookup_failed".to_string(),
+                reason: "database disk image is malformed".to_string(),
+                count: 2,
+            }],
+            "the absent failure is settled while the recurring failure keeps its count"
+        );
+
+        reconcile_sampling_failure_counts(scratch.path(), &[]).unwrap();
+        assert_eq!(
+            read_sampling_failure_counts(scratch.path()).unwrap(),
+            vec![],
+            "a clean completed batch settles every older failure"
         );
     }
 

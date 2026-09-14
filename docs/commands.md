@@ -675,6 +675,20 @@ alias applies to history and not only to sessions ingested after it.
 **Answers:** is the recorded evidence healthy, and does the transcript
 corpus still match its parsers?
 
+`sqlite-and-schema-health` treats a durable meter-attempt start with no
+terminal result as valid evidence, not as a missing or invented outcome. Once
+the command budget stored with that attempt has elapsed, a passing check names
+the count as collector interruption evidence. It never inserts a
+`meter_attempt_result` row to make the ledger look complete.
+
+`sampling-failure-counts` is reconciled from the complete account report after
+each successful sampling tick. A `(category, reason)` count continues growing
+while the same failure remains in the newest completed tick; a reason absent
+from that tick is removed, so a recovered database does not keep reporting a
+failure that subsequent sampling has already disproved. The completed batch is
+the authority rather than a ledger query because a due-lookup failure can occur
+before the ledger contains a row from which to reconstruct it.
+
 **Refuses:** to repair anything unless `--fix` is given, and even then it
 refuses anything outside the four permitted repairs; the rest of the check
 registry only reports. `--fix` also refuses combination with
@@ -807,4 +821,3 @@ rather than racing an attempt already in flight against it. When the name
 being retired is one an older row already holds (a name reused after a
 config change), rename that older row out of the way first; nothing here
 deletes a row, so both stay in `list` under their own names.
-

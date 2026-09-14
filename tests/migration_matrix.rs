@@ -501,15 +501,18 @@ fn populate_task_event_quarantine(conn: &rusqlite::Connection) -> Result<(), Str
 
 fn populate_meter_attempt(conn: &rusqlite::Connection) -> Result<(), String> {
     // Row 2 sets the due-basis attempt reference (one arm of the exclusive-or
-    // CHECK); rows 1 and 3 leave both basis columns null. Three distinct
-    // due_reason enum values are covered.
+    // CHECK); rows 1, 3 and 4 leave both basis columns null. Row 4 deliberately
+    // has no terminal result: a durable start surviving without one is the
+    // collector-interruption state, not a foreign-key violation (`aub-7xlf`).
+    // All four due_reason enum values are covered.
     exec(
         conn,
         "meter_attempt",
         "INSERT INTO meter_attempt (id, run_id, account_id, provider, request_started_at, credential_context_id, policy_snapshot_id, due_at, due_reason, due_basis_attempt_id, due_basis_result_id, provider_contract_id, meter_semantics_id) VALUES
             (1, 1, 1, 'anthropic', 400, NULL, 1, 500, 'ordinary_cadence', NULL, NULL, 'matrix-contract', 'matrix-semantics'),
             (2, 1, 1, 'anthropic', 450, 'matrix-credential', 1, 550, 'forced_or_manual', 1, NULL, 'matrix-contract', 'matrix-semantics'),
-            (3, 1, 1, 'anthropic', 500, NULL, 1, 600, 'reset_edge', NULL, NULL, 'matrix-contract', 'matrix-semantics')",
+            (3, 1, 1, 'anthropic', 500, NULL, 1, 600, 'reset_edge', NULL, NULL, 'matrix-contract', 'matrix-semantics'),
+            (4, 1, 1, 'anthropic', 550, NULL, 1, 650, 'post_reset_confirmation', NULL, NULL, 'matrix-contract', 'matrix-semantics')",
     )
 }
 
@@ -1056,6 +1059,41 @@ fn check_post_migration(conn: &rusqlite::Connection, version: u32) -> Result<(),
             "foreign_key_check after migration to version {version} failed: {violations:?}"
         ));
     }
+    assert_resultless_attempt_fixture(conn, version)?;
+    Ok(())
+}
+
+/// Once a matrix row starts from a version that owns attempt tables, its
+/// populated fixture must carry exactly one durable start without a terminal
+/// result through every later migration. Rows that start before migration 8
+/// have empty newly-created tables and therefore have no attempt fixture yet.
+fn assert_resultless_attempt_fixture(
+    conn: &rusqlite::Connection,
+    version: u32,
+) -> Result<(), String> {
+    if !table_exists(conn, "meter_attempt") || row_count(conn, "meter_attempt")? == 0 {
+        return Ok(());
+    }
+    let count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM meter_attempt attempt
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM meter_attempt_result result
+                 WHERE result.attempt_id = attempt.id
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map_err(|error| {
+            format!(
+                "cannot count resultless attempts after migration to version {version}: {error}"
+            )
+        })?;
+    if count != 1 {
+        return Err(format!(
+            "resultless attempt fixture after migration to version {version} has {count} open rows; expected exactly 1 collector-interruption row"
+        ));
+    }
     Ok(())
 }
 
@@ -1251,6 +1289,21 @@ fn registry_with_a_synthetic_rewrite() -> Vec<Migration> {
 // ---------------------------------------------------------------------------
 // The matrix itself
 // ---------------------------------------------------------------------------
+
+#[test]
+fn populated_attempt_fixture_carries_one_start_without_a_terminal_result() {
+    let migrations = registry();
+    let highest = migrations
+        .last()
+        .map(|migration| migration.version)
+        .unwrap_or(0);
+    let db = FixtureDb::new("resultless-attempt");
+    let (conn, _) = open_populated_fixture(&db, &migrations, highest)
+        .expect("the populated fixture must build");
+
+    assert_resultless_attempt_fixture(&conn, highest)
+        .expect("the fixture must retain one collector-interruption row");
+}
 
 /// Integration: the matrix applies every migration forward from every prior
 /// schema version against a populated fixture database, with post-migration
