@@ -11,6 +11,7 @@
 //! invocations by the external scheduler.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::domain::provenance::CostModelId;
@@ -22,10 +23,10 @@ use agent_usage_book::store::account::account_id_by_identity;
 use agent_usage_book::store::calibration::PlanTier;
 use agent_usage_book::store::calibration_controlled::{
     ControlledExperimentId, ControlledExperimentRun, ControlledRunPhase,
-    default_expected_token_kinds, insert_begin, load_by_experiment_id, missing_expected_terms,
-    record_end, status_for_run,
+    default_expected_token_kinds, insert_begin, load_by_experiment_id, load_latest,
+    missing_expected_terms, record_end, status_for_run,
 };
-use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
+use agent_usage_book::store::connection::{AccessMode, LEDGER_DATABASE_FILE, PragmaPolicy, open};
 use agent_usage_book::store::cost_model::{
     ProviderKey, anthropic_claude_messages_incomplete_v1, anthropic_claude_messages_v1,
 };
@@ -34,6 +35,7 @@ use agent_usage_book::store::meter_evidence::{
 };
 use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::migrations::registry;
+use test_support::StateDir;
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -389,4 +391,191 @@ fn end_records_the_boundary_without_declaring_the_meter_settled() {
             "end must not declare settlement: a climbing meter stays unsettled after the boundary"
         );
     }
+}
+
+// --- plan-tier resolution through the release binary (aub-ai1j) ------------------
+//
+// The four `begin` cases: the run's tier comes from the account's
+// configuration, `--plan-tier` is an optional cross-check, and both refusals
+// happen before anything is recorded. Each case seeds its ledger in-process
+// (the complete cost model plus one meter baseline), then runs
+// `calibrate begin` as a separate process against a temporary state
+// directory, so the binary reads the configuration file exactly as installed.
+
+/// Seeds a temporary state directory for one `begin` run: a configuration
+/// naming `account` with or without `plan_tier`, the complete seed cost
+/// model, and one baseline observation on the `five_hour` window.
+fn plan_tier_state(account: &str, plan_tier: Option<&str>) -> StateDir {
+    let state = StateDir::new();
+    std::fs::create_dir_all(state.path().join("home")).expect("home must be creatable");
+    let tier_line = plan_tier
+        .map(|tier| format!("plan_tier = \"{tier}\"\n"))
+        .unwrap_or_default();
+    std::fs::write(
+        state.path().join("aub.toml"),
+        format!("[[accounts]]\nname = \"{account}\"\nprovider = \"anthropic\"\n{tier_line}"),
+    )
+    .expect("config must be writable");
+    let db_path = state.path().join(LEDGER_DATABASE_FILE);
+    let mut conn = open(&db_path, AccessMode::ReadWrite, &pragma()).expect("ledger must open");
+    run_migrations(
+        &mut conn,
+        &registry(),
+        None,
+        &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
+    )
+    .expect("migrations must apply");
+    let at = UtcTimestamp::from_unix_nanos(1_000);
+    let model = anthropic_claude_messages_v1(at);
+    agent_usage_book::store::cost_model::activate(&mut conn, &model, at, None)
+        .expect("cost model must activate");
+    insert_meter_chain(&conn, account, "five_hour", at, 600_000);
+    state
+}
+
+/// Runs `aub` against the temporary state as its own process and returns the
+/// captured output without asserting on the exit status: the refusal cases
+/// exit non-zero by design.
+fn begin_output(state: &StateDir, args: &[&str]) -> std::process::Output {
+    Command::new(env!("CARGO_BIN_EXE_aub"))
+        .args(args)
+        .env("HOME", state.path().join("home"))
+        .env("AUB_STATE_DIR", state.path())
+        .env("AUB_CONFIG_FILE", state.path().join("aub.toml"))
+        .env("AUB_LOG_LEVEL", "off")
+        .output()
+        .expect("the aub binary must be spawnable")
+}
+
+/// The latest controlled run in the temporary ledger, read back through a
+/// fresh connection: `None` proves a refused `begin` recorded nothing.
+fn latest_run(state: &StateDir) -> Option<ControlledExperimentRun> {
+    let db_path = state.path().join(LEDGER_DATABASE_FILE);
+    let conn = open(&db_path, AccessMode::ReadWrite, &pragma()).expect("ledger must reopen");
+    load_latest(&conn).expect("load must work")
+}
+
+fn begin_args<'a>(experiment: &'a str, extra: &[&'a str]) -> Vec<&'a str> {
+    let mut args = vec![
+        "calibrate",
+        "--account",
+        "bianca",
+        "begin",
+        "--window",
+        "five_hour",
+        "--cost-model",
+        "anthropic-claude-messages-v1",
+        "--experiment",
+        experiment,
+        "--assert-exclusive",
+    ];
+    args.extend_from_slice(extra);
+    args
+}
+
+/// With `plan_tier = "pro"` configured, the flag omitted records a run whose
+/// tier is `pro`, and the report line prints `plan_tier=pro`.
+#[test]
+fn begin_takes_the_configured_tier_when_the_flag_is_omitted() {
+    let state = plan_tier_state("bianca", Some("pro"));
+    let output = begin_output(&state, &begin_args("exp-configured-tier", &[]));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "begin must succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("plan_tier=pro"),
+        "the report line must print the configured tier:\n{stdout}"
+    );
+    let run = latest_run(&state).expect("the run must be recorded");
+    assert_eq!(run.plan_tier.as_str(), "pro");
+}
+
+/// With `plan_tier = "pro"` configured, `--plan-tier max-5x` refuses with the
+/// usage exit class, naming the account and both tiers, and records no run.
+#[test]
+fn begin_refuses_a_flag_that_disagrees_with_the_configured_tier() {
+    let state = plan_tier_state("bianca", Some("pro"));
+    let output = begin_output(
+        &state,
+        &begin_args("exp-tier-mismatch", &["--plan-tier", "max-5x"]),
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a mismatched tier must refuse with the usage exit class.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bianca"),
+        "the refusal must name the account:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pro"),
+        "the refusal must name the configured tier:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("max-5x"),
+        "the refusal must name the given tier:\n{stderr}"
+    );
+    assert!(
+        latest_run(&state).is_none(),
+        "a refused begin must record no run"
+    );
+}
+
+/// Against an account with no `plan_tier` configured and no flag, `begin`
+/// refuses with the usage exit class, naming the account and the key, and
+/// records no run.
+#[test]
+fn begin_refuses_when_no_tier_is_configured_and_no_flag_is_given() {
+    let state = plan_tier_state("bianca", None);
+    let output = begin_output(&state, &begin_args("exp-tier-missing", &[]));
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "a missing tier must refuse with the usage exit class.\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("bianca"),
+        "the refusal must name the account:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("plan_tier"),
+        "the refusal must name the missing key:\n{stderr}"
+    );
+    assert!(
+        latest_run(&state).is_none(),
+        "a refused begin must record no run"
+    );
+}
+
+/// Against an account with no `plan_tier` configured, the flag records its
+/// value as before.
+#[test]
+fn begin_records_the_flag_when_no_tier_is_configured() {
+    let state = plan_tier_state("bianca", None);
+    let output = begin_output(
+        &state,
+        &begin_args("exp-flag-tier", &["--plan-tier", "max-5x"]),
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "begin with the flag must succeed.\nstdout: {stdout}\nstderr: {stderr}"
+    );
+    assert!(
+        stdout.contains("plan_tier=max-5x"),
+        "the report line must print the flag's tier:\n{stdout}"
+    );
+    let run = latest_run(&state).expect("the run must be recorded");
+    assert_eq!(run.plan_tier.as_str(), "max-5x");
 }

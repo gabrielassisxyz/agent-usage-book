@@ -538,6 +538,15 @@ settled. `fit` and `passive` refuse to activate candidate calibrations automatic
 candidates are written immutably and never promoted to active status by the
 fitter (Invariant 14).
 
+`begin` takes the run's plan tier from the account's configuration: the
+`plan_tier` key on the named `[[accounts]]` entry. `--plan-tier` is optional:
+omitted, the configured tier is recorded and printed; given with the same
+value it passes as a cross-check. Two mismatches are refused with the usage
+exit class before anything is recorded: a flag that disagrees with the
+configured tier, naming the account and both tiers, and an omitted flag with
+no tier configured for the account, naming the account and the `plan_tier`
+key. With no configured tier the flag records its value as before.
+
 `fit` follows the experiment's premise. `fit --experiment ID` naming a controlled
 experiment whose `--expect-kinds` premise names two or more token kinds fits them
 jointly, one coefficient per named kind, regressed directly on the recorded

@@ -20,6 +20,7 @@ fn account(path: &str) -> AccountConfig {
         exclusivity_policy: AccountExclusivityPolicy::ForbidPassive,
         opencode_workspace: None,
         codex_home: None,
+        plan_tier: None,
     }
 }
 

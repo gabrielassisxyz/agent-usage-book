@@ -460,6 +460,11 @@ pub struct AccountConfig {
     /// transcript-only, with no meter home at all, and no other provider has
     /// a local source, so a `codex_home` on any other provider is rejected.
     pub codex_home: Option<PathBuf>,
+    /// The subscription plan tier a controlled calibration run records for
+    /// this account (`aub-ai1j`). Optional: an account with no tier configured
+    /// must be named explicitly with `calibrate begin --plan-tier`, and a flag
+    /// that disagrees with the configured tier is refused.
+    pub plan_tier: Option<String>,
 }
 
 impl AccountConfig {
@@ -605,6 +610,7 @@ const ACCOUNT_KEYS: &[&str] = &[
     "exclusivity_policy",
     "opencode_workspace",
     "codex_home",
+    "plan_tier",
 ];
 const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
@@ -1811,6 +1817,24 @@ pub fn resolve(
                         }
                         None => None,
                     };
+                    let plan_tier = match entry.get("plan_tier") {
+                        Some(val) => {
+                            let raw = val.as_str().ok_or_else(|| {
+                                Error::Usage("accounts[].plan_tier must be a string".to_string())
+                            })?;
+                            if raw.trim().is_empty() {
+                                return Err(Error::Usage(format!(
+                                    "accounts[].plan_tier for account '{}' must not be empty",
+                                    entry
+                                        .get("name")
+                                        .and_then(toml::Value::as_str)
+                                        .unwrap_or_default(),
+                                )));
+                            }
+                            Some(raw.to_string())
+                        }
+                        None => None,
+                    };
                     Ok(AccountConfig {
                         name: entry
                             .get("name")
@@ -1839,6 +1863,7 @@ pub fn resolve(
                         exclusivity_policy,
                         opencode_workspace,
                         codex_home,
+                        plan_tier,
                     })
                 })
                 .collect::<Result<Vec<_>, Error>>()
@@ -2171,6 +2196,11 @@ fn push_account_provenance_rows(
         // optional field in this output: an unset key is never invented.
         if let Some(home) = &account.codex_home {
             entry.push((format!("{base}.codex_home"), home.display().to_string()));
+        }
+        // The optional plan tier prints only when set, like the meter home
+        // above: an account with no configured tier prints no row for it.
+        if let Some(tier) = &account.plan_tier {
+            entry.push((format!("{base}.plan_tier"), tier.clone()));
         }
         entry.sort();
         for (key, value) in entry {
@@ -3439,6 +3469,56 @@ codex_home = "/home/user/.codex"
         let empty = "[[accounts]]\nname = \"work\"\nprovider = \"codex\"\ncodex_home = \"  \"\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(empty)).unwrap_err();
         assert!(err.to_string().contains("codex_home"), "{err}");
+    }
+
+    /// The plan tier key resolves as a string on any provider and reaches
+    /// the provenance rows only when set (aub-ai1j).
+    #[test]
+    fn plan_tier_resolves_and_prints_only_when_set() {
+        let file = r#"
+[[accounts]]
+name = "bianca"
+provider = "anthropic"
+plan_tier = "pro"
+"#;
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.accounts[0].plan_tier.as_deref(), Some("pro"));
+        let rows = config.provenance_rows(&provenance);
+        let tier = rows
+            .iter()
+            .find(|row| row.key == "accounts[0].plan_tier")
+            .expect("the set tier prints as its own row");
+        assert_eq!(tier.value, "pro");
+
+        // An account without one resolves to none and prints no row for a
+        // key nobody set.
+        let bare = "[[accounts]]\nname = \"work\"\nprovider = \"anthropic\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(bare)).unwrap();
+        assert!(config.accounts[0].plan_tier.is_none());
+        assert!(
+            config
+                .provenance_rows(&provenance)
+                .iter()
+                .all(|row| row.key != "accounts[0].plan_tier")
+        );
+    }
+
+    /// An empty `plan_tier` is a usage error naming the key and the account,
+    /// never a silently empty tier on the recorded run (aub-ai1j).
+    #[test]
+    fn plan_tier_refuses_empty_values_naming_key_and_account() {
+        let empty =
+            "[[accounts]]\nname = \"bianca\"\nprovider = \"anthropic\"\nplan_tier = \"  \"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(empty)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        let message = err.to_string();
+        assert!(message.contains("accounts[].plan_tier"), "{message}");
+        assert!(message.contains("bianca"), "{message}");
+
+        let garbage = "[[accounts]]\nname = \"bianca\"\nprovider = \"anthropic\"\nplan_tier = 3\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("accounts[].plan_tier"), "{err}");
     }
 
     // --- aub-34ik: boxed fields carry section and index --------------------------
