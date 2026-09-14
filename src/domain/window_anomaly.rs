@@ -201,7 +201,9 @@ fn either_is_scheduled(previous_reset: WindowResetState, current_reset: WindowRe
 /// new state moved forward rather than sideways or backward. Any decrease
 /// not backed by that is [`WindowAnomalyKind::PercentageDecreaseWithoutReset`];
 /// any reset-state change not backed by that, with no decrease, is
-/// [`WindowAnomalyKind::UnexpectedResetTimestampChange`].
+/// [`WindowAnomalyKind::UnexpectedResetTimestampChange`], except a window
+/// starting: `NotStarted` followed by `Known` with no decrease is the
+/// ordinary beginning of a window (`aub-0x4j`), not a provider reset event.
 pub fn classify_window_transition(
     previous: WindowReading,
     current: WindowReading,
@@ -214,6 +216,13 @@ pub fn classify_window_transition(
 
     let decreased = current.quota_used.as_ppm().get() < previous.quota_used.as_ppm().get();
 
+    // A window starting (`aub-0x4j`): idle (`NotStarted`) followed by a
+    // freshly known reset instant with no decrease is the ordinary beginning
+    // of a window, not an unexpected reset change. A decrease on the same
+    // shape stays on the decrease path above.
+    let is_window_start = matches!(previous.resets_at, WindowResetState::NotStarted)
+        && matches!(current.resets_at, WindowResetState::Known(_));
+
     if decreased {
         if legitimate_reset {
             None
@@ -223,6 +232,7 @@ pub fn classify_window_transition(
     } else if reset_changed
         && !legitimate_reset
         && !either_is_scheduled(previous.resets_at, current.resets_at)
+        && !is_window_start
     {
         Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
     } else {
@@ -772,6 +782,55 @@ mod tests {
         );
         let current = reading(0, WindowResetState::NotStarted, 1_000);
         assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// A window starting (`aub-0x4j`): idle (`NotStarted`) followed by a
+    /// freshly known reset instant with no decrease in the used fraction is
+    /// the ordinary beginning of a window, not an unexpected reset change.
+    /// Mirrors the live-ledger shape (0% `NotStarted`, then 3% `Known`).
+    #[test]
+    fn aub_0x4j_not_started_to_known_without_decrease_is_a_window_start() {
+        let previous = reading(0, WindowResetState::NotStarted, 500);
+        let current = reading(
+            30_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000_000_000)),
+            600,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// The same start shape with a decrease (`aub-0x4j`): `NotStarted`
+    /// followed by `Known` with the used fraction falling stays the
+    /// decrease-without-reset anomaly, via the decrease path above.
+    #[test]
+    fn aub_0x4j_not_started_to_known_with_decrease_is_still_a_decrease_anomaly() {
+        let previous = reading(100_000, WindowResetState::NotStarted, 500);
+        let current = reading(
+            50_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000_000_000)),
+            600,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::PercentageDecreaseWithoutReset)
+        );
+    }
+
+    /// The stop direction is out of scope for `aub-0x4j` and unchanged: a
+    /// `Known` window going idle before its boundary was due, with no
+    /// decrease, stays the unexpected-reset-change anomaly.
+    #[test]
+    fn aub_0x4j_known_to_not_started_before_due_is_still_an_unexpected_reset_change() {
+        let previous = reading(
+            300_000,
+            WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000_000_000)),
+            500,
+        );
+        let current = reading(300_000, WindowResetState::NotStarted, 600);
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
     }
 
     /// Planted negative for the decrease case: the same drop, but the
