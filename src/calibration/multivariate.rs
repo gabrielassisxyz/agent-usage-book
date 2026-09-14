@@ -24,7 +24,7 @@
 // the same nested index arithmetic obscure which element is being rotated.
 #![allow(clippy::needless_range_loop)]
 
-use super::fitter::{EntangledCoefficientPair, FitRejection};
+use super::fitter::{ConstantDesignColumn, EntangledCoefficientPair, FitRejection};
 use crate::domain::provenance::EvidenceId;
 use crate::domain::tokens::{KnownTokenVector, TokenKind};
 use crate::store::calibration::ExcludedSample;
@@ -37,6 +37,10 @@ use crate::store::calibration::ExcludedSample;
 /// The approximation is stated in the parameters string of every result so a
 /// reader knows what the interval claims.
 const NORMAL_975_QUANTILE: f64 = 1.96;
+
+/// How far below zero, in standard errors, a coefficient must fall before its
+/// sign refuses the fit.
+const SIGN_REFUSAL_STANDARD_ERRORS: f64 = 2.0;
 
 /// Exclusion reason for rows carrying no usage in any fitted kind. A row of
 /// zeros constrains no coefficient, so it leaves the fit with its reason
@@ -336,8 +340,10 @@ impl MultivariateFitResult {
 
 /// Fits quota movement as a joint linear function of per-kind token counts.
 ///
-/// The gate order is cheapest-first: sample count, then identifiability
-/// (condition number against the configured threshold), then sign. A fit that
+/// The gate order is cheapest-first: sample count, then a column that never
+/// varied, then identifiability (condition number against the configured
+/// threshold), then sign, judged against each coefficient's own standard
+/// error. A fit that
 /// passes all three records its coefficients with standard errors and
 /// intervals, the regularization actually applied, the non-negativity outcome,
 /// and the phase design it was fitted from.
@@ -399,6 +405,31 @@ pub fn fit_multivariate(
         .map(|observation| observation.quota_delta_ppm)
         .collect();
 
+    // Through the origin, a column holding one value in every row is an
+    // intercept under another name: it absorbs whatever the other kinds leave
+    // unexplained and comes back as an arbitrary number of either sign. That
+    // is a design that cannot identify the kind, so it is refused by name
+    // before any coefficient exists to be misread.
+    let constant: Vec<ConstantDesignColumn> = selected
+        .iter()
+        .filter_map(|kind| {
+            let first = usable[0].tokens.value(*kind);
+            usable
+                .iter()
+                .all(|observation| observation.tokens.value(*kind) == first)
+                .then_some(ConstantDesignColumn {
+                    kind: *kind,
+                    tokens: first,
+                })
+        })
+        .collect();
+    if !constant.is_empty() {
+        return Err(FitRejection::ConstantColumn {
+            columns: constant,
+            blocks: usable.len(),
+        });
+    }
+
     let mut entangled: Vec<EntangledCoefficientPair> = Vec::new();
     for (i, first) in selected.iter().enumerate() {
         for (j, second) in selected.iter().enumerate().skip(i + 1) {
@@ -420,9 +451,8 @@ pub fn fit_multivariate(
     // units from the figure and leaves the dependence, which is the thing
     // the gate exists to judge. Estimates and their errors are transformed
     // back below so every reported figure stays in ppm per token.
-    // A kind with no usage at all has norm zero; it is left unscaled so the
-    // gram keeps its zero eigenvalue and the gate refuses it by name as an
-    // ill-conditioned design, the same verdict it always gave.
+    // A kind with no usage at all never reaches here: its column is constant
+    // and refused above. The fallback norm only keeps the division defined.
     let norms: Vec<f64> = columns
         .iter()
         .map(|column| column.iter().map(|x| x * x).sum::<f64>().sqrt())
@@ -501,15 +531,6 @@ pub fn fit_multivariate(
         })
         .collect();
 
-    for (kind, estimate) in selected.iter().zip(estimates.iter()) {
-        if *estimate <= 0.0 {
-            return Err(FitRejection::NonPositiveCoefficient {
-                kind: *kind,
-                estimate_ppm_per_token: *estimate,
-            });
-        }
-    }
-
     let predictions: Vec<f64> = (0..usable.len())
         .map(|row| {
             estimates
@@ -547,6 +568,26 @@ pub fn fit_multivariate(
         })
         .collect();
 
+    // A free kind fits to zero plus noise, so half the time its estimate is a
+    // hair below zero. Only an estimate more than two standard errors under
+    // zero says usage reduced the meter, which is a broken design; anything
+    // closer is the finding that the kind costs nothing measurable.
+    for coefficient in &coefficients {
+        let margin = SIGN_REFUSAL_STANDARD_ERRORS * coefficient.std_error_ppm_per_token;
+        if coefficient.estimate_ppm_per_token + margin < 0.0 {
+            return Err(FitRejection::NonPositiveCoefficient {
+                kind: coefficient.kind,
+                estimate_ppm_per_token: coefficient.estimate_ppm_per_token,
+                std_error_ppm_per_token: coefficient.std_error_ppm_per_token,
+            });
+        }
+    }
+    let at_or_below_zero: Vec<&str> = coefficients
+        .iter()
+        .filter(|coefficient| coefficient.estimate_ppm_per_token <= 0.0)
+        .map(|coefficient| coefficient.kind.label())
+        .collect();
+
     let pairwise_correlations: Vec<TokenKindCorrelation> = entangled
         .iter()
         .map(|pair| TokenKindCorrelation {
@@ -564,16 +605,19 @@ pub fn fit_multivariate(
     } else {
         "none".to_string()
     };
-    let non_negativity = if config.enforce_non_negativity() {
-        format!(
+    let non_negativity = match (config.enforce_non_negativity(), at_or_below_zero.is_empty()) {
+        (true, true) => format!(
             "enforced: all {} coefficients constrained to >= 0 ppm/token; unconstrained solution satisfied every bound",
             selected.len()
-        )
-    } else {
-        format!(
+        ),
+        (false, true) => format!(
             "not enforced by configuration; all {} fitted coefficients are positive",
             selected.len()
-        )
+        ),
+        (_, false) => format!(
+            "estimate at or below zero within two standard errors for {}; reported as fitted, not clamped",
+            at_or_below_zero.join(",")
+        ),
     };
     let statistical_method = if config.ridge_penalty() > 0.0 {
         "multivariate-ridge-through-origin".to_string()
@@ -959,6 +1003,7 @@ mod tests {
             | FitRejection::Underidentified { .. }
             | FitRejection::NonPositiveSlope { .. }
             | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::ConstantColumn { .. }
             | FitRejection::ZeroCreditSpan
             | FitRejection::BaselinePlateauNotSettled
             | FitRejection::TerminalPlateauNotSettled
@@ -1115,6 +1160,7 @@ mod tests {
             other @ (FitRejection::Underidentified { .. }
             | FitRejection::NonPositiveSlope { .. }
             | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::ConstantColumn { .. }
             | FitRejection::IllConditioned { .. }
             | FitRejection::ZeroCreditSpan
             | FitRejection::BaselinePlateauNotSettled
@@ -1141,10 +1187,10 @@ mod tests {
     #[test]
     fn non_positive_slope_rejected() {
         let observations = vec![
-            observation("ev-down-1", 100, 0, 3000.0),
-            observation("ev-down-2", 200, 0, 1000.0),
-            observation("ev-down-3", 300, 0, -1000.0),
-            observation("ev-down-4", 400, 0, -3000.0),
+            observation("ev-down-1", 100, 0, -1000.0),
+            observation("ev-down-2", 200, 0, -2010.0),
+            observation("ev-down-3", 300, 0, -2990.0),
+            observation("ev-down-4", 400, 0, -4000.0),
         ];
         let rejection = fit_multivariate(
             &observations,
@@ -1158,16 +1204,18 @@ mod tests {
             FitRejection::NonPositiveCoefficient {
                 kind,
                 estimate_ppm_per_token,
+                std_error_ppm_per_token,
             } => {
                 assert_eq!(kind, TokenKind::Input);
                 assert!(
-                    estimate_ppm_per_token < 0.0,
-                    "estimate must be negative, got {estimate_ppm_per_token}"
+                    estimate_ppm_per_token + 2.0 * std_error_ppm_per_token < 0.0,
+                    "estimate must sit more than two errors below zero, got {estimate_ppm_per_token} +- {std_error_ppm_per_token}"
                 );
             }
             other @ (FitRejection::InsufficientObservations { .. }
             | FitRejection::Underidentified { .. }
             | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::ConstantColumn { .. }
             | FitRejection::IllConditioned { .. }
             | FitRejection::ZeroCreditSpan
             | FitRejection::BaselinePlateauNotSettled
@@ -1300,6 +1348,7 @@ mod tests {
             | FitRejection::Underidentified { .. }
             | FitRejection::NonPositiveSlope { .. }
             | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::ConstantColumn { .. }
             | FitRejection::ZeroCreditSpan
             | FitRejection::BaselinePlateauNotSettled
             | FitRejection::TerminalPlateauNotSettled
@@ -1350,28 +1399,126 @@ mod tests {
             fit_multivariate(&flat_cache, &kinds(), &config(30.0, 2), "flat-cache-kind")
                 .expect_err("a kind with no variation must be rejected");
         match &rejection {
-            FitRejection::IllConditioned { entangled, .. } => {
-                assert!(
-                    entangled.is_empty(),
-                    "no pair varies, so no correlation exists to report"
+            FitRejection::ConstantColumn { columns, blocks } => {
+                assert_eq!(
+                    columns,
+                    &vec![ConstantDesignColumn {
+                        kind: TokenKind::CacheRead,
+                        tokens: 0,
+                    }]
                 );
+                assert_eq!(*blocks, 4);
             }
             other @ (FitRejection::InsufficientObservations { .. }
             | FitRejection::Underidentified { .. }
             | FitRejection::NonPositiveSlope { .. }
             | FitRejection::NonPositiveCoefficient { .. }
+            | FitRejection::IllConditioned { .. }
             | FitRejection::ZeroCreditSpan
             | FitRejection::BaselinePlateauNotSettled
             | FitRejection::TerminalPlateauNotSettled
             | FitRejection::MissingCostModelTerm { .. }
             | FitRejection::ContaminatedSeries { .. }) => {
-                panic!("expected ill-conditioned rejection, got {other}")
+                panic!("expected constant-column rejection, got {other}")
             }
         }
+        let message = rejection.to_string();
         assert!(
-            rejection.to_string().contains("no token-kind pair"),
-            "message says what is missing: {}",
-            rejection
+            message.contains("cache_read") && message.contains("never varied"),
+            "message names the kind and says its column never varied: {message}"
         );
+        assert!(
+            !message.contains("ill-conditioned"),
+            "distinct from the condition-number refusal: {message}"
+        );
+    }
+
+    /// A kind that costs nothing, observed through meter noise of one step,
+    /// fits to a coefficient near zero that is reported rather than refused,
+    /// while the same design with that kind pushed well below zero is refused
+    /// for its sign.
+    #[test]
+    fn a_free_kind_is_reported_at_zero_and_a_clearly_negative_one_is_refused() {
+        let rows: [(u64, u64, f64); 8] = [
+            (60_000, 80_000, 10_000.0),
+            (90_000, 130_000, -10_000.0),
+            (120_000, 75_000, 0.0),
+            (70_000, 110_000, 10_000.0),
+            (100_000, 90_000, -10_000.0),
+            (80_000, 125_000, 0.0),
+            (110_000, 100_000, 10_000.0),
+            (65_000, 95_000, -10_000.0),
+        ];
+        let input_rate = 0.7;
+        let build = |cache_read_rate: f64| -> Vec<MultivariateFitObservation> {
+            rows.iter()
+                .enumerate()
+                .map(|(i, (input, cache, noise))| {
+                    observation(
+                        &format!("ev-free-{i}"),
+                        *input,
+                        *cache,
+                        input_rate * *input as f64 + cache_read_rate * *cache as f64 + noise,
+                    )
+                })
+                .collect()
+        };
+
+        let free = fit_multivariate(&build(0.0), &kinds(), &config(30.0, 4), "free-cache-read")
+            .expect("a kind at zero within its error is a result, not a refusal");
+        let cache_read = free
+            .coefficients()
+            .iter()
+            .find(|c| c.kind() == TokenKind::CacheRead)
+            .expect("cache_read reported");
+        assert!(
+            cache_read.estimate_ppm_per_token().abs() <= cache_read.std_error_ppm_per_token(),
+            "zero within one standard error: {} +- {}",
+            cache_read.estimate_ppm_per_token(),
+            cache_read.std_error_ppm_per_token()
+        );
+        let input = free
+            .coefficients()
+            .iter()
+            .find(|c| c.kind() == TokenKind::Input)
+            .expect("input reported");
+        assert!(input.estimate_ppm_per_token() > 0.0);
+
+        let negative_rate = -5.0 * cache_read.std_error_ppm_per_token();
+        let rejection = fit_multivariate(
+            &build(negative_rate),
+            &kinds(),
+            &config(30.0, 4),
+            "negative-cache-read",
+        )
+        .expect_err("five standard errors below zero is refused");
+        match rejection {
+            FitRejection::NonPositiveCoefficient {
+                kind,
+                estimate_ppm_per_token,
+                std_error_ppm_per_token,
+            } => {
+                assert_eq!(kind, TokenKind::CacheRead);
+                let message = rejection.to_string();
+                assert!(message.contains("cache_read"), "{message}");
+                assert!(
+                    message.contains(&estimate_ppm_per_token.to_string())
+                        && message.contains(&std_error_ppm_per_token.to_string()),
+                    "message carries the estimate and the error: {message}"
+                );
+            }
+            other @ (FitRejection::InsufficientObservations { .. }
+            | FitRejection::Underidentified { .. }
+            | FitRejection::NonPositiveSlope { .. }
+            | FitRejection::ConstantColumn { .. }
+            | FitRejection::IllConditioned { .. }
+            | FitRejection::ZeroCreditSpan
+            | FitRejection::BaselinePlateauNotSettled
+            | FitRejection::TerminalPlateauNotSettled
+            | FitRejection::MissingCostModelTerm { .. }
+            | FitRejection::ContaminatedSeries { .. }) => {
+                panic!("expected a sign refusal, got {other}")
+            }
+        }
     }
 }

@@ -227,6 +227,13 @@ impl EntangledCoefficientPair {
     }
 }
 
+/// A token kind whose count was the same in every usable block of a joint fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConstantDesignColumn {
+    pub kind: TokenKind,
+    pub tokens: u64,
+}
+
 /// Typed rejection reasons for calibration fitting.
 #[derive(Debug, Clone, PartialEq)]
 pub enum FitRejection {
@@ -243,6 +250,11 @@ pub enum FitRejection {
     NonPositiveCoefficient {
         kind: TokenKind,
         estimate_ppm_per_token: f64,
+        std_error_ppm_per_token: f64,
+    },
+    ConstantColumn {
+        columns: Vec<ConstantDesignColumn>,
+        blocks: usize,
     },
     IllConditioned {
         condition_number: f64,
@@ -286,11 +298,29 @@ impl fmt::Display for FitRejection {
             Self::NonPositiveCoefficient {
                 kind,
                 estimate_ppm_per_token,
+                std_error_ppm_per_token,
             } => {
                 write!(
                     f,
-                    "non-positive coefficient fitted for {}: {estimate_ppm_per_token} ppm/token; token usage cannot reduce the used fraction",
+                    "negative coefficient fitted for {}: {estimate_ppm_per_token} ppm/token with standard error {std_error_ppm_per_token}, more than two standard errors below zero; token usage cannot reduce the used fraction",
                     kind.label()
+                )
+            }
+            Self::ConstantColumn { columns, blocks } => {
+                let named = columns
+                    .iter()
+                    .map(|column| {
+                        format!(
+                            "{} ({} tokens in every block)",
+                            column.kind.label(),
+                            column.tokens
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                write!(
+                    f,
+                    "cannot identify {named}: the column never varied across the {blocks} usable blocks, so the fit through the origin would read it as an intercept; vary it between blocks or leave it out of the premise"
                 )
             }
             Self::IllConditioned {
