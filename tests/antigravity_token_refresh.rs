@@ -27,11 +27,22 @@ const NEW_ACCESS: &str = "new-agy-access-token-abc";
 /// (`src/auth/token_endpoint.rs`) can extract an OAuth client id and secret
 /// without touching a real installation: one run starting `107` and ending
 /// `.apps.googleusercontent.com`, and *two* runs starting `GOCSPX-` (the
-/// second one is the client secret the production code reads).
-const FAKE_AGY_BINARY: &[u8] = b"FAKE_AGY_BINARY_FOR_TESTS\n\
+/// second one is the client secret the production code reads). Both secrets
+/// are `GOCSPX-` plus 28 characters, matching the bounded Google format the
+/// extractor requires. They are assembled at run time: the literal shape is
+/// what GitHub push protection matches as a Google OAuth client secret, and a
+/// synthetic one in the source is refused the same as a real one.
+fn fake_agy_binary() -> Vec<u8> {
+    format!(
+        "FAKE_AGY_BINARY_FOR_TESTS\n\
 client_id=107222333444-fakeclientidabcXYZ.apps.googleusercontent.com\n\
-secret1=GOCSPX-unused-first-secret\n\
-secret2=GOCSPX-real-second-secret-value\n";
+secret1=GOCSPX-{}\n\
+secret2=GOCSPX-{}\n",
+        "A".repeat(28),
+        "B".repeat(28),
+    )
+    .into_bytes()
+}
 
 struct Environment {
     root: PathBuf,
@@ -46,7 +57,7 @@ impl Environment {
         std::fs::create_dir_all(root.join("state")).unwrap();
         std::fs::create_dir_all(root.join("creds")).unwrap();
         std::fs::write(root.join("creds/.token"), credential_json).unwrap();
-        std::fs::write(root.join("fake-agy-binary"), FAKE_AGY_BINARY).unwrap();
+        std::fs::write(root.join("fake-agy-binary"), fake_agy_binary()).unwrap();
         std::fs::write(
             root.join("aub.toml"),
             format!(

@@ -37,7 +37,7 @@ impl AntigravityTokenEndpoint {
         })?;
         let text = String::from_utf8_lossy(&bytes);
         let ids = strings_with_prefix(&text, "107", ".apps.googleusercontent.com");
-        let secrets = strings_with_prefix(&text, "GOCSPX-", "");
+        let secrets = antigravity_gocspx_secrets(&text);
         let Some(client_id) = ids.first() else {
             return Err(
                 crate::auth::antigravity_credentials::RefreshError::Configuration(
@@ -69,13 +69,37 @@ fn agy_binary_path() -> std::path::PathBuf {
 fn strings_with_prefix(text: &str, prefix: &str, suffix: &str) -> Vec<String> {
     text.match_indices(prefix)
         .filter_map(|(start, _)| {
-            let value: String = text[start..]
+            let rest = &text[start..];
+            let suffix_offset = rest.find(suffix)?;
+            let candidate = &rest[..suffix_offset + suffix.len()];
+            candidate
                 .chars()
-                .take_while(|character| {
+                .all(|character| {
                     character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.')
                 })
+                .then(|| candidate.to_string())
+        })
+        .collect()
+}
+
+/// Google OAuth client secrets packed in the `agy` binary: `GOCSPX-` plus
+/// exactly 28 `[A-Za-z0-9_-]` characters. The tail is a fixed width, never a
+/// run to the next terminator, because the binary packs the next string table
+/// entry directly against the secret with no separator.
+fn antigravity_gocspx_secrets(text: &str) -> Vec<String> {
+    const PREFIX: &str = "GOCSPX-";
+    const TAIL_LEN: usize = 28;
+    text.match_indices(PREFIX)
+        .filter_map(|(start, _)| {
+            let tail: String = text[start + PREFIX.len()..]
+                .chars()
+                .take(TAIL_LEN)
                 .collect();
-            value.ends_with(suffix).then_some(value)
+            (tail.len() == TAIL_LEN
+                && tail.chars().all(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                }))
+            .then(|| format!("{PREFIX}{tail}"))
         })
         .collect()
 }
@@ -246,5 +270,43 @@ impl crate::auth::credentials_lock::OAuthRefreshEndpoint for AnthropicTokenEndpo
         } else {
             Err(RefreshEndpointError::HttpStatus(status))
         }
+    }
+}
+
+#[cfg(test)]
+mod antigravity_client_material_tests {
+    use super::{antigravity_gocspx_secrets, strings_with_prefix};
+
+    const TERMINATED_CLIENT_ID: &str = "107222333444-fakeclientidabcXYZ.apps.googleusercontent.com";
+    const PACKED_CLIENT_ID: &str = "107999888777-fakepackedclientidxyz.apps.googleusercontent.com";
+    // Assembled at run time: GitHub push protection refuses the literal
+    // `GOCSPX-` plus 28 characters shape as a Google OAuth client secret,
+    // synthetic or not.
+    fn secret(fill: &str) -> String {
+        format!("GOCSPX-{}", fill.repeat(28))
+    }
+
+    #[test]
+    fn terminated_id_and_secrets_extract_exactly() {
+        let (first, second) = (secret("A"), secret("B"));
+        let text = format!(
+            "prefix\nclient_id={TERMINATED_CLIENT_ID}\nsecret1={first}\nsecret2={second}\n"
+        );
+        let ids = strings_with_prefix(&text, "107", ".apps.googleusercontent.com");
+        assert_eq!(ids, vec![TERMINATED_CLIENT_ID.to_string()]);
+        let secrets = antigravity_gocspx_secrets(&text);
+        assert_eq!(secrets, vec![first.clone(), second.clone()]);
+    }
+
+    #[test]
+    fn packed_id_and_secrets_against_next_string_extract_exactly() {
+        let (first, second) = (secret("A"), secret("B"));
+        let text = format!(
+            "prefix{PACKED_CLIENT_ID}handleProgress{first}{second}https://cloudcode-pa.googleapis.com"
+        );
+        let ids = strings_with_prefix(&text, "107", ".apps.googleusercontent.com");
+        assert_eq!(ids, vec![PACKED_CLIENT_ID.to_string()]);
+        let secrets = antigravity_gocspx_secrets(&text);
+        assert_eq!(secrets, vec![first.clone(), second.clone()]);
     }
 }
