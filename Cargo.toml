@@ -54,6 +54,10 @@ sha2 = "0.10"
 # and provides automatic test-case shrinking. No async runtime or network
 # dependencies are pulled in (AGENTS.md constraints).
 proptest = { version = "1", default-features = false, features = ["std"] }
+# Raw fcntl for the lock-preservation test in src/store/connection.rs (aub-a56a): an
+# open file description lock is the one probe that observes, from inside the process,
+# whether SQLite's own POSIX record lock on the ledger is still held.
+libc = "0.2"
 trybuild = "1"
 test-support = { path = "crates/test-support" }
 

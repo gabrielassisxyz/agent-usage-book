@@ -76,6 +76,21 @@ reports `sqlite-and-schema-health` failing with
 the ledger with the same message. It happened twice on 2026-09-11, and both times the file was set
 aside by hand at midnight, which is what this section exists to replace.
 
+Both times the cause was inside `aub` itself, not the disk: the connection
+opener created the file and probed its header through short-lived handles on
+every open, and POSIX releases every lock a process holds on a file the moment
+any of its descriptors is closed. That dropped the shared lock a live
+connection holds on the ledger in WAL mode, a second `aub` process (the sampler
+tick beside a calibration burst's `aub sample`) then checkpointed and deleted
+the WAL and its index under the survivor, and the survivor's next connection
+wrote into a fresh WAL against a stale index. `src/store/connection.rs` now
+keeps one never-closed handle per database file and reads through it, so the
+lock survives every later open in the process; the unit test
+`opening_a_second_connection_keeps_the_first_connections_shared_lock` fails if
+that ever regresses. Two `aub` processes on one state directory are expected
+and safe again, but a hook or driver killed by `timeout` still costs a retry,
+and two writers still serialize on the busy timeout.
+
 Stop the cadence first, so nothing writes while the directory is moved:
 
 ```sh

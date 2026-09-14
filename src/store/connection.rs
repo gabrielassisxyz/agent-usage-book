@@ -18,7 +18,10 @@
 //! connection therefore sets what it can and reads all of it back, refusing with a
 //! store-failure class when a required value is not in effect.
 
+use std::collections::HashMap;
+use std::fs::File;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock, PoisonError};
 
 use crate::domain::time::MonotonicDuration;
 use crate::error::Error;
@@ -247,19 +250,98 @@ pub(crate) fn hold_writer_slot(conn: &mut rusqlite::Connection) -> rusqlite::Tra
 /// Standard 16-byte SQLite database magic header string (`SQLite format 3\0`).
 pub const SQLITE_MAGIC_HEADER: &[u8; 16] = b"SQLite format 3\0";
 
+/// One never-closed handle per database file this process has opened, keyed by
+/// the file's path. Every raw read or create of the database file goes through
+/// the handle held here, and the handle is never dropped while the process lives.
+///
+/// The reason is POSIX record-lock semantics (fcntl(2), and SQLite's own
+/// "how to corrupt" list, item 2.2): closing *any* descriptor of a file releases
+/// *every* lock the process holds on that file, whichever descriptor took it.
+/// SQLite in WAL mode holds a shared lock on the database for as long as a
+/// connection has the WAL open; that lock is what stops another process from
+/// checkpointing and deleting the `-wal` and `-shm` files under a live
+/// connection. On 2026-09-11 this module created the file and probed its header
+/// through short-lived `File`s on every open, `Repository` opens a fresh
+/// connection per call while the command's first connection stays alive, and
+/// each of those closes silently dropped the first connection's lock. A second
+/// `aub` process (the sampler tick beside a calibration burst's `aub sample`)
+/// then deleted the WAL and its index at close; the survivor reopened a new WAL
+/// by path against its stale shared-memory index, both wrote frames into one WAL
+/// without a common lock, and a checkpoint copied page 10 to offset 0 (aub-a56a).
+fn held_database_handles() -> &'static Mutex<HashMap<PathBuf, File>> {
+    static HANDLES: OnceLock<Mutex<HashMap<PathBuf, File>>> = OnceLock::new();
+    HANDLES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Whether `held` still refers to the file currently at `path`: an operator who
+/// sets a ledger aside by rename and copies a fresh one into place leaves the held
+/// handle on the old inode, and probing the old inode would say nothing about the
+/// file SQLite is about to open.
+#[cfg(unix)]
+fn handle_is_current(held: &File, path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (held.metadata(), std::fs::metadata(path)) {
+        (Ok(h), Ok(p)) => h.dev() == p.dev() && h.ino() == p.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn handle_is_current(_held: &File, path: &Path) -> bool {
+    path.exists()
+}
+
+/// Creates the database file at mode 0600 when the write path needs it, and probes
+/// its page-1 header, both through the process-wide held handle so that no
+/// descriptor of the database is ever closed while a connection may be open.
+/// A path that does not exist on a read-only open is left to SQLite, which
+/// reports it. A held handle that no longer matches the file at `path` is
+/// replaced: the connections that may still sit on the old inode are on a file
+/// nobody can reach by name any more, and the new file has no connections yet.
+fn prepare_database_file(path: &Path, mode: AccessMode) -> Result<(), Error> {
+    let key = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    let mut handles = held_database_handles()
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let current = handles
+        .get(&key)
+        .is_some_and(|held| handle_is_current(held, path));
+    if current {
+        if mode == AccessMode::ReadWrite {
+            force_file_mode_0600(path)?;
+        }
+    } else {
+        let handle = if mode == AccessMode::ReadWrite {
+            create_file_mode_0600(path)?
+        } else {
+            match File::open(path) {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+                Err(e) => {
+                    return Err(Error::Store(format!(
+                        "cannot open database {path:?} for header probe: {e}"
+                    )));
+                }
+            }
+        };
+        handles.insert(key.clone(), handle);
+    }
+    let held = handles
+        .get(&key)
+        .expect("the handle was inserted or found current above");
+    probe_database_header(held, path)
+}
+
 /// Probes the page-1 header of an existing SQLite database file before passing it
 /// to SQLite. Refuses when the file is non-empty and does not begin with the
 /// standard 16-byte SQLite magic string (`SQLite format 3\0`), such as when a
-/// leaf or interior b-tree page has been written at offset 0.
-pub fn probe_database_header(path: &Path) -> Result<(), Error> {
-    if !path.exists() {
-        return Ok(());
-    }
-    let metadata = match std::fs::metadata(path) {
-        Ok(m) => m,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(Error::Store(format!("cannot stat database {path:?}: {e}"))),
-    };
+/// leaf or interior b-tree page has been written at offset 0. Reads through a
+/// handle the caller keeps open (see [`held_database_handles`]); `path` is only
+/// named in the refusal.
+pub fn probe_database_header(file: &File, path: &Path) -> Result<(), Error> {
+    let metadata = file
+        .metadata()
+        .map_err(|e| Error::Store(format!("cannot stat database {path:?}: {e}")))?;
     if metadata.len() == 0 {
         return Ok(());
     }
@@ -269,18 +351,15 @@ pub fn probe_database_header(path: &Path) -> Result<(), Error> {
             metadata.len()
         )));
     }
-    let mut file = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(Error::Store(format!(
-                "cannot open database {path:?} for header probe: {e}"
-            )));
-        }
-    };
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
+    let mut reader = file;
+    reader.seek(SeekFrom::Start(0)).map_err(|e| {
+        Error::Store(format!(
+            "cannot read page 1 header of database {path:?}: {e}"
+        ))
+    })?;
     let mut header = [0u8; 16];
-    file.read_exact(&mut header).map_err(|e| {
+    reader.read_exact(&mut header).map_err(|e| {
         Error::Store(format!(
             "cannot read page 1 header of database {path:?}: {e}"
         ))
@@ -316,10 +395,7 @@ pub fn open(
             rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_CREATE
         }
     };
-    if mode == AccessMode::ReadWrite {
-        create_file_mode_0600(path)?;
-    }
-    probe_database_header(path)?;
+    prepare_database_file(path, mode)?;
     let conn = if mode == AccessMode::ArchiveImmutable {
         let uri = archive_immutable_uri(path);
         rusqlite::Connection::open_with_flags(Path::new(&uri), flags)
@@ -1148,7 +1224,8 @@ mod tests {
         leaf_page[4] = 0x01;
         std::fs::write(&db_path, leaf_page).unwrap();
 
-        let err = probe_database_header(&db_path).unwrap_err();
+        let file = File::open(&db_path).unwrap();
+        let err = probe_database_header(&file, &db_path).unwrap_err();
         let msg = err.to_string();
         assert!(
             msg.contains("page 1 integrity probe failed"),
@@ -1171,12 +1248,12 @@ mod tests {
         let scratch = ScratchDir::new();
         let db_path = scratch.path().join("clean.db");
 
-        // Non-existent path passes (SQLite creation will initialize it)
-        assert!(probe_database_header(&db_path).is_ok());
+        // Non-existent path passes on a read-only open (SQLite reports the absence)
+        assert!(prepare_database_file(&db_path, AccessMode::ReadOnly).is_ok());
 
         // Empty file passes
         std::fs::write(&db_path, b"").unwrap();
-        assert!(probe_database_header(&db_path).is_ok());
+        assert!(probe_database_header(&File::open(&db_path).unwrap(), &db_path).is_ok());
 
         // Valid SQLite database passes
         let policy = policy();
@@ -1184,6 +1261,82 @@ mod tests {
         conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
             .unwrap();
         drop(conn);
-        assert!(probe_database_header(&db_path).is_ok());
+        assert!(probe_database_header(&File::open(&db_path).unwrap(), &db_path).is_ok());
+    }
+
+    /// Whether some connection in this process holds SQLite's shared lock on the
+    /// database, observed with an open file description lock: an exclusive OFD
+    /// lock conflicts with a POSIX record lock even inside the same process, and
+    /// unlike a plain `File` it never has to be closed to be released. `probe`
+    /// must be opened before the connections under test and closed after them,
+    /// because closing it is itself the operation that drops the locks.
+    #[cfg(unix)]
+    fn shared_lock_is_held(probe: &File) -> bool {
+        use std::os::unix::io::AsRawFd;
+        let mut lock = libc::flock {
+            l_type: libc::F_WRLCK as libc::c_short,
+            l_whence: libc::SEEK_SET as libc::c_short,
+            l_start: 0,
+            l_len: 0,
+            l_pid: 0,
+        };
+        // SAFETY: fcntl with F_OFD_SETLK reads the flock struct it is handed and
+        // touches nothing else; the descriptor belongs to `probe`, which outlives
+        // the call.
+        let granted = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) } == 0;
+        if granted {
+            lock.l_type = libc::F_UNLCK as libc::c_short;
+            // SAFETY: as above; releases the lock this function just took.
+            let released = unsafe { libc::fcntl(probe.as_raw_fd(), libc::F_OFD_SETLK, &mut lock) };
+            assert_eq!(released, 0, "the probe lock must release");
+        }
+        !granted
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn opening_a_second_connection_keeps_the_first_connections_shared_lock() {
+        let scratch = ScratchDir::new();
+        let db_path = scratch.path().join("shared_lock.db");
+        let policy = policy();
+        let creator = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
+        creator
+            .execute_batch("CREATE TABLE samples (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        drop(creator);
+
+        let probe = File::options()
+            .read(true)
+            .write(true)
+            .open(&db_path)
+            .unwrap();
+        let first = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
+        let count: i64 = first
+            .query_row("SELECT COUNT(*) FROM samples", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(
+            shared_lock_is_held(&probe),
+            "a connection with the WAL open must hold SQLite's shared lock"
+        );
+
+        // The Repository pattern: a second connection to the same file while the
+        // first stays open. On 2026-09-11 this open closed a short-lived handle of
+        // the file and the kernel released the first connection's lock with it.
+        let second = open(&db_path, AccessMode::ReadWrite, &policy).unwrap();
+        assert!(
+            shared_lock_is_held(&probe),
+            "opening a second connection released the first connection's shared lock"
+        );
+        let second_read = open(&db_path, AccessMode::ReadOnly, &policy).unwrap();
+        assert!(
+            shared_lock_is_held(&probe),
+            "opening a read-only connection released the first connection's shared lock"
+        );
+
+        drop(second_read);
+        drop(second);
+        drop(first);
+        drop(probe);
     }
 }
