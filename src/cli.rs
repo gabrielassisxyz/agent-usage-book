@@ -872,7 +872,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME --plan-tier TIER --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
+                "begin --account NAME [--plan-tier TIER] --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status => Some("--refresh"),
@@ -6753,7 +6753,7 @@ fn calibrate_take_value(
 
 #[derive(Debug)]
 struct CalibrateBeginArgs {
-    plan_tier: String,
+    plan_tier: Option<String>,
     window: String,
     cost_model: String,
     expect_kinds: Option<String>,
@@ -6762,10 +6762,10 @@ struct CalibrateBeginArgs {
 }
 
 fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
-    let usage = "calibrate begin requires --account NAME --plan-tier TIER --window KEY \
-                 --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
+    let usage = "calibrate begin requires --account NAME --window KEY \
+                 --cost-model ID [--plan-tier TIER] [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
     let mut args = CalibrateBeginArgs {
-        plan_tier: String::new(),
+        plan_tier: None,
         window: String::new(),
         cost_model: String::new(),
         expect_kinds: None,
@@ -6777,9 +6777,9 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
         if arg == "--assert-exclusive" {
             args.assert_exclusive = true;
         } else if arg == "--plan-tier" {
-            args.plan_tier = calibrate_next_arg(&mut rest, "--plan-tier")?;
+            args.plan_tier = Some(calibrate_next_arg(&mut rest, "--plan-tier")?);
         } else if let Some(value) = arg.strip_prefix("--plan-tier=") {
-            args.plan_tier = value.to_string();
+            args.plan_tier = Some(value.to_string());
         } else if arg == "--window" {
             args.window = calibrate_next_arg(&mut rest, "--window")?;
         } else if let Some(value) = arg.strip_prefix("--window=") {
@@ -6802,11 +6802,20 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
             )));
         }
     }
-    if args.plan_tier.trim().is_empty()
-        || args.window.trim().is_empty()
-        || args.cost_model.trim().is_empty()
-    {
+    if args.window.trim().is_empty() || args.cost_model.trim().is_empty() {
         return Err(Error::Usage(usage.into()));
+    }
+    if let Some(tier) = args.plan_tier.as_mut() {
+        let trimmed = tier.trim();
+        if trimmed.is_empty() {
+            return Err(Error::Usage(
+                "--plan-tier requires a non-empty value".into(),
+            ));
+        }
+        // Trimmed here, like the configured tier, so a given " pro" and a
+        // configured "pro" are one tier instead of a mismatch whose message
+        // names the same word twice.
+        *tier = trimmed.to_string();
     }
     if !args.assert_exclusive {
         return Err(Error::Usage(
@@ -6814,6 +6823,29 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
         ));
     }
     Ok(args)
+}
+
+/// Resolves the plan tier a controlled run records (aub-ai1j): the
+/// account's configured `plan_tier` wins when the flag is omitted, a flag
+/// that repeats the configured tier passes as a cross-check, and anything
+/// else is a usage error before anything is recorded. With no configured
+/// tier the flag carries the run as before, and with neither the command
+/// refuses naming the account and the key.
+fn resolve_calibrate_begin_plan_tier(
+    account: &str,
+    configured: Option<&str>,
+    flag: Option<&str>,
+) -> Result<String, Error> {
+    match (configured, flag) {
+        (Some(configured), Some(given)) if configured != given => Err(Error::Usage(format!(
+            "account '{account}' configures plan_tier '{configured}' (accounts[].plan_tier) but --plan-tier '{given}' was given; omit the flag to use the configured tier"
+        ))),
+        (Some(configured), _) => Ok(configured.to_string()),
+        (None, Some(given)) => Ok(given.to_string()),
+        (None, None) => Err(Error::Usage(format!(
+            "account '{account}' configures no plan_tier (accounts[].plan_tier) and no --plan-tier was given; set plan_tier for the account or pass --plan-tier TIER"
+        ))),
+    }
 }
 
 /// Resolves the experiment `status` and `end` operate on: the `--experiment`
@@ -6892,19 +6924,27 @@ fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Resul
         file_contents.as_deref(),
         &file_path,
     )?;
-    let provider = config
+    let configured = config
         .accounts
         .iter()
         .find(|entry| entry.name == account)
-        .map(|entry| entry.provider.clone())
         .ok_or_else(|| {
             Error::Usage(format!(
                 "unknown account '{account}': calibrate begin --account names a configured account"
             ))
         })?;
+    let provider = configured.provider.clone();
+    let configured_plan_tier = configured.plan_tier.clone();
 
     let conn = open_ledger(clock)?;
-    let run = calibrate_begin_validated(&conn, &provider, account, &args, clock)?;
+    let run = calibrate_begin_validated(
+        &conn,
+        &provider,
+        account,
+        &args,
+        configured_plan_tier.as_deref(),
+        clock,
+    )?;
     println!(
         "calibrate begin: experiment={} account={} plan_tier={} window={} cost_model={} baseline_observation={} started_at={}",
         run.id.as_str(),
@@ -6923,12 +6963,15 @@ fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Resul
 
 /// The testable core of `calibrate begin`: everything after configuration and
 /// connection setup, so unit tests can drive the refusal branches against a
-/// fixture database with no environment involved.
+/// fixture database with no environment involved. The configured tier is the
+/// account's `plan_tier` from the resolved configuration, if any; the flag's
+/// tier arrives inside `args`.
 fn calibrate_begin_validated(
     conn: &rusqlite::Connection,
     provider: &str,
     account: &str,
     args: &CalibrateBeginArgs,
+    configured_plan_tier: Option<&str>,
     clock: &impl Clock,
 ) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
     use crate::store::calibration_controlled::{
@@ -6936,6 +6979,11 @@ fn calibrate_begin_validated(
         insert_begin, load_by_experiment_id, missing_expected_terms, parse_expected_token_kinds,
         running_for_account,
     };
+    let plan_tier = resolve_calibrate_begin_plan_tier(
+        account,
+        configured_plan_tier,
+        args.plan_tier.as_deref(),
+    )?;
     let started_at = clock.now();
     let experiment_id = args
         .experiment
@@ -7009,7 +7057,7 @@ fn calibrate_begin_validated(
     let run = ControlledExperimentRun {
         account: account.to_string(),
         provider: crate::store::cost_model::ProviderKey::new(provider),
-        plan_tier: crate::store::calibration::PlanTier::new(args.plan_tier.clone()),
+        plan_tier: crate::store::calibration::PlanTier::new(plan_tier),
         window_semantic_key: crate::domain::window::WindowSemanticKey::new(args.window.clone()),
         cost_model_id,
         expected_token_kinds: expected,
@@ -11161,11 +11209,133 @@ usage_evidence = "measured"
     fn calibrate_begin_parses_its_flags() {
         let rest = calibrate_begin_rest("pro-5h", "five_hour", "cm-1", "exp-1");
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
-        assert_eq!(args.plan_tier, "pro-5h");
+        assert_eq!(args.plan_tier.as_deref(), Some("pro-5h"));
         assert_eq!(args.window, "five_hour");
         assert_eq!(args.cost_model, "cm-1");
         assert_eq!(args.experiment.as_deref(), Some("exp-1"));
         assert!(args.assert_exclusive);
+    }
+
+    #[test]
+    fn calibrate_begin_parses_without_a_plan_tier_flag() {
+        let rest: Vec<String> = [
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "cm-1",
+            "--experiment",
+            "exp-1",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse without the flag");
+        assert_eq!(args.plan_tier, None);
+    }
+
+    #[test]
+    fn calibrate_begin_refuses_an_empty_plan_tier_flag() {
+        let rest: Vec<String> = [
+            "--plan-tier=",
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "cm-1",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        match calibrate_parse_begin(&rest) {
+            Err(Error::Usage(message)) => assert!(
+                message.contains("--plan-tier"),
+                "the refusal must name the flag: {message}"
+            ),
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_begin_trims_the_plan_tier_flag() {
+        let rest: Vec<String> = [
+            "--plan-tier= pro ",
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "cm-1",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        assert_eq!(args.plan_tier.as_deref(), Some("pro"));
+        // And the trimmed flag agrees with the configured tier rather than
+        // refusing against a value that prints the same.
+        assert_eq!(
+            resolve_calibrate_begin_plan_tier("bianca", Some("pro"), args.plan_tier.as_deref())
+                .unwrap(),
+            "pro"
+        );
+    }
+
+    #[test]
+    fn calibrate_begin_plan_tier_resolution_prefers_neither_nor_confuses_either() {
+        assert_eq!(
+            resolve_calibrate_begin_plan_tier("bianca", Some("pro"), None).unwrap(),
+            "pro"
+        );
+        assert_eq!(
+            resolve_calibrate_begin_plan_tier("bianca", Some("pro"), Some("pro")).unwrap(),
+            "pro"
+        );
+        assert_eq!(
+            resolve_calibrate_begin_plan_tier("bianca", None, Some("max-5x")).unwrap(),
+            "max-5x"
+        );
+        match resolve_calibrate_begin_plan_tier("bianca", Some("pro"), Some("max-5x")) {
+            Err(Error::Usage(message)) => {
+                assert!(message.contains("bianca"), "{message}");
+                assert!(message.contains("pro"), "{message}");
+                assert!(message.contains("max-5x"), "{message}");
+            }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+        match resolve_calibrate_begin_plan_tier("bianca", None, None) {
+            Err(Error::Usage(message)) => {
+                assert!(message.contains("bianca"), "{message}");
+                assert!(message.contains("plan_tier"), "{message}");
+            }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn calibrate_begin_validated_records_the_configured_tier_when_the_flag_is_omitted() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, true);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "anthropic-claude-messages-v1",
+            "--experiment",
+            "exp-configured-tier",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse without the flag");
+        let clock = FakeClock::new(at);
+        let run =
+            calibrate_begin_validated(&conn, "anthropic", "work-a", &args, Some("pro"), &clock)
+                .expect("begin with a configured tier must work");
+        assert_eq!(run.plan_tier.as_str(), "pro");
     }
 
     #[test]
@@ -11218,7 +11388,7 @@ usage_evidence = "measured"
         );
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
         let clock = FakeClock::new(at);
-        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock) {
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
             Err(Error::Usage(message)) => assert!(
                 message.contains("cache_write"),
                 "the refusal must name the missing term: {message}"
@@ -11241,7 +11411,7 @@ usage_evidence = "measured"
         );
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
         let clock = FakeClock::new(at);
-        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock) {
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
             Err(Error::Usage(message)) => assert!(
                 message.contains("sample first"),
                 "the refusal must point at sampling: {message}"
@@ -11265,7 +11435,7 @@ usage_evidence = "measured"
             "exp-1",
         );
         let args = calibrate_parse_begin(&first).expect("begin args must parse");
-        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock)
+        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
             .expect("first begin must work");
         assert_eq!(run.account, "work-a");
         assert_eq!(run.plan_tier.as_str(), "pro-5h");
@@ -11283,7 +11453,7 @@ usage_evidence = "measured"
             "exp-2",
         );
         let args = calibrate_parse_begin(&second).expect("begin args must parse");
-        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock) {
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
             Err(Error::Usage(message)) => assert!(
                 message.contains("exp-1"),
                 "the overlap refusal must name the running holder: {message}"
@@ -11307,7 +11477,7 @@ usage_evidence = "measured"
             "exp-resolve",
         );
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
-        calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock)
+        calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
             .expect("begin must work");
 
         for rest in [
@@ -11355,7 +11525,7 @@ usage_evidence = "measured"
             "exp-end",
         );
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
-        calibrate_begin_validated(&conn, "anthropic", "work-a", &args, &clock)
+        calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
             .expect("begin must work");
 
         let ended_at = UtcTimestamp::from_unix_nanos(2_000_000_000);
