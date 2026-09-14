@@ -1221,12 +1221,14 @@ fn row_23_web_consumption_has_no_transcript() {
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(0),
         reset_precision: None,
+        nominal_duration: None,
     };
     let current = WindowReading {
         quota_used: QuotaUsed::new(QuotaFractionPpm::new(150_000).unwrap()),
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(1_000),
         reset_precision: None,
+        nominal_duration: None,
     };
     assert_eq!(classify_window_transition(previous, current), None);
 }
@@ -1318,6 +1320,7 @@ fn row_26_meter_percent_decreases_without_reset() {
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(0),
         reset_precision: None,
+        nominal_duration: None,
     };
     let current = WindowReading {
         // Dropped with no reset state change at all: nothing legitimises it.
@@ -1325,6 +1328,7 @@ fn row_26_meter_percent_decreases_without_reset() {
         resets_at: WindowResetState::NotStarted,
         observed_at: ts(1_000),
         reset_precision: None,
+        nominal_duration: None,
     };
 
     let anomaly = classify_window_transition(previous, current);
@@ -1359,6 +1363,7 @@ fn row_27_reset_timestamp_changes_unexpectedly() {
         resets_at: WindowResetState::Known(ts(10_000_000_000)),
         observed_at: ts(4_000_000_000),
         reset_precision: None,
+        nominal_duration: None,
     };
     let current = WindowReading {
         // No decrease, but the reset instant moved by 3 s with no boundary
@@ -1368,6 +1373,7 @@ fn row_27_reset_timestamp_changes_unexpectedly() {
         resets_at: WindowResetState::Known(ts(13_000_000_000)),
         observed_at: ts(5_000_000_000),
         reset_precision: None,
+        nominal_duration: None,
     };
 
     let anomaly = classify_window_transition(previous, current);

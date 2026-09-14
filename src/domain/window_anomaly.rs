@@ -26,7 +26,9 @@
 
 use crate::domain::quota::QuotaUsed;
 use crate::domain::time::UtcTimestamp;
-use crate::domain::window::{ResetPrecision, WindowResetState, WindowScopeKind};
+use crate::domain::window::{
+    NominalWindowDuration, ResetPrecision, WindowResetState, WindowScopeKind,
+};
 
 /// Provider-reported `resets_at` jitter envelope, sized from the measured
 /// distribution rather than from one sample.
@@ -88,6 +90,11 @@ pub struct WindowReading {
     pub resets_at: WindowResetState,
     pub observed_at: UtcTimestamp,
     pub reset_precision: Option<ResetPrecision>,
+    /// The window's nominal length, when the caller knows it. A window that
+    /// starts reports its first reset within one nominal length of the
+    /// reading (`aub-0x4j`); without the length a start cannot be told from a
+    /// boundary that moved, and the transition stays an anomaly.
+    pub nominal_duration: Option<NominalWindowDuration>,
 }
 
 /// True when the window's previously reported boundary had already been
@@ -218,10 +225,23 @@ pub fn classify_window_transition(
 
     // A window starting (`aub-0x4j`): idle (`NotStarted`) followed by a
     // freshly known reset instant with no decrease is the ordinary beginning
-    // of a window, not an unexpected reset change. A decrease on the same
-    // shape stays on the decrease path above.
+    // of a window, not an unexpected reset change, provided the new instant
+    // lies within one nominal length of the reading. An instant beyond that
+    // is a boundary that moved (`aub-z09n`'s four-hundred-hour case) and
+    // stays an anomaly. A decrease on either shape stays on the decrease path.
     let is_window_start = matches!(previous.resets_at, WindowResetState::NotStarted)
-        && matches!(current.resets_at, WindowResetState::Known(_));
+        && match (current.resets_at, current.nominal_duration) {
+            (WindowResetState::Known(instant), Some(nominal)) => {
+                let nominal_nanos = i64::try_from(nominal.as_nanos()).unwrap_or(i64::MAX);
+                let latest_start = current
+                    .observed_at
+                    .unix_nanos()
+                    .saturating_add(nominal_nanos)
+                    .saturating_add(tolerance_nanos);
+                instant.unix_nanos() <= latest_start
+            }
+            _ => false,
+        };
 
     if decreased {
         if legitimate_reset {
@@ -323,6 +343,17 @@ mod tests {
             resets_at,
             observed_at: UtcTimestamp::from_unix_nanos(observed_at),
             reset_precision,
+            nominal_duration: None,
+        }
+    }
+
+    /// Five hours, the session window's nominal length.
+    const SESSION_NANOS: u64 = 18_000_000_000_000;
+
+    fn with_nominal(reading: WindowReading, nanos: u64) -> WindowReading {
+        WindowReading {
+            nominal_duration: Some(NominalWindowDuration::from_nanos(nanos)),
+            ..reading
         }
     }
 
@@ -791,12 +822,55 @@ mod tests {
     #[test]
     fn aub_0x4j_not_started_to_known_without_decrease_is_a_window_start() {
         let previous = reading(0, WindowResetState::NotStarted, 500);
+        let current = with_nominal(
+            reading(
+                30_000,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000_000_000)),
+                600,
+            ),
+            SESSION_NANOS,
+        );
+        assert_eq!(classify_window_transition(previous, current), None);
+    }
+
+    /// Planted negative for the start (`aub-0x4j` against `aub-z09n`): the same
+    /// idle-to-known shape whose first reset lies four hundred hours past a
+    /// five-hour window's reading is a boundary that moved, not a start.
+    #[test]
+    fn aub_0x4j_not_started_to_known_far_past_the_nominal_length_is_still_an_anomaly() {
+        let observed = 1_000_000_000_000;
+        let previous = reading(0, WindowResetState::NotStarted, observed - 60_000_000_000);
+        let four_hundred_hours = 400 * 3_600_000_000_000;
+        let current = with_nominal(
+            reading(
+                30_000,
+                WindowResetState::Known(UtcTimestamp::from_unix_nanos(
+                    observed + four_hundred_hours,
+                )),
+                observed,
+            ),
+            SESSION_NANOS,
+        );
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
+    }
+
+    /// Without a nominal length the start cannot be told from a moved boundary,
+    /// so the idle-to-known shape keeps its anomaly (`aub-0x4j`).
+    #[test]
+    fn aub_0x4j_not_started_to_known_without_a_nominal_length_stays_an_anomaly() {
+        let previous = reading(0, WindowResetState::NotStarted, 500);
         let current = reading(
             30_000,
             WindowResetState::Known(UtcTimestamp::from_unix_nanos(10_000_000_000)),
             600,
         );
-        assert_eq!(classify_window_transition(previous, current), None);
+        assert_eq!(
+            classify_window_transition(previous, current),
+            Some(WindowAnomalyKind::UnexpectedResetTimestampChange)
+        );
     }
 
     /// The same start shape with a decrease (`aub-0x4j`): `NotStarted`
