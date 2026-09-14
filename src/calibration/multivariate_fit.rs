@@ -272,6 +272,41 @@ fn to_micro(value: f64) -> i64 {
     (value * MICRO).round() as i64
 }
 
+/// The last instant a reading still measures the run: the end of controlled
+/// work plus the settlement grace recorded at `begin`, cut short by the first
+/// usage the markers place on the run's own account after the end. The last
+/// block has no next spend to close it, so without this bound it closes on
+/// whatever the account's window did after the run: on 2026-09-14 two
+/// cold-resume probes 28 and 41 minutes after `end` added 130,000 ppm to the
+/// input arm's last block. Usage no marker places on any account does not cut
+/// the bound, the same rule that keeps it out of the blocks.
+fn settlement_bound(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    ended_at: UtcTimestamp,
+) -> Result<UtcTimestamp, Error> {
+    let grace = i64::try_from(
+        run.contamination_thresholds
+            .post_settlement_grace()
+            .as_nanos(),
+    )
+    .unwrap_or(i64::MAX);
+    let grace_end = UtcTimestamp::from_unix_nanos(ended_at.unix_nanos().saturating_add(grace));
+    let after_end: Vec<StoredUsageEvent> = load_experiment_usage(conn, ended_at, grace_end)?
+        .into_iter()
+        .filter(|row| row.timestamp > ended_at)
+        .collect();
+    let markers = markers_by_session(conn, &after_end)?;
+    let (own, _unattributed) = retain_account_usage(after_end, &markers, &run.account)?;
+    Ok(own
+        .iter()
+        .map(|row| row.timestamp)
+        .min()
+        .map_or(grace_end, |first| {
+            UtcTimestamp::from_unix_nanos(first.unix_nanos().saturating_sub(1))
+        }))
+}
+
 /// Fits the run's observations jointly over the kinds its premise names and
 /// records the candidate immutably. A refusal from the identifiability gate
 /// comes back as the fitter's own message, which names the collinear pair
@@ -287,7 +322,8 @@ pub fn fit_controlled_run_and_record(
         .ended_at
         .ok_or_else(|| still_running_refusal(run.id.as_str()))?;
     let now = clock.now();
-    let stored = observations_for_run(conn, run, now)?;
+    let until = settlement_bound(conn, run, ended_at)?.min(now);
+    let stored = observations_for_run(conn, run, until)?;
     if stored.is_empty() {
         return Err(Error::InsufficientEvidence(format!(
             "no meter observations found for controlled experiment '{}'",

@@ -350,6 +350,27 @@ fn spend(conn: &Connection, at_nanos: i64, index: usize, block: &ArmBlock) {
 /// `begin` with the given premise, then per block one usage event followed
 /// by a lagging reading and two settled ones, then `end`.
 fn seed_burst(state: &StateDir, fixture: &ArmFixture, expected_kinds: Vec<TokenKind>) {
+    seed_burst_ending(state, fixture, expected_kinds, RunEnd::AfterLastSettle);
+}
+
+/// Where `end` falls relative to the last block's readings.
+#[derive(Clone, Copy, PartialEq)]
+enum RunEnd {
+    /// After the last block's settled readings, as a driver that waits does.
+    AfterLastSettle,
+    /// Between the last block's lagging reading and its settled ones, so the
+    /// reading that measures the last block is taken after `end`.
+    BeforeLastSettle,
+}
+
+/// [`seed_burst`] with the end placed as `end` says; returns the `end`
+/// instant in unix nanos.
+fn seed_burst_ending(
+    state: &StateDir,
+    fixture: &ArmFixture,
+    expected_kinds: Vec<TokenKind>,
+    end: RunEnd,
+) -> i64 {
     let conn = open_test_ledger(state);
     let chain = meter_chain(&conn);
     let t0 = 1_000 * SECOND;
@@ -380,6 +401,8 @@ fn seed_burst(state: &StateDir, fixture: &ArmFixture, expected_kinds: Vec<TokenK
 
     let mut cumulative_ppm = BASELINE_PPM as f64;
     let mut t = t0 + 60 * SECOND;
+    let last_block = fixture.blocks.len() - 1;
+    let mut ended_at = None;
     for (index, block) in fixture.blocks.iter().enumerate() {
         spend(&conn, t, index, block);
         let movement: f64 = block
@@ -403,12 +426,20 @@ fn seed_burst(state: &StateDir, fixture: &ArmFixture, expected_kinds: Vec<TokenK
             t + 10 * SECOND,
             (cumulative_ppm + movement / 2.0).round() as i64,
         );
+        if index == last_block && end == RunEnd::BeforeLastSettle {
+            let at = t + 15 * SECOND;
+            record_end(&conn, &run.id, UtcTimestamp::from_unix_nanos(at)).unwrap();
+            ended_at = Some(at);
+        }
         reading(&conn, &chain, t + 20 * SECOND, settled.round() as i64);
         reading(&conn, &chain, t + 30 * SECOND, settled.round() as i64);
         cumulative_ppm = settled;
         t += 60 * SECOND;
     }
-    record_end(&conn, &run.id, UtcTimestamp::from_unix_nanos(t)).unwrap();
+    let ended_at = ended_at.unwrap_or_else(|| {
+        record_end(&conn, &run.id, UtcTimestamp::from_unix_nanos(t)).unwrap();
+        t
+    });
     reading(
         &conn,
         &chain,
@@ -416,6 +447,7 @@ fn seed_burst(state: &StateDir, fixture: &ArmFixture, expected_kinds: Vec<TokenK
         cumulative_ppm.round() as i64,
     );
     std::fs::write(state.path().join("aub.toml"), "").unwrap();
+    ended_at
 }
 
 fn run_aub(state: &StateDir, args: &[&str]) -> std::process::Output {
@@ -1069,6 +1101,133 @@ fn usage_of_another_account_in_the_run_window_never_enters_the_fit() {
     assert_eq!(
         contaminated_json["excluded_samples"],
         clean_json["excluded_samples"]
+    );
+}
+
+/// The settled value of the newest reading in the ledger.
+fn newest_reading_ppm(conn: &Connection) -> i64 {
+    count(
+        conn,
+        "SELECT mw.quota_used_ppm FROM meter_window mw
+         JOIN meter_observation mo ON mo.id = mw.observation_id
+         ORDER BY mo.received_at DESC, mw.id DESC LIMIT 1",
+    )
+}
+
+/// Every part of a joint fit's answer that the readings decide: the
+/// coefficients with their errors and intervals, the block residual, the
+/// block count and the exclusions.
+fn assert_same_fit(actual: &serde_json::Value, expected: &serde_json::Value, what: &str) {
+    for key in [
+        "coefficients",
+        "fit_residual_ppm",
+        "usable_observations",
+        "excluded_samples",
+    ] {
+        assert_eq!(actual[key], expected[key], "{key} changed when {what}");
+    }
+}
+
+/// The last block has no next spend to close it. A session on the run's own
+/// account resumed after `end`, and the meter moving 130,000 ppm for it
+/// inside the settlement grace, measure the window after the run: the fit
+/// with them present is the fit without them.
+#[test]
+fn usage_on_the_run_account_after_end_never_reaches_the_last_block() {
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    let clean = StateDir::new();
+    seed_burst(&clean, &fixture, TokenKind::ALL.to_vec());
+    let clean_json = fit_json(&clean);
+
+    let late = StateDir::new();
+    let ended_at = seed_burst_ending(
+        &late,
+        &fixture,
+        TokenKind::ALL.to_vec(),
+        RunEnd::AfterLastSettle,
+    );
+    let conn = open_test_ledger(&late);
+    let chain = meter_chain(&conn);
+    let settled_ppm = newest_reading_ppm(&conn);
+    usage_event(
+        &conn,
+        BURST_SESSION,
+        "cold-resume-probe",
+        ended_at + 60 * SECOND,
+        &[
+            (TokenKind::CacheWrite, 122_598),
+            (TokenKind::CacheRead, 8_033),
+        ],
+    );
+    reading(
+        &conn,
+        &chain,
+        ended_at + 120 * SECOND,
+        settled_ppm + 130_000,
+    );
+    drop(conn);
+
+    assert_same_fit(
+        &fit_json(&late),
+        &clean_json,
+        "the run's account was used after end",
+    );
+}
+
+/// With no usage after `end` at all, a reading past the settlement grace
+/// recorded at `begin` is still the window after the run, not a late
+/// settlement of its last block.
+#[test]
+fn a_reading_past_the_settlement_grace_never_reaches_the_last_block() {
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    let clean = StateDir::new();
+    seed_burst(&clean, &fixture, TokenKind::ALL.to_vec());
+    let clean_json = fit_json(&clean);
+
+    let late = StateDir::new();
+    let ended_at = seed_burst_ending(
+        &late,
+        &fixture,
+        TokenKind::ALL.to_vec(),
+        RunEnd::AfterLastSettle,
+    );
+    let grace = ContaminationThresholds::conservative_default().post_settlement_grace();
+    let conn = open_test_ledger(&late);
+    let chain = meter_chain(&conn);
+    let settled_ppm = newest_reading_ppm(&conn);
+    let past_grace = ended_at + i64::try_from(grace.as_nanos()).unwrap() + 60 * SECOND;
+    reading(&conn, &chain, past_grace, settled_ppm + 130_000);
+    drop(conn);
+
+    assert_same_fit(
+        &fit_json(&late),
+        &clean_json,
+        "a reading arrived past the settlement grace",
+    );
+}
+
+/// The bound must not cut the settlement it exists for: when `end` is
+/// recorded before the last block's meter caught up, the settled readings
+/// taken after `end` still close that block.
+#[test]
+fn the_last_block_still_settles_on_readings_taken_after_end() {
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    let clean = StateDir::new();
+    seed_burst(&clean, &fixture, TokenKind::ALL.to_vec());
+    let clean_json = fit_json(&clean);
+
+    let early_end = StateDir::new();
+    seed_burst_ending(
+        &early_end,
+        &fixture,
+        TokenKind::ALL.to_vec(),
+        RunEnd::BeforeLastSettle,
+    );
+
+    assert_same_fit(
+        &fit_json(&early_end),
+        &clean_json,
+        "end was recorded before the last block settled",
     );
 }
 
