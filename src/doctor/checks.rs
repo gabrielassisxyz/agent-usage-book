@@ -189,7 +189,7 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::LastSampleTick => "the last aub sample invocation succeeded",
         CheckName::SamplingFailureCounts => {
-            "the newest completed sampling tick has no persist-failed or due-lookup-failed disposition"
+            "no persist-failed or due-lookup-failed sampler disposition in the last 24h"
         }
         CheckName::MeterErrorClassifications => {
             "every failed attempt in the recent window carries the provider error              classification the sampler stored for it"
@@ -1246,24 +1246,52 @@ fn last_sample_tick(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::LastSampleTick, status)
 }
 
-/// Every persist-failed and due-lookup-failed sampler disposition still
-/// present in the newest completed batch, by reason (`aub-b0w6`, `aub-7xlf`), read from
+/// Every persist-failed and due-lookup-failed sampler disposition seen in the
+/// last 24 hours, by reason (`aub-b0w6`, `aub-7xlf`, `aub-ahyc`), read from
 /// `crate::store::sampling_failure_counts` rather than the ledger or the
 /// scheduler's journal. A continuing recurrence stays a `Fail` and its count
-/// grows; a later completed tick that no longer carries the reason settles it.
+/// grows; an entry stays a `Fail` for 24 hours after its last occurrence even
+/// when later ticks no longer carry it, then drops out on its own. Entries
+/// without `last_seen_unix_nanos` are never reported: a missing instant
+/// cannot be placed inside any window.
 fn sampling_failure_counts(ctx: &DoctorContext) -> CheckOutcome {
     let status = match crate::store::sampling_failure_counts::read_sampling_failure_counts(
         &ctx.config.state.dir,
     ) {
-        Ok(counts) if counts.is_empty() => CheckStatus::Pass,
-        Ok(mut counts) => {
-            counts.sort_by(|a, b| (&a.category, &a.reason).cmp(&(&b.category, &b.reason)));
-            let detail = counts
-                .iter()
-                .map(|c| format!("{}: {} (count={})", c.category, c.reason, c.count))
-                .collect::<Vec<_>>()
-                .join(", ");
-            CheckStatus::Fail(detail)
+        Ok(counts) => {
+            let mut live: Vec<_> = counts
+                .into_iter()
+                .filter(|c| {
+                    ctx.timestamp
+                        .unix_nanos()
+                        .saturating_sub(c.last_seen.unix_nanos())
+                        < crate::store::sampling_failure_counts::SAMPLING_FAILURE_VISIBILITY_WINDOW_NANOS
+                })
+                .collect();
+            if live.is_empty() {
+                CheckStatus::Pass
+            } else {
+                live.sort_by(|a, b| (&a.category, &a.reason).cmp(&(&b.category, &b.reason)));
+                let detail = live
+                    .iter()
+                    .map(|c| {
+                        let age_nanos = ctx
+                            .timestamp
+                            .unix_nanos()
+                            .saturating_sub(c.last_seen.unix_nanos())
+                            .max(0) as u64;
+                        format!(
+                            "{}: {} (count={}, age={}s)",
+                            c.category,
+                            c.reason,
+                            c.count,
+                            age_nanos / 1_000_000_000
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                CheckStatus::Fail(detail)
+            }
         }
         Err(error) => {
             CheckStatus::Fail(format!("cannot read the sampling failure counts: {error}"))

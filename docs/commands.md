@@ -682,10 +682,16 @@ the count as collector interruption evidence. It never inserts a
 `meter_attempt_result` row to make the ledger look complete.
 
 `sampling-failure-counts` is reconciled from the complete account report after
-each successful sampling tick. A `(category, reason)` count continues growing
-while the same failure remains in the newest completed tick; a reason absent
-from that tick is removed, so a recovered database does not keep reporting a
-failure that subsequent sampling has already disproved. The completed batch is
+each successful sampling tick. Each `(category, reason)` entry carries the
+instant it last occurred as `last_seen_unix_nanos`. A tick carrying a failure
+increments its count and restamps it to that tick's instant; a tick not
+carrying it keeps the entry unchanged while its last occurrence is less than
+24 hours old, and removes it once it is 24 hours old or older. The check
+fails while any entry is inside the 24-hour window, naming each entry's
+category, reason, count and age since its last occurrence, and passes when
+none is. A failure from the night is therefore still on `doctor` the next
+day, while a recovered fault stops reporting on its own. An entry without
+`last_seen_unix_nanos` counts as already expired. The completed batch is
 the authority rather than a ledger query because a due-lookup failure can occur
 before the ledger contains a row from which to reconstruct it.
 

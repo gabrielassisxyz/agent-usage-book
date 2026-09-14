@@ -1269,21 +1269,24 @@ fn check_fails_sampling_failure_counts_and_names_the_recurring_reason() {
     use agent_usage_book::store::sampling_failure_counts::reconcile_sampling_failure_counts;
 
     let state = StateDir::new();
+    let t0 = ts(1_700_000_000);
     reconcile_sampling_failure_counts(
         state.path(),
         &[("due_lookup_failed", "database disk image is malformed")],
+        t0,
     )
     .unwrap();
     reconcile_sampling_failure_counts(
         state.path(),
         &[("due_lookup_failed", "database disk image is malformed")],
+        t0,
     )
     .unwrap();
 
     let config = test_config(state.path());
     let ctx = DoctorContext {
         config: &config,
-        timestamp: ts(1_700_000_000),
+        timestamp: t0,
         db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
         db: None,
         db_missing: true,
@@ -1300,48 +1303,137 @@ fn check_fails_sampling_failure_counts_and_names_the_recurring_reason() {
             CheckStatus::Fail(ref detail)
                 if detail.contains("database disk image is malformed")
                     && detail.contains("count=2")
+                    && detail.contains("age=")
         ),
         "{:?}",
         outcome.status
     );
 }
 
+/// `aub-ahyc`: a clean tick minutes after the failure keeps it visible;
+/// a clean tick 24 hours after its last occurrence removes it.
 #[test]
-fn sampling_failure_counts_passes_after_a_newer_clean_tick_settles_the_failure() {
-    use agent_usage_book::store::sample_tick::{LastSampleTick, TickOutcome, record_last_tick};
+fn sampling_failure_counts_keeps_recent_failure_through_a_clean_tick_and_clears_at_24h() {
     use agent_usage_book::store::sampling_failure_counts::reconcile_sampling_failure_counts;
 
     let state = StateDir::new();
+    let t0 = ts(1_700_000_000);
     reconcile_sampling_failure_counts(
         state.path(),
         &[("due_lookup_failed", "database disk image is malformed")],
+        t0,
     )
     .unwrap();
 
-    record_last_tick(
-        state.path(),
-        &LastSampleTick {
-            started_at: ts(1_700_000_001),
-            outcome: TickOutcome::Success,
-        },
-    )
-    .unwrap();
-    reconcile_sampling_failure_counts(state.path(), &[]).unwrap();
+    let minute_later = ts(1_700_000_000 + 60);
+    reconcile_sampling_failure_counts(state.path(), &[], minute_later).unwrap();
 
     let config = test_config(state.path());
     let ctx = DoctorContext {
         config: &config,
-        timestamp: ts(1_700_000_002),
+        timestamp: minute_later,
         db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
         db: None,
         db_missing: true,
         db_open_error: None,
     };
-    let outcomes = build_registry(&ctx);
-    let outcome = outcomes
+    let outcome = build_registry(&ctx)
         .iter()
         .find(|outcome| outcome.name == CheckName::SamplingFailureCounts)
-        .expect("SamplingFailureCounts present");
+        .expect("SamplingFailureCounts present")
+        .clone();
+    assert!(
+        matches!(outcome.status, CheckStatus::Fail(_)),
+        "a clean tick a minute later must keep the failure visible: {:?}",
+        outcome.status
+    );
+
+    let day_later = ts(1_700_000_000 + 24 * 60 * 60);
+    reconcile_sampling_failure_counts(state.path(), &[], day_later).unwrap();
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: day_later,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcome = build_registry(&ctx)
+        .iter()
+        .find(|outcome| outcome.name == CheckName::SamplingFailureCounts)
+        .expect("SamplingFailureCounts present")
+        .clone();
+    assert_eq!(outcome.status, CheckStatus::Pass);
+}
+
+/// `aub-ahyc`: a counts file with one entry 1 hour old fails the check
+/// naming its age.
+#[test]
+fn sampling_failure_counts_fails_for_a_1h_old_entry_naming_its_age() {
+    use agent_usage_book::store::sampling_failure_counts::sampling_failure_counts_path;
+
+    let state = StateDir::new();
+    let now = ts(1_700_000_000);
+    let hour_ago = ts(1_700_000_000 - 3_600);
+    let text = format!(
+        "{{\"schema_version\":1,\"failures\":[{{\"category\":\"persist_failed\",\"reason\":\"disk full\",\"count\":1,\"last_seen_unix_nanos\":{}}}]}}",
+        hour_ago.unix_nanos()
+    );
+    fs::write(sampling_failure_counts_path(state.path()), text).unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcome = build_registry(&ctx)
+        .iter()
+        .find(|o| o.name == CheckName::SamplingFailureCounts)
+        .expect("SamplingFailureCounts present")
+        .clone();
+    match &outcome.status {
+        CheckStatus::Fail(detail) => {
+            assert!(detail.contains("persist_failed"), "{detail}");
+            assert!(detail.contains("disk full"), "{detail}");
+            assert!(detail.contains("count=1"), "{detail}");
+            assert!(detail.contains("age=3600s"), "{detail}");
+        }
+        other => panic!("a 1-hour-old entry must fail naming its age, got {other:?}"),
+    }
+}
+
+/// `aub-ahyc`: a counts file with one entry 25 hours old passes.
+#[test]
+fn sampling_failure_counts_passes_for_a_25h_old_entry() {
+    use agent_usage_book::store::sampling_failure_counts::sampling_failure_counts_path;
+
+    let state = StateDir::new();
+    let now = ts(1_700_000_000);
+    let old = ts(1_700_000_000 - 25 * 3_600);
+    let text = format!(
+        "{{\"schema_version\":1,\"failures\":[{{\"category\":\"persist_failed\",\"reason\":\"disk full\",\"count\":1,\"last_seen_unix_nanos\":{}}}]}}",
+        old.unix_nanos()
+    );
+    fs::write(sampling_failure_counts_path(state.path()), text).unwrap();
+
+    let config = test_config(state.path());
+    let ctx = DoctorContext {
+        config: &config,
+        timestamp: now,
+        db_path: state.path().join(connection::LEDGER_DATABASE_FILE),
+        db: None,
+        db_missing: true,
+        db_open_error: None,
+    };
+    let outcome = build_registry(&ctx)
+        .iter()
+        .find(|o| o.name == CheckName::SamplingFailureCounts)
+        .expect("SamplingFailureCounts present")
+        .clone();
     assert_eq!(outcome.status, CheckStatus::Pass);
 }
 

@@ -1749,11 +1749,13 @@ pub(crate) fn sample_command(
     // A malformed-database recurrence (`aub-lz0k`) surfaces as a `PersistFailed`
     // or `DueLookupFailed` disposition, not as an `Err` from `run_result` above,
     // so it is invisible to `sample_tick`'s single latest-tick record. Reconcile
-    // the durable counts from the completed batch: a continuing failure grows,
-    // while a reason absent from this successful tick is settled (`aub-7xlf`).
-    // A count-write failure is a diagnostic-aid failure, same as the tick
-    // marker above, so it never masks or replaces the tick's own result.
-    let _ = record_sampling_failure_counts(&config.state.dir, &batch_report.accounts);
+    // the durable counts from the completed batch: a continuing failure grows
+    // and is restamped to this tick's own instant, while a reason absent from
+    // this tick stays visible for 24 hours after its last occurrence
+    // (`aub-ahyc`). A count-write failure is a diagnostic-aid failure, same
+    // as the tick marker above, so it never masks or replaces the tick's own
+    // result.
+    let _ = record_sampling_failure_counts(&config.state.dir, &batch_report.accounts, timestamp);
 
     // Emitted once regardless of output format, so a JSON-format invocation's
     // anomalies reach the diagnostic log exactly like a text-format one's do;
@@ -2289,12 +2291,14 @@ fn sampling_disposition_error(
 }
 
 /// Reconciles every `PersistFailed` and `DueLookupFailed` disposition in one
-/// completed tick with the durable per-reason counts (`aub-b0w6`, `aub-7xlf`).
-/// A failure present again increments; a failure absent from this tick is no
-/// longer current and is removed.
+/// completed tick with the durable per-reason counts
+/// (`aub-b0w6`, `aub-7xlf`, `aub-ahyc`). A failure present again increments
+/// and is restamped to the tick's own instant `now`; a failure absent from
+/// this tick is kept while its last occurrence is less than 24 hours old.
 fn record_sampling_failure_counts(
     state_dir: &Path,
     accounts: &[crate::meter::sampler::AccountReport],
+    now: crate::domain::time::UtcTimestamp,
 ) -> Result<(), Error> {
     let failures = accounts
         .iter()
@@ -2312,7 +2316,9 @@ fn record_sampling_failure_counts(
             | crate::meter::sampler::AccountDisposition::Spooled { .. } => None,
         })
         .collect::<Vec<_>>();
-    crate::store::sampling_failure_counts::reconcile_sampling_failure_counts(state_dir, &failures)
+    crate::store::sampling_failure_counts::reconcile_sampling_failure_counts(
+        state_dir, &failures, now,
+    )
 }
 
 /// Writes the `now` report in the requested format. One freshness variant per
@@ -10812,10 +10818,13 @@ usage_evidence = "measured"
     }
 
     /// `record_sampling_failure_counts` is the glue between one completed
-    /// tick and the durable per-reason counter (`aub-b0w6`, `aub-7xlf`). A
-    /// `PersistFailed` and a `DueLookupFailed` each add one to their own
-    /// category's count. The next tick retains only a failure that recurs,
-    /// then a clean tick settles it too.
+    /// tick and the durable per-reason counter
+    /// (`aub-b0w6`, `aub-7xlf`, `aub-ahyc`). A `PersistFailed` and a
+    /// `DueLookupFailed` each add one to their own category's count and are
+    /// restamped to the tick's instant. A tick that does not carry a failure
+    /// keeps that entry while its last occurrence is less than 24 hours old:
+    /// the planted negative against the `aub-7xlf` behaviour, which removed
+    /// it at once.
     #[test]
     fn record_sampling_failure_counts_reconciles_each_completed_tick() {
         use crate::domain::attempt::{AttemptId, AttemptOutcome};
@@ -10827,6 +10836,11 @@ usage_evidence = "measured"
             std::process::id()
         ));
         std::fs::create_dir_all(&state_dir).unwrap();
+        let t0 = crate::domain::time::UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        let t1 =
+            crate::domain::time::UtcTimestamp::from_unix_nanos(t0.unix_nanos() + 60_000_000_000);
+        let t2 =
+            crate::domain::time::UtcTimestamp::from_unix_nanos(t1.unix_nanos() + 60_000_000_000);
 
         let persist_failed = AccountReport {
             name: AccountName::new("work-a"),
@@ -10848,8 +10862,12 @@ usage_evidence = "measured"
                 next_due_at: crate::domain::time::UtcTimestamp::from_unix_nanos(1),
             },
         };
-        record_sampling_failure_counts(&state_dir, &[persist_failed, due_lookup_failed, not_yet])
-            .unwrap();
+        record_sampling_failure_counts(
+            &state_dir,
+            &[persist_failed, due_lookup_failed, not_yet],
+            t0,
+        )
+        .unwrap();
 
         let mut counts =
             crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
@@ -10862,11 +10880,13 @@ usage_evidence = "measured"
                     category: "due_lookup_failed".to_string(),
                     reason: "database disk image is malformed".to_string(),
                     count: 1,
+                    last_seen: t0,
                 },
                 crate::store::sampling_failure_counts::SamplingFailureCount {
                     category: "persist_failed".to_string(),
                     reason: "database disk image is malformed".to_string(),
                     count: 1,
+                    last_seen: t0,
                 },
             ]
         );
@@ -10877,11 +10897,12 @@ usage_evidence = "measured"
                 reason: "database disk image is malformed".to_string(),
             },
         };
-        record_sampling_failure_counts(&state_dir, &[due_lookup_failed_again]).unwrap();
+        record_sampling_failure_counts(&state_dir, &[due_lookup_failed_again], t1).unwrap();
 
-        let counts_after_recurrence =
+        let mut counts_after_recurrence =
             crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
                 .unwrap();
+        counts_after_recurrence.sort_by(|a, b| a.category.cmp(&b.category));
         assert_eq!(
             counts_after_recurrence,
             vec![
@@ -10889,9 +10910,16 @@ usage_evidence = "measured"
                     category: "due_lookup_failed".to_string(),
                     reason: "database disk image is malformed".to_string(),
                     count: 2,
+                    last_seen: t1,
+                },
+                crate::store::sampling_failure_counts::SamplingFailureCount {
+                    category: "persist_failed".to_string(),
+                    reason: "database disk image is malformed".to_string(),
+                    count: 1,
+                    last_seen: t0,
                 },
             ],
-            "the current failure keeps accumulating while the absent one is settled"
+            "a tick without persist_failed must keep that entry inside 24h"
         );
 
         let sampled = AccountReport {
@@ -10906,15 +10934,15 @@ usage_evidence = "measured"
                 window_anomalies: Vec::new(),
             }),
         };
-        record_sampling_failure_counts(&state_dir, &[sampled]).unwrap();
+        record_sampling_failure_counts(&state_dir, &[sampled], t2).unwrap();
 
         let counts_after_clean_tick =
             crate::store::sampling_failure_counts::read_sampling_failure_counts(&state_dir)
                 .unwrap();
         assert_eq!(
-            counts_after_clean_tick,
-            Vec::<crate::store::sampling_failure_counts::SamplingFailureCount>::new(),
-            "a clean completed tick must settle every earlier failure"
+            counts_after_clean_tick.len(),
+            2,
+            "a clean tick minutes later must keep recent failures visible"
         );
 
         std::fs::remove_dir_all(&state_dir).unwrap();
