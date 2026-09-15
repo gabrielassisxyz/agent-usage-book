@@ -305,13 +305,26 @@ fn integration_requested_valuation_unavailable_renders_unavailable_form() {
     assert!(text.contains("valued at API list-price equivalent"));
     assert_eq!(
         spend_row_cells(&text, "2026-08-25"),
-        ["2026-08-25", "10k", "5000", "1000", "2000", "known", "0.11"],
-        "the token cells stay intact next to the unavailable valuation: {text}"
+        [
+            "2026-08-25",
+            "10000",
+            "5000",
+            "1000",
+            "2000",
+            "known",
+            "0.11"
+        ],
+        "a valued report keeps exact token cells next to the unavailable valuation: {text}"
     );
     assert!(text.contains("API list-price equivalent unavailable"));
+    let lines = text.lines().collect::<Vec<_>>();
+    let row = lines
+        .iter()
+        .position(|line| line.starts_with("\u{2502}  2026-08-25 "))
+        .expect("the group row is rendered");
     assert!(
-        text.contains("day=2026-08-25: API list-price equivalent unavailable"),
-        "the unavailable form is attributed to its group: {text}"
+        lines[row + 1].contains("API list-price equivalent unavailable"),
+        "the unavailable form sits under its own row: {text}"
     );
     assert!(
         !text.contains('\u{25d0}'),
@@ -473,9 +486,12 @@ fn unit_stale_rate_card_reported_by_doctor_and_noted_on_valued_report() {
     .with_stale_rate_card_note(Some(stale_note));
 
     let text = render_spend_report(&report);
-    assert!(text.contains(
-        "note: rate card review is due (configured review-due date 2026-08-31 has passed)"
-    ));
+    assert!(
+        spend_box_inner_text(&text).contains(
+            "note: rate card review is due (configured review-due date 2026-08-31 has passed)"
+        ),
+        "{text}"
+    );
     assert!(text.contains("valued at API list-price equivalent"));
 
     let json_str = spend_json(&report, RunId::from_string("run-stale".to_string()));
@@ -791,4 +807,14 @@ fn spend_row_cells(text: &str, label: &str) -> Vec<String> {
         })
         .find(|cells| cells.first().map(String::as_str) == Some(label))
         .unwrap_or_else(|| panic!("no spend row labelled {label}: {text}"))
+}
+
+/// The box's content with rails and padding removed and lines joined by one
+/// space, so a note the renderer wrapped inside the box reads as one sentence.
+fn spend_box_inner_text(text: &str) -> String {
+    text.lines()
+        .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c == ' '))
+        .filter(|inner| !inner.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
 }

@@ -938,10 +938,10 @@ struct SpendTableSection {
     rows: Vec<SpendTableRow>,
 }
 
-/// Renders the boxed spend surface. The width used to choose columns is the
-/// measured terminal width, while the shared frame still enforces its 80-column
-/// floor. This distinction lets a narrow pty exercise the same drop policy as a
-/// real terminal without making the frame itself unreadably narrow.
+/// Renders the boxed spend surface. Columns are chosen against the narrower of
+/// the measured terminal and the box: a narrow pty drops columns the way a real
+/// narrow terminal would, while a terminal wider than the box never lets the
+/// table outgrow the frame it is drawn in.
 fn render_spend_box(report: &SpendReport, style: Style) -> String {
     render_spend_box_at_width(report, style, usize::from(style.width()))
 }
@@ -951,6 +951,9 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
     let total = spend_total_row(report, report.groups.iter().any(spend_group_has_reasoning));
     let has_valuation = report.groups.iter().any(spend_group_has_valuation);
     let has_credits = report.groups.iter().any(spend_group_has_credits);
+    // `--value api-list` is the one text surface that keeps exact counts: every
+    // group carries a valuation exactly when it was requested.
+    let exact = has_valuation;
     let has_partial = sections
         .iter()
         .flat_map(|section| section.rows.iter())
@@ -977,11 +980,12 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
     }
 
     let box_width = boxed_width(&style);
-    let measured_area = measured_width.saturating_sub(6);
-    let grouping_label = spend_grouping_label(report);
+    let content_area = boxed_content_area(box_width);
+    let layout_area = measured_width.min(box_width).saturating_sub(6);
+    let key_header = spend_key_header(report);
     let mut hidden = Vec::new();
-    while spend_table_width(&grouping_label, &columns, &sections, &total, has_partial)
-        > measured_area
+    while spend_table_width(&key_header, &columns, &sections, &total, has_partial, exact)
+        > layout_area
         && columns.len() > 3
     {
         let candidate = [
@@ -997,13 +1001,11 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
         hidden.push(candidate);
     }
 
-    let scales = spend_column_scales(&columns, &sections);
-    let widths = spend_column_widths(&grouping_label, &columns, &sections, &total, &scales);
+    let mut widths = spend_column_widths(&key_header, &columns, &sections, &total, exact);
+    fit_spend_key_column(&mut widths, has_partial, layout_area);
     let rule_width = spend_table_width_from_widths(&widths, has_partial);
-    let mut lines = vec![boxed_top(
-        &style.paint(style.bold(), &spend_title(report)),
-        box_width,
-    )];
+    let title = truncate_spend_text(&spend_title(report), box_width.saturating_sub(6));
+    let mut lines = vec![boxed_top(&style.paint(style.bold(), &title), box_width)];
     lines.push(boxed_blank(box_width));
 
     let nested = report.grouping.len() > 1;
@@ -1012,18 +1014,19 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
             lines.push(boxed_blank(box_width));
         }
         if let Some(title) = &section.title {
-            lines.push(boxed_body(&style.paint(style.accent(), title), box_width));
+            let title = truncate_spend_text(title, content_area);
+            lines.push(boxed_body(&style.paint(style.accent(), &title), box_width));
         }
         lines.push(boxed_body(
             &style.paint(
                 style.muted(),
-                &spend_header_line(&grouping_label, &columns, &widths),
+                &spend_header_line(&key_header, &columns, &widths),
             ),
             box_width,
         ));
         lines.push(boxed_rule(rule_width, box_width));
         for row in &section.rows {
-            let content = spend_row_line(row, &columns, &widths, &scales, has_partial);
+            let content = spend_row_line(row, &columns, &widths, exact, has_partial);
             let content = if row.dim {
                 style.paint(style.dim(), &content)
             } else {
@@ -1031,21 +1034,48 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
             };
             lines.push(boxed_body(&content, box_width));
             for detail in &row.details {
-                lines.push(boxed_body(
-                    &style.paint(style.dim(), &format!("  {detail}")),
-                    box_width,
-                ));
+                lines.extend(
+                    wrap_spend_text(detail, content_area, "  ", "    ")
+                        .into_iter()
+                        .map(|line| boxed_body(&style.paint(style.dim(), &line), box_width)),
+                );
             }
         }
     }
 
     lines.push(boxed_rule(rule_width, box_width));
-    let total_line = spend_row_line(&total, &columns, &widths, &[], false);
+    let total_line = spend_row_line(&total, &columns, &widths, exact, false);
     lines.push(boxed_body(
         &style.paint(style.bold(), &total_line),
         box_width,
     ));
 
+    let footer = spend_footer_lines(report, has_valuation, has_credits, has_partial, hidden);
+    if !footer.is_empty() {
+        lines.push(boxed_blank(box_width));
+        lines.extend(
+            footer
+                .iter()
+                .flat_map(|line| wrap_spend_text(line, content_area, "", "  "))
+                .map(|line| boxed_body(&style.paint(style.dim(), &line), box_width)),
+        );
+    }
+    lines.push(boxed_bottom(box_width));
+    lines.join("\n")
+}
+
+/// The legend a `◐` row marker points at. It names what the marker means and
+/// no cause: incomplete coverage can be a day still in progress, a source not
+/// yet read, or a component the parser does not model.
+const SPEND_PARTIAL_LEGEND: &str = "◐ partial: coverage incomplete for this row";
+
+fn spend_footer_lines(
+    report: &SpendReport,
+    has_valuation: bool,
+    has_credits: bool,
+    has_partial: bool,
+    hidden: Vec<SpendTableColumn>,
+) -> Vec<String> {
     let mut footer = Vec::new();
     if has_valuation {
         footer.push("valued at API list-price equivalent".to_string());
@@ -1061,14 +1091,7 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
         ));
     }
     if has_partial {
-        footer.push(format!(
-            "◐ partial: {} still in progress",
-            report
-                .grouping
-                .last()
-                .map(|grouping| grouping.as_str())
-                .unwrap_or("group")
-        ));
+        footer.push(SPEND_PARTIAL_LEGEND.to_string());
     }
     for outcome in &report.filters {
         footer.push(render_spend_filter_exclusion(outcome));
@@ -1098,17 +1121,7 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
             .iter()
             .map(|file| format!("unreadable: {file}")),
     );
-
-    if !footer.is_empty() {
-        lines.push(boxed_blank(box_width));
-        lines.extend(
-            footer
-                .into_iter()
-                .map(|line| boxed_body(&style.paint(style.dim(), &line), box_width)),
-        );
-    }
-    lines.push(boxed_bottom(box_width));
-    lines.join("\n")
+    footer
 }
 
 fn spend_title(report: &SpendReport) -> String {
@@ -1154,7 +1167,7 @@ fn spend_sections(report: &SpendReport) -> Vec<SpendTableSection> {
                 collect_spend_leaves(group, &mut leaves);
                 leaves
             })
-            .map(spend_table_row)
+            .map(|group| spend_table_row(group, false))
             .collect();
         return vec![SpendTableSection { title: None, rows }];
     }
@@ -1163,18 +1176,19 @@ fn spend_sections(report: &SpendReport) -> Vec<SpendTableSection> {
         let mut leaves = Vec::new();
         collect_spend_leaves(group, &mut leaves);
         sections.push(SpendTableSection {
-            title: nested.then(|| {
-                format!(
-                    "{} · {}",
-                    report
-                        .grouping
-                        .first()
-                        .map(|grouping| grouping.as_str())
-                        .unwrap_or("group"),
-                    spend_group_dimension_value(group.key.as_str(), 0)
-                )
-            }),
-            rows: leaves.into_iter().map(spend_table_row).collect(),
+            title: Some(format!(
+                "{} · {}",
+                report
+                    .grouping
+                    .first()
+                    .map(|grouping| grouping.as_str())
+                    .unwrap_or("group"),
+                spend_group_dimension_value(group.key.as_str(), 0)
+            )),
+            rows: leaves
+                .into_iter()
+                .map(|group| spend_table_row(group, true))
+                .collect(),
         });
     }
     sections
@@ -1203,35 +1217,26 @@ fn collect_spend_leaves<'a>(group: &'a SpendGroup, leaves: &mut Vec<&'a SpendGro
     }
 }
 
-fn spend_table_row(group: &SpendGroup) -> SpendTableRow {
+/// One table row per leaf group. Detail lines under the row carry only the
+/// derived value: the row label already names the group, so repeating the full
+/// key would spend the box width on text the reader has just read.
+fn spend_table_row(group: &SpendGroup, nested: bool) -> SpendTableRow {
     let known = group.usage.known();
     let mut details = Vec::new();
     if let Some(valuation) = &group.valuation {
-        details.push(format!(
-            "{}: {}",
-            group.key.as_str(),
-            spend_valuation_description(valuation)
-        ));
+        details.push(spend_valuation_description(valuation));
     }
     if let Some(credits) = &group.credits {
-        details.push(format!(
-            "{}: {}",
-            group.key.as_str(),
-            render_credits(credits)
-        ));
+        details.push(render_credits(credits));
     }
     if let Some(window_equivalent) = &group.window_equivalent {
-        details.push(format!(
-            "{}: {}",
-            group.key.as_str(),
-            render_window_equivalent(window_equivalent)
-        ));
+        details.push(render_window_equivalent(window_equivalent));
     }
     if let Some(term) = quality_term(group.usage.quality()) {
-        details.push(format!("{}: {}", group.key.as_str(), term.term()));
+        details.push(term.term().to_string());
     }
     SpendTableRow {
-        label: fit_spend_group_key(spend_group_dimension_value(group.key.as_str(), usize::MAX)),
+        label: spend_row_label(group.key.as_str(), nested),
         known: std::array::from_fn(|index| known.value(TokenKind::ALL[index])),
         reasoning: group
             .usage
@@ -1349,52 +1354,119 @@ fn spend_group_dimension_value(key: &str, index: usize) -> String {
         .to_string()
 }
 
-fn spend_grouping_label(report: &SpendReport) -> String {
-    report
-        .grouping
-        .last()
-        .map(|grouping| grouping.as_str())
-        .unwrap_or("group")
-        .to_string()
+/// The row label: under a nested grouping the section title already names the
+/// first dimension, so the label joins every remaining dimension's value. A
+/// grouping of three or more dimensions therefore keeps each value visible
+/// instead of showing only the innermost one.
+fn spend_row_label(key: &str, nested: bool) -> String {
+    let values = key
+        .split(" / ")
+        .map(|part| {
+            let value = part.split_once('=').map(|(_, value)| value).unwrap_or(part);
+            fit_spend_group_key(value)
+        })
+        .collect::<Vec<_>>();
+    let skip = if nested && values.len() > 1 {
+        1
+    } else {
+        values.len().saturating_sub(1)
+    };
+    values[skip..].join(" · ")
 }
 
-fn fit_spend_group_key(key: String) -> String {
-    const MAX_GROUP_KEY_WIDTH: usize = 24;
-    if key.chars().count() <= MAX_GROUP_KEY_WIDTH {
-        return key;
+/// The key column's header, built the same way as the row labels it heads.
+fn spend_key_header(report: &SpendReport) -> String {
+    let names = report
+        .grouping
+        .iter()
+        .map(|grouping| grouping.as_str())
+        .collect::<Vec<_>>();
+    match names.len() {
+        0 => "group".to_string(),
+        1 => names[0].to_string(),
+        _ => names[1..].join(" · "),
     }
-    let mut shortened = key
+}
+
+fn fit_spend_group_key(value: &str) -> String {
+    const MAX_GROUP_KEY_WIDTH: usize = 24;
+    truncate_spend_text(value, MAX_GROUP_KEY_WIDTH)
+}
+
+/// Shortens text to `width` characters, marking the cut with `…`.
+fn truncate_spend_text(text: &str, width: usize) -> String {
+    if text.chars().count() <= width {
+        return text.to_string();
+    }
+    let mut shortened = text
         .chars()
-        .take(MAX_GROUP_KEY_WIDTH - 1)
+        .take(width.saturating_sub(1))
         .collect::<String>();
     shortened.push('…');
     shortened
 }
 
-/// Formats token counts for the compact human table. Rounding is done before
-/// choosing the suffix, so 9,999,999 is promoted to `10.0M` rather than shown
-/// as `10000.0k`.
+/// Breaks free text into lines no wider than `width`, at spaces where it can.
+/// A word longer than a whole line is split by characters, because a detail or
+/// a footer note must stay inside the box rather than push its right rail out.
+fn wrap_spend_text(text: &str, width: usize, first: &str, rest: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = first.to_string();
+    let mut has_word = false;
+    for word in text.split(' ').filter(|word| !word.is_empty()) {
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        if has_word && current_len + 1 + word_len > width {
+            lines.push(std::mem::replace(&mut current, rest.to_string()));
+            has_word = false;
+        }
+        let mut word = word.to_string();
+        while !has_word && current.chars().count() + word.chars().count() > width {
+            let room = width.saturating_sub(current.chars().count()).max(1);
+            let head = word.chars().take(room).collect::<String>();
+            word = word.chars().skip(room).collect();
+            current.push_str(&head);
+            lines.push(std::mem::replace(&mut current, rest.to_string()));
+        }
+        if has_word {
+            current.push(' ');
+        }
+        current.push_str(&word);
+        has_word = true;
+    }
+    lines.push(current);
+    lines
+}
+
+/// Formats token counts for the compact human table: under 10k the exact
+/// integer, under 10M thousands with one decimal, else millions with one
+/// decimal. Rounding is done before choosing the suffix, so 9,999,999 is
+/// promoted to `10.0M` rather than shown as `10000.0k`.
 pub fn format_spend_count(raw: u64) -> String {
     if raw < 10_000 {
         return raw.to_string();
     }
-    if raw < 1_000_000 {
-        let tenths = (raw + 50) / 100;
-        if raw < 100_000 {
-            return format!("{}.{:01}k", tenths / 10, tenths % 10);
-        }
-        let rounded = (raw + 500) / 1_000;
-        if rounded >= 1_000 {
-            return "1.0M".to_string();
-        }
-        return format!("{rounded}k");
+    let kilo_tenths = raw.saturating_add(50) / 100;
+    if kilo_tenths < 100_000 {
+        return format!("{}.{}k", kilo_tenths / 10, kilo_tenths % 10);
     }
-    let tenths = (raw + 50_000) / 100_000;
-    format!("{}.{:01}M", tenths / 10, tenths % 10)
+    let mega_tenths = raw.saturating_add(50_000) / 100_000;
+    format!("{}.{}M", mega_tenths / 10, mega_tenths % 10)
 }
 
-fn spend_header_line(grouping: &str, columns: &[SpendTableColumn], widths: &[usize]) -> String {
-    let mut cells = vec![grouping.to_string()];
+fn spend_count_cell(raw: u64, exact: bool) -> String {
+    if exact {
+        raw.to_string()
+    } else {
+        format_spend_count(raw)
+    }
+}
+
+fn spend_header_line(key_header: &str, columns: &[SpendTableColumn], widths: &[usize]) -> String {
+    let mut cells = vec![truncate_spend_text(
+        key_header,
+        widths.first().copied().unwrap_or(0),
+    )];
     cells.extend(columns.iter().map(|column| column.header().to_string()));
     spend_join_cells(&cells, widths, false)
 }
@@ -1403,45 +1475,34 @@ fn spend_row_line(
     row: &SpendTableRow,
     columns: &[SpendTableColumn],
     widths: &[usize],
-    scales: &[SpendScale],
+    exact: bool,
     include_marker: bool,
 ) -> String {
-    let mut cells = vec![row.label.clone()];
+    let mut cells = vec![truncate_spend_text(
+        &row.label,
+        widths.first().copied().unwrap_or(0),
+    )];
     cells.extend(
         columns
             .iter()
-            .map(|column| spend_row_cell_with_scales(row, *column, scales)),
+            .map(|column| spend_row_cell(row, *column, exact)),
     );
-    let full_widths = std::iter::once(widths.first().copied().unwrap_or(0))
-        .chain(widths.iter().copied().skip(1))
-        .collect::<Vec<_>>();
-    let mut line = spend_join_cells(&cells, &full_widths, true);
+    let mut line = spend_join_cells(&cells, widths, true);
     if include_marker && row.partial {
         line.push_str("  ◐");
     }
     line
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpendScale {
-    Raw,
-    Kilo,
-    Mega,
-}
-
-fn spend_row_cell_with_scales(
-    row: &SpendTableRow,
-    column: SpendTableColumn,
-    scales: &[SpendScale],
-) -> String {
+fn spend_row_cell(row: &SpendTableRow, column: SpendTableColumn, exact: bool) -> String {
     match column {
-        SpendTableColumn::Input => format_spend_scaled(row.known[0], scales.first().copied()),
-        SpendTableColumn::Output => format_spend_scaled(row.known[1], scales.get(1).copied()),
-        SpendTableColumn::CacheRead => format_spend_scaled(row.known[2], scales.get(2).copied()),
-        SpendTableColumn::CacheWrite => format_spend_scaled(row.known[3], scales.get(3).copied()),
+        SpendTableColumn::Input => spend_count_cell(row.known[0], exact),
+        SpendTableColumn::Output => spend_count_cell(row.known[1], exact),
+        SpendTableColumn::CacheRead => spend_count_cell(row.known[2], exact),
+        SpendTableColumn::CacheWrite => spend_count_cell(row.known[3], exact),
         SpendTableColumn::Reasoning => row
             .reasoning
-            .map(|value| format_spend_scaled(value, scales.get(4).copied()))
+            .map(|value| spend_count_cell(value, exact))
             .unwrap_or_else(|| "\u{2014}".to_string()),
         SpendTableColumn::Valuation => row
             .valuation
@@ -1454,121 +1515,52 @@ fn spend_row_cell_with_scales(
     }
 }
 
-fn format_spend_scaled(raw: u64, scale: Option<SpendScale>) -> String {
-    match scale {
-        None => format_spend_count(raw),
-        Some(SpendScale::Raw) => raw.to_string(),
-        Some(SpendScale::Kilo) => {
-            if raw >= 100_000 {
-                let rounded = (raw + 500) / 1_000;
-                if rounded >= 1_000 {
-                    "1.0M".to_string()
-                } else {
-                    format!("{rounded}k")
-                }
-            } else {
-                let tenths = (raw + 50) / 100;
-                if tenths.is_multiple_of(10) {
-                    format!("{}k", tenths / 10)
-                } else {
-                    format!("{}.{:01}k", tenths / 10, tenths % 10)
-                }
-            }
-        }
-        Some(SpendScale::Mega) => {
-            let tenths = (raw + 50_000) / 100_000;
-            format!("{}.{:01}M", tenths / 10, tenths % 10)
-        }
-    }
-}
-
-fn spend_column_scales(
-    columns: &[SpendTableColumn],
-    sections: &[SpendTableSection],
-) -> Vec<SpendScale> {
-    columns
-        .iter()
-        .map(|column| match column {
-            SpendTableColumn::Input
-            | SpendTableColumn::Output
-            | SpendTableColumn::CacheRead
-            | SpendTableColumn::CacheWrite
-            | SpendTableColumn::Reasoning => {
-                let mut maximum = 0;
-                for section in sections {
-                    for row in &section.rows {
-                        let value = match column {
-                            SpendTableColumn::Input => row.known[0],
-                            SpendTableColumn::Output => row.known[1],
-                            SpendTableColumn::CacheRead => row.known[2],
-                            SpendTableColumn::CacheWrite => row.known[3],
-                            SpendTableColumn::Reasoning => row.reasoning.unwrap_or(0),
-                            SpendTableColumn::Valuation | SpendTableColumn::Credits => 0,
-                        };
-                        maximum = maximum.max(value);
-                    }
-                }
-                if maximum >= 1_000_000 {
-                    SpendScale::Mega
-                } else if maximum >= 10_000 {
-                    SpendScale::Kilo
-                } else {
-                    SpendScale::Raw
-                }
-            }
-            SpendTableColumn::Valuation | SpendTableColumn::Credits => SpendScale::Raw,
-        })
-        .collect()
-}
-
-fn spend_header_widths(grouping: &str, columns: &[SpendTableColumn]) -> Vec<usize> {
-    std::iter::once(grouping.chars().count())
-        .chain(columns.iter().map(|column| column.header().chars().count()))
-        .collect()
-}
-
 fn spend_column_widths(
-    grouping: &str,
+    key_header: &str,
     columns: &[SpendTableColumn],
     sections: &[SpendTableSection],
     total: &SpendTableRow,
-    scales: &[SpendScale],
+    exact: bool,
 ) -> Vec<usize> {
-    let mut widths = spend_header_widths(grouping, columns);
-    widths[0] = widths[0].max(total.label.chars().count());
-    for section in sections {
-        for row in &section.rows {
-            widths[0] = widths[0].max(row.label.chars().count());
-        }
-    }
-    for (index, column) in columns.iter().enumerate() {
-        widths[index + 1] = widths[index + 1].max(
-            spend_row_cell_with_scales(total, *column, &[])
-                .chars()
-                .count(),
-        );
-        for section in sections {
-            for row in &section.rows {
-                widths[index + 1] = widths[index + 1].max(
-                    spend_row_cell_with_scales(row, *column, scales)
-                        .chars()
-                        .count(),
-                );
-            }
+    let rows = sections
+        .iter()
+        .flat_map(|section| section.rows.iter())
+        .chain(std::iter::once(total))
+        .collect::<Vec<_>>();
+    let mut widths = std::iter::once(key_header.chars().count())
+        .chain(columns.iter().map(|column| column.header().chars().count()))
+        .collect::<Vec<_>>();
+    for row in rows {
+        widths[0] = widths[0].max(row.label.chars().count());
+        for (index, column) in columns.iter().enumerate() {
+            widths[index + 1] =
+                widths[index + 1].max(spend_row_cell(row, *column, exact).chars().count());
         }
     }
     widths
 }
 
+/// Narrows the key column when the table still outgrows the layout after the
+/// optional columns are gone: labels are cut with `…` rather than letting a
+/// row run past the box. The floor keeps `total` legible.
+fn fit_spend_key_column(widths: &mut [usize], has_partial: bool, area: usize) {
+    const MIN_KEY_WIDTH: usize = 5;
+    let table = spend_table_width_from_widths(widths, has_partial);
+    if table <= area || widths.is_empty() {
+        return;
+    }
+    widths[0] = widths[0].saturating_sub(table - area).max(MIN_KEY_WIDTH);
+}
+
 fn spend_table_width(
-    grouping: &str,
+    key_header: &str,
     columns: &[SpendTableColumn],
     sections: &[SpendTableSection],
     total: &SpendTableRow,
     has_partial: bool,
+    exact: bool,
 ) -> usize {
-    let scales = spend_column_scales(columns, sections);
-    let widths = spend_column_widths(grouping, columns, sections, total, &scales);
+    let widths = spend_column_widths(key_header, columns, sections, total, exact);
     spend_table_width_from_widths(&widths, has_partial)
 }
 
@@ -5468,8 +5460,248 @@ mod tests {
     fn spend_count_boundaries_are_promoted_before_the_suffix_is_selected() {
         assert_eq!(format_spend_count(9_999), "9999");
         assert_eq!(format_spend_count(10_000), "10.0k");
-        assert_eq!(format_spend_count(999_999), "1.0M");
+        assert_eq!(format_spend_count(0), "0");
+        assert_eq!(format_spend_count(999_999), "1000.0k");
+        assert_eq!(format_spend_count(9_999_949), "9999.9k");
         assert_eq!(format_spend_count(9_999_999), "10.0M");
         assert_eq!(format_spend_count(198_471_956), "198.5M");
+    }
+
+    /// The whitespace-separated cells of the boxed row whose first cell is
+    /// `label`, so an assertion compares whole cells rather than substrings.
+    fn spend_row_cells(text: &str, label: &str) -> Vec<String> {
+        text.lines()
+            .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c == ' '))
+            .find(|inner| inner.starts_with(label))
+            .map(|inner| {
+                inner
+                    .strip_prefix(label)
+                    .unwrap_or(inner)
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_else(|| panic!("no spend row labelled {label}: {text}"))
+    }
+
+    fn assert_every_spend_line_is_80_wide(text: &str) {
+        for line in text.lines() {
+            assert_eq!(
+                line.chars().count(),
+                80,
+                "a spend box line left the 80-column box: {line}\n{text}"
+            );
+        }
+    }
+
+    /// Observed in e2e 028: a column holding a 1.0M row once printed a
+    /// 20-token neighbour as `0.0M`. Every cell goes through one rule now.
+    #[test]
+    fn spend_small_counts_keep_their_own_unit_beside_large_ones() {
+        let report = golden_report(
+            "2026-08-25",
+            "2026-08-26",
+            vec![crate::report::SpendGrouping::Account],
+            vec![
+                golden_group(
+                    "account=research",
+                    golden_usage(20, 1_000_000, 0, 0, None, false),
+                ),
+                golden_group(
+                    "account=work",
+                    golden_usage(1_000_000, 20_000, 0, 0, None, false),
+                ),
+            ],
+            1,
+            2,
+        );
+        let text = render_spend_report(&report);
+        assert_eq!(
+            spend_row_cells(&text, "research"),
+            ["20", "1000.0k", "0", "0"],
+            "{text}"
+        );
+        assert_eq!(
+            spend_row_cells(&text, "work"),
+            ["1000.0k", "20.0k", "0", "0"],
+            "{text}"
+        );
+    }
+
+    /// Observed in the partial golden: the row printed `11k` and the total
+    /// `11.0k` for the same count. A value renders one way wherever it sits.
+    #[test]
+    fn spend_row_and_total_render_the_same_value_the_same_way() {
+        let text = render_spend_report(&partial_golden_report());
+        let row = spend_row_cells(&text, "2026-09-01");
+        let total = spend_row_cells(&text, "total");
+        assert_eq!(row[..5], total[..5], "{text}");
+        assert_eq!(total, ["11.0k", "722.0k", "198.5M", "3300.0k", "82.0k"]);
+    }
+
+    /// Observed in e2e 007 step 1: grouping by day, session, project and
+    /// repository showed only the repository, so every row read
+    /// `unknown-repository`. The label now carries every inner dimension.
+    #[test]
+    fn spend_rows_keep_every_inner_dimension_of_a_deep_grouping() {
+        let leaf = |session: &str, input: u64| {
+            golden_group(
+                &format!(
+                    "day=2026-08-25 / session={session} / project=unknown-project / repository=unknown-repository"
+                ),
+                golden_usage(input, 10, 0, 0, None, false),
+            )
+        };
+        let branch = |key: &str, input: u64, children: Vec<SpendGroup>| {
+            golden_group(key, golden_usage(input, 10, 0, 0, None, false)).with_children(children)
+        };
+        let day = branch(
+            "day=2026-08-25",
+            3_000,
+            vec![
+                branch(
+                    "day=2026-08-25 / session=claude-code:s-e2e-0",
+                    1_000,
+                    vec![branch(
+                        "day=2026-08-25 / session=claude-code:s-e2e-0 / project=unknown-project",
+                        1_000,
+                        vec![leaf("claude-code:s-e2e-0", 1_000)],
+                    )],
+                ),
+                branch(
+                    "day=2026-08-25 / session=claude-code:s-e2e-1",
+                    2_000,
+                    vec![branch(
+                        "day=2026-08-25 / session=claude-code:s-e2e-1 / project=unknown-project",
+                        2_000,
+                        vec![leaf("claude-code:s-e2e-1", 2_000)],
+                    )],
+                ),
+            ],
+        );
+        let report = golden_report(
+            "2026-08-25",
+            "2026-08-27",
+            vec![
+                crate::report::SpendGrouping::Day,
+                crate::report::SpendGrouping::Session,
+                crate::report::SpendGrouping::Project,
+                crate::report::SpendGrouping::Repository,
+            ],
+            vec![day],
+            1,
+            2,
+        );
+        let text = render_spend_report(&report);
+        assert!(text.contains("day · 2026-08-25"), "{text}");
+        assert!(text.contains("session · project · repository"), "{text}");
+        // At 80 columns the three kept numeric columns leave the key column 47
+        // wide, so the last value is cut with `…`; the session and the project
+        // stay whole, which is what the innermost-only label lost.
+        assert!(
+            text.contains("│  claude-code:s-e2e-0 · unknown-project · unknow…"),
+            "{text}"
+        );
+        assert!(
+            text.contains("│  claude-code:s-e2e-1 · unknown-project · unknow…"),
+            "{text}"
+        );
+        assert_every_spend_line_is_80_wide(&text);
+    }
+
+    /// Observed in e2e 017 and 028: a credits refusal or a window-equivalent
+    /// detail repeated the full group key and ran past the right rail. Detail
+    /// lines now name only the value and wrap inside the box.
+    #[test]
+    fn spend_detail_lines_wrap_inside_the_box_without_the_group_key() {
+        let refusal = Derivation::unavailable(
+            [crate::evidence::RequiredFact::new(
+                "unknown component: tool_use_tokens reported by a harness this cost model has never priced",
+            )],
+            crate::evidence::Provenance::new(["cost-model:golden".to_string()]),
+        )
+        .expect("a named missing fact");
+        let mut report = golden_report(
+            "2026-09-01",
+            "2026-09-02",
+            vec![crate::report::SpendGrouping::Session],
+            vec![
+                golden_group(
+                    "session=claude-code:s-credits-unknown",
+                    golden_usage(1_000, 200, 0, 0, None, false),
+                )
+                .with_credits(refusal),
+            ],
+            1,
+            1,
+        );
+        report.stale_rate_card_note = Some(
+            "rate card review is due (configured review-due date 2026-08-31 has passed)"
+                .to_string(),
+        );
+        let text = render_spend_report(&report);
+        assert_every_spend_line_is_80_wide(&text);
+        assert!(!text.contains("session=claude-code"), "{text}");
+        let inner = text
+            .lines()
+            .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c == ' '))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(inner.contains("never priced"), "{text}");
+        assert!(inner.contains("2026-08-31 has passed)"), "{text}");
+    }
+
+    /// The legend describes the marker; it does not guess why coverage is
+    /// incomplete, which the old "day still in progress" did for past days.
+    #[test]
+    fn spend_partial_legend_names_the_marker_without_a_cause() {
+        let text = render_spend_report(&partial_golden_report());
+        assert!(
+            text.contains("◐ partial: coverage incomplete for this row"),
+            "{text}"
+        );
+        assert!(!text.contains("still in progress"), "{text}");
+    }
+
+    /// A terminal wider than the box must not let the table outgrow the box:
+    /// columns are dropped against the narrower of the two.
+    #[test]
+    fn spend_columns_drop_against_the_box_when_the_terminal_is_wider() {
+        let text = render_spend_box_at_width(&narrow_golden_report(), Style::plain(), 200);
+        assert!(text.contains("reasoning column hidden: width"), "{text}");
+        assert_every_spend_line_is_80_wide(&text);
+    }
+
+    /// `--value api-list` keeps exact integers in every count cell.
+    #[test]
+    fn spend_valued_report_prints_exact_counts() {
+        let valuation = ValuationOutcome::Complete(crate::valuation::ApiListPriceEquivalent::new(
+            Money::<Usd>::from_micros(450_000),
+        ));
+        let report = golden_report(
+            "2026-09-01",
+            "2026-09-02",
+            vec![crate::report::SpendGrouping::Day],
+            vec![
+                golden_group(
+                    "day=2026-09-01",
+                    golden_usage(100_000, 12_345_678, 0, 0, None, false),
+                )
+                .with_valuation(Some(valuation)),
+            ],
+            1,
+            1,
+        );
+        let text = render_spend_report(&report);
+        assert_eq!(
+            spend_row_cells(&text, "2026-09-01"),
+            ["100000", "12345678", "0", "0", "0.45"],
+            "{text}"
+        );
+        assert_eq!(
+            spend_row_cells(&text, "total"),
+            ["100000", "12345678", "0", "0", "0.45"],
+            "{text}"
+        );
     }
 }

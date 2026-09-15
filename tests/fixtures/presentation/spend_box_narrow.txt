@@ -2,9 +2,9 @@
 │                                                                              │
 │  day                       input  output  cache read                         │
 │  ───────────────────────────────────────────────────                         │
-│  2026-09-01-with-a-very-…  11.0M    722k      198.5M                         │
+│  2026-09-01-with-a-very-…  11.0M  722.0k      198.5M                         │
 │  ───────────────────────────────────────────────────                         │
-│  total                     11.0M    722k      198.5M                         │
+│  total                     11.0M  722.0k      198.5M                         │
 │                                                                              │
 │  reasoning column hidden: width                                              │
 │  cache write column hidden: width                                            │

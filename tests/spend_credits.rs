@@ -152,7 +152,7 @@ fn credits_are_absent_unless_requested() {
     );
     assert_eq!(
         spend_row_cells(&text, "2026-08-25"),
-        ["2026-08-25", "100k", "20k", "50k", "10k"],
+        ["2026-08-25", "100.0k", "20.0k", "50.0k", "10.0k"],
         "the token row must carry all four kinds and no credits cell: {text}"
     );
     assert!(
@@ -200,7 +200,7 @@ fn every_modeled_token_kind_contributes_its_exact_term() {
     assert!(text.contains("0.65 credits (complete)"), "{text}");
     assert_eq!(
         spend_row_cells(&text, "2026-08-25"),
-        ["2026-08-25", "100k", "20k", "50k", "10k", "0.65"],
+        ["2026-08-25", "100.0k", "20.0k", "50.0k", "10.0k", "0.65"],
         "tokens must survive next to the credits: {text}"
     );
 
@@ -245,7 +245,14 @@ fn a_missing_term_blocks_the_total_and_names_the_kind() {
     assert!(text.contains("credits unavailable:"), "{text}");
     assert_eq!(
         spend_row_cells(&text, "2026-08-25"),
-        ["2026-08-25", "100k", "20k", "50k", "10k", "\u{2014}"],
+        [
+            "2026-08-25",
+            "100.0k",
+            "20.0k",
+            "50.0k",
+            "10.0k",
+            "\u{2014}"
+        ],
         "tokens, cache write included, must survive the refusal: {text}"
     );
     assert!(

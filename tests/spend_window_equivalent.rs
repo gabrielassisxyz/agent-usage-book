@@ -128,7 +128,7 @@ fn human_and_json_window_equivalent_contracts_retain_the_same_interval_and_witne
     );
     assert_eq!(
         spend_row_cells(&human, "2026-08-25"),
-        ["2026-08-25", "100k", "20k", "50k", "10k", "0.65"],
+        ["2026-08-25", "100.0k", "20.0k", "50.0k", "10.0k", "0.65"],
         "token dimension must remain: {human}"
     );
     assert!(

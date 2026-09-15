@@ -2,10 +2,10 @@
 │                                                                              │
 │  day         input  output  cache read  cache write  reasoning               │
 │  ────────────────────────────────────────────────────────────────            │
-│  2026-09-01    11k    722k      198.5M         3.3M        82k  ◐            │
+│  2026-09-01  11.0k  722.0k      198.5M      3300.0k      82.0k  ◐            │
 │  ────────────────────────────────────────────────────────────────            │
-│  total       11.0k    722k      198.5M         3.3M      82.0k               │
+│  total       11.0k  722.0k      198.5M      3300.0k      82.0k               │
 │                                                                              │
-│  ◐ partial: day still in progress                                            │
+│  ◐ partial: coverage incomplete for this row                                 │
 │  3 events · 2 files read · 0 quarantined · generation 148                    │
 └──────────────────────────────────────────────────────────────────────────────┘
