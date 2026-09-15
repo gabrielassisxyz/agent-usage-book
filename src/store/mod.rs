@@ -63,6 +63,7 @@ pub mod task_identity;
 #[cfg(test)]
 pub mod test_schema;
 pub mod transcript_file;
+pub mod transcript_session;
 pub mod usage_component;
 pub mod usage_event;
 pub mod usage_occurrence;

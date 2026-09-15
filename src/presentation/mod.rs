@@ -15,6 +15,7 @@ pub mod local_time;
 pub mod precision;
 pub mod render;
 pub mod style;
+pub mod transcript;
 pub mod vocabulary;
 
 pub use json::{

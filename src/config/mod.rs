@@ -352,6 +352,15 @@ pub struct DoctorConfig {
     pub meter_anomaly_horizon: MonotonicDuration,
 }
 
+/// The transcript export's own options (`aub-xpfl`).
+#[derive(Debug, Clone)]
+pub struct ExportConfig {
+    /// The command `aub export transcript -c` pipes the markdown to, read
+    /// from the child's stdin. `wl-copy` names Wayland; a headless machine
+    /// sets this to its own clipboard command instead.
+    pub clipboard_command: String,
+}
+
 /// The Anthropic provider's own options (aub-79gp).
 #[derive(Debug, Clone)]
 pub struct AnthropicConfig {
@@ -540,6 +549,7 @@ pub struct Config {
     pub drill: DrillConfig,
     pub adapter_semantics: AdapterSemanticsConfig,
     pub doctor: DoctorConfig,
+    pub export: ExportConfig,
     pub anthropic: AnthropicConfig,
     pub antigravity: AntigravityConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
@@ -571,6 +581,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "drill",
     "adapter_semantics",
     "doctor",
+    "export",
     "anthropic",
     "antigravity",
     "projects",
@@ -630,6 +641,7 @@ const BACKUP_KEYS: &[&str] = &[
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
+const EXPORT_KEYS: &[&str] = &["clipboard_command"];
 const ANTHROPIC_KEYS: &[&str] = &["refresh", "statusline"];
 const ANTIGRAVITY_KEYS: &[&str] = &["refresh"];
 
@@ -787,6 +799,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("doctor").and_then(toml::Value::as_table) {
         check_keys(t, DOCTOR_KEYS, "doctor", file_display)?;
+    }
+    if let Some(t) = table.get("export").and_then(toml::Value::as_table) {
+        check_keys(t, EXPORT_KEYS, "export", file_display)?;
     }
     if let Some(t) = table.get("anthropic").and_then(toml::Value::as_table) {
         check_keys(t, ANTHROPIC_KEYS, "anthropic", file_display)?;
@@ -1688,6 +1703,18 @@ pub fn resolve(
         )?,
     };
 
+    let export = ExportConfig {
+        clipboard_command: resolve_string(
+            "export.clipboard_command",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "export", "clipboard_command"),
+            Some("wl-copy"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let anthropic = AnthropicConfig {
         refresh: resolve_bool(
             "anthropic.refresh",
@@ -1957,6 +1984,7 @@ pub fn resolve(
             drill,
             adapter_semantics,
             doctor,
+            export,
             anthropic,
             antigravity,
             projects,
@@ -2134,6 +2162,7 @@ impl Config {
             "doctor.meter_anomaly_horizon" => {
                 format_config_duration(self.doctor.meter_anomaly_horizon)
             }
+            "export.clipboard_command" => self.export.clipboard_command.clone(),
             "anthropic.refresh" => self.anthropic.refresh.to_string(),
             "anthropic.statusline" => self.anthropic.statusline.to_string(),
             "antigravity.refresh" => self.antigravity.refresh.to_string(),
@@ -3834,6 +3863,8 @@ coverage.measurement_floor            0.95                                     d
 doctor.meter_anomaly_horizon          15m                                      default
 
 drill.max_age                         30d                                      default
+
+export.clipboard_command              wl-copy                                  default
 
 freshness.meter                       12m                                      default
 

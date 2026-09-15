@@ -48,7 +48,7 @@ export:
   answers: which usage did each session or run consume, as a versioned JSONL ledger for an external join?
   refuses: --format (export is always versioned JSONL); --explain (export derives no quantity); --account (export reads every stored session, not one account); --model (export keys on session or run, not on a model); --no-color (export prints no color)
   format: text only: export is always versioned JSONL
-  options: --key session-id|run-id (required), --include-logical-ids
+  options: --key session-id|run-id (required), --include-logical-ids | transcript ID [-o [PATH] | -p | -c] [--latest] [--include-tools] [--include-thinking] [--harness NAME]
 
 cost-model:
   answers: which published cost model prices usage into credits?

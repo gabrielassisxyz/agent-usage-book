@@ -251,6 +251,9 @@ without the section prefix (the full box for a two-account config):
 │  drill                                                                       │
 │    max_age                  30d                                     default  │
 │                                                                              │
+│  export                                                                      │
+│    clipboard_command        wl-copy                                 default  │
+│                                                                              │
 │  freshness                                                                   │
 │    meter                    12m                                     default  │
 │                                                                              │
@@ -416,6 +419,29 @@ JSONL ledger for an external join?
 
 **Refuses:** to run without a chosen join key. `--key session-id|run-id` is
 required; `export` does not guess which key a downstream consumer wants.
+
+`aub export transcript <id>` renders one session's transcript as markdown
+from the ledger's own knowledge of where every transcript lives: the id
+resolves against the `session` table (full or prefix, case-insensitive,
+across every harness unless `--harness` narrows it), the files are read from
+the `usage_occurrence.source_file` paths recorded at ingest, and the
+conversation comes out as `## User` / `## Assistant` sections with, on
+request, tool calls and results untruncated (`--include-tools`) and thinking
+blocks (`--include-thinking`).
+
+A prefix matching more than one session fails, listing every candidate with
+harness, start time and project, and `--latest` renders the most recent of
+them; choosing silently was rejected because the wrong transcript reads as a
+plausible session. A claude-code subagent transcript
+(`<session>/subagents/agent-*.jsonl`) renders after the parent under a
+`## Subagent <file>` heading. A harness with no renderer yet fails with `no
+transcript renderer for harness '<name>'`, never with an empty document.
+
+Four destinations: `-o` with no path writes
+`~/agent-transcripts/<YYYY-MM-DD>-<project>-<uuid8>.md` and prints the path;
+`-o <dir>` uses that directory with the same name; `-o <file>` writes that
+file; `-p` writes only the markdown to stdout. `-c` pipes the markdown to
+the command named by `export.clipboard_command` (default `wl-copy`).
 
 ## `aub cost-model`
 
