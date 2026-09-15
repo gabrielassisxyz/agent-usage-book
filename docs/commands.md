@@ -267,7 +267,7 @@ without the section prefix (the full box for a two-account config):
 │    auth_backoff_cap         6h                                      default  │
 │    auth_backoff_threshold   3                                       default  │
 │    busy_timeout             10s                                     default  │
-│    command_budget           8s                                      default  │
+│    command_budget           30s                                     default  │
 │    default_interval         5m                                      default  │
 │    max_concurrent_requests  2                                       default  │
 │    request_timeout          5s                                      default  │

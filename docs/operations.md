@@ -49,6 +49,34 @@ as durably recorded evidence rather than a cadence failure) are in
 machine" walkthrough end to end; `aub status` moving off "never observed"
 within one sampling interval is the signal the cadence is live.
 
+### The fixed timeouts a sampling request runs under
+
+The five provider adapters build their request timeouts inline as deliberate
+constants, not from configuration -- settled on aub-fhh9 as option D
+(2026-09-14), implemented in aub-rqh2. Every request an adapter sends
+through the transport, local-file reads included, carries a connect timeout
+of 5s, a read timeout of 10s, a total timeout of 15s, and a command budget of
+30s. The seven production call sites:
+
+- `src/meter/agy.rs`, the quota request build
+- `src/meter/opencode.rs`, the quota page request build
+- `src/meter/anthropic.rs`, twice: the status-line record file read and the
+  usage endpoint
+- `src/meter/codex.rs`, twice: the newest rollout file read and the usage
+  endpoint
+- `src/meter/ollama.rs`, the quota request build
+
+Two `sampling` keys sit beside these constants and bound other things.
+`sampling.request_timeout` is the store timeout: the ledger connection's
+wait for the writer slot and `aub backup verify`'s read of an archive. It
+does not bound a provider request. `sampling.command_budget` is the
+projection's command horizon past which a resultless attempt is classified
+as a collector interruption, defaulted to the same 30s so the horizon does
+not fire while the adapter is still waiting; it bounds no request either.
+Should a provider-request timeout ever need to be operator-tunable, that is
+its own decision with a default sized from burn-in, not a new duty for
+these keys.
+
 ## 4. Know what each command answers, and what it refuses
 
 [docs/commands.md](commands.md) is the per-command reference: the question

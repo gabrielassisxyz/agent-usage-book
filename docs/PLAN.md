@@ -5386,7 +5386,7 @@ default_interval = "5m"
 # reset_edge_lead must strictly exceed the 1m scheduler tick
 reset_edge_lead = "120s"
 request_timeout = "5s"
-command_budget = "8s"
+command_budget = "30s"
 
 [freshness]
 meter = "12m"
