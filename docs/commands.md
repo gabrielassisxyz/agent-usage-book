@@ -237,8 +237,11 @@ without the section prefix (the full box for a two-account config):
 │                                                                              │
 │  accounts                                                                    │
 │    work-primary    provider-a  file:/tmp/aub-golden/creds-primary.js…  file  │
-│    work-secondary  provider-b  env:AUB_GOLDEN_TOKEN                    file  │
+│      opencode_workspace wrk_golden                                           │
+│      plan_tier max-20x                                                       │
+│    work-secondary  codex       env:AUB_GOLDEN_TOKEN                    file  │
 │      exclusivity_policy permit_passive                                       │
+│      codex_home /tmp/aub-golden/codex-home                                   │
 │                                                                              │
 │  adapter_semantics                                                           │
 │    max_comparison_age       30d                                     default  │
@@ -275,6 +278,9 @@ without the section prefix (the full box for a two-account config):
 │  drill                                                                       │
 │    max_age                  30d                                     default  │
 │                                                                              │
+│  export                                                                      │
+│    clipboard_command        wl-copy                                 default  │
+│                                                                              │
 │  freshness                                                                   │
 │    meter                    12m                                     default  │
 │                                                                              │
@@ -291,7 +297,7 @@ without the section prefix (the full box for a two-account config):
 │    auth_backoff_cap         6h                                      default  │
 │    auth_backoff_threshold   3                                       default  │
 │    busy_timeout             10s                                     default  │
-│    command_budget           8s                                      default  │
+│    command_budget           30s                                     default  │
 │    default_interval         5m                                      default  │
 │    max_concurrent_requests  2                                       default  │
 │    request_timeout          5s                                      default  │
@@ -321,12 +327,13 @@ without the section prefix (the full box for a two-account config):
 
 `accounts` prints one line per account (`name  provider  credential  source`)
 with a second dim line only when the account's `exclusivity_policy` differs
-from the default; `transcripts` prints one line per source with the `pattern`
-(and any `usage_evidence`) on dim lines under it. The source column reads
-`default` in dim and `file`, `override` or `environment` in body text, so the
-keys the operator set stand out from the ones they did not. Values longer
-than the room to the source column end in `…`. A `--set key=value` override
-prints with source `override`.
+from the default, followed by dim sub-rows for any configured optional keys
+(`opencode_workspace`, `codex_home`, `plan_tier`); `transcripts` prints one
+line per source with the `pattern` (and any `usage_evidence`) on dim lines
+under it. The source column reads `default` in dim and `file`, `override` or
+`environment` in body text, so the keys the operator set stand out from the
+ones they did not. Values longer than the room to the source column end in
+`…`. A `--set key=value` override prints with source `override`.
 
 **Refuses:** to invent a value for a key nobody set. An unset key prints with
 source `default`, never a value that looks like it came from a file. It also
@@ -426,6 +433,46 @@ unmapped models: 412 events (kimi-k2.7, minimax-m3-max-k3)
 That line is how a new alias becomes visible the day it first appears. An event
 whose transcript recorded no model id at all is counted under `(no model id)`.
 
+### `[layout]`: which repository a checkout belongs to
+
+Two roots describe the whole checkout layout instead of one alias per
+checkout:
+
+```toml
+[layout]
+repositories = "/home/user/repositories"
+worktrees = "/home/user/repositories/.worktrees"
+ignore = ["scratch"]
+```
+
+`repositories` makes every immediate child directory a repository named after
+that directory (`/home/user/repositories/aub/src` resolves to `aub`);
+`worktrees` makes `<dir>/<repo>/<anything>` resolve to `<repo>`
+(`/home/user/repositories/.worktrees/aub/bugfix-x/src` resolves to `aub`);
+`ignore` sends the named repositories to the unknown bucket on purpose (a
+`scratch` checkout stays inside totals as `unknown-repository` and
+`unknown-project` rather than disappearing from them).
+
+Precedence for a working directory, in order:
+
+1. An explicit alias with an exact key wins (`[repositories]` for the
+   repository, `[projects]` for the project).
+2. The `worktrees` root, checked before the repositories root because it sits
+   inside it on this machine.
+3. The `repositories` root.
+4. Unknown.
+
+Under a root the identity is the first path segment after it; a directory
+equal to a root itself resolves to unknown. A project is its repository
+unless an explicit `[projects]` entry with an exact key says otherwise, which
+is how a project spanning repositories is expressed. A dot-named segment
+(such as `.worktrees` from a misconfigured root) is refused at resolution and
+reported once per ingest in the summary, so a misconfigured root is visible
+rather than silently producing dot-named repositories. Both roots are
+optional; with neither set, behaviour is exactly today's exact-match aliases:
+the project resolves through `[projects]` alone, and a `[repositories]` alias
+names only the repository.
+
 For scheduled runs, note that the sampler runs from `aub-sample.service`,
 which has no shell: a variable exported in an interactive profile does not
 reach it. Give the service an `EnvironmentFile=` of its own (for example
@@ -440,6 +487,29 @@ JSONL ledger for an external join?
 
 **Refuses:** to run without a chosen join key. `--key session-id|run-id` is
 required; `export` does not guess which key a downstream consumer wants.
+
+`aub export transcript <id>` renders one session's transcript as markdown
+from the ledger's own knowledge of where every transcript lives: the id
+resolves against the `session` table (full or prefix, case-insensitive,
+across every harness unless `--harness` narrows it), the files are read from
+the `usage_occurrence.source_file` paths recorded at ingest, and the
+conversation comes out as `## User` / `## Assistant` sections with, on
+request, tool calls and results untruncated (`--include-tools`) and thinking
+blocks (`--include-thinking`).
+
+A prefix matching more than one session fails, listing every candidate with
+harness, start time and project, and `--latest` renders the most recent of
+them; choosing silently was rejected because the wrong transcript reads as a
+plausible session. A claude-code subagent transcript
+(`<session>/subagents/agent-*.jsonl`) renders after the parent under a
+`## Subagent <file>` heading. A harness with no renderer yet fails with `no
+transcript renderer for harness '<name>'`, never with an empty document.
+
+Four destinations: `-o` with no path writes
+`~/agent-transcripts/<YYYY-MM-DD>-<project>-<uuid8>.md` and prints the path;
+`-o <dir>` uses that directory with the same name; `-o <file>` writes that
+file; `-p` writes only the markdown to stdout. `-c` pipes the markdown to
+the command named by `export.clipboard_command` (default `wl-copy`).
 
 ## `aub cost-model`
 
@@ -554,9 +624,10 @@ what quota window capacity is fitted from recorded meter observations?
 the ledger, do their read or write, and exit; the experiment survives in the
 database between them, including across a reboot. Sampling cadence during an
 experiment is tightened by invoking `sample --due` more often through the
-external scheduler, never by a loop inside `aub`. `begin` refuses when the
-named cost model covers none of the expected token kinds, when the account has
-no sampled baseline yet, and when the account already runs an experiment;
+external scheduler, never by a loop inside `aub`. `begin` refuses a one-kind
+premise with no cost model or with a named cost model that carries no term for
+the expected kind, a `--cost-model` naming no stored model, an account with
+no sampled baseline yet, and an account that already runs an experiment;
 `end` records the end of controlled work and never declares the meter
 settled. `fit` and `passive` refuse to activate candidate calibrations automatically:
 candidates are written immutably and never promoted to active status by the
@@ -572,6 +643,15 @@ no tier configured for the account, naming the account and the `plan_tier`
 key. With no configured tier the flag records its value as before. Both the
 configured tier and the flag are trimmed, so surrounding whitespace never makes
 two identical tiers disagree.
+
+`begin` requires `--cost-model` only for a one-kind premise. A premise naming
+two or more token kinds fits jointly straight from the recorded usage counts
+with no rate book in between, so it begins with no `--cost-model` and stores
+`none`; a model named on such a premise is recorded as given without the
+expected-terms check. A premise naming one kind fits univariately through the
+rate book and still requires `--cost-model`, and a named model missing a term
+for the expected kind is refused as before. The `begin` report line prints
+`expect_kinds` alongside `cost_model`, so the recorded premise is visible.
 
 `fit` follows the experiment's premise. `fit --experiment ID` naming a controlled
 experiment whose `--expect-kinds` premise names two or more token kinds fits them
@@ -690,8 +770,8 @@ result, response evidence, an observation, or a calibration even if asked to.
 
 `aub rebuild sessions` is not a sweep: it re-resolves every stored session's
 project and repository keys from its stored working directory through the
-current `[projects]` and `[repositories]` alias tables, rewriting derived
-keys only. Bounds, run ids and every evidence table stay untouched, so a new
+current `[projects]` and `[repositories]` alias tables and `[layout]` roots,
+rewriting derived keys only. Bounds, run ids and every evidence table stay untouched, so a new
 alias applies to history and not only to sessions ingested after it.
 
 ## `aub doctor`

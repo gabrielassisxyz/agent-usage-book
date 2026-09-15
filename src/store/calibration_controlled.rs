@@ -143,6 +143,16 @@ pub fn default_expected_token_kinds() -> Vec<TokenKind> {
     TokenKind::ALL.to_vec()
 }
 
+/// The `cost_model_id` stored when a joint premise begins without
+/// `--cost-model` (`aub-ks5n`). The joint fit regresses quota movement
+/// directly on the recorded `usage_component` counts and never loads a cost
+/// model, so the column carries this sentinel instead of a model id. It
+/// satisfies the `NOT NULL` and `length > 0` constraints of migration 0030
+/// with no migration: neither fit path reads the stored id (the univariate
+/// path loads the model active at the run's start), and the two `status`
+/// and `begin` report lines print it as stored.
+pub const CONTROLLED_RUN_NO_COST_MODEL_ID: &str = "none";
+
 /// Parses the `--expect-kinds` value: comma-separated stable [`TokenKind`]
 /// labels in any order, deduplicated into [`TokenKind::ALL`] order. Empty
 /// input and unknown labels are refused rather than guessed at.

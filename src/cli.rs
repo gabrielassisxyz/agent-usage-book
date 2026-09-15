@@ -850,7 +850,9 @@ impl Command {
             }
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
-            Command::Export => Some("--key session-id|run-id (required), --include-logical-ids"),
+            Command::Export => Some(
+                "--key session-id|run-id (required), --include-logical-ids | transcript ID [-o [PATH] | -p | -c] [--latest] [--include-tools] [--include-thinking] [--harness NAME]",
+            ),
             Command::Doctor => Some("--fix | --transcript-format-drift"),
             Command::Coverage => {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
@@ -872,7 +874,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME [--plan-tier TIER] --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
+                "begin --account NAME [--plan-tier TIER] --window KEY [--cost-model ID] [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status => Some("--refresh"),
@@ -3796,6 +3798,15 @@ fn config_boxed_render_with_width(
                         width,
                     ));
                 }
+                if let Some(plan_tier) = by_key("plan_tier") {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(style.dim(), &format!("plan_tier {}", plan_tier.value))
+                        ),
+                        width,
+                    ));
+                }
             }
         } else if section == "transcripts" {
             let mut indexes: Vec<usize> = fields
@@ -3947,6 +3958,9 @@ fn config_command(args: impl Iterator<Item = OsString>) -> Result<(), Error> {
 /// directory it was produced in, so the default carries nothing that names a
 /// project or repository, and the header records what was included.
 fn export_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    if invocation.rest.first().map(String::as_str) == Some("transcript") {
+        return export_transcript_command(clock, level, invocation);
+    }
     let (key, include_logical_ids) = export_flags(&invocation.rest)?;
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
@@ -4008,6 +4022,402 @@ fn parse_export_key(value: &str) -> Result<ExportKey, Error> {
             "--key must be session-id or run-id, got {other}"
         ))),
     }
+}
+
+/// Where `aub export transcript` delivers the markdown.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum TranscriptDestination {
+    /// `-p`: only the markdown to stdout.
+    Print,
+    /// `-c`: the markdown to the clipboard command's stdin.
+    Clipboard,
+    /// `-o` with no path: `~/agent-transcripts/<date>-<project>-<uuid8>.md`.
+    DefaultFile,
+    /// `-o <path>`: that directory (with the default name) or that file.
+    ExplicitPath(PathBuf),
+}
+
+/// The parsed `export transcript` arguments: the session id or prefix plus
+/// the resolution and output options.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TranscriptArgs {
+    id: String,
+    destination: TranscriptDestination,
+    latest: bool,
+    include_tools: bool,
+    include_thinking: bool,
+    harness: Option<String>,
+}
+
+/// The `export transcript` flags: the id (first bare word), one of
+/// `-o [PATH] | -p | -c`, and `--latest`, `--include-tools`,
+/// `--include-thinking`, `--harness NAME`. Everything else is a usage error
+/// naming the argument, so a mistyped flag cannot silently change what is
+/// rendered or where it lands.
+fn parse_transcript_args(rest: &[String]) -> Result<TranscriptArgs, Error> {
+    let mut id: Option<String> = None;
+    let mut destination: Option<TranscriptDestination> = None;
+    let mut latest = false;
+    let mut include_tools = false;
+    let mut include_thinking = false;
+    let mut harness: Option<String> = None;
+    let mut args = rest.iter().peekable();
+    while let Some(arg) = args.next() {
+        if arg == "-p" || arg == "--print" {
+            set_transcript_destination(&mut destination, TranscriptDestination::Print, "-p")?;
+        } else if arg == "-c" || arg == "--clipboard" {
+            set_transcript_destination(&mut destination, TranscriptDestination::Clipboard, "-c")?;
+        } else if arg == "-o" || arg == "--output" {
+            let path = match args.peek() {
+                Some(next) if !next.starts_with('-') => {
+                    Some(PathBuf::from(args.next().expect("peeked value exists")))
+                }
+                _ => None,
+            };
+            let dest = match path {
+                Some(path) => TranscriptDestination::ExplicitPath(path),
+                None => TranscriptDestination::DefaultFile,
+            };
+            set_transcript_destination(&mut destination, dest, "-o")?;
+        } else if let Some(inline) = arg.strip_prefix("--output=") {
+            set_transcript_destination(
+                &mut destination,
+                TranscriptDestination::ExplicitPath(PathBuf::from(inline)),
+                "-o",
+            )?;
+        } else if arg == "--latest" {
+            latest = true;
+        } else if arg == "--include-tools" {
+            include_tools = true;
+        } else if arg == "--include-thinking" {
+            include_thinking = true;
+        } else if let Some(inline) = arg.strip_prefix("--harness=") {
+            harness = Some(require_non_empty_harness(inline)?);
+        } else if arg == "--harness" {
+            let value = args
+                .next()
+                .cloned()
+                .ok_or_else(|| Error::Usage("--harness requires a harness name".into()))?;
+            harness = Some(require_non_empty_harness(&value)?);
+        } else if arg.starts_with('-') {
+            return Err(Error::Usage(format!("unknown argument: {arg}")));
+        } else if id.is_none() {
+            id = Some(arg.clone());
+        } else {
+            return Err(Error::Usage(format!("unexpected argument: {arg}")));
+        }
+    }
+    let id = id.ok_or_else(|| {
+        Error::Usage("export transcript requires a session id or id prefix".into())
+    })?;
+    Ok(TranscriptArgs {
+        id,
+        destination: destination.unwrap_or(TranscriptDestination::DefaultFile),
+        latest,
+        include_tools,
+        include_thinking,
+        harness,
+    })
+}
+
+fn require_non_empty_harness(value: &str) -> Result<String, Error> {
+    if value.trim().is_empty() {
+        return Err(Error::Usage("--harness requires a harness name".into()));
+    }
+    Ok(value.to_string())
+}
+
+fn set_transcript_destination(
+    current: &mut Option<TranscriptDestination>,
+    next: TranscriptDestination,
+    flag: &str,
+) -> Result<(), Error> {
+    if current.is_some() {
+        return Err(Error::Usage(format!(
+            "{flag} cannot be combined with another output destination: choose one of -o, -p or -c"
+        )));
+    }
+    *current = Some(next);
+    Ok(())
+}
+
+/// Picks the session to render from the id resolution: exactly one match
+/// renders; zero matches is a usage error naming the id; more than one is a
+/// usage error listing every candidate with harness, start time and project
+/// unless `--latest`, which renders the most recent. Choosing silently was
+/// rejected: the wrong transcript reads as a plausible session and nobody
+/// notices. Matches arrive in `(start, source, native id)` order, so the
+/// latest is the last row.
+fn select_transcript_session(
+    matches: &[crate::store::transcript_session::TranscriptSession],
+    id: &str,
+    harness: Option<&str>,
+    latest: bool,
+) -> Result<crate::store::transcript_session::TranscriptSession, Error> {
+    match matches {
+        [] => {
+            let scope = harness
+                .map(|name| format!(" for harness '{name}'"))
+                .unwrap_or_default();
+            Err(Error::Usage(format!("no session matches '{id}'{scope}")))
+        }
+        [only] => Ok(only.clone()),
+        many => {
+            if latest {
+                return Ok(many
+                    .last()
+                    .expect("more than one match has a last row")
+                    .clone());
+            }
+            let mut message = format!(
+                "'{id}' matches {} sessions; be more specific or pass --latest:",
+                many.len()
+            );
+            for candidate in many {
+                message.push_str(&format!(
+                    "\n  {} {} started {} project {}",
+                    candidate.native_session_id.as_str(),
+                    candidate.source.as_str(),
+                    candidate.start.to_rfc3339(),
+                    candidate.project_key.as_str(),
+                ));
+            }
+            Err(Error::Usage(message))
+        }
+    }
+}
+
+/// The default output name `~/agent-transcripts/<YYYY-MM-DD>-<project>-<uuid8>.md`:
+/// the session start's UTC date, the logical project key (`unknown-project`
+/// spelled as `noproject`, the one filename this default invents), and the
+/// first eight characters of the native session id.
+fn transcript_default_file_name(
+    session: &crate::store::transcript_session::TranscriptSession,
+) -> String {
+    let project = session.project_key.as_str();
+    let safe_project = if project == crate::sessions::resolver::UNKNOWN_PROJECT {
+        "noproject"
+    } else {
+        project
+    };
+    let short: String = session.native_session_id.as_str().chars().take(8).collect();
+    format!(
+        "{}-{safe_project}-{short}.md",
+        session.start.utc_date().iso()
+    )
+}
+
+/// Whether an explicit `-o` path names a directory: an existing directory,
+/// or a path with a trailing separator that is created as one. Anything else
+/// names the file itself (parents created), so `-o out.md` writes `out.md`
+/// while `-o out/` writes `out/<default name>`.
+fn transcript_explicit_path_is_dir(path: &Path) -> bool {
+    if path.exists() {
+        return path.is_dir();
+    }
+    path.as_os_str()
+        .to_string_lossy()
+        .ends_with(std::path::MAIN_SEPARATOR)
+}
+
+/// `aub export transcript <id>`: one session's transcript as markdown from
+/// the ledger's own map of where every transcript lives (`aub-xpfl`). The
+/// id resolves against the `session` table, the files come from
+/// `usage_occurrence.source_file` recorded at ingest, and the conversation
+/// renders as `## User` / `## Assistant` sections.
+#[allow(clippy::too_many_lines)]
+fn export_transcript_command(
+    clock: &impl Clock,
+    level: Level,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let args = parse_transcript_args(&invocation.rest[1..])?;
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("export");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run);
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let (conn, config) = open_ledger_with_config(clock)?;
+    let matches = crate::store::transcript_session::resolve_transcript_sessions(
+        &conn,
+        &args.id,
+        args.harness.as_deref(),
+    )?;
+    let session =
+        select_transcript_session(&matches, &args.id, args.harness.as_deref(), args.latest)?;
+    let renderer = crate::presentation::transcript::renderer_for(session.source.as_str())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "no transcript renderer for harness '{}'",
+                session.source.as_str()
+            ))
+        })?;
+    let files = crate::store::transcript_session::transcript_source_files(&conn, &session)?;
+    let ordered = crate::presentation::transcript::order_transcript_files(files);
+    let options = crate::presentation::transcript::TranscriptRenderOptions {
+        include_tools: args.include_tools,
+        include_thinking: args.include_thinking,
+    };
+    let (rendered_files, missing_paths) = read_transcript_files(renderer, &ordered);
+    for (path, error) in &missing_paths {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            eprintln!("missing: {path}");
+        } else {
+            eprintln!("unreadable: {path}: {error}");
+        }
+    }
+    let missing = missing_paths.len();
+    let document = crate::presentation::transcript::TranscriptDocument {
+        harness: session.source.as_str().to_string(),
+        project: session.project_key.as_str().to_string(),
+        session_id: session.native_session_id.as_str().to_string(),
+        started: session.start,
+        files: rendered_files,
+    };
+    let markdown = crate::presentation::transcript::render_transcript_markdown(&document, &options);
+    match &args.destination {
+        TranscriptDestination::Print => print!("{markdown}"),
+        TranscriptDestination::Clipboard => {
+            pipe_transcript_to_clipboard(&config.export.clipboard_command, &markdown)?;
+        }
+        TranscriptDestination::DefaultFile => {
+            let path = transcript_default_output_path(&session)?;
+            write_transcript_file(&path, &markdown)?;
+            println!("{}", path.display());
+        }
+        TranscriptDestination::ExplicitPath(explicit) => {
+            let path = if transcript_explicit_path_is_dir(explicit) {
+                std::fs::create_dir_all(explicit).map_err(|error| {
+                    Error::IngestIncomplete(format!(
+                        "cannot create the transcript directory {}: {error}",
+                        explicit.display()
+                    ))
+                })?;
+                explicit.join(transcript_default_file_name(&session))
+            } else {
+                explicit.clone()
+            };
+            write_transcript_file(&path, &markdown)?;
+            println!("{}", path.display());
+        }
+    }
+    if missing > 0 {
+        return Err(Error::IngestIncomplete(format!(
+            "export transcript: {missing} transcript file(s) missing; rendered the files that exist"
+        )));
+    }
+    Ok(())
+}
+
+/// Reads every transcript file for one export: rendered files in order,
+/// plus the paths that could not be read with their errors. A file that no
+/// longer exists is reported by path and the export continues with the rest.
+fn read_transcript_files(
+    renderer: &dyn crate::presentation::transcript::TranscriptRenderer,
+    paths: &[String],
+) -> (
+    Vec<crate::presentation::transcript::TranscriptFile>,
+    Vec<(String, std::io::Error)>,
+) {
+    let mut rendered = Vec::new();
+    let mut missing = Vec::new();
+    for path in paths {
+        match std::fs::read_to_string(path) {
+            Ok(body) => rendered.push(crate::presentation::transcript::TranscriptFile {
+                file_name: crate::presentation::transcript::transcript_file_name(path).to_string(),
+                is_subagent: crate::presentation::transcript::is_subagent_transcript_path(path),
+                messages: renderer.render_file(&body),
+            }),
+            Err(error) => missing.push((path.clone(), error)),
+        }
+    }
+    (rendered, missing)
+}
+
+/// The default output path `~/agent-transcripts/<default name>`, creating
+/// the directory. The file is the default destination because it is the one
+/// destination that exists on every machine and in every session kind.
+fn transcript_default_output_path(
+    session: &crate::store::transcript_session::TranscriptSession,
+) -> Result<PathBuf, Error> {
+    let home = std::env::var("HOME").map_err(|_| {
+        Error::Usage("cannot derive the default transcript path: HOME is not set".into())
+    })?;
+    transcript_default_output_path_for_home(&home, session)
+}
+
+fn transcript_default_output_path_for_home(
+    home: &str,
+    session: &crate::store::transcript_session::TranscriptSession,
+) -> Result<PathBuf, Error> {
+    let dir = PathBuf::from(home).join("agent-transcripts");
+    std::fs::create_dir_all(&dir).map_err(|error| {
+        Error::IngestIncomplete(format!(
+            "cannot create the transcript directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir.join(transcript_default_file_name(session)))
+}
+
+fn write_transcript_file(path: &Path, markdown: &str) -> Result<(), Error> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Error::IngestIncomplete(format!(
+                "cannot create the transcript directory {}: {error}",
+                parent.display()
+            ))
+        })?;
+    }
+    std::fs::write(path, markdown).map_err(|error| {
+        Error::IngestIncomplete(format!(
+            "cannot write the transcript file {}: {error}",
+            path.display()
+        ))
+    })
+}
+
+/// Pipes the markdown to the command named by `export.clipboard_command` on
+/// its stdin. This is the crate's first and only subprocess, spawned only
+/// when `-c` is passed; a missing command is a usage error naming the key.
+fn pipe_transcript_to_clipboard(command: &str, markdown: &str) -> Result<(), Error> {
+    let mut child = std::process::Command::new(command)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|error| {
+            Error::Usage(format!(
+                "export.clipboard_command is {command:?} but it could not be started: {error}; \
+                 set export.clipboard_command to an installed clipboard command"
+            ))
+        })?;
+    if let Some(stdin) = child.stdin.take() {
+        let mut stdin = stdin;
+        stdin.write_all(markdown.as_bytes()).map_err(|error| {
+            Error::IngestIncomplete(format!(
+                "cannot pipe the transcript to {command:?}: {error}"
+            ))
+        })?;
+    }
+    let status = child.wait().map_err(|error| {
+        Error::IngestIncomplete(format!("cannot wait for {command:?}: {error}"))
+    })?;
+    if !status.success() {
+        return Err(Error::IngestIncomplete(format!(
+            "{command:?} from export.clipboard_command exited with {status}"
+        )));
+    }
+    Ok(())
 }
 
 fn next_arg(args: &mut impl Iterator<Item = OsString>, flag: &str) -> Result<String, Error> {
@@ -6756,7 +7166,7 @@ fn calibrate_take_value(
 struct CalibrateBeginArgs {
     plan_tier: Option<String>,
     window: String,
-    cost_model: String,
+    cost_model: Option<String>,
     expect_kinds: Option<String>,
     experiment: Option<String>,
     assert_exclusive: bool,
@@ -6764,11 +7174,11 @@ struct CalibrateBeginArgs {
 
 fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
     let usage = "calibrate begin requires --account NAME --window KEY \
-                 --cost-model ID [--plan-tier TIER] [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
+                 [--cost-model ID] [--plan-tier TIER] [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
     let mut args = CalibrateBeginArgs {
         plan_tier: None,
         window: String::new(),
-        cost_model: String::new(),
+        cost_model: None,
         expect_kinds: None,
         experiment: None,
         assert_exclusive: false,
@@ -6786,9 +7196,9 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
         } else if let Some(value) = arg.strip_prefix("--window=") {
             args.window = value.to_string();
         } else if arg == "--cost-model" {
-            args.cost_model = calibrate_next_arg(&mut rest, "--cost-model")?;
+            args.cost_model = Some(calibrate_next_arg(&mut rest, "--cost-model")?);
         } else if let Some(value) = arg.strip_prefix("--cost-model=") {
-            args.cost_model = value.to_string();
+            args.cost_model = Some(value.to_string());
         } else if arg == "--expect-kinds" {
             args.expect_kinds = Some(calibrate_next_arg(&mut rest, "--expect-kinds")?);
         } else if let Some(value) = arg.strip_prefix("--expect-kinds=") {
@@ -6803,8 +7213,15 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
             )));
         }
     }
-    if args.window.trim().is_empty() || args.cost_model.trim().is_empty() {
+    if args.window.trim().is_empty() {
         return Err(Error::Usage(usage.into()));
+    }
+    if let Some(model) = args.cost_model.as_deref()
+        && model.trim().is_empty()
+    {
+        return Err(Error::Usage(
+            "--cost-model requires a non-empty value".into(),
+        ));
     }
     if let Some(tier) = args.plan_tier.as_mut() {
         let trimmed = tier.trim();
@@ -6947,12 +7364,15 @@ fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Resul
         clock,
     )?;
     println!(
-        "calibrate begin: experiment={} account={} plan_tier={} window={} cost_model={} baseline_observation={} started_at={}",
+        "calibrate begin: experiment={} account={} plan_tier={} window={} cost_model={} expect_kinds={} baseline_observation={} started_at={}",
         run.id.as_str(),
         run.account,
         run.plan_tier.as_str(),
         run.window_semantic_key.as_str(),
         run.cost_model_id.as_str(),
+        crate::store::calibration_controlled::encode_expected_token_kinds(
+            &run.expected_token_kinds
+        ),
         run.baseline_observation_id.value(),
         run.started_at.unix_nanos(),
     );
@@ -6976,9 +7396,9 @@ fn calibrate_begin_validated(
     clock: &impl Clock,
 ) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
     use crate::store::calibration_controlled::{
-        ControlledExperimentId, ControlledExperimentRun, default_expected_token_kinds,
-        insert_begin, load_by_experiment_id, missing_expected_terms, parse_expected_token_kinds,
-        running_for_account,
+        CONTROLLED_RUN_NO_COST_MODEL_ID, ControlledExperimentId, ControlledExperimentRun,
+        default_expected_token_kinds, insert_begin, load_by_experiment_id, missing_expected_terms,
+        parse_expected_token_kinds, running_for_account,
     };
     let plan_tier = resolve_calibrate_begin_plan_tier(
         account,
@@ -6992,31 +7412,65 @@ fn calibrate_begin_validated(
         .map(ControlledExperimentId::new)
         .unwrap_or_else(|| ControlledExperimentId::new(format!("cal-{}", started_at.unix_nanos())));
 
-    let cost_model_id = crate::domain::provenance::CostModelId::new(args.cost_model.clone());
-    let model =
-        crate::store::cost_model::load_by_semantic_id(conn, &cost_model_id)?.ok_or_else(|| {
-            Error::Usage(format!(
-                "unknown cost model '{}': calibrate begin --cost-model names a stored cost model",
-                args.cost_model
-            ))
-        })?;
     let expected = match args.expect_kinds.as_deref() {
         Some(kinds) => parse_expected_token_kinds(kinds)?,
         None => default_expected_token_kinds(),
     };
-    let missing = missing_expected_terms(&model, &expected);
-    if !missing.is_empty() {
-        let names = missing
-            .iter()
-            .copied()
-            .map(crate::domain::tokens::TokenKind::label)
-            .collect::<Vec<_>>()
-            .join(",");
-        return Err(Error::Usage(format!(
-            "cost model '{}' carries no term for expected token kind(s) {}; fit the cost model first",
-            args.cost_model, names
-        )));
-    }
+    // The requirement follows the fit the premise selects (aub-ks5n): a
+    // premise naming two or more kinds fits jointly straight from the
+    // recorded usage counts and never opens a cost model, so `--cost-model`
+    // is optional there and a named model keeps its id as given without the
+    // expected-terms check; a one-kind premise fits univariately through the
+    // rate book and still requires it.
+    let is_joint = crate::calibration::multivariate_fit::fit_path_for_premise(Some(&expected))
+        == crate::calibration::multivariate_fit::FitPath::Multivariate;
+    let cost_model_id = match (args.cost_model.as_deref(), is_joint) {
+        (Some(given), true) => {
+            let id = crate::domain::provenance::CostModelId::new(given);
+            crate::store::cost_model::load_by_semantic_id(conn, &id)?.ok_or_else(|| {
+                Error::Usage(format!(
+                    "unknown cost model '{given}': calibrate begin --cost-model names a stored cost model"
+                ))
+            })?;
+            id
+        }
+        (Some(given), false) => {
+            let id = crate::domain::provenance::CostModelId::new(given);
+            let model =
+                crate::store::cost_model::load_by_semantic_id(conn, &id)?.ok_or_else(|| {
+                    Error::Usage(format!(
+                        "unknown cost model '{given}': calibrate begin --cost-model names a stored cost model"
+                    ))
+                })?;
+            let missing = missing_expected_terms(&model, &expected);
+            if !missing.is_empty() {
+                let names = missing
+                    .iter()
+                    .copied()
+                    .map(crate::domain::tokens::TokenKind::label)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(Error::Usage(format!(
+                    "cost model '{given}' carries no term for expected token kind(s) {names}; fit the cost model first"
+                )));
+            }
+            id
+        }
+        (None, true) => {
+            crate::domain::provenance::CostModelId::new(CONTROLLED_RUN_NO_COST_MODEL_ID)
+        }
+        (None, false) => {
+            let names = expected
+                .iter()
+                .copied()
+                .map(crate::domain::tokens::TokenKind::label)
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(Error::Usage(format!(
+                "calibrate begin --cost-model is required for a one-kind premise ({names}): the univariate fit prices usage through the rate book, so the run must name the cost model it prices against"
+            )));
+        }
+    };
 
     let account_id = crate::store::account::account_id_by_identity(conn, provider, account)?
         .ok_or_else(|| {
@@ -8460,7 +8914,7 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         &mut progress_sink,
     )?;
     println!(
-        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={} working_directory_changes={}",
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={} working_directory_changes={}{}",
         report.sources.join(","),
         report.files_scanned,
         report.files_parsed,
@@ -8470,6 +8924,14 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         report.generation.value(),
         report.batches.len(),
         report.working_directory_changes,
+        if report.layout_rejected.is_empty() {
+            String::new()
+        } else {
+            // A misconfigured layout root made visible (`aub-p07j`): the
+            // distinct dot-named repositories the roots implied, reported once
+            // rather than once per session they touched.
+            format!(" layout_rejected={}", report.layout_rejected.join(","))
+        },
     );
     let outcome = &report.outcome;
     println!(
@@ -8545,10 +9007,10 @@ fn ingest_flags(rest: &[String]) -> Result<crate::ingest::IngestOptions, Error> 
 /// [`crate::store::retention::delete_rebuildable`] derives from the
 /// taxonomy rather than a list declared here. The `sessions` target is not a
 /// sweep: it re-resolves every stored session's project and repository keys
-/// from its stored working directory through the current alias tables
-/// (`aub-4ow0`), rewriting derived keys only and leaving every evidence table
-/// untouched, so a new alias applies to history and not only to sessions
-/// ingested after it.
+/// from its stored working directory through the current alias tables and
+/// `[layout]` roots (`aub-4ow0`, `aub-p07j`), rewriting derived keys only and
+/// leaving every evidence table untouched, so a new alias applies to history
+/// and not only to sessions ingested after it.
 fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let target_name = invocation.rest.first().cloned().ok_or_else(|| {
         Error::Usage(format!(
@@ -8599,7 +9061,7 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
 
 /// `aub rebuild sessions`: re-resolves every stored session's project and
 /// repository keys from its stored working directory through the current
-/// `[projects]` and `[repositories]` alias tables. Derived keys only move;
+/// `[projects]` and `[repositories]` alias tables and `[layout]` roots. Derived keys only move;
 /// bounds, run ids and every evidence table stay untouched, so the pass is
 /// idempotent and advances the ledger generation with the rewrite.
 fn rebuild_sessions_command(clock: &impl Clock) -> Result<(), Error> {
@@ -8613,8 +9075,12 @@ fn rebuild_sessions_command(clock: &impl Clock) -> Result<(), Error> {
         &file_path,
     )?;
     let mut conn = open_ledger(clock)?;
-    let outcome =
-        crate::store::session::reresolve_keys(&mut conn, &config.projects, &config.repositories)?;
+    let outcome = crate::store::session::reresolve_keys(
+        &mut conn,
+        &config.projects,
+        &config.repositories,
+        &config.layout,
+    )?;
     println!(
         "rebuild sessions: re-resolved {} sessions generation={}",
         outcome.sessions,
@@ -10298,6 +10764,302 @@ mod tests {
         }
     }
 
+    fn transcript_args(items: &[&str]) -> Vec<String> {
+        items.iter().map(|item| item.to_string()).collect()
+    }
+
+    /// The transcript flags: the id plus every destination and option, with
+    /// the file destination as the default. Each negative names what it
+    /// refused: a missing id, a second destination, an unknown flag, and a
+    /// second bare word.
+    #[test]
+    fn transcript_flags_read_the_id_destinations_and_options() {
+        let parsed = parse_transcript_args(&transcript_args(&["aaaa0001"])).unwrap();
+        assert_eq!(parsed.id, "aaaa0001");
+        assert_eq!(parsed.destination, TranscriptDestination::DefaultFile);
+        assert!(!parsed.latest && !parsed.include_tools && !parsed.include_thinking);
+        assert_eq!(parsed.harness, None);
+
+        let parsed = parse_transcript_args(&transcript_args(&[
+            "aaaa0001",
+            "-p",
+            "--latest",
+            "--include-tools",
+            "--include-thinking",
+            "--harness",
+            "codex",
+        ]))
+        .unwrap();
+        assert_eq!(parsed.destination, TranscriptDestination::Print);
+        assert!(parsed.latest && parsed.include_tools && parsed.include_thinking);
+        assert_eq!(parsed.harness.as_deref(), Some("codex"));
+
+        let parsed =
+            parse_transcript_args(&transcript_args(&["-o", "/tmp/out.md", "aaaa"])).unwrap();
+        assert_eq!(
+            parsed.destination,
+            TranscriptDestination::ExplicitPath(PathBuf::from("/tmp/out.md"))
+        );
+
+        let parsed =
+            parse_transcript_args(&transcript_args(&["aaaa", "--output=/tmp/dir"])).unwrap();
+        assert_eq!(
+            parsed.destination,
+            TranscriptDestination::ExplicitPath(PathBuf::from("/tmp/dir"))
+        );
+
+        let parsed = parse_transcript_args(&transcript_args(&["aaaa", "-c"])).unwrap();
+        assert_eq!(parsed.destination, TranscriptDestination::Clipboard);
+
+        for (rest, expected) in [
+            (transcript_args(&[]), "requires a session id"),
+            (
+                transcript_args(&["aaaa", "-p", "-o"]),
+                "choose one of -o, -p or -c",
+            ),
+            (
+                transcript_args(&["aaaa", "-p", "-c"]),
+                "choose one of -o, -p or -c",
+            ),
+            (transcript_args(&["aaaa", "--bogus"]), "--bogus"),
+            (transcript_args(&["aaaa", "-z"]), "-z"),
+            (
+                transcript_args(&["aaaa", "bbbb"]),
+                "unexpected argument: bbbb",
+            ),
+            (
+                transcript_args(&["aaaa", "--harness"]),
+                "--harness requires",
+            ),
+            (
+                transcript_args(&["aaaa", "--harness="]),
+                "--harness requires",
+            ),
+        ] {
+            match parse_transcript_args(&rest) {
+                Err(Error::Usage(message)) => {
+                    assert!(
+                        message.contains(expected),
+                        "{message:?} must name {expected:?}"
+                    )
+                }
+                other => panic!("expected a usage error naming {expected:?}, got {other:?}"),
+            }
+        }
+    }
+
+    fn transcript_candidate(
+        source: &str,
+        native: &str,
+        start: i64,
+        project: &str,
+    ) -> crate::store::transcript_session::TranscriptSession {
+        crate::store::transcript_session::TranscriptSession {
+            source: crate::domain::ids::SourceNamespace::new(source),
+            native_session_id: crate::domain::ids::NativeSessionId::new(native),
+            start: crate::domain::time::UtcTimestamp::from_unix_nanos(start),
+            project_key: crate::sessions::resolver::ProjectKey::new(project),
+        }
+    }
+
+    /// Selection over the bead's two-candidate case: one match renders, zero
+    /// names the id, two fail listing harness, start and project each, and
+    /// `--latest` picks the later start.
+    #[test]
+    fn transcript_selection_resolves_lists_or_picks_latest() {
+        let pair = vec![
+            transcript_candidate("claude-code", "aaaa0001-early", 100, "proj-alpha"),
+            transcript_candidate("codex", "aaaa0002-late", 200, "proj-beta"),
+        ];
+        let only = select_transcript_session(&pair[..1], "aaaa0001", None, false).unwrap();
+        assert_eq!(only.native_session_id.as_str(), "aaaa0001-early");
+
+        match select_transcript_session(&[], "zzzz", None, false) {
+            Err(Error::Usage(message)) => assert!(message.contains("zzzz")),
+            other => panic!("expected a usage error naming the id, got {other:?}"),
+        }
+
+        match select_transcript_session(&pair, "aaaa", None, false) {
+            Err(Error::Usage(message)) => {
+                assert!(
+                    message.contains("2 sessions"),
+                    "{message:?} counts the candidates"
+                );
+                assert!(
+                    message.contains("--latest"),
+                    "{message:?} names the way out"
+                );
+                for expected in [
+                    "aaaa0001-early",
+                    "aaaa0002-late",
+                    "claude-code",
+                    "codex",
+                    "proj-alpha",
+                    "proj-beta",
+                ] {
+                    assert!(
+                        message.contains(expected),
+                        "{message:?} must name {expected:?}"
+                    );
+                }
+            }
+            other => panic!("expected the ambiguous listing, got {other:?}"),
+        }
+
+        let latest = select_transcript_session(&pair, "aaaa", None, true).unwrap();
+        assert_eq!(latest.native_session_id.as_str(), "aaaa0002-late");
+
+        // The planted negative: picking the first row instead of the last
+        // would still return a plausible session, so this pins the later one.
+        let reversed = vec![pair[1].clone(), pair[0].clone()];
+        let latest_reversed = select_transcript_session(&reversed, "aaaa", None, true).unwrap();
+        assert_eq!(
+            latest_reversed.native_session_id.as_str(),
+            "aaaa0001-early",
+            "latest is the last row in resolution order, not the later start"
+        );
+    }
+
+    /// The default output name pins the date, the project and the short id;
+    /// `unknown-project` is spelled `noproject`, the one invention in the name.
+    #[test]
+    fn transcript_default_name_dates_projects_and_shortens_the_id() {
+        let session = transcript_candidate(
+            "claude-code",
+            "190c2fb2-1111-4222-8333-444444444444",
+            1_788_652_800_000_000_000,
+            "llm-workflow",
+        );
+        assert_eq!(
+            transcript_default_file_name(&session),
+            "2026-09-06-llm-workflow-190c2fb2.md"
+        );
+        let unknown = transcript_candidate("claude-code", "abcdef12-0000", 100, "unknown-project");
+        assert_eq!(
+            transcript_default_file_name(&unknown),
+            "1970-01-01-noproject-abcdef12.md"
+        );
+    }
+
+    /// The default output path lands under `~/agent-transcripts/` with the
+    /// default name, creating the directory. The home travels as a parameter
+    /// so the test never touches the process environment.
+    #[test]
+    fn transcript_default_path_lives_under_home_agent_transcripts() {
+        let session = transcript_candidate("claude-code", "aaaa0001-early", 100, "proj-alpha");
+        let home = std::env::temp_dir().join(format!(
+            "aub-xpfl-home-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock runs forward")
+                .as_nanos()
+        ));
+        let path =
+            transcript_default_output_path_for_home(&home.to_string_lossy(), &session).unwrap();
+        assert_eq!(
+            path,
+            home.join("agent-transcripts")
+                .join("1970-01-01-proj-alpha-aaaa0001.md")
+        );
+        assert!(home.join("agent-transcripts").is_dir());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// An explicit `-o` path with a trailing separator names a directory;
+    /// anything else names the file itself.
+    #[test]
+    fn transcript_explicit_dir_detection_uses_trailing_separator_or_reality() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aub-xpfl-dir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock runs forward")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        assert!(transcript_explicit_path_is_dir(&scratch));
+        assert!(transcript_explicit_path_is_dir(&scratch.join("")));
+        assert!(!transcript_explicit_path_is_dir(&scratch.join("out.md")));
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// The read loop renders the files that exist (flagging the subagent
+    /// one) and reports the missing one by path, so the caller can render
+    /// the rest and still exit non-zero.
+    #[test]
+    fn transcript_read_renders_what_exists_and_reports_what_does_not() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aub-xpfl-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock runs forward")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(scratch.join("sess/subagents")).unwrap();
+        let parent = scratch.join("sess.jsonl");
+        let subagent = scratch.join("sess/subagents/agent-x.jsonl");
+        std::fs::write(
+            &parent,
+            "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"timestamp\":\"2026-09-06T10:00:00.000Z\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            &subagent,
+            "{\"type\":\"assistant\",\"message\":{\"role\":\"assistant\",\"content\":\"sub\"},\"timestamp\":\"2026-09-06T10:01:00.000Z\"}\n",
+        )
+        .unwrap();
+        let gone = scratch.join("gone.jsonl").to_string_lossy().to_string();
+        let renderer = crate::presentation::transcript::renderer_for("claude-code").unwrap();
+        let (rendered, missing) = read_transcript_files(
+            renderer,
+            &[
+                parent.to_string_lossy().to_string(),
+                subagent.to_string_lossy().to_string(),
+                gone.clone(),
+            ],
+        );
+        assert_eq!(rendered.len(), 2);
+        assert!(!rendered[0].is_subagent);
+        assert!(rendered[1].is_subagent);
+        assert_eq!(rendered[1].file_name, "agent-x.jsonl");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].0, gone);
+        assert_eq!(
+            missing[0].1.kind(),
+            std::io::ErrorKind::NotFound,
+            "a vanished file reports as missing, not unreadable"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// The export help line documents `transcript` with the resolution rule
+    /// and the four destinations, so the surface the bead ships is the
+    /// surface `--help` states.
+    #[test]
+    fn export_help_documents_transcript_with_destinations() {
+        let options = Command::Export
+            .options_help()
+            .expect("export documents options");
+        for expected in [
+            "transcript",
+            "-o [PATH]",
+            "-p",
+            "-c",
+            "--latest",
+            "--include-tools",
+            "--include-thinking",
+            "--harness",
+        ] {
+            assert!(
+                options.contains(expected),
+                "{options:?} must document {expected:?}"
+            );
+        }
+    }
+
     #[test]
     fn resolve_config_file_path_prefers_the_flag_over_the_environment_and_default() {
         let env = FakeEnv::new()
@@ -10382,12 +11144,15 @@ destination = "/tmp/aub-golden/backups"
 name = "work-primary"
 provider = "provider-a"
 credential = { kind = "file", path = "/tmp/aub-golden/creds-primary.json" }
+opencode_workspace = "wrk_golden"
+plan_tier = "max-20x"
 
 [[accounts]]
 name = "work-secondary"
-provider = "provider-b"
+provider = "codex"
 credential = { kind = "env", name = "AUB_GOLDEN_TOKEN" }
 exclusivity_policy = "permit_passive"
+codex_home = "/tmp/aub-golden/codex-home"
 
 [[transcripts]]
 name = "cli-a"
@@ -10534,9 +11299,46 @@ usage_evidence = "measured"
         );
     }
 
+    /// Array line shapes for plan_tier (aub-y5hj): an account with a configured
+    /// plan_tier renders a dim sub-row with the tier value, while an account
+    /// without plan_tier renders no plan_tier line.
+    #[test]
+    fn config_boxed_account_plan_tier_rendered_only_when_set() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let primary: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("plan_tier"))
+            .collect();
+        assert_eq!(
+            primary.len(),
+            1,
+            "exactly one plan_tier row is rendered: {primary:?}"
+        );
+        assert!(
+            primary[0].contains("plan_tier max-20x"),
+            "the plan_tier row names key and value: {:?}",
+            primary[0]
+        );
+        assert!(
+            primary[0].starts_with("│      plan_tier"),
+            "the plan_tier row is indented like other sub-rows: {:?}",
+            primary[0]
+        );
+    }
+
     /// Every resolver key appears exactly once without its section prefix
     /// (aub-34ik): the test walks `Provenance::entries()` and finds each
     /// key's last segment in the boxed output, while no dotted key survives.
+    /// Extended in aub-y5hj to verify that every per-account and per-transcript
+    /// provenance row key outside table columns is rendered in the boxed view.
     #[test]
     fn config_boxed_every_resolver_key_appears_once_without_prefix() {
         let (config, provenance, _, file_path) = config_boxed_fixture();
@@ -10558,6 +11360,27 @@ usage_evidence = "measured"
             assert!(
                 text.contains(last),
                 "the boxed output must contain the last segment {last:?} of {key:?}"
+            );
+        }
+        let rows = config.provenance_rows(&provenance);
+        assert!(
+            rows.iter().any(|r| r.key.ends_with(".plan_tier"))
+                && rows.iter().any(|r| r.key.ends_with(".codex_home"))
+                && rows.iter().any(|r| r.key.ends_with(".opencode_workspace")),
+            "CONFIG_BOXED_GOLDEN_TOML must set plan_tier, codex_home, and opencode_workspace on at least one account each"
+        );
+        for row in &rows {
+            let last = row.key.rsplit('.').next().unwrap_or(row.key.as_str());
+            if matches!(last, "name" | "provider" | "credential" | "format" | "root") {
+                continue;
+            }
+            if last == "exclusivity_policy" && row.value == "forbid_passive" {
+                continue;
+            }
+            assert!(
+                text.contains(last),
+                "the boxed output must contain the last segment {last:?} of {key:?}",
+                key = row.key
             );
         }
         for (key, _) in &entries {
@@ -11253,7 +12076,7 @@ usage_evidence = "measured"
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
         assert_eq!(args.plan_tier.as_deref(), Some("pro-5h"));
         assert_eq!(args.window, "five_hour");
-        assert_eq!(args.cost_model, "cm-1");
+        assert_eq!(args.cost_model.as_deref(), Some("cm-1"));
         assert_eq!(args.experiment.as_deref(), Some("exp-1"));
         assert!(args.assert_exclusive);
     }
@@ -11422,12 +12245,22 @@ usage_evidence = "measured"
         calibrate_activate_cost_model(&mut conn, false);
         let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
         calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
-        let rest = calibrate_begin_rest(
+        let rest: Vec<String> = [
+            "--plan-tier",
             "pro-5h",
+            "--window",
             "five_hour",
+            "--cost-model",
             "anthropic-claude-messages-incomplete-v1",
+            "--expect-kinds",
+            "cache_write",
+            "--experiment",
             "exp-incomplete",
-        );
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
         let clock = FakeClock::new(at);
         match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
@@ -11437,6 +12270,179 @@ usage_evidence = "measured"
             ),
             other => panic!("expected Error::Usage, got {other:?}"),
         }
+    }
+
+    /// A joint premise needs no cost model: with no model in the ledger at
+    /// all, `begin` over two kinds records the run with the `none` sentinel.
+    #[test]
+    fn calibrate_begin_joint_two_kind_premise_records_without_a_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::domain::tokens::TokenKind;
+        let (_scratch, conn) = calibrate_fixture_db();
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--expect-kinds",
+            "input,output",
+            "--experiment",
+            "exp-joint-two",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse without the flag");
+        assert_eq!(args.cost_model, None);
+        let clock = FakeClock::new(at);
+        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
+            .expect("a joint begin with no cost model must work");
+        assert_eq!(
+            run.cost_model_id.as_str(),
+            crate::store::calibration_controlled::CONTROLLED_RUN_NO_COST_MODEL_ID
+        );
+        assert_eq!(
+            run.expected_token_kinds,
+            vec![TokenKind::Input, TokenKind::Output]
+        );
+    }
+
+    /// The same rule over all four kinds, and over the default premise when
+    /// `--expect-kinds` is omitted: both are joint fits, so both begin with
+    /// no cost model in the ledger.
+    #[test]
+    fn calibrate_begin_joint_four_kind_and_default_premises_record_without_a_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::domain::tokens::TokenKind;
+        for (label, kinds_flag, expected) in [
+            (
+                "exp-joint-four",
+                Some("input,output,cache_read,cache_write"),
+                vec![
+                    TokenKind::Input,
+                    TokenKind::Output,
+                    TokenKind::CacheRead,
+                    TokenKind::CacheWrite,
+                ],
+            ),
+            (
+                "exp-joint-default",
+                None,
+                vec![
+                    TokenKind::Input,
+                    TokenKind::Output,
+                    TokenKind::CacheRead,
+                    TokenKind::CacheWrite,
+                ],
+            ),
+        ] {
+            let (_scratch, conn) = calibrate_fixture_db();
+            let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+            calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+            let mut parts = vec![
+                "--plan-tier".to_string(),
+                "pro-5h".to_string(),
+                "--window".to_string(),
+                "five_hour".to_string(),
+            ];
+            if let Some(kinds) = kinds_flag {
+                parts.push("--expect-kinds".to_string());
+                parts.push(kinds.to_string());
+            }
+            parts.push("--experiment".to_string());
+            parts.push(label.to_string());
+            parts.push("--assert-exclusive".to_string());
+            let args =
+                calibrate_parse_begin(&parts).expect("begin args must parse without the flag");
+            let clock = FakeClock::new(at);
+            let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
+                .unwrap_or_else(|e| panic!("{label} must begin with no cost model: {e:?}"));
+            assert_eq!(
+                run.cost_model_id.as_str(),
+                crate::store::calibration_controlled::CONTROLLED_RUN_NO_COST_MODEL_ID,
+                "{label} must store the sentinel"
+            );
+            assert_eq!(run.expected_token_kinds, expected, "{label} premise");
+        }
+    }
+
+    /// A one-kind premise keeps the requirement: with no `--cost-model` the
+    /// command is refused naming the flag and saying why the univariate fit
+    /// needs it.
+    #[test]
+    fn calibrate_begin_one_kind_premise_refuses_without_a_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, conn) = calibrate_fixture_db();
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--expect-kinds",
+            "output",
+            "--experiment",
+            "exp-single-no-model",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse without the flag");
+        let clock = FakeClock::new(at);
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
+            Err(Error::Usage(message)) => {
+                assert!(
+                    message.contains("--cost-model"),
+                    "the refusal must name the flag: {message}"
+                );
+                assert!(
+                    message.contains("output"),
+                    "the refusal must name the expected kind: {message}"
+                );
+            }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    /// A joint premise skips the expected-terms check: a named model missing
+    /// a term for an expected kind is still refused for one kind but accepted
+    /// for two or more, with the id recorded as given.
+    #[test]
+    fn calibrate_begin_joint_premise_accepts_a_model_missing_an_expected_term() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, false);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "anthropic-claude-messages-incomplete-v1",
+            "--expect-kinds",
+            "input,cache_write",
+            "--experiment",
+            "exp-joint-incomplete",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        let clock = FakeClock::new(at);
+        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
+            .expect("a joint begin must accept the incomplete model as given");
+        assert_eq!(
+            run.cost_model_id.as_str(),
+            "anthropic-claude-messages-incomplete-v1"
+        );
     }
 
     #[test]

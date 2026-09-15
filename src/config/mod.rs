@@ -29,7 +29,7 @@
 //! `doctor.meter_anomaly_horizon`) go through the full four-level order and are
 //! individually provenance-tracked, since those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
-//! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
+//! `transcripts`, `tracker`, `layout` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
 //! heterogeneous list, or a credential shape that varies by its own `kind` field,
 //! through one `--set` string is not a well-formed operation, and the adapters that
@@ -39,6 +39,7 @@
 mod duration;
 
 pub mod aliases;
+pub mod layout;
 pub mod models;
 
 use std::collections::BTreeMap;
@@ -54,6 +55,7 @@ use crate::error::Error;
 
 pub use aliases::AliasTable;
 pub use duration::{format_config_duration, parse_duration};
+pub use layout::LayoutRoots;
 pub use models::{ModelRule, ModelTable, PricedModel};
 
 /// Where a resolved value came from, in the order that decides a tie.
@@ -199,12 +201,27 @@ pub struct SamplingConfig {
     pub scheduler_tick: MonotonicDuration,
     pub default_interval: MonotonicDuration,
     pub reset_edge_lead: MonotonicDuration,
+    /// The store timeout (aub-rqh2): it bounds the ledger connection's wait
+    /// for the writer slot and `aub backup verify`'s read of an archive. It
+    /// bounds no provider request -- every adapter carries its own fixed 5s
+    /// connect / 10s read / 15s total budget (docs/operations.md) -- and it is
+    /// not the lock wait a sampling tick refuses after: that is `busy_timeout`,
+    /// its own key, so raising this for a slow verifier never lengthens a
+    /// tick's lock wait.
     pub request_timeout: MonotonicDuration,
     /// How long `aub sample` waits for the ledger's write slot before refusing
-    /// a tick. Its own key rather than `request_timeout`: that one bounds a
-    /// provider request, and an operator raising it for a slow provider must
-    /// not thereby lengthen a lock wait, nor push it past the store's bound.
+    /// a tick. Its own key rather than `request_timeout`: that one bounds the
+    /// ledger connection and the archive verifier, and an operator raising it
+    /// for a slow verifier must not thereby lengthen a lock wait, nor push it
+    /// past the store's bound.
     pub busy_timeout: MonotonicDuration,
+    /// The command horizon past which a sampling attempt with no terminal
+    /// result is classified as a collector interruption (aub-rqh2): the
+    /// projection reads it as `command_horizon`, so a resultless attempt older
+    /// than it is an interruption, not work still in flight. Defaults to the
+    /// 30s budget every provider adapter builds its requests under, so the
+    /// horizon does not fire while the adapter itself is still waiting. It
+    /// bounds no request; the adapters' own fixed budgets do.
     pub command_budget: MonotonicDuration,
     /// The most provider requests one sampling batch may keep in flight.
     /// Bounded so a machine with many configured accounts cannot open an
@@ -350,6 +367,15 @@ pub struct AdapterSemanticsConfig {
 #[derive(Debug, Clone)]
 pub struct DoctorConfig {
     pub meter_anomaly_horizon: MonotonicDuration,
+}
+
+/// The transcript export's own options (`aub-xpfl`).
+#[derive(Debug, Clone)]
+pub struct ExportConfig {
+    /// The command `aub export transcript -c` pipes the markdown to, read
+    /// from the child's stdin. `wl-copy` names Wayland; a headless machine
+    /// sets this to its own clipboard command instead.
+    pub clipboard_command: String,
 }
 
 /// The Anthropic provider's own options (aub-79gp).
@@ -540,12 +566,16 @@ pub struct Config {
     pub drill: DrillConfig,
     pub adapter_semantics: AdapterSemanticsConfig,
     pub doctor: DoctorConfig,
+    pub export: ExportConfig,
     pub anthropic: AnthropicConfig,
     pub antigravity: AntigravityConfig,
     /// Working-directory to logical project identity (`aub-lqe.12`).
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
     pub repositories: AliasTable,
+    /// The checkout-layout roots project and repository resolve from when no
+    /// explicit alias matches (`aub-p07j`).
+    pub layout: LayoutRoots,
 }
 
 /// The section names and, one level down, the key names this project recognizes. An
@@ -571,10 +601,12 @@ const KNOWN_SECTIONS: &[&str] = &[
     "drill",
     "adapter_semantics",
     "doctor",
+    "export",
     "anthropic",
     "antigravity",
     "projects",
     "repositories",
+    "layout",
 ];
 const STATE_KEYS: &[&str] = &["dir"];
 const SAMPLING_KEYS: &[&str] = &[
@@ -630,8 +662,10 @@ const BACKUP_KEYS: &[&str] = &[
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
+const EXPORT_KEYS: &[&str] = &["clipboard_command"];
 const ANTHROPIC_KEYS: &[&str] = &["refresh", "statusline"];
 const ANTIGRAVITY_KEYS: &[&str] = &["refresh"];
+const LAYOUT_KEYS: &[&str] = &["repositories", "worktrees", "ignore"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -788,11 +822,17 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     if let Some(t) = table.get("doctor").and_then(toml::Value::as_table) {
         check_keys(t, DOCTOR_KEYS, "doctor", file_display)?;
     }
+    if let Some(t) = table.get("export").and_then(toml::Value::as_table) {
+        check_keys(t, EXPORT_KEYS, "export", file_display)?;
+    }
     if let Some(t) = table.get("anthropic").and_then(toml::Value::as_table) {
         check_keys(t, ANTHROPIC_KEYS, "anthropic", file_display)?;
     }
     if let Some(t) = table.get("antigravity").and_then(toml::Value::as_table) {
         check_keys(t, ANTIGRAVITY_KEYS, "antigravity", file_display)?;
+    }
+    if let Some(t) = table.get("layout").and_then(toml::Value::as_table) {
+        check_keys(t, LAYOUT_KEYS, "layout", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -1322,12 +1362,15 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        // The 30s budget every provider adapter builds its requests under
+        // (aub-rqh2), so a resultless attempt is read as a collector
+        // interruption only after the request itself would have given up.
         command_budget: resolve_duration(
             "sampling.command_budget",
             overrides,
             env,
             file_raw(file.as_ref(), "sampling", "command_budget"),
-            Some("8s"),
+            Some("30s"),
             &file_display,
             &mut provenance,
         )?,
@@ -1688,6 +1731,18 @@ pub fn resolve(
         )?,
     };
 
+    let export = ExportConfig {
+        clipboard_command: resolve_string(
+            "export.clipboard_command",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "export", "clipboard_command"),
+            Some("wl-copy"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let anthropic = AnthropicConfig {
         refresh: resolve_bool(
             "anthropic.refresh",
@@ -1936,6 +1991,7 @@ pub fn resolve(
     if repositories.entries().next().is_some() {
         provenance.set("repositories", ConfigSource::File);
     }
+    let layout = layout_from_file(file.as_ref(), &mut provenance)?;
 
     Ok((
         Config {
@@ -1957,10 +2013,12 @@ pub fn resolve(
             drill,
             adapter_semantics,
             doctor,
+            export,
             anthropic,
             antigravity,
             projects,
             repositories,
+            layout,
         },
         provenance,
     ))
@@ -2134,12 +2192,16 @@ impl Config {
             "doctor.meter_anomaly_horizon" => {
                 format_config_duration(self.doctor.meter_anomaly_horizon)
             }
+            "export.clipboard_command" => self.export.clipboard_command.clone(),
             "anthropic.refresh" => self.anthropic.refresh.to_string(),
             "anthropic.statusline" => self.anthropic.statusline.to_string(),
             "antigravity.refresh" => self.antigravity.refresh.to_string(),
             "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
             "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
             "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
+            "layout.repositories" => self.layout.repositories.as_ref()?.display().to_string(),
+            "layout.worktrees" => self.layout.worktrees.as_ref()?.display().to_string(),
+            "layout.ignore" => self.layout.ignore.join(", "),
             _ => return None,
         };
         Some(value)
@@ -2427,6 +2489,79 @@ fn alias_table_from_file(file: Option<&toml::Table>, section: &str) -> Result<Al
     AliasTable::new(entries)
 }
 
+/// Reads the `[layout]` checkout roots from the file (`aub-p07j`). File-only,
+/// like the other heterogeneous sections: a root is a path and `ignore` is a
+/// list, neither of which one `--set key=value` string expresses.
+///
+/// Both roots are optional; with neither set the resolver is exactly today's
+/// exact-match aliases. A root that is present must be a string holding an
+/// absolute path, and `ignore` must be an array of non-empty repository names;
+/// anything else is a usage error naming `layout.<key>`. An unknown key is
+/// already refused by `validate_known_keys`, so what is decided here is the
+/// shape of the three known keys, which only the assembled values can answer.
+fn layout_from_file(
+    file: Option<&toml::Table>,
+    provenance: &mut Provenance,
+) -> Result<LayoutRoots, Error> {
+    let Some(table) = file
+        .and_then(|t| t.get("layout"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(LayoutRoots::default());
+    };
+    let mut root = |key: &str| -> Result<Option<PathBuf>, Error> {
+        match table.get(key) {
+            None => Ok(None),
+            Some(toml::Value::String(raw)) => {
+                if raw.is_empty() || !raw.starts_with('/') {
+                    return Err(Error::Usage(format!(
+                        "layout.{key}: {raw:?} is not an absolute path; \
+                         set it to the directory the checkouts live under"
+                    )));
+                }
+                provenance.set(&format!("layout.{key}"), ConfigSource::File);
+                Ok(Some(PathBuf::from(raw)))
+            }
+            Some(_) => Err(Error::Usage(format!(
+                "layout.{key} must be a string holding an absolute path"
+            ))),
+        }
+    };
+    let repositories = root("repositories")?;
+    let worktrees = root("worktrees")?;
+    let ignore = match table.get("ignore") {
+        None => Vec::new(),
+        Some(toml::Value::Array(names)) => {
+            let mut ignore = Vec::with_capacity(names.len());
+            for name in names {
+                match name.as_str() {
+                    Some(name) if !name.is_empty() && !name.starts_with('/') => {
+                        ignore.push(name.to_string());
+                    }
+                    _ => {
+                        return Err(Error::Usage(
+                            "layout.ignore must be an array of non-empty repository names"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            provenance.set("layout.ignore", ConfigSource::File);
+            ignore
+        }
+        Some(_) => {
+            return Err(Error::Usage(
+                "layout.ignore must be an array of non-empty repository names".to_string(),
+            ));
+        }
+    };
+    Ok(LayoutRoots {
+        repositories,
+        worktrees,
+        ignore,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2499,6 +2634,22 @@ mod tests {
         );
         assert_eq!(
             provenance.get("sampling.default_interval"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    /// The command budget default is the 30s the provider adapters build
+    /// their requests under (aub-rqh2). A value-level assert rather than only
+    /// the goldens: a golden catches any change here and distinguishes none.
+    #[test]
+    fn command_budget_defaults_to_the_thirty_seconds_the_adapters_build() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            config.sampling.command_budget,
+            MonotonicDuration::from_seconds(30)
+        );
+        assert_eq!(
+            provenance.get("sampling.command_budget"),
             Some(ConfigSource::Default)
         );
     }
@@ -3543,6 +3694,149 @@ plan_tier = "pro"
         assert!(err.to_string().contains("accounts[].plan_tier"), "{err}");
     }
 
+    // --- aub-p07j: the [layout] checkout roots --------------------------------
+
+    /// The layout roots resolve from the file and reach the provenance rows
+    /// with source `file` (aub-p07j): `aub config` prints the three keys with
+    /// the source that won for each.
+    #[test]
+    fn layout_roots_resolve_from_the_file_and_print_with_their_source() {
+        let file = "[layout]\nrepositories = \"/r\"\nworktrees = \"/r/.worktrees\"\nignore = [\"scratch\"]\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config
+                .layout
+                .repositories
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            Some("/r".to_string())
+        );
+        assert_eq!(
+            config
+                .layout
+                .worktrees
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            Some("/r/.worktrees".to_string())
+        );
+        assert_eq!(config.layout.ignore, vec!["scratch".to_string()]);
+        assert_eq!(
+            provenance.get("layout.repositories"),
+            Some(ConfigSource::File)
+        );
+        assert_eq!(provenance.get("layout.worktrees"), Some(ConfigSource::File));
+        assert_eq!(provenance.get("layout.ignore"), Some(ConfigSource::File));
+        let rows = config.provenance_rows(&provenance);
+        let by_key = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("the set layout key {key:?} prints as its own row"))
+        };
+        assert_eq!(by_key("layout.repositories").value, "/r");
+        assert_eq!(by_key("layout.worktrees").value, "/r/.worktrees");
+        assert_eq!(by_key("layout.ignore").value, "scratch");
+    }
+
+    /// Both roots are optional (aub-p07j): with neither set, behaviour is
+    /// exactly today's exact-match aliases, and no layout row prints for a
+    /// key nobody set.
+    #[test]
+    fn an_absent_layout_section_resolves_to_empty_roots_and_prints_nothing() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(config.layout.is_empty());
+        assert!(provenance.get("layout.repositories").is_none());
+        assert!(provenance.get("layout.worktrees").is_none());
+        assert!(provenance.get("layout.ignore").is_none());
+        assert!(
+            config
+                .provenance_rows(&provenance)
+                .iter()
+                .all(|row| !row.key.starts_with("layout."))
+        );
+    }
+
+    /// One root without the other is legal (aub-p07j): only the set key
+    /// prints.
+    #[test]
+    fn a_single_layout_root_resolves_and_prints_alone() {
+        let file = "[layout]\nrepositories = \"/r\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert!(config.layout.worktrees.is_none());
+        assert!(config.layout.ignore.is_empty());
+        assert_eq!(
+            provenance.get("layout.repositories"),
+            Some(ConfigSource::File)
+        );
+        assert!(provenance.get("layout.worktrees").is_none());
+    }
+
+    /// An unknown key under `[layout]` is a named error (aub-p07j), never a
+    /// silently ignored line.
+    #[test]
+    fn an_unknown_key_under_layout_is_a_named_error() {
+        let file = "[layout]\nrepositories = \"/r\"\nroots = \"/r\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("layout.roots"), "{err}");
+    }
+
+    /// The two roots must be absolute paths (aub-p07j): a relative root would
+    /// resolve every working directory against the wrong base.
+    #[test]
+    fn relative_layout_roots_are_named_usage_errors() {
+        for key in ["repositories", "worktrees"] {
+            let file = format!("[layout]\n{key} = \"relative/dir\"\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&file)).unwrap_err();
+            assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+            assert!(err.to_string().contains(&format!("layout.{key}")), "{err}");
+
+            let empty = format!("[layout]\n{key} = \"\"\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&empty)).unwrap_err();
+            assert!(err.to_string().contains(&format!("layout.{key}")), "{err}");
+
+            let typed = format!("[layout]\n{key} = 3\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&typed)).unwrap_err();
+            assert!(err.to_string().contains(&format!("layout.{key}")), "{err}");
+        }
+    }
+
+    /// `ignore` must be an array of non-empty repository names (aub-p07j):
+    /// anything else is a usage error naming the key, never a silently
+    /// degenerate filter.
+    #[test]
+    fn a_misshapen_layout_ignore_is_a_named_usage_error() {
+        let scalar = "[layout]\nignore = \"scratch\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(scalar)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+
+        let empty = "[layout]\nignore = [\"\"]\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(empty)).unwrap_err();
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+
+        let typed = "[layout]\nignore = [3]\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(typed)).unwrap_err();
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+
+        let absolute = "[layout]\nignore = [\"/scratch\"]\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(absolute)).unwrap_err();
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+    }
+
+    /// The planted negative for the file-override direction (aub-p07j): a
+    /// resolver that silently ignored the file value and always reported
+    /// empty roots would still pass the default-only assertion but not this
+    /// one.
+    #[test]
+    fn multiple_ignored_names_resolve_in_file_order() {
+        let file = "[layout]\nignore = [\"scratch\", \"junk\"]\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.layout.ignore,
+            vec!["scratch".to_string(), "junk".to_string()]
+        );
+    }
+
     // --- aub-34ik: boxed fields carry section and index --------------------------
 
     /// The dotted key splits into section, key and index (aub-34ik): scalars
@@ -3835,6 +4129,8 @@ doctor.meter_anomaly_horizon          15m                                      d
 
 drill.max_age                         30d                                      default
 
+export.clipboard_command              wl-copy                                  default
+
 freshness.meter                       12m                                      default
 
 ingest.max_batch_events               5000                                     default
@@ -3847,7 +4143,7 @@ reconciliation.residual_window        30d                                      d
 sampling.auth_backoff_cap             6h                                       default
 sampling.auth_backoff_threshold       3                                        default
 sampling.busy_timeout                 10s                                      default
-sampling.command_budget               8s                                       default
+sampling.command_budget               30s                                      default
 sampling.default_interval             5m                                       default
 sampling.max_concurrent_requests      2                                        default
 sampling.request_timeout              5s                                       default

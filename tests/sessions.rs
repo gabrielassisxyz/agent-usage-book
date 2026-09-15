@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::config::AliasTable;
+use agent_usage_book::config::layout::LayoutRoots;
 use agent_usage_book::config::{FakeEnv, Overrides, resolve as resolve_config};
 use agent_usage_book::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
 use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
@@ -107,7 +108,15 @@ fn two_identical_native_session_ids_from_different_sources_remain_distinct() {
     let projects = aliases(&[]);
     let repositories = aliases(&[]);
 
-    let count = rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
+    let count = rebuild_sessions(
+        &mut conn,
+        &events,
+        &dirs,
+        &projects,
+        &repositories,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     assert_eq!(count, 3, "three distinct source namespaces");
 
     let stored = load_all_sessions(&conn).unwrap();
@@ -164,7 +173,15 @@ fn no_absolute_machine_path_stored_as_report_identity() {
     let projects = aliases(&[("/home/developer/code/aub", "agent-usage-book")]);
     let repositories = aliases(&[("/home/developer/code/aub", "agent-usage-book")]);
 
-    rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
+    rebuild_sessions(
+        &mut conn,
+        &events,
+        &dirs,
+        &projects,
+        &repositories,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     let stored = load_all_sessions(&conn).unwrap();
 
     for row in &stored {
@@ -198,8 +215,15 @@ fn report_grouped_by_project_accounts_for_every_canonical_event_with_unknown_buc
         (s3.clone(), None),
     ]);
     let projects = aliases(&[("/work/aub", "agent-usage-book")]);
+    let repositories = aliases(&[]);
 
-    let counts = count_events_by_project(&events, &dirs, &projects);
+    let counts = count_events_by_project(
+        &events,
+        &dirs,
+        &projects,
+        &repositories,
+        &LayoutRoots::default(),
+    );
     let sum: usize = counts.values().sum();
     assert_eq!(sum, 4, "every event must be accounted for");
     assert_eq!(
@@ -245,12 +269,28 @@ fn rebuild_determinism_property_over_sessions() {
     let projects = aliases(&[("/aub", "proj-aub"), ("/other", "proj-other")]);
     let repos = aliases(&[("/aub", "repo-aub"), ("/other", "repo-other")]);
 
-    rebuild_sessions(&mut conn, &events, &dirs, &projects, &repos).unwrap();
+    rebuild_sessions(
+        &mut conn,
+        &events,
+        &dirs,
+        &projects,
+        &repos,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     let first = load_all_sessions(&conn).unwrap();
 
     // Rebuild again on fresh table
     agent_usage_book::store::session::clear_all_sessions(&conn).unwrap();
-    rebuild_sessions(&mut conn, &events, &dirs, &projects, &repos).unwrap();
+    rebuild_sessions(
+        &mut conn,
+        &events,
+        &dirs,
+        &projects,
+        &repos,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     let second = load_all_sessions(&conn).unwrap();
 
     assert_eq!(first, second, "rebuilt sessions must be strictly identical");
@@ -434,7 +474,13 @@ fn rebuild_sessions_reresolves_keys_and_leaves_evidence_untouched() {
     let generation_before = ledger_generation::current(&conn).unwrap();
 
     let first_table = aliases(&[("/tmp/aub-fixture-project", "fixture")]);
-    let outcome = reresolve_keys(&mut conn, &first_table, &first_table).unwrap();
+    let outcome = reresolve_keys(
+        &mut conn,
+        &first_table,
+        &first_table,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     assert_eq!(outcome.sessions, 2);
     assert_eq!(
         outcome.generation,
@@ -472,7 +518,13 @@ fn rebuild_sessions_reresolves_keys_and_leaves_evidence_untouched() {
     // A changed alias table moves the keys on the next run: the new alias
     // applies to history, not only to sessions ingested after it.
     let second_table = aliases(&[("/tmp/aub-fixture-project", "renamed")]);
-    let outcome = reresolve_keys(&mut conn, &second_table, &second_table).unwrap();
+    let outcome = reresolve_keys(
+        &mut conn,
+        &second_table,
+        &second_table,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     assert_eq!(outcome.sessions, 2);
     let stored = load_all_sessions(&conn).unwrap();
     let mapped = stored
@@ -497,7 +549,13 @@ fn rebuild_sessions_reresolves_keys_and_leaves_evidence_untouched() {
     // Idempotent: a third run with the same table changes nothing but still
     // advances the generation with the rewrite.
     let stored_before = load_all_sessions(&conn).unwrap();
-    reresolve_keys(&mut conn, &second_table, &second_table).unwrap();
+    reresolve_keys(
+        &mut conn,
+        &second_table,
+        &second_table,
+        &LayoutRoots::default(),
+    )
+    .unwrap();
     assert_eq!(load_all_sessions(&conn).unwrap(), stored_before);
 }
 
@@ -581,4 +639,183 @@ fn ingest_resolves_project_from_the_transcript_directory_through_aliases() {
         Some("/tmp/aub-fixture-project"),
         "the directory is stored even when no alias maps it"
     );
+}
+
+/// With `[layout] repositories = "/tmp"`, ingesting the fixture whose `cwd`
+/// is `/tmp/aub-fixture-project` resolves both keys to the directory name
+/// with no per-checkout alias at all; adding the name to `ignore` sends the
+/// same session to the unknown buckets instead (`aub-p07j`).
+#[test]
+fn ingest_resolves_project_and_repository_from_layout_roots() {
+    let scratch = ScratchDir::new();
+    let corpus = scratch.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus dir must be creatable");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/transcripts/working-directory/claude-code.jsonl");
+    std::fs::copy(&fixture, corpus.join("session.jsonl")).expect("fixture must copy");
+
+    let config_with_layout = format!(
+        "[layout]\nrepositories = \"/tmp\"\n\n\
+         [[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\n\
+         pattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n",
+        corpus.display()
+    );
+    let (config, _) = resolve_config(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&config_with_layout),
+        "/virtual/aub.toml",
+    )
+    .expect("config with layout must resolve");
+    let (_ledger_scratch, mut conn) = fixture_conn();
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000_000));
+    let report = run_ingest(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("ingest with layout must succeed");
+    assert!(report.layout_rejected.is_empty());
+    let stored = load_all_sessions(&conn).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].project_key().as_str(), "aub-fixture-project");
+    assert_eq!(stored[0].repository_key().as_str(), "aub-fixture-project");
+
+    // The planted negative: the same corpus with the derived name ignored
+    // lands in the unknown buckets. An implementation that ignored `ignore`
+    // would still report the directory name here.
+    let config_ignored = format!(
+        "[layout]\nrepositories = \"/tmp\"\nignore = [\"aub-fixture-project\"]\n\n\
+         [[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\n\
+         pattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n",
+        corpus.display()
+    );
+    let (config, _) = resolve_config(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&config_ignored),
+        "/virtual/aub.toml",
+    )
+    .expect("config with ignore must resolve");
+    let (_ledger_scratch, mut conn) = fixture_conn();
+    run_ingest(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("ingest with ignore must succeed");
+    let stored = load_all_sessions(&conn).unwrap();
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].project_key().as_str(), UNKNOWN_PROJECT);
+    assert_eq!(
+        stored[0].repository_key().as_str(),
+        UNKNOWN_REPOSITORY,
+        "an ignored repository stays inside totals in the unknown bucket"
+    );
+
+    // Re-resolving the first ledger through the ignoring config moves the
+    // stored keys to unknown without touching the stored directory: a new
+    // layout applies to history, not only to sessions ingested after it.
+    let (_ledger_scratch, mut conn) = fixture_conn();
+    run_ingest(
+        &mut conn,
+        &resolve_config(
+            &Overrides::new(),
+            &FakeEnv::new(),
+            Some(&config_with_layout),
+            "/virtual/aub.toml",
+        )
+        .expect("layout config must resolve")
+        .0,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("seed ingest must succeed");
+    let (ignoring, _) = resolve_config(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&config_ignored),
+        "/virtual/aub.toml",
+    )
+    .expect("ignore config must resolve");
+    let outcome = reresolve_keys(
+        &mut conn,
+        &ignoring.projects,
+        &ignoring.repositories,
+        &ignoring.layout,
+    )
+    .expect("rebuild with layout must succeed");
+    assert_eq!(outcome.sessions, 1);
+    let stored = load_all_sessions(&conn).unwrap();
+    assert_eq!(stored[0].repository_key().as_str(), UNKNOWN_REPOSITORY);
+    assert_eq!(
+        stored[0].working_directory(),
+        Some("/tmp/aub-fixture-project"),
+        "the stored directory survives the re-resolve"
+    );
+}
+
+/// A misconfigured root is reported once per ingest (`aub-p07j`, rule 5):
+/// with only `repositories` set, two sessions under the worktrees directory
+/// both imply the dot-named repository `.worktrees`; the report names it once
+/// and both sessions land in the unknown bucket instead of a dot-named one.
+#[test]
+fn ingest_reports_a_dot_named_layout_repository_once() {
+    let scratch = ScratchDir::new();
+    let corpus = scratch.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus dir must be creatable");
+    let transcript = [
+        ("s1", "m1", "/aub-p07j-root/.worktrees/aub/task-a"),
+        ("s2", "m2", "/aub-p07j-root/.worktrees/aub/task-b"),
+    ]
+    .iter()
+    .map(|(session, message, cwd)| {
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"2026-08-25T10:00:00.000Z\",\
+             \"sessionId\":\"{session}\",\"cwd\":\"{cwd}\",\"message\":{{\"id\":\"{message}\",\
+             \"model\":\"claude-opus-4\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}}}\n"
+        )
+    })
+    .collect::<String>();
+    std::fs::write(corpus.join("session.jsonl"), transcript).expect("transcript must write");
+
+    let config_text = format!(
+        "[layout]\nrepositories = \"/aub-p07j-root\"\n\n\
+         [[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\n\
+         pattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n",
+        corpus.display()
+    );
+    let (config, _) = resolve_config(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&config_text),
+        "/virtual/aub.toml",
+    )
+    .expect("config with a repositories-only layout must resolve");
+    let (_ledger_scratch, mut conn) = fixture_conn();
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000_000));
+    let report = run_ingest(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("ingest with a misconfigured layout must still succeed");
+    assert_eq!(report.layout_rejected, vec![".worktrees".to_string()]);
+    let stored = load_all_sessions(&conn).unwrap();
+    assert_eq!(stored.len(), 2);
+    for row in &stored {
+        assert_eq!(row.repository_key().as_str(), UNKNOWN_REPOSITORY);
+        assert_eq!(row.project_key().as_str(), UNKNOWN_PROJECT);
+    }
 }
