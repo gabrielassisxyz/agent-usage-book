@@ -1,0 +1,289 @@
+#!/usr/bin/env bash
+# migration-schema-pin (aub-migration-bumps-e2e-schema-pin-un2g): the
+# end-to-end case tests/e2e/cases/012-backup.sh pins the schema version the
+# migration chain produces today ("schema=NN generation="), and its own
+# comment tells a bead that adds a migration to bump that number. Nothing
+# pointed a lane at the case: the lane adding NNNN_*.rs has no reason to open
+# an e2e case about backups, its targeted suites never run it, and the review
+# before a landing does not run the whole e2e suite. So the forgetting
+# surfaced at the batch gate, after review, costing a full gate for every lane
+# in the batch; that is what happened on 2026-09-11, when aub-4ow0 added
+# 0038_session_working_directory, the case stayed at 37, and the red gate
+# reported attribution=unattributed because nothing in the failing check's
+# text named the lane's diff. This check runs before the e2e suite, costs no
+# build, and names the migration file and the case, which makes the red
+# attributable in seconds.
+#
+# The rule is a coupling, not a diff scan: the highest NNNN_*.rs under
+# src/store/migrations/ and every "schema=NN generation=" pin in the case file
+# must carry the same number, in whichever direction they drift. A change that
+# touches an existing migration without adding one (a comment, a fix, a
+# same-number rename) moves neither side and passes. The pin's trailing
+# " generation=" is load-bearing and required here: a bare "schema=1" once
+# matched every version from 10 to 19 and the assertion silently verified
+# nothing for ten migrations.
+#
+# Scoped to the one case the tracker names. A later e2e case that pins the
+# schema version should join this comparison rather than fork it.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+MIGRATIONS_SUBDIR="src/store/migrations"
+CASE_SUBPATH="tests/e2e/cases/012-backup.sh"
+
+# newest_migration <dir>: prints "<version>|<file name>" for the
+# highest-numbered NNNN_*.rs file, or nothing when none matches. The file
+# name's leading number is the migration's own version by the ordering rule in
+# src/store/migrations/mod.rs, so the file names are a faithful projection of
+# the schema version, readable without running or compiling anything.
+newest_migration() {
+    local dir="$1" path name num best_num=0 best_name=""
+    for path in "$dir"/*.rs; do
+        [ -f "$path" ] || continue
+        name="$(basename -- "$path")"
+        case "$name" in
+            [0-9][0-9][0-9][0-9]_*.rs) ;;
+            *) continue ;;
+        esac
+        num=$((10#${name%%_*}))
+        if [ "$num" -gt "$best_num" ]; then
+            best_num="$num"
+            best_name="$name"
+        fi
+    done
+    if [ -n "$best_name" ]; then
+        printf '%s|%s\n' "$best_num" "$best_name"
+    fi
+    return 0
+}
+
+# pinned_schema_versions <case file>: prints each distinct number the case
+# pins as "schema=NN generation=", one per line. The trailing " generation="
+# is part of the required shape; a pin without it is not a pin this check can
+# trust, for the ten-silent-migrations reason in the header.
+pinned_schema_versions() {
+    grep -oE 'schema=[0-9]+ generation=' -- "$1" | grep -oE '[0-9]+' | sort -u
+    return 0
+}
+
+# check_tree <root>: judge one tree. Green prints one line; every failure line
+# names the migration file and the case, because the red must be attributable
+# to the lane whose diff holds the migration.
+check_tree() {
+    local root="$1"
+    local migrations_dir="$root/$MIGRATIONS_SUBDIR"
+    local case_file="$root/$CASE_SUBPATH"
+    local newest newest_num newest_name pins pin_count pin pin_num
+
+    if [ ! -d "$migrations_dir" ]; then
+        echo "migration-schema-pin: FAIL: no migration directory at $MIGRATIONS_SUBDIR under $root" >&2
+        return 1
+    fi
+    if [ ! -f "$case_file" ]; then
+        echo "migration-schema-pin: FAIL: no e2e case at $CASE_SUBPATH under $root" >&2
+        return 1
+    fi
+
+    newest="$(newest_migration "$migrations_dir")"
+    if [ -z "$newest" ]; then
+        echo "migration-schema-pin: FAIL: no NNNN_*.rs migration file under $MIGRATIONS_SUBDIR" >&2
+        return 1
+    fi
+    newest_num="${newest%%|*}"
+    newest_num=$((10#$newest_num))
+    newest_name="${newest#*|}"
+
+    pins="$(pinned_schema_versions "$case_file")"
+    pin_count="$(printf '%s' "$pins" | grep -c . || true)"
+
+    if [ "$pin_count" -eq 0 ]; then
+        echo "migration-schema-pin: FAIL: $CASE_SUBPATH carries no \"schema=NN generation=\" assertion while the newest migration is $MIGRATIONS_SUBDIR/$newest_name (schema version $newest_num)" >&2
+        echo "migration-schema-pin: the pin is load-bearing: a bare \"schema=NN\" once matched every version from 10 to 19 and the assertion verified nothing. Restore it and bump it on every migration." >&2
+        return 1
+    fi
+
+    if [ "$pin_count" -gt 1 ]; then
+        echo "migration-schema-pin: FAIL: $CASE_SUBPATH pins more than one schema version ($(printf '%s' "$pins" | paste -sd, -)) while the newest migration is $MIGRATIONS_SUBDIR/$newest_name (schema version $newest_num)" >&2
+        echo "migration-schema-pin: every \"schema=NN generation=\" occurrence in $CASE_SUBPATH must carry the same number, currently $newest_num" >&2
+        return 1
+    fi
+
+    pin="$(printf '%s' "$pins" | head -1)"
+    pin_num=$((10#$pin))
+
+    if [ "$pin_num" -ne "$newest_num" ]; then
+        echo "migration-schema-pin: FAIL: $CASE_SUBPATH pins schema=$pin generation= but the newest migration is $MIGRATIONS_SUBDIR/$newest_name (schema version $newest_num)" >&2
+        if [ "$pin_num" -lt "$newest_num" ]; then
+            echo "migration-schema-pin: a bead that adds a migration bumps the pinned schema version in $CASE_SUBPATH: every \"schema=NN generation=\" occurrence must say $newest_num" >&2
+        else
+            echo "migration-schema-pin: the pin names a version no migration produces; move it back to $newest_num or land the migration that produces $pin_num" >&2
+        fi
+        return 1
+    fi
+
+    echo "migration-schema-pin: in sync: newest migration $MIGRATIONS_SUBDIR/$newest_name (schema version $newest_num); $CASE_SUBPATH pins schema=$pin generation="
+    return 0
+}
+
+# --- self-tests --------------------------------------------------------------
+# The live comparison above is judged by the gate; these scenarios prove the
+# comparison discriminates, on scratch trees rather than against this
+# repository's own history. A planted next migration with the pin left behind
+# is red with both names in the message; an existing migration edited or
+# renamed in place is green; a half-moved pin and a deleted pin are red; and
+# the neutered rule lets the red scenario through, which is what makes the
+# red the rule's work and not an incidental failure of the script.
+
+build_scenario() {
+    # A scratch tree holding a copy of the real migration directory and the
+    # real case file, so the scenarios look the way a lane's tree looks.
+    local dir="$scratch/$1"
+    mkdir -p "$dir/src/store" "$dir/tests/e2e/cases"
+    cp -a "$repo_root/$MIGRATIONS_SUBDIR" "$dir/src/store/migrations"
+    cp -- "$repo_root/$CASE_SUBPATH" "$dir/tests/e2e/cases/012-backup.sh"
+    printf '%s\n' "$dir"
+}
+
+plant_next_migration() {
+    # $1 = scenario dir: writes the migration file the next schema bead would
+    # write (highest version plus one) and prints its file name.
+    local dir="$1" name
+    name="$(printf '%04d_zz_probe_migration.rs' $(( newest_num + 1 )))"
+    printf '// probe migration planted by the %s self-test\n' "$CASE_SUBPATH" \
+        > "$dir/$MIGRATIONS_SUBDIR/$name"
+    printf '%s\n' "$name"
+}
+
+expect_red() {
+    # $1 = scenario dir, $2 = label, $3 = extended regex the failure must match.
+    local dir="$1" label="$2" want_re="$3" out rc
+    out="$("$script_dir/56-migration-schema-pin" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "migration-schema-pin self-test: $label: expected red, was green" >&2
+        return 1
+    fi
+    if ! printf '%s\n' "$out" | grep -Eq -- "$want_re"; then
+        echo "migration-schema-pin self-test: $label: red without the expected signature ($want_re):" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    return 0
+}
+
+expect_green() {
+    local dir="$1" label="$2" out rc
+    out="$("$script_dir/56-migration-schema-pin" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "migration-schema-pin self-test: $label: expected green, was red:" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    return 0
+}
+
+run_self_tests() {
+    local fail=0 dir probe_name out rc
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-migration-pin-XXXXXX")" || return 1
+    trap 'rm -rf "$scratch"' EXIT
+
+    local newest
+    newest="$(newest_migration "$repo_root/$MIGRATIONS_SUBDIR")"
+    if [ -z "$newest" ]; then
+        echo "migration-schema-pin self-test: no migration files to build scenarios from" >&2
+        return 1
+    fi
+    newest_num="${newest%%|*}"
+    newest_num=$((10#$newest_num))
+    newest_name="${newest#*|}"
+
+    # Red: a new migration file with the pin left behind, the scenario the
+    # whole check exists for. The failure must name the migration and the case.
+    dir="$(build_scenario red-new-migration)"
+    probe_name="$(plant_next_migration "$dir")"
+    expect_red "$dir" "a new migration with the pin left behind" \
+        "012-backup\.sh pins schema=[0-9]+ generation=.*$probe_name" || fail=1
+
+    # Green: an existing migration edited in place moves neither side.
+    dir="$(build_scenario green-comment-edit)"
+    printf '// a comment the self-test appended\n' >> "$dir/$MIGRATIONS_SUBDIR/$newest_name"
+    expect_green "$dir" "a comment inside an existing migration" || fail=1
+
+    # Green: a same-number rename. The number is what couples; the name is free.
+    dir="$(build_scenario green-same-number-rename)"
+    mv "$dir/$MIGRATIONS_SUBDIR/$newest_name" \
+        "$dir/$MIGRATIONS_SUBDIR/$(printf '%04d' "$newest_num")_renamed_by_self_test.rs"
+    expect_green "$dir" "a same-number rename" || fail=1
+
+    # Red: the pin moved in one assertion but not the other. A comparison that
+    # stops at the first pin it finds would pass this.
+    dir="$(build_scenario red-partial-bump)"
+    sed -i "0,/schema=$newest_num generation=/s//schema=$((newest_num + 1)) generation=/" \
+        "$dir/tests/e2e/cases/012-backup.sh"
+    grep -q "schema=$((newest_num + 1)) generation=" "$dir/tests/e2e/cases/012-backup.sh" || {
+        echo "migration-schema-pin self-test: the partial-bump mutation changed nothing" >&2
+        fail=1
+    }
+    expect_red "$dir" "a half-moved pin" "pins more than one schema version" || fail=1
+
+    # Red: the pin deleted outright, not merely left behind.
+    dir="$(build_scenario red-pin-deleted)"
+    sed -i 's/schema=/pin-gone=/' "$dir/tests/e2e/cases/012-backup.sh"
+    grep -qE 'schema=[0-9]+ generation=' "$dir/tests/e2e/cases/012-backup.sh" && {
+        echo "migration-schema-pin self-test: the pin-deletion mutation left a pin behind" >&2
+        fail=1
+    }
+    expect_red "$dir" "a deleted pin" "carries no .schema=NN generation=. assertion" || fail=1
+
+    # The mutation proof: the same red tree, first under the intact rule (red),
+    # then under a check whose line 2 is an exit 0 (green). The pair is what
+    # makes the red above the rule's work and not an incidental defect, and it
+    # is exercised here against a scratch tree, never against this
+    # repository's own history.
+    dir="$(build_scenario red-neutered-rule)"
+    plant_next_migration "$dir" >/dev/null
+    cp "$script_dir/56-migration-schema-pin" "$scratch/neutered-check"
+    sed -i '2i exit 0' "$scratch/neutered-check"
+    chmod +x "$scratch/neutered-check"
+    out="$("$script_dir/56-migration-schema-pin" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "migration-schema-pin self-test: the intact rule passed its own red scenario; the tree is wrong:" >&2
+        printf '%s\n' "$out" >&2
+        fail=1
+    fi
+    out="$("$scratch/neutered-check" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "migration-schema-pin self-test: the neutered rule still fires on the red scenario:" >&2
+        printf '%s\n' "$out" >&2
+        fail=1
+    fi
+
+    if [ "$fail" -ne 0 ]; then
+        return 1
+    fi
+    echo "migration-schema-pin: self-tests ok: red names migration and case, in-place edits stay green, the neutered rule passes the red scenario."
+    return 0
+}
+
+# Argument mode judges one tree and stops there; the embedded self-tests run
+# against scratch trees only in the live path, after the gate's own comparison
+# has passed.
+if [ "$#" -gt 0 ]; then
+    check_tree "$1"
+    exit $?
+fi
+
+fail=0
+check_tree "$repo_root" || fail=1
+if [ "$fail" -eq 0 ]; then
+    run_self_tests || fail=1
+fi
+if [ "$fail" -ne 0 ]; then
+    echo "==> migration-schema-pin FAILED" >&2
+fi
+exit "$fail"
