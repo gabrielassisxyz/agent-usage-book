@@ -402,6 +402,46 @@ unmapped models: 412 events (kimi-k2.7, minimax-m3-max-k3)
 That line is how a new alias becomes visible the day it first appears. An event
 whose transcript recorded no model id at all is counted under `(no model id)`.
 
+### `[layout]`: which repository a checkout belongs to
+
+Two roots describe the whole checkout layout instead of one alias per
+checkout:
+
+```toml
+[layout]
+repositories = "/home/user/repositories"
+worktrees = "/home/user/repositories/.worktrees"
+ignore = ["scratch"]
+```
+
+`repositories` makes every immediate child directory a repository named after
+that directory (`/home/user/repositories/aub/src` resolves to `aub`);
+`worktrees` makes `<dir>/<repo>/<anything>` resolve to `<repo>`
+(`/home/user/repositories/.worktrees/aub/bugfix-x/src` resolves to `aub`);
+`ignore` sends the named repositories to the unknown bucket on purpose (a
+`scratch` checkout stays inside totals as `unknown-repository` and
+`unknown-project` rather than disappearing from them).
+
+Precedence for a working directory, in order:
+
+1. An explicit alias with an exact key wins (`[repositories]` for the
+   repository, `[projects]` for the project).
+2. The `worktrees` root, checked before the repositories root because it sits
+   inside it on this machine.
+3. The `repositories` root.
+4. Unknown.
+
+Under a root the identity is the first path segment after it; a directory
+equal to a root itself resolves to unknown. A project is its repository
+unless an explicit `[projects]` entry with an exact key says otherwise, which
+is how a project spanning repositories is expressed. A dot-named segment
+(such as `.worktrees` from a misconfigured root) is refused at resolution and
+reported once per ingest in the summary, so a misconfigured root is visible
+rather than silently producing dot-named repositories. Both roots are
+optional; with neither set, behaviour is exactly today's exact-match aliases:
+the project resolves through `[projects]` alone, and a `[repositories]` alias
+names only the repository.
+
 For scheduled runs, note that the sampler runs from `aub-sample.service`,
 which has no shell: a variable exported in an interactive profile does not
 reach it. Give the service an `EnvironmentFile=` of its own (for example
@@ -676,8 +716,8 @@ result, response evidence, an observation, or a calibration even if asked to.
 
 `aub rebuild sessions` is not a sweep: it re-resolves every stored session's
 project and repository keys from its stored working directory through the
-current `[projects]` and `[repositories]` alias tables, rewriting derived
-keys only. Bounds, run ids and every evidence table stay untouched, so a new
+current `[projects]` and `[repositories]` alias tables and `[layout]` roots,
+rewriting derived keys only. Bounds, run ids and every evidence table stay untouched, so a new
 alias applies to history and not only to sessions ingested after it.
 
 ## `aub doctor`

@@ -29,7 +29,7 @@
 //! `doctor.meter_anomaly_horizon`) go through the full four-level order and are
 //! individually provenance-tracked, since those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
-//! `transcripts`, `tracker` and `valuation.default_rate_book` are populated from the
+//! `transcripts`, `tracker`, `layout` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
 //! heterogeneous list, or a credential shape that varies by its own `kind` field,
 //! through one `--set` string is not a well-formed operation, and the adapters that
@@ -39,6 +39,7 @@
 mod duration;
 
 pub mod aliases;
+pub mod layout;
 pub mod models;
 
 use std::collections::BTreeMap;
@@ -54,6 +55,7 @@ use crate::error::Error;
 
 pub use aliases::AliasTable;
 pub use duration::{format_config_duration, parse_duration};
+pub use layout::LayoutRoots;
 pub use models::{ModelRule, ModelTable, PricedModel};
 
 /// Where a resolved value came from, in the order that decides a tie.
@@ -561,6 +563,9 @@ pub struct Config {
     pub projects: AliasTable,
     /// Working-directory to logical repository identity (`aub-lqe.12`).
     pub repositories: AliasTable,
+    /// The checkout-layout roots project and repository resolve from when no
+    /// explicit alias matches (`aub-p07j`).
+    pub layout: LayoutRoots,
 }
 
 /// The section names and, one level down, the key names this project recognizes. An
@@ -590,6 +595,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "antigravity",
     "projects",
     "repositories",
+    "layout",
 ];
 const STATE_KEYS: &[&str] = &["dir"];
 const SAMPLING_KEYS: &[&str] = &[
@@ -647,6 +653,7 @@ const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
 const ANTHROPIC_KEYS: &[&str] = &["refresh", "statusline"];
 const ANTIGRAVITY_KEYS: &[&str] = &["refresh"];
+const LAYOUT_KEYS: &[&str] = &["repositories", "worktrees", "ignore"];
 
 fn unknown_key_error(key: &str, file_display: &str) -> Error {
     Error::Usage(format!(
@@ -808,6 +815,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("antigravity").and_then(toml::Value::as_table) {
         check_keys(t, ANTIGRAVITY_KEYS, "antigravity", file_display)?;
+    }
+    if let Some(t) = table.get("layout").and_then(toml::Value::as_table) {
+        check_keys(t, LAYOUT_KEYS, "layout", file_display)?;
     }
     if let Some(accounts) = table.get("accounts").and_then(toml::Value::as_array) {
         for account in accounts {
@@ -1954,6 +1964,7 @@ pub fn resolve(
     if repositories.entries().next().is_some() {
         provenance.set("repositories", ConfigSource::File);
     }
+    let layout = layout_from_file(file.as_ref(), &mut provenance)?;
 
     Ok((
         Config {
@@ -1979,6 +1990,7 @@ pub fn resolve(
             antigravity,
             projects,
             repositories,
+            layout,
         },
         provenance,
     ))
@@ -2158,6 +2170,9 @@ impl Config {
             "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
             "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
             "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
+            "layout.repositories" => self.layout.repositories.as_ref()?.display().to_string(),
+            "layout.worktrees" => self.layout.worktrees.as_ref()?.display().to_string(),
+            "layout.ignore" => self.layout.ignore.join(", "),
             _ => return None,
         };
         Some(value)
@@ -2443,6 +2458,79 @@ fn alias_table_from_file(file: Option<&toml::Table>, section: &str) -> Result<Al
         entries.insert(path.clone(), name.to_string());
     }
     AliasTable::new(entries)
+}
+
+/// Reads the `[layout]` checkout roots from the file (`aub-p07j`). File-only,
+/// like the other heterogeneous sections: a root is a path and `ignore` is a
+/// list, neither of which one `--set key=value` string expresses.
+///
+/// Both roots are optional; with neither set the resolver is exactly today's
+/// exact-match aliases. A root that is present must be a string holding an
+/// absolute path, and `ignore` must be an array of non-empty repository names;
+/// anything else is a usage error naming `layout.<key>`. An unknown key is
+/// already refused by `validate_known_keys`, so what is decided here is the
+/// shape of the three known keys, which only the assembled values can answer.
+fn layout_from_file(
+    file: Option<&toml::Table>,
+    provenance: &mut Provenance,
+) -> Result<LayoutRoots, Error> {
+    let Some(table) = file
+        .and_then(|t| t.get("layout"))
+        .and_then(toml::Value::as_table)
+    else {
+        return Ok(LayoutRoots::default());
+    };
+    let mut root = |key: &str| -> Result<Option<PathBuf>, Error> {
+        match table.get(key) {
+            None => Ok(None),
+            Some(toml::Value::String(raw)) => {
+                if raw.is_empty() || !raw.starts_with('/') {
+                    return Err(Error::Usage(format!(
+                        "layout.{key}: {raw:?} is not an absolute path; \
+                         set it to the directory the checkouts live under"
+                    )));
+                }
+                provenance.set(&format!("layout.{key}"), ConfigSource::File);
+                Ok(Some(PathBuf::from(raw)))
+            }
+            Some(_) => Err(Error::Usage(format!(
+                "layout.{key} must be a string holding an absolute path"
+            ))),
+        }
+    };
+    let repositories = root("repositories")?;
+    let worktrees = root("worktrees")?;
+    let ignore = match table.get("ignore") {
+        None => Vec::new(),
+        Some(toml::Value::Array(names)) => {
+            let mut ignore = Vec::with_capacity(names.len());
+            for name in names {
+                match name.as_str() {
+                    Some(name) if !name.is_empty() && !name.starts_with('/') => {
+                        ignore.push(name.to_string());
+                    }
+                    _ => {
+                        return Err(Error::Usage(
+                            "layout.ignore must be an array of non-empty repository names"
+                                .to_string(),
+                        ));
+                    }
+                }
+            }
+            provenance.set("layout.ignore", ConfigSource::File);
+            ignore
+        }
+        Some(_) => {
+            return Err(Error::Usage(
+                "layout.ignore must be an array of non-empty repository names".to_string(),
+            ));
+        }
+    };
+    Ok(LayoutRoots {
+        repositories,
+        worktrees,
+        ignore,
+    })
 }
 
 #[cfg(test)]
@@ -3575,6 +3663,149 @@ plan_tier = "pro"
         let err = resolve_with(Overrides::new(), plain_env(), Some(garbage)).unwrap_err();
         assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
         assert!(err.to_string().contains("accounts[].plan_tier"), "{err}");
+    }
+
+    // --- aub-p07j: the [layout] checkout roots --------------------------------
+
+    /// The layout roots resolve from the file and reach the provenance rows
+    /// with source `file` (aub-p07j): `aub config` prints the three keys with
+    /// the source that won for each.
+    #[test]
+    fn layout_roots_resolve_from_the_file_and_print_with_their_source() {
+        let file = "[layout]\nrepositories = \"/r\"\nworktrees = \"/r/.worktrees\"\nignore = [\"scratch\"]\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config
+                .layout
+                .repositories
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            Some("/r".to_string())
+        );
+        assert_eq!(
+            config
+                .layout
+                .worktrees
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            Some("/r/.worktrees".to_string())
+        );
+        assert_eq!(config.layout.ignore, vec!["scratch".to_string()]);
+        assert_eq!(
+            provenance.get("layout.repositories"),
+            Some(ConfigSource::File)
+        );
+        assert_eq!(provenance.get("layout.worktrees"), Some(ConfigSource::File));
+        assert_eq!(provenance.get("layout.ignore"), Some(ConfigSource::File));
+        let rows = config.provenance_rows(&provenance);
+        let by_key = |key: &str| {
+            rows.iter()
+                .find(|row| row.key == key)
+                .unwrap_or_else(|| panic!("the set layout key {key:?} prints as its own row"))
+        };
+        assert_eq!(by_key("layout.repositories").value, "/r");
+        assert_eq!(by_key("layout.worktrees").value, "/r/.worktrees");
+        assert_eq!(by_key("layout.ignore").value, "scratch");
+    }
+
+    /// Both roots are optional (aub-p07j): with neither set, behaviour is
+    /// exactly today's exact-match aliases, and no layout row prints for a
+    /// key nobody set.
+    #[test]
+    fn an_absent_layout_section_resolves_to_empty_roots_and_prints_nothing() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(config.layout.is_empty());
+        assert!(provenance.get("layout.repositories").is_none());
+        assert!(provenance.get("layout.worktrees").is_none());
+        assert!(provenance.get("layout.ignore").is_none());
+        assert!(
+            config
+                .provenance_rows(&provenance)
+                .iter()
+                .all(|row| !row.key.starts_with("layout."))
+        );
+    }
+
+    /// One root without the other is legal (aub-p07j): only the set key
+    /// prints.
+    #[test]
+    fn a_single_layout_root_resolves_and_prints_alone() {
+        let file = "[layout]\nrepositories = \"/r\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert!(config.layout.worktrees.is_none());
+        assert!(config.layout.ignore.is_empty());
+        assert_eq!(
+            provenance.get("layout.repositories"),
+            Some(ConfigSource::File)
+        );
+        assert!(provenance.get("layout.worktrees").is_none());
+    }
+
+    /// An unknown key under `[layout]` is a named error (aub-p07j), never a
+    /// silently ignored line.
+    #[test]
+    fn an_unknown_key_under_layout_is_a_named_error() {
+        let file = "[layout]\nrepositories = \"/r\"\nroots = \"/r\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("layout.roots"), "{err}");
+    }
+
+    /// The two roots must be absolute paths (aub-p07j): a relative root would
+    /// resolve every working directory against the wrong base.
+    #[test]
+    fn relative_layout_roots_are_named_usage_errors() {
+        for key in ["repositories", "worktrees"] {
+            let file = format!("[layout]\n{key} = \"relative/dir\"\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&file)).unwrap_err();
+            assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+            assert!(err.to_string().contains(&format!("layout.{key}")), "{err}");
+
+            let empty = format!("[layout]\n{key} = \"\"\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&empty)).unwrap_err();
+            assert!(err.to_string().contains(&format!("layout.{key}")), "{err}");
+
+            let typed = format!("[layout]\n{key} = 3\n");
+            let err = resolve_with(Overrides::new(), plain_env(), Some(&typed)).unwrap_err();
+            assert!(err.to_string().contains(&format!("layout.{key}")), "{err}");
+        }
+    }
+
+    /// `ignore` must be an array of non-empty repository names (aub-p07j):
+    /// anything else is a usage error naming the key, never a silently
+    /// degenerate filter.
+    #[test]
+    fn a_misshapen_layout_ignore_is_a_named_usage_error() {
+        let scalar = "[layout]\nignore = \"scratch\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(scalar)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+
+        let empty = "[layout]\nignore = [\"\"]\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(empty)).unwrap_err();
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+
+        let typed = "[layout]\nignore = [3]\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(typed)).unwrap_err();
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+
+        let absolute = "[layout]\nignore = [\"/scratch\"]\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(absolute)).unwrap_err();
+        assert!(err.to_string().contains("layout.ignore"), "{err}");
+    }
+
+    /// The planted negative for the file-override direction (aub-p07j): a
+    /// resolver that silently ignored the file value and always reported
+    /// empty roots would still pass the default-only assertion but not this
+    /// one.
+    #[test]
+    fn multiple_ignored_names_resolve_in_file_order() {
+        let file = "[layout]\nignore = [\"scratch\", \"junk\"]\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.layout.ignore,
+            vec!["scratch".to_string(), "junk".to_string()]
+        );
     }
 
     // --- aub-34ik: boxed fields carry section and index --------------------------

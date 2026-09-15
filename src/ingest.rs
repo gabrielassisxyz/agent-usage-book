@@ -110,6 +110,11 @@ pub struct IngestReport {
     /// Sessions whose transcript stated two different working directories, so
     /// the stored row keeps the first and this count says the choice was made.
     pub working_directory_changes: u64,
+    /// Distinct dot-named repositories the layout roots implied this pass
+    /// (`aub-p07j`): a misconfigured root made visible rather than silently
+    /// producing dot-named repositories. Empty in the ordinary case, reported
+    /// once in the ingest summary when non-empty.
+    pub layout_rejected: Vec<String>,
     /// The generation the pass landed as, from the transaction's advance.
     pub generation: crate::store::ingestion_generation::Generation,
     /// Rows landed, as the persistence path counted them, summed over every
@@ -437,6 +442,22 @@ pub fn run(
             },
         ));
 
+    // Dot-named repositories the layout roots imply (`aub-p07j`): collected
+    // once over the pass-wide directories, distinct and sorted, so a
+    // misconfigured root is reported once in the summary no matter how many
+    // sessions it touched.
+    let layout_rejected: Vec<String> = {
+        let mut rejected = std::collections::BTreeSet::new();
+        for directory in session_directories.values().flatten() {
+            if let Some(name) =
+                crate::config::layout::layout_rejected_repository_name(&config.layout, directory)
+            {
+                rejected.insert(name);
+            }
+        }
+        rejected.into_iter().collect()
+    };
+
     let mut persist_events = Vec::with_capacity(deduplicated.canonical.len());
     for event in &deduplicated.canonical {
         let identity = canonical_identity(event);
@@ -537,6 +558,7 @@ pub fn run(
             &session_directories,
             &config.projects,
             &config.repositories,
+            &config.layout,
         );
         let chunk_watermarks = if last {
             std::mem::take(&mut watermarks)
@@ -657,6 +679,7 @@ pub fn run(
         unreadable_files,
         quarantined,
         working_directory_changes,
+        layout_rejected,
         generation: totals.generation,
         outcome: totals,
         batches,
@@ -819,13 +842,14 @@ fn collision_descriptors(
 /// given events. A session whose events all lack a timestamp has no bounds to
 /// state, so it produces no row: an invented bound would be a fabricated fact.
 /// Project and repository resolve from the pass-wide first-wins directories
-/// through the configured alias tables; a session with no stated directory
-/// stays in the unknown buckets.
+/// through the configured alias tables and layout roots; a session with no
+/// stated directory stays in the unknown buckets.
 fn session_pass<'a>(
     events: impl IntoIterator<Item = &'a NormalizedUsageEvent>,
     directories: &BTreeMap<(String, String), Option<String>>,
     projects: &crate::config::AliasTable,
     repositories: &crate::config::AliasTable,
+    layout: &crate::config::layout::LayoutRoots,
 ) -> Vec<NewSession> {
     let mut bounds: BTreeMap<(String, String), (Option<UtcTimestamp>, Option<UtcTimestamp>)> =
         BTreeMap::new();
@@ -855,12 +879,15 @@ fn session_pass<'a>(
                 native_session_id: crate::domain::ids::NativeSessionId::new(native),
                 start: start?,
                 end,
-                project_key: crate::sessions::resolve_project(
+                project_key: crate::sessions::resolve_project_with_layout(
                     projects,
+                    repositories,
+                    layout,
                     working_directory.as_deref(),
                 ),
-                repository_key: crate::sessions::resolve_repository(
+                repository_key: crate::sessions::resolve_repository_with_layout(
                     repositories,
+                    layout,
                     working_directory.as_deref(),
                 ),
                 working_directory,
