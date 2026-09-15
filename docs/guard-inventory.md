@@ -170,6 +170,8 @@ e-10	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/007-spend.sh	s/+4701 +2092/+4702 
 e-11	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/018-task.sh	s/events_inserted=1/events_inserted=2/		events_inserted|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-12	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/023-calibrate-controlled-experiment.sh	141s/assert_exit 0 3/assert_exit 1 3/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-13	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/026-can-run.sh	244s/assert_exit 0 1/assert_exit 1 1/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
+sh-34	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/56-migration-schema-pin	plant	src/store/migrations/9999_zz_guard_probe_migration.rs	pub fn zz_guard_probe_migration() {}		012-backup\.sh pins schema=[0-9]+ generation=.*9999_zz_guard_probe_migration\.rs	bin/checks/70-quantity-inventory	0	every pub struct/enum
+sh-35	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/80-gate-coverage "$SCRATCH"	neuter	bin/checks/56-migration-schema-pin			56-migration-schema-pin is neutered with exit 0	bin/checks/70-quantity-inventory	0	every pub struct/enum
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness
