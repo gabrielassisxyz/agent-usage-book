@@ -1279,7 +1279,7 @@ fn spend_total_row(report: &SpendReport, has_reasoning: bool) -> SpendTableRow {
     }
     let credits = has_credits.then(|| {
         if credits_unavailable {
-            "—".to_string()
+            "\u{2014}".to_string()
         } else {
             render_credits_amount(Credits::from_micros(credit_micros))
         }
@@ -1318,7 +1318,7 @@ fn spend_valuation_cell(value: &ValuationOutcome<crate::domain::money::Usd>) -> 
             "known {}",
             render_money_amount(known_price_subtotal.amount())
         ),
-        ValuationOutcome::UnsupportedCurrency { .. } => "—".to_string(),
+        ValuationOutcome::UnsupportedCurrency { .. } => "\u{2014}".to_string(),
     }
 }
 
@@ -1328,7 +1328,7 @@ fn spend_credits_cell(value: &Derivation<Credits>) -> String {
             let (value, _, _, _) = qualified.clone().into_parts();
             render_credits_amount(value)
         }
-        Derivation::Unavailable { .. } => "—".to_string(),
+        Derivation::Unavailable { .. } => "\u{2014}".to_string(),
     }
 }
 
@@ -1442,9 +1442,15 @@ fn spend_row_cell_with_scales(
         SpendTableColumn::Reasoning => row
             .reasoning
             .map(|value| format_spend_scaled(value, scales.get(4).copied()))
-            .unwrap_or_else(|| "—".to_string()),
-        SpendTableColumn::Valuation => row.valuation.clone().unwrap_or_else(|| "—".to_string()),
-        SpendTableColumn::Credits => row.credits.clone().unwrap_or_else(|| "—".to_string()),
+            .unwrap_or_else(|| "\u{2014}".to_string()),
+        SpendTableColumn::Valuation => row
+            .valuation
+            .clone()
+            .unwrap_or_else(|| "\u{2014}".to_string()),
+        SpendTableColumn::Credits => row
+            .credits
+            .clone()
+            .unwrap_or_else(|| "\u{2014}".to_string()),
     }
 }
 
