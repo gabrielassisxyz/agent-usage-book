@@ -110,21 +110,26 @@ is the transcript namespace the config named (`claude-code`, `codex`, `pi`,
 field names lands in the `unknown-harness` or `unknown-model` bucket.
 
 Text output is a bordered table. Counts use compact human units in the table;
-`--format json` and `--value api-list` retain exact quantities.
+`--format json` retains the exact quantities.
 
 ```text
-┌─ spend · 2026-09-01 → 2026-09-07 · 7 days UTC · by day ─────────────────────┐
-│                                                                             │
-│  day          input   output   cache read   cache write   reasoning        │
-│  ───────────────────────────────────────────────────────────────────────    │
-│  2026-09-01   2.1M     310k       38.2M         0.9M          12k          │
-│  2026-09-07  11.0M     722k      198.5M         3.3M          82k  ◐       │
-│  ───────────────────────────────────────────────────────────────────────    │
-│  total       31.4M     2.9M      612.0M        11.2M         210k          │
-│                                                                             │
-│  ◐ partial: day still in progress                                           │
-│  1085 events · 8 files read · 0 quarantined · generation 148               │
-└─────────────────────────────────────────────────────────────────────────────┘
+┌─ spend · 2026-09-01 → 2026-09-07 · 7 days UTC · by day ──────────────────────┐
+│                                                                              │
+│  day         input  output  cache read  cache write  reasoning               │
+│  ────────────────────────────────────────────────────────────────            │
+│  2026-09-01   2.1M    310k       38.2M         0.9M        12k               │
+│  2026-09-02   3.7M    374k       75.1M         1.4M      23.2k               │
+│  2026-09-03   3.7M    374k       75.1M         1.4M      23.2k               │
+│  2026-09-04   3.7M    374k       75.1M         1.4M      23.2k               │
+│  2026-09-05   3.7M    374k       75.1M         1.4M      23.2k               │
+│  2026-09-06   3.7M    374k       75.1M         1.4M      23.2k               │
+│  2026-09-07  11.0M    722k      198.5M         3.3M        82k  ◐            │
+│  ────────────────────────────────────────────────────────────────            │
+│  total       31.4M    2.9M      612.0M        11.2M       210k               │
+│                                                                              │
+│  ◐ partial: day still in progress                                            │
+│  1085 events · 8 files read · 0 quarantined · generation 148                 │
+└──────────────────────────────────────────────────────────────────────────────┘
 ```
 
 The box uses the terminal width from the style layer, with an 80-column

@@ -5439,9 +5439,14 @@ mod tests {
     #[test]
     fn spend_command_docs_show_the_box_example() {
         let docs = include_str!("../../docs/commands.md");
+        let golden = include_str!("../../tests/fixtures/presentation/spend_box_single.txt");
         assert!(docs.contains("Text output is a bordered table."));
-        assert!(docs.contains("┌─ spend · 2026-09-01 → 2026-09-07 · 7 days UTC · by day"));
-        assert!(docs.contains("1085 events · 8 files read · 0 quarantined · generation 148"));
+        // The documented box is the single golden verbatim, so the example cannot
+        // drift from what the renderer prints.
+        assert!(
+            docs.contains(&format!("```text\n{golden}")),
+            "docs/commands.md must show the single spend golden verbatim"
+        );
     }
 
     #[test]
