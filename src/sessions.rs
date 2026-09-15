@@ -15,7 +15,8 @@ pub mod timeline;
 
 pub use resolver::{
     ProjectKey, RepositoryKey, UNKNOWN_PROJECT, UNKNOWN_REPOSITORY, first_working_directories,
-    resolve_project, resolve_repository,
+    resolve_project, resolve_project_with_layout, resolve_repository,
+    resolve_repository_with_layout,
 };
 pub use timeline::{
     SessionTimeline, build_timelines, count_events_by_project, derive_session_bounds,
