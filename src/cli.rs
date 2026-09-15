@@ -3792,6 +3792,15 @@ fn config_boxed_render_with_width(
                         width,
                     ));
                 }
+                if let Some(plan_tier) = by_key("plan_tier") {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(style.dim(), &format!("plan_tier {}", plan_tier.value))
+                        ),
+                        width,
+                    ));
+                }
             }
         } else if section == "transcripts" {
             let mut indexes: Vec<usize> = fields
@@ -10434,12 +10443,15 @@ destination = "/tmp/aub-golden/backups"
 name = "work-primary"
 provider = "provider-a"
 credential = { kind = "file", path = "/tmp/aub-golden/creds-primary.json" }
+opencode_workspace = "wrk_golden"
+plan_tier = "max-20x"
 
 [[accounts]]
 name = "work-secondary"
-provider = "provider-b"
+provider = "codex"
 credential = { kind = "env", name = "AUB_GOLDEN_TOKEN" }
 exclusivity_policy = "permit_passive"
+codex_home = "/tmp/aub-golden/codex-home"
 
 [[transcripts]]
 name = "cli-a"
@@ -10586,9 +10598,46 @@ usage_evidence = "measured"
         );
     }
 
+    /// Array line shapes for plan_tier (aub-y5hj): an account with a configured
+    /// plan_tier renders a dim sub-row with the tier value, while an account
+    /// without plan_tier renders no plan_tier line.
+    #[test]
+    fn config_boxed_account_plan_tier_rendered_only_when_set() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let primary: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("plan_tier"))
+            .collect();
+        assert_eq!(
+            primary.len(),
+            1,
+            "exactly one plan_tier row is rendered: {primary:?}"
+        );
+        assert!(
+            primary[0].contains("plan_tier max-20x"),
+            "the plan_tier row names key and value: {:?}",
+            primary[0]
+        );
+        assert!(
+            primary[0].starts_with("│      plan_tier"),
+            "the plan_tier row is indented like other sub-rows: {:?}",
+            primary[0]
+        );
+    }
+
     /// Every resolver key appears exactly once without its section prefix
     /// (aub-34ik): the test walks `Provenance::entries()` and finds each
     /// key's last segment in the boxed output, while no dotted key survives.
+    /// Extended in aub-y5hj to verify that every per-account and per-transcript
+    /// provenance row key outside table columns is rendered in the boxed view.
     #[test]
     fn config_boxed_every_resolver_key_appears_once_without_prefix() {
         let (config, provenance, _, file_path) = config_boxed_fixture();
@@ -10610,6 +10659,27 @@ usage_evidence = "measured"
             assert!(
                 text.contains(last),
                 "the boxed output must contain the last segment {last:?} of {key:?}"
+            );
+        }
+        let rows = config.provenance_rows(&provenance);
+        assert!(
+            rows.iter().any(|r| r.key.ends_with(".plan_tier"))
+                && rows.iter().any(|r| r.key.ends_with(".codex_home"))
+                && rows.iter().any(|r| r.key.ends_with(".opencode_workspace")),
+            "CONFIG_BOXED_GOLDEN_TOML must set plan_tier, codex_home, and opencode_workspace on at least one account each"
+        );
+        for row in &rows {
+            let last = row.key.rsplit('.').next().unwrap_or(row.key.as_str());
+            if matches!(last, "name" | "provider" | "credential" | "format" | "root") {
+                continue;
+            }
+            if last == "exclusivity_policy" && row.value == "forbid_passive" {
+                continue;
+            }
+            assert!(
+                text.contains(last),
+                "the boxed output must contain the last segment {last:?} of {key:?}",
+                key = row.key
             );
         }
         for (key, _) in &entries {
