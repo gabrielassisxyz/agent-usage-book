@@ -1,21 +1,22 @@
 //! Session timeline building and the rebuild path (`aub-lqe.12`, PLAN.md 12.8,
-//! 19.1, 19.3).
+//! 19.1, 19.3, `aub-p07j`).
 //!
 //! The session is the join that makes everything else possible, so it is normalized
 //! immediately and namespaced by its source. Timelines are derived from usage-event
 //! timestamps where the source does not state them, with the derivation documented
 //! on [`derive_session_bounds`]; sessions are rebuildable from usage events, and
 //! [`rebuild_sessions`] is that path, resolving project and repository through the
-//! configured aliases so the stored rows carry logical identities, never machine
-//! paths.
+//! configured aliases and layout roots so the stored rows carry logical identities,
+//! never machine paths.
 
 use std::collections::{BTreeMap, HashMap};
 
 use crate::config::AliasTable;
+use crate::config::layout::LayoutRoots;
 use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
-use crate::sessions::resolver::{resolve_project, resolve_repository};
+use crate::sessions::resolver::{resolve_project_with_layout, resolve_repository_with_layout};
 use crate::store::session::{NewSession, replace_all_sessions};
 
 /// A normalized session timeline: the namespaced session and its derived bounds.
@@ -72,22 +73,28 @@ pub fn build_timelines(events: &[(SessionId, UtcTimestamp)]) -> Vec<SessionTimel
 /// Counts events per resolved project: the resolution-level guarantee a report
 /// grouped by project depends on. Every event lands in exactly one bucket, and the
 /// unknown bucket is visible when a working directory is unmapped or absent.
+/// Project resolution falls back to the repository identity, so the repository
+/// table and the layout roots travel in as well.
 pub fn count_events_by_project(
     events: &[(SessionId, UtcTimestamp)],
     working_dirs: &HashMap<SessionId, Option<String>>,
     project_aliases: &AliasTable,
+    repository_aliases: &AliasTable,
+    layout: &LayoutRoots,
 ) -> BTreeMap<crate::sessions::resolver::ProjectKey, usize> {
     let mut counts: BTreeMap<crate::sessions::resolver::ProjectKey, usize> = BTreeMap::new();
     for (session, _) in events {
         let working_dir = working_dirs.get(session).and_then(|dir| dir.as_deref());
-        let key = resolve_project(project_aliases, working_dir);
+        let key =
+            resolve_project_with_layout(project_aliases, repository_aliases, layout, working_dir);
         *counts.entry(key).or_insert(0) += 1;
     }
     counts
 }
 
 /// The rebuild path: replaces every stored session with rows derived from the given
-/// events, resolving project and repository through the configured aliases.
+/// events, resolving project and repository through the configured aliases and
+/// layout roots.
 ///
 /// The stored row keeps the directory the map states for the session, so the
 /// evidence the keys were resolved from survives the rebuild. Run identifiers
@@ -100,6 +107,7 @@ pub fn rebuild_sessions(
     working_dirs: &HashMap<SessionId, Option<String>>,
     project_aliases: &AliasTable,
     repository_aliases: &AliasTable,
+    layout: &LayoutRoots,
 ) -> Result<usize, Error> {
     let timelines = build_timelines(events);
     let sessions: Vec<NewSession> = timelines
@@ -115,8 +123,17 @@ pub fn rebuild_sessions(
                 native_session_id: NativeSessionId::new(timeline.session.native().as_str()),
                 start: timeline.start,
                 end: timeline.end,
-                project_key: resolve_project(project_aliases, working_dir.as_deref()),
-                repository_key: resolve_repository(repository_aliases, working_dir.as_deref()),
+                project_key: resolve_project_with_layout(
+                    project_aliases,
+                    repository_aliases,
+                    layout,
+                    working_dir.as_deref(),
+                ),
+                repository_key: resolve_repository_with_layout(
+                    repository_aliases,
+                    layout,
+                    working_dir.as_deref(),
+                ),
                 working_directory: working_dir,
                 run_id: None,
             }
@@ -220,7 +237,15 @@ mod tests {
         let dirs = HashMap::new();
         let projects = aliases(&[]);
         let repositories = aliases(&[]);
-        rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
+        rebuild_sessions(
+            &mut conn,
+            &events,
+            &dirs,
+            &projects,
+            &repositories,
+            &LayoutRoots::default(),
+        )
+        .unwrap();
 
         let stored = load_all_sessions(&conn).unwrap();
         assert_eq!(stored.len(), 2);
@@ -247,7 +272,15 @@ mod tests {
         ]);
         let projects = aliases(&[("/home/u/work/aub", "agent-usage-book")]);
         let repositories = aliases(&[("/home/u/work/aub", "agent-usage-book")]);
-        rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
+        rebuild_sessions(
+            &mut conn,
+            &events,
+            &dirs,
+            &projects,
+            &repositories,
+            &LayoutRoots::default(),
+        )
+        .unwrap();
 
         let stored = load_all_sessions(&conn).unwrap();
         for row in &stored {
@@ -291,8 +324,15 @@ mod tests {
             (unmapped.clone(), None),
         ]);
         let projects = aliases(&[("/home/u/work/aub", "agent-usage-book")]);
+        let repositories = aliases(&[]);
 
-        let counts = count_events_by_project(&events, &dirs, &projects);
+        let counts = count_events_by_project(
+            &events,
+            &dirs,
+            &projects,
+            &repositories,
+            &LayoutRoots::default(),
+        );
         let total: usize = counts.values().sum();
         assert_eq!(total, events.len(), "every event must land in a bucket");
         assert_eq!(
@@ -321,12 +361,28 @@ mod tests {
         let projects = aliases(&[("/w", "proj")]);
         let repositories = aliases(&[("/w", "repo")]);
 
-        rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
+        rebuild_sessions(
+            &mut conn,
+            &events,
+            &dirs,
+            &projects,
+            &repositories,
+            &LayoutRoots::default(),
+        )
+        .unwrap();
         let first = load_all_sessions(&conn).unwrap();
 
         // Delete and rebuild from the same events: identical rows come back.
         crate::store::session::clear_all_sessions(&conn).unwrap();
-        rebuild_sessions(&mut conn, &events, &dirs, &projects, &repositories).unwrap();
+        rebuild_sessions(
+            &mut conn,
+            &events,
+            &dirs,
+            &projects,
+            &repositories,
+            &LayoutRoots::default(),
+        )
+        .unwrap();
         let second = load_all_sessions(&conn).unwrap();
 
         assert_eq!(first, second);

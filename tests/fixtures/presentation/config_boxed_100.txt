@@ -2,8 +2,11 @@
 │                                                                                                  │
 │  accounts                                                                                        │
 │    work-primary    provider-a  file:/tmp/aub-golden/creds-primary.json                     file  │
-│    work-secondary  provider-b  env:AUB_GOLDEN_TOKEN                                        file  │
+│      opencode_workspace wrk_golden                                                               │
+│      plan_tier max-20x                                                                           │
+│    work-secondary  codex       env:AUB_GOLDEN_TOKEN                                        file  │
 │      exclusivity_policy permit_passive                                                           │
+│      codex_home /tmp/aub-golden/codex-home                                                       │
 │                                                                                                  │
 │  adapter_semantics                                                                               │
 │    max_comparison_age       30d                                                         default  │
@@ -60,7 +63,7 @@
 │    auth_backoff_cap         6h                                                          default  │
 │    auth_backoff_threshold   3                                                           default  │
 │    busy_timeout             10s                                                         default  │
-│    command_budget           8s                                                          default  │
+│    command_budget           30s                                                         default  │
 │    default_interval         5m                                                          default  │
 │    max_concurrent_requests  2                                                           default  │
 │    request_timeout          5s                                                          default  │

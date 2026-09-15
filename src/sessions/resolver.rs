@@ -1,4 +1,4 @@
-//! Project and repository resolution (`aub-lqe.12`, PLAN.md 19.3).
+//! Project and repository resolution (`aub-lqe.12`, PLAN.md 19.3, `aub-p07j`).
 //!
 //! Project and repository are typed logical identities, resolved through configured
 //! aliases rather than embedded machine paths. Where a source provides a working
@@ -9,8 +9,19 @@
 //! The unknown buckets are ordinary keys, not `Option`: a report grouped by project
 //! shows `unknown-project` as a visible group, which is what makes an unmapped
 //! session distinguishable from a missing one.
+//!
+//! With `[layout]` configured (`aub-p07j`), resolution gains the checkout roots
+//! below the explicit aliases. Precedence is: an explicit alias with an exact
+//! key wins; then the `worktrees` root; then the `repositories` root; then
+//! unknown. The worktree root is checked first because it sits inside the
+//! repositories root on this machine. Under a root the identity is the first
+//! path segment after it, a repository named in `ignore` resolves to unknown,
+//! and a dot-named segment is refused at resolution (reported once per ingest
+//! in the summary). A project is its repository unless an explicit `[projects]`
+//! entry, matched exactly, says otherwise.
 
 use crate::config::AliasTable;
+use crate::config::layout::{LayoutRoots, layout_repository_name, valid_layout_repository_name};
 
 /// The logical project identity a report groups by.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -60,6 +71,64 @@ pub fn resolve_repository(aliases: &AliasTable, working_dir: Option<&str>) -> Re
     match working_dir.and_then(|dir| aliases.resolve(dir)) {
         Some(name) => RepositoryKey::new(name),
         None => RepositoryKey::new(UNKNOWN_REPOSITORY),
+    }
+}
+
+/// Resolves a working directory to its repository identity through an explicit
+/// alias table plus the configured layout roots (`aub-p07j`): an explicit
+/// alias with an exact key wins; then the `worktrees` root; then the
+/// `repositories` root; then unknown. A layout-derived name in `ignore`, or a
+/// dot-named segment from a misconfigured root, resolves to unknown rather
+/// than to a guessed or dot-named repository.
+pub fn resolve_repository_with_layout(
+    aliases: &AliasTable,
+    layout: &LayoutRoots,
+    working_dir: Option<&str>,
+) -> RepositoryKey {
+    let dir = match working_dir {
+        Some(dir) if !dir.is_empty() => dir,
+        _ => return RepositoryKey::new(UNKNOWN_REPOSITORY),
+    };
+    if let Some(name) = aliases.resolve(dir) {
+        return RepositoryKey::new(name);
+    }
+    match layout_repository_name(layout, dir) {
+        Some(name) if layout.is_ignored(&name) => RepositoryKey::new(UNKNOWN_REPOSITORY),
+        Some(name) if valid_layout_repository_name(&name) => RepositoryKey::new(name),
+        _ => RepositoryKey::new(UNKNOWN_REPOSITORY),
+    }
+}
+
+/// Resolves a working directory to its project identity through an explicit
+/// project table, an explicit repository table and the layout roots
+/// (`aub-p07j`): an explicit `[projects]` entry with an exact key wins,
+/// otherwise, when a layout root is set, the project is its repository as
+/// resolved above, which is how a project spanning repositories is expressed.
+/// With neither root set, an unmatched `[projects]` lookup stays unknown, as
+/// it was before the layout existed.
+pub fn resolve_project_with_layout(
+    projects: &AliasTable,
+    repositories: &AliasTable,
+    layout: &LayoutRoots,
+    working_dir: Option<&str>,
+) -> ProjectKey {
+    let dir = match working_dir {
+        Some(dir) if !dir.is_empty() => dir,
+        _ => return ProjectKey::new(UNKNOWN_PROJECT),
+    };
+    if let Some(name) = projects.resolve(dir) {
+        return ProjectKey::new(name);
+    }
+    // Rule 6: with neither root set, the project resolves exactly as before,
+    // through `[projects]` alone, never through a `[repositories]` alias.
+    if !layout.has_root() {
+        return ProjectKey::new(UNKNOWN_PROJECT);
+    }
+    let repository = resolve_repository_with_layout(repositories, layout, Some(dir));
+    if repository.as_str() == UNKNOWN_REPOSITORY {
+        ProjectKey::new(UNKNOWN_PROJECT)
+    } else {
+        ProjectKey::new(repository.as_str())
     }
 }
 
@@ -174,6 +243,265 @@ mod tests {
         keys.insert(ProjectKey::new(UNKNOWN_PROJECT), 1usize);
         keys.insert(ProjectKey::new("agent-usage-book"), 2usize);
         assert_eq!(keys.len(), 2);
+    }
+
+    /// The `aub-p07j` acceptance table, row by row: with
+    /// `repositories = "/r"`, `worktrees = "/r/.worktrees"`,
+    /// `ignore = ["scratch"]` and `[repositories] "/elsewhere/x" =
+    /// "x-explicit"`, every listed working directory resolves to its listed
+    /// repository and project.
+    mod layout_acceptance {
+        use super::*;
+        use crate::config::layout::LayoutRoots;
+        use std::path::PathBuf;
+
+        fn tables() -> (AliasTable, AliasTable, LayoutRoots) {
+            let projects = AliasTable::new(BTreeMap::new()).unwrap();
+            let repositories = AliasTable::new(BTreeMap::from([(
+                "/elsewhere/x".to_string(),
+                "x-explicit".to_string(),
+            )]))
+            .unwrap();
+            let layout = LayoutRoots {
+                repositories: Some(PathBuf::from("/r")),
+                worktrees: Some(PathBuf::from("/r/.worktrees")),
+                ignore: vec!["scratch".to_string()],
+            };
+            (projects, repositories, layout)
+        }
+
+        fn check(dir: &str, repository: &str, project: &str) {
+            let (projects, repositories, layout) = tables();
+            assert_eq!(
+                resolve_repository_with_layout(&repositories, &layout, Some(dir)).as_str(),
+                repository,
+                "repository for {dir:?}"
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &layout, Some(dir)).as_str(),
+                project,
+                "project for {dir:?}"
+            );
+        }
+
+        #[test]
+        fn repositories_root_names_the_immediate_child() {
+            check("/r/aub", "aub", "aub");
+            check("/r/aub/src/meter", "aub", "aub");
+        }
+
+        #[test]
+        fn worktrees_root_names_the_repo_before_the_task() {
+            check("/r/.worktrees/aub/bugfix-x", "aub", "aub");
+            check("/r/.worktrees/aub/bugfix-x/src", "aub", "aub");
+        }
+
+        #[test]
+        fn roots_themselves_and_ignored_and_outside_dirs_are_unknown() {
+            check("/r/.worktrees", UNKNOWN_REPOSITORY, UNKNOWN_PROJECT);
+            check("/r", UNKNOWN_REPOSITORY, UNKNOWN_PROJECT);
+            check("/r/scratch/notes", UNKNOWN_REPOSITORY, UNKNOWN_PROJECT);
+            check("/tmp/build", UNKNOWN_REPOSITORY, UNKNOWN_PROJECT);
+        }
+
+        /// Rule 6: with no `[layout]` roots, a `[repositories]` alias does not
+        /// name the project; the project resolves through `[projects]` alone,
+        /// exactly as `resolve_project` did before the layout existed.
+        #[test]
+        fn without_a_layout_root_a_repository_alias_does_not_name_the_project() {
+            let projects = AliasTable::new(BTreeMap::new()).unwrap();
+            let repositories =
+                AliasTable::new(BTreeMap::from([("/w".to_string(), "repo".to_string())])).unwrap();
+            let no_layout = LayoutRoots::default();
+            assert_eq!(
+                resolve_repository_with_layout(&repositories, &no_layout, Some("/w")).as_str(),
+                "repo"
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &no_layout, Some("/w"))
+                    .as_str(),
+                UNKNOWN_PROJECT
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &no_layout, Some("/w"))
+                    .as_str(),
+                resolve_project(&projects, Some("/w")).as_str(),
+                "matches the pre-layout resolver"
+            );
+        }
+
+        /// A working directory equal to a configured root resolves to unknown
+        /// and raises no misconfiguration warning: the worktrees root does not
+        /// fall through to the repositories root as `.worktrees`.
+        #[test]
+        fn a_configured_root_itself_is_unknown_without_a_warning() {
+            let (_, _, layout) = tables();
+            for dir in ["/r", "/r/.worktrees"] {
+                check(dir, UNKNOWN_REPOSITORY, UNKNOWN_PROJECT);
+                assert_eq!(
+                    crate::config::layout::layout_rejected_repository_name(&layout, dir),
+                    None,
+                    "no layout_rejected entry for the root {dir:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn an_explicit_alias_wins_over_the_roots() {
+            check("/elsewhere/x", "x-explicit", "x-explicit");
+        }
+
+        #[test]
+        fn absent_working_directory_is_unknown_under_layout_too() {
+            let (projects, repositories, layout) = tables();
+            assert_eq!(
+                resolve_repository_with_layout(&repositories, &layout, None).as_str(),
+                UNKNOWN_REPOSITORY
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &layout, None).as_str(),
+                UNKNOWN_PROJECT
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &layout, Some("")).as_str(),
+                UNKNOWN_PROJECT
+            );
+        }
+
+        /// With `[projects] "/r/aub" = "usage"` added, `/r/aub` resolves to
+        /// repository `aub` and project `usage`, while `/r/aub/src` resolves
+        /// to project `aub`: the project alias is an exact key, never a
+        /// prefix.
+        #[test]
+        fn an_explicit_project_overrides_the_repository_default_exactly() {
+            let (_, repositories, layout) = tables();
+            let projects = AliasTable::new(BTreeMap::from([(
+                "/r/aub".to_string(),
+                "usage".to_string(),
+            )]))
+            .unwrap();
+            assert_eq!(
+                resolve_repository_with_layout(&repositories, &layout, Some("/r/aub")).as_str(),
+                "aub"
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &layout, Some("/r/aub"))
+                    .as_str(),
+                "usage"
+            );
+            assert_eq!(
+                resolve_project_with_layout(&projects, &repositories, &layout, Some("/r/aub/src"))
+                    .as_str(),
+                "aub",
+                "a subdirectory does not inherit the exact project key"
+            );
+        }
+
+        /// Property: any path under `<worktrees>/<repo>/...` with a
+        /// non-empty, slash-free `repo` resolves to `repo`.
+        #[test]
+        fn any_worktree_path_resolves_to_its_repo_segment() {
+            let (projects, repositories, layout) = tables();
+            for repo in ["aub", "x", "repo-with-dashes", "UPPER", "0"] {
+                for suffix in ["", "/task", "/task/src/deep"] {
+                    let dir = format!("/r/.worktrees/{repo}{suffix}");
+                    assert_eq!(
+                        resolve_repository_with_layout(&repositories, &layout, Some(&dir)).as_str(),
+                        repo,
+                        "worktree path {dir:?}"
+                    );
+                    assert_eq!(
+                        resolve_project_with_layout(&projects, &repositories, &layout, Some(&dir))
+                            .as_str(),
+                        repo,
+                        "worktree project {dir:?}"
+                    );
+                }
+            }
+        }
+
+        /// Property: any path under `<repositories>/<repo>/...` with a
+        /// non-empty, slash-free `repo` outside `ignore` resolves to `repo`.
+        #[test]
+        fn any_repository_path_resolves_to_its_first_segment() {
+            let (projects, repositories, layout) = tables();
+            for repo in ["aub", "other"] {
+                for suffix in ["", "/src", "/src/meter"] {
+                    let dir = format!("/r/{repo}{suffix}");
+                    assert_eq!(
+                        resolve_repository_with_layout(&repositories, &layout, Some(&dir)).as_str(),
+                        repo,
+                        "repository path {dir:?}"
+                    );
+                    assert_eq!(
+                        resolve_project_with_layout(&projects, &repositories, &layout, Some(&dir))
+                            .as_str(),
+                        repo,
+                        "repository project {dir:?}"
+                    );
+                }
+            }
+        }
+
+        /// Property: any path not under either root and not an explicit key
+        /// resolves to unknown.
+        #[test]
+        fn paths_outside_both_roots_are_unknown() {
+            let (projects, repositories, layout) = tables();
+            for dir in [
+                "/tmp/build",
+                "/home/u/work/aub",
+                "/r2/aub",
+                "/r-suffix/aub",
+                "/",
+            ] {
+                assert_eq!(
+                    resolve_repository_with_layout(&repositories, &layout, Some(dir)).as_str(),
+                    UNKNOWN_REPOSITORY,
+                    "outside path {dir:?}"
+                );
+                assert_eq!(
+                    resolve_project_with_layout(&projects, &repositories, &layout, Some(dir))
+                        .as_str(),
+                    UNKNOWN_PROJECT,
+                    "outside project {dir:?}"
+                );
+            }
+        }
+
+        /// A dot-named segment from a misconfigured root is refused at
+        /// resolution: with no worktrees root, the worktrees directory itself
+        /// appears as `.worktrees` and must land in unknown, never as a
+        /// dot-named repository.
+        #[test]
+        fn dot_named_segments_are_refused_at_resolution() {
+            let projects = AliasTable::new(BTreeMap::new()).unwrap();
+            let repositories = AliasTable::new(BTreeMap::new()).unwrap();
+            let repos_only = LayoutRoots {
+                repositories: Some(PathBuf::from("/r")),
+                worktrees: None,
+                ignore: Vec::new(),
+            };
+            assert_eq!(
+                resolve_repository_with_layout(
+                    &repositories,
+                    &repos_only,
+                    Some("/r/.worktrees/aub/x")
+                )
+                .as_str(),
+                UNKNOWN_REPOSITORY
+            );
+            assert_eq!(
+                resolve_project_with_layout(
+                    &projects,
+                    &repositories,
+                    &repos_only,
+                    Some("/r/.worktrees/aub/x")
+                )
+                .as_str(),
+                UNKNOWN_PROJECT
+            );
+        }
     }
 
     fn observed(pairs: &[((&str, &str), Option<&str>)]) -> Vec<((String, String), Option<String>)> {

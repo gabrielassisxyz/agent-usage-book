@@ -261,7 +261,8 @@ pub struct ReresolveOutcome {
 }
 
 /// Re-resolves every stored session's project and repository keys from its
-/// stored working directory through the current alias tables (`aub-4ow0`).
+/// stored working directory through the current alias tables and layout roots
+/// (`aub-4ow0`, `aub-p07j`).
 ///
 /// Only the derived keys move: bounds, run ids, the stored directories and
 /// every evidence table stay untouched, so the pass is idempotent and a wrong
@@ -277,6 +278,7 @@ pub fn reresolve_keys(
     conn: &mut Connection,
     projects: &crate::config::AliasTable,
     repositories: &crate::config::AliasTable,
+    layout: &crate::config::layout::LayoutRoots,
 ) -> Result<ReresolveOutcome, Error> {
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
@@ -298,9 +300,17 @@ pub fn reresolve_keys(
         .map_err(|e| Error::Store(format!("cannot read a session row: {e}")))?
     };
     for (id, working_directory) in &rows {
-        let project = crate::sessions::resolve_project(projects, working_directory.as_deref());
-        let repository =
-            crate::sessions::resolve_repository(repositories, working_directory.as_deref());
+        let project = crate::sessions::resolve_project_with_layout(
+            projects,
+            repositories,
+            layout,
+            working_directory.as_deref(),
+        );
+        let repository = crate::sessions::resolve_repository_with_layout(
+            repositories,
+            layout,
+            working_directory.as_deref(),
+        );
         tx.execute(
             "UPDATE session SET project_key = ?1, repository_key = ?2 WHERE id = ?3",
             params![project.as_str(), repository.as_str(), id],

@@ -874,7 +874,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME [--plan-tier TIER] --window KEY --cost-model ID [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
+                "begin --account NAME [--plan-tier TIER] --window KEY [--cost-model ID] [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status => Some("--refresh"),
@@ -3790,6 +3790,15 @@ fn config_boxed_render_with_width(
                                     config_boxed_tilde_value(&codex_home.value, home)
                                 )
                             )
+                        ),
+                        width,
+                    ));
+                }
+                if let Some(plan_tier) = by_key("plan_tier") {
+                    lines.push(boxed_body(
+                        &format!(
+                            "    {}",
+                            style.paint(style.dim(), &format!("plan_tier {}", plan_tier.value))
                         ),
                         width,
                     ));
@@ -7153,7 +7162,7 @@ fn calibrate_take_value(
 struct CalibrateBeginArgs {
     plan_tier: Option<String>,
     window: String,
-    cost_model: String,
+    cost_model: Option<String>,
     expect_kinds: Option<String>,
     experiment: Option<String>,
     assert_exclusive: bool,
@@ -7161,11 +7170,11 @@ struct CalibrateBeginArgs {
 
 fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
     let usage = "calibrate begin requires --account NAME --window KEY \
-                 --cost-model ID [--plan-tier TIER] [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
+                 [--cost-model ID] [--plan-tier TIER] [--expect-kinds K,...] [--experiment ID] --assert-exclusive";
     let mut args = CalibrateBeginArgs {
         plan_tier: None,
         window: String::new(),
-        cost_model: String::new(),
+        cost_model: None,
         expect_kinds: None,
         experiment: None,
         assert_exclusive: false,
@@ -7183,9 +7192,9 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
         } else if let Some(value) = arg.strip_prefix("--window=") {
             args.window = value.to_string();
         } else if arg == "--cost-model" {
-            args.cost_model = calibrate_next_arg(&mut rest, "--cost-model")?;
+            args.cost_model = Some(calibrate_next_arg(&mut rest, "--cost-model")?);
         } else if let Some(value) = arg.strip_prefix("--cost-model=") {
-            args.cost_model = value.to_string();
+            args.cost_model = Some(value.to_string());
         } else if arg == "--expect-kinds" {
             args.expect_kinds = Some(calibrate_next_arg(&mut rest, "--expect-kinds")?);
         } else if let Some(value) = arg.strip_prefix("--expect-kinds=") {
@@ -7200,8 +7209,15 @@ fn calibrate_parse_begin(rest: &[String]) -> Result<CalibrateBeginArgs, Error> {
             )));
         }
     }
-    if args.window.trim().is_empty() || args.cost_model.trim().is_empty() {
+    if args.window.trim().is_empty() {
         return Err(Error::Usage(usage.into()));
+    }
+    if let Some(model) = args.cost_model.as_deref()
+        && model.trim().is_empty()
+    {
+        return Err(Error::Usage(
+            "--cost-model requires a non-empty value".into(),
+        ));
     }
     if let Some(tier) = args.plan_tier.as_mut() {
         let trimmed = tier.trim();
@@ -7344,12 +7360,15 @@ fn calibrate_begin_command(clock: &impl Clock, invocation: &Invocation) -> Resul
         clock,
     )?;
     println!(
-        "calibrate begin: experiment={} account={} plan_tier={} window={} cost_model={} baseline_observation={} started_at={}",
+        "calibrate begin: experiment={} account={} plan_tier={} window={} cost_model={} expect_kinds={} baseline_observation={} started_at={}",
         run.id.as_str(),
         run.account,
         run.plan_tier.as_str(),
         run.window_semantic_key.as_str(),
         run.cost_model_id.as_str(),
+        crate::store::calibration_controlled::encode_expected_token_kinds(
+            &run.expected_token_kinds
+        ),
         run.baseline_observation_id.value(),
         run.started_at.unix_nanos(),
     );
@@ -7373,9 +7392,9 @@ fn calibrate_begin_validated(
     clock: &impl Clock,
 ) -> Result<crate::store::calibration_controlled::ControlledExperimentRun, Error> {
     use crate::store::calibration_controlled::{
-        ControlledExperimentId, ControlledExperimentRun, default_expected_token_kinds,
-        insert_begin, load_by_experiment_id, missing_expected_terms, parse_expected_token_kinds,
-        running_for_account,
+        CONTROLLED_RUN_NO_COST_MODEL_ID, ControlledExperimentId, ControlledExperimentRun,
+        default_expected_token_kinds, insert_begin, load_by_experiment_id, missing_expected_terms,
+        parse_expected_token_kinds, running_for_account,
     };
     let plan_tier = resolve_calibrate_begin_plan_tier(
         account,
@@ -7389,31 +7408,65 @@ fn calibrate_begin_validated(
         .map(ControlledExperimentId::new)
         .unwrap_or_else(|| ControlledExperimentId::new(format!("cal-{}", started_at.unix_nanos())));
 
-    let cost_model_id = crate::domain::provenance::CostModelId::new(args.cost_model.clone());
-    let model =
-        crate::store::cost_model::load_by_semantic_id(conn, &cost_model_id)?.ok_or_else(|| {
-            Error::Usage(format!(
-                "unknown cost model '{}': calibrate begin --cost-model names a stored cost model",
-                args.cost_model
-            ))
-        })?;
     let expected = match args.expect_kinds.as_deref() {
         Some(kinds) => parse_expected_token_kinds(kinds)?,
         None => default_expected_token_kinds(),
     };
-    let missing = missing_expected_terms(&model, &expected);
-    if !missing.is_empty() {
-        let names = missing
-            .iter()
-            .copied()
-            .map(crate::domain::tokens::TokenKind::label)
-            .collect::<Vec<_>>()
-            .join(",");
-        return Err(Error::Usage(format!(
-            "cost model '{}' carries no term for expected token kind(s) {}; fit the cost model first",
-            args.cost_model, names
-        )));
-    }
+    // The requirement follows the fit the premise selects (aub-ks5n): a
+    // premise naming two or more kinds fits jointly straight from the
+    // recorded usage counts and never opens a cost model, so `--cost-model`
+    // is optional there and a named model keeps its id as given without the
+    // expected-terms check; a one-kind premise fits univariately through the
+    // rate book and still requires it.
+    let is_joint = crate::calibration::multivariate_fit::fit_path_for_premise(Some(&expected))
+        == crate::calibration::multivariate_fit::FitPath::Multivariate;
+    let cost_model_id = match (args.cost_model.as_deref(), is_joint) {
+        (Some(given), true) => {
+            let id = crate::domain::provenance::CostModelId::new(given);
+            crate::store::cost_model::load_by_semantic_id(conn, &id)?.ok_or_else(|| {
+                Error::Usage(format!(
+                    "unknown cost model '{given}': calibrate begin --cost-model names a stored cost model"
+                ))
+            })?;
+            id
+        }
+        (Some(given), false) => {
+            let id = crate::domain::provenance::CostModelId::new(given);
+            let model =
+                crate::store::cost_model::load_by_semantic_id(conn, &id)?.ok_or_else(|| {
+                    Error::Usage(format!(
+                        "unknown cost model '{given}': calibrate begin --cost-model names a stored cost model"
+                    ))
+                })?;
+            let missing = missing_expected_terms(&model, &expected);
+            if !missing.is_empty() {
+                let names = missing
+                    .iter()
+                    .copied()
+                    .map(crate::domain::tokens::TokenKind::label)
+                    .collect::<Vec<_>>()
+                    .join(",");
+                return Err(Error::Usage(format!(
+                    "cost model '{given}' carries no term for expected token kind(s) {names}; fit the cost model first"
+                )));
+            }
+            id
+        }
+        (None, true) => {
+            crate::domain::provenance::CostModelId::new(CONTROLLED_RUN_NO_COST_MODEL_ID)
+        }
+        (None, false) => {
+            let names = expected
+                .iter()
+                .copied()
+                .map(crate::domain::tokens::TokenKind::label)
+                .collect::<Vec<_>>()
+                .join(",");
+            return Err(Error::Usage(format!(
+                "calibrate begin --cost-model is required for a one-kind premise ({names}): the univariate fit prices usage through the rate book, so the run must name the cost model it prices against"
+            )));
+        }
+    };
 
     let account_id = crate::store::account::account_id_by_identity(conn, provider, account)?
         .ok_or_else(|| {
@@ -8857,7 +8910,7 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         &mut progress_sink,
     )?;
     println!(
-        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={} working_directory_changes={}",
+        "ingest transcripts: sources={} scanned={} parsed={} skipped={} unreadable={} quarantined={} generation={} batches={} working_directory_changes={}{}",
         report.sources.join(","),
         report.files_scanned,
         report.files_parsed,
@@ -8867,6 +8920,14 @@ fn ingest_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> 
         report.generation.value(),
         report.batches.len(),
         report.working_directory_changes,
+        if report.layout_rejected.is_empty() {
+            String::new()
+        } else {
+            // A misconfigured layout root made visible (`aub-p07j`): the
+            // distinct dot-named repositories the roots implied, reported once
+            // rather than once per session they touched.
+            format!(" layout_rejected={}", report.layout_rejected.join(","))
+        },
     );
     let outcome = &report.outcome;
     println!(
@@ -8942,10 +9003,10 @@ fn ingest_flags(rest: &[String]) -> Result<crate::ingest::IngestOptions, Error> 
 /// [`crate::store::retention::delete_rebuildable`] derives from the
 /// taxonomy rather than a list declared here. The `sessions` target is not a
 /// sweep: it re-resolves every stored session's project and repository keys
-/// from its stored working directory through the current alias tables
-/// (`aub-4ow0`), rewriting derived keys only and leaving every evidence table
-/// untouched, so a new alias applies to history and not only to sessions
-/// ingested after it.
+/// from its stored working directory through the current alias tables and
+/// `[layout]` roots (`aub-4ow0`, `aub-p07j`), rewriting derived keys only and
+/// leaving every evidence table untouched, so a new alias applies to history
+/// and not only to sessions ingested after it.
 fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let target_name = invocation.rest.first().cloned().ok_or_else(|| {
         Error::Usage(format!(
@@ -8996,7 +9057,7 @@ fn rebuild_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
 
 /// `aub rebuild sessions`: re-resolves every stored session's project and
 /// repository keys from its stored working directory through the current
-/// `[projects]` and `[repositories]` alias tables. Derived keys only move;
+/// `[projects]` and `[repositories]` alias tables and `[layout]` roots. Derived keys only move;
 /// bounds, run ids and every evidence table stay untouched, so the pass is
 /// idempotent and advances the ledger generation with the rewrite.
 fn rebuild_sessions_command(clock: &impl Clock) -> Result<(), Error> {
@@ -9010,8 +9071,12 @@ fn rebuild_sessions_command(clock: &impl Clock) -> Result<(), Error> {
         &file_path,
     )?;
     let mut conn = open_ledger(clock)?;
-    let outcome =
-        crate::store::session::reresolve_keys(&mut conn, &config.projects, &config.repositories)?;
+    let outcome = crate::store::session::reresolve_keys(
+        &mut conn,
+        &config.projects,
+        &config.repositories,
+        &config.layout,
+    )?;
     println!(
         "rebuild sessions: re-resolved {} sessions generation={}",
         outcome.sessions,
@@ -11075,12 +11140,15 @@ destination = "/tmp/aub-golden/backups"
 name = "work-primary"
 provider = "provider-a"
 credential = { kind = "file", path = "/tmp/aub-golden/creds-primary.json" }
+opencode_workspace = "wrk_golden"
+plan_tier = "max-20x"
 
 [[accounts]]
 name = "work-secondary"
-provider = "provider-b"
+provider = "codex"
 credential = { kind = "env", name = "AUB_GOLDEN_TOKEN" }
 exclusivity_policy = "permit_passive"
+codex_home = "/tmp/aub-golden/codex-home"
 
 [[transcripts]]
 name = "cli-a"
@@ -11227,9 +11295,46 @@ usage_evidence = "measured"
         );
     }
 
+    /// Array line shapes for plan_tier (aub-y5hj): an account with a configured
+    /// plan_tier renders a dim sub-row with the tier value, while an account
+    /// without plan_tier renders no plan_tier line.
+    #[test]
+    fn config_boxed_account_plan_tier_rendered_only_when_set() {
+        let (config, provenance, _, file_path) = config_boxed_fixture();
+        let home = "/home/synthetic-user";
+        let text = config_boxed_render(
+            &config,
+            &provenance,
+            &file_path,
+            home,
+            crate::presentation::Style::plain(),
+        );
+        let primary: Vec<&str> = text
+            .lines()
+            .filter(|line| line.contains("plan_tier"))
+            .collect();
+        assert_eq!(
+            primary.len(),
+            1,
+            "exactly one plan_tier row is rendered: {primary:?}"
+        );
+        assert!(
+            primary[0].contains("plan_tier max-20x"),
+            "the plan_tier row names key and value: {:?}",
+            primary[0]
+        );
+        assert!(
+            primary[0].starts_with("│      plan_tier"),
+            "the plan_tier row is indented like other sub-rows: {:?}",
+            primary[0]
+        );
+    }
+
     /// Every resolver key appears exactly once without its section prefix
     /// (aub-34ik): the test walks `Provenance::entries()` and finds each
     /// key's last segment in the boxed output, while no dotted key survives.
+    /// Extended in aub-y5hj to verify that every per-account and per-transcript
+    /// provenance row key outside table columns is rendered in the boxed view.
     #[test]
     fn config_boxed_every_resolver_key_appears_once_without_prefix() {
         let (config, provenance, _, file_path) = config_boxed_fixture();
@@ -11251,6 +11356,27 @@ usage_evidence = "measured"
             assert!(
                 text.contains(last),
                 "the boxed output must contain the last segment {last:?} of {key:?}"
+            );
+        }
+        let rows = config.provenance_rows(&provenance);
+        assert!(
+            rows.iter().any(|r| r.key.ends_with(".plan_tier"))
+                && rows.iter().any(|r| r.key.ends_with(".codex_home"))
+                && rows.iter().any(|r| r.key.ends_with(".opencode_workspace")),
+            "CONFIG_BOXED_GOLDEN_TOML must set plan_tier, codex_home, and opencode_workspace on at least one account each"
+        );
+        for row in &rows {
+            let last = row.key.rsplit('.').next().unwrap_or(row.key.as_str());
+            if matches!(last, "name" | "provider" | "credential" | "format" | "root") {
+                continue;
+            }
+            if last == "exclusivity_policy" && row.value == "forbid_passive" {
+                continue;
+            }
+            assert!(
+                text.contains(last),
+                "the boxed output must contain the last segment {last:?} of {key:?}",
+                key = row.key
             );
         }
         for (key, _) in &entries {
@@ -11946,7 +12072,7 @@ usage_evidence = "measured"
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
         assert_eq!(args.plan_tier.as_deref(), Some("pro-5h"));
         assert_eq!(args.window, "five_hour");
-        assert_eq!(args.cost_model, "cm-1");
+        assert_eq!(args.cost_model.as_deref(), Some("cm-1"));
         assert_eq!(args.experiment.as_deref(), Some("exp-1"));
         assert!(args.assert_exclusive);
     }
@@ -12115,12 +12241,22 @@ usage_evidence = "measured"
         calibrate_activate_cost_model(&mut conn, false);
         let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
         calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
-        let rest = calibrate_begin_rest(
+        let rest: Vec<String> = [
+            "--plan-tier",
             "pro-5h",
+            "--window",
             "five_hour",
+            "--cost-model",
             "anthropic-claude-messages-incomplete-v1",
+            "--expect-kinds",
+            "cache_write",
+            "--experiment",
             "exp-incomplete",
-        );
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
         let args = calibrate_parse_begin(&rest).expect("begin args must parse");
         let clock = FakeClock::new(at);
         match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
@@ -12130,6 +12266,179 @@ usage_evidence = "measured"
             ),
             other => panic!("expected Error::Usage, got {other:?}"),
         }
+    }
+
+    /// A joint premise needs no cost model: with no model in the ledger at
+    /// all, `begin` over two kinds records the run with the `none` sentinel.
+    #[test]
+    fn calibrate_begin_joint_two_kind_premise_records_without_a_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::domain::tokens::TokenKind;
+        let (_scratch, conn) = calibrate_fixture_db();
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--expect-kinds",
+            "input,output",
+            "--experiment",
+            "exp-joint-two",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse without the flag");
+        assert_eq!(args.cost_model, None);
+        let clock = FakeClock::new(at);
+        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
+            .expect("a joint begin with no cost model must work");
+        assert_eq!(
+            run.cost_model_id.as_str(),
+            crate::store::calibration_controlled::CONTROLLED_RUN_NO_COST_MODEL_ID
+        );
+        assert_eq!(
+            run.expected_token_kinds,
+            vec![TokenKind::Input, TokenKind::Output]
+        );
+    }
+
+    /// The same rule over all four kinds, and over the default premise when
+    /// `--expect-kinds` is omitted: both are joint fits, so both begin with
+    /// no cost model in the ledger.
+    #[test]
+    fn calibrate_begin_joint_four_kind_and_default_premises_record_without_a_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        use crate::domain::tokens::TokenKind;
+        for (label, kinds_flag, expected) in [
+            (
+                "exp-joint-four",
+                Some("input,output,cache_read,cache_write"),
+                vec![
+                    TokenKind::Input,
+                    TokenKind::Output,
+                    TokenKind::CacheRead,
+                    TokenKind::CacheWrite,
+                ],
+            ),
+            (
+                "exp-joint-default",
+                None,
+                vec![
+                    TokenKind::Input,
+                    TokenKind::Output,
+                    TokenKind::CacheRead,
+                    TokenKind::CacheWrite,
+                ],
+            ),
+        ] {
+            let (_scratch, conn) = calibrate_fixture_db();
+            let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+            calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+            let mut parts = vec![
+                "--plan-tier".to_string(),
+                "pro-5h".to_string(),
+                "--window".to_string(),
+                "five_hour".to_string(),
+            ];
+            if let Some(kinds) = kinds_flag {
+                parts.push("--expect-kinds".to_string());
+                parts.push(kinds.to_string());
+            }
+            parts.push("--experiment".to_string());
+            parts.push(label.to_string());
+            parts.push("--assert-exclusive".to_string());
+            let args =
+                calibrate_parse_begin(&parts).expect("begin args must parse without the flag");
+            let clock = FakeClock::new(at);
+            let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
+                .unwrap_or_else(|e| panic!("{label} must begin with no cost model: {e:?}"));
+            assert_eq!(
+                run.cost_model_id.as_str(),
+                crate::store::calibration_controlled::CONTROLLED_RUN_NO_COST_MODEL_ID,
+                "{label} must store the sentinel"
+            );
+            assert_eq!(run.expected_token_kinds, expected, "{label} premise");
+        }
+    }
+
+    /// A one-kind premise keeps the requirement: with no `--cost-model` the
+    /// command is refused naming the flag and saying why the univariate fit
+    /// needs it.
+    #[test]
+    fn calibrate_begin_one_kind_premise_refuses_without_a_cost_model() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, conn) = calibrate_fixture_db();
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--expect-kinds",
+            "output",
+            "--experiment",
+            "exp-single-no-model",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse without the flag");
+        let clock = FakeClock::new(at);
+        match calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock) {
+            Err(Error::Usage(message)) => {
+                assert!(
+                    message.contains("--cost-model"),
+                    "the refusal must name the flag: {message}"
+                );
+                assert!(
+                    message.contains("output"),
+                    "the refusal must name the expected kind: {message}"
+                );
+            }
+            other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    /// A joint premise skips the expected-terms check: a named model missing
+    /// a term for an expected kind is still refused for one kind but accepted
+    /// for two or more, with the id recorded as given.
+    #[test]
+    fn calibrate_begin_joint_premise_accepts_a_model_missing_an_expected_term() {
+        use crate::domain::time::{FakeClock, UtcTimestamp};
+        let (_scratch, mut conn) = calibrate_fixture_db();
+        calibrate_activate_cost_model(&mut conn, false);
+        let at = UtcTimestamp::from_unix_nanos(1_000_000_000);
+        calibrate_insert_meter_chain(&conn, "work-a", "five_hour", at, 100_000);
+        let rest: Vec<String> = [
+            "--plan-tier",
+            "pro-5h",
+            "--window",
+            "five_hour",
+            "--cost-model",
+            "anthropic-claude-messages-incomplete-v1",
+            "--expect-kinds",
+            "input,cache_write",
+            "--experiment",
+            "exp-joint-incomplete",
+            "--assert-exclusive",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        let args = calibrate_parse_begin(&rest).expect("begin args must parse");
+        let clock = FakeClock::new(at);
+        let run = calibrate_begin_validated(&conn, "anthropic", "work-a", &args, None, &clock)
+            .expect("a joint begin must accept the incomplete model as given");
+        assert_eq!(
+            run.cost_model_id.as_str(),
+            "anthropic-claude-messages-incomplete-v1"
+        );
     }
 
     #[test]
