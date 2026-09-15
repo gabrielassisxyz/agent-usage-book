@@ -2,8 +2,11 @@
 │                                                                              │
 │  accounts                                                                    │
 │    work-primary    provider-a  file:/tmp/aub-golden/creds-primary.js…  file  │
-│    work-secondary  provider-b  env:AUB_GOLDEN_TOKEN                    file  │
+│      opencode_workspace wrk_golden                                           │
+│      plan_tier max-20x                                                       │
+│    work-secondary  codex       env:AUB_GOLDEN_TOKEN                    file  │
 │      exclusivity_policy permit_passive                                       │
+│      codex_home /tmp/aub-golden/codex-home                                   │
 │                                                                              │
 │  adapter_semantics                                                           │
 │    max_comparison_age       30d                                     default  │
