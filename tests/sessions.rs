@@ -762,3 +762,60 @@ fn ingest_resolves_project_and_repository_from_layout_roots() {
         "the stored directory survives the re-resolve"
     );
 }
+
+/// A misconfigured root is reported once per ingest (`aub-p07j`, rule 5):
+/// with only `repositories` set, two sessions under the worktrees directory
+/// both imply the dot-named repository `.worktrees`; the report names it once
+/// and both sessions land in the unknown bucket instead of a dot-named one.
+#[test]
+fn ingest_reports_a_dot_named_layout_repository_once() {
+    let scratch = ScratchDir::new();
+    let corpus = scratch.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus dir must be creatable");
+    let transcript = [
+        ("s1", "m1", "/aub-p07j-root/.worktrees/aub/task-a"),
+        ("s2", "m2", "/aub-p07j-root/.worktrees/aub/task-b"),
+    ]
+    .iter()
+    .map(|(session, message, cwd)| {
+        format!(
+            "{{\"type\":\"assistant\",\"timestamp\":\"2026-08-25T10:00:00.000Z\",\
+             \"sessionId\":\"{session}\",\"cwd\":\"{cwd}\",\"message\":{{\"id\":\"{message}\",\
+             \"model\":\"claude-opus-4\",\"usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}}}\n"
+        )
+    })
+    .collect::<String>();
+    std::fs::write(corpus.join("session.jsonl"), transcript).expect("transcript must write");
+
+    let config_text = format!(
+        "[layout]\nrepositories = \"/aub-p07j-root\"\n\n\
+         [[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\n\
+         pattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n",
+        corpus.display()
+    );
+    let (config, _) = resolve_config(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&config_text),
+        "/virtual/aub.toml",
+    )
+    .expect("config with a repositories-only layout must resolve");
+    let (_ledger_scratch, mut conn) = fixture_conn();
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000_000));
+    let report = run_ingest(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("ingest with a misconfigured layout must still succeed");
+    assert_eq!(report.layout_rejected, vec![".worktrees".to_string()]);
+    let stored = load_all_sessions(&conn).unwrap();
+    assert_eq!(stored.len(), 2);
+    for row in &stored {
+        assert_eq!(row.repository_key().as_str(), UNKNOWN_REPOSITORY);
+        assert_eq!(row.project_key().as_str(), UNKNOWN_PROJECT);
+    }
+}
