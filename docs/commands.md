@@ -301,12 +301,12 @@ without the section prefix (the full box for a two-account config):
 `accounts` prints one line per account (`name  provider  credential  source`)
 with a second dim line only when the account's `exclusivity_policy` differs
 from the default, followed by dim sub-rows for any configured optional keys
-(`opencode_workspace`, `codex_home`, `plan_tier`); `transcripts` prints one line
-per source with the `pattern` (and any `usage_evidence`) on dim lines under it. The source column reads
-`default` in dim and `file`, `override` or `environment` in body text, so the
-keys the operator set stand out from the ones they did not. Values longer
-than the room to the source column end in `…`. A `--set key=value` override
-prints with source `override`.
+(`opencode_workspace`, `codex_home`, `plan_tier`); `transcripts` prints one
+line per source with the `pattern` (and any `usage_evidence`) on dim lines
+under it. The source column reads `default` in dim and `file`, `override` or
+`environment` in body text, so the keys the operator set stand out from the
+ones they did not. Values longer than the room to the source column end in
+`…`. A `--set key=value` override prints with source `override`.
 
 **Refuses:** to invent a value for a key nobody set. An unset key prints with
 source `default`, never a value that looks like it came from a file. It also
