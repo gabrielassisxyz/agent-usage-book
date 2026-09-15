@@ -86,6 +86,22 @@ check_tree() {
         return 1
     fi
 
+    # A migration file outside the NNNN_*.rs shape is invisible to
+    # newest_migration, so without this refusal it would leave the check green
+    # against the previous version.
+    local stray stray_path
+    for stray_path in "$migrations_dir"/*.rs; do
+        [ -f "$stray_path" ] || continue
+        stray="$(basename -- "$stray_path")"
+        case "$stray" in
+            mod.rs|[0-9][0-9][0-9][0-9]_*.rs) ;;
+            *)
+                echo "migration-schema-pin: FAIL: $MIGRATIONS_SUBDIR/$stray is not named NNNN_*.rs, so its schema version cannot be compared with the pin in $CASE_SUBPATH" >&2
+                return 1
+                ;;
+        esac
+    done
+
     newest="$(newest_migration "$migrations_dir")"
     if [ -z "$newest" ]; then
         echo "migration-schema-pin: FAIL: no NNNN_*.rs migration file under $MIGRATIONS_SUBDIR" >&2
@@ -238,6 +254,14 @@ run_self_tests() {
     }
     expect_red "$dir" "a deleted pin" "carries no .schema=NN generation=. assertion" || fail=1
 
+    # Red: a new migration named outside NNNN_*.rs, which the version scan
+    # cannot see and would otherwise judge against the previous version.
+    dir="$(build_scenario red-misnamed-migration)"
+    probe_name="$(printf '%05d_zz_probe_migration.rs' $(( newest_num + 1 )))"
+    printf '// probe\n' > "$dir/$MIGRATIONS_SUBDIR/$probe_name"
+    expect_red "$dir" "a migration named outside NNNN_*.rs" \
+        "$probe_name is not named NNNN_\*\.rs.*012-backup\.sh" || fail=1
+
     # The mutation proof: the same red tree, first under the intact rule (red),
     # then under a check whose line 2 is an exit 0 (green). The pair is what
     # makes the red above the rule's work and not an incidental defect, and it
@@ -273,17 +297,28 @@ run_self_tests() {
 # Argument mode judges one tree and stops there; the embedded self-tests run
 # against scratch trees only in the live path, after the gate's own comparison
 # has passed.
-if [ "$#" -gt 0 ]; then
-    check_tree "$1"
-    exit $?
-fi
+#
+# Wrapped in main because bash abandons the whole top-level command on an
+# arithmetic expansion error: with the dispatch at top level, an aborted
+# argument-mode run fell through into live mode, whose self-tests call this
+# script with a tree argument again and recursed without bound. Inside main the
+# abort lands on the exit below with a nonzero status.
+main() {
+    if [ "$#" -gt 0 ]; then
+        check_tree "$1"
+        return $?
+    fi
 
-fail=0
-check_tree "$repo_root" || fail=1
-if [ "$fail" -eq 0 ]; then
-    run_self_tests || fail=1
-fi
-if [ "$fail" -ne 0 ]; then
-    echo "==> migration-schema-pin FAILED" >&2
-fi
-exit "$fail"
+    local fail=0
+    check_tree "$repo_root" || fail=1
+    if [ "$fail" -eq 0 ]; then
+        run_self_tests || fail=1
+    fi
+    if [ "$fail" -ne 0 ]; then
+        echo "==> migration-schema-pin FAILED" >&2
+    fi
+    return "$fail"
+}
+
+main "$@"
+exit $?
