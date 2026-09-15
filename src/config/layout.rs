@@ -36,6 +36,21 @@ impl LayoutRoots {
         self.repositories.is_none() && self.worktrees.is_none() && self.ignore.is_empty()
     }
 
+    /// True when at least one of the two roots is set. With neither, the
+    /// resolver keeps today's exact-match aliases, ignore list or not.
+    pub fn has_root(&self) -> bool {
+        self.repositories.is_some() || self.worktrees.is_some()
+    }
+
+    /// True when `working_dir` is exactly one of the configured roots.
+    fn is_configured_root(&self, working_dir: &str) -> bool {
+        let dir = Path::new(working_dir);
+        [&self.repositories, &self.worktrees]
+            .into_iter()
+            .flatten()
+            .any(|root| root.as_path() == dir)
+    }
+
     /// True when `name` is deliberately sent to the unknown bucket.
     pub fn is_ignored(&self, name: &str) -> bool {
         self.ignore.iter().any(|ignored| ignored == name)
@@ -65,6 +80,13 @@ fn first_segment_after_root(root: &Path, working_dir: &str) -> Option<String> {
 /// because it sits inside the repositories root on this machine, and checking
 /// the repositories root first would name every worktree `.worktrees`.
 pub fn layout_repository_name(layout: &LayoutRoots, working_dir: &str) -> Option<String> {
+    // A directory equal to any configured root names no repository. Without
+    // this, the worktrees root itself falls through to the repositories root
+    // it sits inside and surfaces as `.worktrees`, a misconfiguration warning
+    // for a correctly configured layout.
+    if layout.is_configured_root(working_dir) {
+        return None;
+    }
     if let Some(worktrees) = &layout.worktrees
         && let Some(name) = first_segment_after_root(worktrees, working_dir)
     {
@@ -147,14 +169,14 @@ mod tests {
     #[test]
     fn a_directory_equal_to_a_root_itself_resolves_to_nothing() {
         assert_eq!(layout_repository_name(&layout(), "/r"), None);
-        // `/r/.worktrees` equals the worktrees root, so the worktrees check
-        // yields nothing and the path falls through to the repositories root,
-        // which sees the `.worktrees` segment: extraction reports it, and
-        // resolution refuses the dot-named segment (proved at the resolver
-        // level), rather than silently producing a dot-named repository.
+        // `/r/.worktrees` equals the worktrees root: it names nothing, and in
+        // particular does not fall through to the repositories root as a
+        // `.worktrees` repository, so a correct layout raises no warning.
+        assert_eq!(layout_repository_name(&layout(), "/r/.worktrees"), None);
+        assert_eq!(layout_repository_name(&layout(), "/r/.worktrees/"), None);
         assert_eq!(
-            layout_repository_name(&layout(), "/r/.worktrees"),
-            Some(".worktrees".to_string())
+            layout_rejected_repository_name(&layout(), "/r/.worktrees"),
+            None
         );
     }
 

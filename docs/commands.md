@@ -438,7 +438,9 @@ is how a project spanning repositories is expressed. A dot-named segment
 (such as `.worktrees` from a misconfigured root) is refused at resolution and
 reported once per ingest in the summary, so a misconfigured root is visible
 rather than silently producing dot-named repositories. Both roots are
-optional; with neither set, behaviour is exactly today's exact-match aliases.
+optional; with neither set, behaviour is exactly today's exact-match aliases:
+the project resolves through `[projects]` alone, and a `[repositories]` alias
+names only the repository.
 
 For scheduled runs, note that the sampler runs from `aub-sample.service`,
 which has no shell: a variable exported in an interactive profile does not
