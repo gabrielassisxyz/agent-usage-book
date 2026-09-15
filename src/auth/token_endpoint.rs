@@ -46,10 +46,10 @@ impl AntigravityTokenEndpoint {
                 ),
             );
         };
-        let Some(client_secret) = found.secrets.into_iter().nth(1) else {
+        let Some(client_secret) = found.secrets.into_iter().next() else {
             return Err(
                 crate::auth::antigravity_credentials::RefreshError::Configuration(
-                    "agy binary did not contain the expected second OAuth client secret".into(),
+                    "agy binary did not contain an OAuth client secret".into(),
                 ),
             );
         };
@@ -93,8 +93,12 @@ struct AgyClientMaterial {
 }
 
 impl AgyClientMaterial {
-    /// The refresh uses the first client id and the second secret, so nothing
-    /// after both have been seen can change its result.
+    /// The refresh uses the first `107`-prefixed client id and the first of the
+    /// two secrets the binary packs: probing the token endpoint on 2026-09-14
+    /// (aub-vl8t) showed Google accepts that pair and rejects the second secret
+    /// with `invalid_client`. Both secrets are still collected before the scan
+    /// is called complete, because the binary packs exactly two adjacent, and
+    /// seeing the second is what bounds how far the scan reads.
     fn complete(&self) -> bool {
         self.client_id.is_some() && self.secrets.len() >= 2
     }
@@ -451,5 +455,42 @@ mod antigravity_client_material_tests {
         )
         .expect("the scan must not read past complete material");
         assert!(found.complete());
+    }
+
+    /// The real binary's layout: two secrets packed adjacent at a lower offset
+    /// than two client ids, only one of which carries the `107` prefix. The
+    /// refresh must pick that id and the FIRST secret, the pair the token
+    /// endpoint accepted on 2026-09-14 (aub-vl8t). This fails against the
+    /// previous `secrets.into_iter().nth(1)` selection, which sent the second.
+    #[test]
+    fn client_material_selects_the_107_id_and_the_first_secret() {
+        use super::AntigravityTokenEndpoint;
+
+        // An `884...` id the extractor must ignore, then the `107` id, with the
+        // two secrets ahead of both as in the installed binary.
+        let ignored_id = "888777666555-fakeotherclientid00.apps.googleusercontent.com";
+        let (first, second) = (secret("A"), secret("B"));
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"leading padding");
+        bytes.extend_from_slice(first.as_bytes());
+        bytes.extend_from_slice(second.as_bytes());
+        bytes.extend_from_slice(b"gap between secrets and ids");
+        bytes.extend_from_slice(ignored_id.as_bytes());
+        bytes.push(b'\n');
+        bytes.extend_from_slice(PACKED_CLIENT_ID.as_bytes());
+        bytes.extend_from_slice(&[b' '; 64]);
+
+        let path =
+            std::env::temp_dir().join(format!("aub-agy-material-{}.bin", std::process::id()));
+        std::fs::write(&path, &bytes).unwrap();
+        let endpoint = AntigravityTokenEndpoint {
+            url: String::new(),
+            binary: path.clone(),
+        };
+        let (client_id, client_secret) = endpoint.client_material().expect("material extracts");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(client_id, PACKED_CLIENT_ID);
+        assert_eq!(client_secret, first);
     }
 }

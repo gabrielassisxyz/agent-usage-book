@@ -27,8 +27,8 @@ const NEW_ACCESS: &str = "new-agy-access-token-abc";
 /// (`src/auth/token_endpoint.rs`) can extract an OAuth client id and secret
 /// without touching a real installation: one run starting `107` and ending
 /// `.apps.googleusercontent.com`, and *two* runs starting `GOCSPX-` (the
-/// second one is the client secret the production code reads). Both secrets
-/// are `GOCSPX-` plus 28 characters, matching the bounded Google format the
+/// first one is the client secret the production code reads; aub-vl8t). Both
+/// secrets are `GOCSPX-` plus 28 characters, matching the bounded Google format the
 /// extractor requires. They are assembled at run time: the literal shape is
 /// what GitHub push protection matches as a Google OAuth client secret, and a
 /// synthetic one in the source is refused the same as a real one.
@@ -395,7 +395,7 @@ fn extracting_client_material_from_a_large_binary_does_not_hold_it_in_memory() {
     let refresh_body = String::from_utf8_lossy(&token.requests()[0].body).into_owned();
     assert!(
         refresh_body.contains("107222333444-fakeclientidabcXYZ.apps.googleusercontent.com")
-            && refresh_body.contains(&format!("GOCSPX-{}", "B".repeat(28))),
+            && refresh_body.contains(&format!("GOCSPX-{}", "A".repeat(28))),
         "the material behind the filler must still be extracted: {refresh_body}"
     );
     assert!(
