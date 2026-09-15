@@ -252,6 +252,19 @@ assert_stdout_contains() {
     fi
 }
 
+# assert_stdout_matches STEP ERE: some line of the step's stdout matches the
+# extended regular expression ERE. For column-aligned text, where a fixed
+# substring either pins the padding or shrinks to a fragment any number contains.
+assert_stdout_matches() {
+    local step="$1" pattern="$2"
+    if grep -qE -- "$pattern" "$(step_dir "$step")/stdout.bin"; then
+        record_assertion "assert_stdout_matches step $step" "matches:$pattern" "matches:$pattern" "pass"
+    else
+        record_assertion "assert_stdout_matches step $step" "matches:$pattern" "absent" "fail"
+        CASE_FAILED=1
+    fi
+}
+
 # assert_stderr_contains STEP TEXT: the step's stderr contains TEXT.
 assert_stderr_contains() {
     local step="$1" text="$2"

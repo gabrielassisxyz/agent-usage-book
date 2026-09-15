@@ -132,7 +132,7 @@ case_assertions() {
     # percentage-point total; the two known account children each convert.
     assert_exit 0 6
     assert_stdout_contains 6 "converted to window-equivalent percentage points for five_hour"
-    assert_stdout_contains 6 "1.5M"
+    assert_stdout_matches 6 "^│  total +1\\.5M "
     assert_stdout_contains 6 "day=2026-08-25 / account=work"
     assert_stdout_contains 6 "window equivalent [3.0000, 3.0000] percentage points"
     assert_stdout_contains 6 "day=2026-08-25 / account=research"

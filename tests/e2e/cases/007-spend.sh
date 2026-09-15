@@ -116,7 +116,7 @@ case_assertions() {
     # longer silently skipped, while the replay is still one canonical event.
     assert_stdout_contains 1 "┌─ spend · 2026-08-25"
     assert_stdout_contains 1 "· by day, session, project, repository"
-    assert_stdout_contains 1 "total"
+    assert_stdout_matches 1 "^│  total +4711 +2112 +27\\.2k +30\\.0k "
     assert_stdout_contains 1 "generation 1"
     assert_stdout_contains 1 "└"
 
@@ -139,15 +139,22 @@ case_assertions() {
     # with one visible row for every UTC day and a grand total.
     assert_exit 0 3
     assert_stdout_contains 3 "┌─ spend · 2026-08-25 → 2026-08-31 · 7 days UTC · by day"
-    assert_stdout_contains 3 "2026-08-25"
-    assert_stdout_contains 3 "2026-08-26"
-    assert_stdout_contains 3 "2026-08-27"
-    assert_stdout_contains 3 "2026-08-28"
-    assert_stdout_contains 3 "2026-08-29"
-    assert_stdout_contains 3 "2026-08-30"
-    assert_stdout_contains 3 "2026-08-31"
-    assert_stdout_contains 3 "total"
-    assert_stdout_contains 3 "└"
+    assert_stdout_matches 3 "^│  2026-08-25 +4701 +2092 +27\\.2k +30k "
+    assert_stdout_matches 3 "^│  2026-08-26 +10 +20 "
+    assert_stdout_matches 3 "^│  2026-08-27 +10 +1 "
+    assert_stdout_matches 3 "^│  2026-08-28 +10 +1 "
+    assert_stdout_matches 3 "^│  2026-08-29 +10 +1 "
+    assert_stdout_matches 3 "^│  2026-08-30 +10 +1 "
+    assert_stdout_matches 3 "^│  2026-08-31 +10 +1 "
+    assert_stdout_matches 3 "^│  total +4761 +2117 +27\\.2k +30\\.0k "
+    if [ "$(grep -cE '^│  2026-08-[0-9]{2} ' "$(step_dir 3)/stdout.bin")" != 7 ]; then
+        echo "step 3 must render exactly seven day rows" >&2
+        return 1
+    fi
+    if ! tail -n 1 "$(step_dir 3)/stdout.bin" | grep -qE '^└─+┘$'; then
+        echo "step 3 must end on the bottom rail of the box" >&2
+        return 1
+    fi
 
     # A window with no events is reported as such, never as a bare zero.
     assert_exit 0 4
@@ -158,13 +165,15 @@ case_assertions() {
     # footer names what the filter excluded (aub-satk).
     assert_exit 0 5
     assert_stdout_contains 5 "· by harness"
-    assert_stdout_contains 5 "codex"
+    assert_stdout_matches 5 "^│  codex +220 +11 "
     assert_stdout_contains 5 "excluded: 2 sessions, of which 0 unknown-harness"
-    if grep -qF "harness=claude-code" "$(step_dir 5)/stdout.bin"; then
+    # Rows carry the bare dimension value, so the guard matches the row cell,
+    # not the harness=... key the pre-box text printed.
+    if grep -qE "^│  claude-code |harness=claude-code" "$(step_dir 5)/stdout.bin"; then
         echo "step 5 must not show a filtered-out harness row" >&2
         return 1
     fi
-    if grep -qF "harness=pi" "$(step_dir 5)/stdout.bin"; then
+    if grep -qE "^│  pi |harness=pi" "$(step_dir 5)/stdout.bin"; then
         echo "step 5 must not show a filtered-out harness row" >&2
         return 1
     fi

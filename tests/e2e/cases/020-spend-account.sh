@@ -94,10 +94,8 @@ case_assertions() {
     # 12:00 message (input 400) is account-b.
     assert_exit 0 2
     assert_stdout_contains 2 "· by account"
-    assert_stdout_contains 2 "account-a"
-    assert_stdout_contains 2 "account-b"
-    assert_stdout_contains 2 "100"
-    assert_stdout_contains 2 "400"
+    assert_stdout_matches 2 "^│  account-a +100 +10 "
+    assert_stdout_matches 2 "^│  account-b +400 +40 "
 
     assert_exit 0 3
     assert_json_field 3 "grouping[0]" "account"
