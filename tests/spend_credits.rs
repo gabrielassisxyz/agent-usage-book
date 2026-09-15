@@ -150,7 +150,15 @@ fn credits_are_absent_unless_requested() {
         !text.contains("credits"),
         "unrequested credits leaked: {text}"
     );
-    assert!(text.contains("100k"));
+    assert_eq!(
+        spend_row_cells(&text, "2026-08-25"),
+        ["2026-08-25", "100k", "20k", "50k", "10k"],
+        "the token row must carry all four kinds and no credits cell: {text}"
+    );
+    assert!(
+        !text.contains('\u{25d0}'),
+        "a complete group carries no partial marker: {text}"
+    );
 
     let json = spend_json(&report, RunId::from_string("run-no-credits".to_string()));
     assert!(
@@ -190,7 +198,11 @@ fn every_modeled_token_kind_contributes_its_exact_term() {
     let text = render_spend_report(&report);
     assert!(text.contains(&format!("credits {COMPLETE_MODEL}")));
     assert!(text.contains("0.65 credits (complete)"), "{text}");
-    assert!(text.contains("100k"), "tokens must survive: {text}");
+    assert_eq!(
+        spend_row_cells(&text, "2026-08-25"),
+        ["2026-08-25", "100k", "20k", "50k", "10k", "0.65"],
+        "tokens must survive next to the credits: {text}"
+    );
 
     let json = spend_json(&report, RunId::from_string("run-credits".to_string()));
     assert!(
@@ -231,7 +243,11 @@ fn a_missing_term_blocks_the_total_and_names_the_kind() {
 
     let text = render_spend_report(&report);
     assert!(text.contains("credits unavailable:"), "{text}");
-    assert!(text.contains("10k"), "tokens must survive: {text}");
+    assert_eq!(
+        spend_row_cells(&text, "2026-08-25"),
+        ["2026-08-25", "100k", "20k", "50k", "10k", "\u{2014}"],
+        "tokens, cache write included, must survive the refusal: {text}"
+    );
     assert!(
         !text.contains("0.00 credits"),
         "a refusal must never render a zero: {text}"
@@ -351,4 +367,20 @@ fn human_and_json_agree_on_amount_qualification_and_model_identity() {
     }
     assert!(text.contains("credits"));
     assert!(json.contains("\"unit\":\"credits\""));
+}
+
+/// The whitespace-separated cells of the boxed spend table row whose first cell is
+/// `label`. Matching whole cells rather than substrings keeps a count from passing
+/// because an unrelated number happens to contain it.
+fn spend_row_cells(text: &str, label: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c == ' '))
+        .map(|inner| {
+            inner
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .find(|cells| cells.first().map(String::as_str) == Some(label))
+        .unwrap_or_else(|| panic!("no spend row labelled {label}: {text}"))
 }

@@ -126,8 +126,9 @@ fn human_and_json_window_equivalent_contracts_retain_the_same_interval_and_witne
         human.contains("0.65 credits"),
         "credit dimension must remain: {human}"
     );
-    assert!(
-        human.contains("100k"),
+    assert_eq!(
+        spend_row_cells(&human, "2026-08-25"),
+        ["2026-08-25", "100k", "20k", "50k", "10k", "0.65"],
         "token dimension must remain: {human}"
     );
     assert!(
@@ -161,4 +162,20 @@ fn human_and_json_window_equivalent_contracts_retain_the_same_interval_and_witne
             .to_string()
             .contains("window-calibration:calibration-v1")
     );
+}
+
+/// The whitespace-separated cells of the boxed spend table row whose first cell is
+/// `label`. Matching whole cells rather than substrings keeps a count from passing
+/// because an unrelated number happens to contain it.
+fn spend_row_cells(text: &str, label: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c == ' '))
+        .map(|inner| {
+            inner
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .find(|cells| cells.first().map(String::as_str) == Some(label))
+        .unwrap_or_else(|| panic!("no spend row labelled {label}: {text}"))
 }

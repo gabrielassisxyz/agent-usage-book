@@ -184,7 +184,15 @@ fn integration_unvalued_spend_with_no_rate_cards_produces_complete_report() {
     assert!(text.contains("spend · 2026-08-25 → 2026-08-25 · 1 day UTC · by day"));
     assert!(!text.contains("valued at API list-price equivalent"));
     assert!(!text.contains("API list-price equivalent"));
-    assert!(text.contains("2026-08-25") && text.contains("input"));
+    assert_eq!(
+        spend_row_cells(&text, "2026-08-25"),
+        ["2026-08-25", "1000", "500", "200", "100"],
+        "the unvalued row carries the four exact counts and no $ cell: {text}"
+    );
+    assert!(
+        !text.contains('\u{25d0}'),
+        "a complete group carries no partial marker: {text}"
+    );
 
     // JSON rendering: unvalued run omits api_list_price_equivalent and rate_card_version
     let run = RunId::from_string("run-unvalued".to_string());
@@ -295,14 +303,20 @@ fn integration_requested_valuation_unavailable_renders_unavailable_form() {
     // Text rendering: renders unavailable form and keeps other dimensions intact
     let text = render_spend_report(&report);
     assert!(text.contains("valued at API list-price equivalent"));
-    assert!(
-        text.contains("10k")
-            && text.contains("5000")
-            && text.contains("1000")
-            && text.contains("2000")
+    assert_eq!(
+        spend_row_cells(&text, "2026-08-25"),
+        ["2026-08-25", "10k", "5000", "1000", "2000", "known", "0.11"],
+        "the token cells stay intact next to the unavailable valuation: {text}"
     );
     assert!(text.contains("API list-price equivalent unavailable"));
-    assert!(text.contains("day=2026-08-25"));
+    assert!(
+        text.contains("day=2026-08-25: API list-price equivalent unavailable"),
+        "the unavailable form is attributed to its group: {text}"
+    );
+    assert!(
+        !text.contains('\u{25d0}'),
+        "a complete group carries no partial marker: {text}"
+    );
     // Neither prints a monetary zero for the missing rate
     assert!(!text.contains("$0.00"));
 
@@ -761,4 +775,20 @@ fn golden_explain_names_each_card_with_its_schedule() {
         "{json_str}"
     );
     validate_spend_report_json(&json_str).expect("rate-cards JSON must validate");
+}
+
+/// The whitespace-separated cells of the boxed spend table row whose first cell is
+/// `label`. Matching whole cells rather than substrings keeps a count from passing
+/// because an unrelated number happens to contain it.
+fn spend_row_cells(text: &str, label: &str) -> Vec<String> {
+    text.lines()
+        .map(|line| line.trim_matches(|c: char| c == '\u{2502}' || c == ' '))
+        .map(|inner| {
+            inner
+                .split_whitespace()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .find(|cells| cells.first().map(String::as_str) == Some(label))
+        .unwrap_or_else(|| panic!("no spend row labelled {label}: {text}"))
 }
