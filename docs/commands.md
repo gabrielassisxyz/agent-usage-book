@@ -549,6 +549,15 @@ key. With no configured tier the flag records its value as before. Both the
 configured tier and the flag are trimmed, so surrounding whitespace never makes
 two identical tiers disagree.
 
+`begin` requires `--cost-model` only for a one-kind premise. A premise naming
+two or more token kinds fits jointly straight from the recorded usage counts
+with no rate book in between, so it begins with no `--cost-model` and stores
+`none`; a model named on such a premise is recorded as given without the
+expected-terms check. A premise naming one kind fits univariately through the
+rate book and still requires `--cost-model`, and a named model missing a term
+for the expected kind is refused as before. The `begin` report line prints
+`expect_kinds` alongside `cost_model`, so the recorded premise is visible.
+
 `fit` follows the experiment's premise. `fit --experiment ID` naming a controlled
 experiment whose `--expect-kinds` premise names two or more token kinds fits them
 jointly, one coefficient per named kind, regressed directly on the recorded

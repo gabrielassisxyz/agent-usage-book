@@ -590,6 +590,215 @@ fn multivariate_fit_records_a_candidate_and_never_activates() {
     );
 }
 
+/// The `aub-ks5n` premise rule through the binary: a joint premise begins
+/// with no `--cost-model` on a ledger holding no cost model at all, and
+/// `status`, `end` and `fit` all work on it, with `fit` recording a
+/// multivariate candidate. Every command here is its own process; the
+/// readings between them are stored rows standing in for scheduler samples.
+#[test]
+fn joint_premise_begins_ends_and_fits_with_no_cost_model_in_the_ledger() {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    const JOINT_EXPERIMENT: &str = "exp-joint-no-model";
+    let now_nanos = || {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time must be readable")
+            .as_nanos() as i64
+    };
+    let state = StateDir::new();
+    std::fs::write(
+        state.path().join("aub.toml"),
+        "[[accounts]]\nname = \"bianca\"\nprovider = \"anthropic\"\nplan_tier = \"max-5x\"\n",
+    )
+    .expect("config must be writable");
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+
+    // One settled baseline reading a minute in the past, then `begin` with a
+    // four-kind premise and no `--cost-model` as its own process.
+    let baseline_at = now_nanos() - 60 * SECOND;
+    {
+        let conn = open_test_ledger(&state);
+        let chain = meter_chain(&conn);
+        reading(&conn, &chain, baseline_at, BASELINE_PPM);
+    }
+    let begin = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "--account",
+            ACCOUNT,
+            "begin",
+            "--window",
+            WINDOW,
+            "--expect-kinds",
+            "input,output,cache_read,cache_write",
+            "--experiment",
+            JOINT_EXPERIMENT,
+            "--assert-exclusive",
+        ],
+    );
+    let begin_stdout = String::from_utf8_lossy(&begin.stdout).into_owned();
+    let begin_stderr = String::from_utf8_lossy(&begin.stderr).into_owned();
+    assert_eq!(
+        begin.status.code(),
+        Some(0),
+        "begin must succeed with no cost model.\nstdout: {begin_stdout}\nstderr: {begin_stderr}"
+    );
+    assert!(
+        begin_stdout.contains(&format!("experiment={JOINT_EXPERIMENT}")),
+        "begin must print the premise:\n{begin_stdout}"
+    );
+    assert!(
+        begin_stdout.contains("cost_model=none"),
+        "begin must print the sentinel:\n{begin_stdout}"
+    );
+    assert!(
+        begin_stdout.contains("expect_kinds=input,output,cache_read,cache_write"),
+        "begin must print the premise kinds:\n{begin_stdout}"
+    );
+    {
+        let conn = open_test_ledger(&state);
+        assert_eq!(
+            count(&conn, "SELECT COUNT(*) FROM cost_model"),
+            0,
+            "the ledger must hold no cost model at all"
+        );
+        let stored: String = conn
+            .query_row(
+                "SELECT cost_model_id FROM calibration_controlled_run WHERE experiment_id = ?1",
+                [JOINT_EXPERIMENT],
+                |row| row.get(0),
+            )
+            .expect("the run must be recorded");
+        assert_eq!(stored, "none");
+    }
+
+    // The burst between the two boundaries: one usage event per block, each
+    // followed by a lagging reading and two settled ones, stamped after the
+    // recorded `started_at` so the run's own frame holds them.
+    let started_at: i64 = {
+        let conn = open_test_ledger(&state);
+        conn.query_row(
+            "SELECT started_at FROM calibration_controlled_run WHERE experiment_id = ?1",
+            [JOINT_EXPERIMENT],
+            |row| row.get(0),
+        )
+        .expect("the run must be recorded")
+    };
+    {
+        let conn = open_test_ledger(&state);
+        let chain = meter_chain(&conn);
+        attribute_session(&conn, BURST_SESSION, ACCOUNT, baseline_at);
+        let mut cumulative_ppm = BASELINE_PPM as f64;
+        let mut t = started_at + SECOND / 1_000;
+        for (index, block) in fixture.blocks.iter().enumerate() {
+            spend(&conn, t, 1_000_000 + index, block);
+            let movement: f64 = block
+                .counts
+                .iter()
+                .map(|(kind, count)| {
+                    let truth = fixture
+                        .truth_ppm_per_token
+                        .iter()
+                        .find(|(k, _)| k == kind)
+                        .map(|(_, v)| *v)
+                        .unwrap();
+                    truth * *count as f64
+                })
+                .sum();
+            let settled = cumulative_ppm + movement;
+            reading(
+                &conn,
+                &chain,
+                t + 2 * SECOND / 1_000,
+                (cumulative_ppm + movement / 2.0).round() as i64,
+            );
+            reading(
+                &conn,
+                &chain,
+                t + 4 * SECOND / 1_000,
+                settled.round() as i64,
+            );
+            reading(
+                &conn,
+                &chain,
+                t + 6 * SECOND / 1_000,
+                settled.round() as i64,
+            );
+            cumulative_ppm = settled;
+            t += 10 * SECOND / 1_000;
+        }
+        // `end` stamps the real instant it runs, so wait until the wall
+        // clock has passed the last block before closing the boundary.
+        while now_nanos() <= t {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    let status_running = run_aub(
+        &state,
+        &["calibrate", "status", "--experiment", JOINT_EXPERIMENT],
+    );
+    let status_stdout = String::from_utf8_lossy(&status_running.stdout).into_owned();
+    assert_eq!(
+        status_running.status.code(),
+        Some(0),
+        "status must work on the joint run: {status_stdout}"
+    );
+    assert!(status_stdout.contains("phase=running"), "{status_stdout}");
+
+    let end = run_aub(
+        &state,
+        &["calibrate", "end", "--experiment", JOINT_EXPERIMENT],
+    );
+    let end_stdout = String::from_utf8_lossy(&end.stdout).into_owned();
+    let end_stderr = String::from_utf8_lossy(&end.stderr).into_owned();
+    assert_eq!(
+        end.status.code(),
+        Some(0),
+        "end must work on the joint run.\nstdout: {end_stdout}\nstderr: {end_stderr}"
+    );
+
+    let fit = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "fit",
+            "--experiment",
+            JOINT_EXPERIMENT,
+            "--format",
+            "json",
+        ],
+    );
+    let fit_stdout = String::from_utf8_lossy(&fit.stdout).into_owned();
+    let fit_stderr = String::from_utf8_lossy(&fit.stderr).into_owned();
+    assert_eq!(
+        fit.status.code(),
+        Some(0),
+        "fit must work on the joint run.\nstdout: {fit_stdout}\nstderr: {fit_stderr}"
+    );
+    let json: serde_json::Value =
+        serde_json::from_str(fit_stdout.trim()).expect("fit stdout must be JSON");
+    assert_eq!(json["fit_kind"], "multivariate");
+    assert_eq!(json["experiment_id"], JOINT_EXPERIMENT);
+    let conn = open_test_ledger(&state);
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM window_calibration_multivariate_candidate"
+        ),
+        1,
+        "fit must record a multivariate candidate"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM window_calibration_multivariate_coefficient"
+        ),
+        4
+    );
+}
+
 /// The text rendering names every kind and says activation was not performed.
 #[test]
 fn multivariate_fit_text_report_names_each_kind_and_the_gate() {
