@@ -213,19 +213,40 @@ const SPEND_WINDOW_ARGS: [&str; 6] = [
     "account",
 ];
 
-/// The window-equivalent line for one calibrated account child, so a test can
+/// The window-equivalent detail for one calibrated account child, so a test can
 /// assert on the exact interval and calibration id together rather than on
-/// two separately matched substrings that could belong to different lines.
-fn window_equivalent_line<'a>(spend_text: &'a str, account: &str) -> &'a str {
-    let account_marker = format!("account={account}");
-    let account_at = spend_text
-        .find(&account_marker)
-        .unwrap_or_else(|| panic!("account={account} must appear in:\n{spend_text}"));
-    spend_text[account_at..]
-        .lines()
-        .find(|line| line.contains("window equivalent"))
+/// two separately matched substrings that could belong to different rows.
+///
+/// The boxed spend table names the account in the row's first cell and lists
+/// that row's details on the indented lines under it, wrapping a long detail
+/// onto deeper-indented continuation lines. The detail is rejoined here, so a
+/// wrap never splits the interval from its calibration id.
+fn window_equivalent_line(spend_text: &str, account: &str) -> String {
+    let row_prefix = format!("\u{2502}  {account} ");
+    let mut lines = spend_text.lines();
+    lines
+        .by_ref()
+        .find(|line| line.starts_with(&row_prefix))
+        .unwrap_or_else(|| panic!("a row for account {account} must appear in:\n{spend_text}"));
+    let mut details: Vec<String> = Vec::new();
+    for line in lines {
+        let inner = line.trim_end_matches('\u{2502}').trim_end();
+        if let Some(continued) = inner.strip_prefix("\u{2502}      ") {
+            if let Some(last) = details.last_mut() {
+                last.push(' ');
+                last.push_str(continued.trim_start());
+            }
+        } else if let Some(detail) = inner.strip_prefix("\u{2502}    ") {
+            details.push(detail.to_string());
+        } else {
+            break;
+        }
+    }
+    details
+        .into_iter()
+        .find(|detail| detail.contains("window equivalent"))
         .unwrap_or_else(|| {
-            panic!("no window-equivalent line after account={account} in:\n{spend_text}")
+            panic!("no window-equivalent detail under account {account} in:\n{spend_text}")
         })
 }
 
@@ -782,8 +803,8 @@ fn can_run_supersession_moves_all_three_consumers_together() {
 
     // No credential file is created anywhere under this state directory:
     // every command below must succeed without reading one. The spend-only
-    // account is named `spend` rather than `work` so its `account=spend`
-    // marker cannot substring-match the `account=work-primary` lines. The
+    // account is named `spend` rather than `work` so its `spend` row cell
+    // cannot prefix-match the `work-primary` row. The
     // two accounts name different (equally absent) paths because two logical
     // accounts must not share one credential source (aub-iwkg).
     let config = format!(
