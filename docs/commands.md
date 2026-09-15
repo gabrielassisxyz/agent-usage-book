@@ -530,9 +530,10 @@ what quota window capacity is fitted from recorded meter observations?
 the ledger, do their read or write, and exit; the experiment survives in the
 database between them, including across a reboot. Sampling cadence during an
 experiment is tightened by invoking `sample --due` more often through the
-external scheduler, never by a loop inside `aub`. `begin` refuses when the
-named cost model covers none of the expected token kinds, when the account has
-no sampled baseline yet, and when the account already runs an experiment;
+external scheduler, never by a loop inside `aub`. `begin` refuses a one-kind
+premise with no cost model or with a named cost model that carries no term for
+the expected kind, a `--cost-model` naming no stored model, an account with
+no sampled baseline yet, and an account that already runs an experiment;
 `end` records the end of controlled work and never declares the meter
 settled. `fit` and `passive` refuse to activate candidate calibrations automatically:
 candidates are written immutably and never promoted to active status by the
