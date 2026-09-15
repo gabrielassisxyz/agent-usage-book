@@ -53,15 +53,17 @@ within one sampling interval is the signal the cadence is live.
 
 The five provider adapters build their request timeouts inline as deliberate
 constants, not from configuration -- settled on aub-fhh9 as option D
-(2026-09-14), implemented in aub-rqh2. Every provider request carries a
-connect timeout of 5s, a read timeout of 10s, a total timeout of 15s, and a
-command budget of 30s. The production call sites:
+(2026-09-14), implemented in aub-rqh2. Every request an adapter sends
+through the transport, local-file reads included, carries a connect timeout
+of 5s, a read timeout of 10s, a total timeout of 15s, and a command budget of
+30s. The seven production call sites:
 
 - `src/meter/agy.rs`, the quota request build
 - `src/meter/opencode.rs`, the quota page request build
-- `src/meter/anthropic.rs`, twice: the statusline transcript read and the
+- `src/meter/anthropic.rs`, twice: the status-line record file read and the
   usage endpoint
-- `src/meter/codex.rs`, twice: the rollout capture and the usage endpoint
+- `src/meter/codex.rs`, twice: the newest rollout file read and the usage
+  endpoint
 - `src/meter/ollama.rs`, the quota request build
 
 Two `sampling` keys sit beside these constants and bound other things.
