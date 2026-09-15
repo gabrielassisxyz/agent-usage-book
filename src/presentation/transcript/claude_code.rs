@@ -4,10 +4,10 @@
 //! Reads each JSONL line's `type`, `message.role`, `message.content` (a
 //! string, or an array of `text`, `tool_use`, `tool_result` and `thinking`
 //! blocks) and `timestamp`; file order is conversation order. Tool results
-//! arrive in later user messages carrying the `toolUseID` of their call, so
-//! the renderer pairs them by id in a second pass. System reminders and
-//! injected skill text are dropped per block, `isMeta` snapshot records and
-//! `summary` lines are not conversation and are skipped. A line that is not
+//! arrive in later user messages carrying the `tool_use_id` of their call
+//! (`toolUseID` is also accepted), so the renderer pairs them by id. System
+//! reminders and injected skill text are dropped per block, `isMeta`
+//! snapshot records and `summary` lines are not conversation and are skipped. A line that is not
 //! JSON, or that carries no renderable message, contributes nothing: a wrong
 //! guess here would read as a plausible session.
 //!
@@ -262,7 +262,7 @@ mod tests {
         format!(
             "{{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"Do the thing\"}},\"timestamp\":\"2026-09-06T10:00:00.000Z\",\"sessionId\":\"sess\"}}\n\
              {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"text\",\"text\":\"On it\"}},{{\"type\":\"tool_use\",\"id\":\"toolu_1\",\"name\":\"Read\",\"input\":{{\"data\":\"{big}\"}}}}]}},\"timestamp\":\"2026-09-06T10:01:00.000Z\",\"sessionId\":\"sess\"}}\n\
-             {{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"toolUseID\":\"toolu_1\",\"content\":\"README contents\"}}]}},\"timestamp\":\"2026-09-06T10:02:00.000Z\",\"sessionId\":\"sess\"}}\n\
+             {{\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":[{{\"type\":\"tool_result\",\"tool_use_id\":\"toolu_1\",\"content\":\"README contents\"}}]}},\"timestamp\":\"2026-09-06T10:02:00.000Z\",\"sessionId\":\"sess\"}}\n\
              {{\"type\":\"assistant\",\"message\":{{\"role\":\"assistant\",\"content\":[{{\"type\":\"thinking\",\"thinking\":\"First do this\",\"signature\":\"sig\"}},{{\"type\":\"text\",\"text\":\"Finished\"}}]}},\"timestamp\":\"2026-09-06T10:03:00.000Z\",\"sessionId\":\"sess\"}}\n"
         )
     }
@@ -289,6 +289,12 @@ mod tests {
         );
         assert!(out.contains("**Tool result:**"));
         assert!(out.contains("README contents"));
+        // The fixture carries the real key, `tool_use_id`: an unpaired
+        // result would still print its text, but under an unknown call.
+        assert!(
+            !out.contains("**Tool: (unknown)**"),
+            "the result pairs back to its call by tool_use_id"
+        );
         assert!(!out.contains("First do this"));
     }
 

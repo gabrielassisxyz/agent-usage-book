@@ -41,6 +41,9 @@
 │  drill                                                                       │
 │    max_age                  30d                                     default  │
 │                                                                              │
+│  export                                                                      │
+│    clipboard_command        wl-copy                                 default  │
+│                                                                              │
 │  freshness                                                                   │
 │    meter                    12m                                     default  │
 │                                                                              │

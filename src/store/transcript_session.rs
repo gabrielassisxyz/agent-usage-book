@@ -271,6 +271,11 @@ mod tests {
         let narrowed = resolve_transcript_sessions(&conn, "aaaa", Some("codex")).unwrap();
         assert_eq!(narrowed.len(), 1);
         assert_eq!(narrowed[0].source.as_str(), "codex");
+        // The narrowed query orders by start too, so `--latest` on the
+        // `01a0318b` codex pair picks the later session.
+        let pair = resolve_transcript_sessions(&conn, "01a0318b", Some("codex")).unwrap();
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[1].native_session_id.as_str(), "01a0318b-2bbb");
         let missing = resolve_transcript_sessions(&conn, "zzzz", None).unwrap();
         assert!(missing.is_empty());
         let missing_narrowed = resolve_transcript_sessions(&conn, "aaaa", Some("pi")).unwrap();

@@ -54,7 +54,7 @@ case_steps() {
         cat >"$parent" <<JSONL
 {"type":"user","message":{"role":"user","content":"Do the thing"},"timestamp":"2026-09-06T10:00:00.000Z","sessionId":"aaaa0001-1111-4222-8333-444444444444"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"On it"},{"type":"tool_use","id":"toolu_1","name":"Read","input":{"data":"$big"}}]},"timestamp":"2026-09-06T10:01:00.000Z","sessionId":"aaaa0001-1111-4222-8333-444444444444"}
-{"type":"user","message":{"role":"user","content":[{"type":"tool_result","toolUseID":"toolu_1","content":"README contents"}]},"timestamp":"2026-09-06T10:02:00.000Z","sessionId":"aaaa0001-1111-4222-8333-444444444444"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_1","content":"README contents"}]},"timestamp":"2026-09-06T10:02:00.000Z","sessionId":"aaaa0001-1111-4222-8333-444444444444"}
 {"type":"assistant","message":{"role":"assistant","content":[{"type":"thinking","thinking":"First do this","signature":"sig"},{"type":"text","text":"Finished"}]},"timestamp":"2026-09-06T10:03:00.000Z","sessionId":"aaaa0001-1111-4222-8333-444444444444"}
 JSONL
         cat >"$subagent" <<JSONL
