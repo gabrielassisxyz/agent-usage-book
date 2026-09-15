@@ -199,12 +199,27 @@ pub struct SamplingConfig {
     pub scheduler_tick: MonotonicDuration,
     pub default_interval: MonotonicDuration,
     pub reset_edge_lead: MonotonicDuration,
+    /// The store timeout (aub-rqh2): it bounds the ledger connection's wait
+    /// for the writer slot and `aub backup verify`'s read of an archive. It
+    /// bounds no provider request -- every adapter carries its own fixed 5s
+    /// connect / 10s read / 15s total budget (docs/operations.md) -- and it is
+    /// not the lock wait a sampling tick refuses after: that is `busy_timeout`,
+    /// its own key, so raising this for a slow verifier never lengthens a
+    /// tick's lock wait.
     pub request_timeout: MonotonicDuration,
     /// How long `aub sample` waits for the ledger's write slot before refusing
-    /// a tick. Its own key rather than `request_timeout`: that one bounds a
-    /// provider request, and an operator raising it for a slow provider must
-    /// not thereby lengthen a lock wait, nor push it past the store's bound.
+    /// a tick. Its own key rather than `request_timeout`: that one bounds the
+    /// ledger connection and the archive verifier, and an operator raising it
+    /// for a slow verifier must not thereby lengthen a lock wait, nor push it
+    /// past the store's bound.
     pub busy_timeout: MonotonicDuration,
+    /// The command horizon past which a sampling attempt with no terminal
+    /// result is classified as a collector interruption (aub-rqh2): the
+    /// projection reads it as `command_horizon`, so a resultless attempt older
+    /// than it is an interruption, not work still in flight. Defaults to the
+    /// 30s budget every provider adapter builds its requests under, so the
+    /// horizon does not fire while the adapter itself is still waiting. It
+    /// bounds no request; the adapters' own fixed budgets do.
     pub command_budget: MonotonicDuration,
     /// The most provider requests one sampling batch may keep in flight.
     /// Bounded so a machine with many configured accounts cannot open an
@@ -1322,12 +1337,15 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        // The 30s budget every provider adapter builds its requests under
+        // (aub-rqh2), so a resultless attempt is read as a collector
+        // interruption only after the request itself would have given up.
         command_budget: resolve_duration(
             "sampling.command_budget",
             overrides,
             env,
             file_raw(file.as_ref(), "sampling", "command_budget"),
-            Some("8s"),
+            Some("30s"),
             &file_display,
             &mut provenance,
         )?,
@@ -2499,6 +2517,22 @@ mod tests {
         );
         assert_eq!(
             provenance.get("sampling.default_interval"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    /// The command budget default is the 30s the provider adapters build
+    /// their requests under (aub-rqh2). A value-level assert rather than only
+    /// the goldens: a golden catches any change here and distinguishes none.
+    #[test]
+    fn command_budget_defaults_to_the_thirty_seconds_the_adapters_build() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            config.sampling.command_budget,
+            MonotonicDuration::from_seconds(30)
+        );
+        assert_eq!(
+            provenance.get("sampling.command_budget"),
             Some(ConfigSource::Default)
         );
     }
@@ -3847,7 +3881,7 @@ reconciliation.residual_window        30d                                      d
 sampling.auth_backoff_cap             6h                                       default
 sampling.auth_backoff_threshold       3                                        default
 sampling.busy_timeout                 10s                                      default
-sampling.command_budget               8s                                       default
+sampling.command_budget               30s                                      default
 sampling.default_interval             5m                                       default
 sampling.max_concurrent_requests      2                                        default
 sampling.request_timeout              5s                                       default
