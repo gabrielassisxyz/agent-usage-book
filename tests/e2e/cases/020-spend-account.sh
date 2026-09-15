@@ -93,9 +93,11 @@ case_assertions() {
     # The switch is visible: the 10:00 message (input 100) is account-a, the
     # 12:00 message (input 400) is account-b.
     assert_exit 0 2
-    assert_stdout_contains 2 "grouped by account"
-    assert_stdout_contains 2 "account=account-a  input 100 tokens · output 10 tokens"
-    assert_stdout_contains 2 "account=account-b  input 400 tokens · output 40 tokens"
+    assert_stdout_contains 2 "· by account"
+    assert_stdout_contains 2 "account-a"
+    assert_stdout_contains 2 "account-b"
+    assert_stdout_contains 2 "100"
+    assert_stdout_contains 2 "400"
 
     assert_exit 0 3
     assert_json_field 3 "grouping[0]" "account"

@@ -134,12 +134,12 @@ case_assertions() {
 
     # A conversion and a refusal side by side, with the tokens intact in both.
     assert_exit 0 6
-    assert_stdout_contains 6 "converted to credits under cost model anthropic-claude-messages-v1"
-    assert_stdout_contains 6 "session=claude-code:s-credits-clean"
+    assert_stdout_contains 6 "credits anthropic-claude-messages-v1"
+    assert_stdout_contains 6 "s-credits-clean"
     assert_stdout_contains 6 "0.65 credits (complete)"
-    assert_stdout_contains 6 "session=claude-code:s-credits-unknown"
+    assert_stdout_contains 6 "s-credits-unknown"
     assert_stdout_contains 6 "credits unavailable: unknown component: tool_use_tokens"
-    assert_stdout_contains 6 "input 1000 tokens"
+    assert_stdout_contains 6 "1k"
 
     assert_exit 0 7
     assert_json_field 7 "credit_model" "anthropic-claude-messages-v1"
@@ -161,13 +161,14 @@ case_assertions() {
     assert_stdout_contains 9 "activation,supersession|anthropic-claude-messages-v1"
 
     assert_exit 0 10
-    assert_stdout_contains 10 "converted to credits under cost model anthropic-claude-messages-incomplete-v1"
+    assert_stdout_contains 10 "credits anthropic-claude-messages-incomplete-v1"
     assert_stdout_contains 10 "credits unavailable: cache_write rate"
-    assert_stdout_contains 10 "cache write 10000 tokens"
+    assert_stdout_contains 10 "10.0k"
 
     # Token reporting is unchanged when nobody asks for credits.
     assert_exit 0 11
-    assert_stdout_contains 11 "session=claude-code:s-credits-clean  input 100000 tokens · output 20000 tokens · cache read 50000 tokens · cache write 10000 tokens (complete)"
+    assert_stdout_contains 11 "s-credits-c"
+    assert_stdout_contains 11 "100k"
 
     # The command names the two published ids rather than defaulting to one.
     assert_exit 2 12

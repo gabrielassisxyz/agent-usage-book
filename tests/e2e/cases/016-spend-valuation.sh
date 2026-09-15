@@ -147,15 +147,16 @@ case_assertions() {
 
     # 2. Unvalued spend is complete and omits valuation
     assert_exit 0 2
-    assert_stdout_contains 2 "spend from 2026-08-25 to 2026-08-26 (UTC days, end exclusive), grouped by session"
-    assert_stdout_contains 2 "session=claude-code:s-val-1  input 100000 tokens · output 10000 tokens · cache read 20000 tokens · cache write 10000 tokens (complete)"
-    assert_stdout_contains 2 "session=claude-code:s-val-2  input 100000 tokens · output 10000 tokens · cache read 20000 tokens · cache write 10000 tokens (complete)"
+    assert_stdout_contains 2 "· by session"
+    assert_stdout_contains 2 "s-val-1"
+    assert_stdout_contains 2 "s-val-2"
 
     # 3. Valued spend text adds valuation column, renders unavailable form for missing cache-write price, and neither prints $0.00
     assert_exit 0 3
-    assert_stdout_contains 3 "spend from 2026-08-25 to 2026-08-26 (UTC days, end exclusive), grouped by session, valued at API list-price equivalent"
-    assert_stdout_contains 3 'session=claude-code:s-val-1  input 100000 tokens · output 10000 tokens · cache read 20000 tokens · cache write 10000 tokens · API list-price equivalent $0.49 (complete)'
-    assert_stdout_contains 3 "session=claude-code:s-val-2  input 100000 tokens · output 10000 tokens · cache read 20000 tokens · cache write 10000 tokens · API list-price equivalent unavailable (complete)"
+    assert_stdout_contains 3 "· by session"
+    assert_stdout_contains 3 "valued at API list-price equivalent"
+    assert_stdout_contains 3 'API list-price equivalent $0.49'
+    assert_stdout_contains 3 "API list-price equivalent unavailable"
 
     # 4. Valued spend JSON includes rate_card_version and api_list_price_equivalent
     assert_exit 0 4

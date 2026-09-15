@@ -34,7 +34,7 @@ use crate::presentation::render::{
     render_calibrate_activate_report, render_calibrate_compare_report,
     render_calibrate_history_report, render_calibrate_promote_report, render_calibrate_show_report,
     render_coverage_report, render_coverage_threshold_message, render_now_report_with_explain,
-    render_spend_report_with_explain, render_status_report_with_explain,
+    render_spend_report_with_explain_and_style, render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
 use crate::report::coverage::{CoverageFloors, CoverageSelector, assemble as assemble_coverage};
@@ -2888,7 +2888,11 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
     match invocation.format {
         OutputFormat::Text => println!(
             "{}",
-            render_spend_report_with_explain(&report, invocation.explain)
+            render_spend_report_with_explain_and_style(
+                &report,
+                invocation.explain,
+                Style::detect(invocation.no_color),
+            )
         ),
         OutputFormat::Json => println!(
             "{}",

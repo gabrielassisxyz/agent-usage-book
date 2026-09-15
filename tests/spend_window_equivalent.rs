@@ -127,7 +127,7 @@ fn human_and_json_window_equivalent_contracts_retain_the_same_interval_and_witne
         "credit dimension must remain: {human}"
     );
     assert!(
-        human.contains("input 100000 tokens"),
+        human.contains("100k"),
         "token dimension must remain: {human}"
     );
     assert!(

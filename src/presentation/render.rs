@@ -10,7 +10,7 @@ use crate::doctor::{CheckStatus, DoctorReport};
 use crate::domain::credits::Credits;
 use crate::domain::failure::FailureClass;
 use crate::domain::freshness::{Freshness, StaleReason};
-use crate::domain::money::{Currency, Money};
+use crate::domain::money::{Currency, Money, Usd};
 use crate::domain::provenance::DerivationId;
 use crate::domain::quota::{PercentagePoints, QuotaRemaining};
 use crate::domain::render::Precision;
@@ -842,11 +842,9 @@ fn join_report_with_explain(
 /// The unit every token count is rendered in.
 const TOKEN_UNIT: &str = "tokens";
 
-/// The report-to-rendering seam for spend: the window, one line per group with the
-/// four known kinds and any unknown component, each count carrying its unit, then
-/// the ingest summary. The summary is not optional output: a count printed without
-/// what was quarantined, skipped or replayed behind it would read as complete when
-/// nothing proved it was.
+/// The report-to-rendering seam for spend. The human surface is a fixed-width box;
+/// JSON remains the contract for the complete report shape and all unmodelled
+/// components.
 pub fn render_spend_report(report: &SpendReport) -> String {
     render_spend_report_with_explain(report, ExplainMode::Off)
 }
@@ -860,85 +858,735 @@ pub fn render_reconciliation(outcome: &crate::reconciliation::ReconciliationOutc
 
 /// Renders a spend report, optionally including the explain block.
 pub fn render_spend_report_with_explain(report: &SpendReport, explain: ExplainMode) -> String {
+    render_spend_report_with_explain_and_style(report, explain, Style::plain())
+}
+
+/// Renders spend with the terminal style selected by the command invocation.
+pub fn render_spend_report_with_explain_and_style(
+    report: &SpendReport,
+    explain: ExplainMode,
+    style: Style,
+) -> String {
+    let report_text = render_spend_box(report, style);
+    if explain == ExplainMode::Off {
+        return report_text;
+    }
+
+    let mut explain_text = render_explain(&report.provenance, explain);
+    let account_text = render_account_explain(report);
+    if !account_text.is_empty() {
+        explain_text.push_str("\n\n");
+        explain_text.push_str(&account_text);
+    }
+    let priced_text = render_priced_as_explain(report);
+    if !priced_text.is_empty() {
+        explain_text.push_str("\n\n");
+        explain_text.push_str(&priced_text);
+    }
+    let cards_text = render_rate_cards_explain(report);
+    if !cards_text.is_empty() {
+        explain_text.push_str("\n\n");
+        explain_text.push_str(&cards_text);
+    }
+    if report_text.is_empty() {
+        explain_text
+    } else {
+        format!("{report_text}\n\n{explain_text}")
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpendTableColumn {
+    Input,
+    Output,
+    CacheRead,
+    CacheWrite,
+    Reasoning,
+    Valuation,
+    Credits,
+}
+
+impl SpendTableColumn {
+    fn header(self) -> &'static str {
+        match self {
+            Self::Input => "input",
+            Self::Output => "output",
+            Self::CacheRead => "cache read",
+            Self::CacheWrite => "cache write",
+            Self::Reasoning => "reasoning",
+            Self::Valuation => "$",
+            Self::Credits => "credits",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SpendTableRow {
+    label: String,
+    known: [u64; 4],
+    reasoning: Option<u64>,
+    valuation: Option<String>,
+    credits: Option<String>,
+    partial: bool,
+    dim: bool,
+    details: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+struct SpendTableSection {
+    title: Option<String>,
+    rows: Vec<SpendTableRow>,
+}
+
+/// Renders the boxed spend surface. The width used to choose columns is the
+/// measured terminal width, while the shared frame still enforces its 80-column
+/// floor. This distinction lets a narrow pty exercise the same drop policy as a
+/// real terminal without making the frame itself unreadably narrow.
+fn render_spend_box(report: &SpendReport, style: Style) -> String {
+    render_spend_box_at_width(report, style, usize::from(style.width()))
+}
+
+fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width: usize) -> String {
+    let sections = spend_sections(report);
+    let total = spend_total_row(report, report.groups.iter().any(spend_group_has_reasoning));
+    let has_valuation = report.groups.iter().any(spend_group_has_valuation);
+    let has_credits = report.groups.iter().any(spend_group_has_credits);
+    let has_partial = sections
+        .iter()
+        .flat_map(|section| section.rows.iter())
+        .any(|row| row.partial);
+    let mut columns = vec![
+        SpendTableColumn::Input,
+        SpendTableColumn::Output,
+        SpendTableColumn::CacheRead,
+        SpendTableColumn::CacheWrite,
+    ];
+    if total.reasoning.is_some()
+        || sections
+            .iter()
+            .flat_map(|section| section.rows.iter())
+            .any(|row| row.reasoning.is_some())
+    {
+        columns.push(SpendTableColumn::Reasoning);
+    }
+    if has_valuation {
+        columns.push(SpendTableColumn::Valuation);
+    }
+    if has_credits {
+        columns.push(SpendTableColumn::Credits);
+    }
+
+    let box_width = boxed_width(&style);
+    let measured_area = measured_width.saturating_sub(6);
+    let grouping_label = spend_grouping_label(report);
+    let mut hidden = Vec::new();
+    while spend_table_width(&grouping_label, &columns, &sections, &total, has_partial)
+        > measured_area
+        && columns.len() > 3
+    {
+        let candidate = [
+            SpendTableColumn::Reasoning,
+            SpendTableColumn::CacheWrite,
+            SpendTableColumn::Valuation,
+            SpendTableColumn::Credits,
+        ]
+        .into_iter()
+        .find(|candidate| columns.contains(candidate));
+        let Some(candidate) = candidate else { break };
+        columns.retain(|column| *column != candidate);
+        hidden.push(candidate);
+    }
+
+    let scales = spend_column_scales(&columns, &sections);
+    let widths = spend_column_widths(&grouping_label, &columns, &sections, &total, &scales);
+    let rule_width = spend_table_width_from_widths(&widths, has_partial);
+    let mut lines = vec![boxed_top(
+        &style.paint(style.bold(), &spend_title(report)),
+        box_width,
+    )];
+    lines.push(boxed_blank(box_width));
+
+    let nested = report.grouping.len() > 1;
+    for (section_index, section) in sections.iter().enumerate() {
+        if nested && section_index > 0 {
+            lines.push(boxed_blank(box_width));
+        }
+        if let Some(title) = &section.title {
+            lines.push(boxed_body(&style.paint(style.accent(), title), box_width));
+        }
+        lines.push(boxed_body(
+            &style.paint(
+                style.muted(),
+                &spend_header_line(&grouping_label, &columns, &widths),
+            ),
+            box_width,
+        ));
+        lines.push(boxed_rule(rule_width, box_width));
+        for row in &section.rows {
+            let content = spend_row_line(row, &columns, &widths, &scales, has_partial);
+            let content = if row.dim {
+                style.paint(style.dim(), &content)
+            } else {
+                content
+            };
+            lines.push(boxed_body(&content, box_width));
+            for detail in &row.details {
+                lines.push(boxed_body(
+                    &style.paint(style.dim(), &format!("  {detail}")),
+                    box_width,
+                ));
+            }
+        }
+    }
+
+    lines.push(boxed_rule(rule_width, box_width));
+    let total_line = spend_row_line(&total, &columns, &widths, &[], false);
+    lines.push(boxed_body(
+        &style.paint(style.bold(), &total_line),
+        box_width,
+    ));
+
+    let mut footer = Vec::new();
+    if has_valuation {
+        footer.push("valued at API list-price equivalent".to_string());
+    }
+    match (&report.credit_model, has_credits) {
+        (Some(model), _) => footer.push(format!("credits {}", model.as_str())),
+        (None, true) => footer.push("credits requested with no active cost model".to_string()),
+        (None, false) => {}
+    }
+    if let Some(window) = &report.window_equivalent_window {
+        footer.push(format!(
+            "converted to window-equivalent percentage points for {window}"
+        ));
+    }
+    if has_partial {
+        footer.push(format!(
+            "◐ partial: {} still in progress",
+            report
+                .grouping
+                .last()
+                .map(|grouping| grouping.as_str())
+                .unwrap_or("group")
+        ));
+    }
+    for outcome in &report.filters {
+        footer.push(render_spend_filter_exclusion(outcome));
+    }
+    if let Some(note) = &report.stale_rate_card_note {
+        footer.push(format!("note: {note}"));
+    }
+    if report.groups.is_empty() {
+        footer.push(format!(
+            "no usage events in the window: {} outside it, {} undated",
+            report.ingest.events_outside_window, report.ingest.undated_events
+        ));
+    }
+    if let Some(unmapped) = render_unmapped_models(report) {
+        footer.push(unmapped);
+    }
+    footer.extend(
+        hidden
+            .into_iter()
+            .map(|column| format!("{} column hidden: width", column.header())),
+    );
+    footer.push(render_spend_ingest_footer(report));
+    footer.extend(
+        report
+            .ingest
+            .unreadable_files
+            .iter()
+            .map(|file| format!("unreadable: {file}")),
+    );
+
+    if !footer.is_empty() {
+        lines.push(boxed_blank(box_width));
+        lines.extend(
+            footer
+                .into_iter()
+                .map(|line| boxed_body(&style.paint(style.dim(), &line), box_width)),
+        );
+    }
+    lines.push(boxed_bottom(box_width));
+    lines.join("\n")
+}
+
+fn spend_title(report: &SpendReport) -> String {
     let grouping = report
         .grouping
         .iter()
         .map(|dimension| dimension.as_str())
         .collect::<Vec<_>>()
         .join(", ");
-    let is_valued = report.groups.iter().any(|g| g.valuation.is_some());
-    let valuation_clause = if is_valued {
-        ", valued at API list-price equivalent"
-    } else {
-        ""
-    };
-    let credit_clause = match &report.credit_model {
-        Some(model) => format!(", converted to credits under cost model {}", model.as_str()),
-        None if report.groups.iter().any(|g| g.credits.is_some()) => {
-            ", credits requested with no active cost model".to_string()
-        }
-        None => String::new(),
-    };
-    let window_equivalent_clause = report
-        .window_equivalent_window
-        .as_deref()
-        .map(|window| format!(", converted to window-equivalent percentage points for {window}"))
-        .unwrap_or_default();
-    let mut lines = vec![format!(
-        "spend from {} to {} (UTC days, end exclusive), grouped by {grouping}{valuation_clause}{credit_clause}{window_equivalent_clause}",
+    let days = spend_window_days(report);
+    let day_label = if days == 1 { "day" } else { "days" };
+    format!(
+        "spend · {} → {} · {days} {day_label} UTC · by {grouping}",
         report.since.iso(),
-        report.until.iso()
-    )];
-    if let Some(generation) = report.metadata.ingestion_generation {
-        lines.push(format!("ingestion generation: {}", generation.get()));
+        report.until.plus_days(-1).iso(),
+    )
+}
+
+fn spend_window_days(report: &SpendReport) -> u64 {
+    let mut date = report.since;
+    let mut days = 0;
+    while date < report.until {
+        days += 1;
+        date = date.next();
     }
-    if let Some(note) = &report.stale_rate_card_note {
-        lines.push(format!("note: {note}"));
-    }
+    days
+}
+
+fn spend_sections(report: &SpendReport) -> Vec<SpendTableSection> {
     if report.groups.is_empty() {
-        lines.push(format!(
-            "no usage events in the window: {} canonical events read, {} outside it, {} undated",
-            report.ingest.events_in_window,
-            report.ingest.events_outside_window,
-            report.ingest.undated_events
+        return vec![SpendTableSection {
+            title: None,
+            rows: Vec::new(),
+        }];
+    }
+    let nested = report.grouping.len() > 1;
+    if !nested {
+        let rows = report
+            .groups
+            .iter()
+            .flat_map(|group| {
+                let mut leaves = Vec::new();
+                collect_spend_leaves(group, &mut leaves);
+                leaves
+            })
+            .map(spend_table_row)
+            .collect();
+        return vec![SpendTableSection { title: None, rows }];
+    }
+    let mut sections = Vec::new();
+    for group in &report.groups {
+        let mut leaves = Vec::new();
+        collect_spend_leaves(group, &mut leaves);
+        sections.push(SpendTableSection {
+            title: nested.then(|| {
+                format!(
+                    "{} · {}",
+                    report
+                        .grouping
+                        .first()
+                        .map(|grouping| grouping.as_str())
+                        .unwrap_or("group"),
+                    spend_group_dimension_value(group.key.as_str(), 0)
+                )
+            }),
+            rows: leaves.into_iter().map(spend_table_row).collect(),
+        });
+    }
+    sections
+}
+
+fn spend_group_has_reasoning(group: &SpendGroup) -> bool {
+    group.usage.unknown().contains_key("reasoning")
+        || group.children.iter().any(spend_group_has_reasoning)
+}
+
+fn spend_group_has_valuation(group: &SpendGroup) -> bool {
+    group.valuation.is_some() || group.children.iter().any(spend_group_has_valuation)
+}
+
+fn spend_group_has_credits(group: &SpendGroup) -> bool {
+    group.credits.is_some() || group.children.iter().any(spend_group_has_credits)
+}
+
+fn collect_spend_leaves<'a>(group: &'a SpendGroup, leaves: &mut Vec<&'a SpendGroup>) {
+    if group.children.is_empty() {
+        leaves.push(group);
+        return;
+    }
+    for child in &group.children {
+        collect_spend_leaves(child, leaves);
+    }
+}
+
+fn spend_table_row(group: &SpendGroup) -> SpendTableRow {
+    let known = group.usage.known();
+    let mut details = Vec::new();
+    if let Some(valuation) = &group.valuation {
+        details.push(format!(
+            "{}: {}",
+            group.key.as_str(),
+            spend_valuation_description(valuation)
         ));
     }
+    if let Some(credits) = &group.credits {
+        details.push(format!(
+            "{}: {}",
+            group.key.as_str(),
+            render_credits(credits)
+        ));
+    }
+    if let Some(window_equivalent) = &group.window_equivalent {
+        details.push(format!(
+            "{}: {}",
+            group.key.as_str(),
+            render_window_equivalent(window_equivalent)
+        ));
+    }
+    if let Some(term) = quality_term(group.usage.quality()) {
+        details.push(format!("{}: {}", group.key.as_str(), term.term()));
+    }
+    SpendTableRow {
+        label: fit_spend_group_key(spend_group_dimension_value(group.key.as_str(), usize::MAX)),
+        known: std::array::from_fn(|index| known.value(TokenKind::ALL[index])),
+        reasoning: group
+            .usage
+            .unknown()
+            .get("reasoning")
+            .map(|count| count.value()),
+        valuation: group.valuation.as_ref().map(spend_valuation_cell),
+        credits: group.credits.as_ref().map(spend_credits_cell),
+        partial: group.usage.coverage().missing().is_some(),
+        dim: spend_group_dimension_value(group.key.as_str(), usize::MAX).starts_with("unknown-"),
+        details,
+    }
+}
+
+fn spend_total_row(report: &SpendReport, has_reasoning: bool) -> SpendTableRow {
+    let mut known = [0_u64; 4];
+    let mut reasoning = 0_u64;
+    let mut valuation: Option<ValuationOutcome<Usd>> = None;
+    let mut credit_micros = 0_i64;
+    let mut has_credits = false;
+    let mut credits_unavailable = false;
     for group in &report.groups {
-        render_spend_group(group, 0, &mut lines);
-    }
-    for outcome in &report.filters {
-        lines.push(render_spend_filter_exclusion(outcome));
-    }
-    lines.push(render_ingest_summary(report));
-    if let Some(unmapped) = render_unmapped_models(report) {
-        lines.push(unmapped);
-    }
-    let report_text = lines.join("\n");
-    if explain == ExplainMode::Off {
-        report_text
-    } else {
-        let mut explain_text = render_explain(&report.provenance, explain);
-        let account_text = render_account_explain(report);
-        if !account_text.is_empty() {
-            explain_text.push_str("\n\n");
-            explain_text.push_str(&account_text);
+        for (index, kind) in TokenKind::ALL.into_iter().enumerate() {
+            known[index] = known[index].saturating_add(group.usage.known().value(kind));
         }
-        let priced_text = render_priced_as_explain(report);
-        if !priced_text.is_empty() {
-            explain_text.push_str("\n\n");
-            explain_text.push_str(&priced_text);
+        if let Some(count) = group.usage.unknown().get("reasoning") {
+            reasoning = reasoning.saturating_add(count.value());
         }
-        let cards_text = render_rate_cards_explain(report);
-        if !cards_text.is_empty() {
-            explain_text.push_str("\n\n");
-            explain_text.push_str(&cards_text);
+        if let Some(value) = &group.valuation {
+            valuation = Some(match valuation {
+                Some(total) => total.combine(value.clone()),
+                None => value.clone(),
+            });
         }
-        if report_text.is_empty() {
-            explain_text
+        if let Some(value) = &group.credits {
+            has_credits = true;
+            match value {
+                Derivation::Available(qualified) => {
+                    let (value, _, _, _) = qualified.clone().into_parts();
+                    credit_micros = credit_micros.saturating_add(value.micros());
+                }
+                Derivation::Unavailable { .. } => credits_unavailable = true,
+            }
+        }
+    }
+    let credits = has_credits.then(|| {
+        if credits_unavailable {
+            "—".to_string()
         } else {
-            format!("{report_text}\n\n{explain_text}")
+            render_credits_amount(Credits::from_micros(credit_micros))
+        }
+    });
+    SpendTableRow {
+        label: "total".to_string(),
+        known,
+        reasoning: has_reasoning.then_some(reasoning),
+        valuation: valuation.as_ref().map(spend_valuation_cell),
+        credits,
+        partial: false,
+        dim: false,
+        details: Vec::new(),
+    }
+}
+
+fn spend_valuation_description(value: &ValuationOutcome<crate::domain::money::Usd>) -> String {
+    match value {
+        ValuationOutcome::Complete(equivalent) => format!(
+            "API list-price equivalent ${}",
+            render_money_amount(equivalent.amount())
+        ),
+        ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
+            "API list-price equivalent unavailable".to_string()
         }
     }
+}
+
+fn spend_valuation_cell(value: &ValuationOutcome<crate::domain::money::Usd>) -> String {
+    match value {
+        ValuationOutcome::Complete(equivalent) => render_money_amount(equivalent.amount()),
+        ValuationOutcome::Incomplete {
+            known_price_subtotal,
+            ..
+        } => format!(
+            "known {}",
+            render_money_amount(known_price_subtotal.amount())
+        ),
+        ValuationOutcome::UnsupportedCurrency { .. } => "—".to_string(),
+    }
+}
+
+fn spend_credits_cell(value: &Derivation<Credits>) -> String {
+    match value {
+        Derivation::Available(qualified) => {
+            let (value, _, _, _) = qualified.clone().into_parts();
+            render_credits_amount(value)
+        }
+        Derivation::Unavailable { .. } => "—".to_string(),
+    }
+}
+
+fn spend_group_dimension_value(key: &str, index: usize) -> String {
+    let parts = key.split(" / ").collect::<Vec<_>>();
+    let part = if index == usize::MAX {
+        parts.last().copied().unwrap_or(key)
+    } else {
+        parts
+            .get(index)
+            .copied()
+            .or_else(|| parts.last().copied())
+            .unwrap_or(key)
+    };
+    part.split_once('=')
+        .map(|(_, value)| value)
+        .unwrap_or(part)
+        .to_string()
+}
+
+fn spend_grouping_label(report: &SpendReport) -> String {
+    report
+        .grouping
+        .last()
+        .map(|grouping| grouping.as_str())
+        .unwrap_or("group")
+        .to_string()
+}
+
+fn fit_spend_group_key(key: String) -> String {
+    const MAX_GROUP_KEY_WIDTH: usize = 24;
+    if key.chars().count() <= MAX_GROUP_KEY_WIDTH {
+        return key;
+    }
+    let mut shortened = key
+        .chars()
+        .take(MAX_GROUP_KEY_WIDTH - 1)
+        .collect::<String>();
+    shortened.push('…');
+    shortened
+}
+
+/// Formats token counts for the compact human table. Rounding is done before
+/// choosing the suffix, so 9,999,999 is promoted to `10.0M` rather than shown
+/// as `10000.0k`.
+pub fn format_spend_count(raw: u64) -> String {
+    if raw < 10_000 {
+        return raw.to_string();
+    }
+    if raw < 1_000_000 {
+        let tenths = (raw + 50) / 100;
+        if raw < 100_000 {
+            return format!("{}.{:01}k", tenths / 10, tenths % 10);
+        }
+        let rounded = (raw + 500) / 1_000;
+        if rounded >= 1_000 {
+            return "1.0M".to_string();
+        }
+        return format!("{rounded}k");
+    }
+    let tenths = (raw + 50_000) / 100_000;
+    format!("{}.{:01}M", tenths / 10, tenths % 10)
+}
+
+fn spend_header_line(grouping: &str, columns: &[SpendTableColumn], widths: &[usize]) -> String {
+    let mut cells = vec![grouping.to_string()];
+    cells.extend(columns.iter().map(|column| column.header().to_string()));
+    spend_join_cells(&cells, widths, false)
+}
+
+fn spend_row_line(
+    row: &SpendTableRow,
+    columns: &[SpendTableColumn],
+    widths: &[usize],
+    scales: &[SpendScale],
+    include_marker: bool,
+) -> String {
+    let mut cells = vec![row.label.clone()];
+    cells.extend(
+        columns
+            .iter()
+            .map(|column| spend_row_cell_with_scales(row, *column, scales)),
+    );
+    let full_widths = std::iter::once(widths.first().copied().unwrap_or(0))
+        .chain(widths.iter().copied().skip(1))
+        .collect::<Vec<_>>();
+    let mut line = spend_join_cells(&cells, &full_widths, true);
+    if include_marker && row.partial {
+        line.push_str("  ◐");
+    }
+    line
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpendScale {
+    Raw,
+    Kilo,
+    Mega,
+}
+
+fn spend_row_cell_with_scales(
+    row: &SpendTableRow,
+    column: SpendTableColumn,
+    scales: &[SpendScale],
+) -> String {
+    match column {
+        SpendTableColumn::Input => format_spend_scaled(row.known[0], scales.first().copied()),
+        SpendTableColumn::Output => format_spend_scaled(row.known[1], scales.get(1).copied()),
+        SpendTableColumn::CacheRead => format_spend_scaled(row.known[2], scales.get(2).copied()),
+        SpendTableColumn::CacheWrite => format_spend_scaled(row.known[3], scales.get(3).copied()),
+        SpendTableColumn::Reasoning => row
+            .reasoning
+            .map(|value| format_spend_scaled(value, scales.get(4).copied()))
+            .unwrap_or_else(|| "—".to_string()),
+        SpendTableColumn::Valuation => row.valuation.clone().unwrap_or_else(|| "—".to_string()),
+        SpendTableColumn::Credits => row.credits.clone().unwrap_or_else(|| "—".to_string()),
+    }
+}
+
+fn format_spend_scaled(raw: u64, scale: Option<SpendScale>) -> String {
+    match scale {
+        None => format_spend_count(raw),
+        Some(SpendScale::Raw) => raw.to_string(),
+        Some(SpendScale::Kilo) => {
+            if raw >= 100_000 {
+                let rounded = (raw + 500) / 1_000;
+                if rounded >= 1_000 {
+                    "1.0M".to_string()
+                } else {
+                    format!("{rounded}k")
+                }
+            } else {
+                let tenths = (raw + 50) / 100;
+                if tenths.is_multiple_of(10) {
+                    format!("{}k", tenths / 10)
+                } else {
+                    format!("{}.{:01}k", tenths / 10, tenths % 10)
+                }
+            }
+        }
+        Some(SpendScale::Mega) => {
+            let tenths = (raw + 50_000) / 100_000;
+            format!("{}.{:01}M", tenths / 10, tenths % 10)
+        }
+    }
+}
+
+fn spend_column_scales(
+    columns: &[SpendTableColumn],
+    sections: &[SpendTableSection],
+) -> Vec<SpendScale> {
+    columns
+        .iter()
+        .map(|column| match column {
+            SpendTableColumn::Input
+            | SpendTableColumn::Output
+            | SpendTableColumn::CacheRead
+            | SpendTableColumn::CacheWrite
+            | SpendTableColumn::Reasoning => {
+                let mut maximum = 0;
+                for section in sections {
+                    for row in &section.rows {
+                        let value = match column {
+                            SpendTableColumn::Input => row.known[0],
+                            SpendTableColumn::Output => row.known[1],
+                            SpendTableColumn::CacheRead => row.known[2],
+                            SpendTableColumn::CacheWrite => row.known[3],
+                            SpendTableColumn::Reasoning => row.reasoning.unwrap_or(0),
+                            SpendTableColumn::Valuation | SpendTableColumn::Credits => 0,
+                        };
+                        maximum = maximum.max(value);
+                    }
+                }
+                if maximum >= 1_000_000 {
+                    SpendScale::Mega
+                } else if maximum >= 10_000 {
+                    SpendScale::Kilo
+                } else {
+                    SpendScale::Raw
+                }
+            }
+            SpendTableColumn::Valuation | SpendTableColumn::Credits => SpendScale::Raw,
+        })
+        .collect()
+}
+
+fn spend_header_widths(grouping: &str, columns: &[SpendTableColumn]) -> Vec<usize> {
+    std::iter::once(grouping.chars().count())
+        .chain(columns.iter().map(|column| column.header().chars().count()))
+        .collect()
+}
+
+fn spend_column_widths(
+    grouping: &str,
+    columns: &[SpendTableColumn],
+    sections: &[SpendTableSection],
+    total: &SpendTableRow,
+    scales: &[SpendScale],
+) -> Vec<usize> {
+    let mut widths = spend_header_widths(grouping, columns);
+    widths[0] = widths[0].max(total.label.chars().count());
+    for section in sections {
+        for row in &section.rows {
+            widths[0] = widths[0].max(row.label.chars().count());
+        }
+    }
+    for (index, column) in columns.iter().enumerate() {
+        widths[index + 1] = widths[index + 1].max(
+            spend_row_cell_with_scales(total, *column, &[])
+                .chars()
+                .count(),
+        );
+        for section in sections {
+            for row in &section.rows {
+                widths[index + 1] = widths[index + 1].max(
+                    spend_row_cell_with_scales(row, *column, scales)
+                        .chars()
+                        .count(),
+                );
+            }
+        }
+    }
+    widths
+}
+
+fn spend_table_width(
+    grouping: &str,
+    columns: &[SpendTableColumn],
+    sections: &[SpendTableSection],
+    total: &SpendTableRow,
+    has_partial: bool,
+) -> usize {
+    let scales = spend_column_scales(columns, sections);
+    let widths = spend_column_widths(grouping, columns, sections, total, &scales);
+    spend_table_width_from_widths(&widths, has_partial)
+}
+
+fn spend_table_width_from_widths(widths: &[usize], has_partial: bool) -> usize {
+    widths.iter().sum::<usize>()
+        + widths.len().saturating_sub(1) * 2
+        + if has_partial { 3 } else { 0 }
+}
+
+fn spend_join_cells(cells: &[String], widths: &[usize], numeric: bool) -> String {
+    let mut line = String::new();
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            line.push_str("  ");
+        }
+        let width = widths.get(index).copied().unwrap_or(cell.chars().count());
+        let right = numeric && index > 0;
+        if right {
+            line.push_str(&format!("{cell:>width$}"));
+        } else {
+            line.push_str(&format!("{cell:<width$}"));
+        }
+    }
+    line.trim_end().to_string()
 }
 
 /// The vendor and model behind every group's valuation, under `--explain`.
@@ -1034,11 +1682,11 @@ fn render_unmapped_models(report: &SpendReport) -> Option<String> {
 /// never loses the gap (aub-satk).
 fn render_spend_filter_exclusion(outcome: &SpendFilterOutcome) -> String {
     format!(
-        "excluded by {}: {} sessions ({} {})",
-        outcome.filter.flag,
+        "excluded: {} sessions, of which {} {} (via {})",
         outcome.excluded.sessions,
         outcome.excluded.unknown_sessions,
         outcome.filter.dimension.unknown_bucket(),
+        outcome.filter.flag,
     )
 }
 
@@ -1151,56 +1799,6 @@ pub fn render_explain(graph: &ProvenanceGraph, mode: ExplainMode) -> String {
     lines.join("\n")
 }
 
-fn render_spend_group(group: &SpendGroup, depth: usize, lines: &mut Vec<String>) {
-    let known = group.usage.known();
-    let mut parts: Vec<String> = TokenKind::ALL
-        .iter()
-        .map(|kind| {
-            format!(
-                "{} {}",
-                token_kind_label(*kind),
-                render_count(known.value(*kind))
-            )
-        })
-        .collect();
-    for (name, count) in group.usage.unknown() {
-        parts.push(format!("{name} {}", render_count(count.value())));
-    }
-    if let Some(valuation) = &group.valuation {
-        match valuation {
-            ValuationOutcome::Complete(equiv) => {
-                parts.push(format!(
-                    "API list-price equivalent ${}",
-                    render_money_amount(equiv.amount())
-                ));
-            }
-            ValuationOutcome::Incomplete { .. } | ValuationOutcome::UnsupportedCurrency { .. } => {
-                parts.push("API list-price equivalent unavailable".to_string());
-            }
-        }
-    }
-    if let Some(credits) = &group.credits {
-        parts.push(render_credits(credits));
-    }
-    if let Some(window_equivalent) = &group.window_equivalent {
-        parts.push(render_window_equivalent(window_equivalent));
-    }
-    let qualification = match quality_term(group.usage.quality()) {
-        Some(term) => term,
-        None => coverage_term(group.usage.coverage()),
-    };
-    lines.push(format!(
-        "{}{}  {} ({})",
-        "  ".repeat(depth),
-        group.key.as_str(),
-        parts.join(" · "),
-        qualification.term()
-    ));
-    for child in &group.children {
-        render_spend_group(child, depth + 1, lines);
-    }
-}
-
 /// The credit term of a spend line: the qualified amount, or the refusal naming
 /// every fact it is missing. A refusal is rendered next to the tokens rather than
 /// in place of them, so a window whose credits cannot be derived still reports the
@@ -1299,39 +1897,25 @@ fn token_kind_label(kind: TokenKind) -> &'static str {
     }
 }
 
-fn render_ingest_summary(report: &SpendReport) -> String {
+fn render_spend_ingest_footer(report: &SpendReport) -> String {
     let ingest = &report.ingest;
     let quarantined: u64 = ingest.quarantined_by_class.values().sum();
-    let by_class = ingest
-        .quarantined_by_class
-        .iter()
-        .map(|(class, count)| format!("{class} {count}"))
-        .collect::<Vec<_>>()
-        .join(", ");
     let mut line = format!(
-        "ingest: {} files read, {} skipped (unchanged before the window), {} unreadable · {} canonical events in window, {} outside, {} undated · {} replayed occurrences, {} collisions, {} without identity · {} quarantined",
-        ingest.files_read,
-        ingest.files_skipped_before_window,
-        ingest.unreadable_files.len(),
+        "{} events · {} files read · {} quarantined · generation {}",
         ingest.events_in_window,
-        ingest.events_outside_window,
-        ingest.undated_events,
-        ingest.replayed_occurrences,
-        ingest.collisions,
-        ingest.without_identity,
-        quarantined
+        ingest.files_read,
+        quarantined,
+        report
+            .metadata
+            .ingestion_generation
+            .map(|generation| generation.get().to_string())
+            .unwrap_or_else(|| "unknown".to_string())
     );
     if ingest.refresh_attempted {
         line.push_str(" · refresh requested");
     }
     if let Some(failure) = &ingest.refresh_failure {
         line.push_str(&format!(" · refresh incomplete: {failure}"));
-    }
-    if !by_class.is_empty() {
-        line.push_str(&format!(" ({by_class})"));
-    }
-    for file in &ingest.unreadable_files {
-        line.push_str(&format!("\nunreadable: {file}"));
     }
     line
 }
@@ -4500,7 +5084,7 @@ mod tests {
         );
         assert_eq!(
             render_spend_filter_exclusion(&outcome),
-            "excluded by --account: 3 sessions (2 unknown-account)"
+            "excluded: 3 sessions, of which 2 unknown-account (via --account)"
         );
 
         let spend_report = |filters: Vec<SpendFilterOutcome>| {
@@ -4526,11 +5110,11 @@ mod tests {
         let rendered = render_spend_report(&spend_report(vec![outcome.clone()]));
         let filter_line = rendered
             .lines()
-            .position(|line| line.starts_with("excluded by --account:"))
+            .position(|line| line.contains("excluded: 3 sessions, of which 2 unknown-account"))
             .expect("the filter footer is present for an active filter");
         let ingest_line = rendered
             .lines()
-            .position(|line| line.starts_with("ingest:"))
+            .position(|line| line.contains("5 events · 1 files read"))
             .expect("the ingest line is always present");
         assert!(
             filter_line < ingest_line,
@@ -4539,7 +5123,7 @@ mod tests {
 
         let no_filter = render_spend_report(&spend_report(Vec::new()));
         assert!(
-            !no_filter.contains("excluded by"),
+            !no_filter.contains("excluded:"),
             "a filter-free report carries no filter footer: {no_filter}"
         );
 
@@ -4558,5 +5142,323 @@ mod tests {
         assert_eq!(first["excluded"]["events"], 5);
         assert_eq!(first["excluded"]["unknown_sessions"], 2);
         assert_eq!(first["excluded"]["unknown_events"], 4);
+    }
+
+    fn golden_usage(
+        input: u64,
+        output: u64,
+        cache_read: u64,
+        cache_write: u64,
+        reasoning: Option<u64>,
+        partial: bool,
+    ) -> UsageVector {
+        let mut unknown = std::collections::BTreeMap::new();
+        if let Some(reasoning) = reasoning {
+            unknown.insert(
+                "reasoning".to_string(),
+                crate::domain::tokens::TokenCount::new(reasoning),
+            );
+        }
+        let coverage = if partial {
+            CoverageCompleteness::partial([crate::evidence::ComponentKind::new("cache-write")])
+        } else {
+            CoverageCompleteness::Complete
+        };
+        UsageVector::new(
+            crate::domain::tokens::KnownTokenVector::new(
+                crate::domain::tokens::InputTokens::new(input),
+                crate::domain::tokens::OutputTokens::new(output),
+                crate::domain::tokens::CacheReadTokens::new(cache_read),
+                crate::domain::tokens::CacheWriteTokens::new(cache_write),
+            ),
+            unknown,
+            coverage,
+            crate::evidence::EvidenceQuality::Measured,
+        )
+    }
+
+    fn golden_group(key: &str, usage: UsageVector) -> SpendGroup {
+        let manifest = crate::domain::provenance::ProvenanceManifest::new(
+            [],
+            [],
+            crate::domain::provenance::QuerySemantics::new("spend", "golden"),
+        );
+        SpendGroup::new(
+            crate::logging::LogicalName::new(key),
+            usage,
+            crate::evidence::Provenance::new([] as [String; 0]),
+            crate::domain::provenance::DerivationId::from_manifest(&manifest),
+        )
+    }
+
+    fn golden_report(
+        since: &str,
+        until: &str,
+        grouping: Vec<crate::report::SpendGrouping>,
+        groups: Vec<SpendGroup>,
+        files_read: u64,
+        events_in_window: u64,
+    ) -> SpendReport {
+        SpendReport::new(
+            crate::report::ReportMetadata::new(
+                UtcTimestamp::from_unix_nanos(1_000),
+                UtcTimestamp::from_unix_nanos(1_000),
+                crate::report::LedgerGeneration::new(1),
+                Some(crate::report::IngestionGeneration::new(148)),
+            ),
+            crate::domain::time::UtcDate::parse(since).unwrap(),
+            crate::domain::time::UtcDate::parse(until).unwrap(),
+            groups,
+            Vec::new(),
+            crate::report::IngestSummary {
+                files_read,
+                events_in_window,
+                ..Default::default()
+            },
+        )
+        .with_grouping(grouping)
+    }
+
+    fn single_golden_report() -> SpendReport {
+        golden_report(
+            "2026-09-01",
+            "2026-09-08",
+            vec![crate::report::SpendGrouping::Day],
+            vec![
+                golden_group(
+                    "day=2026-09-01",
+                    golden_usage(2_100_000, 310_000, 38_200_000, 900_000, Some(12_000), false),
+                ),
+                golden_group(
+                    "day=2026-09-02",
+                    golden_usage(
+                        3_660_000,
+                        373_600,
+                        75_060_000,
+                        1_400_000,
+                        Some(23_200),
+                        false,
+                    ),
+                ),
+                golden_group(
+                    "day=2026-09-03",
+                    golden_usage(
+                        3_660_000,
+                        373_600,
+                        75_060_000,
+                        1_400_000,
+                        Some(23_200),
+                        false,
+                    ),
+                ),
+                golden_group(
+                    "day=2026-09-04",
+                    golden_usage(
+                        3_660_000,
+                        373_600,
+                        75_060_000,
+                        1_400_000,
+                        Some(23_200),
+                        false,
+                    ),
+                ),
+                golden_group(
+                    "day=2026-09-05",
+                    golden_usage(
+                        3_660_000,
+                        373_600,
+                        75_060_000,
+                        1_400_000,
+                        Some(23_200),
+                        false,
+                    ),
+                ),
+                golden_group(
+                    "day=2026-09-06",
+                    golden_usage(
+                        3_660_000,
+                        373_600,
+                        75_060_000,
+                        1_400_000,
+                        Some(23_200),
+                        false,
+                    ),
+                ),
+                golden_group(
+                    "day=2026-09-07",
+                    golden_usage(
+                        11_000_000,
+                        722_000,
+                        198_500_000,
+                        3_300_000,
+                        Some(82_000),
+                        true,
+                    ),
+                ),
+            ],
+            8,
+            1_085,
+        )
+    }
+
+    fn nested_golden_report() -> SpendReport {
+        let max_children = vec![
+            golden_group(
+                "account=max / day=2026-09-01",
+                golden_usage(2_100_000, 310_000, 38_200_000, 900_000, None, false),
+            ),
+            golden_group(
+                "account=max / day=2026-09-02",
+                golden_usage(10_900_000, 412_000, 160_300_000, 2_400_000, None, false),
+            ),
+        ];
+        let codex_children = vec![golden_group(
+            "account=codex / day=2026-09-01",
+            golden_usage(1_000_000, 70_000, 4_000_000, 800_000, None, false),
+        )];
+        golden_report(
+            "2026-09-01",
+            "2026-09-03",
+            vec![
+                crate::report::SpendGrouping::Account,
+                crate::report::SpendGrouping::Day,
+            ],
+            vec![
+                golden_group(
+                    "account=max",
+                    golden_usage(13_000_000, 722_000, 198_500_000, 3_300_000, None, false),
+                )
+                .with_children(max_children),
+                golden_group(
+                    "account=codex",
+                    golden_usage(1_000_000, 70_000, 4_000_000, 800_000, None, false),
+                )
+                .with_children(codex_children),
+            ],
+            8,
+            1_085,
+        )
+    }
+
+    fn partial_golden_report() -> SpendReport {
+        golden_report(
+            "2026-09-01",
+            "2026-09-02",
+            vec![crate::report::SpendGrouping::Day],
+            vec![golden_group(
+                "day=2026-09-01",
+                golden_usage(11_000, 722_000, 198_500_000, 3_300_000, Some(82_000), true),
+            )],
+            2,
+            3,
+        )
+    }
+
+    fn narrow_golden_report() -> SpendReport {
+        golden_report(
+            "2026-09-01",
+            "2026-09-02",
+            vec![crate::report::SpendGrouping::Day],
+            vec![golden_group(
+                "day=2026-09-01-with-a-very-long-group-key",
+                golden_usage(
+                    11_000_000,
+                    722_000,
+                    198_500_000,
+                    3_300_000,
+                    Some(82_000),
+                    false,
+                ),
+            )],
+            1,
+            1,
+        )
+    }
+
+    fn normalized_golden(text: &str) -> String {
+        text.lines()
+            .map(str::trim_end)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn assert_spend_golden(name: &str, rendered: String, expected: &str) {
+        assert!(
+            rendered.lines().all(|line| line.chars().count() == 80),
+            "{name} box line is not 80 columns:\n{rendered}"
+        );
+        assert_eq!(
+            normalized_golden(&rendered),
+            expected.trim_end(),
+            "{name} spend golden changed"
+        );
+    }
+
+    #[test]
+    fn spend_single_box_golden_matches_the_seven_day_fixture() {
+        assert_spend_golden(
+            "single",
+            render_spend_report(&single_golden_report()),
+            include_str!("../../tests/fixtures/presentation/spend_box_single.txt"),
+        );
+    }
+
+    #[test]
+    fn spend_nested_box_golden_matches_the_two_account_fixture() {
+        assert_spend_golden(
+            "nested",
+            render_spend_report(&nested_golden_report()),
+            include_str!("../../tests/fixtures/presentation/spend_box_nested.txt"),
+        );
+    }
+
+    #[test]
+    fn spend_partial_box_golden_matches_the_marker_fixture() {
+        assert_spend_golden(
+            "partial",
+            render_spend_report(&partial_golden_report()),
+            include_str!("../../tests/fixtures/presentation/spend_box_partial.txt"),
+        );
+    }
+
+    #[test]
+    fn spend_narrow_box_golden_matches_the_column_drop_fixture() {
+        assert_spend_golden(
+            "narrow",
+            render_spend_box_at_width(&narrow_golden_report(), Style::plain(), 60),
+            include_str!("../../tests/fixtures/presentation/spend_box_narrow.txt"),
+        );
+    }
+
+    #[test]
+    fn spend_command_docs_show_the_box_example() {
+        let docs = include_str!("../../docs/commands.md");
+        assert!(docs.contains("Text output is a bordered table."));
+        assert!(docs.contains("┌─ spend · 2026-09-01 → 2026-09-07 · 7 days UTC · by day"));
+        assert!(docs.contains("1085 events · 8 files read · 0 quarantined · generation 148"));
+    }
+
+    #[test]
+    fn spend_key_truncation_and_column_drop_order_are_stable() {
+        let narrow = narrow_golden_report();
+        let at_80 = render_spend_box_at_width(&single_golden_report(), Style::plain(), 80);
+        let at_70 = render_spend_box_at_width(&narrow, Style::plain(), 70);
+        let at_60 = render_spend_box_at_width(&narrow, Style::plain(), 60);
+
+        assert!(at_80.contains("reasoning"));
+        assert!(at_70.contains("reasoning column hidden: width"));
+        assert!(!at_70.contains("cache write column hidden: width"));
+        assert!(at_60.contains("reasoning column hidden: width"));
+        assert!(at_60.contains("cache write column hidden: width"));
+        assert!(at_60.contains("2026-09-01-with-a-very-…"));
+    }
+
+    #[test]
+    fn spend_count_boundaries_are_promoted_before_the_suffix_is_selected() {
+        assert_eq!(format_spend_count(9_999), "9999");
+        assert_eq!(format_spend_count(10_000), "10.0k");
+        assert_eq!(format_spend_count(999_999), "1.0M");
+        assert_eq!(format_spend_count(9_999_999), "10.0M");
+        assert_eq!(format_spend_count(198_471_956), "198.5M");
     }
 }

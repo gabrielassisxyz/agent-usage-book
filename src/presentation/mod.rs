@@ -31,15 +31,16 @@ pub use json::{
 };
 pub use precision::{CREDITS, MONEY, PERCENT, TOKENS};
 pub use render::{
-    ExplainMode, LimitingWindowDisplay, format_number, render_age, render_attribution_quality,
-    render_calibrate_activate_report, render_calibrate_compare_report,
+    ExplainMode, LimitingWindowDisplay, format_number, format_spend_count, render_age,
+    render_attribution_quality, render_calibrate_activate_report, render_calibrate_compare_report,
     render_calibrate_history_report, render_calibrate_promote_report, render_calibrate_show_entry,
     render_calibrate_show_report, render_can_run_report, render_clear_diagnostics,
     render_coverage_report, render_doctor_drift_report, render_doctor_report, render_explain,
     render_failure_class, render_fix_report, render_meter_reading, render_now_report,
     render_now_report_with_explain, render_percentage, render_quantity, render_reconciliation,
-    render_spend_report, render_spend_report_with_explain, render_stale_reason,
-    render_status_report, render_status_report_with_explain, render_total,
+    render_spend_report, render_spend_report_with_explain,
+    render_spend_report_with_explain_and_style, render_stale_reason, render_status_report,
+    render_status_report_with_explain, render_total,
 };
 pub use style::Style;
 pub use vocabulary::{Qualification, coverage_term, quality_term};

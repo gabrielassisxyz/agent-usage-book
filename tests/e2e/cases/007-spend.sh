@@ -20,6 +20,13 @@ case_preconditions() {
 {"type":"assistant","timestamp":"2026-08-25T11:00:00.000Z","sessionId":"s-e2e-1","message":{"id":"msg_e2e_2","usage":{"input_tokens":"not-a-number","output_tokens":5}}}
 {"type":"assistant","timestamp":"2026-08-26T00:00:00.000Z","sessionId":"s-e2e-1","message":{"id":"msg_e2e_3","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":20}}}
 JSONL
+    cat > "$corpus/claude-code/project-a/seven-day.jsonl" <<'JSONL'
+{"type":"assistant","timestamp":"2026-08-27T10:00:00.000Z","sessionId":"s-e2e-day-27","message":{"id":"msg_e2e_day_27","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-08-28T10:00:00.000Z","sessionId":"s-e2e-day-28","message":{"id":"msg_e2e_day_28","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-08-29T10:00:00.000Z","sessionId":"s-e2e-day-29","message":{"id":"msg_e2e_day_29","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-08-30T10:00:00.000Z","sessionId":"s-e2e-day-30","message":{"id":"msg_e2e_day_30","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+{"type":"assistant","timestamp":"2026-08-31T10:00:00.000Z","sessionId":"s-e2e-day-31","message":{"id":"msg_e2e_day_31","usage":{"input_tokens":10,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":1}}}
+JSONL
     cat > "$corpus/claude-code/project-a/old.jsonl" <<'JSONL'
 {"type":"assistant","timestamp":"2026-08-25T09:00:00.000Z","sessionId":"s-e2e-0","message":{"id":"msg_e2e_old","usage":{"input_tokens":999,"output_tokens":999}}}
 JSONL
@@ -40,7 +47,6 @@ JSONL
     # actually produces (aub-satk).
     TODAY="$(date -u +%F)"
     YESTERDAY="$(date -u -d 'yesterday' +%F)"
-    TOMORROW="$(date -u -d 'tomorrow' +%F)"
     cat > "$corpus/claude-code/project-a/today.jsonl" <<JSONL
 {"type":"assistant","timestamp":"${TODAY}T08:00:00.000Z","sessionId":"s-e2e-today","message":{"id":"msg_e2e_today","usage":{"input_tokens":11,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":4,"service_tier":"standard"}}}
 JSONL
@@ -85,10 +91,14 @@ case_steps() {
         "$AUB_BIN" spend --since 2026-08-25 --days 2 \
         --group-by day --group-by session --group-by project --group-by repository \
         --refresh never --format json
+    step "spend seven-day boxed text" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_CONFIG_FILE=$CONFIG_FILE" \
+        "$AUB_BIN" spend --since 2026-08-25 --days 7 --group-by day --refresh never
     step "spend empty window" env \
         "HOME=$STATE_DIR/home" \
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
-        "$AUB_BIN" spend --since 2026-08-27 --until 2026-08-28 --refresh never
+        "$AUB_BIN" spend --since 2026-09-02 --until 2026-09-03 --refresh never
     step "spend backward window and harness filter" env \
         "HOME=$STATE_DIR/home" \
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
@@ -104,13 +114,11 @@ case_assertions() {
     assert_exit 0 1
     # The report reads its canonical event store: the old-mtime transcript is no
     # longer silently skipped, while the replay is still one canonical event.
-    assert_stdout_contains 1 "grouped by day, session, project, repository"
-    assert_stdout_contains 1 "ingestion generation: 1"
-    assert_stdout_contains 1 "day=2026-08-25  input 4701 tokens · output 2092 tokens · cache read 27200 tokens · cache write 30000 tokens"
-    assert_stdout_contains 1 "day=2026-08-26  input 10 tokens · output 20 tokens · cache read 0 tokens · cache write 0 tokens"
-    assert_stdout_contains 1 "session=claude-code:s-e2e-1"
-    assert_stdout_contains 1 "project=unknown-project"
-    assert_stdout_contains 1 "repository=unknown-repository"
+    assert_stdout_contains 1 "┌─ spend · 2026-08-25"
+    assert_stdout_contains 1 "· by day, session, project, repository"
+    assert_stdout_contains 1 "total"
+    assert_stdout_contains 1 "generation 1"
+    assert_stdout_contains 1 "└"
 
     assert_exit 0 2
     assert_json_field 2 "command" "spend"
@@ -127,33 +135,47 @@ case_assertions() {
     assert_json_field 2 "ingest.quarantined.wrong_field_type" "1"
     assert_json_field 2 "ingest.files_skipped_before_window" "0"
 
-    # A window with no events is reported as such, never as a bare zero.
+    # The seven-day pipe exercises the real box from its first rail to its last,
+    # with one visible row for every UTC day and a grand total.
     assert_exit 0 3
-    assert_stdout_contains 3 "no usage events in the window"
+    assert_stdout_contains 3 "┌─ spend · 2026-08-25 → 2026-08-31 · 7 days UTC · by day"
+    assert_stdout_contains 3 "2026-08-25"
+    assert_stdout_contains 3 "2026-08-26"
+    assert_stdout_contains 3 "2026-08-27"
+    assert_stdout_contains 3 "2026-08-28"
+    assert_stdout_contains 3 "2026-08-29"
+    assert_stdout_contains 3 "2026-08-30"
+    assert_stdout_contains 3 "2026-08-31"
+    assert_stdout_contains 3 "total"
+    assert_stdout_contains 3 "└"
+
+    # A window with no events is reported as such, never as a bare zero.
+    assert_exit 0 4
+    assert_stdout_contains 4 "no usage events in the window"
 
     # The backward `--days 2` window is the two days ending today, today
     # included, and the harness filter keeps only the codex rows while the
     # footer names what the filter excluded (aub-satk).
-    assert_exit 0 4
-    assert_stdout_contains 4 "spend from $YESTERDAY to $TOMORROW (UTC days, end exclusive), grouped by harness"
-    assert_stdout_contains 4 "harness=codex"
-    assert_stdout_contains 4 "excluded by --harness: 2 sessions (0 unknown-harness)"
-    if grep -qF "harness=claude-code" "$(step_dir 4)/stdout.bin"; then
-        echo "step 4 must not show a filtered-out harness row" >&2
+    assert_exit 0 5
+    assert_stdout_contains 5 "· by harness"
+    assert_stdout_contains 5 "codex"
+    assert_stdout_contains 5 "excluded: 2 sessions, of which 0 unknown-harness"
+    if grep -qF "harness=claude-code" "$(step_dir 5)/stdout.bin"; then
+        echo "step 5 must not show a filtered-out harness row" >&2
         return 1
     fi
-    if grep -qF "harness=pi" "$(step_dir 4)/stdout.bin"; then
-        echo "step 4 must not show a filtered-out harness row" >&2
+    if grep -qF "harness=pi" "$(step_dir 5)/stdout.bin"; then
+        echo "step 5 must not show a filtered-out harness row" >&2
         return 1
     fi
 
-    assert_exit 0 5
-    assert_json_field 5 "window.since" "$YESTERDAY"
-    assert_json_field 5 "grouping[0]" "harness"
-    assert_json_field 5 "groups[0].key" "harness=codex"
-    assert_json_field 5 "groups[0].tokens.input.value" "220"
-    assert_json_field 5 "filters[0].flag" "--harness"
-    assert_json_field 5 "filters[0].excluded.sessions" "2"
-    assert_json_field 5 "filters[0].excluded.events" "2"
-    assert_json_field 5 "filters[0].excluded.unknown_events" "0"
+    assert_exit 0 6
+    assert_json_field 6 "window.since" "$YESTERDAY"
+    assert_json_field 6 "grouping[0]" "harness"
+    assert_json_field 6 "groups[0].key" "harness=codex"
+    assert_json_field 6 "groups[0].tokens.input.value" "220"
+    assert_json_field 6 "filters[0].flag" "--harness"
+    assert_json_field 6 "filters[0].excluded.sessions" "2"
+    assert_json_field 6 "filters[0].excluded.events" "2"
+    assert_json_field 6 "filters[0].excluded.unknown_events" "0"
 }

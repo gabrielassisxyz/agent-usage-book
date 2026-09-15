@@ -109,6 +109,29 @@ is the transcript namespace the config named (`claude-code`, `codex`, `pi`,
 `opencode`) and `model` is the model id the transcript stored; usage neither
 field names lands in the `unknown-harness` or `unknown-model` bucket.
 
+Text output is a bordered table. Counts use compact human units in the table;
+`--format json` and `--value api-list` retain exact quantities.
+
+```text
+┌─ spend · 2026-09-01 → 2026-09-07 · 7 days UTC · by day ─────────────────────┐
+│                                                                             │
+│  day          input   output   cache read   cache write   reasoning        │
+│  ───────────────────────────────────────────────────────────────────────    │
+│  2026-09-01   2.1M     310k       38.2M         0.9M          12k          │
+│  2026-09-07  11.0M     722k      198.5M         3.3M          82k  ◐       │
+│  ───────────────────────────────────────────────────────────────────────    │
+│  total       31.4M     2.9M      612.0M        11.2M         210k          │
+│                                                                             │
+│  ◐ partial: day still in progress                                           │
+│  1085 events · 8 files read · 0 quarantined · generation 148               │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+The box uses the terminal width from the style layer, with an 80-column
+minimum and a 120-column maximum. On a narrow terminal it drops `reasoning`
+first and then `cache write`, and says which columns were hidden in the footer.
+Nested groupings get an accent section title and a table per outer group.
+
 Every dimension except `day` has a filter flag of the same name: `--harness`,
 `--account`, `--project`, `--repo`, `--task`, `--model` and `--session`, where
 `--repo` is the flag for the repository dimension and the `--group-by
@@ -117,8 +140,9 @@ values are OR-ed; different flags combine with AND. A filter that would hide an
 `unknown-*` bucket does not hide it silently: every active filter reports, in
 the footer, how many sessions and events it excluded and how many of those were
 in the dimension's `unknown-*` bucket, one line per filter in the order the
-flags were given, for example `excluded by --account: 3 sessions (2
-unknown-account)`. The JSON carries the same record per filter under `filters[]`.
+flags were given, for example `excluded: 3 sessions, of which 2
+unknown-account (via --account)`. The JSON carries the same record per filter
+under `filters[]`.
 
 The window is read the way people say it (UTC days, end exclusive):
 
