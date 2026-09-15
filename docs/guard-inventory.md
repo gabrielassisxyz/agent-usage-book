@@ -166,7 +166,7 @@ e-06	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/013-coverage.sh	s/assert_exit 6 1
 e-07	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/017-now.sh	s/aub work-primary ? · stale/aub work-primary ? · fresh/		stale|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-08	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/013-status-projection.sh	s/assert_stdout_contains 1 "62%"/assert_stdout_contains 1 "63%"/		62%|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-09	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/013-restore-drill.sh	s/drill: passed=true/drill: passed=false/		passed|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
-e-10	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/007-spend.sh	s/input 4701 tokens/input 4702 tokens/		4701|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
+e-10	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/007-spend.sh	s/+4701 +2092/+4702 +2092/		4701|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-11	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/018-task.sh	s/events_inserted=1/events_inserted=2/		events_inserted|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-12	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/023-calibrate-controlled-experiment.sh	141s/assert_exit 0 3/assert_exit 1 3/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-13	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/026-can-run.sh	244s/assert_exit 0 1/assert_exit 1 1/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
