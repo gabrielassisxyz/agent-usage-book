@@ -135,11 +135,10 @@ case_assertions() {
     # A conversion and a refusal side by side, with the tokens intact in both.
     assert_exit 0 6
     assert_stdout_contains 6 "credits anthropic-claude-messages-v1"
-    assert_stdout_contains 6 "s-credits-clean"
-    assert_stdout_contains 6 "session=claude-code:s-credits-clean: 0.65 credits (complete)"
-    assert_stdout_contains 6 "s-credits-unknown"
-    assert_stdout_contains 6 "credits unavailable: unknown component: tool_use_tokens"
-    assert_stdout_matches 6 "^│  claude-code:s-credits-u… +1k "
+    assert_stdout_matches 6 "^│  claude-code:s-credits-c… +100\\.0k +20\\.0k +50\\.0k +10\\.0k +0\\.65 "
+    assert_row_detail_contains 6 "^│  claude-code:s-credits-c… " "0.65 credits (complete)"
+    assert_stdout_matches 6 "^│  claude-code:s-credits-u… +1000 +200 "
+    assert_row_detail_contains 6 "^│  claude-code:s-credits-u… " "credits unavailable: unknown component: tool_use_tokens"
 
     assert_exit 0 7
     assert_json_field 7 "credit_model" "anthropic-claude-messages-v1"
@@ -163,11 +162,11 @@ case_assertions() {
     assert_exit 0 10
     assert_stdout_contains 10 "credits anthropic-claude-messages-incomplete-v1"
     assert_stdout_contains 10 "credits unavailable: cache_write rate"
-    assert_stdout_matches 10 "^│  claude-code:s-credits-c… +100k +20k +50k +10k "
+    assert_stdout_matches 10 "^│  claude-code:s-credits-c… +100\\.0k +20\\.0k +50\\.0k +10\\.0k "
 
     # Token reporting is unchanged when nobody asks for credits.
     assert_exit 0 11
-    assert_stdout_matches 11 "^│  claude-code:s-credits-c… +100k +20k +50k +10k +│\$"
+    assert_stdout_matches 11 "^│  claude-code:s-credits-c… +100\\.0k +20\\.0k +50\\.0k +10\\.0k +│\$"
 
     # The command names the two published ids rather than defaulting to one.
     assert_exit 2 12

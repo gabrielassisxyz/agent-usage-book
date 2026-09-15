@@ -265,6 +265,32 @@ assert_stdout_matches() {
     fi
 }
 
+# assert_row_detail_contains STEP ROW_ERE TEXT: the detail lines indented under
+# the first boxed table row matching ROW_ERE, rails stripped and joined by one
+# space, contain TEXT. A detail line names no group key, so its position under
+# the row is what attributes it, and a wrapped detail still reads as one line.
+assert_row_detail_contains() {
+    local step="$1" row="$2" text="$3" details
+    details="$(awk -v row="$row" '
+        found && /^│    / {
+            line = $0
+            sub(/^│ +/, "", line)
+            sub(/ +│$/, "", line)
+            joined = joined (joined == "" ? "" : " ") line
+            next
+        }
+        found { exit }
+        $0 ~ row { found = 1 }
+        END { print joined }
+    ' "$(step_dir "$step")/stdout.bin")"
+    if [[ "$details" == *"$text"* ]]; then
+        record_assertion "assert_row_detail_contains step $step" "under:$row:$text" "under:$row:$text" "pass"
+    else
+        record_assertion "assert_row_detail_contains step $step" "under:$row:$text" "details:$details" "fail"
+        CASE_FAILED=1
+    fi
+}
+
 # assert_stderr_contains STEP TEXT: the step's stderr contains TEXT.
 assert_stderr_contains() {
     local step="$1" text="$2"

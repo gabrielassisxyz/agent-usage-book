@@ -148,16 +148,17 @@ case_assertions() {
     # 2. Unvalued spend is complete and omits valuation
     assert_exit 0 2
     assert_stdout_contains 2 "· by session"
-    assert_stdout_matches 2 "^│  claude-code:s-val-1 +100k +10k +20k +10k +│\$"
-    assert_stdout_matches 2 "^│  claude-code:s-val-2 +100k +10k +20k +10k +│\$"
+    assert_stdout_matches 2 "^│  claude-code:s-val-1 +100\\.0k +10\\.0k +20\\.0k +10\\.0k +│\$"
+    assert_stdout_matches 2 "^│  claude-code:s-val-2 +100\\.0k +10\\.0k +20\\.0k +10\\.0k +│\$"
 
     # 3. Valued spend text adds valuation column, renders unavailable form for missing cache-write price, and neither prints $0.00
     assert_exit 0 3
     assert_stdout_contains 3 "· by session"
     assert_stdout_contains 3 "valued at API list-price equivalent"
-    assert_stdout_contains 3 'session=claude-code:s-val-1: API list-price equivalent $0.49'
-    assert_stdout_contains 3 "session=claude-code:s-val-2: API list-price equivalent unavailable"
-    assert_stdout_matches 3 "^│  claude-code:s-val-1 +100k +10k +20k +10k +0\\.49 "
+    # --value api-list keeps exact integers in the count cells.
+    assert_stdout_matches 3 "^│  claude-code:s-val-1 +100000 +10000 +20000 +10000 +0\\.49 "
+    assert_row_detail_contains 3 "^│  claude-code:s-val-1 " 'API list-price equivalent $0.49'
+    assert_row_detail_contains 3 "^│  claude-code:s-val-2 " "API list-price equivalent unavailable"
 
     # 4. Valued spend JSON includes rate_card_version and api_list_price_equivalent
     assert_exit 0 4

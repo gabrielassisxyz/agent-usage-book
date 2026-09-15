@@ -115,8 +115,13 @@ case_assertions() {
     # The report reads its canonical event store: the old-mtime transcript is no
     # longer silently skipped, while the replay is still one canonical event.
     assert_stdout_contains 1 "┌─ spend · 2026-08-25"
-    assert_stdout_contains 1 "· by day, session, project, repository"
-    assert_stdout_matches 1 "^│  total +4711 +2112 +27\\.2k +30\\.0k "
+    # Four dimensions: the day titles each section and every row names its
+    # session and project, which the innermost-only label used to drop.
+    assert_stdout_contains 1 "· by day, session, project"
+    assert_stdout_contains 1 "│  day · 2026-08-25"
+    assert_stdout_matches 1 "^│  session · project · repository +input "
+    assert_stdout_matches 1 "^│  claude-code:s-e2e-1 · unknown-project · [^ ]+ +2 +913 +26\\.0k "
+    assert_stdout_matches 1 "^│  total +4711 +2112 +27\\.2k "
     assert_stdout_contains 1 "generation 1"
     assert_stdout_contains 1 "└"
 
@@ -139,7 +144,7 @@ case_assertions() {
     # with one visible row for every UTC day and a grand total.
     assert_exit 0 3
     assert_stdout_contains 3 "┌─ spend · 2026-08-25 → 2026-08-31 · 7 days UTC · by day"
-    assert_stdout_matches 3 "^│  2026-08-25 +4701 +2092 +27\\.2k +30k "
+    assert_stdout_matches 3 "^│  2026-08-25 +4701 +2092 +27\\.2k +30\\.0k "
     assert_stdout_matches 3 "^│  2026-08-26 +10 +20 "
     assert_stdout_matches 3 "^│  2026-08-27 +10 +1 "
     assert_stdout_matches 3 "^│  2026-08-28 +10 +1 "

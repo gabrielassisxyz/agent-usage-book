@@ -132,14 +132,15 @@ case_assertions() {
     # percentage-point total; the two known account children each convert.
     assert_exit 0 6
     assert_stdout_contains 6 "converted to window-equivalent percentage points for five_hour"
-    assert_stdout_matches 6 "^│  total +1\\.5M "
-    assert_stdout_contains 6 "day=2026-08-25 / account=work"
-    assert_stdout_contains 6 "window equivalent [3.0000, 3.0000] percentage points"
-    assert_stdout_contains 6 "day=2026-08-25 / account=research"
-    assert_stdout_contains 6 "window equivalent [15.0000, 15.0000] percentage points"
-    assert_stdout_contains 6 "account=unknown-account"
-    assert_stdout_contains 6 "window equivalent unavailable: account attribution"
-    assert_stdout_contains 6 "3.00 credits"
+    assert_stdout_matches 6 "^│  total +1500\\.0k +1000\\.0k "
+    assert_stdout_contains 6 "│  day · 2026-08-25"
+    assert_stdout_matches 6 "^│  work +1000\\.0k +0 "
+    assert_row_detail_contains 6 "^│  work " "window equivalent [3.0000, 3.0000] percentage points"
+    assert_row_detail_contains 6 "^│  work " "3.00 credits"
+    assert_stdout_matches 6 "^│  research +0 +1000\\.0k "
+    assert_row_detail_contains 6 "^│  research " "window equivalent [15.0000, 15.0000] percentage points"
+    assert_stdout_matches 6 "^│  unknown-account +500\\.0k "
+    assert_row_detail_contains 6 "^│  unknown-account " "window equivalent unavailable: account attribution"
 
     assert_exit 0 7
     assert_json_field 7 "window_equivalent_window" "five_hour"
@@ -152,7 +153,7 @@ case_assertions() {
     assert_stdout_contains 7 '"arithmetic":"converted from credits to percentage_points"'
 
     assert_exit 0 8
-    assert_stdout_contains 8 "window equivalent unavailable: active calibration for provider anthropic and window thirty_day"
+    assert_row_detail_contains 8 "^│  research " "window equivalent unavailable: active calibration for provider anthropic and window thirty_day"
     assert_stdout_contains 8 "credits"
     assert_stdout_contains 8 "input"
 
