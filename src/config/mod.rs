@@ -648,7 +648,7 @@ const CREDENTIAL_PROFILE_KEYS: &[&str] = &["kind", "ref"];
 const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const CREDENTIAL_ENV_KEYS: &[&str] = &["kind", "name"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
-const MODEL_KEYS: &[&str] = &["pattern", "vendor", "model"];
+const MODEL_KEYS: &[&str] = &["pattern", "vendor", "model", "name"];
 const TRACKER_KEYS: &[&str] = &["kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &[
@@ -890,8 +890,8 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
                     ));
                 };
                 check_keys(entry, MODEL_KEYS, "models[]", file_display)?;
-                for key in MODEL_KEYS {
-                    match entry.get(*key) {
+                for key in ["pattern", "vendor", "model"] {
+                    match entry.get(key) {
                         Some(toml::Value::String(_)) => {}
                         Some(_) => {
                             return Err(Error::Usage(format!("models[].{key} must be a string")));
@@ -903,6 +903,11 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
                             ));
                         }
                     }
+                }
+                if let Some(value) = entry.get("name")
+                    && !matches!(value, toml::Value::String(_))
+                {
+                    return Err(Error::Usage("models[].name must be a string".to_string()));
                 }
             }
         }
@@ -2331,11 +2336,16 @@ fn push_model_provenance_rows(
 ) {
     for (index, rule) in models.rules().iter().enumerate() {
         let base = format!("models[{index}]");
-        for (key, value) in [
+        let mut entry = vec![
             (format!("{base}.model"), rule.model().to_string()),
             (format!("{base}.pattern"), rule.pattern().to_string()),
             (format!("{base}.vendor"), rule.vendor().to_string()),
-        ] {
+        ];
+        if let Some(name) = rule.name() {
+            entry.push((format!("{base}.name"), name.to_string()));
+        }
+        entry.sort();
+        for (key, value) in entry {
             rows.push(ConfigProvenanceRow { key, value, source });
         }
     }
@@ -2463,10 +2473,15 @@ fn model_table_from_file(file: Option<&toml::Table>) -> Result<ModelTable, Error
                 .and_then(toml::Value::as_str)
                 .unwrap_or_default()
         };
-        rules.push(ModelRule::new(
+        let name = entry
+            .get("name")
+            .and_then(toml::Value::as_str)
+            .map(str::to_string);
+        rules.push(ModelRule::new_with_name(
             field("pattern"),
             field("vendor"),
             field("model"),
+            name,
         )?);
     }
     ModelTable::new(rules)
@@ -2699,6 +2714,58 @@ model = \"glm-5.3\"
                 .map(|(_, source)| source),
             Some(ConfigSource::File)
         );
+    }
+
+    /// `aub config` prints the `name` of each rule with its source, like the
+    /// other keys (`aub-2mrh`). An entry without one prints no name row,
+    /// exactly as today.
+    #[test]
+    fn a_models_name_prints_with_its_source_like_the_other_keys() {
+        let file = "\
+[[models]]
+pattern = \"claude-opus-5\"
+vendor = \"anthropic\"
+model = \"claude-opus-5\"
+name = \"Opus 5\"
+
+[[models]]
+pattern = \"glm-5.3-flash*\"
+vendor = \"ollama\"
+model = \"glm-5.3-flash\"
+";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.models.rules()[0].name(), Some("Opus 5"));
+        assert_eq!(config.models.rules()[1].name(), None);
+        let rows = config.provenance_rows(&provenance);
+        let name = rows
+            .iter()
+            .find(|row| row.key == "models[0].name")
+            .expect("the set name prints as its own row");
+        assert_eq!(name.value, "Opus 5");
+        assert_eq!(name.source, ConfigSource::File);
+        assert!(
+            rows.iter().all(|row| row.key != "models[1].name"),
+            "an entry without a name prints no name row"
+        );
+    }
+
+    /// An empty `name` is rejected at load with the offending pattern named
+    /// (`aub-2mrh`); a non-string `name` names the key.
+    #[test]
+    fn a_models_empty_or_non_string_name_is_rejected() {
+        let empty =
+            "[[models]]\npattern = \"glm*\"\nvendor = \"ollama\"\nmodel = \"glm\"\nname = \"\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(empty))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("glm*"), "{message}");
+        assert!(message.contains("empty name"), "{message}");
+        let garbage =
+            "[[models]]\npattern = \"glm*\"\nvendor = \"ollama\"\nmodel = \"glm\"\nname = 3\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(garbage))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("models[].name"), "{message}");
     }
 
     /// The negative that separates a real order-preserving read from a keyed
