@@ -480,6 +480,12 @@ impl NowReport {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SpendGroup {
     pub key: LogicalName,
+    /// The printable label the text renderer shows for a model group when its
+    /// rule carries a `name` (`aub-2mrh`). `None` for every other dimension
+    /// and for a model group with no name, in which case the renderer shows
+    /// the key. Never serialized to JSON and never matched by CLI filters:
+    /// both keep the raw key, so a rename cannot desynchronize them.
+    pub display: Option<String>,
     pub usage: UsageVector,
     pub valuation: Option<ValuationOutcome<Usd>>,
     pub provenance: Provenance,
@@ -558,6 +564,7 @@ impl SpendGroup {
     ) -> Self {
         Self {
             key,
+            display: None,
             usage,
             valuation: None,
             provenance,
@@ -568,6 +575,14 @@ impl SpendGroup {
             priced_as: BTreeSet::new(),
             priced_cards: BTreeSet::new(),
         }
+    }
+
+    /// Attaches the printable model label the text renderer shows instead of
+    /// the key (`aub-2mrh`). Only the text renderer reads it: the JSON keeps
+    /// emitting the key and the CLI filters keep matching it.
+    pub fn with_display(mut self, display: impl Into<String>) -> Self {
+        self.display = Some(display.into());
+        self
     }
 
     pub fn with_priced_as(mut self, priced_as: BTreeSet<PricedModelRef>) -> Self {

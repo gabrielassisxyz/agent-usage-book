@@ -31,8 +31,9 @@
 use crate::domain::glob::{glob_match, glob_match_chars};
 use crate::error::Error;
 
-/// One `[[models]]` entry: a glob over the stored model id, and the vendor and
-/// model that matching events are priced as.
+/// One `[[models]]` entry: a glob over the stored model id, the vendor and
+/// model that matching events are priced as, and the optional printable name
+/// the spend report shows instead of the raw transcript id (`aub-2mrh`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelRule {
     pattern: String,
@@ -41,6 +42,7 @@ pub struct ModelRule {
     pattern_chars: Vec<char>,
     vendor: String,
     model: String,
+    name: Option<String>,
 }
 
 impl ModelRule {
@@ -51,6 +53,19 @@ impl ModelRule {
         pattern: impl Into<String>,
         vendor: impl Into<String>,
         model: impl Into<String>,
+    ) -> Result<Self, Error> {
+        Self::new_with_name(pattern, vendor, model, None)
+    }
+
+    /// Builds one rule with an optional printable name, rejecting an empty
+    /// pattern, vendor or model as [`ModelRule::new`] does, and rejecting an
+    /// empty name with the offending pattern named: an empty name would read
+    /// as a mapped event with nothing to print.
+    pub fn new_with_name(
+        pattern: impl Into<String>,
+        vendor: impl Into<String>,
+        model: impl Into<String>,
+        name: Option<String>,
     ) -> Result<Self, Error> {
         let pattern = pattern.into();
         let vendor = vendor.into();
@@ -68,11 +83,35 @@ impl ModelRule {
                 "models[]: empty model for pattern {pattern:?}"
             )));
         }
+        if let Some(name) = &name
+            && name.is_empty()
+        {
+            return Err(Error::Usage(format!(
+                "models[]: empty name for pattern {pattern:?}"
+            )));
+        }
         Ok(Self {
             pattern_chars: pattern.chars().collect(),
             pattern,
             vendor,
             model,
+            name,
+        })
+    }
+
+    /// Attaches a printable name to a rule built by [`ModelRule::new`],
+    /// rejecting an empty one with the offending pattern named.
+    pub fn with_name(self, name: impl Into<String>) -> Result<Self, Error> {
+        let name = name.into();
+        if name.is_empty() {
+            return Err(Error::Usage(format!(
+                "models[]: empty name for pattern {:?}",
+                self.pattern
+            )));
+        }
+        Ok(Self {
+            name: Some(name),
+            ..self
         })
     }
 
@@ -86,6 +125,12 @@ impl ModelRule {
 
     pub fn model(&self) -> &str {
         &self.model
+    }
+
+    /// The printable name the spend report shows for ids this rule matches,
+    /// or `None` when the rule carries none and the raw id prints (`aub-2mrh`).
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
     }
 }
 
@@ -183,6 +228,77 @@ impl ModelTable {
     pub fn is_empty(&self) -> bool {
         self.rules.is_empty()
     }
+
+    /// The first configured rule matching `model_id`, in file order, or `None`
+    /// when no configured rule matches (`aub-2mrh`). Built-ins are not rules:
+    /// they carry no printable name, so they never decide a display.
+    pub fn matched_rule(&self, model_id: &str) -> Option<&ModelRule> {
+        if model_id.is_empty() {
+            return None;
+        }
+        let id: Vec<char> = model_id.chars().collect();
+        self.rules
+            .iter()
+            .find(|rule| glob_match_chars(&rule.pattern_chars, &id))
+    }
+
+    /// The printable name for `model_id`: the matched configured rule's name
+    /// when it carries one, otherwise `None`, in which case the raw id prints
+    /// (`aub-2mrh`). Rule order decides which name wins when two patterns
+    /// match, because [`ModelTable::matched_rule`] returns the first match.
+    pub fn display_name(&self, model_id: &str) -> Option<&str> {
+        self.matched_rule(model_id)?.name()
+    }
+
+    /// The key-slot account for `model_id`, or `None` when the id carries no
+    /// slot (`aub-2mrh`).
+    ///
+    /// An id whose matched rule declares a vendor and whose id ends in `-k1`,
+    /// `-k2` or `-k3` reports `<vendor>-<slot>`: the suffix stops being part
+    /// of the model identity and becomes the account instead. The stripped
+    /// base must still match the same pattern that matched the full id;
+    /// otherwise the suffix is part of the model name itself. That is what
+    /// keeps `kimi-k3` (whose stripped `kimi` matches no `kimi-k3*` rule) a
+    /// model while `kimi-k3-max-k1` (whose stripped `kimi-k3-max` still
+    /// matches) reports its slot, with no hand-written map and no derived
+    /// regex that would silently turn the model *Kimi K3* into `kimi`.
+    ///
+    /// An id matching no rule (configured or built-in) reports no slot and
+    /// keeps its raw id under `unknown-account`, rather than being guessed at.
+    pub fn slot_account(&self, model_id: &str) -> Option<String> {
+        let slot = key_slot_suffix(model_id)?;
+        let base = &model_id[..model_id.len() - slot.len() - 1];
+        if base.is_empty() {
+            return None;
+        }
+        if let Some(rule) = self.matched_rule(model_id) {
+            if glob_match_chars(&rule.pattern_chars, &base.chars().collect::<Vec<_>>()) {
+                return Some(format!("{}-{slot}", rule.vendor));
+            }
+            return None;
+        }
+        for (pattern, vendor) in BUILT_IN_VENDORS {
+            if glob_match(pattern, model_id) {
+                if glob_match(pattern, base) {
+                    return Some(format!("{vendor}-{slot}"));
+                }
+                return None;
+            }
+        }
+        None
+    }
+}
+
+/// The `-k1` / `-k2` / `-k3` suffix of a stored model id, without the leading
+/// dash, or `None` when the id carries no key slot (`aub-2mrh`). Only these
+/// three slots exist: the pi harness records exactly them, and anything else
+/// is part of the model name.
+fn key_slot_suffix(model_id: &str) -> Option<&str> {
+    ["k1", "k2", "k3"].into_iter().find(|slot| {
+        model_id
+            .strip_suffix(slot)
+            .is_some_and(|head| head.ends_with('-'))
+    })
 }
 
 /// Whether every id `later` can match is already matched by `earlier`.
@@ -435,6 +551,109 @@ mod tests {
         assert_eq!(
             table.resolve("deepseek-v4-pro-high-k1"),
             mapped("ollama", "whatever-runs-on-k1")
+        );
+    }
+
+    /// `name` is optional: an entry without it behaves exactly as today, and
+    /// an empty one is rejected at load with the offending pattern named
+    /// (`aub-2mrh`). The planted negative is the empty string, which differs
+    /// from the absent key only in being present.
+    #[test]
+    fn a_name_is_optional_and_an_empty_one_names_its_pattern() {
+        let without = ModelRule::new("glm-5.3-flash*", "ollama", "glm-5.3-flash").unwrap();
+        assert_eq!(without.name(), None);
+        let with = ModelRule::new_with_name(
+            "glm-5.3-flash*",
+            "ollama",
+            "glm-5.3-flash",
+            Some("GLM 5.3 Flash".to_string()),
+        )
+        .unwrap();
+        assert_eq!(with.name(), Some("GLM 5.3 Flash"));
+        let error = ModelRule::new_with_name(
+            "glm-5.3-flash*",
+            "ollama",
+            "glm-5.3-flash",
+            Some(String::new()),
+        )
+        .unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("glm-5.3-flash*"), "{message}");
+        assert!(message.contains("empty name"), "{message}");
+        let error = ModelRule::new("glm-5.3-flash*", "ollama", "glm-5.3-flash")
+            .unwrap()
+            .with_name(String::new())
+            .unwrap_err();
+        assert!(error.to_string().contains("glm-5.3-flash*"));
+    }
+
+    /// Rule order decides which name wins when two patterns match: the first
+    /// match's name, not the most specific one after the fact (`aub-2mrh`).
+    /// The planted negative lists the general rule first and is rejected by
+    /// the shadowing validator, so the positive below is the only order that
+    /// can exist.
+    #[test]
+    fn rule_order_decides_which_name_wins() {
+        let table = ModelTable::new(vec![
+            ModelRule::new_with_name(
+                "glm-5.3-flash*",
+                "ollama",
+                "glm-5.3-flash",
+                Some("GLM 5.3 Flash".to_string()),
+            )
+            .unwrap(),
+            ModelRule::new_with_name("glm-5.3*", "ollama", "glm-5.3", Some("GLM 5.3".to_string()))
+                .unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            table.display_name("glm-5.3-flash-max-k2"),
+            Some("GLM 5.3 Flash")
+        );
+        assert_eq!(table.display_name("glm-5.3-xhigh-k3"), Some("GLM 5.3"));
+        assert_eq!(table.display_name("claude-opus-5"), None);
+    }
+
+    /// The key slot becomes the account (`aub-2mrh`): an id whose matched rule
+    /// declares a vendor and whose id ends in `-k1`, `-k2` or `-k3` reports
+    /// `<vendor>-<slot>`. `kimi-k3` is the planted negative: its stripped
+    /// `kimi` matches no `kimi-k3*` rule, so it stays a model with no slot,
+    /// while its neighbours strip onto the same rule and report theirs.
+    #[test]
+    fn the_key_slot_becomes_the_account_and_kimi_k3_is_not_a_slot() {
+        let table = ModelTable::new(vec![
+            ModelRule::new("glm-5.3-flash*", "ollama", "glm-5.3-flash").unwrap(),
+            ModelRule::new("kimi-k3*", "ollama", "kimi-k3").unwrap(),
+            ModelRule::new("kimi-k2.7*", "ollama", "kimi-k2.7-code").unwrap(),
+        ])
+        .unwrap();
+        assert_eq!(
+            table.slot_account("glm-5.3-flash-max-k1"),
+            Some("ollama-k1".to_string())
+        );
+        assert_eq!(
+            table.slot_account("glm-5.3-flash-max-k2"),
+            Some("ollama-k2".to_string())
+        );
+        assert_eq!(
+            table.slot_account("glm-5.3-flash-max-k3"),
+            Some("ollama-k3".to_string())
+        );
+        assert_eq!(
+            table.slot_account("kimi-k3-max-k1"),
+            Some("ollama-k1".to_string())
+        );
+        assert_eq!(table.slot_account("kimi-k3"), None);
+        assert_eq!(table.slot_account("kimi-k2.7"), None);
+        assert_eq!(
+            table.slot_account("kimi-k2.7-k1"),
+            Some("ollama-k1".to_string())
+        );
+        assert_eq!(table.slot_account("claude-opus-5"), None);
+        assert_eq!(
+            table.slot_account("unknown-model-k1"),
+            None,
+            "an id with a slot but matching no rule keeps no slot"
         );
     }
 }

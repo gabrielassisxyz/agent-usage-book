@@ -584,13 +584,29 @@ pub fn assemble_canonical_with_window_equivalent(
         || filters
             .iter()
             .any(|filter| filter.dimension == SpendGrouping::Account);
-    let account_of = if account_attribution_needed {
+    let mut account_of = if account_attribution_needed {
         let (map, explain) = account_attribution(conn, &events)?;
         account_explain = explain;
         map
     } else {
         BTreeMap::new()
     };
+    // The key slot stops being part of the model identity and becomes the
+    // account instead (`aub-2mrh`): an id whose matched rule declares a vendor
+    // and whose id ends in `-k1`, `-k2` or `-k3` reports `<vendor>-<slot>`,
+    // replacing the marker attribution for that event. An id matching no rule
+    // keeps its raw id and stays `unknown-account` (or whatever the markers
+    // said in a test with markers); `kimi-k3` is not a slot because its
+    // stripped `kimi` matches no `kimi-k3*` rule, so its account is unchanged.
+    // This runs at report time over ids already in the ledger, so reverting
+    // restores the previous output with no rebuild.
+    for event in &events {
+        if let Some(id) = event.model.as_deref()
+            && let Some(slot_account) = models.slot_account(id)
+        {
+            account_of.insert(event.canonical_id.clone(), slot_account);
+        }
+    }
     // The window counts the ledger read, and the groups sum the filtered
     // remainder: the difference is exactly what `filters` reports, so a filter
     // never shrinks the report without naming what it removed.
@@ -633,6 +649,7 @@ pub fn assemble_canonical_with_window_equivalent(
         &task_labels,
         window_resolver,
         &mut window_provenance,
+        models,
     )?;
     let mut metadata = ReportMetadata::new(
         generated_at,
@@ -745,6 +762,7 @@ fn canonical_groups(
     task_labels: &BTreeMap<String, String>,
     window_resolver: Option<&dyn WindowEquivalentResolver>,
     window_provenance: &mut Vec<SpendGroupWindowEquivalentProvenance>,
+    models: &ModelTable,
 ) -> Result<Vec<SpendGroup>, Error> {
     let Some(dimension) = grouping.get(depth).copied() else {
         return Ok(Vec::new());
@@ -875,6 +893,23 @@ fn canonical_groups(
                 ));
             }
             let priced_as = members_priced_as(&members);
+            // The printable model label when the group's first member matched
+            // a rule carrying a `name` (`aub-2mrh`). Only the text renderer
+            // reads it: the key above keeps the priced (or raw) id the JSON
+            // emits and the CLI filters match. Members of one model group
+            // share their priced key, so the first member's display decides
+            // the row; two rules mapping to one priced id with different
+            // names would need a more specific rule earlier in the array,
+            // which the table's ordering already supports.
+            let display = if dimension == SpendGrouping::Model {
+                members
+                    .iter()
+                    .filter_map(|event| event.model.as_deref())
+                    .find_map(|id| models.display_name(id))
+                    .map(str::to_string)
+            } else {
+                None
+            };
             let children = canonical_groups(
                 &members.into_iter().cloned().collect::<Vec<_>>(),
                 grouping,
@@ -890,13 +925,17 @@ fn canonical_groups(
                 task_labels,
                 window_resolver,
                 window_provenance,
+                models,
             )?;
             path.pop();
-            let group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
+            let mut group = SpendGroup::new(key, usage, Provenance::new(sources), derivation_id)
                 .with_valuation(valuation)
                 .with_children(children)
                 .with_priced_as(priced_as)
                 .with_priced_cards(priced_cards);
+            if let Some(display) = display {
+                group = group.with_display(display);
+            }
             let group = match credits {
                 Some(credits) => group.with_credits(credits),
                 None => group,
@@ -1217,13 +1256,19 @@ fn group_value(
             .filter(|namespace| !namespace.is_empty())
             .unwrap_or(UNKNOWN_HARNESS_LABEL)
             .to_string(),
-        // The model id as the transcript stored it, `<synthetic>` included: it
-        // is a value the ledger really holds. No id at all is the unknown
-        // bucket, which keeps the unnamed spend visible instead of merged.
+        // The priced model when the id resolved through `[[models]]` or a
+        // built-in default, otherwise the raw transcript id (`aub-2mrh`): the
+        // alias encodes the reasoning effort and the key slot, neither of
+        // which is priced, so the three `glm-5.3-flash` efforts collapse onto
+        // the one id the rate book carries. An unmapped id keeps its raw id
+        // and is counted in the unmapped-models footer; no id at all is the
+        // unknown bucket, which keeps the unnamed spend visible instead of
+        // merged.
         SpendGrouping::Model => event
-            .model
+            .priced_as
             .as_deref()
-            .filter(|id| !id.is_empty())
+            .filter(|canonical| !canonical.is_empty())
+            .or_else(|| event.model.as_deref().filter(|id| !id.is_empty()))
             .unwrap_or(UNKNOWN_MODEL_LABEL)
             .to_string(),
     }
@@ -2822,6 +2867,375 @@ mod tests {
         crate::presentation::validate_spend_report_json(&json).unwrap();
     }
 
+    /// The `[[models]]` table for the printable-name and slot tests
+    /// (`aub-2mrh`): one flash rule with a name, plus the kimi neighbours
+    /// that prove a regex would strip the wrong suffix.
+    fn named_flash_table() -> crate::config::ModelTable {
+        crate::config::ModelTable::new(vec![
+            crate::config::ModelRule::new_with_name(
+                "glm-5.3-flash*",
+                "ollama",
+                "glm-5.3-flash",
+                Some("GLM 5.3 Flash".to_string()),
+            )
+            .unwrap(),
+            crate::config::ModelRule::new("kimi-k3*", "ollama", "kimi-k3").unwrap(),
+            crate::config::ModelRule::new("kimi-k2.7*", "ollama", "kimi-k2.7-code").unwrap(),
+        ])
+        .unwrap()
+    }
+
+    /// The four operator-chosen names round-trip through the text renderer
+    /// while the group key keeps the priced id the JSON emits (`aub-2mrh`).
+    /// The planted negative is the same table without names, which prints
+    /// the raw (here priced, since the exact patterns equal their models)
+    /// ids instead.
+    #[test]
+    fn the_four_operator_names_round_trip_while_the_key_keeps_the_priced_id() {
+        let table = crate::config::ModelTable::new(vec![
+            crate::config::ModelRule::new_with_name(
+                "claude-opus-5",
+                "anthropic",
+                "claude-opus-5",
+                Some("Opus 5".to_string()),
+            )
+            .unwrap(),
+            crate::config::ModelRule::new_with_name(
+                "claude-fable-5-1",
+                "anthropic",
+                "claude-fable-5-1",
+                Some("Fable 5.1".to_string()),
+            )
+            .unwrap(),
+            crate::config::ModelRule::new_with_name(
+                "claude-haiku-4-5-20251001",
+                "anthropic",
+                "claude-haiku-4-5-20251001",
+                Some("Haiku 4.5".to_string()),
+            )
+            .unwrap(),
+            crate::config::ModelRule::new_with_name(
+                "gpt-5.6-luna",
+                "openai",
+                "gpt-5.6-luna",
+                Some("GPT 5.6 Luna".to_string()),
+            )
+            .unwrap(),
+        ])
+        .unwrap();
+        let (_root, conn) = canonical_conn("canonical-four-names");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        for (index, id) in [
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "claude-haiku-4-5-20251001",
+            "gpt-5.6-luna",
+        ]
+        .iter()
+        .enumerate()
+        {
+            seed_canonical_with_model(
+                &conn,
+                &format!("e-{index}"),
+                day + 10 + index as i64,
+                "s1",
+                "reported",
+                &[("input", 10)],
+                Some(id),
+            );
+        }
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Model],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &table,
+        )
+        .unwrap();
+        assert_eq!(report.groups.len(), 4);
+        let by_display: BTreeMap<&str, &SpendGroup> = report
+            .groups
+            .iter()
+            .map(|group| (group.display.as_deref().unwrap_or(""), group))
+            .collect();
+        for name in ["Opus 5", "Fable 5.1", "Haiku 4.5", "GPT 5.6 Luna"] {
+            assert!(by_display.contains_key(name), "missing {name}");
+        }
+        let text = crate::presentation::render_spend_report(&report);
+        for name in ["Opus 5", "Fable 5.1", "Haiku 4.5", "GPT 5.6 Luna"] {
+            assert!(text.contains(name), "{text}");
+        }
+        let json = crate::presentation::spend_json(&report, crate::logging::RunId::new(now()));
+        for raw in [
+            "claude-opus-5",
+            "claude-fable-5-1",
+            "claude-haiku-4-5-20251001",
+            "gpt-5.6-luna",
+        ] {
+            assert!(json.contains(raw), "JSON keeps the raw key {raw}: {json}");
+        }
+        assert!(
+            !json.contains("Opus 5"),
+            "the display name must not reach the JSON: {json}"
+        );
+        crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    /// No reasoning-effort marker reaches the model column: one
+    /// `glm-5.3-flash*` rule named `GLM 5.3 Flash` covers `-max`, `-high`
+    /// and no marker, all print the name, and `--group-by model` returns one
+    /// row for the three, not three rows (`aub-2mrh`).
+    #[test]
+    fn no_reasoning_effort_reaches_the_model_column() {
+        let (_root, conn) = canonical_conn("canonical-no-effort");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        for (index, id) in [
+            "glm-5.3-flash-max-k2",
+            "glm-5.3-flash-high-k2",
+            "glm-5.3-flash-k1",
+        ]
+        .iter()
+        .enumerate()
+        {
+            seed_canonical_with_model(
+                &conn,
+                &format!("e-{index}"),
+                day + 10 + index as i64,
+                "s1",
+                "reported",
+                &[("input", 10)],
+                Some(id),
+            );
+        }
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Model],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        assert_eq!(
+            report.groups.len(),
+            1,
+            "the three efforts are one row, not three"
+        );
+        assert_eq!(report.groups[0].display.as_deref(), Some("GLM 5.3 Flash"));
+        assert_eq!(report.groups[0].key.as_str(), "model=glm-5.3-flash");
+        let text = crate::presentation::render_spend_report(&report);
+        assert!(text.contains("GLM 5.3 Flash"), "{text}");
+        assert!(!text.contains("-max"), "{text}");
+        assert!(!text.contains("-high"), "{text}");
+    }
+
+    /// The key slot becomes the account: `glm-5.3-flash-max-k1/-k2/-k3`
+    /// become one model row and three accounts `ollama-k1`, `ollama-k2`,
+    /// `ollama-k3` (`aub-2mrh`). The model key keeps the priced id without
+    /// the suffix; the account key carries `<vendor>-<slot>`.
+    #[test]
+    fn the_key_slot_becomes_three_vendor_slot_accounts_under_one_model_row() {
+        let (_root, conn) = canonical_conn("canonical-slot-accounts");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        for (index, id) in [
+            "glm-5.3-flash-max-k1",
+            "glm-5.3-flash-max-k2",
+            "glm-5.3-flash-max-k3",
+        ]
+        .iter()
+        .enumerate()
+        {
+            seed_canonical_with_model(
+                &conn,
+                &format!("e-{index}"),
+                day + 10 + index as i64,
+                "s1",
+                "reported",
+                &[("input", 10)],
+                Some(id),
+            );
+        }
+        let model_report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Model],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        assert_eq!(model_report.groups.len(), 1);
+        assert_eq!(model_report.groups[0].key.as_str(), "model=glm-5.3-flash");
+        let account_report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        let mut keys: Vec<&str> = account_report
+            .groups
+            .iter()
+            .map(|group| group.key.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "account=ollama-k1",
+                "account=ollama-k2",
+                "account=ollama-k3"
+            ]
+        );
+    }
+
+    /// `kimi-k3` is not a slot: with no rule declaring it one, it stays the
+    /// model id `kimi-k3` and its account is unchanged (`aub-2mrh`). This is
+    /// a test, not a comment: the positive beside it (`kimi-k3-max-k1`)
+    /// differs only in carrying a slot the same rule covers.
+    #[test]
+    fn kimi_k3_is_not_a_slot_while_its_suffixed_neighbour_is() {
+        let (_root, conn) = canonical_conn("canonical-kimi-negative");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical_with_model(
+            &conn,
+            "e-kimi",
+            day + 10,
+            "s1",
+            "reported",
+            &[("input", 10)],
+            Some("kimi-k3"),
+        );
+        seed_canonical_with_model(
+            &conn,
+            "e-kimi-slot",
+            day + 20,
+            "s1",
+            "reported",
+            &[("input", 10)],
+            Some("kimi-k3-max-k1"),
+        );
+        let model_report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Model],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        let mut keys: Vec<&str> = model_report
+            .groups
+            .iter()
+            .map(|group| group.key.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(keys, vec!["model=kimi-k3"]);
+        let account_report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        let mut account_keys: Vec<&str> = account_report
+            .groups
+            .iter()
+            .map(|group| group.key.as_str())
+            .collect();
+        account_keys.sort();
+        assert_eq!(
+            account_keys,
+            vec!["account=ollama-k1", "account=unknown-account"],
+            "kimi-k3 keeps its marker account while its neighbour reports its slot"
+        );
+    }
+
+    /// An id with a slot but matching no rule keeps its raw id and stays
+    /// `unknown-account` (`aub-2mrh`): nothing declares its vendor, so
+    /// nothing is guessed at.
+    #[test]
+    fn an_unmatched_slot_keeps_its_raw_id_and_stays_unknown_account() {
+        let (_root, conn) = canonical_conn("canonical-unmatched-slot");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical_with_model(
+            &conn,
+            "e-unknown",
+            day + 10,
+            "s1",
+            "reported",
+            &[("input", 10)],
+            Some("mystery-model-k2"),
+        );
+        let model_report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Model],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        assert_eq!(model_report.groups.len(), 1);
+        assert_eq!(
+            model_report.groups[0].key.as_str(),
+            "model=mystery-model-k2"
+        );
+        assert_eq!(model_report.groups[0].display, None);
+        assert_eq!(
+            model_report.unmapped_models.get("mystery-model-k2"),
+            Some(&1)
+        );
+        let account_report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &named_flash_table(),
+        )
+        .unwrap();
+        assert_eq!(account_report.groups.len(), 1);
+        assert_eq!(
+            account_report.groups[0].key.as_str(),
+            "account=unknown-account"
+        );
+    }
+
     /// A weekday afternoon prices at the peak and a Saturday afternoon at
     /// the default, through the whole canonical pipeline: the ledger, the
     /// model table, the book and the day groups (aub-pwtn).
@@ -2994,6 +3408,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             &mut window_provenance,
+            &crate::config::ModelTable::default(),
         )
         .unwrap();
 

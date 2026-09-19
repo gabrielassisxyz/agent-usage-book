@@ -1193,6 +1193,17 @@ fn spend_sections(report: &SpendReport) -> Vec<SpendTableSection> {
     for group in &report.groups {
         let mut leaves = Vec::new();
         collect_spend_leaves(group, &mut leaves);
+        // A model parent with a printable `name` titles its section with
+        // that name (`aub-2mrh`); every other dimension titles with its key
+        // segment as today, with the `unknown-*` sentinels shortened at
+        // render time only.
+        let first_value = match &group.display {
+            Some(display) => display.clone(),
+            None => {
+                spend_segment_display_value(&spend_group_dimension_value(group.key.as_str(), 0))
+                    .to_string()
+            }
+        };
         sections.push(SpendTableSection {
             title: Some(format!(
                 "{} · {}",
@@ -1201,7 +1212,7 @@ fn spend_sections(report: &SpendReport) -> Vec<SpendTableSection> {
                     .first()
                     .map(|grouping| grouping.as_str())
                     .unwrap_or("group"),
-                spend_segment_display_value(&spend_group_dimension_value(group.key.as_str(), 0))
+                first_value
             )),
             rows: leaves
                 .into_iter()
@@ -1253,8 +1264,16 @@ fn spend_table_row(group: &SpendGroup, nested: bool) -> SpendTableRow {
     if let Some(term) = quality_term(group.usage.quality()) {
         details.push(term.term().to_string());
     }
+    // A model leaf with a printable `name` labels its row with that name
+    // (`aub-2mrh`); every other leaf labels with its key segments as today.
+    // The key itself keeps the priced (or raw) id the JSON emits and the CLI
+    // filters match, so only this label reads the display.
+    let label_segments = match &group.display {
+        Some(display) => vec![fit_spend_group_key(display)],
+        None => spend_row_label_segments(group.key.as_str(), nested),
+    };
     SpendTableRow {
-        label_segments: spend_row_label_segments(group.key.as_str(), nested),
+        label_segments,
         known: std::array::from_fn(|index| known.value(TokenKind::ALL[index])),
         reasoning: group
             .usage
