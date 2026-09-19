@@ -238,3 +238,53 @@ fn authentication_backoff() {
     assert_eq!(report.attempt_coverage.unwrap().as_f64(), 1.0);
     assert_eq!(report.measurement_coverage, CoverageFraction::new(4, 12));
 }
+
+/// aub-eun.13: a changed sampling default is prospective. The coverage engine
+/// reconstructs each interval's denominator from the policy snapshots in force
+/// inside it, so a snapshot effective after the interval ends must leave that
+/// interval's expected opportunities exactly where they were, and a snapshot
+/// effective inside it must govern only the part after its instant.
+///
+/// The three assertions below are one scenario read three ways. The first pins
+/// the baseline; the second is the one a naive implementation fails, by reading
+/// the newest snapshot as if it had always been in force; the third shows the
+/// same change does move the denominator once the interval reaches past it, so
+/// the second is not passing merely because the engine ignores new snapshots.
+#[test]
+fn a_prospective_cadence_change_leaves_earlier_denominators_alone() {
+    let old_policy = snapshot(0, 300);
+    let new_policy = snapshot(3_600, 900);
+
+    // One hour at the 5-minute cadence: 12 opportunities owed.
+    let before_the_change =
+        compute(&inputs(0, 3_600, vec![old_policy.clone()], vec![], vec![])).expected_opportunities;
+    assert_eq!(before_the_change, Some(12));
+
+    // The same hour, recomputed after the slower cadence was adopted at its
+    // end. The historical denominator is untouched: the new snapshot governs
+    // nothing inside an interval it is not yet effective in.
+    let recomputed = compute(&inputs(
+        0,
+        3_600,
+        vec![old_policy.clone(), new_policy.clone()],
+        vec![],
+        vec![],
+    ))
+    .expected_opportunities;
+    assert_eq!(
+        recomputed, before_the_change,
+        "a prospective policy change must not rewrite an earlier interval's denominator"
+    );
+
+    // The hour that follows is owed at the new cadence alone: 4 opportunities,
+    // not the 12 the old one would have owed.
+    let after_the_change = compute(&inputs(
+        3_600,
+        7_200,
+        vec![old_policy, new_policy],
+        vec![],
+        vec![],
+    ))
+    .expected_opportunities;
+    assert_eq!(after_the_change, Some(4));
+}
