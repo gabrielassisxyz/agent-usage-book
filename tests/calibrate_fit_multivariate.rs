@@ -950,6 +950,7 @@ fn seed_single_kind_burst(state: &StateDir, end_the_run: bool, decoy_account: bo
         exclusivity_assertion: format!("account {ACCOUNT} reserved for {SINGLE_KIND_EXPERIMENT}"),
     };
     insert_begin(&conn, &run).unwrap();
+    attribute_session(&conn, BURST_SESSION, ACCOUNT, t0);
 
     let mut t = t0 + 60 * SECOND;
     let mut used_ppm = BASELINE_PPM;
@@ -1311,6 +1312,159 @@ fn usage_of_another_account_in_the_run_window_never_enters_the_fit() {
         contaminated_json["excluded_samples"],
         clean_json["excluded_samples"]
     );
+}
+
+/// The single-kind run's third block spends at this instant; the decoy and
+/// the two held-out readings are placed around it. A decoy in the first or the
+/// last block would shift one end of the series, which the robust fit sets
+/// aside as a single outlier and so would not detect a priced decoy; in the
+/// middle it splits the series in two and moves the slope.
+const SINGLE_KIND_DECOY_BLOCK_AT: i64 = 1_180 * SECOND;
+
+/// Two readings of a third account's window, one before and one after the
+/// single-kind run's third block, moved by exactly that block's credits at the
+/// seeded coefficient: the held-out residual is zero on the run's own spend.
+/// A decoy session spending between them would push the predicted movement far
+/// past the second reading if its credits were priced.
+fn seed_holdout_readings(state: &StateDir) {
+    let conn = open_test_ledger(state);
+    let holdout = meter_chain_for(&conn, "holdout");
+    reading(
+        &conn,
+        &holdout,
+        SINGLE_KIND_DECOY_BLOCK_AT - 7 * SECOND,
+        BASELINE_PPM,
+    );
+    reading(
+        &conn,
+        &holdout,
+        SINGLE_KIND_DECOY_BLOCK_AT + 23 * SECOND,
+        BASELINE_PPM + PPM_PER_BLOCK,
+    );
+}
+
+/// A session on another account spending 3,000,000 output tokens, the kind the
+/// premise names, inside the single-kind run's third block.
+fn seed_decoy_session(state: &StateDir) {
+    let conn = open_test_ledger(state);
+    attribute_session(&conn, "decoy-session", "someone-else", 900 * SECOND);
+    usage_event(
+        &conn,
+        "decoy-session",
+        "decoy-turn",
+        SINGLE_KIND_DECOY_BLOCK_AT + 10 * SECOND,
+        &[(TokenKind::Output, 3_000_000)],
+    );
+}
+
+/// The evidence ids of `account`'s readings, comma-joined in time order.
+fn evidence_of_account(conn: &Connection, account: &str) -> String {
+    let mut stmt = conn
+        .prepare(
+            "SELECT re.content_hash
+             FROM meter_observation mo
+             JOIN meter_response_evidence re ON re.id = mo.evidence_id
+             JOIN account a ON a.id = mo.account_id
+             WHERE a.logical_name = ?1
+             ORDER BY mo.received_at ASC, mo.id ASC",
+        )
+        .unwrap();
+    let rows = stmt
+        .query_map([account], |row| row.get::<_, String>(0))
+        .unwrap();
+    rows.map(Result::unwrap).collect::<Vec<_>>().join(",")
+}
+
+fn single_kind_fit_json(state: &StateDir) -> serde_json::Value {
+    let fit = run_aub(
+        state,
+        &[
+            "calibrate",
+            "fit",
+            "--experiment",
+            SINGLE_KIND_EXPERIMENT,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        fit.status.code(),
+        Some(0),
+        "fit: {}",
+        String::from_utf8_lossy(&fit.stderr)
+    );
+    serde_json::from_str(String::from_utf8_lossy(&fit.stdout).trim()).unwrap()
+}
+
+/// Promotes the fitted single-kind candidate against the holdout readings.
+fn promote_single_kind_json(state: &StateDir, fit_json: &serde_json::Value) -> serde_json::Value {
+    let conn = open_test_ledger(state);
+    let training = evidence_of_account(&conn, ACCOUNT);
+    let validation = evidence_of_account(&conn, "holdout");
+    drop(conn);
+    let candidate_id = fit_json["candidate_id"].as_str().unwrap().to_string();
+    let promote = run_aub(
+        state,
+        &[
+            "calibrate",
+            "promote",
+            &candidate_id,
+            "--training",
+            &training,
+            "--validation",
+            &validation,
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(
+        promote.status.code(),
+        Some(0),
+        "promote: {}",
+        String::from_utf8_lossy(&promote.stderr)
+    );
+    serde_json::from_slice(&promote.stdout).unwrap()
+}
+
+/// A session on another account spending 3,000,000 output tokens inside a
+/// one-kind run is not the run's spend. The univariate coefficient fitted with
+/// it present is the one fitted without it, to the micro, and promotion
+/// reproduces that coefficient and judges it on the same held-out residual.
+#[test]
+fn a_decoy_account_never_enters_the_single_kind_fit_or_its_promotion() {
+    let clean = StateDir::new();
+    seed_single_kind_burst(&clean, true, true);
+    seed_holdout_readings(&clean);
+    let clean_fit = single_kind_fit_json(&clean);
+
+    let contaminated = StateDir::new();
+    seed_single_kind_burst(&contaminated, true, true);
+    seed_holdout_readings(&contaminated);
+    seed_decoy_session(&contaminated);
+    let fit = single_kind_fit_json(&contaminated);
+
+    assert_eq!(
+        fit["fitted_micros_per_point"], SEEDED_MICROS_PER_POINT,
+        "the decoy moved the fitted coefficient"
+    );
+    assert_eq!(
+        fit["fitted_micros_per_point"],
+        clean_fit["fitted_micros_per_point"]
+    );
+    assert_eq!(fit["excluded_samples"], clean_fit["excluded_samples"]);
+
+    let clean_promote = promote_single_kind_json(&clean, &clean_fit);
+    let promote = promote_single_kind_json(&contaminated, &fit);
+    assert_eq!(promote["fitted"], clean_promote["fitted"]);
+    assert_eq!(
+        promote["held_out_residual"]["value"], "0",
+        "the held-out readings moved by the run's own block alone"
+    );
+    assert_eq!(
+        promote["held_out_residual"], clean_promote["held_out_residual"],
+        "the decoy reached the promotion's validation series"
+    );
+    assert_eq!(promote["validation_observations"], 2);
 }
 
 /// The settled value of the newest reading in the ledger.

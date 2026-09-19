@@ -14,6 +14,7 @@ use std::fmt;
 
 use rusqlite::Connection;
 
+use crate::calibration::multivariate_fit::{markers_by_session, retain_account_usage};
 use crate::calibration::settlement::SettlementPolicy;
 use crate::cost_model::convert as convert_usage;
 use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
@@ -33,7 +34,9 @@ use crate::store::calibration::{
     insert_experiment, load_candidate, load_experiment, load_experiment_observations,
     load_experiment_usage, load_latest_experiment,
 };
-use crate::store::calibration_controlled::ControlledExperimentRun;
+use crate::store::calibration_controlled::{
+    ControlledExperimentId, ControlledExperimentRun, load_by_experiment_id as load_controlled_run,
+};
 use crate::store::calibration_multivariate::observations_for_run;
 use crate::store::cost_model::{ValidityInterval, load_active_at as load_active_cost_model_at};
 use crate::store::meter_evidence::observation_by_row_id;
@@ -876,16 +879,31 @@ pub fn aggregate_event_tokens(
     Ok(event_tokens)
 }
 
+/// A credit series and the sessions its account filter left out.
+type ScopedCreditSeries = (Vec<(UtcTimestamp, Credits)>, Vec<ExcludedSample>);
+
 /// The credits spent locally in an interval, one entry per usage event, sorted
 /// by time. Shared by the fitter and by promotion so a held-out residual is
 /// computed against the same credit arithmetic the coefficient was fitted on.
+///
+/// With an account, only the usage the session markers place on it is priced,
+/// by the rule the joint fit applies; the sessions no marker places anywhere
+/// come back as excluded samples. An uncontrolled experiment carries no
+/// account and passes none, which prices every event in the interval.
 fn credit_series(
     conn: &Connection,
     cost_model: &crate::store::cost_model::CostModel,
     from: UtcTimestamp,
     until: UtcTimestamp,
-) -> Result<Vec<(UtcTimestamp, Credits)>, Error> {
-    let event_tokens = aggregate_event_tokens(load_experiment_usage(conn, from, until)?)?;
+    account: Option<&str>,
+) -> Result<ScopedCreditSeries, Error> {
+    let mut usage = load_experiment_usage(conn, from, until)?;
+    let mut unattributed = Vec::new();
+    if let Some(account) = account {
+        let markers = markers_by_session(conn, &usage)?;
+        (usage, unattributed) = retain_account_usage(usage, &markers, account)?;
+    }
+    let event_tokens = aggregate_event_tokens(usage)?;
     let mut event_credits: Vec<(UtcTimestamp, Credits)> = Vec::new();
     for (_event_id, (ts, known)) in event_tokens {
         let usage = UsageVector::new(
@@ -912,7 +930,7 @@ fn credit_series(
         }
     }
     event_credits.sort_by_key(|(ts, _)| *ts);
-    Ok(event_credits)
+    Ok((event_credits, unattributed))
 }
 
 /// Pairs each stored reading with the credits spent up to its timestamp.
@@ -953,26 +971,39 @@ fn experiment_cost_model(
     })
 }
 
-/// The experiment's own observations as fit inputs.
+/// The experiment's own observations as fit inputs, read in the frame its fit
+/// read them in: a controlled run's readings on its account, known by
+/// `fitted_at`, priced against that account's usage alone; otherwise the
+/// provider-wide readings priced against every event. Also returns the
+/// sessions the account filter left out.
 fn experiment_fit_observations(
     conn: &Connection,
     experiment: &crate::store::calibration::CalibrationExperiment,
+    controlled_run: Option<&ControlledExperimentRun>,
     cost_model: &crate::store::cost_model::CostModel,
-) -> Result<Vec<FitObservation>, Error> {
-    let stored_obs = load_experiment_observations(conn, experiment)?;
+    fitted_at: UtcTimestamp,
+) -> Result<(Vec<FitObservation>, Vec<ExcludedSample>), Error> {
+    let stored_obs = match controlled_run {
+        Some(run) => observations_for_run(conn, run, fitted_at)?,
+        None => load_experiment_observations(conn, experiment)?,
+    };
     if stored_obs.is_empty() {
         return Err(Error::InsufficientEvidence(format!(
             "no meter observations found for experiment '{}'",
             experiment.id.as_str()
         )));
     }
-    let series = credit_series(
+    let (series, unattributed) = credit_series(
         conn,
         cost_model,
         experiment.validity.valid_from(),
         experiment.validity.valid_until(),
+        controlled_run.map(|run| run.account.as_str()),
     )?;
-    Ok(observations_with_cumulative_credits(stored_obs, &series))
+    Ok((
+        observations_with_cumulative_credits(stored_obs, &series),
+        unattributed,
+    ))
 }
 
 /// Executes fitting from the database and inserts the resulting candidate row immutably.
@@ -993,7 +1024,7 @@ pub fn fit_and_record_candidate(
     };
 
     let stored_obs = load_experiment_observations(conn, &experiment)?;
-    fit_observations_and_record(conn, &experiment, stored_obs, clock)
+    fit_observations_and_record(conn, &experiment, stored_obs, None, clock)
 }
 
 /// The refusal a controlled run that has not recorded `end` earns, shared by
@@ -1079,16 +1110,18 @@ pub fn fit_controlled_run_univariate_and_record(
     }
 
     let stored_obs = observations_for_run(conn, run, clock.now())?;
-    fit_observations_and_record(conn, &experiment, stored_obs, clock)
+    fit_observations_and_record(conn, &experiment, stored_obs, Some(&run.account), clock)
 }
 
 /// Turns stored readings into a candidate: the usage the experiment's validity
 /// brackets becomes cumulative credits under the cost model in force at its
 /// start, the fit runs over the pairs, and the candidate is recorded once.
+/// With an account, only that account's usage is priced.
 fn fit_observations_and_record(
     conn: &Connection,
     experiment: &CalibrationExperiment,
     stored_obs: Vec<crate::store::calibration::StoredFitObservation>,
+    account: Option<&str>,
     clock: &impl Clock,
 ) -> Result<FitResult, Error> {
     if stored_obs.is_empty() {
@@ -1098,16 +1131,18 @@ fn fit_observations_and_record(
         )));
     }
     let cost_model = experiment_cost_model(conn, experiment)?;
-    let series = credit_series(
+    let (series, unattributed) = credit_series(
         conn,
         &cost_model,
         experiment.validity.valid_from(),
         experiment.validity.valid_until(),
+        account,
     )?;
     let fit_observations = observations_with_cumulative_credits(stored_obs, &series);
 
     // Execute fit
     let mut result = fit(&fit_observations, experiment).map_err(|rej| rej.into_error())?;
+    result.excluded_samples.extend(unattributed);
 
     // Update knowledge time with the clock
     result.candidate.knowledge_time = clock.now();
@@ -1251,15 +1286,28 @@ pub fn promote_candidate(
         ))
     })?;
     let cost_model = experiment_cost_model(conn, &experiment)?;
+    // A controlled run shares its identifier with the experiment row its fit
+    // wrote, and its candidate was fitted on its own account's readings and
+    // usage; the refit and the held-out residual have to read the same frame.
+    let controlled_run =
+        load_controlled_run(conn, &ControlledExperimentId::new(experiment.id.as_str()))?;
+    let account = controlled_run.as_ref().map(|run| run.account.as_str());
 
     // A candidate row records the coefficient but not the method that produced
     // it, and a result must state both. Refitting the experiment recovers the
     // method, its parameters, the lag handling and the excluded samples, and
     // makes the promotion refuse a candidate that no longer reproduces rather
     // than dress a stale number in fresh validation metadata.
-    let training_observations = experiment_fit_observations(conn, &experiment, &cost_model)?;
-    let refit =
+    let (training_observations, unattributed) = experiment_fit_observations(
+        conn,
+        &experiment,
+        controlled_run.as_ref(),
+        &cost_model,
+        candidate.knowledge_time,
+    )?;
+    let mut refit =
         fit(&training_observations, &experiment).map_err(|rejection| rejection.into_error())?;
+    refit.excluded_samples.extend(unattributed);
     if refit.candidate.fitted != candidate.fitted || refit.candidate.inputs != candidate.inputs {
         return Err(Error::InsufficientEvidence(format!(
             "promote '{}': the recorded candidate fits {} micros/point over {} observations, and the evidence in the ledger now fits {} over {}",
@@ -1306,11 +1354,12 @@ pub fn promote_candidate(
         .max()
         .unwrap_or_else(|| experiment.validity.valid_until())
         .max(experiment.validity.valid_until());
-    let series = credit_series(
+    let (series, _) = credit_series(
         conn,
         &cost_model,
         experiment.validity.valid_from(),
         validation_until,
+        account,
     )?;
     let validation_observations = observations_with_cumulative_credits(stored_validation, &series);
     let held_out = crate::calibration::activation::held_out_residual(
@@ -2010,5 +2059,137 @@ mod tests {
             refusal.to_string(),
             still_running_refusal("exp-derived").to_string()
         );
+    }
+
+    /// One output-only usage event of `native`'s session, placed on `account`
+    /// by a launcher marker a second before it.
+    fn seed_account_spend(conn: &Connection, native: &str, account: &str, at: i64, output: u64) {
+        use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
+        use crate::store::session_account_marker::{
+            EvidenceDesignation, MarkerSource, NewSessionAccountMarker, insert_marker,
+        };
+        use crate::store::usage_component::{NewUsageComponent, insert_component};
+        use crate::store::usage_event::{NewUsageEvent, insert_event};
+        use crate::store::usage_occurrence::{NewUsageOccurrence, insert_occurrence};
+        use crate::transcripts::parser::ParserVersion;
+
+        insert_marker(
+            conn,
+            &NewSessionAccountMarker {
+                session_id: SessionId::new(
+                    SourceNamespace::new("claude-code"),
+                    NativeSessionId::new(native),
+                ),
+                observed_at: UtcTimestamp::from_unix_nanos(at - 1_000_000_000),
+                source_ordering_key: None,
+                logical_account: account.to_string(),
+                resolved_account_id: None,
+                marker_source: MarkerSource::new("hook"),
+                run_id: None,
+                evidence_designation: EvidenceDesignation::ExplicitLauncherOrHook,
+            },
+        )
+        .unwrap();
+        let canonical_id = format!("{native}-turn");
+        let ts = UtcTimestamp::from_unix_nanos(at);
+        let event_id = insert_event(
+            conn,
+            &NewUsageEvent {
+                canonical_event_id: &canonical_id,
+                session_id: Some(native),
+                event_timestamp: Some(ts),
+                model_id: Some("claude-opus"),
+                evidence_kind: "transcript",
+                source_provenance: "test",
+                parser_version: "v1",
+                created_at: ts,
+            },
+        )
+        .unwrap();
+        insert_component(
+            conn,
+            &NewUsageComponent {
+                event_id,
+                token_class: "output",
+                count: output,
+            },
+        )
+        .unwrap();
+        insert_occurrence(
+            conn,
+            &NewUsageOccurrence {
+                source_namespace: &SourceNamespace::new("claude-code"),
+                native_event_id: Some(&canonical_id),
+                parser_version: &ParserVersion::new("claude-code-1"),
+                heuristic_key: None,
+                source_file: &format!("corpus/{native}.jsonl"),
+                occurred_at_nanos: Some(at),
+                event_id: Some(event_id),
+                transcript_file_id: None,
+                source_location: None,
+                canonical_fingerprint: None,
+                identity_strength: None,
+                heuristic_algorithm_version: None,
+                canonical_payload_digest: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// The uncontrolled path passes no account and still prices every event in
+    /// the interval, whichever account its session runs on; naming one of the
+    /// two accounts keeps that account's event alone.
+    #[test]
+    fn the_credit_series_prices_every_account_unless_one_is_named() {
+        let scratch = ScratchDir::new();
+        let policy = crate::store::connection::PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        };
+        let mut conn = crate::store::test_schema::open_migrated(
+            &scratch.path().join("calibration.db"),
+            &policy,
+        );
+        let cost_model = crate::store::cost_model::seed_initial_cost_model(
+            &mut conn,
+            UtcTimestamp::from_unix_nanos(500_000_000_000),
+        )
+        .unwrap();
+        let first = 1_010_000_000_000;
+        let second = 1_020_000_000_000;
+        seed_account_spend(&conn, "session-alpha", "alpha", first, 200_000);
+        seed_account_spend(&conn, "session-beta", "beta", second, 3_000_000);
+        let from = UtcTimestamp::from_unix_nanos(1_000_000_000_000);
+        let until = UtcTimestamp::from_unix_nanos(1_100_000_000_000);
+
+        // 15 credits per million output tokens under the built-in model.
+        let (every_account, unattributed) =
+            credit_series(&conn, &cost_model, from, until, None).unwrap();
+        assert_eq!(
+            every_account,
+            vec![
+                (
+                    UtcTimestamp::from_unix_nanos(first),
+                    Credits::from_micros(3_000_000)
+                ),
+                (
+                    UtcTimestamp::from_unix_nanos(second),
+                    Credits::from_micros(45_000_000)
+                ),
+            ],
+            "with no account every event is priced, on either account"
+        );
+        assert!(unattributed.is_empty());
+
+        let (alpha_only, unattributed) =
+            credit_series(&conn, &cost_model, from, until, Some("alpha")).unwrap();
+        assert_eq!(
+            alpha_only,
+            vec![(
+                UtcTimestamp::from_unix_nanos(first),
+                Credits::from_micros(3_000_000)
+            )],
+            "naming an account keeps its own event alone"
+        );
+        assert!(unattributed.is_empty());
     }
 }

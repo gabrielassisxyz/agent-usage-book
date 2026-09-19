@@ -170,7 +170,7 @@ fn settled_blocks(
 }
 
 /// The account-marker timeline of every session the usage rows name.
-fn markers_by_session(
+pub(super) fn markers_by_session(
     conn: &Connection,
     usage: &[StoredUsageEvent],
 ) -> Result<BTreeMap<(String, String), Vec<AccountMarkerBoundary>>, Error> {
@@ -199,7 +199,10 @@ fn markers_by_session(
 /// no marker places on any account are left out too, one excluded sample per
 /// session, so a run whose own sessions lost their markers is visible rather
 /// than fitted to empty blocks.
-fn retain_account_usage(
+///
+/// The univariate controlled fit and its promotion scope their credit series
+/// through this same rule (`aub-s9qw`), so both paths price one account.
+pub(super) fn retain_account_usage(
     usage: Vec<StoredUsageEvent>,
     markers: &BTreeMap<(String, String), Vec<AccountMarkerBoundary>>,
     account: &str,
