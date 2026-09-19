@@ -25,11 +25,13 @@ use crate::presentation::boxed::{
 use crate::presentation::precision::{COVERAGE_PERCENT, PERCENT, TOKENS};
 use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
+use crate::report::models::{UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL, UNKNOWN_MODEL_LABEL};
 use crate::report::{
     ActiveActivityState, CoverageReport, LivenessGap, NowReport, PricedCardRef, PricedModelRef,
     ProvenanceGraph, SpendFilterOutcome, SpendGroup, SpendReport, StatusReport, TaskOverheadReport,
     TaskReport, WindowEquivalentDerivation,
 };
+use crate::sessions::{UNKNOWN_PROJECT, UNKNOWN_REPOSITORY};
 use crate::transcripts::TranscriptDriftReport;
 use crate::valuation::ValuationOutcome;
 
@@ -922,7 +924,7 @@ impl SpendTableColumn {
 
 #[derive(Debug, Clone)]
 struct SpendTableRow {
-    label: String,
+    label_segments: Vec<String>,
     known: [u64; 4],
     reasoning: Option<u64>,
     valuation: Option<String>,
@@ -982,10 +984,18 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
     let box_width = boxed_width(&style);
     let content_area = boxed_content_area(box_width);
     let layout_area = measured_width.min(box_width).saturating_sub(6);
-    let key_header = spend_key_header(report);
+    let key_header = spend_key_header_segments(report);
+    let segment_widths = spend_segment_widths(&key_header, &sections);
     let mut hidden = Vec::new();
-    while spend_table_width(&key_header, &columns, &sections, &total, has_partial, exact)
-        > layout_area
+    while spend_table_width(
+        &key_header,
+        &segment_widths,
+        &columns,
+        &sections,
+        &total,
+        has_partial,
+        exact,
+    ) > layout_area
         && columns.len() > 3
     {
         let candidate = [
@@ -1001,7 +1011,14 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
         hidden.push(candidate);
     }
 
-    let mut widths = spend_column_widths(&key_header, &columns, &sections, &total, exact);
+    let mut widths = spend_column_widths(
+        &key_header,
+        &segment_widths,
+        &columns,
+        &sections,
+        &total,
+        exact,
+    );
     fit_spend_key_column(&mut widths, has_partial, layout_area);
     let rule_width = spend_table_width_from_widths(&widths, has_partial);
     let title = truncate_spend_text(&spend_title(report), box_width.saturating_sub(6));
@@ -1020,13 +1037,14 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
         lines.push(boxed_body(
             &style.paint(
                 style.muted(),
-                &spend_header_line(&key_header, &columns, &widths),
+                &spend_header_line(&key_header, &segment_widths, &columns, &widths),
             ),
             box_width,
         ));
         lines.push(boxed_rule(rule_width, box_width));
         for row in &section.rows {
-            let content = spend_row_line(row, &columns, &widths, exact, has_partial);
+            let content =
+                spend_row_line(row, &segment_widths, &columns, &widths, exact, has_partial);
             let content = if row.dim {
                 style.paint(style.dim(), &content)
             } else {
@@ -1044,7 +1062,7 @@ fn render_spend_box_at_width(report: &SpendReport, style: Style, measured_width:
     }
 
     lines.push(boxed_rule(rule_width, box_width));
-    let total_line = spend_row_line(&total, &columns, &widths, exact, false);
+    let total_line = spend_row_line(&total, &segment_widths, &columns, &widths, exact, false);
     lines.push(boxed_body(
         &style.paint(style.bold(), &total_line),
         box_width,
@@ -1183,7 +1201,7 @@ fn spend_sections(report: &SpendReport) -> Vec<SpendTableSection> {
                     .first()
                     .map(|grouping| grouping.as_str())
                     .unwrap_or("group"),
-                spend_group_dimension_value(group.key.as_str(), 0)
+                spend_segment_display_value(&spend_group_dimension_value(group.key.as_str(), 0))
             )),
             rows: leaves
                 .into_iter()
@@ -1236,7 +1254,7 @@ fn spend_table_row(group: &SpendGroup, nested: bool) -> SpendTableRow {
         details.push(term.term().to_string());
     }
     SpendTableRow {
-        label: spend_row_label(group.key.as_str(), nested),
+        label_segments: spend_row_label_segments(group.key.as_str(), nested),
         known: std::array::from_fn(|index| known.value(TokenKind::ALL[index])),
         reasoning: group
             .usage
@@ -1290,7 +1308,7 @@ fn spend_total_row(report: &SpendReport, has_reasoning: bool) -> SpendTableRow {
         }
     });
     SpendTableRow {
-        label: "total".to_string(),
+        label_segments: vec!["total".to_string()],
         known,
         reasoning: has_reasoning.then_some(reasoning),
         valuation: valuation.as_ref().map(spend_valuation_cell),
@@ -1354,16 +1372,21 @@ fn spend_group_dimension_value(key: &str, index: usize) -> String {
         .to_string()
 }
 
-/// The row label: under a nested grouping the section title already names the
-/// first dimension, so the label joins every remaining dimension's value. A
+/// The row label as its segments: under a nested grouping the section title
+/// already names the first dimension, so the label keeps every remaining
+/// dimension's value. A
 /// grouping of three or more dimensions therefore keeps each value visible
 /// instead of showing only the innermost one.
-fn spend_row_label(key: &str, nested: bool) -> String {
+///
+/// The segments survive as a vector as far as the width computation so each
+/// `·`-separated segment can be padded to its own width; they are joined only
+/// when the line is laid out.
+fn spend_row_label_segments(key: &str, nested: bool) -> Vec<String> {
     let values = key
         .split(" / ")
         .map(|part| {
             let value = part.split_once('=').map(|(_, value)| value).unwrap_or(part);
-            fit_spend_group_key(value)
+            fit_spend_group_key(spend_segment_display_value(value))
         })
         .collect::<Vec<_>>();
     let skip = if nested && values.len() > 1 {
@@ -1371,20 +1394,82 @@ fn spend_row_label(key: &str, nested: bool) -> String {
     } else {
         values.len().saturating_sub(1)
     };
-    values[skip..].join(" · ")
+    values[skip..].to_vec()
 }
 
-/// The key column's header, built the same way as the row labels it heads.
-fn spend_key_header(report: &SpendReport) -> String {
+/// Renders one group-key value for the text table: the five `unknown-*`
+/// sentinel buckets print as `unknown`. The group key itself keeps the full
+/// sentinel (it is what the JSON emits verbatim and what `--account`,
+/// `--repo` and `--project` match against), so this mapping runs at render
+/// time only, against the label, never against `group.key`.
+fn spend_segment_display_value(value: &str) -> &str {
+    if value == UNKNOWN_ACCOUNT_LABEL
+        || value == UNKNOWN_HARNESS_LABEL
+        || value == UNKNOWN_MODEL_LABEL
+        || value == UNKNOWN_PROJECT
+        || value == UNKNOWN_REPOSITORY
+    {
+        "unknown"
+    } else {
+        value
+    }
+}
+
+/// Lays out label segments on per-segment widths: every segment but the shape
+/// of a single-segment label is padded to its column so the `·` separators
+/// line up. A section whose rows have one segment renders exactly as before,
+/// with no padding added here (the cell join still sizes the column).
+fn spend_format_label_segments(segments: &[String], widths: &[usize]) -> String {
+    if segments.len() <= 1 || widths.len() != segments.len() {
+        return segments.join(" · ");
+    }
+    segments
+        .iter()
+        .enumerate()
+        .map(|(index, segment)| format!("{segment:<width$}", width = widths[index]))
+        .collect::<Vec<_>>()
+        .join(" · ")
+}
+
+/// One width per label segment: the widest value of that segment across the
+/// header and every row of every section, so the whole report shares one grid.
+/// The total row spans the key column rather than owning a segment, so it
+/// sizes the column only when its `total` label outgrows the padded grid.
+fn spend_segment_widths(header: &[String], sections: &[SpendTableSection]) -> Vec<usize> {
+    let mut widths = header
+        .iter()
+        .map(|segment| segment.chars().count())
+        .collect::<Vec<_>>();
+    for row in sections.iter().flat_map(|section| section.rows.iter()) {
+        if row.label_segments.len() != widths.len() {
+            continue;
+        }
+        for (index, segment) in row.label_segments.iter().enumerate() {
+            widths[index] = widths[index].max(segment.chars().count());
+        }
+    }
+    widths
+}
+
+/// The padded width of the whole key column: the segments joined with their
+/// separators, or the `total` label when that alone is wider.
+fn spend_key_column_total_width(segment_widths: &[usize], total: &SpendTableRow) -> usize {
+    let padded = segment_widths.iter().sum::<usize>() + segment_widths.len().saturating_sub(1) * 3;
+    let total_label = total.label_segments.join(" · ");
+    padded.max(total_label.chars().count())
+}
+
+/// The key column's header as its segments, one per dimension the rows show.
+fn spend_key_header_segments(report: &SpendReport) -> Vec<String> {
     let names = report
         .grouping
         .iter()
         .map(|grouping| grouping.as_str())
         .collect::<Vec<_>>();
     match names.len() {
-        0 => "group".to_string(),
-        1 => names[0].to_string(),
-        _ => names[1..].join(" · "),
+        0 => vec!["group".to_string()],
+        1 => vec![names[0].to_string()],
+        _ => names[1..].iter().map(|name| name.to_string()).collect(),
     }
 }
 
@@ -1438,16 +1523,16 @@ fn wrap_spend_text(text: &str, width: usize, first: &str, rest: &str) -> Vec<Str
     lines
 }
 
-/// Formats token counts for the compact human table: under 10k the exact
-/// integer, under 10M thousands with one decimal, else millions with one
-/// decimal. Rounding is done before choosing the suffix, so 9,999,999 is
-/// promoted to `10.0M` rather than shown as `10000.0k`.
+/// Formats token counts for the compact human table: under 1k the exact
+/// integer, under 1M thousands with one decimal, else millions with one
+/// decimal. Rounding is done before choosing the suffix, so 999,999 is
+/// promoted to `1.0M` rather than shown as `1000.0k`.
 pub fn format_spend_count(raw: u64) -> String {
-    if raw < 10_000 {
+    if raw < 1_000 {
         return raw.to_string();
     }
     let kilo_tenths = raw.saturating_add(50) / 100;
-    if kilo_tenths < 100_000 {
+    if kilo_tenths < 10_000 {
         return format!("{}.{}k", kilo_tenths / 10, kilo_tenths % 10);
     }
     let mega_tenths = raw.saturating_add(50_000) / 100_000;
@@ -1462,9 +1547,14 @@ fn spend_count_cell(raw: u64, exact: bool) -> String {
     }
 }
 
-fn spend_header_line(key_header: &str, columns: &[SpendTableColumn], widths: &[usize]) -> String {
+fn spend_header_line(
+    key_header: &[String],
+    segment_widths: &[usize],
+    columns: &[SpendTableColumn],
+    widths: &[usize],
+) -> String {
     let mut cells = vec![truncate_spend_text(
-        key_header,
+        &spend_format_label_segments(key_header, segment_widths),
         widths.first().copied().unwrap_or(0),
     )];
     cells.extend(columns.iter().map(|column| column.header().to_string()));
@@ -1473,13 +1563,14 @@ fn spend_header_line(key_header: &str, columns: &[SpendTableColumn], widths: &[u
 
 fn spend_row_line(
     row: &SpendTableRow,
+    segment_widths: &[usize],
     columns: &[SpendTableColumn],
     widths: &[usize],
     exact: bool,
     include_marker: bool,
 ) -> String {
     let mut cells = vec![truncate_spend_text(
-        &row.label,
+        &spend_format_label_segments(&row.label_segments, segment_widths),
         widths.first().copied().unwrap_or(0),
     )];
     cells.extend(
@@ -1516,7 +1607,8 @@ fn spend_row_cell(row: &SpendTableRow, column: SpendTableColumn, exact: bool) ->
 }
 
 fn spend_column_widths(
-    key_header: &str,
+    key_header: &[String],
+    segment_widths: &[usize],
     columns: &[SpendTableColumn],
     sections: &[SpendTableSection],
     total: &SpendTableRow,
@@ -1527,11 +1619,16 @@ fn spend_column_widths(
         .flat_map(|section| section.rows.iter())
         .chain(std::iter::once(total))
         .collect::<Vec<_>>();
-    let mut widths = std::iter::once(key_header.chars().count())
+    let mut widths = std::iter::once(spend_key_column_total_width(segment_widths, total))
         .chain(columns.iter().map(|column| column.header().chars().count()))
         .collect::<Vec<_>>();
+    widths[0] = widths[0].max(key_header.join(" · ").chars().count());
     for row in rows {
-        widths[0] = widths[0].max(row.label.chars().count());
+        widths[0] = widths[0].max(
+            spend_format_label_segments(&row.label_segments, segment_widths)
+                .chars()
+                .count(),
+        );
         for (index, column) in columns.iter().enumerate() {
             widths[index + 1] =
                 widths[index + 1].max(spend_row_cell(row, *column, exact).chars().count());
@@ -1553,14 +1650,15 @@ fn fit_spend_key_column(widths: &mut [usize], has_partial: bool, area: usize) {
 }
 
 fn spend_table_width(
-    key_header: &str,
+    key_header: &[String],
+    segment_widths: &[usize],
     columns: &[SpendTableColumn],
     sections: &[SpendTableSection],
     total: &SpendTableRow,
     has_partial: bool,
     exact: bool,
 ) -> usize {
-    let widths = spend_column_widths(key_header, columns, sections, total, exact);
+    let widths = spend_column_widths(key_header, segment_widths, columns, sections, total, exact);
     spend_table_width_from_widths(&widths, has_partial)
 }
 
@@ -5458,12 +5556,16 @@ mod tests {
 
     #[test]
     fn spend_count_boundaries_are_promoted_before_the_suffix_is_selected() {
-        assert_eq!(format_spend_count(9_999), "9999");
+        assert_eq!(format_spend_count(9_999), "10.0k");
         assert_eq!(format_spend_count(10_000), "10.0k");
         assert_eq!(format_spend_count(0), "0");
-        assert_eq!(format_spend_count(999_999), "1000.0k");
-        assert_eq!(format_spend_count(9_999_949), "9999.9k");
+        assert_eq!(format_spend_count(802), "802");
+        assert_eq!(format_spend_count(4_370), "4.4k");
+        assert_eq!(format_spend_count(999_999), "1.0M");
+        assert_eq!(format_spend_count(2_100_000), "2.1M");
+        assert_eq!(format_spend_count(9_999_949), "10.0M");
         assert_eq!(format_spend_count(9_999_999), "10.0M");
+        assert_eq!(format_spend_count(65_000_000), "65.0M");
         assert_eq!(format_spend_count(198_471_956), "198.5M");
     }
 
@@ -5518,12 +5620,12 @@ mod tests {
         let text = render_spend_report(&report);
         assert_eq!(
             spend_row_cells(&text, "research"),
-            ["20", "1000.0k", "0", "0"],
+            ["20", "1.0M", "0", "0"],
             "{text}"
         );
         assert_eq!(
             spend_row_cells(&text, "work"),
-            ["1000.0k", "20.0k", "0", "0"],
+            ["1.0M", "20.0k", "0", "0"],
             "{text}"
         );
     }
@@ -5536,7 +5638,7 @@ mod tests {
         let row = spend_row_cells(&text, "2026-09-01");
         let total = spend_row_cells(&text, "total");
         assert_eq!(row[..5], total[..5], "{text}");
-        assert_eq!(total, ["11.0k", "722.0k", "198.5M", "3300.0k", "82.0k"]);
+        assert_eq!(total, ["11.0k", "722.0k", "198.5M", "3.3M", "82.0k"]);
     }
 
     /// Observed in e2e 007 step 1: grouping by day, session, project and
@@ -5594,19 +5696,118 @@ mod tests {
         );
         let text = render_spend_report(&report);
         assert!(text.contains("day · 2026-08-25"), "{text}");
-        assert!(text.contains("session · project · repository"), "{text}");
-        // At 80 columns the three kept numeric columns leave the key column 47
-        // wide, so the last value is cut with `…`; the session and the project
-        // stay whole, which is what the innermost-only label lost.
+        // The header sits on the same per-segment grid, so its first segment
+        // is padded to the widest session value.
+        assert!(text.contains("· project · repository"), "{text}");
+        // The `unknown-*` sentinels print as `unknown` in the text table while
+        // the group key keeps the full bucket name for the JSON and filters.
         assert!(
-            text.contains("│  claude-code:s-e2e-0 · unknown-project · unknow…"),
+            text.contains("│  claude-code:s-e2e-0 · unknown · unknown"),
             "{text}"
         );
         assert!(
-            text.contains("│  claude-code:s-e2e-1 · unknown-project · unknow…"),
+            text.contains("│  claude-code:s-e2e-1 · unknown · unknown"),
+            "{text}"
+        );
+        assert!(!text.contains("unknown-project"), "{text}");
+        assert!(!text.contains("unknown-repository"), "{text}");
+        assert_every_spend_line_is_80_wide(&text);
+    }
+
+    /// Each `·`-separated segment of a multi-segment label is padded to the
+    /// widest value of that segment, so the separators of every row sit at
+    /// identical character offsets.
+    #[test]
+    fn spend_multi_segment_labels_align_their_separators() {
+        let leaf = |key: &str| golden_group(key, golden_usage(1_000, 10, 0, 0, None, false));
+        let report = golden_report(
+            "2026-08-25",
+            "2026-08-27",
+            vec![
+                crate::report::SpendGrouping::Day,
+                crate::report::SpendGrouping::Session,
+                crate::report::SpendGrouping::Project,
+            ],
+            vec![golden_group("day=2026-08-25", golden_usage(3_000, 10, 0, 0, None, false))
+                .with_children(vec![
+                    leaf("day=2026-08-25 / session=a / project=unknown-project"),
+                    leaf(
+                        "day=2026-08-25 / session=a-much-longer-session / project=unknown-project",
+                    ),
+                ])],
+            1,
+            2,
+        );
+        let text = render_spend_report(&report);
+        let rows = text
+            .lines()
+            .filter(|line| line.contains('·') && line.contains("unknown"))
+            .collect::<Vec<_>>();
+        assert_eq!(rows.len(), 2, "{text}");
+        let offsets = |line: &str| {
+            line.char_indices()
+                .filter_map(|(index, c)| (c == '·').then_some(index))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(offsets(rows[0]), offsets(rows[1]), "{text}");
+        // The short session is padded to the long one rather than joined
+        // bare: no row shows the unpadded `a ·` shape.
+        assert!(!rows[0].contains("│  a ·"), "{text}");
+        assert!(
+            rows[1].contains("a-much-longer-session · unknown"),
             "{text}"
         );
         assert_every_spend_line_is_80_wide(&text);
+    }
+
+    /// A section whose rows have one segment renders with no padding beyond
+    /// the column the cells already share: the label prints verbatim.
+    #[test]
+    fn spend_single_segment_labels_carry_no_padding() {
+        let row = SpendTableRow {
+            label_segments: vec!["2026-09-01".to_string()],
+            known: [1, 2, 3, 4],
+            reasoning: None,
+            valuation: None,
+            credits: None,
+            partial: false,
+            dim: false,
+            details: Vec::new(),
+        };
+        let header = vec!["day".to_string()];
+        let sections = vec![SpendTableSection {
+            title: None,
+            rows: vec![row.clone()],
+        }];
+        assert_eq!(spend_segment_widths(&header, &sections), vec![10]);
+        assert_eq!(
+            spend_format_label_segments(&row.label_segments, &[10]),
+            "2026-09-01"
+        );
+    }
+
+    /// The five `unknown-*` sentinel buckets print as `unknown` in the text
+    /// table; any other value prints verbatim.
+    #[test]
+    fn spend_unknown_sentinels_render_as_unknown() {
+        for sentinel in [
+            UNKNOWN_ACCOUNT_LABEL,
+            UNKNOWN_HARNESS_LABEL,
+            UNKNOWN_MODEL_LABEL,
+            UNKNOWN_PROJECT,
+            UNKNOWN_REPOSITORY,
+        ] {
+            assert_eq!(
+                spend_segment_display_value(sentinel),
+                "unknown",
+                "{sentinel}"
+            );
+        }
+        assert_eq!(spend_segment_display_value("primary"), "primary");
+        assert_eq!(
+            spend_segment_display_value("agent-usage-book"),
+            "agent-usage-book"
+        );
     }
 
     /// Observed in e2e 017 and 028: a credits refusal or a window-equivalent
