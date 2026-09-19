@@ -33,6 +33,12 @@ state.dir = "$STATE_DIR"
 # The second tick must run after the ordinary cadence boundary has already
 # passed: a hold that only lasted the remaining cadence would not catch the
 # defect this case pins, where every tick past the boundary re-attempted.
+#
+# The tick moves with the cadence: this case drives ticks by invoking the
+# binary rather than by the timer, and config resolution refuses a cadence
+# shorter than the tick it is paired with (aub-eun.13), which a bare 1s cadence
+# against the 1m default would be.
+scheduler_tick = "1s"
 default_interval = "1s"
 
 [[accounts]]

@@ -11524,13 +11524,16 @@ usage_evidence = "measured"
     }
 
     /// A `--set` override lands in its section with source `override`
-    /// (aub-34ik): the freshness block shows `meter  5m  override`.
+    /// (aub-34ik): the freshness block shows `meter  15m  override`. The value
+    /// is 15m rather than 5m because `validate_sampling_schedule` refuses a
+    /// horizon inside one cadence plus one tick (aub-eun.13), and the golden
+    /// TOML carries no `[sampling]` section, so the defaults apply.
     #[test]
     fn config_boxed_set_override_shows_in_its_section() {
         let home = "/home/synthetic-user";
         let env = FakeEnv::new().set("HOME", home);
         let file_path = format!("{home}/.config/aub/config.toml");
-        let overrides = crate::config::Overrides::new().set("freshness.meter", "5m");
+        let overrides = crate::config::Overrides::new().set("freshness.meter", "15m");
         let (config, provenance) = crate::config::resolve(
             &overrides,
             &env,
@@ -11548,7 +11551,9 @@ usage_evidence = "measured"
         let freshness_at = text.find("freshness").expect("a freshness section");
         let row = text
             .lines()
-            .find(|line| line.contains("meter") && line.contains("5m") && line.contains("override"))
+            .find(|line| {
+                line.contains("meter") && line.contains("15m") && line.contains("override")
+            })
             .expect("the override row names key, value and source");
         let row_at = text.find(row).expect("the row is in the output");
         assert!(

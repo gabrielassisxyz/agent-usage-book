@@ -29,6 +29,10 @@ case_preconditions() {
 state.dir = "$STATE_DIR"
 
 [sampling]
+# The tick moves with the cadence: this case drives ticks by invoking the
+# binary rather than by the timer, and config resolution refuses a cadence
+# shorter than the tick it is paired with (aub-eun.13).
+scheduler_tick = "1s"
 default_interval = "1s"
 auth_backoff_threshold = 2
 auth_backoff_cap = "60s"

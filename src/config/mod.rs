@@ -198,8 +198,45 @@ pub struct StateConfig {
 
 #[derive(Debug, Clone)]
 pub struct SamplingConfig {
+    /// How often the scheduler wakes and asks every account whether it is due.
+    /// It is the granularity of every other duration in this struct, never a
+    /// sampling rate of its own: a reset-edge lead or an ordinary cadence
+    /// shorter than one tick cannot be delivered, which
+    /// [`validate_sampling_schedule`] refuses rather than silently rounds.
+    /// Retained at `1m` by the aub-eun.13 review of the aub-eun.10 burn-in: at
+    /// a 5m cadence the measured inter-attempt interval held at 288 to 293
+    /// attempts per account per day over twelve days, so the tick delivered
+    /// every cadence it owed and a finer one would only cost wakeups.
     pub scheduler_tick: MonotonicDuration,
+    /// The ordinary cadence: how long after an account's last due instant the
+    /// next ordinary attempt is owed. It is the denominator the coverage
+    /// engine reconstructs an interval's expected opportunities from, so it is
+    /// recorded in every attempt's `sampling_policy_snapshot` row and a change
+    /// to it applies only to attempts after the new snapshot's effective
+    /// instant.
+    ///
+    /// Retained at `5m` by the aub-eun.13 review. Measured over 2026-09-07 to
+    /// 2026-09-18 on nine accounts: about 3,600 attempts each, attempt
+    /// coverage at the floor's ceiling on every reviewed 168h window, and only
+    /// four to ten inter-attempt gaps per account longer than 12 minutes in
+    /// the whole series. Nothing in the distribution asks for a faster cadence,
+    /// and a faster one buys provider requests against rate limits the burn-in
+    /// already saw bite (`gmail`, 2026-09-07).
     pub default_interval: MonotonicDuration,
+    /// How far before a known quota reset an extra attempt is owed, so the
+    /// window's final reading is captured before it rolls over. The lead must
+    /// strictly exceed [`Self::scheduler_tick`] or the window it opens can be
+    /// straddled by two consecutive ticks and the pre-reset reading lost with
+    /// nothing recorded.
+    ///
+    /// Retained at `2m` by the aub-eun.13 review. Measured against the three
+    /// Anthropic accounts over 2026-09-07 to 2026-09-18, whose reported reset
+    /// instants are stable enough to judge a lead by: the newest observation
+    /// preceding a reset was inside 2 minutes for 3,646 of 3,647 reset instants
+    /// on `bianca`, 1,935 of 1,937 on `gmail` and 6,976 of 7,016 on `primary`.
+    /// The Codex and opencode accounts miss that bound far more often, and the
+    /// cause is not the lead: they report reset instants faster than the
+    /// cadence can attend to them, so no lead can edge-sample every one.
     pub reset_edge_lead: MonotonicDuration,
     /// The store timeout (aub-rqh2): it bounds the ledger connection's wait
     /// for the writer slot and `aub backup verify`'s read of an archive. It
@@ -208,6 +245,13 @@ pub struct SamplingConfig {
     /// not the lock wait a sampling tick refuses after: that is `busy_timeout`,
     /// its own key, so raising this for a slow verifier never lengthens a
     /// tick's lock wait.
+    ///
+    /// Retained at `5s` by the aub-eun.13 review. The burn-in's latency
+    /// distribution does not judge this key at all -- that was the error
+    /// aub-fhh9 corrected -- and the store path it does bound produced no
+    /// refusal in the series: every attempt started between 2026-09-14 and
+    /// 2026-09-19 reached a terminal result, so nothing was ever waiting on the
+    /// ledger when the timeout would have fired.
     pub request_timeout: MonotonicDuration,
     /// How long `aub sample` waits for the ledger's write slot before refusing
     /// a tick. Its own key rather than `request_timeout`: that one bounds the
@@ -222,6 +266,13 @@ pub struct SamplingConfig {
     /// 30s budget every provider adapter builds its requests under, so the
     /// horizon does not fire while the adapter itself is still waiting. It
     /// bounds no request; the adapters' own fixed budgets do.
+    ///
+    /// Confirmed at `30s` by the aub-eun.13 review, against the series that ran
+    /// after the change landed: of 13,404 successful attempts between
+    /// 2026-09-14 and 2026-09-19, four exceeded the 8s horizon this key used to
+    /// carry, the slowest at 12,037 ms, and none came within 18s of 30s. Those
+    /// four are exactly the readings the old value rendered as collector
+    /// interruptions while the request was still legitimately in flight.
     pub command_budget: MonotonicDuration,
     /// The most provider requests one sampling batch may keep in flight.
     /// Bounded so a machine with many configured accounts cannot open an
@@ -247,8 +298,10 @@ pub struct SamplingConfig {
     /// The longest the authentication backoff may hold an account past its
     /// last rejection (aub-x2je), in the same policy surface as
     /// `retry_after_cap` rather than as a constant. Six hours bounds a
-    /// permanently dead credential to about eleven attempts a day at a
-    /// five-minute cadence instead of 288, while a credential fixed at noon
+    /// permanently dead credential to four attempts a day at a five-minute
+    /// cadence instead of 288 -- measured by the aub-eun.13 review on `agy`,
+    /// which held at exactly four a day for the six days from 2026-09-13, and
+    /// again on `opencode` from 2026-09-18 -- while a credential fixed at noon
     /// still resumes the same day even if the change signal were missed;
     /// the normal path resumes at the next tick via the credential-context
     /// change, so the cap only bounds the un-fixed case.
@@ -287,12 +340,54 @@ pub struct IngestConfig {
 
 #[derive(Debug, Clone)]
 pub struct FreshnessConfig {
+    /// How old a meter reading may be before it is rendered `stale` rather than
+    /// `fresh`. It must strictly exceed the ordinary cadence plus one scheduler
+    /// tick, which is the soonest a replacement reading can arrive;
+    /// [`validate_sampling_schedule`] refuses anything shorter.
+    ///
+    /// Retained at `12m` by the aub-eun.13 review, and the evidence is that the
+    /// value barely matters inside its plausible range. Measured over
+    /// 2026-09-07 to 2026-09-18 on nine accounts, the share of wall-clock time
+    /// with no reading newer than the horizon moves from 0.53% at a 10m horizon
+    /// to 0.49% at 12m to 0.42% at 15m on a representative account: almost no
+    /// interval between successful readings lands in that band, because
+    /// staleness is produced by rare provider outages lasting an hour or more,
+    /// never by cadence jitter. `12m` is retained because it is the value that
+    /// tolerates exactly one fully missed cadence (2 x 5m + 2 x 1m) without
+    /// reporting a healthy sampler as stale.
     pub meter: MonotonicDuration,
 }
 
 #[derive(Debug, Clone)]
 pub struct CoverageConfig {
+    /// The floor `coverage` and `doctor` judge attempt coverage against: the
+    /// share of the opportunities the policy owed over the interval that were
+    /// actually attempted. A breach means the sampler did not try, which is a
+    /// collector fault rather than a provider one.
+    ///
+    /// Retained at `0.98` by the aub-eun.13 review. Over the six reviewed 168h
+    /// windows ending 2026-09-14 through 2026-09-19, every account with working
+    /// credentials attempted at least 97.9% of a naive cadence denominator and
+    /// `aub coverage` reported 100.0% on all ten for the burn-in period. The
+    /// two accounts that fell below were `agy` and `opencode`, each held by the
+    /// authentication backoff after its credentials failed -- which is the
+    /// breach this floor exists to raise, not a reason to lower it.
     pub attempt_floor: CoverageFloor,
+    /// The floor measurement coverage is judged against: the share of terminal
+    /// attempts that produced a usable reading. A breach means the provider
+    /// refused or the response was unusable, which is a different fault from
+    /// the one [`Self::attempt_floor`] catches, and the two are deliberately
+    /// separate numbers.
+    ///
+    /// Retained at `0.95` by the aub-eun.13 review, because the observed
+    /// distribution is bimodal and `0.95` sits in the empty band between its
+    /// two modes. Over the same six 168h windows, ordinary operation ran
+    /// between 98.6% and 99.8% on every account, while the one genuine provider
+    /// episode in the series -- the eleven-hour rate-limit block on `gmail`
+    /// starting 2026-09-07 -- drove that account's window to 92.3%. A floor
+    /// anywhere in between separates the two; `0.95` is retained as the value
+    /// already in force, and no window in the series lands between 92.3% and
+    /// 98.6% for it to misjudge.
     pub measurement_floor: CoverageFloor,
 }
 
@@ -761,6 +856,70 @@ fn check_keys(
         if !allowed.contains(&key.as_str()) {
             return Err(unknown_key_error(&format!("{path}.{key}"), file_display));
         }
+    }
+    Ok(())
+}
+
+/// Rejects the combinations of scheduler tick, ordinary cadence, reset-edge lead
+/// and meter freshness horizon that describe a schedule the sampler cannot
+/// deliver (aub-eun.13). Each rule below is an impossibility, not a preference:
+/// a tight-but-deliverable schedule is the operator's business, and only a
+/// schedule whose own terms contradict each other is refused here.
+///
+/// The three rules, and what makes each one impossible rather than merely tight:
+///
+/// 1. The reset-edge lead must strictly exceed the scheduler tick. The lead is
+///    the window in which a reset-edge attempt is owed, and the sampler only
+///    evaluates due-ness once per tick, so a lead at or below the tick has a
+///    window two consecutive ticks can straddle without ever landing inside it.
+///    The pre-reset reading is then lost for that reset with no failure
+///    recorded anywhere.
+/// 2. The ordinary cadence must be at least the scheduler tick. A cadence below
+///    the tick cannot be honoured by a scheduler that wakes on the tick; it
+///    silently degrades to the tick, so the recorded policy and the delivered
+///    schedule disagree, and every coverage denominator computed from the
+///    recorded cadence over-counts what was ever owed.
+/// 3. The meter freshness horizon must strictly exceed cadence plus tick. A
+///    reading goes stale after the horizon, and the soonest the next reading
+///    can arrive is one cadence plus up to one tick of scheduler granularity.
+///    A horizon at or below that sum reports a stale meter in steady state
+///    while the sampler is working perfectly, which is exactly the wrong-number
+///    failure this project exists to prevent.
+///
+/// The shipped defaults (1m tick, 5m cadence, 2m lead, 12m horizon) clear all
+/// three with room: the horizon is 12m against a 6m minimum, which is the
+/// headroom that absorbs one fully missed cadence.
+fn validate_sampling_schedule(
+    sampling: &SamplingConfig,
+    freshness: &FreshnessConfig,
+) -> Result<(), Error> {
+    let tick = sampling.scheduler_tick;
+    let cadence = sampling.default_interval;
+    let lead = sampling.reset_edge_lead;
+    let horizon = freshness.meter;
+
+    if lead.as_nanos() <= tick.as_nanos() {
+        return Err(Error::Usage(format!(
+            "sampling.reset_edge_lead ({}) must be longer than sampling.scheduler_tick ({}): a lead no longer than one tick can be stepped over entirely, losing the pre-reset reading",
+            format_config_duration(lead),
+            format_config_duration(tick)
+        )));
+    }
+    if cadence.as_nanos() < tick.as_nanos() {
+        return Err(Error::Usage(format!(
+            "sampling.default_interval ({}) must be at least sampling.scheduler_tick ({}): the scheduler wakes once per tick and cannot deliver a shorter cadence",
+            format_config_duration(cadence),
+            format_config_duration(tick)
+        )));
+    }
+    let soonest_next_reading = cadence.as_nanos().saturating_add(tick.as_nanos());
+    if horizon.as_nanos() <= soonest_next_reading {
+        return Err(Error::Usage(format!(
+            "freshness.meter ({}) must be longer than sampling.default_interval ({}) plus sampling.scheduler_tick ({}): a shorter horizon reports every reading stale before the next one can be taken",
+            format_config_duration(horizon),
+            format_config_duration(cadence),
+            format_config_duration(tick)
+        )));
     }
     Ok(())
 }
@@ -1435,6 +1594,8 @@ pub fn resolve(
             &mut provenance,
         )?,
     };
+
+    validate_sampling_schedule(&sampling, &freshness)?;
 
     let coverage = CoverageConfig {
         attempt_floor: resolve_floor(
@@ -3276,6 +3437,75 @@ provider = "codex"
         assert_eq!(config.coverage.attempt_floor.get(), 0.9);
     }
 
+    /// aub-eun.13: the four schedule keys are rejected in combination, not only
+    /// one at a time. Each case below pairs a refused combination with a
+    /// near-identical accepted one differing only in the forbidden dimension,
+    /// so a validator that refused everything, or nothing, fails here.
+    #[test]
+    fn a_reset_edge_lead_no_longer_than_the_scheduler_tick_is_a_usage_error() {
+        let file = "[sampling]\nscheduler_tick = \"2m\"\nreset_edge_lead = \"2m\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("sampling.reset_edge_lead"),
+            "the message must name the key that is wrong, got {err}"
+        );
+
+        let permitted = "[sampling]\nscheduler_tick = \"2m\"\nreset_edge_lead = \"121s\"\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(permitted))
+            .expect("a lead one second longer than the tick is deliverable");
+        assert_eq!(config.sampling.reset_edge_lead.as_nanos(), 121_000_000_000);
+    }
+
+    #[test]
+    fn an_ordinary_cadence_shorter_than_the_scheduler_tick_is_a_usage_error() {
+        let file = "[sampling]\nscheduler_tick = \"1m\"\ndefault_interval = \"30s\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("sampling.default_interval"),
+            "the message must name the key that is wrong, got {err}"
+        );
+
+        // Equal is deliverable: the scheduler wakes exactly when the cadence
+        // expires. Only shorter than the tick is impossible.
+        let permitted = "[sampling]\nscheduler_tick = \"1m\"\ndefault_interval = \"1m\"\n[freshness]\nmeter = \"3m\"\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(permitted))
+            .expect("a cadence equal to the tick is deliverable");
+        assert_eq!(config.sampling.default_interval.as_nanos(), 60_000_000_000);
+    }
+
+    #[test]
+    fn a_freshness_horizon_inside_one_cadence_plus_one_tick_is_a_usage_error() {
+        // 5m cadence plus the 1m tick is exactly 6m, and the horizon must
+        // strictly exceed it: at 6m a healthy sampler reports stale.
+        let file = "[freshness]\nmeter = \"6m\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("freshness.meter"),
+            "the message must name the key that is wrong, got {err}"
+        );
+
+        let permitted = "[freshness]\nmeter = \"361s\"\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(permitted))
+            .expect("a horizon one second past the sum is reachable");
+        assert_eq!(config.freshness.meter.as_nanos(), 361_000_000_000);
+    }
+
+    #[test]
+    fn the_shipped_schedule_defaults_are_mutually_consistent() {
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), None)
+            .expect("the shipped defaults must pass their own consistency check");
+        assert!(config.sampling.reset_edge_lead > config.sampling.scheduler_tick);
+        assert!(config.sampling.default_interval >= config.sampling.scheduler_tick);
+        assert!(
+            config.freshness.meter.as_nanos()
+                > config.sampling.default_interval.as_nanos()
+                    + config.sampling.scheduler_tick.as_nanos()
+        );
+    }
+
     #[test]
     fn the_attribution_quality_floor_is_absent_by_default_and_set_from_the_file() {
         let (default_config, provenance) =
@@ -4056,14 +4286,17 @@ plan_tier = "pro"
 
     #[test]
     fn a_command_line_override_row_carries_the_override_source() {
-        let overrides = Overrides::new().set("freshness.meter", "5m");
+        // 15m rather than a value under the schedule minimum: the override has
+        // to survive `validate_sampling_schedule`, which refuses a horizon
+        // inside one cadence plus one tick (aub-eun.13).
+        let overrides = Overrides::new().set("freshness.meter", "15m");
         let (config, provenance) = resolve_with(overrides, plain_env(), None).unwrap();
         let rows = config.provenance_rows(&provenance);
         let row = rows
             .iter()
             .find(|row| row.key == "freshness.meter")
             .expect("every resolved scalar has a row");
-        assert_eq!(row.value, "5m");
+        assert_eq!(row.value, "15m");
         assert_eq!(row.source, ConfigSource::Flag);
         assert_eq!(row.source.label(), "override");
     }

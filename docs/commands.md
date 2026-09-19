@@ -351,6 +351,58 @@ source `default`, never a value that looks like it came from a file. It also
 never prints credential material, only the kind and reference (`file:<path>`,
 `env:<NAME>`, `none`) of the key that names one.
 
+#### The sampling schedule, and why its defaults are what they are
+
+Four keys describe one schedule, and they constrain each other. `aub config`
+refuses to resolve a combination the sampler could not deliver, naming both
+keys and both values:
+
+| rule | why a violation is impossible rather than merely tight |
+| --- | --- |
+| `sampling.reset_edge_lead` > `sampling.scheduler_tick` | the lead is the window a reset-edge attempt is owed in, and due-ness is only evaluated once per tick, so a lead no longer than a tick has a window two consecutive ticks can straddle. The pre-reset reading is lost with no failure recorded |
+| `sampling.default_interval` >= `sampling.scheduler_tick` | a scheduler that wakes on the tick cannot deliver a shorter cadence. It degrades to the tick silently, so every coverage denominator computed from the recorded cadence over-counts what was ever owed |
+| `freshness.meter` > `sampling.default_interval` + `sampling.scheduler_tick` | a reading goes stale after the horizon, and the soonest a replacement can arrive is one cadence plus up to one tick. A shorter horizon reports a stale meter in steady state while the sampler is working |
+
+The defaults clear all three with room: a 1m tick, a 5m cadence, a 2m lead and
+a 12m horizon against a 6m minimum.
+
+Each of those values, and the two coverage floors, was re-examined against the
+unattended burn-in recorded on `aub-eun.10` (2026-09-07 to 2026-09-14, ten real
+accounts) plus the series that has run since. Every one was retained, and the
+evidence for each is on its field in `src/config/mod.rs`. The short form:
+
+- **`scheduler_tick` 1m, `default_interval` 5m.** Nine accounts with working
+  credentials delivered 288 to 293 attempts a day each over twelve days, and
+  only four to ten inter-attempt gaps per account exceeded 12 minutes in the
+  whole series. Nothing asks for a faster cadence, and a faster one spends
+  provider requests against rate limits the burn-in already saw bite.
+- **`reset_edge_lead` 2m.** On the three accounts whose reported reset instants
+  are stable enough to judge a lead by, the newest observation preceding a reset
+  was inside 2 minutes for 3,646 of 3,647, 1,935 of 1,937 and 6,976 of 7,016
+  reset instants. The accounts that miss that bound report reset instants faster
+  than any cadence can attend to, which no lead can fix.
+- **`freshness.meter` 12m.** The share of wall-clock time with no reading newer
+  than the horizon moves only from 0.53% at 10m to 0.49% at 12m to 0.42% at 15m:
+  staleness comes from rare hour-long provider outages, not from cadence jitter,
+  so nothing in the plausible range distinguishes itself on frequency. 12m is
+  kept because it is the value that absorbs exactly one fully missed cadence.
+- **`coverage.attempt_floor` 0.98 and `coverage.measurement_floor` 0.95.** Over
+  the six 168h windows ending 2026-09-14 through 2026-09-19, ordinary operation
+  measured between 98.6% and 99.8%, while the one genuine provider episode in
+  the series drove a single account to 92.3%. The floors sit in the empty band
+  between those two modes rather than under the worst run.
+- **`request_timeout` 5s and `command_budget` 30s** were settled on `aub-fhh9`
+  and `aub-rqh2` out of this same burn-in. `request_timeout` bounds the ledger
+  connection and the archive verifier, never a provider request. `command_budget`
+  matches the 30s budget the adapters build: of 13,404 successful attempts after
+  the change landed, four exceeded the 8s horizon it used to carry, the slowest
+  at 12,037 ms.
+
+A changed value applies prospectively. It is written into a new
+`sampling_policy_snapshot` row with its own effective instant, and the coverage
+engine reconstructs each interval's denominator from the snapshots in force
+inside that interval, so no earlier expectation is rewritten.
+
 An account's `credential` table takes one of three kinds:
 
 ```toml
