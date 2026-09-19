@@ -4294,12 +4294,7 @@ fn export_transcript_command(
         }
         TranscriptDestination::ExplicitPath(explicit) => {
             let path = if transcript_explicit_path_is_dir(explicit) {
-                std::fs::create_dir_all(explicit).map_err(|error| {
-                    Error::IngestIncomplete(format!(
-                        "cannot create the transcript directory {}: {error}",
-                        explicit.display()
-                    ))
-                })?;
+                ensure_transcript_output_dir(explicit)?;
                 explicit.join(transcript_default_file_name(&session))
             } else {
                 explicit.clone()
@@ -4358,7 +4353,10 @@ fn transcript_default_output_path_for_home(
     session: &crate::store::transcript_session::TranscriptSession,
 ) -> Result<PathBuf, Error> {
     let dir = PathBuf::from(home).join("agent-transcripts");
-    std::fs::create_dir_all(&dir).map_err(|error| {
+    // The default destination is the exporter's own directory, so it is forced
+    // to 0700 whether it is created here or found wider from an older build:
+    // `ensure_dir_mode_0700` repairs rather than refuses.
+    crate::store::startup::ensure_dir_mode_0700(&dir).map_err(|error| {
         Error::IngestIncomplete(format!(
             "cannot create the transcript directory {}: {error}",
             dir.display()
@@ -4367,18 +4365,55 @@ fn transcript_default_output_path_for_home(
     Ok(dir.join(transcript_default_file_name(session)))
 }
 
+/// Makes sure `dir` exists before a transcript lands in it. A directory this
+/// call creates is forced to mode 0700, so the file name it holds (which
+/// carries the project and the shortened session id) stays visible only to
+/// the exporting user; one that already existed keeps its own mode, because
+/// an export must not chmod a directory the user did not create for it.
+fn ensure_transcript_output_dir(dir: &Path) -> Result<(), Error> {
+    let created = !dir.exists();
+    std::fs::create_dir_all(dir).map_err(|error| {
+        Error::IngestIncomplete(format!(
+            "cannot create the transcript directory {}: {error}",
+            dir.display()
+        ))
+    })?;
+    if created {
+        crate::store::startup::ensure_dir_mode_0700(dir).map_err(|error| {
+            Error::IngestIncomplete(format!(
+                "cannot set the transcript directory {} to mode 0700: {error}",
+                dir.display()
+            ))
+        })?;
+    }
+    Ok(())
+}
+
+/// Writes the rendered markdown at mode 0600 through the ledger's own
+/// [`crate::store::startup::create_file_mode_0600`], so the file's protection
+/// is the exporter's guarantee rather than the caller's umask. The helper
+/// opens without truncating; the old content is cut explicitly before the new
+/// markdown is written, so an export over an earlier longer transcript leaves
+/// no stale tail.
 fn write_transcript_file(path: &Path, markdown: &str) -> Result<(), Error> {
     if let Some(parent) = path.parent()
         && !parent.as_os_str().is_empty()
     {
-        std::fs::create_dir_all(parent).map_err(|error| {
-            Error::IngestIncomplete(format!(
-                "cannot create the transcript directory {}: {error}",
-                parent.display()
-            ))
-        })?;
+        ensure_transcript_output_dir(parent)?;
     }
-    std::fs::write(path, markdown).map_err(|error| {
+    let mut file = crate::store::startup::create_file_mode_0600(path).map_err(|error| {
+        Error::IngestIncomplete(format!(
+            "cannot write the transcript file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.set_len(0).map_err(|error| {
+        Error::IngestIncomplete(format!(
+            "cannot write the transcript file {}: {error}",
+            path.display()
+        ))
+    })?;
+    file.write_all(markdown.as_bytes()).map_err(|error| {
         Error::IngestIncomplete(format!(
             "cannot write the transcript file {}: {error}",
             path.display()
@@ -10983,6 +11018,101 @@ mod tests {
         assert!(transcript_explicit_path_is_dir(&scratch.join("")));
         assert!(!transcript_explicit_path_is_dir(&scratch.join("out.md")));
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// The exported transcript file is mode 0600 on unix, whatever the umask,
+    /// and the directories the export creates are mode 0700 (aub-ywqw). The
+    /// markdown carries tool results as recorded, and the file name carries
+    /// the project and the shortened session id, so both must stay private
+    /// to the exporting user.
+    #[cfg(unix)]
+    mod transcript_file_permissions {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        fn scratch() -> PathBuf {
+            std::env::temp_dir().join(format!(
+                "aub-ywqw-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .expect("clock runs forward")
+                    .as_nanos()
+            ))
+        }
+
+        fn mode_of(path: &Path) -> u32 {
+            std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+        }
+
+        /// The file an export writes is mode 0600 and holds exactly the
+        /// rendered markdown.
+        #[test]
+        fn export_writes_the_file_at_mode_0600() {
+            let root = scratch();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("out.md");
+            write_transcript_file(&target, "# heading\n").unwrap();
+            assert_eq!(mode_of(&target), 0o600);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "# heading\n");
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        /// Planted negative: exporting over yesterday's 0644 file tightens it
+        /// and replaces its content. The ledger helper opens without
+        /// truncating, so skipping the explicit cut leaves a stale tail after
+        /// a shorter markdown.
+        #[test]
+        fn export_tightens_a_preexisting_wider_file_and_replaces_its_content() {
+            let root = scratch();
+            std::fs::create_dir_all(&root).unwrap();
+            let target = root.join("out.md");
+            std::fs::write(&target, "an older, longer transcript body").unwrap();
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o644)).unwrap();
+            assert_eq!(mode_of(&target), 0o644);
+
+            write_transcript_file(&target, "new").unwrap();
+            assert_eq!(mode_of(&target), 0o600);
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        /// A parent directory this export creates is mode 0700; one that
+        /// already existed keeps its own mode, because `-o /tmp/out.md` must
+        /// not tighten /tmp.
+        #[test]
+        fn export_creates_a_missing_parent_at_mode_0700_and_leaves_an_existing_one() {
+            let root = scratch();
+            std::fs::create_dir_all(&root).unwrap();
+            let existing_mode = mode_of(&root);
+
+            write_transcript_file(&root.join("new/sub/out.md"), "x").unwrap();
+            assert_eq!(mode_of(&root.join("new/sub")), 0o700);
+            assert_eq!(mode_of(&root), existing_mode);
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        /// The default destination directory is created at 0700, and a wider
+        /// one left by an older build is tightened in place rather than left
+        /// standing: the repair-not-refuse policy `create_file_mode_0600`
+        /// documents for the ledger.
+        #[test]
+        fn default_destination_directory_is_0700_and_tightens_a_wider_one() {
+            let root = scratch();
+            let home = root.join("home");
+            let target = home.join("agent-transcripts");
+            let session = transcript_candidate("claude-code", "aaaa0001-early", 100, "proj-alpha");
+
+            transcript_default_output_path_for_home(&home.to_string_lossy(), &session).unwrap();
+            assert_eq!(mode_of(&target), 0o700);
+
+            std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o755)).unwrap();
+            transcript_default_output_path_for_home(&home.to_string_lossy(), &session).unwrap();
+            assert_eq!(mode_of(&target), 0o700);
+
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     /// The read loop renders the files that exist (flagging the subagent

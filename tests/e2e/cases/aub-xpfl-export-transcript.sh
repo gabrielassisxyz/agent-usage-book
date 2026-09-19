@@ -155,6 +155,26 @@ case_assertions() {
         CASE_FAILED=1
     fi
 
+    # The exported file and its default directory are private to the
+    # exporting user: the markdown carries tool results as recorded, and the
+    # file name carries the project and the shortened session id. The mode
+    # comes from the export itself, so the assertion holds under any umask.
+    local file_mode dir_mode
+    file_mode="$(stat -c %a "$out_path")"
+    if [ "$file_mode" = "600" ]; then
+        record_assertion "exported file mode" "600" "$file_mode" "pass"
+    else
+        record_assertion "exported file mode" "600" "$file_mode" "fail"
+        CASE_FAILED=1
+    fi
+    dir_mode="$(stat -c %a "$STATE_DIR/home/agent-transcripts")"
+    if [ "$dir_mode" = "700" ]; then
+        record_assertion "default directory mode" "700" "$dir_mode" "pass"
+    else
+        record_assertion "default directory mode" "700" "$dir_mode" "fail"
+        CASE_FAILED=1
+    fi
+
     # The missing file is reported by path, the files that exist still
     # render, and the exit is non-zero.
     assert_exit 8 11
