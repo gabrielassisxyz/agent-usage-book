@@ -137,7 +137,7 @@ case_assertions() {
     assert_stdout_contains 6 "credits anthropic-claude-messages-v1"
     assert_stdout_matches 6 "^│  claude-code:s-credits-c… +100\\.0k +20\\.0k +50\\.0k +10\\.0k +0\\.65 "
     assert_row_detail_contains 6 "^│  claude-code:s-credits-c… " "0.65 credits (complete)"
-    assert_stdout_matches 6 "^│  claude-code:s-credits-u… +1000 +200 "
+    assert_stdout_matches 6 "^│  claude-code:s-credits-u… +1\\.0k +200 "
     assert_row_detail_contains 6 "^│  claude-code:s-credits-u… " "credits unavailable: unknown component: tool_use_tokens"
 
     assert_exit 0 7
