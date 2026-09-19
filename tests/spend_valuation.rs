@@ -186,8 +186,8 @@ fn integration_unvalued_spend_with_no_rate_cards_produces_complete_report() {
     assert!(!text.contains("API list-price equivalent"));
     assert_eq!(
         spend_row_cells(&text, "2026-08-25"),
-        ["2026-08-25", "1000", "500", "200", "100"],
-        "the unvalued row carries the four exact counts and no $ cell: {text}"
+        ["2026-08-25", "1.0k", "500", "200", "100"],
+        "the unvalued row carries the four compact counts and no $ cell: {text}"
     );
     assert!(
         !text.contains('\u{25d0}'),

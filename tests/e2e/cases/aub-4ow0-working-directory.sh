@@ -64,7 +64,7 @@ case_assertions() {
     # is the configured logical name, not the unknown bucket.
     assert_exit 0 2
     assert_stdout_matches 2 "^│  fixture +130 "
-    if grep -qE "^│  unknown-project |project=unknown-project" "$(step_dir 2)/stdout.bin"; then
+    if grep -qE "^│  unknown-project |project=unknown-project|^│  unknown " "$(step_dir 2)/stdout.bin"; then
         echo "step 2 must not show an unknown-project row" >&2
         return 1
     fi

@@ -115,24 +115,24 @@ Text output is a bordered table. Counts use compact human units in the table;
 ```text
 ┌─ spend · 2026-09-01 → 2026-09-07 · 7 days UTC · by day ──────────────────────┐
 │                                                                              │
-│  day         input    output   cache read  cache write  reasoning            │
-│  ───────────────────────────────────────────────────────────────────         │
-│  2026-09-01  2100.0k   310.0k       38.2M       900.0k      12.0k            │
-│  2026-09-02  3660.0k   373.6k       75.1M      1400.0k      23.2k            │
-│  2026-09-03  3660.0k   373.6k       75.1M      1400.0k      23.2k            │
-│  2026-09-04  3660.0k   373.6k       75.1M      1400.0k      23.2k            │
-│  2026-09-05  3660.0k   373.6k       75.1M      1400.0k      23.2k            │
-│  2026-09-06  3660.0k   373.6k       75.1M      1400.0k      23.2k            │
-│  2026-09-07    11.0M   722.0k      198.5M      3300.0k      82.0k  ◐         │
-│  ───────────────────────────────────────────────────────────────────         │
-│  total         31.4M  2900.0k      612.0M        11.2M     210.0k            │
+│  day         input  output  cache read  cache write  reasoning               │
+│  ────────────────────────────────────────────────────────────────            │
+│  2026-09-01   2.1M  310.0k       38.2M       900.0k      12.0k               │
+│  2026-09-02   3.7M  373.6k       75.1M         1.4M      23.2k               │
+│  2026-09-03   3.7M  373.6k       75.1M         1.4M      23.2k               │
+│  2026-09-04   3.7M  373.6k       75.1M         1.4M      23.2k               │
+│  2026-09-05   3.7M  373.6k       75.1M         1.4M      23.2k               │
+│  2026-09-06   3.7M  373.6k       75.1M         1.4M      23.2k               │
+│  2026-09-07  11.0M  722.0k      198.5M         3.3M      82.0k  ◐            │
+│  ────────────────────────────────────────────────────────────────            │
+│  total       31.4M    2.9M      612.0M        11.2M     210.0k               │
 │                                                                              │
 │  ◐ partial: coverage incomplete for this row                                 │
 │  1085 events · 8 files read · 0 quarantined · generation 148                 │
 └──────────────────────────────────────────────────────────────────────────────┘
 ```
 
-A count under 10k is the exact integer, under 10M it is thousands with one
+A count under 1k is the exact integer, under 1M it is thousands with one
 decimal, and above that millions with one decimal; a row and the total print
 the same value the same way. The box uses the terminal width from the style
 layer, with an 80-column minimum and a 120-column maximum. When the table is

@@ -120,7 +120,7 @@ case_assertions() {
     assert_stdout_contains 1 "· by day, session, project"
     assert_stdout_contains 1 "│  day · 2026-08-25"
     assert_stdout_matches 1 "^│  session · project · repository +input "
-    assert_stdout_matches 1 "^│  claude-code:s-e2e-1 · unknown-project · [^ ]+ +2 +913 +26\\.0k "
+    assert_stdout_matches 1 "^│  claude-code:s-e2e-1 +· unknown +· unknown +2 +913 +26\\.0k "
     assert_stdout_matches 1 "^│  total +4711 +2112 +27\\.2k "
     assert_stdout_contains 1 "generation 1"
     assert_stdout_contains 1 "└"
