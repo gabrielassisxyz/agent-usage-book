@@ -223,15 +223,16 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
         );
     }
     assert!(
-        stored
-            .evidence_capsule
-            .contains("2026-09-21T00:00:00.000Z"),
+        stored.evidence_capsule.contains("2026-09-21T00:00:00.000Z"),
         "the stated reset instant must persist: {}",
         stored.evidence_capsule
     );
     // The account identifiers the response carries are not evidence of a quota
     // number, and the projection is what keeps them out.
-    for field in ["usr_fixtureNotARealSubscriber", "pm_fixtureNotARealPaymentMethod"] {
+    for field in [
+        "usr_fixtureNotARealSubscriber",
+        "pm_fixtureNotARealPaymentMethod",
+    ] {
         assert!(
             !stored.evidence_capsule.contains(field),
             "{field} must not persist: {}",
