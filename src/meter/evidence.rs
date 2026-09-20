@@ -378,9 +378,23 @@ fn sensitive_key(key: &str) -> bool {
         .filter(|character| character.is_ascii_alphanumeric())
         .flat_map(char::to_lowercase)
         .collect::<String>();
-    ["authorization", "cookie", "token", "credential"]
-        .iter()
-        .any(|needle| normalized.contains(needle))
+    // The four credential needles remove what authenticates a caller. The two
+    // that follow remove what identifies the account behind it: the OpenCode
+    // console's status response carries a subscriber id and a payment-method
+    // id alongside the quota it is fetched for, and an evidence store that
+    // exists to prove a number has no business retaining either. They are
+    // listed here rather than in that adapter because the next provider to
+    // answer with an account identifier should not have to rediscover this.
+    [
+        "authorization",
+        "cookie",
+        "token",
+        "credential",
+        "subscriberuser",
+        "paymentmethod",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 /// Anthropic's own key prefix, held reversed so the shipped binary never
@@ -554,6 +568,35 @@ mod tests {
             headers: Vec::new(),
             body: body.into(),
         }
+    }
+
+    /// The account identifiers a quota response can carry are removed by key
+    /// name, alongside the credential needles. The positive half proves the
+    /// removal; the negative half is the part that matters, because a rule
+    /// that also ate `usedMicroCents` would pass a test that only looked for
+    /// the identifiers being gone.
+    #[test]
+    fn account_identifiers_are_removed_and_the_quota_numbers_are_not() {
+        let body =
+            br#"{"subscriberUserId":"usr_not_a_real_id","paymentMethodId":"pm_not_a_real_id",
+            "usedMicroCents":"137731547","limitMicroCents":"3000000000"}"#;
+        let capsule = capture_json_response(
+            &response(body.as_slice()),
+            &SensitiveResponseMaterial::default(),
+        );
+        let serialized = capsule.serialized();
+        assert!(
+            !serialized.contains("usr_not_a_real_id"),
+            "a subscriber id is not evidence of a quota number"
+        );
+        assert!(
+            !serialized.contains("pm_not_a_real_id"),
+            "a payment-method id is not evidence of a quota number"
+        );
+        assert!(
+            serialized.contains("137731547") && serialized.contains("3000000000"),
+            "the quantities the capsule exists to retain survive the key filter"
+        );
     }
 
     #[test]

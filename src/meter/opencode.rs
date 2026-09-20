@@ -1,28 +1,39 @@
-//! The OpenCode Go workspace-page meter adapter (aub-8hu3).
+//! The OpenCode Go console status meter adapter (aub-8hu3, aub-id41).
 //!
-//! The OpenCode Go usage meter has no public endpoint: the authoritative
-//! surface is the workspace page (`GET https://opencode.ai/workspace/<id>/go`)
-//! as seen in a signed-in browser. The page renders its usage meters as
-//! markup, not as an embedded JSON blob: the reference tool
-//! (`git.sr.ht/~hrbrmstr/opencode-go-usage`, `usage/usage.go`) parses the
-//! rendered HTML rather than any script payload, and this adapter follows
-//! the same contract. This adapter fetches that page with the session
-//! cookie the caller resolved (an `env` credential whose value is the bare
-//! `auth` cookie value), reads the three usage windows from the markup, and
-//! answers with a typed reading.
+//! The OpenCode Go usage meter is served by the console's own endpoint,
+//! `GET https://opencode.ai/console/api/go/status`, which answers JSON for a
+//! signed-in browser session. The reference tool
+//! (`git.sr.ht/~hrbrmstr/opencode-go-usage`, `usage/usage.go`) reads that
+//! endpoint, and this adapter follows the same contract.
 //!
-//! One `<div data-slot="usage-item">` exists per window. Inside it: a
-//! `<span data-slot="usage-label">` naming the window (`5-hour Usage`,
-//! `Weekly Usage`, `Monthly Usage`); a `role="progressbar"` element whose
-//! `aria-valuenow` attribute carries the percent as a decimal with one
-//! place; and a `<span data-slot="reset-time">` whose text, once its React
-//! comment markers are stripped, reads `Resets in <N days> <N hours>
-//! <N minutes> <N seconds>` in any subset of those units.
+//! An earlier revision of this adapter scraped the rendered workspace page,
+//! because that was the reference's contract when it was written. The console
+//! stopped accepting a single-cookie caller between 2026-09-17 and 2026-09-18
+//! and the reference migrated in the same window; measured against the live
+//! service on 2026-09-20, the page answers `302` to `/console/login` and the
+//! endpoint answers `401` for the `auth` cookie alone. Both cookies are
+//! therefore mandatory, and the endpoint is strictly the better surface: it
+//! states a refused credential as a status instead of as a redirect to be
+//! sniffed, and it reports integer micro-cents and an absolute RFC 3339 reset
+//! instant where the markup carried a percentage rounded to one decimal place
+//! and a reset sentence floored to whole hours.
 //!
-//! The request never follows a redirect: the provider answers an expired
-//! session by redirecting to its sign-in page, so the redirect response is
-//! the authentication signal and arrives here unfollowed (the transport's
-//! `without_redirects`). A page with no `data-slot="usage-item"` element is
+//! The response body carries one object per window under `access.meters`,
+//! keyed `fiveHour`, `week` and `month`. Each holds `limitMicroCents` and
+//! `usedMicroCents` as decimal strings, and `resetsAt` either as an RFC 3339
+//! instant, as `null`, or not at all. A window with no reset instant is
+//! [`WindowResetState::NotStarted`], which is the meaning `aub-eun.15`
+//! decided for a null reset rather than one this adapter invents; nothing
+//! here derives a reset from `access.endsAt`, which would be an inference and
+//! not a reading.
+//!
+//! The credential is the `Cookie` header value, which is what `aub-r7k0`
+//! decided it was ("a file whose content is the `Cookie:` header value"); the
+//! previous revision narrowed it to the bare `auth` value and rebuilt the
+//! header itself, which cannot express the pair the console now requires.
+//! The adapter sends the material verbatim and reinterprets nothing.
+//!
+//! A body that is not JSON, or that carries no `access.meters` object, is
 //! [`FailureClass::SchemaDrift`], never a silent zero.
 //!
 //! May not depend on:
@@ -40,7 +51,7 @@ use crate::domain::time::{
 };
 use crate::domain::window::{
     MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution, ResetPrecision,
-    WindowScope, WindowSemanticKey,
+    WindowResetState, WindowScope, WindowSemanticKey,
 };
 use crate::meter::adapter::{
     AdapterDeclarations, CredentialHandle, HttpTransport, MeterRequest, ProviderAdapter,
@@ -52,25 +63,35 @@ use crate::meter::evidence::{
 };
 use crate::meter::transport::{CommandBudget, HttpRequest, HttpResponse, RequestTimeoutConfig};
 
-/// The page-state marker the parser keys on: the literal attribute pair that
-/// opens every usage-window block. A page with no element carrying it has no
-/// usage meters to read, and is schema drift.
-pub const STATE_MARKER: &str = "data-slot=\"usage-item\"";
+/// The response-state marker the parser keys on: the object that holds one
+/// entry per usage window. A body with no `meters` object under `access` has
+/// no usage meters to read, and is schema drift.
+pub const STATE_MARKER: &str = "meters";
 
-/// The provider base the workspace page hangs from. The full page URL is
-/// `{DEFAULT_PAGE_BASE}/workspace/<id>/go`; the id is account configuration
-/// handed across the boundary in [`MeterRequest::workspace_id`].
+/// The provider base the status endpoint hangs from. The full request URL is
+/// `{DEFAULT_PAGE_BASE}{STATUS_PATH}`; the workspace id rides in a header
+/// rather than in the path, which is why the base alone is enough to reach
+/// it.
 pub const DEFAULT_PAGE_BASE: &str = "https://opencode.ai";
 
-/// The one cookie-header credential: the reference's client authenticates
-/// with a session cookie named `auth`, and the operator exports the bare
-/// cookie value by hand (decided in `aub-r7k0`); the adapter builds the
-/// `auth=<value>` header pair itself.
+/// The status endpoint's path, appended to the base when no endpoint
+/// override is in force.
+pub const STATUS_PATH: &str = "/console/api/go/status";
+
+/// The credential header: the console authenticates a browser session with
+/// two cookies, `auth` and `__Host-console_session`, and the operator exports
+/// the whole header value (decided in `aub-r7k0`). The adapter sends that
+/// value verbatim and never builds a cookie pair of its own.
 pub const COOKIE_HEADER: &str = "Cookie";
 
+/// The header carrying the workspace id. The endpoint scopes its answer by
+/// this header rather than by a path segment, so an observation without a
+/// workspace id has nothing to ask about.
+pub const ORG_HEADER: &str = "x-org-id";
+
 /// The typed success reading produced by [`OpenCodeAdapter`]: one row per
-/// usage window the page carries, with the reset anchored at the instant the
-/// page was received.
+/// usage window the response carries, with the reset instant the provider
+/// stated.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenCodeReading {
     pub windows: Vec<MeterWindow>,
@@ -90,39 +111,39 @@ impl OpenCodeReading {
 
 /// The OpenCode Go provider adapter.
 ///
-/// The workspace page URL comes from two places, in override order: the
-/// endpoint override the caller resolved from the environment (the same
-/// channel `AUB_ANTHROPIC_ENDPOINT` uses for the Anthropic adapter, so an
-/// end-to-end run can point this adapter at a synthetic server), and
-/// otherwise the account's workspace id, which the caller resolved from
-/// configuration and handed over in [`MeterRequest::workspace_id`]. The
-/// adapter never reads configuration or the environment itself (rule `07`).
+/// The request URL comes from two places, in override order: the endpoint
+/// override the caller resolved from the environment (the same channel
+/// `AUB_ANTHROPIC_ENDPOINT` uses for the Anthropic adapter, so an end-to-end
+/// run can point this adapter at a synthetic server), and otherwise the
+/// provider's own base with the status path appended. The adapter never reads
+/// configuration or the environment itself (rule `07`).
 pub struct OpenCodeAdapter {
     endpoint_override: Option<String>,
     declarations: AdapterDeclarations,
 }
 
 impl OpenCodeAdapter {
-    pub const DEFAULT_CONTRACT_ID: &'static str = "opencode-go-workspace-page-v1";
+    pub const DEFAULT_CONTRACT_ID: &'static str = "opencode-go-console-status-v1";
     pub const DEFAULT_SEMANTICS_ID: &'static str = "opencode-go-subscription-v1";
     pub const REQUIRED_WINDOW_KINDS: &'static [&'static str] = &["rolling", "weekly", "monthly"];
 
-    /// The precision of every reset instant this adapter derives, in seconds:
-    /// the page's rendered reset text floors the remaining time to whole
-    /// hours (`Resets in 6 days 8 hours`), so a re-derived instant is exact
-    /// only to one hour. The classifier consumes this declaration
-    /// (`aub-w1a0`); one hour covers all three windows because all three
-    /// read their reset from the same text renderer.
-    pub const RESET_PRECISION_SECONDS: u64 = 3600;
+    /// The precision of every reset instant this adapter reports, in seconds.
+    /// The endpoint states an absolute RFC 3339 instant rather than a rounded
+    /// remaining duration, so the declaration is one second: the coarsest
+    /// bound the whole-second constructor can express, and three orders of
+    /// magnitude tighter than the one hour the page's rendered sentence
+    /// forced. The classifier consumes this declaration (`aub-w1a0`).
+    pub const RESET_PRECISION_SECONDS: u64 = 1;
 
-    /// Builds the adapter with an optional full workspace-page URL override.
+    /// Builds the adapter with an optional full status-endpoint URL override.
     pub fn new(endpoint_override: Option<String>) -> Self {
         Self {
             endpoint_override,
             declarations: AdapterDeclarations::new(
-                // The page documents no provider measurement time: the
-                // reading's basis is the local receive instant, the same
-                // anchor the reset arithmetic uses.
+                // The response documents no provider measurement time: the
+                // reading's basis is the local receive instant. Unlike the
+                // page revision, no reset arithmetic hangs off that anchor,
+                // because every reset the provider states is absolute.
                 MeasurementBasis::LocallyReceived,
                 ProviderContractId::new(Self::DEFAULT_CONTRACT_ID),
                 MeterSemanticsId::new(Self::DEFAULT_SEMANTICS_ID),
@@ -131,24 +152,21 @@ impl OpenCodeAdapter {
                 Self::REQUIRED_WINDOW_KINDS,
             ))
             .with_reset_precision(
-                // One hour, statically non-zero, so the constructor's
+                // One second, statically non-zero, so the constructor's
                 // refusal is unreachable for this constant.
                 ResetPrecision::from_seconds(Self::RESET_PRECISION_SECONDS)
-                    .expect("a one-hour precision is a non-zero second count"),
+                    .expect("a one-second precision is a non-zero second count"),
             ),
         }
     }
 
-    /// The workspace page URL for one observation: the override when the
-    /// caller resolved one, otherwise the workspace page of the account's
-    /// workspace id.
-    fn page_url(&self, workspace_id: Option<&str>) -> Result<String, FailureClass> {
-        match (&self.endpoint_override, workspace_id) {
-            (Some(url), _) => Ok(url.clone()),
-            (None, Some(id)) if !id.trim().is_empty() => {
-                Ok(format!("{DEFAULT_PAGE_BASE}/workspace/{id}/go"))
-            }
-            (None, _) => Err(FailureClass::MissingRequiredField),
+    /// The status endpoint URL for one observation: the override when the
+    /// caller resolved one, otherwise the provider's base with the status
+    /// path appended.
+    fn status_url(&self) -> String {
+        match &self.endpoint_override {
+            Some(url) => url.clone(),
+            None => format!("{DEFAULT_PAGE_BASE}{STATUS_PATH}"),
         }
     }
 
@@ -157,205 +175,93 @@ impl OpenCodeAdapter {
     }
 }
 
-/// The one-decimal percent to parts-per-million step: the provider reports
-/// the percent to one decimal place, so one tenth of a percent is exactly
-/// 1 000 ppm.
-const PPM_PER_PERCENT: f64 = 10_000.0;
+/// One part per million of the quota window, as the numerator of the
+/// used-over-limit ratio: the fraction is computed in integers, because the
+/// provider states both sides as exact micro-cent counts and a float round
+/// trip would reintroduce the rounding the page revision was stuck with.
+const PPM_SCALE: i128 = 1_000_000;
 
-/// Splits a workspace page body on [`STATE_MARKER`] and returns the inner
-/// markup of each `<div data-slot="usage-item">…</div>` block, in document
-/// order. A page with no such element has nothing to read and is
-/// [`FailureClass::SchemaDrift`].
-fn extract_item_blocks(body: &[u8]) -> Result<Vec<&str>, FailureClass> {
-    let text = std::str::from_utf8(body).map_err(|_| FailureClass::MalformedBody)?;
-    let mut items = Vec::new();
-    let mut search_from = 0usize;
-    while let Some(marker_offset) = text[search_from..].find(STATE_MARKER) {
-        let marker_pos = search_from + marker_offset;
-        let tag_start = text[..marker_pos]
-            .rfind("<div")
-            .ok_or(FailureClass::MalformedBody)?;
-        let tag_end = text[tag_start..]
-            .find('>')
-            .map(|offset| tag_start + offset + 1)
-            .ok_or(FailureClass::MalformedBody)?;
-        let inner_len = balanced_div_end(&text[tag_end..]).ok_or(FailureClass::MalformedBody)?;
-        items.push(&text[tag_end..tag_end + inner_len]);
-        search_from = tag_end + inner_len;
-    }
-    if items.is_empty() {
-        return Err(FailureClass::SchemaDrift);
-    }
-    Ok(items)
-}
-
-/// Finds the byte offset, within `text`, of the `</div>` that closes the
-/// div whose content `text` begins at (depth already 1 for that div), by
-/// tracking every nested `<div` opening against every `</div>` closing.
-/// Only bare `<div` opening tags are counted, which matches the reference
-/// fixture's markup and every fixture this adapter reads.
-fn balanced_div_end(text: &str) -> Option<usize> {
-    let mut depth = 1i32;
-    for (offset, _) in text.char_indices() {
-        if text[offset..].starts_with("<div") {
-            depth += 1;
-        } else if text[offset..].starts_with("</div>") {
-            depth -= 1;
-            if depth == 0 {
-                return Some(offset);
-            }
-        }
-    }
-    None
-}
-
-/// Extracts the text between the opening tag of the first
-/// `<span data-slot="$slot">…` in `block` and its next `</span>`. The
-/// reset-time span nests only comment markers, never another `<span>`, so
-/// the next `</span>` is always the matching close. Returns `None` when the
-/// span itself is absent, which is a structural read failure distinct from
-/// a value that is present but unusable.
-fn span_text<'a>(block: &'a str, slot: &str) -> Option<&'a str> {
-    let needle = format!("data-slot=\"{slot}\"");
-    let marker_pos = block.find(&needle)?;
-    let tag_end = block[marker_pos..].find('>').map(|o| marker_pos + o + 1)?;
-    let close = block[tag_end..].find("</span>").map(|o| tag_end + o)?;
-    Some(&block[tag_end..close])
-}
-
-/// Extracts the value of `attribute="…"` from `block`. Returns `None` when
-/// the attribute itself is absent.
-fn attribute_value<'a>(block: &'a str, attribute: &str) -> Option<&'a str> {
-    let needle = format!("{attribute}=\"");
-    let start = block.find(&needle).map(|o| o + needle.len())?;
-    let end = block[start..].find('"').map(|o| start + o)?;
-    Some(&block[start..end])
-}
-
-/// Strips every `<…>` span (both real tags and the React `<!--$-->` /
-/// `<!--/-->` comment markers) out of `text`, leaving the plain reader-
-/// visible text behind.
-fn strip_tags(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut inside = false;
-    for character in text.chars() {
-        match character {
-            '<' => inside = true,
-            '>' => inside = false,
-            _ if !inside => out.push(character),
-            _ => {}
-        }
-    }
-    out
-}
-
-/// Parses `Resets in <N days> <N hours> <N minutes> <N seconds>` (any subset
-/// of those four units, in that order) into a total second count. The
-/// leading "Resets in" label is case-insensitively stripped first, and the
-/// React comment markers around it are already gone by the time this runs
-/// (the caller strips tags before calling this).
-fn parse_reset_seconds(text: &str) -> Option<i64> {
-    let lower = text.to_ascii_lowercase();
-    let stripped = lower
-        .strip_prefix("resets in")
-        .map(|rest| &text[text.len() - rest.len()..])
-        .unwrap_or(text);
-    let tokens: Vec<&str> = stripped.split_whitespace().collect();
-    if tokens.is_empty() || !tokens.len().is_multiple_of(2) {
+/// Converts an exact used-over-limit micro-cent ratio into parts per
+/// million, rounded half away from zero. `None` when the limit is not a
+/// usable denominator: a window whose limit is zero states no ceiling, and
+/// reporting it as zero usage would print a number the provider did not
+/// state.
+fn ppm_from_micro_cents(used: i128, limit: i128) -> Option<i32> {
+    if limit <= 0 || used < 0 {
         return None;
     }
-    let mut total = 0i64;
-    for pair in tokens.chunks_exact(2) {
-        let amount: i64 = pair[0].parse().ok()?;
-        let unit_seconds = match pair[1].trim_end_matches(',').to_ascii_lowercase().as_str() {
-            "day" | "days" => 24 * 3600,
-            "hour" | "hours" => 3600,
-            "minute" | "minutes" => 60,
-            "second" | "seconds" => 1,
-            _ => return None,
-        };
-        total = total.checked_add(amount.checked_mul(unit_seconds)?)?;
-    }
-    Some(total)
+    let scaled = used.checked_mul(PPM_SCALE)?;
+    let rounded = (scaled.checked_add(limit / 2)?).checked_div(limit)?;
+    i32::try_from(rounded).ok()
 }
 
-/// The raw fields one usage-item block contributes, extracted structurally
-/// (the span and attribute exist) but not yet validated semantically (the
-/// percent may not parse as a number, the reset text may not parse as a
-/// duration). Building this struct can fail only when the markup itself is
-/// missing a required element; a present-but-unusable value survives into
-/// this struct as text, so it can still ride into the evidence capsule.
-struct RawWindowItem {
-    key: WindowKind,
-    percent_text: String,
-    reset_text: String,
+/// Parses one decimal micro-cent string. The endpoint states both counts as
+/// strings rather than as numbers, which is what keeps them exact past the
+/// range a JSON number is guaranteed to survive, so they are read as strings
+/// here and never through a float.
+fn micro_cents(value: Option<&serde_json::Value>) -> Option<i128> {
+    value?.as_str()?.trim().parse::<i128>().ok()
 }
 
-/// Reads the structural fields out of one `usage-item` block: the label
-/// (used only to identify which window this is), the `aria-valuenow`
-/// attribute text, and the reset-time span text with its tags stripped. A
-/// label that matches none of the three known windows yields `None`, and
-/// the item is skipped rather than treated as an error, matching the
-/// reference tool's own label-driven mapping.
-fn read_raw_item(block: &str) -> Result<Option<RawWindowItem>, FailureClass> {
-    let label = span_text(block, "usage-label").ok_or(FailureClass::MalformedBody)?;
-    let Some(key) = WindowKind::from_label(label) else {
-        return Ok(None);
-    };
-    let percent_text =
-        attribute_value(block, "aria-valuenow").ok_or(FailureClass::MalformedBody)?;
-    let reset_span = span_text(block, "reset-time").ok_or(FailureClass::MalformedBody)?;
-    let reset_text = strip_tags(reset_span);
-    Ok(Some(RawWindowItem {
-        key,
-        percent_text: percent_text.to_string(),
-        reset_text,
-    }))
-}
-
-/// Builds the raw-evidence JSON object from every recognized item on the
-/// page: one entry per matched window, carrying the still-unvalidated
-/// `percent` and `reset_text` strings exactly as read from the markup. This
-/// is the object the evidence capsule is captured from, and the object
-/// [`parse_state`] later re-reads to derive the typed windows, so the
-/// retained evidence is exactly what the reading was derived from.
+/// Builds the raw-evidence JSON object from the response body: one entry per
+/// recognized window, carrying the provider's own micro-cent strings and its
+/// reset instant exactly as stated. This is the object the evidence capsule
+/// is captured from, and the object [`parse_state`] later re-reads to derive
+/// the typed windows, so the retained evidence is exactly what the reading
+/// was derived from.
+///
+/// The projection is deliberately narrower than the response. The body also
+/// carries a subscriber id and a payment-method id, and neither belongs in an
+/// evidence store that exists to prove a quota number; keeping the projection
+/// narrow means they are never captured in the first place, which is a
+/// stronger guarantee than redacting them afterwards.
 fn build_raw_state(body: &[u8]) -> Result<serde_json::Value, FailureClass> {
-    let blocks = extract_item_blocks(body)?;
+    let root: serde_json::Value =
+        serde_json::from_slice(body).map_err(|_| FailureClass::MalformedBody)?;
+    let meters = root
+        .get("access")
+        .and_then(|access| access.get(STATE_MARKER))
+        .and_then(|meters| meters.as_object())
+        .ok_or(FailureClass::SchemaDrift)?;
     let mut object = serde_json::Map::new();
-    for block in blocks {
-        if let Some(item) = read_raw_item(block)? {
-            object.insert(
-                item.key.semantic_key().as_str().to_string(),
-                serde_json::json!({
-                    "percent": item.percent_text,
-                    "reset_text": item.reset_text,
-                }),
-            );
-        }
+    for (name, meter) in meters {
+        let Some(kind) = WindowKind::from_meter_name(name) else {
+            continue;
+        };
+        let Some(meter) = meter.as_object() else {
+            return Err(FailureClass::MalformedBody);
+        };
+        object.insert(
+            kind.semantic_key().as_str().to_string(),
+            serde_json::json!({
+                "used_micro_cents": meter.get("usedMicroCents").cloned(),
+                "limit_micro_cents": meter.get("limitMicroCents").cloned(),
+                "resets_at": meter.get("resetsAt").cloned(),
+            }),
+        );
+    }
+    if object.is_empty() {
+        return Err(FailureClass::SchemaDrift);
     }
     Ok(serde_json::Value::Object(object))
 }
 
 /// Parses the raw-evidence JSON object (as re-read from the capsule) into
-/// the reading's windows. Every required window must be present, with a
-/// percent that parses as a decimal in `0.0..=100.0` and a reset text that
-/// parses as a duration; every reset is anchored at the instant the page
-/// was received: the provider states the interval, `aub` states the
-/// anchor.
-fn parse_state(
-    root: &serde_json::Value,
-    received_at: UtcTimestamp,
-) -> Result<Vec<MeterWindow>, FailureClass> {
+/// the reading's windows. Every required window must be present, with a used
+/// and a limit that parse as micro-cent counts; a reset instant that the
+/// provider states is carried through as stated, and one it omits or states
+/// as null is the not-started state.
+fn parse_state(root: &serde_json::Value) -> Result<Vec<MeterWindow>, FailureClass> {
     let mut windows = Vec::new();
     for kind in [WindowKind::Rolling, WindowKind::Weekly, WindowKind::Monthly] {
-        windows.push(kind.parse_window(root, received_at)?);
+        windows.push(kind.parse_window(root)?);
     }
     Ok(windows)
 }
 
-/// The three usage windows the page's `usage-label` text distinguishes,
-/// each with its semantic key and the nominal length this adapter stores
-/// for it: rolling matches the page's own "5-hour Usage" label, and the two
+/// The three usage windows the response's `access.meters` keys distinguish,
+/// each with its semantic key and the nominal length this adapter stores for
+/// it: rolling matches the endpoint's own `fiveHour` key, and the two
 /// calendar windows are the bead's 7-day and 30-day decisions.
 #[derive(Debug, Clone, Copy)]
 enum WindowKind {
@@ -365,19 +271,16 @@ enum WindowKind {
 }
 
 impl WindowKind {
-    /// Maps a `usage-label` text to the window it names, matching the
-    /// reference tool's own substring rule: a label containing `5-hour`,
-    /// `Weekly` or `Monthly` names that window; anything else is not one of
-    /// the three required windows.
-    fn from_label(label: &str) -> Option<Self> {
-        if label.contains("5-hour") {
-            Some(Self::Rolling)
-        } else if label.contains("Weekly") {
-            Some(Self::Weekly)
-        } else if label.contains("Monthly") {
-            Some(Self::Monthly)
-        } else {
-            None
+    /// Maps an `access.meters` key to the window it names, matching the
+    /// reference tool's own mapping; anything else is not one of the three
+    /// required windows and is skipped rather than treated as an error, so a
+    /// window the provider adds later cannot fail an observation.
+    fn from_meter_name(name: &str) -> Option<Self> {
+        match name {
+            "fiveHour" => Some(Self::Rolling),
+            "week" => Some(Self::Weekly),
+            "month" => Some(Self::Monthly),
+            _ => None,
         }
     }
 
@@ -398,65 +301,54 @@ impl WindowKind {
         NominalWindowDuration::from_nanos(seconds * 1_000_000_000)
     }
 
-    /// Parses one window object from the raw-evidence root: the still-raw
-    /// `percent` and `reset_text` strings, validated and converted into the
-    /// typed window.
-    fn parse_window(
-        self,
-        root: &serde_json::Value,
-        received_at: UtcTimestamp,
-    ) -> Result<MeterWindow, FailureClass> {
+    /// Parses one window object from the raw-evidence root: the provider's
+    /// own micro-cent strings and reset instant, validated and converted into
+    /// the typed window.
+    fn parse_window(self, root: &serde_json::Value) -> Result<MeterWindow, FailureClass> {
         let key = self.semantic_key();
         let object = root
             .get(key.as_str())
             .and_then(|value| value.as_object())
             .ok_or(FailureClass::MissingRequiredField)?;
-        let percent_text = object
-            .get("percent")
-            .and_then(|value| value.as_str())
-            .ok_or(FailureClass::MalformedBody)?;
-        let percent: f64 = percent_text
-            .parse()
-            .map_err(|_| FailureClass::MalformedBody)?;
-        if !(0.0..=100.0).contains(&percent) {
-            return Err(FailureClass::MalformedBody);
-        }
-        let reset_text = object
-            .get("reset_text")
-            .and_then(|value| value.as_str())
-            .ok_or(FailureClass::MalformedBody)?;
-        let reset_in_sec = parse_reset_seconds(reset_text).ok_or(FailureClass::MalformedBody)?;
-        let reset_nanos = reset_in_sec
-            .checked_mul(1_000_000_000)
-            .and_then(|nanos| received_at.unix_nanos().checked_add(nanos))
-            .ok_or(FailureClass::MalformedBody)?;
-        // `percent` is already validated into `0.0..=100.0` above, so the
-        // rounded ppm value is always within `QuotaFractionPpm`'s domain;
-        // the fallible constructor is still the boundary that proves it.
-        let percent_ppm = QuotaFractionPpm::new((percent * PPM_PER_PERCENT).round() as i32)
-            .ok_or(FailureClass::MalformedBody)?;
+        let used =
+            micro_cents(object.get("used_micro_cents")).ok_or(FailureClass::MalformedBody)?;
+        let limit =
+            micro_cents(object.get("limit_micro_cents")).ok_or(FailureClass::MalformedBody)?;
+        // A limit of zero is a window with no stated ceiling, and a used count
+        // above its limit is a ratio the quota fraction cannot hold; both
+        // refuse here rather than print a number the provider did not state.
+        let ppm = ppm_from_micro_cents(used, limit).ok_or(FailureClass::MalformedBody)?;
+        let used_fraction = QuotaFractionPpm::new(ppm).ok_or(FailureClass::MalformedBody)?;
+        let reset_state = match object.get("resets_at") {
+            None | Some(serde_json::Value::Null) => WindowResetState::NotStarted,
+            Some(value) => {
+                let text = value.as_str().ok_or(FailureClass::MalformedBody)?;
+                let instant =
+                    UtcTimestamp::parse_rfc3339(text).ok_or(FailureClass::MalformedBody)?;
+                WindowResetState::Known(instant)
+            }
+        };
         Ok(MeterWindow::new(
             key,
             WindowScope::AccountWide,
-            QuotaUsed::new(percent_ppm),
-            decimal_percent_resolution(),
+            QuotaUsed::new(used_fraction),
+            exact_micro_cent_resolution(),
             QuantizationSemantics::Exact,
-            UtcTimestamp::from_unix_nanos(reset_nanos),
+            reset_state,
             self.nominal_duration(),
         ))
     }
 }
 
-/// The reported resolution of a one-decimal percent: one tenth of a
-/// percent, 1 000 ppm.
-fn decimal_percent_resolution() -> ReportedResolution {
-    // 1 000 ppm is one tenth of a percent, statically inside the fraction's
-    // domain and non-zero, so both constructors' refusals are unreachable
-    // for this constant.
-    ReportedResolution::new(
-        QuotaFractionPpm::new(1_000).expect("one tenth of a percent is a valid fraction"),
-    )
-    .expect("one tenth of a percent is a non-zero resolution")
+/// The reported resolution of an exact micro-cent ratio: one part per
+/// million, the finest step the quota fraction can hold. The provider states
+/// both sides of the ratio as integers, so the only rounding left is the one
+/// this crate performs converting to ppm.
+fn exact_micro_cent_resolution() -> ReportedResolution {
+    // 1 ppm is statically inside the fraction's domain and non-zero, so both
+    // constructors' refusals are unreachable for this constant.
+    ReportedResolution::new(QuotaFractionPpm::new(1).expect("one ppm is a valid fraction"))
+        .expect("one ppm is a non-zero resolution")
 }
 
 impl ProviderAdapter for OpenCodeAdapter {
@@ -484,7 +376,7 @@ impl ProviderAdapter for OpenCodeAdapter {
         transport: &impl HttpTransport,
         clock: &impl Clock,
     ) -> CapturedProviderResponse<Self::Reading> {
-        // The credential is the bare `auth` cookie value, decided in
+        // The credential is the whole `Cookie` header value, decided in
         // `aub-r7k0`: no trimming, no reinterpretation, and an empty material
         // is an expired credential rather than an unauthenticated request.
         let material = credential.expose();
@@ -493,31 +385,34 @@ impl ProviderAdapter for OpenCodeAdapter {
                 AuthReason::CredentialExpired,
             ));
         }
-        let page_url = match self.page_url(request.workspace_id.as_deref()) {
-            Ok(url) => url,
-            Err(failure) => {
-                return CapturedProviderResponse::without_response(
-                    ProviderObservation::Unreachable(failure),
-                );
-            }
+        // The workspace id is required even under an endpoint override: the
+        // endpoint scopes its answer by the header, so an observation without
+        // one asks about no workspace at all.
+        let Some(workspace_id) = request
+            .workspace_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return CapturedProviderResponse::without_response(ProviderObservation::Unreachable(
+                FailureClass::MissingRequiredField,
+            ));
         };
+        let status_url = self.status_url();
 
         let timeouts = RequestTimeoutConfig::new(
             MonotonicDuration::from_seconds(5),
             MonotonicDuration::from_seconds(10),
             Some(MonotonicDuration::from_seconds(15)),
         );
-        let req = HttpRequest::get(&page_url, timeouts)
-            // The `auth` cookie name is the reference client's own name for
-            // this session cookie; the credential material is the bare
-            // cookie value, and the header carries the name and the value
-            // together.
-            .with_header(COOKIE_HEADER, format!("auth={material}"))
-            .with_header("Accept", "text/html")
+        let req = HttpRequest::get(&status_url, timeouts)
+            .with_header(COOKIE_HEADER, material.to_string())
+            .with_header(ORG_HEADER, workspace_id.to_string())
+            .with_header("Accept", "application/json")
             .with_header("User-Agent", "agent-usage-book/0.1.0")
-            // The redirect is the authentication signal: an expired session
-            // answers with a redirect to the sign-in page, so the 3xx must
-            // arrive here as the response it is.
+            // A signed-out caller is answered with a status, but the console
+            // also redirects some paths to its sign-in page, and a redirect
+            // followed would arrive here as a login page with a 200 on it.
             .without_redirects();
         let budget = CommandBudget::new(MonotonicDuration::from_seconds(30), clock);
 
@@ -529,17 +424,15 @@ impl ProviderAdapter for OpenCodeAdapter {
                 );
             }
         };
-        // The anchor for every reset derivation: the instant the page
-        // arrived. The provider states the interval, `aub` states the
-        // anchor, and the capsule keeps the raw percent and reset text
-        // beside the derived instants so the arithmetic stays auditable.
-        let received_at = clock.now();
+        // No reset is derived from the receive instant any more: the provider
+        // states every reset as an absolute instant, so nothing here needs a
+        // local anchor and the clock is left to the transport's own budget.
         let (observation, evidence) = match response.status() {
-            200 => reading_from_response(&response, received_at, material),
-            // Any redirect is the sign-in redirect: the reference's client
-            // checks the redirect target for a sign-in path and reports the
-            // session as invalid or expired, and a workspace page that
-            // redirects elsewhere is equally not a usable state page.
+            200 => reading_from_response(&response, material),
+            // A redirect still means the sign-in page, which is why the
+            // request refuses to follow one. Measured 2026-09-20, the
+            // endpoint answers a refused credential with 401 instead, but a
+            // redirect arriving here has no other meaning.
             300..=399 => (
                 ProviderObservation::AuthRequired(AuthReason::CredentialExpired),
                 None,
@@ -550,7 +443,7 @@ impl ProviderAdapter for OpenCodeAdapter {
             ),
             // A 403 is an ambiguous client error, never a classification:
             // section 34.8 reserves authentication conclusions for providers
-            // that state them.
+            // that state them, and this one states 401 when it means one.
             403 => (
                 ProviderObservation::Unreachable(FailureClass::HttpStatus(
                     HttpStatusClass::ClientError,
@@ -610,20 +503,29 @@ impl ProviderAdapter for OpenCodeAdapter {
     }
 }
 
-/// Reads one successful workspace response: the raw-state object is built
-/// from the markup and sanitized into the evidence capsule first, then the
+/// Reads one successful status response: the raw-state object is projected
+/// out of the body and sanitized into the evidence capsule first, then the
 /// windows are parsed from the capsule's own quota subtree, so the retained
-/// evidence is exactly what the reading was derived from. A page with no
-/// `usage-item` element never reaches the capsule at all: it is schema
-/// drift with nothing to retain.
+/// evidence is exactly what the reading was derived from. A body that is not
+/// JSON, or that carries no `access.meters` object, never reaches the capsule
+/// at all: it is schema drift with nothing to retain.
 fn reading_from_response(
     response: &HttpResponse,
-    received_at: UtcTimestamp,
     cookie_material: &str,
 ) -> (
     ProviderObservation<OpenCodeReading>,
     Option<JsonEvidenceCapsule>,
 ) {
+    // A 200 carrying HTML is the sign-in page served in place of the answer,
+    // which is a different state from a JSON body this adapter cannot read.
+    if let Some(content_type) = response.header("Content-Type")
+        && !content_type.to_ascii_lowercase().contains("json")
+    {
+        return (
+            ProviderObservation::Unreachable(FailureClass::SchemaDrift),
+            None,
+        );
+    }
     let raw_state = match build_raw_state(response.body()) {
         Ok(state) => state,
         Err(FailureClass::SchemaDrift) => {
@@ -648,7 +550,7 @@ fn reading_from_response(
             );
         }
     };
-    let observation = match parse_state(&quota, received_at) {
+    let observation = match parse_state(&quota) {
         Ok(windows) => ProviderObservation::Measured(OpenCodeReading::new(windows)),
         Err(failure) => ProviderObservation::Unreachable(failure),
     };
@@ -665,7 +567,7 @@ mod tests {
     /// end-to-end run read the same files the reviewer audits.
     const FIXTURE_VALID: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/meter/opencode/valid.html"
+        "/tests/fixtures/meter/opencode/valid.json"
     ));
     const FIXTURE_LOGIN_REDIRECT: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -673,18 +575,18 @@ mod tests {
     ));
     const FIXTURE_NO_MARKER: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/meter/opencode/no-state-marker.html"
+        "/tests/fixtures/meter/opencode/no-state-marker.json"
     ));
     const FIXTURE_MALFORMED: &str = include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/meter/opencode/malformed-state.html"
+        "/tests/fixtures/meter/opencode/malformed-state.json"
     ));
 
-    /// The fixture credential material: the bare cookie value the adapter
-    /// receives, distinctive on purpose so the leak grep over the capsule
-    /// matches nothing but a leak, and free of every shared forbidden
+    /// The fixture credential material: the whole `Cookie` header value the
+    /// adapter receives, distinctive on purpose so the leak grep over the
+    /// capsule matches nothing but a leak, and free of every shared forbidden
     /// pattern (no credential-shaped prefix, no at sign, no path).
-    const FIXTURE_COOKIE: &str = "fixture-session-cookie-9f2c-not-a-real-value";
+    const FIXTURE_COOKIE: &str = "auth=fixture-session-cookie-9f2c-not-a-real-value; __Host-console_session=fixture-console-7b1d";
     /// The workspace id the request-shape case serves, matching the
     /// reference's own id shape.
     const FIXTURE_WORKSPACE_ID: &str = "wrk_2345ABCDEFGHJKLMNOPQRSTuvwx";
@@ -699,10 +601,14 @@ mod tests {
 
     impl SyntheticTransport {
         fn serving(body: &[u8]) -> Self {
+            Self::serving_as("application/json", body)
+        }
+
+        fn serving_as(content_type: &str, body: &[u8]) -> Self {
             Self {
                 response: Ok(HttpResponse {
                     status: 200,
-                    headers: Vec::new(),
+                    headers: vec![("Content-Type".to_string(), content_type.to_string())],
                     body: body.to_vec(),
                 }),
                 seen_request: Cell::new(None),
@@ -739,140 +645,276 @@ mod tests {
         }
     }
 
-    fn observing(transport: &SyntheticTransport) -> CapturedProviderResponse<OpenCodeReading> {
-        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000_000_000));
-        let adapter = OpenCodeAdapter::new(None);
-        let request = MeterRequest {
+    fn meter_request(workspace_id: Option<&str>) -> MeterRequest {
+        MeterRequest {
             model: None,
-            workspace_id: Some(FIXTURE_WORKSPACE_ID.to_string()),
+            workspace_id: workspace_id.map(str::to_string),
             local_home: None,
             codex_sessions_owned: false,
             anthropic_statusline: None,
-        };
+        }
+    }
+
+    fn observing(transport: &SyntheticTransport) -> CapturedProviderResponse<OpenCodeReading> {
+        observing_with(transport, Some(FIXTURE_WORKSPACE_ID), FIXTURE_COOKIE)
+    }
+
+    fn observing_with(
+        transport: &SyntheticTransport,
+        workspace_id: Option<&str>,
+        cookie: &str,
+    ) -> CapturedProviderResponse<OpenCodeReading> {
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000_000_000));
+        let adapter = OpenCodeAdapter::new(None);
         adapter.observe_with_evidence(
-            &CredentialHandle::new(FIXTURE_COOKIE),
-            &request,
+            &CredentialHandle::new(cookie),
+            &meter_request(workspace_id),
             transport,
             &clock,
         )
     }
 
-    /// Case 01: the valid page parses to the three required windows, each
-    /// carrying the fixture's decimal percent as its exact parts-per-million
-    /// value at one-tenth-of-a-percent resolution.
+    fn window_of<'a>(reading: &'a OpenCodeReading, key: &str) -> &'a MeterWindow {
+        reading
+            .windows
+            .iter()
+            .find(|window| window.semantic_key().as_str() == key)
+            .unwrap_or_else(|| panic!("the {key} window must be present"))
+    }
+
+    /// Case 01: the valid body parses to the three required windows, each
+    /// carrying the exact used-over-limit ratio in parts per million. The
+    /// expected values are the arithmetic written out, so a change to the
+    /// rounding rule fails here rather than drifting silently: 137731547 of
+    /// 3000000000 is 45910.5 ppm and rounds half away from zero to 45911.
     #[test]
-    fn case_01_valid_page_yields_three_windows_at_decimal_percent_resolution() {
+    fn case_01_valid_body_yields_three_windows_at_exact_micro_cent_resolution() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
         let captured = observing(&transport);
         let ProviderObservation::Measured(reading) = captured.observation else {
             panic!("the valid fixture must measure: {:?}", captured.observation);
         };
         assert_eq!(reading.windows.len(), 3);
-        for (key, percent_ppm, reset_in_sec) in [
-            ("rolling", 0, 18_000),
-            ("weekly", 11_000, 547_200),
-            ("monthly", 21_000, 2_361_600),
-        ] {
-            let window = reading
-                .windows
-                .iter()
-                .find(|window| window.semantic_key().as_str() == key)
-                .unwrap_or_else(|| panic!("the {key} window must be present"));
+        for (key, expected_ppm) in [("rolling", 0), ("weekly", 45_911), ("monthly", 115_963)] {
+            let window = window_of(&reading, key);
             assert_eq!(
                 window.quota_used().as_ppm().get(),
-                percent_ppm,
-                "the {key} decimal percent converts to ppm by the one-tenth-percent step"
+                expected_ppm,
+                "the {key} micro-cent ratio converts to ppm exactly"
             );
-            assert_eq!(window.reported_resolution().as_ppm().get(), 1_000);
-            assert_eq!(window.quantization(), QuantizationSemantics::Exact);
-            // The reset anchor: the receive instant is the fake clock's
-            // 1_000_000_000, so each reset is exactly reset_in_sec later,
-            // with literal instants the derivation can be audited against.
             assert_eq!(
-                window.resets_at(),
-                Some(UtcTimestamp::from_unix_nanos(
-                    1_000_000_000 + i64::from(reset_in_sec) * 1_000_000_000
-                ))
+                window.reported_resolution().as_ppm().get(),
+                1,
+                "an integer ratio is reported at one ppm, not at the page's one tenth of a percent"
             );
-            assert!(window.reset_state().is_known());
+            assert_eq!(window.quantization(), QuantizationSemantics::Exact);
         }
         assert!(
             captured.evidence.is_some(),
-            "a measured page keeps its capsule"
+            "a measured reading retains its capsule"
         );
-        assert!(captured.failed_body.is_none());
     }
 
-    /// Case 02: the sign-in redirect is the authentication conclusion, and
-    /// the adapter saw the redirect itself because the request asked the
-    /// transport not to follow it.
+    /// Case 02: the reset instant the provider states is carried through as
+    /// stated, and a window that states none is the not-started state rather
+    /// than an instant derived from anything else on the response. This is
+    /// `aub-eun.15`'s decision applied, and the negative half is what stops a
+    /// later implementation inferring a monthly reset from the subscription
+    /// period.
     #[test]
-    fn case_02_login_redirect_is_auth_required() {
-        let transport =
-            SyntheticTransport::with_status(302, "/signin", FIXTURE_LOGIN_REDIRECT.as_bytes());
+    fn case_02_a_stated_reset_is_known_and_an_absent_one_is_not_started() {
+        let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
         let captured = observing(&transport);
+        let ProviderObservation::Measured(reading) = captured.observation else {
+            panic!("the valid fixture must measure: {:?}", captured.observation);
+        };
+        let weekly = window_of(&reading, "weekly");
         assert_eq!(
-            captured.observation,
-            ProviderObservation::AuthRequired(AuthReason::CredentialExpired)
+            weekly.resets_at(),
+            UtcTimestamp::parse_rfc3339("2026-09-21T00:00:00.000Z"),
+            "the weekly reset is the instant the provider stated"
+        );
+        assert!(weekly.reset_state().is_known());
+        for key in ["rolling", "monthly"] {
+            let window = window_of(&reading, key);
+            assert!(
+                window.reset_state().is_not_started(),
+                "the {key} window states no reset instant, so it is not started"
+            );
+            assert_eq!(window.resets_at(), None);
+        }
+    }
+
+    /// Case 03: a redirect is still the sign-in redirect. The endpoint
+    /// answers a refused credential with a status, but the request refuses to
+    /// follow a redirect precisely so one cannot arrive as a 200 carrying a
+    /// login page.
+    #[test]
+    fn case_03_login_redirect_is_auth_required() {
+        let transport = SyntheticTransport::with_status(
+            302,
+            "https://opencode.ai/console/login",
+            FIXTURE_LOGIN_REDIRECT.as_bytes(),
+        );
+        let captured = observing(&transport);
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::AuthRequired(AuthReason::CredentialExpired)
+            ),
+            "a redirect is the sign-in redirect: {:?}",
+            captured.observation
         );
         assert!(captured.evidence.is_none());
-        let request = transport.request();
+    }
+
+    /// Case 04: a stated 401 is the authentication conclusion this endpoint
+    /// gives, and it is `CredentialRejected` rather than `CredentialExpired`
+    /// because the provider states a refusal and not a reason for it.
+    #[test]
+    fn case_04_status_401_is_a_rejected_credential() {
+        let transport = SyntheticTransport::with_status(401, "", b"{\"error\":\"unauthorized\"}");
+        let captured = observing(&transport);
         assert!(
-            !request.follow_redirects,
-            "the workspace request must not follow redirects"
+            matches!(
+                captured.observation,
+                ProviderObservation::AuthRequired(AuthReason::CredentialRejected)
+            ),
+            "a stated 401 is a rejected credential: {:?}",
+            captured.observation
         );
     }
 
-    /// Case 03: a page with no `usage-item` element is schema drift, never a
-    /// silent zero and never a malformed-body claim about a body that
-    /// otherwise parsed.
+    /// Case 05: a JSON body carrying no `access.meters` object is schema
+    /// drift, never a silent zero.
     #[test]
-    fn case_03_page_without_the_usage_item_marker_is_schema_drift() {
+    fn case_05_body_without_the_meters_object_is_schema_drift() {
         let transport = SyntheticTransport::serving(FIXTURE_NO_MARKER.as_bytes());
         let captured = observing(&transport);
-        assert_eq!(
-            captured.observation,
-            ProviderObservation::Unreachable(FailureClass::SchemaDrift)
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::SchemaDrift)
+            ),
+            "a body with no meters object is schema drift: {:?}",
+            captured.observation
         );
-        assert!(captured.evidence.is_none());
+        assert!(
+            captured.evidence.is_none(),
+            "schema drift has no quota evidence to retain"
+        );
     }
 
-    /// Case 04: a page whose items read structurally (label, attribute and
-    /// reset span all present) but whose weekly `aria-valuenow` is not a
-    /// number is the parse failure class. Because the markup itself was
-    /// readable, the sanitized raw-percent/reset-text evidence still rides
-    /// along for the bounded failure store, and it never carries the cookie.
+    /// Case 06: a 200 whose content type is not JSON is the sign-in page
+    /// served in place of the answer. It is schema drift and it never reaches
+    /// the body parser, which would otherwise call it a malformed body and
+    /// hide what actually happened.
     #[test]
-    fn case_04_malformed_state_is_the_parse_failure_class() {
+    fn case_06_a_two_hundred_carrying_html_is_schema_drift() {
+        let transport =
+            SyntheticTransport::serving_as("text/html; charset=utf-8", b"<html>sign in</html>");
+        let captured = observing(&transport);
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::SchemaDrift)
+            ),
+            "an HTML 200 is schema drift: {:?}",
+            captured.observation
+        );
+    }
+
+    /// Case 07: a meter whose micro-cent counts do not parse is the parse
+    /// failure class, and its sanitized body is retained for the bounded
+    /// failure store.
+    #[test]
+    fn case_07_malformed_state_is_the_parse_failure_class() {
         let transport = SyntheticTransport::serving(FIXTURE_MALFORMED.as_bytes());
         let captured = observing(&transport);
-        assert_eq!(
-            captured.observation,
-            ProviderObservation::Unreachable(FailureClass::MalformedBody)
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::MalformedBody)
+            ),
+            "an unparsable micro-cent count is a malformed body: {:?}",
+            captured.observation
         );
         assert!(
-            captured.evidence.is_some(),
-            "a structurally readable page keeps its raw evidence even when a value fails"
-        );
-        let failed_body = captured
-            .failed_body
-            .expect("the sanitized raw-state body rides along on the failure");
-        assert!(
-            !String::from_utf8_lossy(&failed_body).contains(FIXTURE_COOKIE),
-            "the retained body never carries the cookie material"
+            captured.failed_body.is_some(),
+            "a parse failure retains its sanitized body"
         );
     }
 
-    /// The declarations are the calibration-facing identity of the adapter:
-    /// the contract and semantics ids the bead names, and the three required
-    /// windows, readable without a provider call.
+    /// Case 08: a window whose limit is zero states no ceiling, and the ratio
+    /// is undefined rather than zero. The planted negative: an implementation
+    /// that divides and falls back to zero on a zero denominator would report
+    /// a comfortable 0% for a window nobody can spend against, which is the
+    /// one wrong answer nothing downstream could detect.
+    #[test]
+    fn case_08_a_zero_limit_is_not_zero_usage() {
+        let body = br#"{"access":{"meters":{
+            "fiveHour":{"usedMicroCents":"0","limitMicroCents":"0","resetsAt":null},
+            "week":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null},
+            "month":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null}}}}"#;
+        let transport = SyntheticTransport::serving(body);
+        let captured = observing(&transport);
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::MalformedBody)
+            ),
+            "a zero limit refuses instead of reading as zero usage: {:?}",
+            captured.observation
+        );
+    }
+
+    /// Case 09: a used count above its limit is a ratio the quota fraction
+    /// cannot hold, and it refuses rather than saturating at the ceiling.
+    #[test]
+    fn case_09_a_used_count_above_its_limit_refuses() {
+        let body = br#"{"access":{"meters":{
+            "fiveHour":{"usedMicroCents":"3","limitMicroCents":"2","resetsAt":null},
+            "week":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null},
+            "month":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null}}}}"#;
+        let transport = SyntheticTransport::serving(body);
+        let captured = observing(&transport);
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::MalformedBody)
+            ),
+            "a ratio above one refuses: {:?}",
+            captured.observation
+        );
+    }
+
+    /// Case 10: a required window the response omits is a missing field, not
+    /// a window quietly dropped from the reading.
+    #[test]
+    fn case_10_a_missing_required_window_is_a_missing_field() {
+        let body = br#"{"access":{"meters":{
+            "fiveHour":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null},
+            "week":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null}}}}"#;
+        let transport = SyntheticTransport::serving(body);
+        let captured = observing(&transport);
+        assert!(
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
+            ),
+            "an absent monthly window is a missing required field: {:?}",
+            captured.observation
+        );
+    }
+
     #[test]
     fn the_declarations_carry_the_contract_semantics_and_required_windows() {
-        let adapter = OpenCodeAdapter::new(None);
-        let declarations = adapter.declarations();
+        let declarations = OpenCodeAdapter::new(None).declarations();
         assert_eq!(
             declarations.provider_contract_id.as_str(),
-            "opencode-go-workspace-page-v1"
+            "opencode-go-console-status-v1",
+            "the contract id names the JSON surface, so evidence from the page revision is \
+             distinguishable by contract id alone"
         );
         assert_eq!(
             declarations.meter_semantics_id.as_str(),
@@ -890,278 +932,171 @@ mod tests {
         );
     }
 
-    /// The declarations carry the one-hour reset precision (`aub-w1a0`): the
-    /// page's rendered reset text floors the remaining time to whole hours,
-    /// so every reset this adapter derives is exact only to one hour, and
-    /// one declaration covers all three windows because all three read
-    /// their reset from the same text renderer.
     #[test]
-    fn the_declarations_carry_the_one_hour_reset_precision() {
-        let adapter = OpenCodeAdapter::new(None);
-        let declarations = adapter.declarations();
+    fn the_declarations_carry_the_one_second_reset_precision() {
+        let declarations = OpenCodeAdapter::new(None).declarations();
         // The literal, not the constant: the value is the pin. A test that
         // reads the declaration back through the constant it was written from
         // would pass for any constant the constructor happened to carry.
         assert_eq!(
             declarations.reset_precision,
-            Some(ResetPrecision::from_seconds(3_600).expect("one hour is a non-zero second count")),
-            "the declared precision must be the one-hour surface granularity"
-        );
-        for kind in ["rolling", "weekly", "monthly"] {
-            assert!(
-                declarations.required_window_kinds.contains(kind),
-                "the declared precision covers the {kind} window"
-            );
-        }
-    }
-
-    /// The protection the capsule contract names is the sanitizer being fed
-    /// the credential material: a page whose reset-time text echoes the
-    /// session value must still yield a capsule without it.
-    #[test]
-    fn the_sanitizer_removes_the_cookie_even_when_the_page_echoes_it() {
-        let echoed = FIXTURE_VALID.replace("5 hours 0 minutes", FIXTURE_COOKIE);
-        let transport = SyntheticTransport::serving(echoed.as_bytes());
-        let captured = observing(&transport);
-        // The echoed reset text no longer parses as a duration, so this page
-        // fails to measure; the sanitizer's job is that the failure's
-        // retained evidence still excludes the cookie, which is exactly the
-        // property this case checks.
-        assert_eq!(
-            captured.observation,
-            ProviderObservation::Unreachable(FailureClass::MalformedBody)
-        );
-        let failed_body = captured
-            .failed_body
-            .expect("the raw-state body still rides along on a value-parse failure");
-        assert!(
-            !String::from_utf8_lossy(&failed_body).contains(FIXTURE_COOKIE),
-            "the echoed session value must be sanitized out of the retained evidence"
+            Some(ResetPrecision::from_seconds(1).expect("one second is a non-zero second count")),
+            "an absolute instant is precise to the second, not to the hour the page text forced"
         );
     }
 
-    /// The request contract: the workspace page of the account's workspace
-    /// id, the cookie material in the `Cookie` header and nowhere else.
     #[test]
-    fn the_request_carries_the_cookie_header_and_the_workspace_url_alone() {
+    fn the_request_carries_both_cookies_the_workspace_header_and_the_status_url() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
         let _ = observing(&transport);
         let request = transport.request();
-        assert_eq!(
-            request.url,
-            format!("{DEFAULT_PAGE_BASE}/workspace/{FIXTURE_WORKSPACE_ID}/go")
-        );
-        assert!(!request.follow_redirects);
+        assert_eq!(request.url, "https://opencode.ai/console/api/go/status");
         let mut cookie_headers = 0;
+        let mut org_headers = 0;
         for (name, value) in &request.headers {
             if name.eq_ignore_ascii_case(COOKIE_HEADER) {
                 cookie_headers += 1;
                 assert_eq!(
-                    *value,
-                    format!("auth={FIXTURE_COOKIE}"),
-                    "the material goes out under the auth cookie name"
+                    value, FIXTURE_COOKIE,
+                    "the material is sent verbatim, with no cookie pair rebuilt by the adapter"
                 );
+            } else if name.eq_ignore_ascii_case(ORG_HEADER) {
+                org_headers += 1;
+                assert_eq!(value, FIXTURE_WORKSPACE_ID);
             } else {
                 assert!(
-                    !value.contains(FIXTURE_COOKIE),
+                    !value.contains("fixture-session-cookie"),
                     "no header but {COOKIE_HEADER} may carry the cookie material"
                 );
             }
         }
         assert_eq!(cookie_headers, 1, "exactly one Cookie header goes out");
+        assert_eq!(org_headers, 1, "exactly one workspace header goes out");
     }
 
-    /// The endpoint override wins over the workspace-id construction, which
-    /// is how an end-to-end run points this adapter at a synthetic server.
     #[test]
-    fn the_endpoint_override_replaces_the_workspace_url() {
-        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(0));
-        let adapter =
-            OpenCodeAdapter::new(Some("http://127.0.0.1:9/workspace/wrk_x/go".to_string()));
+    fn the_endpoint_override_replaces_the_status_url() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
-        let request = MeterRequest {
-            model: None,
-            workspace_id: Some("wrk_unused".to_string()),
-            local_home: None,
-            codex_sessions_owned: false,
-            anthropic_statusline: None,
-        };
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000_000_000));
+        let adapter = OpenCodeAdapter::new(Some("http://127.0.0.1:8081".to_string()));
         let _ = adapter.observe_with_evidence(
             &CredentialHandle::new(FIXTURE_COOKIE),
-            &request,
+            &meter_request(Some(FIXTURE_WORKSPACE_ID)),
             &transport,
             &clock,
         );
-        assert_eq!(
-            transport.request().url,
-            "http://127.0.0.1:9/workspace/wrk_x/go"
-        );
+        assert_eq!(transport.request().url, "http://127.0.0.1:8081");
     }
 
-    /// An observation without a workspace id and without an override has no
-    /// page to fetch, and says so instead of hitting a half-built URL.
+    /// The workspace id rides in a header rather than in the path, so an
+    /// endpoint override cannot stand in for it the way it could when the id
+    /// was part of the page URL.
     #[test]
-    fn an_observation_without_a_workspace_id_is_a_missing_required_field() {
-        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(0));
-        let adapter = OpenCodeAdapter::new(None);
+    fn an_observation_without_a_workspace_id_is_a_missing_field() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
-        let request = MeterRequest {
-            model: None,
-            workspace_id: None,
-            local_home: None,
-            codex_sessions_owned: false,
-            anthropic_statusline: None,
-        };
-        let captured = adapter.observe_with_evidence(
-            &CredentialHandle::new(FIXTURE_COOKIE),
-            &request,
-            &transport,
-            &clock,
-        );
-        assert_eq!(
-            captured.observation,
-            ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
-        );
+        let captured = observing_with(&transport, None, FIXTURE_COOKIE);
         assert!(
-            transport.seen_request.take().is_none(),
-            "no request may go out for an unresolvable page URL"
+            matches!(
+                captured.observation,
+                ProviderObservation::Unreachable(FailureClass::MissingRequiredField)
+            ),
+            "no workspace id is a missing required field: {:?}",
+            captured.observation
         );
     }
 
-    /// The evidence capsule carries the raw percent and reset text per
-    /// window, and never the cookie material: the serialized capsule is
-    /// grepped for the fixture cookie string, which must match nothing.
     #[test]
-    fn the_capsule_holds_the_raw_percent_and_reset_text_and_never_the_cookie() {
+    fn an_empty_credential_is_an_expired_one() {
+        let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
+        let captured = observing_with(&transport, Some(FIXTURE_WORKSPACE_ID), "");
+        assert!(matches!(
+            captured.observation,
+            ProviderObservation::AuthRequired(AuthReason::CredentialExpired)
+        ));
+    }
+
+    /// The capsule keeps the provider's own micro-cent strings and its reset
+    /// instants, which is what makes the reading auditable against the
+    /// evidence rather than against a number this crate computed. It is also
+    /// the fact `aub-4z5c` turns on: the currency the domain discards at
+    /// parse time survives here, so deciding later costs nothing.
+    #[test]
+    fn the_capsule_holds_the_micro_cent_counts_and_never_the_cookie() {
         let transport = SyntheticTransport::serving(FIXTURE_VALID.as_bytes());
         let captured = observing(&transport);
-        let capsule = captured
-            .evidence
-            .as_ref()
-            .expect("a measured page captures a capsule");
+        let capsule = captured.evidence.expect("a measured reading has a capsule");
         let serialized = capsule.serialized();
-        assert!(
-            !serialized.contains(FIXTURE_COOKIE),
-            "the cookie material must never enter the capsule"
-        );
-        // The raw provider facts ride along per window: the capsule's quota
-        // subtree is the raw-state object, so every percent and reset_text
-        // is readable in it, keeping the derived instants auditable.
-        let quota = quota_response_from_capsule(serialized).expect("the capsule holds the state");
-        for (key, percent, reset_text) in [
-            ("rolling", "0", "Resets in 5 hours 0 minutes"),
-            ("weekly", "1.1", "Resets in 6 days 8 hours"),
-            ("monthly", "2.1", "Resets in 27 days 8 hours"),
+        for needle in [
+            "137731547",
+            "3000000000",
+            "695777296",
+            "2026-09-21T00:00:00.000Z",
         ] {
-            let window = quota.get(key).expect("the raw window object");
-            assert_eq!(window.get("percent"), Some(&serde_json::json!(percent)));
-            assert_eq!(
-                window.get("reset_text"),
-                Some(&serde_json::json!(reset_text))
+            assert!(
+                serialized.contains(needle),
+                "the capsule retains {needle} exactly as the provider stated it"
+            );
+        }
+        assert!(
+            !serialized.contains("fixture-session-cookie"),
+            "the capsule never carries the credential"
+        );
+    }
+
+    /// The response also carries a subscriber id and a payment-method id. The
+    /// projection is what keeps them out of the capsule, so the assertion is
+    /// over a body that contains both.
+    #[test]
+    fn the_capsule_never_carries_the_account_identifiers() {
+        let body =
+            br#"{"subscriberUserId":"sub_fixture_not_real","paymentMethodId":"pm_fixture_not_real",
+            "access":{"meters":{
+            "fiveHour":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null},
+            "week":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null},
+            "month":{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null}}}}"#;
+        let transport = SyntheticTransport::serving(body);
+        let captured = observing(&transport);
+        let capsule = captured.evidence.expect("a measured reading has a capsule");
+        let serialized = capsule.serialized();
+        for needle in ["sub_fixture_not_real", "pm_fixture_not_real"] {
+            assert!(
+                !serialized.contains(needle),
+                "the capsule must not retain {needle}"
             );
         }
     }
 
-    /// The parse contract over planted negatives: an out-of-range percent, a
-    /// missing window, and a reset text with no parseable unit each fail the
-    /// parse instead of yielding a partial reading.
     #[test]
-    fn planted_negatives_fail_the_parse() {
-        let received_at = UtcTimestamp::from_unix_nanos(1_000_000_000);
-        let parse_windows = |state: &serde_json::Value| parse_state(state, received_at);
-        let window = |percent: &str, reset_text: &str| serde_json::json!({"percent": percent, "reset_text": reset_text});
-        // Percent out of range: the provider's field is 0..=100.
-        let out_of_range = serde_json::json!({
-            "rolling": window("101", "Resets in 10 seconds"),
-            "weekly": window("1", "Resets in 10 seconds"),
-            "monthly": window("1", "Resets in 10 seconds"),
-        });
-        assert_eq!(
-            parse_windows(&out_of_range),
-            Err(FailureClass::MalformedBody)
+    fn the_sanitizer_removes_the_cookie_even_when_the_body_echoes_it() {
+        let body = format!(
+            r#"{{"access":{{"meters":{{
+                "fiveHour":{{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null,"echo":"{FIXTURE_COOKIE}"}},
+                "week":{{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null}},
+                "month":{{"usedMicroCents":"1","limitMicroCents":"2","resetsAt":null}}}}}}}}"#
         );
-        // A missing required window: refused, never defaulted to zero.
-        let missing = serde_json::json!({
-            "rolling": window("1", "Resets in 10 seconds"),
-            "weekly": window("1", "Resets in 10 seconds"),
-        });
-        assert_eq!(
-            parse_windows(&missing),
-            Err(FailureClass::MissingRequiredField)
-        );
-        // A reset text with no recognized unit: refused, never a zero reset.
-        let unrecognized_unit = serde_json::json!({
-            "rolling": window("1", "Resets in 10 fortnights"),
-            "weekly": window("1", "Resets in 10 seconds"),
-            "monthly": window("1", "Resets in 10 seconds"),
-        });
-        assert_eq!(
-            parse_windows(&unrecognized_unit),
-            Err(FailureClass::MalformedBody)
-        );
-    }
-
-    /// `parse_reset_seconds` sums every subset of the four units the
-    /// reference documents, in the order the page renders them.
-    #[test]
-    fn parse_reset_seconds_sums_every_unit_subset() {
-        assert_eq!(
-            parse_reset_seconds("Resets in 5 hours 0 minutes"),
-            Some(18_000)
-        );
-        assert_eq!(
-            parse_reset_seconds("Resets in 4 days 10 hours"),
-            Some(381_600)
-        );
-        assert_eq!(
-            parse_reset_seconds("Resets in 7 days 5 hours"),
-            Some(622_800)
-        );
-        assert_eq!(parse_reset_seconds("Resets in 45 seconds"), Some(45));
-        assert_eq!(parse_reset_seconds("Resets in"), None);
-    }
-
-    /// `strip_tags` removes both real tags and the React comment markers,
-    /// leaving the reader-visible text exactly as rendered.
-    #[test]
-    fn strip_tags_removes_comment_markers_and_real_tags() {
-        assert_eq!(
-            strip_tags("<!--$-->Resets in<!--/--> <!--$-->4 days 10 hours<!--/-->"),
-            "Resets in 4 days 10 hours"
-        );
-        assert_eq!(strip_tags("<b>bold</b> plain"), "bold plain");
-    }
-
-    /// Case 05 (aub-rfot): a 429 over an HTML page stores the status spelling
-    /// as the classification and no message, because an HTML body carries no
-    /// `error.type` or `error.message` to read. That is the honest report for
-    /// a failure the provider did not name in a parseable shape.
-    #[test]
-    fn case_05_error_429_over_an_html_page_stores_the_status_spelling() {
-        let transport = SyntheticTransport::with_status(429, "/", b"<html>slow down</html>");
+        let transport = SyntheticTransport::serving(body.as_bytes());
         let captured = observing(&transport);
+        let capsule = captured.evidence.expect("a measured reading has a capsule");
+        let serialized = capsule.serialized();
+        assert!(
+            !serialized.contains("fixture-session-cookie"),
+            "an echoed credential is sanitized out of the capsule"
+        );
+    }
+
+    #[test]
+    fn case_11_error_429_stores_the_status_spelling() {
+        let transport = SyntheticTransport::with_status(429, "", b"{\"error\":\"slow down\"}");
+        let captured = observing(&transport);
+        assert!(matches!(
+            captured.observation,
+            ProviderObservation::Unreachable(FailureClass::RateLimited { retry_after: None })
+        ));
         let report = captured
             .failed_error
             .as_ref()
             .expect("a 429 response stores the provider's error report");
         assert_eq!(report.classification, "http_429");
         assert_eq!(report.message, "");
-        assert!(test_support::sanitization::matched_patterns(&report.classification).is_empty());
-    }
-
-    /// Case 06 (aub-rfot): a 401 over an HTML page stores the status spelling
-    /// too. The classification is what coverage and doctor group by; the
-    /// empty message says the provider supplied no readable words.
-    #[test]
-    fn case_06_error_401_over_an_html_page_stores_the_status_spelling() {
-        let transport = SyntheticTransport::with_status(401, "/", b"<html>no</html>");
-        let captured = observing(&transport);
-        let report = captured
-            .failed_error
-            .as_ref()
-            .expect("a 401 response stores the provider's error report");
-        assert_eq!(report.classification, "http_401");
-        assert_eq!(report.message, "");
-        assert!(test_support::sanitization::matched_patterns(&report.classification).is_empty());
     }
 }

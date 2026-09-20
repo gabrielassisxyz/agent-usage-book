@@ -1,62 +1,72 @@
 # OpenCode Go Meter Fixtures
 
-Synthetic page fixtures for the OpenCode Go workspace-page meter adapter
-(`aub-8hu3`). The OpenCode Go usage meter has no public endpoint: the
-authoritative surface is the workspace page
-`https://opencode.ai/workspace/<id>/go` as seen in a signed-in browser, and
-the usage meters live in the page's **rendered markup**, not in an embedded
-JSON blob. The real contract comes from the reference tool
-(`git.sr.ht/~hrbrmstr/opencode-go-usage`, branch `batman`, `usage/usage.go`
-and `usage/usage_test.go`), which parses the same HTML a browser renders.
+Synthetic fixtures for the OpenCode Go meter adapter (`aub-8hu3`, migrated by
+`aub-id41`). The adapter reads the console's own status endpoint,
+`GET https://opencode.ai/console/api/go/status`, which answers JSON for a
+signed-in browser session. The real contract comes from the reference tool
+(`git.sr.ht/~hrbrmstr/opencode-go-usage`, `usage/usage.go`), whose whole
+history is one commit titled `feat: migrate to console JSON API from HTML
+scraping`.
+
+The `.html` fixtures below belong to the revision this adapter replaced, when
+the authoritative surface was the rendered workspace page. They are kept
+because `login-redirect.html` is still in use and because a capture of a
+surface that existed is evidence, not clutter: the series recorded before
+2026-09-20 was derived from pages of exactly that shape.
 
 ## Provenance
 
-`valid.html` is a sanitized capture of the live workspace page, fetched on
-2026-09-07 with the operator's session cookie while the account was being
-configured (`aub-s6e4`). The workspace id, the account email, the Stripe
-customer, payment-method and subscription ids, the referral code and the
-server-action ids were replaced with zeros or neutral words; nothing else was
-changed, so the fixture carries the page's real hydration script, header,
-navigation and the collapsed "Show details" blocks beside the weekly and
-monthly items. It parses to 0 / 1.1 / 2.1 percent with resets `5 hours 0
-minutes` / `6 days 8 hours` / `27 days 8 hours`. The reset text is
-hour-granular on the real page while the hydration script carries the exact
-`resetInSec`; the parser reads the markup, as the reference tool does.
+`valid.json` is the live response captured on 2026-09-20 with the operator's
+session cookies, with the subscriber id and the payment-method id replaced by
+neutral fixture words. Every quota figure is the response's own: a $12.00
+five-hour ceiling, $30.00 weekly and $60.00 monthly, against 0, 137731547 and
+695777296 micro-cents spent. It carries the real response's own mixture of
+reset instants, which is the reason it is worth keeping verbatim: `week`
+states one, `fiveHour` states `null`, and `month` omits the key altogether.
 
-`malformed-state.html` reproduces the shape of the reference tool's own
-committed sample page (`usage/usage_test.go`'s fixture): three `usage-item`
-blocks with figures 0 / 35.5 / 64.8 percent and resets `5 hours 0 minutes` /
-`4 days 10 hours` / `7 days 5 hours`, with the weekly percent broken on
-purpose. Before the live capture, `valid.html` was that same shape; the
-reference fixture shape survives here so a page the tool itself parses still
-has a case. No cookie, token, key, email, session identifier or account
-identifier appears in any of them, and each parses clean against the shared
-forbidden-pattern list (`docs/forbidden-patterns.txt`).
+`no-state-marker.json` and `malformed-state.json` are hand-written around that
+shape rather than captured. No cookie, token, key, email, session identifier
+or account identifier appears in any fixture, and each parses clean against
+the shared forbidden-pattern list (`docs/forbidden-patterns.txt`).
+
+`valid.html` is the sanitized workspace page captured on 2026-09-07
+(`aub-s6e4`), which the page-scraping revision parsed to 0 / 1.1 / 2.1 percent.
 
 ## Parser contract
 
-The adapter keys the page on the literal marker string
-`data-slot="usage-item"`: one `<div>` carrying that attribute per usage
-window. Inside it: `<span data-slot="usage-label">` names the window
-(`5-hour Usage`, `Weekly Usage`, `Monthly Usage`, matched by substring to
-`rolling`, `weekly`, `monthly`); a `role="progressbar"` element's
-`aria-valuenow` attribute carries the percent as a decimal with one place;
-and `<span data-slot="reset-time">` carries `Resets in <N days> <N hours>
-<N minutes> <N seconds>` (any subset of those units), with React comment
-markers (`<!--$-->`, `<!--/-->`) stripped before parsing. A page with no
-`data-slot="usage-item"` element anywhere is schema drift.
+The adapter keys the response on `access.meters`: one object per usage window,
+under the keys `fiveHour`, `week` and `month`, mapped to the semantic keys
+`rolling`, `weekly` and `monthly`. Each carries `limitMicroCents` and
+`usedMicroCents` as decimal strings, and `resetsAt` as an RFC 3339 instant,
+as `null`, or not at all.
+
+The quota fraction is the exact integer ratio of used to limit, rounded half
+away from zero to parts per million; a window whose limit is zero states no
+ceiling and refuses rather than reading as zero usage. A window with no reset
+instant is the not-started state `aub-eun.15` decided on, and no reset is
+inferred from `access.endsAt`. A body that is not JSON, one whose content type
+is not JSON, and one carrying no `access.meters` object are all schema drift,
+never a silent zero.
+
+The projection the evidence capsule retains is narrower than the response: the
+three windows and nothing else. The response also carries a subscriber id and
+a payment-method id, and neither belongs in an evidence store that exists to
+prove a quota number.
 
 ## Catalog of Fixtures
 
-- `valid.html`: the sanitized live page, three usage windows in the rendered
-  markup; parses to three `MeterWindow` rows at 0 / 1.1 / 2.1 percent.
-- `login-redirect.html`: the sign-in body the workspace request is redirected
-  to when the session cookie is invalid or expired; the adapter classifies
-  the redirect response itself, so this body pairs with a 302 status in the
-  synthetic server and its content is never parsed.
-- `no-state-marker.html`: the page shape with no `usage-item` element at
-  all; parses to `FailureClass::SchemaDrift`, never a silent zero.
-- `malformed-state.html`: three items present, but the weekly item's
-  `aria-valuenow` is the text `not-a-number`; parses to
-  `FailureClass::MalformedBody`, with the sanitized raw-percent/reset-text
-  evidence still retained since the markup itself read structurally fine.
+- `valid.json`: the sanitized live response, three usage windows with the
+  provider's own micro-cent counts; parses to three `MeterWindow` rows at
+  0 / 45911 / 115963 ppm, with only the weekly window stating a reset.
+- `no-state-marker.json`: a well-formed body with no `access.meters` object;
+  parses to `FailureClass::SchemaDrift`, never a silent zero.
+- `malformed-state.json`: three meters present, but the five-hour meter's
+  `usedMicroCents` is the text `not-a-number`; parses to
+  `FailureClass::MalformedBody`, with the sanitized projection still retained
+  since the response itself read structurally fine.
+- `login-redirect.html`: the sign-in body the request is redirected to when
+  the session is invalid or expired; the adapter classifies the redirect
+  response itself, so this body pairs with a 302 status in the synthetic
+  server and its content is never parsed.
+- `valid.html`, `no-state-marker.html`, `malformed-state.html`: the
+  page-scraping revision's fixtures, superseded by their `.json` siblings.

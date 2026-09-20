@@ -1,0 +1,20 @@
+{
+  "access": {
+    "meters": {
+      "fiveHour": {
+        "resetsAt": null,
+        "limitMicroCents": "1200000000",
+        "usedMicroCents": "not-a-number"
+      },
+      "week": {
+        "resetsAt": "2026-09-21T00:00:00.000Z",
+        "limitMicroCents": "3000000000",
+        "usedMicroCents": "137731547"
+      },
+      "month": {
+        "limitMicroCents": "6000000000",
+        "usedMicroCents": "695777296"
+      }
+    }
+  }
+}

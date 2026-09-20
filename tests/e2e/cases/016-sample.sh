@@ -21,9 +21,10 @@ case_preconditions() {
 
     # The opencode account's session-cookie material: distinctive on purpose,
     # so the state-directory leak grep matches nothing but a leak, and free
-    # of every shared forbidden pattern. This is the bare cookie value the
-    # operator exports; the adapter builds the `auth=<value>` header itself.
-    OPENCODE_COOKIE_MATERIAL="fixture-session-cookie-9f2c-not-a-real-value"
+    # of every shared forbidden pattern. This is the whole `Cookie` header
+    # value the operator exports, carrying both cookies the console requires;
+    # the adapter sends it verbatim and builds no cookie pair of its own.
+    OPENCODE_COOKIE_MATERIAL="auth=fixture-session-cookie-9f2c-not-a-real-value; __Host-console_session=fixture-console-7b1d"
 
     cat > "$STATE_DIR/aub.toml" <<CFG_EOF
 state.dir = "$STATE_DIR"
@@ -41,7 +42,7 @@ opencode_workspace = "wrk_2345ABCDEFGHJKLMNOPQRSTuvwx"
 CFG_EOF
 
     # The synthetic opencode transport: one local server answering every
-    # request with the committed valid.html fixture, so the sample workflow
+    # request with the committed valid.json fixture, so the sample workflow
     # exercises the whole adapter path without the real provider.
     python3 -c "
 import http.server
@@ -56,7 +57,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(fixture, 'rb') as f:
             data = f.read()
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -67,7 +68,7 @@ httpd = socketserver.TCPServer(('127.0.0.1', 0), Handler)
 with open(port_file, 'w') as pf:
     pf.write(str(httpd.server_address[1]))
 httpd.serve_forever()
-" "$STATE_DIR/opencode-port.txt" "$REPO_ROOT/tests/fixtures/meter/opencode/valid.html" &
+" "$STATE_DIR/opencode-port.txt" "$REPO_ROOT/tests/fixtures/meter/opencode/valid.json" &
     OPENCODE_SERVER_PID=$!
 
     local count=0
@@ -131,8 +132,8 @@ case_steps() {
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
         "$AUB_BIN" sample --all
 
-    # 8. The opencode account samples its workspace page through the session
-    #    cookie, against the synthetic transport serving valid.html.
+    # 8. The opencode account samples the console status endpoint through the
+    #    session cookies, against the synthetic transport serving valid.json.
     step "sample-opencode-account" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
@@ -197,11 +198,13 @@ case_assertions() {
     assert_exit 0 8
     assert_stdout_contains 8 "sample: account=go-primary outcome=success"
 
-    # Step 9: the three windows persist at the fixture's decimal percents
+    # Step 9: the three windows persist at the fixture's exact micro-cent
+    # ratios. Only the weekly window states a reset instant; the other two
+    # carry none, which is the not-started state aub-eun.15 decided on.
     assert_exit 0 9
-    assert_stdout_contains 9 "monthly,21000,known"
-    assert_stdout_contains 9 "rolling,0,known"
-    assert_stdout_contains 9 "weekly,11000,known"
+    assert_stdout_contains 9 "monthly,115963,not_started"
+    assert_stdout_contains 9 "rolling,0,not_started"
+    assert_stdout_contains 9 "weekly,45911,known"
 
     # Step 10: status prints the go-primary block; the limiting window is
     # the monthly one (97.9% left, 30d)

@@ -1,17 +1,22 @@
-# aub-w1a0: the opencode reset anchor is derived from a page text that floors
-# the remaining time to whole hours, so re-deriving it on every tick drifts
-# the instant by the sampling interval without the provider having moved
-# anything. The adapter declares a one-hour reset precision, and the
-# window-anomaly classifier holds a `Known`-to-`Known` move within that
-# precision plus the gap between the observations to be one unchanged
-# boundary. Consecutive samples of an unchanging page, spaced further apart
-# than the fixed jitter envelope, must therefore record zero
-# `meter_window_anomaly` rows, while one sample whose page really moved the
-# boundary far past that tolerance must still record the typed
-# `unexpected_reset_change` anomaly for every window.
+# aub-w1a0, revised by aub-id41: the opencode reset anchor used to be derived
+# from a page text that floored the remaining time to whole hours, so
+# re-deriving it on every tick drifted the instant by the sampling interval
+# without the provider having moved anything, and this case existed to prove
+# the declared one-hour precision absorbed that drift. The console status
+# endpoint states an absolute instant instead, so the drift is gone at the
+# source and the three ticks no longer need to be spaced past a jitter
+# envelope to be meaningful.
+#
+# The case is kept rather than retired because its second half never depended
+# on the derivation: the window-anomaly classifier must still record zero
+# anomalies across consecutive samples of an unchanging response, and must
+# still record the typed `unexpected_reset_change` for every window when the
+# provider really moves a boundary. That is the property a re-derivation bug
+# or an over-eager classifier would break, and nothing else asserts it
+# end to end.
 
 CASE_ID="036-opencode-reset-precision"
-CASE_DESCRIPTION="three opencode samples of an unchanging page, spaced past the jitter envelope, record zero window anomalies, and a real boundary move still records unexpected_reset_change."
+CASE_DESCRIPTION="three opencode samples of an unchanging status response record zero window anomalies, and a real boundary move still records unexpected_reset_change."
 
 LEDGER_DB=""
 STABLE_STUB_PID=""
@@ -28,8 +33,9 @@ case_preconditions() {
     LEDGER_DB="$STATE_DIR/ledger.db"
 
     # Distinctive on purpose, so a leak grep matches nothing but a leak: the
-    # bare cookie value the adapter builds its `auth=<value>` header from.
-    OPENCODE_COOKIE_MATERIAL="fixture-session-cookie-9f2c-not-a-real-value"
+    # whole `Cookie` header value, carrying both cookies the console requires,
+    # which the adapter sends verbatim.
+    OPENCODE_COOKIE_MATERIAL="auth=fixture-session-cookie-9f2c-not-a-real-value; __Host-console_session=fixture-console-7b1d"
 
     mkdir -p "$STATE_DIR/home"
 
@@ -43,25 +49,57 @@ credential = { kind = "env", name = "OPENCODE_SESSION_COOKIE" }
 opencode_workspace = "wrk_2345ABCDEFGHJKLMNOPQRSTuvwx"
 CFG_EOF
 
-    # The negative control's page: the committed fixture with every reset
-    # text moved far into the future, so one sample against it moves each
-    # window's derived boundary by hundreds of hours and days, far past the
-    # declared one-hour precision plus any observation gap.
-    python3 - "$REPO_ROOT/tests/fixtures/meter/opencode/valid.html" \
-        "$STATE_DIR/moved.html" <<'PY_EOF'
+    # Two bodies built from the committed fixture. The stable one states a
+    # reset instant on all three windows, because a window the provider leaves
+    # without one is not-started and has no boundary to move; the committed
+    # fixture carries the real response's own mixture, which the unit cases
+    # cover and this one cannot use. The moved one pushes every instant far
+    # out, with the quota counts untouched, so the only thing that changed is
+    # the boundary.
+    python3 - "$REPO_ROOT/tests/fixtures/meter/opencode/valid.json" \
+        "$STATE_DIR/stable.json" "$STATE_DIR/moved.json" <<'PY_EOF'
+import datetime
+import json
 import sys
 
-source, destination = sys.argv[1], sys.argv[2]
-page = open(source).read()
-page = page.replace("5 hours 0 minutes", "500 hours 0 minutes")
-page = page.replace("6 days 8 hours", "660 days 8 hours")
-page = page.replace("27 days 8 hours", "670 days 8 hours")
-open(destination, "w").write(page)
+source, stable_path, moved_path = sys.argv[1], sys.argv[2], sys.argv[3]
+document = json.load(open(source))
+meters = document["access"]["meters"]
+
+# The instants are generated from the run's own clock rather than pinned, for
+# the same reason the page revision's fixture stated durations rather than
+# dates: a five-hour window whose boundary sits a year out, or one already
+# elapsed, is not the state this case is about, and either would exercise a
+# different branch of the classifier. The offsets are the nominal lengths.
+now = datetime.datetime.now(datetime.timezone.utc)
+
+
+def stamp(offset):
+    return (now + offset).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+stable_resets = {
+    "fiveHour": stamp(datetime.timedelta(hours=5)),
+    "week": stamp(datetime.timedelta(days=6, hours=8)),
+    "month": stamp(datetime.timedelta(days=27, hours=8)),
+}
+# Years out: past the declared precision plus any observation gap, by a margin
+# no tolerance this system declares could absorb.
+moved_resets = {
+    "fiveHour": stamp(datetime.timedelta(days=1000, hours=5)),
+    "week": stamp(datetime.timedelta(days=1006, hours=8)),
+    "month": stamp(datetime.timedelta(days=1027, hours=8)),
+}
+for name, meter in meters.items():
+    meter["resetsAt"] = stable_resets[name]
+json.dump(document, open(stable_path, "w"))
+for name, meter in meters.items():
+    meter["resetsAt"] = moved_resets[name]
+json.dump(document, open(moved_path, "w"))
 PY_EOF
 
     # Two stub transports: the stable one answers every request with the
-    # committed fixture (tick-to-tick derived moves are the sampling gap
-    # only), the moved one with the shifted page.
+    # stable body, the moved one with the shifted body.
     python3 -c "
 import http.server
 import socketserver
@@ -75,7 +113,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(fixture, 'rb') as f:
             data = f.read()
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -86,7 +124,7 @@ httpd = socketserver.TCPServer(('127.0.0.1', 0), Handler)
 with open(port_file, 'w') as pf:
     pf.write(str(httpd.server_address[1]))
 httpd.serve_forever()
-" "$STATE_DIR/stable-port.txt" "$REPO_ROOT/tests/fixtures/meter/opencode/valid.html" &
+" "$STATE_DIR/stable-port.txt" "$STATE_DIR/stable.json" &
     STABLE_STUB_PID=$!
     python3 -c "
 import http.server
@@ -101,7 +139,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         with open(fixture, 'rb') as f:
             data = f.read()
         self.send_response(200)
-        self.send_header('Content-Type', 'text/html; charset=utf-8')
+        self.send_header('Content-Type', 'application/json')
         self.send_header('Content-Length', str(len(data)))
         self.end_headers()
         self.wfile.write(data)
@@ -112,7 +150,7 @@ httpd = socketserver.TCPServer(('127.0.0.1', 0), Handler)
 with open(port_file, 'w') as pf:
     pf.write(str(httpd.server_address[1]))
 httpd.serve_forever()
-" "$STATE_DIR/moved-port.txt" "$STATE_DIR/moved.html" &
+" "$STATE_DIR/moved-port.txt" "$STATE_DIR/moved.json" &
     MOVED_STUB_PID=$!
 
     local count=0
@@ -129,21 +167,13 @@ httpd.serve_forever()
 }
 
 case_steps() {
-    # Each tick waits three seconds before sampling, on purpose: the sampling
-    # process is fast against a local stub, so back-to-back ticks re-derive
-    # resets only fractions of a second apart and the fixed 2 s provider-jitter
-    # envelope would absorb the drift with no declaration at all. The gap has
-    # to put each pair's drift past that envelope, so that the declared
-    # precision is what absorbs it, while staying far inside the precision
-    # plus the gap, which is the tolerance aub-w1a0 declares. The classifier
-    # judges pairs, so two pairs prove it as well as nine did; three seconds
-    # is the floor rather than 2.5 because a sleep never shortens under load
-    # while start-up overhead only widens the gap, and because the codex
-    # sibling case's stub truncates its anchor to whole seconds, so the two
-    # tick cases carry one rule. Ten ticks at four seconds cost 40 s per run.
+    # The ticks are back to back on purpose. The three-second spacing this
+    # case used to carry existed to put each pair's re-derived drift past the
+    # fixed provider-jitter envelope; the endpoint states an absolute instant,
+    # so consecutive samples of an unchanging response state the identical
+    # boundary at any spacing, and the nine seconds bought nothing.
     local tick
     for tick in 01 02 03; do
-        sleep 3
         step "tick-$tick-opencode-sample" env \
             "HOME=$STATE_DIR/home" \
             "AUB_STATE_DIR=$STATE_DIR" \
@@ -157,10 +187,10 @@ case_steps() {
     step "query-anomaly-count-after-ticks" sqlite3 "$LEDGER_DB" \
         "SELECT 'anomaly_count=' || count(*) FROM meter_window_anomaly"
 
-    # One sample against the page whose rendered resets moved by hundreds of
-    # hours and days: past the declared precision plus the gap for every
-    # window, with the quota percentages unchanged, so each of the three
-    # windows records the typed unexpected-reset-change anomaly.
+    # One sample against the body whose stated resets moved years out: past
+    # the declared precision plus the gap for every window, with the quota
+    # counts unchanged, so each of the three windows records the typed
+    # unexpected-reset-change anomaly.
     step "sample-after-real-reset-move" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
@@ -195,8 +225,8 @@ case_assertions() {
         assert_stdout_contains "$n" "sample: account=go-primary outcome=success"
     done
 
-    # Step 4: three ticks of an unchanging page, two pairs each drifting past
-    # the jitter envelope, recorded no anomaly of any kind.
+    # Step 4: three ticks of an unchanging response recorded no anomaly of
+    # any kind.
     assert_exit 0 4
     assert_stdout_contains 4 "anomaly_count=0"
 

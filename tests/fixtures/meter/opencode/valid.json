@@ -1,0 +1,31 @@
+{
+  "subscriberUserId": "usr_fixtureNotARealSubscriber",
+  "paymentMethodId": "pm_fixtureNotARealPaymentMethod",
+  "renewalCurrency": "usd",
+  "useBalance": false,
+  "cancelAtPeriodEnd": false,
+  "renewalPending": false,
+  "access": {
+    "startsAt": "2026-09-04T23:17:25.000Z",
+    "endsAt": "2026-10-04T23:17:25.000Z",
+    "cancelAtPeriodEnd": false,
+    "meters": {
+      "fiveHour": {
+        "startsAt": null,
+        "resetsAt": null,
+        "limitMicroCents": "1200000000",
+        "usedMicroCents": "0"
+      },
+      "week": {
+        "startsAt": "2026-09-14T00:00:00.000Z",
+        "resetsAt": "2026-09-21T00:00:00.000Z",
+        "limitMicroCents": "3000000000",
+        "usedMicroCents": "137731547"
+      },
+      "month": {
+        "limitMicroCents": "6000000000",
+        "usedMicroCents": "695777296"
+      }
+    }
+  }
+}
