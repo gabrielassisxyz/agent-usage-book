@@ -8,11 +8,10 @@ signed-in browser session. The real contract comes from the reference tool
 history is one commit titled `feat: migrate to console JSON API from HTML
 scraping`.
 
-The `.html` fixtures below belong to the revision this adapter replaced, when
-the authoritative surface was the rendered workspace page. They are kept
-because `login-redirect.html` is still in use and because a capture of a
-surface that existed is evidence, not clutter: the series recorded before
-2026-09-20 was derived from pages of exactly that shape.
+`login-redirect.html` is the one fixture left from the revision this adapter
+replaced, when the authoritative surface was the rendered workspace page. It
+survives because the redirect case still uses it; the three page-parsing
+fixtures beside it were removed with the parser they fed.
 
 ## Provenance
 
@@ -28,9 +27,6 @@ states one, `fiveHour` states `null`, and `month` omits the key altogether.
 shape rather than captured. No cookie, token, key, email, session identifier
 or account identifier appears in any fixture, and each parses clean against
 the shared forbidden-pattern list (`docs/forbidden-patterns.txt`).
-
-`valid.html` is the sanitized workspace page captured on 2026-09-07
-(`aub-s6e4`), which the page-scraping revision parsed to 0 / 1.1 / 2.1 percent.
 
 ## Parser contract
 
@@ -68,5 +64,3 @@ prove a quota number.
   the session is invalid or expired; the adapter classifies the redirect
   response itself, so this body pairs with a 302 status in the synthetic
   server and its content is never parsed.
-- `valid.html`, `no-state-marker.html`, `malformed-state.html`: the
-  page-scraping revision's fixtures, superseded by their `.json` siblings.

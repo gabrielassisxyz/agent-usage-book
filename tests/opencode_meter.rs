@@ -1,4 +1,4 @@
-//! The opencode meter adapter over the persisted ledger (aub-8hu3).
+//! The opencode meter adapter over the persisted ledger (aub-8hu3, aub-id41).
 //!
 //! The unit cases in `src/meter/opencode.rs` prove the parse and the request
 //! shape; this file proves what sampling actually persists. One test owns the
@@ -33,11 +33,13 @@ use agent_usage_book::store::sampling_policy_snapshot::{
 };
 
 /// The fixture under test, shared with the unit cases and the e2e run.
-const FIXTURE_VALID: &str = include_str!("fixtures/meter/opencode/valid.html");
+const FIXTURE_VALID: &str = include_str!("fixtures/meter/opencode/valid.json");
 
-/// Distinctive on purpose, so a grep matches nothing but a leak. The bare
-/// cookie value, matching the credential material the adapter receives.
-const FIXTURE_COOKIE: &str = "fixture-session-cookie-9f2c-not-a-real-value";
+/// Distinctive on purpose, so a grep matches nothing but a leak. The whole
+/// `Cookie` header value, matching the credential material the adapter
+/// receives.
+const FIXTURE_COOKIE: &str = "auth=fixture-session-cookie-9f2c-not-a-real-value; \
+     __Host-console_session=fixture-console-7b1d";
 
 struct TestDb {
     path: PathBuf,
@@ -185,7 +187,7 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
     );
     let capsule = captured
         .evidence
-        .expect("a measured page keeps its capsule");
+        .expect("a measured response keeps its capsule");
 
     let evidence_id = insert_response_evidence(
         &conn,
@@ -205,12 +207,14 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
     let stored = evidence_by_row_id(&conn, evidence_id)
         .expect("the evidence must read")
         .expect("the evidence must exist");
-    // The raw provider facts ride in the capsule exactly as the markup
-    // stated them, so the derived instants stay auditable beside them.
+    // The provider's own micro-cent counts ride in the capsule exactly as it
+    // stated them, so the derived fraction stays auditable beside them. This
+    // is also where the currency the domain discards at parse time survives.
     for field in [
-        "\"percent\":\"0\"",
-        "\"percent\":\"1.1\"",
-        "\"percent\":\"2.1\"",
+        "\"used_micro_cents\":\"0\"",
+        "\"used_micro_cents\":\"137731547\"",
+        "\"used_micro_cents\":\"695777296\"",
+        "\"limit_micro_cents\":\"1200000000\"",
     ] {
         assert!(
             stored.evidence_capsule.contains(field),
@@ -218,10 +222,19 @@ fn the_persisted_evidence_row_holds_the_raw_state_and_never_the_cookie() {
             stored.evidence_capsule
         );
     }
-    for field in ["5 hours 0 minutes", "6 days 8 hours", "27 days 8 hours"] {
+    assert!(
+        stored
+            .evidence_capsule
+            .contains("2026-09-21T00:00:00.000Z"),
+        "the stated reset instant must persist: {}",
+        stored.evidence_capsule
+    );
+    // The account identifiers the response carries are not evidence of a quota
+    // number, and the projection is what keeps them out.
+    for field in ["usr_fixtureNotARealSubscriber", "pm_fixtureNotARealPaymentMethod"] {
         assert!(
-            stored.evidence_capsule.contains(field),
-            "the raw reset text {field} must persist: {}",
+            !stored.evidence_capsule.contains(field),
+            "{field} must not persist: {}",
             stored.evidence_capsule
         );
     }
