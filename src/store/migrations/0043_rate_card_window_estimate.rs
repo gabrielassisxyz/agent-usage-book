@@ -305,6 +305,76 @@ mod tests {
         );
     }
 
+    /// The book an existing ledger already holds re-imports as a no-op after
+    /// this migration: every row written at version 42 has the three new
+    /// columns absent, and the rebuilt content index must still recognise it
+    /// as the same content a fresh import of the same draft produces. An index
+    /// that compared the new columns without `COALESCE` would admit every card
+    /// a second time here.
+    #[test]
+    fn the_shipped_book_imported_before_this_migration_re_imports_unchanged() {
+        let scratch = ScratchDir::new();
+        let mut conn = crate::store::connection::open(
+            &scratch.0.join("rate-card-window-upgrade.db"),
+            AccessMode::ReadWrite,
+            &PragmaPolicy {
+                busy_timeout: crate::domain::time::MonotonicDuration::from_millis(1_000),
+            },
+        )
+        .expect("scratch database must open");
+        let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000));
+        let before: Vec<_> = crate::store::migrations::registry()
+            .into_iter()
+            .filter(|migration| migration.version < super::VERSION)
+            .collect();
+        run_migrations(&mut conn, &before, None, &clock).expect("migrations to 42 must run");
+
+        let book = crate::rate_book::parse(include_str!("../../../rate-book/rates.toml"))
+            .expect("the shipped book must parse");
+        assert!(!book.cards.is_empty());
+        for draft in &book.cards {
+            conn.execute(
+                "INSERT INTO rate_card (
+                    vendor, model, token_class, rate_micros, currency, billing_basis,
+                    effective_start, effective_end, imported_at, published_at, source, review_due,
+                    schedule_days, schedule_hours
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                rusqlite::params![
+                    draft.vendor,
+                    draft.model,
+                    draft.token_class.as_str(),
+                    draft.rate_micros,
+                    draft.denomination.as_str(),
+                    draft.billing_basis.as_str(),
+                    draft.effective_start.iso(),
+                    draft.effective_end.map(UtcDate::iso),
+                    500_i64,
+                    draft.publication.published_at.map(UtcTimestamp::unix_nanos),
+                    draft.publication.source,
+                    draft.review_due.iso(),
+                    draft.schedule.as_ref().map(|window| window.days_text()),
+                    draft.schedule.as_ref().map(|window| window.hours_text()),
+                ],
+            )
+            .expect("a version-42 row must insert");
+        }
+
+        run_migrations(
+            &mut conn,
+            &crate::store::migrations::registry(),
+            None,
+            &clock,
+        )
+        .expect("migration 43 must run over the existing book");
+        let summary = rate_card::insert(&conn, &book.cards, clock.now())
+            .expect("the re-import must not fail");
+        assert_eq!(summary.cards_added, 0);
+        assert_eq!(
+            summary.cards_unchanged,
+            u64::try_from(book.cards.len()).expect("the book fits in u64")
+        );
+    }
+
     /// The documented reversal runs, and a money card survives it: the header
     /// promises a manual down step, and a promise nobody executes is prose.
     #[test]

@@ -3055,6 +3055,60 @@ impl SpendWindowResolver<'_> {
     }
 }
 
+/// What `aub spend --window-equivalent` does with one window, decided from
+/// the health of its active calibration alone (`aub-8vpc`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpendWindowPrecedence {
+    /// A current calibration answers; any estimate card is inert.
+    Calibrated,
+    /// No calibration is recorded, so the labelled rate-card estimate answers,
+    /// or the calibration refusal does when no card exists either.
+    Estimate,
+    /// A calibration exists but is not current: refuse naming its health.
+    RefuseHealth(crate::calibration::health::CalibrationHealth),
+}
+
+fn spend_window_precedence(
+    health: Option<crate::calibration::health::CalibrationHealth>,
+) -> SpendWindowPrecedence {
+    match health {
+        None => SpendWindowPrecedence::Estimate,
+        Some(crate::calibration::health::CalibrationHealth::Current) => {
+            SpendWindowPrecedence::Calibrated
+        }
+        Some(other) => SpendWindowPrecedence::RefuseHealth(other),
+    }
+}
+
+#[cfg(test)]
+mod spend_window_precedence_tests {
+    use super::{SpendWindowPrecedence, spend_window_precedence};
+    use crate::calibration::health::CalibrationHealth;
+
+    /// The precedence table with its literal outcomes. `review_due` and
+    /// `suspect` are the rows that carry the rule: a stale measurement is
+    /// still evidence, so neither may fall through to the estimate.
+    #[test]
+    fn the_spend_precedence_table() {
+        assert_eq!(
+            spend_window_precedence(Some(CalibrationHealth::Current)),
+            SpendWindowPrecedence::Calibrated
+        );
+        assert_eq!(
+            spend_window_precedence(Some(CalibrationHealth::ReviewDue)),
+            SpendWindowPrecedence::RefuseHealth(CalibrationHealth::ReviewDue)
+        );
+        assert_eq!(
+            spend_window_precedence(Some(CalibrationHealth::Suspect)),
+            SpendWindowPrecedence::RefuseHealth(CalibrationHealth::Suspect)
+        );
+        assert_eq!(
+            spend_window_precedence(None),
+            SpendWindowPrecedence::Estimate
+        );
+    }
+}
+
 /// The estimator id every rate-card estimate carries, in the one spelling both
 /// the JSON `methods` array and the provenance use.
 const RATE_CARD_ESTIMATE_METHOD: &str = "rate-card-estimate";
@@ -3098,23 +3152,25 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         // merely not current does not. A stale measurement is still evidence,
         // and an approximation quietly standing in its place would paper over
         // the review it is asking for.
-        let Some(calibration) = calibration else {
-            return Ok(self.estimate(provider, priced_model, usage));
+        let health = calibration
+            .as_ref()
+            .map(|calibration| self.calibration_health(calibration));
+        let calibration = match (spend_window_precedence(health), calibration) {
+            (SpendWindowPrecedence::Calibrated, Some(calibration)) => calibration,
+            (SpendWindowPrecedence::RefuseHealth(health), _) => {
+                return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                    format!(
+                        "current calibration for provider {} and window {}: calibration health is {}",
+                        provider,
+                        self.window_key,
+                        health.label()
+                    ),
+                )]));
+            }
+            (SpendWindowPrecedence::Estimate | SpendWindowPrecedence::Calibrated, _) => {
+                return Ok(self.estimate(provider, priced_model, usage));
+            }
         };
-        let health = self.calibration_health(&calibration);
-        if !matches!(
-            health,
-            crate::calibration::health::CalibrationHealth::Current
-        ) {
-            return Ok(window_refusal([crate::evidence::RequiredFact::new(
-                format!(
-                    "current calibration for provider {} and window {}: calibration health is {}",
-                    provider,
-                    self.window_key,
-                    health.label()
-                ),
-            )]));
-        }
 
         let Some(model) = self.active_cost_model else {
             return Ok(window_refusal([crate::evidence::RequiredFact::new(

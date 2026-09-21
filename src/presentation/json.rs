@@ -3303,6 +3303,54 @@ mod tests {
         assert!(headroom.get("lower").is_some(), "{value}");
         assert!(headroom.get("upper").is_some(), "{value}");
         assert!(value["provenance"]["sources"].is_array(), "{value}");
+        let calibrated_window = &value["outcome"]["windows"][0];
+        assert_eq!(calibrated_window["calibration_id"], "17");
+        assert!(calibrated_window.get("basis").is_none(), "{value}");
+        assert!(
+            !crate::presentation::render::render_can_run_report(&ready_report)
+                .contains("(estimated)")
+        );
+
+        // The same window backed by rate cards instead (`aub-8vpc`): the JSON
+        // names the cards and the evidence quality in place of the calibration
+        // id, and the headroom line ends in the label.
+        let mut estimated_inputs = inputs.clone();
+        let calibration = estimated_inputs
+            .window_calibrations
+            .remove(&WindowSemanticKey::new("account:5h"))
+            .expect("the account window was calibrated above");
+        estimated_inputs.window_estimates.insert(
+            WindowSemanticKey::new("account:5h"),
+            crate::report::can_run::WindowEstimateLookup {
+                rate_card_ids: vec![3, 4],
+                constraint: calibration.constraint,
+            },
+        );
+        let estimated_report = compose_can_run_report(estimated_inputs);
+        let estimated_json = can_run_json(&estimated_report, run.clone());
+        validate_can_run_report_json(&estimated_json)
+            .expect("estimated report validates its own contract");
+        let estimated: serde_json::Value =
+            serde_json::from_str(&estimated_json).expect("valid JSON expected");
+        let estimated_window = &estimated["outcome"]["windows"][0];
+        assert_eq!(estimated_window["evidence_quality"], "estimated");
+        assert_eq!(
+            estimated_window["basis"],
+            serde_json::json!({"kind": "rate_card_estimate", "rate_card_ids": [3, 4]})
+        );
+        assert!(
+            estimated_window.get("calibration_id").is_none(),
+            "{estimated}"
+        );
+        let estimated_text = crate::presentation::render::render_can_run_report(&estimated_report);
+        let headroom_line = estimated_text
+            .lines()
+            .find(|line| line.contains("account:5h") && line.contains("headroom"))
+            .unwrap_or_else(|| panic!("no headroom line: {estimated_text}"));
+        assert!(
+            headroom_line.trim_end().ends_with("credits (estimated)"),
+            "{headroom_line}"
+        );
 
         let mut stale_inputs = inputs;
         stale_inputs.meter = CanRunMeterReadiness::Stale {
