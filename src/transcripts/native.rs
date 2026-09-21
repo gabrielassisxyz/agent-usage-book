@@ -68,6 +68,7 @@ pub const PI_NAMESPACE: &str = "pi";
 /// always carry one spelling of the source, because both read this mapping.
 pub fn namespace_for_format(format: &str) -> Option<&'static str> {
     match format {
+        "agy" => Some(crate::transcripts::estimated::AGY_NAMESPACE),
         "claude-code" => Some(CLAUDE_CODE_NAMESPACE),
         "codex" => Some(CODEX_NAMESPACE),
         "opencode" => Some(OPENCODE_NAMESPACE),

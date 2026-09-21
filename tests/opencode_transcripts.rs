@@ -498,7 +498,10 @@ fn ingest_of_a_fixture_directory_through_the_configured_source() {
 /// unknown format does, and the operator-facing lists name every one.
 #[test]
 fn format_registry_docs_and_help_agree() {
-    assert_eq!(KNOWN_FORMATS, &["claude-code", "codex", "opencode", "pi"]);
+    assert_eq!(
+        KNOWN_FORMATS,
+        &["agy", "claude-code", "codex", "opencode", "pi"]
+    );
     for format in KNOWN_FORMATS {
         assert!(
             parser_for_format(format).is_some(),
@@ -524,7 +527,7 @@ fn format_registry_docs_and_help_agree() {
         );
     }
     assert!(
-        readme.contains("# or \"codex\", \"pi\", \"opencode\""),
+        readme.contains("# or \"agy\", \"codex\", \"pi\", \"opencode\""),
         "README transcripts example must list opencode among the format values"
     );
     assert!(

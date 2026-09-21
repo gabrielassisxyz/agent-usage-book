@@ -7,6 +7,7 @@
 
 pub mod discovery;
 pub mod drift;
+pub mod estimated;
 pub mod native;
 pub mod parser;
 pub mod watermark;
@@ -17,18 +18,20 @@ pub use drift::{
     ShapeSummary, SourceDriftReport, TranscriptDriftReport, ValueType, collect_field_paths,
     detect_drift, extract_record_kind, extract_record_shape, load_fixture_corpus,
 };
+pub use estimated::{AGY_ESTIMATOR_ID, AGY_ESTIMATOR_VERSION, AGY_NAMESPACE, AgyParser};
 pub use native::{ClaudeCodeParser, CodexParser, OpencodeParser, PiParser, namespace_for_format};
 
 /// Every transcript format a parser reads, in one place. Usage errors name
 /// this list rather than restating it, so a format added here cannot leave a
 /// stale copy behind in a message (the one-definition rule in AGENTS.md).
-pub const KNOWN_FORMATS: &[&str] = &["claude-code", "codex", "opencode", "pi"];
+pub const KNOWN_FORMATS: &[&str] = &["agy", "claude-code", "codex", "opencode", "pi"];
 
 /// The parser for a source's declared `format`, or `None` for a format no parser
-/// reads. The four names are the configuration vocabulary; a report over a source
+/// reads. The five names are the configuration vocabulary; a report over a source
 /// with an unknown format refuses rather than guessing a parser from a path.
 pub fn parser_for_format(format: &str) -> Option<Box<dyn ParserAdapter>> {
     match format {
+        "agy" => Some(Box::new(AgyParser)),
         "claude-code" => Some(Box::new(ClaudeCodeParser)),
         "codex" => Some(Box::new(CodexParser)),
         "opencode" => Some(Box::new(OpencodeParser)),

@@ -1,0 +1,4 @@
+{"type":"USER_INPUT","content":"abcdefgh"}
+{"type":"PLANNER_RESPONSE","created_at":"2026-09-20T10:00:00Z","content":"abcd","thinking":"efgh"}
+{"type":"TOOL_RESULT","content":"ijkl"}
+{"type":"PLANNER_RESPONSE","created_at":"2026-09-20T10:01:00Z","content":"mnopqrst","tool_calls":[{"name":"read","args":{"path":"x"}}]}

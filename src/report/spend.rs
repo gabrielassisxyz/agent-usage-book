@@ -1433,7 +1433,7 @@ fn task_target_label(target: &SegmentTarget) -> String {
 /// second copy that could silently drift from it.
 pub(crate) fn canonical_usage(events: &[&CanonicalSpendEvent], partial: bool) -> UsageVector {
     let mut components = BTreeMap::<String, u64>::new();
-    let mut quality = EvidenceQuality::Measured;
+    let mut quality: Option<EvidenceQuality<TokenCount>> = None;
     for event in events {
         for (kind, count) in &event.components {
             *components.entry(kind.clone()).or_insert(0) += count;
@@ -1443,7 +1443,10 @@ pub(crate) fn canonical_usage(events: &[&CanonicalSpendEvent], partial: bool) ->
         } else {
             EvidenceQuality::estimated([EstimatorId::new(event.evidence_kind.clone())], None)
         };
-        quality = quality.combine(&event_quality);
+        quality = Some(match quality {
+            Some(quality) => quality.combine(&event_quality),
+            None => event_quality,
+        });
     }
     let known = KnownTokenVector::new(
         InputTokens::new(components.remove("input").unwrap_or(0)),
@@ -1468,7 +1471,7 @@ pub(crate) fn canonical_usage(events: &[&CanonicalSpendEvent], partial: bool) ->
             .map(|(kind, count)| (kind, TokenCount::new(count)))
             .collect(),
         coverage,
-        quality,
+        quality.unwrap_or(EvidenceQuality::Measured),
     )
 }
 
@@ -2510,6 +2513,75 @@ mod tests {
         assert!(explain.contains("spend_canonical_records"));
         assert!(explain.contains("spend_replayed_occurrences"));
         assert!(explain.contains("spend_heuristic_identities"));
+    }
+
+    #[test]
+    fn reconstructed_only_is_estimated_and_mixing_reported_usage_is_mixed() {
+        let (_root, conn) = canonical_conn("reconstructed-composition");
+        seed_session(&conn, "s1");
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical(
+            &conn,
+            "estimated",
+            day + 1,
+            "s1",
+            "reconstructed:agy-character-count:1",
+            &[("input", 34_492), ("output", 2)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let estimated = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+        match estimated.groups[0].usage.quality() {
+            EvidenceQuality::Estimated {
+                methods,
+                uncertainty,
+            } => {
+                assert_eq!(
+                    methods,
+                    &BTreeSet::from([EstimatorId::new("reconstructed:agy-character-count:1",)])
+                );
+                assert_eq!(uncertainty, &None);
+            }
+            quality @ (EvidenceQuality::Measured | EvidenceQuality::Mixed { .. }) => {
+                panic!("an agy-only aggregate must be estimated, got {quality:?}")
+            }
+        }
+
+        seed_canonical(
+            &conn,
+            "measured",
+            day + 2,
+            "s1",
+            "reported",
+            &[("input", 10), ("output", 5)],
+        );
+        let mixed = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            Vec::new(),
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+        assert!(matches!(
+            mixed.groups[0].usage.quality(),
+            EvidenceQuality::Mixed { .. }
+        ));
     }
 
     /// `--group-by task` reads the tracker's claim/release timeline and

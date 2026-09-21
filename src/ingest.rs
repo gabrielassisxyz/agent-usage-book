@@ -64,7 +64,7 @@ use rusqlite::Connection;
 
 use crate::config::{Config, TranscriptConfig};
 use crate::dedup::{
-    HeuristicKeyCollision, canonical_identity, canonical_payload_digest, deduplicate,
+    HeuristicKey, HeuristicKeyCollision, canonical_identity, canonical_payload_digest, deduplicate,
 };
 use crate::domain::ids::SourceNamespace;
 use crate::domain::time::{Clock, MonotonicDuration, MonotonicInstant, UtcTimestamp};
@@ -461,6 +461,10 @@ pub fn run(
     let mut persist_events = Vec::with_capacity(deduplicated.canonical.len());
     for event in &deduplicated.canonical {
         let identity = canonical_identity(event);
+        let heuristic_algorithm_version = identity
+            .heuristic_key
+            .as_ref()
+            .map(|_| HeuristicKey::ALGORITHM_VERSION.to_string());
         let relative_path = relative_by_source_file.get(event.source_file()).cloned();
         let event_namespace = namespace_by_source_file.get(event.source_file()).cloned();
         persist_events.push(PersistEvent {
@@ -475,7 +479,7 @@ pub fn run(
             canonical_event_id: identity.canonical_event_id,
             native_event_id: identity.native_event_id,
             heuristic_key: identity.heuristic_key,
-            heuristic_algorithm_version: None,
+            heuristic_algorithm_version,
             canonical_payload_digest: canonical_payload_digest(event),
             relative_path,
         });
