@@ -243,6 +243,18 @@ pub struct WindowEstimateLookup {
     pub constraint: CalibratedWindowConstraint,
 }
 
+/// What the percent-of-window cards say about one uncalibrated window
+/// (`aub-8vpc`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowEstimate {
+    /// Every token class the active cost model prices has a card in force.
+    Available(WindowEstimateLookup),
+    /// Some classes have a card and some do not. The window refuses naming
+    /// each gap, because a range over the classes that remain would present a
+    /// partial estimate as a bound.
+    Incomplete { missing: Vec<String> },
+}
+
 /// A configured account plan tier that does not match the plan tier the active
 /// calibration was fitted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -265,7 +277,7 @@ pub struct CanRunJoinInputs {
     pub window_calibrations: BTreeMap<WindowSemanticKey, WindowCalibrationLookup>,
     /// The rate-card estimates available per window, consulted only where
     /// `window_calibrations` holds no entry at all (`aub-8vpc`).
-    pub window_estimates: BTreeMap<WindowSemanticKey, WindowEstimateLookup>,
+    pub window_estimates: BTreeMap<WindowSemanticKey, WindowEstimate>,
     pub cost_model_missing_token_classes: Vec<String>,
     pub plan_tier_mismatch: Option<PlanTierMismatch>,
     pub task: TaskReferenceInput,
@@ -397,7 +409,12 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                         // evidence, and an approximation standing in for it
                         // would hide the review it is asking for.
                         None => match inputs.window_estimates.get(window.semantic_key()) {
-                            Some(estimate) => known.push((
+                            Some(WindowEstimate::Incomplete { missing: gaps }) => {
+                                missing.extend(gaps.iter().map(|gap| {
+                                    missing_fact(window.semantic_key().as_str(), gap.clone())
+                                }));
+                            }
+                            Some(WindowEstimate::Available(estimate)) => known.push((
                                 window,
                                 ResolvedWindowConstraint {
                                     constraint: &estimate.constraint,
@@ -1278,9 +1295,10 @@ mod compose_tests {
                 .insert(WindowSemanticKey::new("account:5h"), calibration);
         }
         if let Some(estimate) = estimate {
-            inputs
-                .window_estimates
-                .insert(WindowSemanticKey::new("account:5h"), estimate);
+            inputs.window_estimates.insert(
+                WindowSemanticKey::new("account:5h"),
+                WindowEstimate::Available(estimate),
+            );
         }
         compose_can_run_report(inputs)
     }
@@ -1362,6 +1380,36 @@ mod compose_tests {
                 fact.reason
             );
         }
+    }
+
+    /// Cards for only some classes refuse the window naming each gap, and
+    /// never fall through to the calibration refusal or to an estimate.
+    #[test]
+    fn an_incomplete_estimate_refuses_naming_the_missing_class() {
+        let mut inputs = worked_example_inputs();
+        inputs
+            .window_calibrations
+            .remove(&WindowSemanticKey::new("account:5h"));
+        inputs.window_estimates.insert(
+            WindowSemanticKey::new("account:5h"),
+            WindowEstimate::Incomplete {
+                missing: vec!["no percent-of-window rate card for a/m/cache_read".to_string()],
+            },
+        );
+        let report = compose_can_run_report(inputs);
+        let CanRunOutcome::Refused(refused) = &report.outcome else {
+            panic!("an incomplete estimate must refuse");
+        };
+        let reasons: Vec<&str> = refused
+            .missing
+            .iter()
+            .filter(|fact| fact.subject == "account:5h")
+            .map(|fact| fact.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["no percent-of-window rate card for a/m/cache_read"]
+        );
     }
 
     #[test]

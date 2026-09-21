@@ -3321,10 +3321,12 @@ mod tests {
             .expect("the account window was calibrated above");
         estimated_inputs.window_estimates.insert(
             WindowSemanticKey::new("account:5h"),
-            crate::report::can_run::WindowEstimateLookup {
-                rate_card_ids: vec![3, 4],
-                constraint: calibration.constraint,
-            },
+            crate::report::can_run::WindowEstimate::Available(
+                crate::report::can_run::WindowEstimateLookup {
+                    rate_card_ids: vec![3, 4],
+                    constraint: calibration.constraint,
+                },
+            ),
         );
         let estimated_report = compose_can_run_report(estimated_inputs);
         let estimated_json = can_run_json(&estimated_report, run.clone());

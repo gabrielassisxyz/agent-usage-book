@@ -7248,8 +7248,11 @@ fn gather_window_calibrations(
 /// that range: not a chosen class, and not an average that would read as more
 /// precise than the cards are.
 ///
-/// A window whose cards and cost model share no class yields nothing, and the
-/// composition then refuses for that window exactly as it did before.
+/// A window with no card of this basis at all yields nothing, and the
+/// composition then refuses for that window exactly as it did before. A window
+/// with cards for only some of the classes the cost model prices yields a
+/// refusal naming the rest, as `spend --window-equivalent` does: the range over
+/// the classes that remain would read as a bound on a mix it never saw.
 fn gather_window_estimates(
     conn: &rusqlite::Connection,
     meter: &crate::report::can_run::CanRunMeterReadiness,
@@ -7263,7 +7266,7 @@ fn gather_window_estimates(
 ) -> Result<
     std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
-        crate::report::can_run::WindowEstimateLookup,
+        crate::report::can_run::WindowEstimate,
     >,
     Error,
 > {
@@ -7292,53 +7295,85 @@ fn gather_window_estimates(
         else {
             continue;
         };
-        let mut ratios = Vec::new();
-        let mut rate_card_ids = Vec::new();
-        for kind_of_token in crate::domain::tokens::TokenKind::ALL {
-            let Some(term) = cost_model.term(kind_of_token) else {
-                continue;
-            };
-            let class = crate::valuation::token_kind_to_class(kind_of_token);
-            let Some(card) = book.find_window_rate(&vendor, &priced_as, class, kind, generated_at)
-            else {
-                continue;
-            };
-            let Some(ratio) = credits_per_point_from_estimate(
-                term.coefficient().micros_per_million_tokens(),
-                card.draft.rate_micros,
-            ) else {
-                continue;
-            };
-            ratios.push(ratio);
-            rate_card_ids.push(card.id);
+        if let Some(estimate) =
+            estimate_window_constraint(&cost_model, &book, &vendor, &priced_as, kind, generated_at)?
+        {
+            result.insert(window.semantic_key().clone(), estimate);
         }
-        let (Some(lowest), Some(highest)) =
-            (ratios.iter().copied().min(), ratios.iter().copied().max())
-        else {
-            continue;
-        };
-        let uncertainty = crate::store::calibration::CoefficientUncertainty::new(
-            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(lowest),
-            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(highest),
-        )?;
-        rate_card_ids.sort_unstable();
-        rate_card_ids.dedup();
-        result.insert(
-            window.semantic_key().clone(),
-            crate::report::can_run::WindowEstimateLookup {
-                rate_card_ids,
-                // Current by construction, and the label is what keeps that
-                // honest: an estimate has no review horizon and no drift
-                // finding to evaluate, so the health machinery has nothing to
-                // say about it. What the operator must not miss is that the
-                // figure is an approximation, and that travels on the basis.
-                constraint: crate::advice::headroom::CalibratedWindowConstraint::current(
-                    uncertainty,
-                ),
-            },
-        );
     }
     Ok(result)
+}
+
+/// One window's estimate from the cards in force at `at`: `None` when no class
+/// the cost model prices has a card of this basis, an incomplete refusal when
+/// some do and some do not, and the constraint only when every one does.
+fn estimate_window_constraint(
+    cost_model: &crate::store::cost_model::CostModel,
+    book: &crate::valuation::RateBook,
+    vendor: &str,
+    priced_as: &str,
+    kind: crate::domain::rate_card::QuotaWindowKind,
+    at: UtcTimestamp,
+) -> Result<Option<crate::report::can_run::WindowEstimate>, Error> {
+    let mut ratios = Vec::new();
+    let mut rate_card_ids = Vec::new();
+    let mut missing = Vec::new();
+    for kind_of_token in crate::domain::tokens::TokenKind::ALL {
+        let Some(term) = cost_model.term(kind_of_token) else {
+            continue;
+        };
+        let class = crate::valuation::token_kind_to_class(kind_of_token);
+        let Some(card) = book.find_window_rate(vendor, priced_as, class, kind, at) else {
+            missing.push(format!(
+                "no percent-of-window rate card for {vendor}/{priced_as}/{}",
+                class.as_str()
+            ));
+            continue;
+        };
+        rate_card_ids.push(card.id);
+        match credits_per_point_from_estimate(
+            term.coefficient().micros_per_million_tokens(),
+            card.draft.rate_micros,
+        ) {
+            Some(ratio) => ratios.push(ratio),
+            None => missing.push(format!(
+                "percent-of-window rate card {} for {vendor}/{priced_as}/{} gives no \
+                 nonzero credits per percentage point",
+                card.id,
+                class.as_str()
+            )),
+        }
+    }
+    if rate_card_ids.is_empty() {
+        return Ok(None);
+    }
+    if !missing.is_empty() {
+        return Ok(Some(crate::report::can_run::WindowEstimate::Incomplete {
+            missing,
+        }));
+    }
+    let (Some(lowest), Some(highest)) =
+        (ratios.iter().copied().min(), ratios.iter().copied().max())
+    else {
+        return Ok(None);
+    };
+    let uncertainty = crate::store::calibration::CoefficientUncertainty::new(
+        crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(lowest),
+        crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(highest),
+    )?;
+    rate_card_ids.sort_unstable();
+    rate_card_ids.dedup();
+    Ok(Some(crate::report::can_run::WindowEstimate::Available(
+        crate::report::can_run::WindowEstimateLookup {
+            rate_card_ids,
+            // Current by construction, and the label is what keeps that
+            // honest: an estimate has no review horizon and no drift
+            // finding to evaluate, so the health machinery has nothing to
+            // say about it. What the operator must not miss is that the
+            // figure is an approximation, and that travels on the basis.
+            constraint: crate::advice::headroom::CalibratedWindowConstraint::current(uncertainty),
+        },
+    )))
 }
 
 /// Micro-credits per one `PercentagePoints` unit, from one class's cost-model
@@ -7347,8 +7382,10 @@ fn gather_window_estimates(
 /// One micro-point is one hundredth of a `PercentagePoints` unit, so the card's
 /// micro-points per million tokens divided by one hundred is its native units
 /// per million tokens, and the cost model's micro-credits over that is the
-/// ratio. `None` for a card whose rate is zero, which would make the ratio
-/// infinite rather than large.
+/// ratio, rounded half away from zero like every other division in the crate.
+/// `None` for a card whose rate is zero, which would make the ratio infinite
+/// rather than large, and for a ratio that rounds to zero, which would make the
+/// headroom infinite instead.
 fn credits_per_point_from_estimate(
     micro_credits_per_million_tokens: i64,
     card_micro_points_per_million_tokens: i64,
@@ -7358,7 +7395,8 @@ fn credits_per_point_from_estimate(
     }
     let numerator = i128::from(micro_credits_per_million_tokens) * 100;
     let denominator = i128::from(card_micro_points_per_million_tokens);
-    i64::try_from(numerator / denominator).ok()
+    let ratio = i64::try_from(crate::domain::credits::round_div(numerator, denominator)).ok()?;
+    (ratio != 0).then_some(ratio)
 }
 
 /// Maps the calibration-fitting subsystem's own
@@ -13939,5 +13977,139 @@ usage_evidence = "measured"
         assert_eq!(window.quota_used.as_ppm().get(), 16_000);
         assert_eq!(window.reported_resolution_ppm.as_ppm().get(), 1_000);
         assert_eq!(window.quantization, QuantizationSemantics::RoundedToNearest);
+    }
+
+    /// One percent-of-window card for the five-hour window, in force from
+    /// 2026-01-01 with no end.
+    fn window_card(
+        id: i64,
+        token_class: crate::domain::rate_card::TokenClass,
+        rate_micros: i64,
+    ) -> crate::domain::rate_card::RateCard {
+        use crate::domain::rate_card::{
+            BillingBasis, CardQuality, Publication, QuotaWindowKind, RateCard, RateCardDraft,
+            RateDenomination, RateUnit, ReviewDuePolicy, WindowEstimate,
+        };
+        RateCard {
+            id,
+            imported_at: UtcTimestamp::from_unix_nanos(0),
+            draft: RateCardDraft {
+                vendor: "anthropic".to_string(),
+                model: "claude-sonnet-4".to_string(),
+                token_class,
+                rate_micros,
+                denomination: RateDenomination::Points(RateUnit::PercentagePoints),
+                billing_basis: BillingBasis::PercentOfWindowPerMillionTokens,
+                window_estimate: Some(WindowEstimate {
+                    window: QuotaWindowKind::FiveHour,
+                    unit: RateUnit::PercentagePoints,
+                    quality: CardQuality::Estimate,
+                }),
+                effective_start: crate::domain::time::UtcDate::parse("2026-01-01").unwrap(),
+                effective_end: None,
+                schedule: None,
+                publication: Publication {
+                    source: Some("test".to_string()),
+                    published_at: None,
+                },
+                review_due: ReviewDuePolicy::None,
+            },
+        }
+    }
+
+    /// A card for each of the four classes the seeded cost model prices:
+    /// input 3.00, output 15.00, cache read 0.30 and cache write 3.75 credits
+    /// per million tokens. Each ratio is `credits_micros * 100 / card_micros`:
+    /// 3_000_000 * 100 / 1_000_000 = 300, 15_000_000 * 100 / 3_000_000 = 500,
+    /// 300_000 * 100 / 100_000 = 300, 3_750_000 * 100 / 1_250_000 = 300.
+    fn four_window_cards() -> Vec<crate::domain::rate_card::RateCard> {
+        use crate::domain::rate_card::TokenClass;
+        vec![
+            window_card(1, TokenClass::Input, 1_000_000),
+            window_card(2, TokenClass::Output, 3_000_000),
+            window_card(3, TokenClass::CacheRead, 100_000),
+            window_card(4, TokenClass::CacheWrite5m, 1_250_000),
+        ]
+    }
+
+    fn estimate_from(
+        cards: Vec<crate::domain::rate_card::RateCard>,
+    ) -> Option<crate::report::can_run::WindowEstimate> {
+        let at = UtcTimestamp::from_unix_nanos(1_787_616_000_000_000_000);
+        estimate_window_constraint(
+            &crate::store::cost_model::anthropic_claude_messages_v1(at),
+            &crate::valuation::RateBook::new(cards),
+            "anthropic",
+            "claude-sonnet-4",
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+            at,
+        )
+        .expect("the estimate composes")
+    }
+
+    #[test]
+    fn every_priced_class_carded_yields_the_ratio_range() {
+        let expected = crate::report::can_run::WindowEstimate::Available(
+            crate::report::can_run::WindowEstimateLookup {
+                rate_card_ids: vec![1, 2, 3, 4],
+                constraint: crate::advice::headroom::CalibratedWindowConstraint::current(
+                    crate::store::calibration::CoefficientUncertainty::new(
+                        crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(
+                            300,
+                        ),
+                        crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(
+                            500,
+                        ),
+                    )
+                    .unwrap(),
+                ),
+            },
+        );
+        assert_eq!(estimate_from(four_window_cards()), Some(expected));
+    }
+
+    /// The same fixture with the cache-write card removed: a range over the
+    /// other three classes would still be [300, 500], so only a refusal tells
+    /// the two apart.
+    #[test]
+    fn a_priced_class_without_a_card_refuses_naming_it() {
+        let mut cards = four_window_cards();
+        cards.retain(|card| card.id != 4);
+        assert_eq!(
+            estimate_from(cards),
+            Some(crate::report::can_run::WindowEstimate::Incomplete {
+                missing: vec![
+                    "no percent-of-window rate card for anthropic/claude-sonnet-4/cache_write_5m"
+                        .to_string()
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn no_card_of_this_basis_yields_nothing() {
+        assert_eq!(estimate_from(Vec::new()), None);
+    }
+
+    #[test]
+    fn credits_per_point_rounds_half_away_from_zero() {
+        // 300_000 * 100 / 700_000 = 42.857..., rounds to 43 (truncation gave 42).
+        assert_eq!(credits_per_point_from_estimate(300_000, 700_000), Some(43));
+        // 3 * 100 / 200 = 1.5 exactly, rounds away from zero to 2.
+        assert_eq!(credits_per_point_from_estimate(3, 200), Some(2));
+        // 3_000_000 * 100 / 1_000_000 = 300 exactly.
+        assert_eq!(
+            credits_per_point_from_estimate(3_000_000, 1_000_000),
+            Some(300)
+        );
+        // 1 * 100 / 200 = 0.5, rounds up to 1 rather than down to zero.
+        assert_eq!(credits_per_point_from_estimate(1, 200), Some(1));
+    }
+
+    #[test]
+    fn credits_per_point_refuses_a_zero_card_and_a_zero_ratio() {
+        assert_eq!(credits_per_point_from_estimate(3_000_000, 0), None);
+        // 1 * 100 / 300 = 0.333..., rounds to 0: an infinite headroom, refused.
+        assert_eq!(credits_per_point_from_estimate(1, 300), None);
     }
 }

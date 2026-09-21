@@ -70,6 +70,8 @@ CFG_EOF
 
     # 3,000 input and 2,400,000 output tokens in all. At 1.0 and 0.5 points
     # per million the estimate is 0.0030 + 1.2000 = 1.2030 points exactly.
+    # The two cache cards price no token here but complete the cost model's
+    # classes, without which can-run refuses the five-hour estimate.
     cat > "$STATE_DIR/transcripts/claude-code/session.jsonl" <<'JSONL'
 {"type":"assistant","timestamp":"2026-08-25T01:00:00.000Z","sessionId":"s1","message":{"id":"m1","model":"claude-sonnet-4","usage":{"input_tokens":1000,"output_tokens":500000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
 {"type":"assistant","timestamp":"2026-08-25T03:00:00.000Z","sessionId":"s2","message":{"id":"m2","model":"claude-sonnet-4","usage":{"input_tokens":1000,"output_tokens":800000,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}
@@ -96,6 +98,30 @@ token_class = "output"
 billing_basis = "percent_of_window_per_million_tokens"
 window = "five_hour"
 rate = "0.5"
+unit = "percentage_points"
+quality = "estimate"
+source = "e2e fixture approximation"
+effective_start = "2026-01-01"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4"
+token_class = "cache_read"
+billing_basis = "percent_of_window_per_million_tokens"
+window = "five_hour"
+rate = "0.1"
+unit = "percentage_points"
+quality = "estimate"
+source = "e2e fixture approximation"
+effective_start = "2026-01-01"
+
+[[card]]
+vendor = "anthropic"
+model = "claude-sonnet-4"
+token_class = "cache_write_5m"
+billing_basis = "percent_of_window_per_million_tokens"
+window = "five_hour"
+rate = "1.25"
 unit = "percentage_points"
 quality = "estimate"
 source = "e2e fixture approximation"
@@ -264,7 +290,7 @@ case_assertions() {
 
     # The cards and no calibration: both answer, labelled, and doctor says so.
     assert_exit 0 11
-    assert_stdout_contains 11 "added=2"
+    assert_stdout_contains 11 "added=4"
     assert_exit 0 12
     assert_row_detail_contains 12 "^│  work-primary " \
         "window equivalent [1.2030, 1.2030] percentage points (estimated) from rate cards 1, 2"
@@ -278,10 +304,10 @@ case_assertions() {
     assert_stdout_matches 14 "five_hour .*headroom .* credits \\(estimated\\)$"
     assert_stdout_matches 14 "seven_day .*headroom .* credits$"
     assert_exit 0 15
-    assert_stdout_contains 15 '"basis":{"kind":"rate_card_estimate","rate_card_ids":[1,2]},"evidence_quality":"estimated"'
+    assert_stdout_contains 15 '"basis":{"kind":"rate_card_estimate","rate_card_ids":[1,2,3,4]},"evidence_quality":"estimated"'
     assert_stdout_contains 16 "[INFO] window-estimate-in-use: window figures come from a rate-card estimate for: anthropic/five_hour"
     assert_exit 0 17
-    assert_stdout_contains 17 "added=0 unchanged=2"
+    assert_stdout_contains 17 "added=0 unchanged=4"
 
     # A current calibration beside the same cards: it answers, unlabelled.
     assert_exit 0 18
