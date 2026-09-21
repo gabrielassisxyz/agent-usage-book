@@ -22,11 +22,15 @@ use std::time::Duration;
 use agent_usage_book::domain::attempt::AttemptOutcome;
 use agent_usage_book::domain::failure::FailureClass;
 use agent_usage_book::domain::ids::AdapterVersion;
-use agent_usage_book::domain::time::{MonotonicDuration, RealClock};
-use agent_usage_book::meter::adapter::{CredentialHandle, MeterRequest};
+use agent_usage_book::domain::time::{
+    Clock, FakeClock, MonotonicDuration, MonotonicInstant, RealClock, UtcTimestamp,
+};
+use agent_usage_book::meter::adapter::{CredentialHandle, HttpTransport, MeterRequest};
 use agent_usage_book::meter::anthropic::AnthropicAdapter;
 use agent_usage_book::meter::sampler::{AccountDisposition, BatchAccount, SamplingOrchestrator};
-use agent_usage_book::meter::transport::BlockingTransport;
+use agent_usage_book::meter::transport::{
+    BlockingTransport, CommandBudget, HttpRequest, HttpResponse,
+};
 use agent_usage_book::store::account::account_id_by_identity;
 use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
 use agent_usage_book::store::ledger_generation;
@@ -388,11 +392,135 @@ fn limits_sample_reaches_the_ledger_and_projection() {
 
 // --- the hanging provider ------------------------------------------------------
 
+/// How long either side of the isolation rendezvous waits for the other.
+/// Generous on purpose: in the passing case the wait ends as soon as the
+/// other request arrives, so the cap is only ever spent when the accounts are
+/// serialized, and a starved machine gets minutes rather than milliseconds.
+const ISOLATION_RENDEZVOUS_CAP: Duration = Duration::from_secs(60);
+
+/// What the isolation rendezvous observed, read by the test after the batch.
+#[derive(Debug, Default)]
+struct IsolationRendezvousState {
+    hanging_in_flight: bool,
+    reachable_saw_hanging_in_flight: bool,
+    reachable_completed: bool,
+    hanging_released_by_reachable: bool,
+}
+
+/// Shared by the transport and the clock of the hanging-provider test. The
+/// command budget only starts counting once the reachable request is done, or
+/// once the hanging request gave up waiting for it, so a starved machine
+/// cannot spend the budget before the request under test is issued.
+struct IsolationRendezvous {
+    hanging_base: String,
+    reachable_base: String,
+    state: std::sync::Mutex<IsolationRendezvousState>,
+    changed: std::sync::Condvar,
+    budget_clock: std::sync::OnceLock<RealClock>,
+}
+
+impl IsolationRendezvous {
+    fn new(hanging_base: String, reachable_base: String) -> Self {
+        Self {
+            hanging_base,
+            reachable_base,
+            state: std::sync::Mutex::new(IsolationRendezvousState::default()),
+            changed: std::sync::Condvar::new(),
+            budget_clock: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn start_budget_clock(&self) {
+        self.budget_clock.get_or_init(RealClock::new);
+    }
+
+    /// The hanging request is held in flight until the reachable one has
+    /// completed, then sent to the stalled server. Under serialized workers
+    /// the reachable request never starts, and the hold ends at the cap.
+    fn hold_hanging_request(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.hanging_in_flight = true;
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, ISOLATION_RENDEZVOUS_CAP, |state| {
+                !state.reachable_completed
+            })
+            .unwrap();
+        state.hanging_released_by_reachable = state.reachable_completed;
+        drop(state);
+        self.start_budget_clock();
+    }
+
+    fn await_hanging_request(&self) {
+        let state = self.state.lock().unwrap();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, ISOLATION_RENDEZVOUS_CAP, |state| {
+                !state.hanging_in_flight
+            })
+            .unwrap();
+        state.reachable_saw_hanging_in_flight = state.hanging_in_flight;
+    }
+
+    fn finish_reachable_request(&self, succeeded: bool) {
+        self.start_budget_clock();
+        let mut state = self.state.lock().unwrap();
+        state.reachable_completed = succeeded;
+        self.changed.notify_all();
+    }
+}
+
+impl HttpTransport for IsolationRendezvous {
+    fn send(
+        &self,
+        request: &HttpRequest,
+        budget: &CommandBudget,
+        clock: &impl Clock,
+    ) -> Result<HttpResponse, FailureClass> {
+        if request.url.starts_with(&self.hanging_base) {
+            self.hold_hanging_request();
+            return BlockingTransport.send(request, budget, clock);
+        }
+        if request.url.starts_with(&self.reachable_base) {
+            self.await_hanging_request();
+            let response = BlockingTransport.send(request, budget, clock);
+            self.finish_reachable_request(response.is_ok());
+            return response;
+        }
+        panic!(
+            "the isolation test sends to two servers only: {}",
+            request.url
+        );
+    }
+}
+
+/// Frozen at the zero instant until the rendezvous starts the budget clock,
+/// real time from then on. The wall clock is always real.
+impl Clock for IsolationRendezvous {
+    fn now(&self) -> UtcTimestamp {
+        RealClock::new().now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        match self.budget_clock.get() {
+            Some(clock) => clock.monotonic_now(),
+            None => FakeClock::new(UtcTimestamp::from_unix_nanos(0)).monotonic_now(),
+        }
+    }
+}
+
 /// One provider hanging until the budget expires does not prevent another
 /// account's successful observation from committing: the hanging account's
 /// request is clipped by the command budget, its attempt records the
 /// expiry, and the reachable account's observation is committed with its
 /// windows regardless.
+///
+/// Isolation is asserted as an ordering, not as a race against the budget:
+/// the reachable request must reach its server and complete while the
+/// hanging one is in flight. A wall-clock budget alone cannot tell a blocked
+/// account from a machine too starved to finish either request in time, which
+/// is how this test once failed at load averages above 40.
 #[test]
 fn a_provider_hanging_until_the_budget_expires_does_not_block_another_accounts_observation() {
     let (_scratch, repository) = fixture_repository("hang");
@@ -407,13 +535,41 @@ fn a_provider_hanging_until_the_budget_expires_does_not_block_another_accounts_o
         batch_account("hanging", format!("{}/usage", stalled.url())),
         batch_account("reachable", format!("{}/usage", reachable.url())),
     ];
+    let rendezvous = IsolationRendezvous::new(stalled.url(), reachable.url());
 
     // Same eight second budget as the mixed-outcome test above, and for the
     // same reason: comfortable headroom below the adapter's ten second read
-    // timeout, while giving stage 1 and 2's own writes room to vary.
-    let report = orchestrator(&repository, MonotonicDuration::from_seconds(8), 2)
-        .run(&accounts)
-        .expect("the batch must run");
+    // timeout, so the hanging request is ended by the budget and not by it.
+    let report = SamplingOrchestrator {
+        repository: &repository,
+        transport: &rendezvous,
+        clock: &rendezvous,
+        trigger: Trigger::Manual,
+        configuration_fingerprint: "integration-fixture".to_string(),
+        holder: LeaseHolder::new("integration-test"),
+        lease_ttl: MonotonicDuration::from_seconds(60),
+        command_budget: MonotonicDuration::from_seconds(8),
+        max_concurrent_requests: 2,
+    }
+    .run(&accounts)
+    .expect("the batch must run");
+
+    let observed = rendezvous.state.lock().unwrap();
+    assert!(
+        observed.reachable_saw_hanging_in_flight,
+        "the reachable request must be issued while the hanging one is in flight: {observed:?}"
+    );
+    assert!(
+        observed.hanging_released_by_reachable,
+        "the reachable request must complete before the hanging one stops waiting: {observed:?}"
+    );
+    drop(observed);
+    assert_eq!(
+        reachable.request_count(),
+        1,
+        "the reachable server was reached"
+    );
+    assert_eq!(stalled.request_count(), 1, "the stalled server was reached");
 
     let hanging_report = &report.accounts[0];
     let reachable_report = &report.accounts[1];
