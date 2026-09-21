@@ -15,9 +15,21 @@
 //! the ordinary transcript strings. `tool_calls` uses Python-compatible JSON
 //! separator widths (comma-space and colon-space), so the port stays comparable
 //! to the estimator it replaces. Integer division rounds down, as the original
-//! did. The fixed floor is the larger measured prompt/tool-definition floor
-//! because the transcript contains no model identity with which to choose a
-//! smaller one.
+//! did. Both constants come from the 2026-08-14 measurement recorded for the
+//! predecessor estimator, rather than from a provider claim. Four characters
+//! per token is that estimator's approximation. The fixed floor covers the
+//! prompt material absent from the transcript: the project instructions, system
+//! prompt, and tool definitions resent on every call. The measurement found
+//! 34,492 tokens for the Anthropic-backed path and 27,525 for gpt-oss. Because
+//! the transcript stores no model identity, version 1 uses the larger value for
+//! every call instead of silently selecting the smaller floor.
+//!
+//! Input grows quadratically across a conversation by design: each turn pays
+//! the fixed floor plus all prior transcript characters because the whole
+//! history is resent. A `PLANNER_RESPONSE` is the model turn because sampled
+//! transcripts carried `thinking` on exactly those steps; other step types are
+//! material a later model turn reads. These observations and constants define
+//! version 1, so changing any of them requires a new estimator version.
 //!
 //! The known error has no defensible event-level bound: output is understated,
 //! compaction is invisible and can overstate input, and the source exposes no
