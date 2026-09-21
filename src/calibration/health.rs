@@ -35,7 +35,7 @@
 use std::fmt;
 
 use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
-use crate::domain::time::UtcTimestamp;
+use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::store::calibration::PlanTier;
 
 /// The health of one calibration. Six states, ordered here from least to most
@@ -162,21 +162,53 @@ pub fn compute_health(inputs: &HealthInputs<'_>, now: UtcTimestamp) -> Calibrati
     if !applies(inputs.calibration, inputs.context) {
         return CalibrationHealth::Inapplicable;
     }
-    if inputs.lifecycle == LifecycleState::Superseded || inputs.cost_model_superseded {
+    if inputs.cost_model_superseded {
         return CalibrationHealth::Superseded;
     }
-    if inputs.lifecycle == LifecycleState::NeverActivated {
+    compute_per_kind_health(inputs.lifecycle, inputs.drift, inputs.review_due_at, now)
+}
+
+/// The health of a per-kind (multivariate) calibration, with the same
+/// precedence as [`compute_health`] over the conditions that can reach one.
+///
+/// A per-kind result records no meter or billing semantics and references no
+/// cost model, so neither the applicability check nor cost-model supersession
+/// has anything to compare; its lifecycle, drift and review horizon are judged
+/// exactly as a scalar calibration's are. `compute_health` delegates here once
+/// its two scalar-only checks pass, so the two shapes cannot drift apart.
+pub fn compute_per_kind_health(
+    lifecycle: LifecycleState,
+    drift: Option<&SignificantDrift>,
+    review_due_at: Option<UtcTimestamp>,
+    now: UtcTimestamp,
+) -> CalibrationHealth {
+    if lifecycle == LifecycleState::Superseded {
+        return CalibrationHealth::Superseded;
+    }
+    if lifecycle == LifecycleState::NeverActivated {
         return CalibrationHealth::Provisional;
     }
-    if inputs.drift.is_some() {
+    if drift.is_some() {
         return CalibrationHealth::Suspect;
     }
-    if let Some(due) = inputs.review_due_at
+    if let Some(due) = review_due_at
         && now.unix_nanos() >= due.unix_nanos()
     {
         return CalibrationHealth::ReviewDue;
     }
     CalibrationHealth::Current
+}
+
+/// The instant a calibration fitted at `fit_timestamp` becomes due for review:
+/// the fit time plus the resolved `calibration.review_after` (`aub-6omr`,
+/// PLAN.md 23.9). One definition for the scalar and the per-kind shape.
+/// Saturates rather than wraps on a horizon no clock will reach.
+pub fn review_instant(
+    fit_timestamp: UtcTimestamp,
+    review_after: MonotonicDuration,
+) -> UtcTimestamp {
+    let horizon_nanos = i64::try_from(review_after.as_nanos()).unwrap_or(i64::MAX);
+    UtcTimestamp::from_unix_nanos(fit_timestamp.unix_nanos().saturating_add(horizon_nanos))
 }
 
 /// Whether the calibration's fitted scope still matches the environment. A
@@ -450,6 +482,68 @@ mod tests {
         assert_eq!(
             compute_health(&suspect_and_review_due, now_ts()),
             CalibrationHealth::Suspect
+        );
+    }
+
+    /// A per-kind calibration turns `review_due` at its review instant and not
+    /// one nanosecond before; the planted negative is the nanosecond before,
+    /// which a per-kind path hard-coded to `current` (review finding D5) or
+    /// one that compared with `>` gets wrong on one side.
+    #[test]
+    fn per_kind_health_turns_review_due_at_the_review_instant() {
+        let due = review_instant(now_ts(), MonotonicDuration::from_seconds(1));
+        let at = |offset: i64| {
+            compute_per_kind_health(
+                LifecycleState::Active,
+                None,
+                Some(due),
+                UtcTimestamp::from_unix_nanos(due.unix_nanos() + offset),
+            )
+        };
+        assert_eq!(at(-1), CalibrationHealth::Current);
+        assert_eq!(at(0), CalibrationHealth::ReviewDue);
+        assert_eq!(at(1), CalibrationHealth::ReviewDue);
+    }
+
+    #[test]
+    fn per_kind_health_keeps_the_scalar_precedence() {
+        let drift = SignificantDrift {
+            finding_id: "d".into(),
+        };
+        let due = Some(UtcTimestamp::from_unix_nanos(0));
+        assert_eq!(
+            compute_per_kind_health(LifecycleState::Superseded, Some(&drift), due, now_ts()),
+            CalibrationHealth::Superseded
+        );
+        assert_eq!(
+            compute_per_kind_health(LifecycleState::NeverActivated, Some(&drift), due, now_ts()),
+            CalibrationHealth::Provisional
+        );
+        assert_eq!(
+            compute_per_kind_health(LifecycleState::Active, Some(&drift), due, now_ts()),
+            CalibrationHealth::Suspect
+        );
+        assert_eq!(
+            compute_per_kind_health(LifecycleState::Active, None, None, now_ts()),
+            CalibrationHealth::Current
+        );
+    }
+
+    #[test]
+    fn the_review_instant_is_the_fit_time_plus_the_horizon_and_saturates() {
+        assert_eq!(
+            review_instant(
+                UtcTimestamp::from_unix_nanos(5),
+                MonotonicDuration::from_seconds(2)
+            ),
+            UtcTimestamp::from_unix_nanos(2_000_000_005)
+        );
+        assert_eq!(
+            review_instant(
+                UtcTimestamp::from_unix_nanos(i64::MAX - 1),
+                MonotonicDuration::from_seconds(2)
+            ),
+            UtcTimestamp::from_unix_nanos(i64::MAX)
         );
     }
 

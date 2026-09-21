@@ -3408,6 +3408,7 @@ mod tests {
                 observed_age: Some(MonotonicDuration::from_seconds(41)),
             },
             window_calibrations: calibrations,
+            per_kind_not_current: BTreeMap::new(),
             window_estimates: BTreeMap::new(),
             cost_model_missing_token_classes: Vec::new(),
             plan_tier_mismatch: None,

@@ -15,7 +15,7 @@ use crate::calibration::health::{
 };
 use crate::domain::credits::Credits;
 use crate::domain::provenance::{CostModelId, EvidenceId};
-use crate::domain::time::UtcTimestamp;
+use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, UsageVector,
 };
@@ -35,8 +35,9 @@ use crate::store::meter_evidence::ObservationRowId;
 /// Loads observation evidence, usage events, and active calibration from SQLite
 /// and performs candidate reconciliation for one interval (aub-dpn.1).
 ///
-/// Takes eight arguments because connection, account, boundary observations, window,
-/// cost model, knowledge time, and effective time represent independent query boundaries.
+/// Takes nine arguments because connection, account, boundary observations, window,
+/// cost model, knowledge time, effective time and the review horizon represent
+/// independent query boundaries.
 #[allow(clippy::too_many_arguments)]
 pub fn reconcile_candidate_from_store(
     conn: &Connection,
@@ -47,6 +48,7 @@ pub fn reconcile_candidate_from_store(
     _cost_model_id: &CostModelId,
     knowledge_time: UtcTimestamp,
     effective_time: UtcTimestamp,
+    review_after: MonotonicDuration,
 ) -> Result<ReconciliationOutcome, Error> {
     let start_obs = crate::store::meter_evidence::observation_by_row_id(conn, start_obs_id)?
         .ok_or_else(|| {
@@ -156,7 +158,10 @@ pub fn reconcile_candidate_from_store(
             lifecycle: LifecycleState::Active,
             cost_model_superseded: false,
             drift: None,
-            review_due_at: None,
+            // The eligibility condition asks for a current calibration, and a
+            // calibration past its review is not one here any more than in
+            // spend or can-run (`aub-ov2f`).
+            review_due_at: Some(crate::store::calibration::review_due_at(cal, review_after)),
         };
         Some(crate::calibration::health::compute_health(
             &health_inputs,
@@ -423,6 +428,7 @@ pub fn load_rolling_residual_from_store(
                     &CostModelId::new("default"),
                     timestamp,
                     timestamp,
+                    config.calibration.review_after,
                 )?;
                 if let ReconciliationOutcome::Computed(res) = outcome {
                     eligible_intervals.push(*res);

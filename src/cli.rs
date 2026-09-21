@@ -2795,14 +2795,26 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             report.ingest.unreadable_files.len()
         )))
     } else if let Some(health) = health_refusal {
-        Err(Error::InsufficientEvidence(format!(
-            "window equivalent refused: the stored calibration for window {} is {}, not current",
+        Err(spend_not_current_calibration_error(
             options.window_equivalent.as_deref().unwrap_or_default(),
-            health.label()
-        )))
+            health,
+        ))
     } else {
         Ok(())
     }
+}
+
+/// The one exit class for a window equivalent withheld because the stored
+/// calibration is not current, whatever made it so: a passed review, a
+/// superseded cost model, a per-kind result past review (`aub-ov2f`).
+fn spend_not_current_calibration_error(
+    window_key: &str,
+    health: crate::calibration::health::CalibrationHealth,
+) -> Error {
+    Error::InsufficientEvidence(format!(
+        "window equivalent refused: the stored calibration for window {window_key} is {}, not current",
+        health.label()
+    ))
 }
 
 /// Resolves the current calibration for each spend stratum. The lookup happens
@@ -2843,6 +2855,22 @@ impl SpendWindowResolver<'_> {
         calibration: &crate::store::calibration::WindowCalibration,
     ) -> crate::calibration::health::CalibrationHealth {
         stored_window_calibration_health(calibration, self.review_after, self.timestamp)
+    }
+
+    /// The refusal for a stored calibration that is not current, recorded so
+    /// the command exits in the not-current class once the report is out.
+    fn refuse_for_health(
+        &self,
+        provider: &str,
+        health: crate::calibration::health::CalibrationHealth,
+    ) -> crate::report::WindowEquivalentDerivation {
+        self.health_refusal.set(Some(health));
+        window_refusal([crate::evidence::RequiredFact::new(format!(
+            "current calibration for provider {} and window {}: calibration health is {}",
+            provider,
+            self.window_key,
+            health.label()
+        ))])
     }
 
     /// The labelled fallback: window movement read straight off the
@@ -3019,6 +3047,24 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         let calibration =
             match crate::store::calibration::load_active_at(self.conn, &scope, self.timestamp)? {
                 None => None,
+                Some(crate::store::calibration::ActiveCalibration::PerKind(per_kind)) => {
+                    // A per-kind calibration past its review refuses by its
+                    // health, as a scalar one does, before the per-kind
+                    // refusal could make it read as a shape problem alone.
+                    let health = stored_per_kind_calibration_health(
+                        &per_kind,
+                        self.review_after,
+                        self.timestamp,
+                    );
+                    if health != crate::calibration::health::CalibrationHealth::Current {
+                        return Ok(self.refuse_for_health(provider, health));
+                    }
+                    let active = crate::store::calibration::ActiveCalibration::PerKind(per_kind);
+                    match crate::calibration::conversion::require_scalar_calibration(active) {
+                        Ok(calibration) => Some(calibration),
+                        Err(refusal) => return Ok(*refusal),
+                    }
+                }
                 Some(active) => {
                     match crate::calibration::conversion::require_scalar_calibration(active) {
                         Ok(calibration) => Some(calibration),
@@ -3038,15 +3084,7 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         let calibration = match (spend_window_precedence(health), calibration) {
             (SpendWindowPrecedence::Calibrated, Some(calibration)) => calibration,
             (SpendWindowPrecedence::RefuseHealth(health), _) => {
-                self.health_refusal.set(Some(health));
-                return Ok(window_refusal([crate::evidence::RequiredFact::new(
-                    format!(
-                        "current calibration for provider {} and window {}: calibration health is {}",
-                        provider,
-                        self.window_key,
-                        health.label()
-                    ),
-                )]));
+                return Ok(self.refuse_for_health(provider, health));
             }
             (SpendWindowPrecedence::Estimate | SpendWindowPrecedence::Calibrated, _) => {
                 return Ok(self.estimate(provider, priced_model, usage));
@@ -3096,6 +3134,12 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
             )),
         };
         let health = crate::calibration::health::compute_health(&health_inputs, self.timestamp);
+        // A superseded cost model makes the calibration not current exactly as
+        // a passed review does, so it exits in the same class (`aub-ov2f`).
+        // `convert` still names the health among its refusal facts.
+        if health != crate::calibration::health::CalibrationHealth::Current {
+            self.health_refusal.set(Some(health));
+        }
         Ok(crate::calibration::conversion::convert(
             credits,
             &calibration,
@@ -7127,6 +7171,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let GatheredWindowCalibrations {
         scalar: window_calibrations,
         per_kind: per_kind_windows,
+        per_kind_not_current,
         not_current: not_current_calibrations,
     } = match &meter {
         crate::report::can_run::CanRunMeterReadiness::Fresh { windows, .. } => {
@@ -7145,6 +7190,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             GatheredWindowCalibrations {
                 scalar: std::collections::BTreeMap::new(),
                 per_kind: std::collections::BTreeSet::new(),
+                per_kind_not_current: std::collections::BTreeMap::new(),
                 not_current: std::collections::BTreeMap::new(),
             }
         }
@@ -7192,6 +7238,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         model,
         meter,
         window_calibrations,
+        per_kind_not_current,
         window_estimates,
         cost_model_missing_token_classes,
         // A plan-tier mismatch is realized through the calibration-health
@@ -7249,14 +7296,30 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         report.outcome,
         crate::report::can_run::CanRunOutcome::Refused(_)
     );
-    match not_current_calibrations.iter().next() {
-        Some((window, health)) if refused => Err(Error::InsufficientEvidence(format!(
-            "can-run refused: the stored calibration for window {} is {}, not current",
-            window.as_str(),
-            health.label()
-        ))),
-        _ => Ok(()),
+    can_run_not_current_calibration_exit(refused, &not_current_calibrations)
+}
+
+/// The exit of a can-run whose report is out: the not-current class when the
+/// report refused and any constraining window's stored calibration, scalar or
+/// per-kind, is not current, naming every such window rather than the first.
+fn can_run_not_current_calibration_exit(
+    refused: bool,
+    not_current: &std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::calibration::health::CalibrationHealth,
+    >,
+) -> Result<(), Error> {
+    if !refused || not_current.is_empty() {
+        return Ok(());
     }
+    let windows = not_current
+        .iter()
+        .map(|(window, health)| format!("window {}: {}", window.as_str(), health.label()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Error::InsufficientEvidence(format!(
+        "can-run refused: a stored calibration is not current ({windows})"
+    )))
 }
 
 /// Converts every provider-reported window constraining `model` into a
@@ -7277,6 +7340,7 @@ fn gather_window_calibrations(
     let mut result = std::collections::BTreeMap::new();
     let mut per_kind = std::collections::BTreeSet::new();
     let mut not_current = std::collections::BTreeMap::new();
+    let mut per_kind_not_current = std::collections::BTreeMap::new();
     for window in windows.iter().filter(|w| w.constrains(model)) {
         let scope = crate::store::calibration::CalibrationScope {
             provider: crate::store::cost_model::ProviderKey::new(provider),
@@ -7289,8 +7353,20 @@ fn gather_window_calibrations(
         // exists, does not stand in for it either.
         let cal = match crate::store::calibration::load_active_at(conn, &scope, generated_at)? {
             None => continue,
-            Some(crate::store::calibration::ActiveCalibration::PerKind(_)) => {
+            Some(crate::store::calibration::ActiveCalibration::PerKind(per_kind_cal)) => {
                 per_kind.insert(window.semantic_key().clone());
+                let health =
+                    stored_per_kind_calibration_health(&per_kind_cal, review_after, generated_at);
+                if health != crate::calibration::health::CalibrationHealth::Current {
+                    not_current.insert(window.semantic_key().clone(), health);
+                    per_kind_not_current.insert(
+                        window.semantic_key().clone(),
+                        crate::report::can_run::PerKindCalibrationNotCurrent {
+                            calibration_id: per_kind_cal.id.as_str().to_string(),
+                            health: map_calibration_health(health),
+                        },
+                    );
+                }
                 continue;
             }
             Some(crate::store::calibration::ActiveCalibration::Scalar(cal)) => cal,
@@ -7314,6 +7390,7 @@ fn gather_window_calibrations(
     Ok(GatheredWindowCalibrations {
         scalar: result,
         per_kind,
+        per_kind_not_current,
         not_current,
     })
 }
@@ -7360,15 +7437,41 @@ fn stored_window_calibration_health(
     )
 }
 
+/// The health of one active per-kind calibration, as `spend
+/// --window-equivalent` and `can-run` read it: active by construction, since
+/// `load_active_at` returned it, and due for review at its fit time plus the
+/// configured `calibration.review_after` (`aub-ov2f`).
+fn stored_per_kind_calibration_health(
+    calibration: &crate::store::calibration_multivariate_result::MultivariateCalibration,
+    review_after: MonotonicDuration,
+    now: UtcTimestamp,
+) -> crate::calibration::health::CalibrationHealth {
+    crate::calibration::health::compute_per_kind_health(
+        crate::calibration::health::LifecycleState::Active,
+        // No drift finding is stored anywhere yet; aub-7j5u decides it.
+        None,
+        Some(crate::calibration::health::review_instant(
+            calibration.fit_timestamp,
+            review_after,
+        )),
+        now,
+    )
+}
+
 /// What [`gather_window_calibrations`] found: the scalar lookups can-run
-/// bounds headroom with, the windows whose active calibration is per-kind, and
-/// the health of every stored calibration that is not current.
+/// bounds headroom with, the windows whose active calibration is per-kind, the
+/// per-kind ones among them that are not current, and the health of every
+/// stored calibration that is not current.
 struct GatheredWindowCalibrations {
     scalar: std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
         crate::report::can_run::WindowCalibrationLookup,
     >,
     per_kind: std::collections::BTreeSet<crate::domain::window::WindowSemanticKey>,
+    per_kind_not_current: std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::report::can_run::PerKindCalibrationNotCurrent,
+    >,
     not_current: std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
         crate::calibration::health::CalibrationHealth,
@@ -8879,15 +8982,17 @@ fn calibrate_lifecycle_state(
     Ok(LifecycleState::Active)
 }
 
-/// The health label of one calibration, for `show` and `history`. The
-/// applicability context mirrors the calibration's own scope, drift has no
-/// recorded finding to consult yet and no review horizon is configured, which
-/// is the same simplification `can-run` documents where it builds the same
-/// inputs: a genuine plan-tier or semantics mismatch still surfaces through
-/// the scope lookup returning nothing for an unfitted tier.
+/// The health label of one calibration, for `show`, `history` and `compare`.
+/// The applicability context mirrors the calibration's own scope and drift has
+/// no recorded finding to consult yet, the same simplification `can-run`
+/// documents where it builds the same inputs: a genuine plan-tier or semantics
+/// mismatch still surfaces through the scope lookup returning nothing for an
+/// unfitted tier. The review instant is the one spend and can-run judge by
+/// (`aub-ov2f`), so no surface labels `current` what another refuses.
 fn calibrate_health_label(
     conn: &rusqlite::Connection,
     calibration: &crate::store::calibration::WindowCalibration,
+    review_after: MonotonicDuration,
     now: UtcTimestamp,
 ) -> Result<String, Error> {
     use crate::calibration::health::{
@@ -8912,7 +9017,10 @@ fn calibrate_health_label(
             calibration.cost_model_id(),
         )?,
         drift: None,
-        review_due_at: None,
+        review_due_at: Some(crate::store::calibration::review_due_at(
+            calibration,
+            review_after,
+        )),
     };
     Ok(compute_health(&inputs, now).label().to_string())
 }
@@ -8950,6 +9058,7 @@ fn calibrate_cost_model_coverage(
 fn calibrate_show_entry_for(
     conn: &rusqlite::Connection,
     calibration: &crate::store::calibration::WindowCalibration,
+    review_after: MonotonicDuration,
     now: UtcTimestamp,
     is_active: bool,
 ) -> Result<CalibrateShowEntry, Error> {
@@ -8987,7 +9096,7 @@ fn calibrate_show_entry_for(
         activation_policy_version: calibration.activation_policy_version().to_string(),
         aub_version: calibration.aub_version().to_string(),
         source_revision: calibration.source_revision().to_string(),
-        health_label: calibrate_health_label(conn, calibration, now)?,
+        health_label: calibrate_health_label(conn, calibration, review_after, now)?,
         is_active,
     })
 }
@@ -8996,6 +9105,7 @@ fn calibrate_show_entry_for(
 /// one entry per scope, ordered by calibration id.
 pub(crate) fn assemble_calibrate_show(
     conn: &rusqlite::Connection,
+    review_after: MonotonicDuration,
     now: UtcTimestamp,
 ) -> Result<CalibrateShowReport, Error> {
     let mut entries = Vec::new();
@@ -9004,10 +9114,21 @@ pub(crate) fn assemble_calibrate_show(
         match crate::store::calibration::load_active_at(conn, &scope, now)? {
             None => {}
             Some(crate::store::calibration::ActiveCalibration::Scalar(calibration)) => {
-                entries.push(calibrate_show_entry_for(conn, &calibration, now, true)?);
+                entries.push(calibrate_show_entry_for(
+                    conn,
+                    &calibration,
+                    review_after,
+                    now,
+                    true,
+                )?);
             }
             Some(crate::store::calibration::ActiveCalibration::PerKind(calibration)) => {
-                per_kind_entries.push(calibrate_per_kind_entry(conn, &calibration)?);
+                per_kind_entries.push(calibrate_per_kind_entry(
+                    conn,
+                    &calibration,
+                    review_after,
+                    now,
+                )?);
             }
         }
     }
@@ -9021,15 +9142,31 @@ pub(crate) fn assemble_calibrate_show(
     })
 }
 
+/// The resolved `calibration.review_after`, for the calibrate reports that
+/// label health and otherwise read no configuration.
+fn resolved_calibration_review_after() -> Result<MonotonicDuration, Error> {
+    let env = crate::config::RealEnv;
+    let file_path = resolve_config_file_path(None, &env);
+    let file_contents = std::fs::read_to_string(&file_path).ok();
+    let (config, _provenance) = crate::config::resolve(
+        &crate::config::Overrides::new(),
+        &env,
+        file_contents.as_deref(),
+        &file_path,
+    )?;
+    Ok(config.calibration.review_after)
+}
+
 fn calibrate_show_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     if let Some(extra) = invocation.rest.get(1) {
         return Err(Error::Usage(format!(
             "unknown argument: {extra}; run aub calibrate show with no arguments"
         )));
     }
+    let review_after = resolved_calibration_review_after()?;
     let conn = open_ledger(clock)?;
     let now = clock.now();
-    let report = assemble_calibrate_show(&conn, now)?;
+    let report = assemble_calibrate_show(&conn, review_after, now)?;
     match invocation.format {
         OutputFormat::Text => println!("{}", render_calibrate_show_report(&report)),
         OutputFormat::Json => println!("{}", calibrate_show_json(&report, RunId::new(now))),
@@ -9042,6 +9179,7 @@ fn calibrate_show_command(clock: &impl Clock, invocation: &Invocation) -> Result
 /// order.
 pub(crate) fn assemble_calibrate_history(
     conn: &rusqlite::Connection,
+    review_after: MonotonicDuration,
     now: UtcTimestamp,
 ) -> Result<CalibrateHistoryReport, Error> {
     let mut entries = Vec::new();
@@ -9060,14 +9198,14 @@ pub(crate) fn assemble_calibrate_history(
             uncertainty_low_micros_per_point: calibration.uncertainty().lower().micros_per_point(),
             uncertainty_high_micros_per_point: calibration.uncertainty().upper().micros_per_point(),
             fit_timestamp_nanos: calibration.fit_timestamp().unix_nanos(),
-            health_label: calibrate_health_label(conn, &calibration, now)?,
+            health_label: calibrate_health_label(conn, &calibration, review_after, now)?,
             events,
         });
     }
     let per_kind_entries =
         crate::store::calibration_multivariate_result::list_all_multivariate_results(conn)?
             .iter()
-            .map(|result| calibrate_per_kind_entry(conn, result))
+            .map(|result| calibrate_per_kind_entry(conn, result, review_after, now))
             .collect::<Result<Vec<_>, Error>>()?;
     Ok(CalibrateHistoryReport {
         metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
@@ -9082,9 +9220,10 @@ fn calibrate_history_command(clock: &impl Clock, invocation: &Invocation) -> Res
             "unknown argument: {extra}; run aub calibrate history with no arguments"
         )));
     }
+    let review_after = resolved_calibration_review_after()?;
     let conn = open_ledger(clock)?;
     let now = clock.now();
-    let report = assemble_calibrate_history(&conn, now)?;
+    let report = assemble_calibrate_history(&conn, review_after, now)?;
     match invocation.format {
         OutputFormat::Text => println!("{}", render_calibrate_history_report(&report)),
         OutputFormat::Json => println!("{}", calibrate_history_json(&report, RunId::new(now))),
@@ -9153,16 +9292,18 @@ fn calibrate_per_kind_result_view(
 }
 
 /// One per-kind calibration with its lifecycle events and health. Its health
-/// is decided by its lifecycle alone: applicability is judged against the
-/// calibration's own scope here exactly as `calibrate_health_label` does for a
-/// scalar one, no drift finding or review horizon is consulted for either, and
-/// a per-kind result references no cost model whose supersession could
-/// retire it.
+/// is decided by its lifecycle and its review instant: applicability is judged
+/// against the calibration's own scope here exactly as `calibrate_health_label`
+/// does for a scalar one, no drift finding is consulted for either, and a
+/// per-kind result references no cost model whose supersession could retire
+/// it.
 fn calibrate_per_kind_entry(
     conn: &rusqlite::Connection,
     result: &crate::store::calibration_multivariate_result::MultivariateCalibration,
+    review_after: MonotonicDuration,
+    now: UtcTimestamp,
 ) -> Result<crate::report::CalibratePerKindEntry, Error> {
-    use crate::calibration::health::{CalibrationHealth, LifecycleState};
+    use crate::calibration::health::LifecycleState;
     let events: Vec<CalibrateLifecycleEventView> =
         crate::store::calibration_multivariate_result::multivariate_activation_events_for(
             conn, &result.id,
@@ -9179,11 +9320,15 @@ fn calibrate_per_kind_entry(
     } else {
         LifecycleState::Active
     };
-    let health = match state {
-        LifecycleState::NeverActivated => CalibrationHealth::Provisional,
-        LifecycleState::Superseded => CalibrationHealth::Superseded,
-        LifecycleState::Active => CalibrationHealth::Current,
-    };
+    let health = crate::calibration::health::compute_per_kind_health(
+        state,
+        None,
+        Some(crate::calibration::health::review_instant(
+            result.fit_timestamp,
+            review_after,
+        )),
+        now,
+    );
     Ok(crate::report::CalibratePerKindEntry {
         result: calibrate_per_kind_result_view(result),
         health_label: health.label().to_string(),
@@ -9225,6 +9370,7 @@ pub(crate) fn assemble_calibrate_compare(
     conn: &rusqlite::Connection,
     candidate_id: &str,
     active_id: &str,
+    review_after: MonotonicDuration,
     now: UtcTimestamp,
 ) -> Result<CalibrateCompareReport, Error> {
     let candidate = calibrate_load_result(conn, candidate_id)?;
@@ -9255,7 +9401,7 @@ pub(crate) fn assemble_calibrate_compare(
         active_fit_residual_micros: active.fit_residual().micros(),
         active_uncertainty_low_micros_per_point: active.uncertainty().lower().micros_per_point(),
         active_uncertainty_high_micros_per_point: active.uncertainty().upper().micros_per_point(),
-        candidate_health_label: calibrate_health_label(conn, &candidate, now)?,
+        candidate_health_label: calibrate_health_label(conn, &candidate, review_after, now)?,
         candidate_is_active,
     })
 }
@@ -9273,9 +9419,10 @@ fn calibrate_compare_command(clock: &impl Clock, invocation: &Invocation) -> Res
     if let Some(extra) = invocation.rest.get(3) {
         return Err(Error::Usage(format!("unknown argument: {extra}; {usage}")));
     }
+    let review_after = resolved_calibration_review_after()?;
     let conn = open_ledger(clock)?;
     let now = clock.now();
-    let report = assemble_calibrate_compare(&conn, candidate, active, now)?;
+    let report = assemble_calibrate_compare(&conn, candidate, active, review_after, now)?;
     match invocation.format {
         OutputFormat::Text => println!("{}", render_calibrate_compare_report(&report)),
         OutputFormat::Json => println!("{}", calibrate_compare_json(&report, RunId::new(now))),
@@ -13573,6 +13720,443 @@ usage_evidence = "measured"
         assert_eq!(health_at(ONE_SECOND_NANOS), CalibrationHealth::ReviewDue);
     }
 
+    /// Stores and activates, through the real gate, a scalar calibration for
+    /// `anthropic/default/five_hour` fitted at `fit_nanos` against
+    /// `cost_model_id` and `billing`.
+    fn seed_active_default_five_hour_calibration(
+        conn: &mut rusqlite::Connection,
+        fit_nanos: i64,
+        cost_model_id: &str,
+        billing: &crate::domain::ids::BillingSemanticsId,
+    ) {
+        use crate::calibration::activation::{
+            ActivationActor, ActivationPolicy, ActivationRequest,
+        };
+        let scope = crate::store::calibration::CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new("anthropic"),
+            plan_tier: crate::store::calibration::PlanTier::new("default"),
+            window_semantic_key: crate::domain::window::WindowSemanticKey::new("five_hour"),
+        };
+        let meter = crate::domain::ids::MeterSemanticsId::new("fixture-meter-v1");
+        let validity = crate::store::cost_model::ValidityInterval::new(
+            crate::domain::time::UtcTimestamp::from_unix_nanos(0),
+            crate::domain::time::UtcTimestamp::from_unix_nanos(i64::MAX),
+        )
+        .expect("the validity interval is ordered");
+        let fit = crate::domain::time::UtcTimestamp::from_unix_nanos(fit_nanos);
+        let experiment = crate::store::calibration::minimal_experiment(
+            "ov2f-experiment",
+            &scope,
+            &meter,
+            billing,
+            validity,
+            fit,
+        );
+        crate::store::calibration::insert_experiment(conn, &experiment)
+            .expect("the experiment must insert");
+        let calibration = crate::store::calibration::minimal_fixture(
+            "ov2f-calibration",
+            &scope,
+            &meter,
+            billing,
+            &crate::domain::provenance::CostModelId::new(cost_model_id),
+            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(100_000),
+            validity,
+            fit,
+        );
+        crate::store::calibration::insert_result(
+            conn,
+            &calibration,
+            &[crate::store::calibration::ExperimentId::new(
+                "ov2f-experiment",
+            )],
+        )
+        .expect("the calibration must insert");
+        let evidence =
+            |tag: &str| -> std::collections::BTreeSet<crate::domain::provenance::EvidenceId> {
+                [crate::domain::provenance::EvidenceId::new(format!(
+                    "fixture:{tag}"
+                ))]
+                .into_iter()
+                .collect()
+            };
+        let actor = ActivationActor::new("ov2f-test").expect("actor is non-empty");
+        let policy = ActivationPolicy::new(
+            "fixture",
+            crate::domain::credits::Credits::from_micros(0),
+            crate::store::calibration::ConditionNumber::from_micros(30_000_000),
+        )
+        .expect("policy version is non-empty");
+        let verdict = crate::calibration::contamination::ContaminationVerdict::clean();
+        crate::store::calibration::activate(
+            conn,
+            &crate::domain::provenance::WindowCalibrationId::new("ov2f-calibration"),
+            fit,
+            None,
+            &ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &evidence("fitting"),
+                validation: &evidence("validation"),
+                contamination: &verdict,
+            },
+        )
+        .expect("the calibration must activate");
+    }
+
+    fn ov2f_usage() -> crate::domain::tokens::UsageVector {
+        crate::domain::tokens::UsageVector::new(
+            crate::domain::tokens::KnownTokenVector::new(
+                crate::domain::tokens::InputTokens::new(10),
+                crate::domain::tokens::OutputTokens::new(10),
+                crate::domain::tokens::CacheReadTokens::new(0),
+                crate::domain::tokens::CacheWriteTokens::new(0),
+            ),
+            std::collections::BTreeMap::new(),
+            crate::evidence::CoverageCompleteness::Complete,
+            crate::evidence::EvidenceQuality::Measured,
+        )
+    }
+
+    fn ov2f_credits() -> crate::evidence::Derivation<crate::domain::credits::Credits> {
+        crate::evidence::Derivation::Available(crate::evidence::Qualified::new(
+            crate::domain::credits::Credits::from_micros(1_000_000),
+            crate::evidence::CoverageCompleteness::Complete,
+            crate::evidence::EvidenceQuality::Measured,
+            crate::evidence::Provenance::new(["cost-model:fixture".to_string()]),
+        ))
+    }
+
+    fn ov2f_missing(derivation: &crate::report::WindowEquivalentDerivation) -> Vec<String> {
+        derivation
+            .missing()
+            .map(|facts| facts.iter().map(|fact| fact.as_str().to_string()).collect())
+            .unwrap_or_default()
+    }
+
+    /// `resolve()` itself records the health refusal a review-due stored
+    /// calibration causes, which is what turns spend's exit into the
+    /// not-current class (`aub-ov2f`). The planted negative is the same
+    /// ledger one second before the review instant: the group still refuses
+    /// (no cost model is active), but not for health, so nothing is recorded.
+    #[test]
+    fn spend_resolve_records_a_health_refusal_for_a_review_due_calibration() {
+        use crate::calibration::health::CalibrationHealth;
+        let (_dir, mut conn) = calibrate_fixture_db();
+        seed_active_default_five_hour_calibration(
+            &mut conn,
+            REVIEW_FIT_NANOS,
+            "fixture-cost-model",
+            &crate::domain::ids::BillingSemanticsId::new("fixture-billing-v1"),
+        );
+        let book = crate::valuation::RateBook::default();
+        let run_at = |offset: i64| {
+            let resolver = SpendWindowResolver {
+                conn: &conn,
+                active_cost_model: None,
+                rate_cards: &book,
+                window_key: "five_hour",
+                timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(
+                    review_instant_nanos() + offset,
+                ),
+                review_after: review_after_thirty_days(),
+                health_refusal: std::cell::Cell::new(None),
+            };
+            let derivation = resolver
+                .resolve(Some("acct"), Some("anthropic"), None, None, &ov2f_usage())
+                .expect("the resolver must answer");
+            (ov2f_missing(&derivation), resolver.health_refusal.get())
+        };
+
+        let (missing, refusal) = run_at(0);
+        assert_eq!(refusal, Some(CalibrationHealth::ReviewDue));
+        assert!(
+            missing
+                .iter()
+                .any(|fact| fact.ends_with("calibration health is review_due")),
+            "{missing:?}"
+        );
+
+        let (missing, refusal) = run_at(-ONE_SECOND_NANOS);
+        assert_eq!(refusal, None);
+        assert_eq!(missing, vec!["active cost model".to_string()]);
+    }
+
+    /// A superseded cost model makes spend's second health check refuse, and
+    /// it records the same health refusal a review-due calibration does, so
+    /// both exit in one class (`aub-ov2f`). The planted negative is the same
+    /// ledger before the supersession: the group converts and records nothing.
+    #[test]
+    fn spend_resolve_records_a_health_refusal_for_a_superseded_cost_model() {
+        use crate::calibration::health::CalibrationHealth;
+        use crate::store::cost_model::{
+            anthropic_claude_messages_incomplete_v1, anthropic_claude_messages_v1,
+        };
+        let (_dir, mut conn) = calibrate_fixture_db();
+        let at = crate::domain::time::UtcTimestamp::from_unix_nanos(1_000);
+        let model = anthropic_claude_messages_v1(at);
+        crate::store::cost_model::activate(&mut conn, &model, at, None)
+            .expect("the cost model activates");
+        seed_active_default_five_hour_calibration(
+            &mut conn,
+            2_000,
+            model.id().as_str(),
+            model.billing_semantics_id(),
+        );
+        let book = crate::valuation::RateBook::default();
+        let credits = ov2f_credits();
+        let resolve = |conn: &rusqlite::Connection| {
+            let resolver = SpendWindowResolver {
+                conn,
+                active_cost_model: Some(&model),
+                rate_cards: &book,
+                window_key: "five_hour",
+                timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(10_000),
+                review_after: review_after_thirty_days(),
+                health_refusal: std::cell::Cell::new(None),
+            };
+            let derivation = resolver
+                .resolve(
+                    Some("acct"),
+                    Some("anthropic"),
+                    None,
+                    Some(&credits),
+                    &ov2f_usage(),
+                )
+                .expect("the resolver must answer");
+            (derivation, resolver.health_refusal.get())
+        };
+
+        let (derivation, refusal) = resolve(&conn);
+        assert_eq!(refusal, None);
+        assert!(
+            matches!(
+                derivation,
+                crate::report::WindowEquivalentDerivation::Available(_)
+            ),
+            "{:?}",
+            ov2f_missing(&derivation)
+        );
+
+        let successor = anthropic_claude_messages_incomplete_v1(at);
+        crate::store::cost_model::activate(
+            &mut conn,
+            &successor,
+            crate::domain::time::UtcTimestamp::from_unix_nanos(5_000),
+            Some(model.id()),
+        )
+        .expect("the successor supersedes the model");
+        let (derivation, refusal) = resolve(&conn);
+        assert_eq!(refusal, Some(CalibrationHealth::Superseded));
+        assert!(
+            ov2f_missing(&derivation).contains(&"calibration health: superseded".to_string()),
+            "{:?}",
+            ov2f_missing(&derivation)
+        );
+    }
+
+    /// spend's exit for a not-current calibration is one class whatever the
+    /// health: review-due and superseded both map to `InsufficientEvidence`.
+    #[test]
+    fn spend_not_current_calibration_exits_in_one_class() {
+        use crate::calibration::health::CalibrationHealth;
+        for health in [CalibrationHealth::ReviewDue, CalibrationHealth::Superseded] {
+            let error = spend_not_current_calibration_error("five_hour", health);
+            let Error::InsufficientEvidence(message) = &error else {
+                panic!("expected InsufficientEvidence, got {error:?}");
+            };
+            assert!(message.contains(health.label()), "{message}");
+        }
+    }
+
+    /// The per-kind fixture is fitted at 2,000 ns; under a one-second horizon
+    /// it is due at this instant.
+    const PER_KIND_REVIEW_INSTANT_NANOS: i64 = 2_000 + ONE_SECOND_NANOS;
+
+    fn review_after_one_second() -> MonotonicDuration {
+        MonotonicDuration::from_seconds(1)
+    }
+
+    /// A per-kind calibration past its review instant makes spend refuse by
+    /// its health and record it for the not-current exit, as a scalar one
+    /// does (`aub-ov2f`, review finding D5). One nanosecond before, the same
+    /// ledger answers with the per-kind refusal and records nothing, which is
+    /// the negative a per-kind health hard-coded to `current` passes and the
+    /// due side fails.
+    #[test]
+    fn spend_resolve_refuses_a_review_due_per_kind_calibration_by_its_health() {
+        use crate::calibration::health::CalibrationHealth;
+        let (_dir, conn) = per_kind_active_ledger();
+        let book = crate::valuation::RateBook::default();
+        let run_at = |offset: i64| {
+            let resolver = SpendWindowResolver {
+                conn: &conn,
+                active_cost_model: None,
+                rate_cards: &book,
+                window_key: "five_hour",
+                timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(
+                    PER_KIND_REVIEW_INSTANT_NANOS + offset,
+                ),
+                review_after: review_after_one_second(),
+                health_refusal: std::cell::Cell::new(None),
+            };
+            let derivation = resolver
+                .resolve(Some("acct"), Some("anthropic"), None, None, &ov2f_usage())
+                .expect("the resolver must answer");
+            (ov2f_missing(&derivation), resolver.health_refusal.get())
+        };
+
+        let (missing, refusal) = run_at(0);
+        assert_eq!(refusal, Some(CalibrationHealth::ReviewDue));
+        assert!(
+            missing
+                .iter()
+                .any(|fact| fact.ends_with("calibration health is review_due")),
+            "{missing:?}"
+        );
+
+        let (missing, refusal) = run_at(-1);
+        assert_eq!(refusal, None);
+        assert!(
+            missing.iter().any(|fact| fact.contains("per-kind")),
+            "{missing:?}"
+        );
+    }
+
+    /// can-run judges a per-kind window by its review instant: past it the
+    /// window is recorded not current for the report and for the exit, and
+    /// the exit is the not-current class naming `review_due`. One nanosecond
+    /// before, nothing is recorded and a refused report exits cleanly.
+    #[test]
+    fn can_run_judges_a_per_kind_window_by_its_review_instant() {
+        use crate::calibration::health::CalibrationHealth;
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::window::{
+            MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
+            WindowScope, WindowSemanticKey,
+        };
+        let (_dir, conn) = per_kind_active_ledger();
+        let window = MeterWindow::new(
+            WindowSemanticKey::new("five_hour"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(100_000).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Exact,
+            crate::domain::time::UtcTimestamp::from_unix_nanos(18_000_000_000_000),
+            NominalWindowDuration::from_nanos(18_000_000_000_000),
+        );
+        let gather_at = |offset: i64| {
+            gather_window_calibrations(
+                &conn,
+                std::slice::from_ref(&window),
+                &crate::domain::window::ModelId::new("claude-opus"),
+                "default",
+                "anthropic",
+                review_after_one_second(),
+                crate::domain::time::UtcTimestamp::from_unix_nanos(
+                    PER_KIND_REVIEW_INSTANT_NANOS + offset,
+                ),
+            )
+            .expect("the lookup must answer")
+        };
+        let key = WindowSemanticKey::new("five_hour");
+
+        let due = gather_at(0);
+        assert_eq!(
+            due.not_current.get(&key),
+            Some(&CalibrationHealth::ReviewDue)
+        );
+        let stale = due
+            .per_kind_not_current
+            .get(&key)
+            .expect("the per-kind window is recorded not current");
+        assert_eq!(stale.calibration_id, "promoted-mvcand-1");
+        assert_eq!(stale.health.label(), "review_due");
+        match can_run_not_current_calibration_exit(true, &due.not_current) {
+            Err(Error::InsufficientEvidence(message)) => {
+                assert!(
+                    message.contains("window five_hour: review_due"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
+
+        let before = gather_at(-1);
+        assert!(before.not_current.is_empty());
+        assert!(before.per_kind_not_current.is_empty());
+        assert!(can_run_not_current_calibration_exit(true, &before.not_current).is_ok());
+    }
+
+    /// `calibrate history` labels a scalar and a per-kind calibration past
+    /// their review instant `review_due`, the health spend and can-run refuse
+    /// by (`aub-ov2f`); one nanosecond before, both read `current`.
+    #[test]
+    fn calibrate_history_labels_a_calibration_past_review_as_review_due() {
+        let (_scalar_dir, mut scalar_conn) = calibrate_fixture_db();
+        seed_active_default_five_hour_calibration(
+            &mut scalar_conn,
+            2_000,
+            "fixture-cost-model",
+            &crate::domain::ids::BillingSemanticsId::new("fixture-billing-v1"),
+        );
+        let (_per_kind_dir, per_kind_conn) = per_kind_active_ledger();
+        let labels_at = |offset: i64| {
+            let now = crate::domain::time::UtcTimestamp::from_unix_nanos(
+                PER_KIND_REVIEW_INSTANT_NANOS + offset,
+            );
+            let scalar = assemble_calibrate_history(&scalar_conn, review_after_one_second(), now)
+                .expect("history must assemble");
+            let per_kind =
+                assemble_calibrate_history(&per_kind_conn, review_after_one_second(), now)
+                    .expect("history must assemble");
+            (
+                scalar.entries[0].health_label.clone(),
+                per_kind.per_kind_entries[0].health_label.clone(),
+            )
+        };
+        assert_eq!(
+            labels_at(0),
+            ("review_due".to_string(), "review_due".to_string())
+        );
+        assert_eq!(
+            labels_at(-1),
+            ("current".to_string(), "current".to_string())
+        );
+    }
+
+    /// can-run names every not-current window in its exit, not only the first
+    /// in map order.
+    #[test]
+    fn can_run_not_current_exit_names_every_window() {
+        use crate::calibration::health::CalibrationHealth;
+        use crate::domain::window::WindowSemanticKey;
+        let not_current = std::collections::BTreeMap::from([
+            (
+                WindowSemanticKey::new("five_hour"),
+                CalibrationHealth::ReviewDue,
+            ),
+            (
+                WindowSemanticKey::new("seven_day"),
+                CalibrationHealth::Superseded,
+            ),
+        ]);
+        match can_run_not_current_calibration_exit(true, &not_current) {
+            Err(Error::InsufficientEvidence(message)) => {
+                assert!(
+                    message.contains("window five_hour: review_due"),
+                    "{message}"
+                );
+                assert!(
+                    message.contains("window seven_day: superseded"),
+                    "{message}"
+                );
+            }
+            other => panic!("expected InsufficientEvidence, got {other:?}"),
+        }
+        assert!(can_run_not_current_calibration_exit(false, &not_current).is_ok());
+    }
+
     /// can-run gives a per-kind window no credit constraint and marks it, so
     /// the rate-card estimate does not stand in for a calibration that exists.
     #[test]
@@ -14440,7 +15024,9 @@ usage_evidence = "measured"
         let (_scratch, mut conn) = calibrate_fixture_db();
         calibrate_activate_cost_model(&mut conn, true);
         let now = fx::seed_active(&mut conn);
-        let report = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let report =
+            assemble_calibrate_show(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("show must assemble");
         assert_eq!(report.entries.len(), 1);
         let text = render_calibrate_show_report(&report);
         for expected in [
@@ -14487,8 +15073,14 @@ usage_evidence = "measured"
         insert_experiment(&conn, &fx::experiment("exp-32")).unwrap();
         let candidate = fx::result("wc-19", 1_038_000, 4_500, "ap-v1", 700);
         insert_result(&mut conn, &candidate, &[ExperimentId::new("exp-32")]).unwrap();
-        let report = assemble_calibrate_compare(&conn, "wc-19", "wc-17", now)
-            .expect("compare must assemble");
+        let report = assemble_calibrate_compare(
+            &conn,
+            "wc-19",
+            "wc-17",
+            MonotonicDuration::from_seconds(30 * 86_400),
+            now,
+        )
+        .expect("compare must assemble");
         assert_eq!(report.difference_bps, 380);
         assert!(!report.candidate_is_active);
         let text = render_calibrate_compare_report(&report);
@@ -14512,7 +15104,9 @@ usage_evidence = "measured"
         let (_scratch, mut conn) = calibrate_fixture_db();
         calibrate_activate_cost_model(&mut conn, true);
         let now = fx::seed_active(&mut conn);
-        let report = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let report =
+            assemble_calibrate_show(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("show must assemble");
         let entry = &report.entries[0];
         assert_eq!(entry.calibration_id, "wc-17");
         assert_eq!(entry.provider, "anthropic");
@@ -14561,8 +15155,14 @@ usage_evidence = "measured"
             "anthropic-claude-messages-incomplete-v1",
         );
         insert_result(&mut conn, &cal, &[ExperimentId::new("exp-40")]).unwrap();
-        let entry =
-            calibrate_show_entry_for(&conn, &cal, fx::ts(1_000), false).expect("entry must build");
+        let entry = calibrate_show_entry_for(
+            &conn,
+            &cal,
+            MonotonicDuration::from_seconds(30 * 86_400),
+            fx::ts(1_000),
+            false,
+        )
+        .expect("entry must build");
         assert!(entry.cost_model.cost_model_found);
         let missing: Vec<&str> = entry
             .cost_model
@@ -14588,7 +15188,9 @@ usage_evidence = "measured"
         let (_scratch, mut conn) = calibrate_fixture_db();
         calibrate_activate_cost_model(&mut conn, true);
         let now = fx::seed_active(&mut conn);
-        let report = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let report =
+            assemble_calibrate_show(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("show must assemble");
         let absent = render_calibrate_show_entry(&report.entries[0]);
         assert!(absent.contains("unknown kinds  none"), "{absent}");
         let mut present = report.entries[0].clone();
@@ -14614,7 +15216,9 @@ usage_evidence = "measured"
         args.actor = "operator".to_string();
         calibrate_activate_validated(&mut conn, &args, fx::ts(900))
             .expect("second activation must work");
-        let report = assemble_calibrate_history(&conn, now).expect("history must assemble");
+        let report =
+            assemble_calibrate_history(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("history must assemble");
         assert_eq!(report.entries.len(), 2);
         let first = &report.entries[0];
         assert_eq!(first.calibration_id, "wc-17");
@@ -14655,8 +15259,12 @@ usage_evidence = "measured"
         insert_experiment(&conn, &fx::experiment("exp-34")).unwrap();
         let provisional = fx::result("wc-provisional", 1_000_000, 4_200, "ap-v1", 500);
         insert_result(&mut conn, &provisional, &[ExperimentId::new("exp-34")]).unwrap();
-        let report =
-            assemble_calibrate_history(&conn, fx::ts(1_000)).expect("history must assemble");
+        let report = assemble_calibrate_history(
+            &conn,
+            MonotonicDuration::from_seconds(30 * 86_400),
+            fx::ts(1_000),
+        )
+        .expect("history must assemble");
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].health_label, "provisional");
         assert!(report.entries[0].events.is_empty());
@@ -14764,12 +15372,22 @@ usage_evidence = "measured"
         let (_scratch, mut conn) = calibrate_fixture_db();
         calibrate_activate_cost_model(&mut conn, true);
         let now = fx::seed_active(&mut conn);
-        let show = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let show =
+            assemble_calibrate_show(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("show must assemble");
         fx::assert_no_bare_coefficient(&render_calibrate_show_report(&show));
-        let history = assemble_calibrate_history(&conn, now).expect("history must assemble");
+        let history =
+            assemble_calibrate_history(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("history must assemble");
         fx::assert_no_bare_coefficient(&render_calibrate_history_report(&history));
-        let compare = assemble_calibrate_compare(&conn, "wc-17", "wc-17", now)
-            .expect("self-compare must assemble");
+        let compare = assemble_calibrate_compare(
+            &conn,
+            "wc-17",
+            "wc-17",
+            MonotonicDuration::from_seconds(30 * 86_400),
+            now,
+        )
+        .expect("self-compare must assemble");
         assert_eq!(compare.difference_bps, 0);
         assert!(compare.candidate_is_active);
         let compare_text = render_calibrate_compare_report(&compare);
@@ -14804,7 +15422,9 @@ usage_evidence = "measured"
         calibrate_activate_cost_model(&mut conn, true);
         let now = fx::seed_active(&mut conn);
         let run = RunId::new(now);
-        let show = assemble_calibrate_show(&conn, now).expect("show must assemble");
+        let show =
+            assemble_calibrate_show(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("show must assemble");
         let show_json = calibrate_show_json(&show, run.clone());
         let show_value: serde_json::Value =
             serde_json::from_str(&show_json).expect("show json must parse");
@@ -14822,7 +15442,9 @@ usage_evidence = "measured"
                 .contains(&serde_json::Value::String("exp-31".to_string()))
         );
         assert_eq!(entry["health"], "current");
-        let history = assemble_calibrate_history(&conn, now).expect("history must assemble");
+        let history =
+            assemble_calibrate_history(&conn, MonotonicDuration::from_seconds(30 * 86_400), now)
+                .expect("history must assemble");
         let history_json = calibrate_history_json(&history, run.clone());
         let history_value: serde_json::Value =
             serde_json::from_str(&history_json).expect("history json must parse");
@@ -14835,8 +15457,14 @@ usage_evidence = "measured"
             history_value["entries"][0]["events"][0]["actor"],
             "operator"
         );
-        let compare = assemble_calibrate_compare(&conn, "wc-17", "wc-17", now)
-            .expect("compare must assemble");
+        let compare = assemble_calibrate_compare(
+            &conn,
+            "wc-17",
+            "wc-17",
+            MonotonicDuration::from_seconds(30 * 86_400),
+            now,
+        )
+        .expect("compare must assemble");
         let compare_json = calibrate_compare_json(&compare, run.clone());
         let compare_value: serde_json::Value =
             serde_json::from_str(&compare_json).expect("compare json must parse");

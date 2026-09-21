@@ -990,6 +990,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
         &cost_model_id,
         UtcTimestamp::from_unix_nanos(1_500),
         UtcTimestamp::from_unix_nanos(2_500),
+        MonotonicDuration::from_seconds(30 * 86_400),
     )
     .expect("reconcile candidate 1");
 
@@ -1037,6 +1038,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
         &cost_model_id,
         UtcTimestamp::from_unix_nanos(3_500),
         UtcTimestamp::from_unix_nanos(2_500),
+        MonotonicDuration::from_seconds(30 * 86_400),
     )
     .expect("reconcile candidate 2");
 

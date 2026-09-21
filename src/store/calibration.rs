@@ -586,13 +586,7 @@ pub fn review_due_at(
     calibration: &WindowCalibration,
     review_after: MonotonicDuration,
 ) -> UtcTimestamp {
-    let horizon_nanos = i64::try_from(review_after.as_nanos()).unwrap_or(i64::MAX);
-    UtcTimestamp::from_unix_nanos(
-        calibration
-            .fit_timestamp()
-            .unix_nanos()
-            .saturating_add(horizon_nanos),
-    )
+    crate::calibration::health::review_instant(calibration.fit_timestamp(), review_after)
 }
 
 /// One activation or supersession event on a calibration result.

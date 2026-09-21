@@ -29,7 +29,9 @@
 
 use std::collections::BTreeMap;
 
-use crate::advice::headroom::{CalibratedWindowConstraint, WindowHeadroom, window_credit_headroom};
+use crate::advice::headroom::{
+    CalibratedWindowConstraint, CalibrationHealth, WindowHeadroom, window_credit_headroom,
+};
 use crate::advice::historical_distribution::{
     AttributionCoverage, DistributionVerdict, ExclusionCounts,
 };
@@ -229,6 +231,17 @@ pub struct WindowCalibrationLookup {
     pub constraint: CalibratedWindowConstraint,
 }
 
+/// A constraining window whose active calibration is per-kind and not current
+/// (`aub-ov2f`). A per-kind calibration has no credits-per-point interval, so
+/// it never becomes a [`WindowCalibrationLookup`]; this carries only what the
+/// refusal names, so a stale per-kind record refuses by its health rather
+/// than reading as a window with no calibration at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PerKindCalibrationNotCurrent {
+    pub calibration_id: String,
+    pub health: CalibrationHealth,
+}
+
 /// One window's percent-of-window rate cards, converted into the same credit
 /// constraint shape a calibration produces (`aub-8vpc`).
 ///
@@ -275,6 +288,9 @@ pub struct CanRunJoinInputs {
     pub model: ModelId,
     pub meter: CanRunMeterReadiness,
     pub window_calibrations: BTreeMap<WindowSemanticKey, WindowCalibrationLookup>,
+    /// Windows whose active calibration is per-kind and not current, consulted
+    /// only where `window_calibrations` holds no entry (`aub-ov2f`).
+    pub per_kind_not_current: BTreeMap<WindowSemanticKey, PerKindCalibrationNotCurrent>,
     /// The rate-card estimates available per window, consulted only where
     /// `window_calibrations` holds no entry at all (`aub-8vpc`).
     pub window_estimates: BTreeMap<WindowSemanticKey, WindowEstimate>,
@@ -402,7 +418,18 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                 // `Superseded`, `Inapplicable` or `Provisional` calibration produces
                 // a refusal naming that exact state.
                 for window in constraining {
+                    let per_kind_stale = inputs.per_kind_not_current.get(window.semantic_key());
                     match inputs.window_calibrations.get(window.semantic_key()) {
+                        None if let Some(stale) = per_kind_stale => {
+                            missing.push(missing_fact(
+                                window.semantic_key().as_str(),
+                                format!(
+                                    "calibration #{} health is {}, not current",
+                                    stale.calibration_id,
+                                    stale.health.label()
+                                ),
+                            ));
+                        }
                         // Precedence (`aub-8vpc`): no calibration record at all
                         // admits a labelled estimate, and a record that is not
                         // current does not. A stale measurement is still
@@ -831,6 +858,7 @@ mod compose_tests {
                 observed_age: Some(MonotonicDuration::from_seconds(41)),
             },
             window_calibrations: calibrations,
+            per_kind_not_current: BTreeMap::new(),
             window_estimates: BTreeMap::new(),
             cost_model_missing_token_classes: Vec::new(),
             plan_tier_mismatch: None,
@@ -1047,6 +1075,35 @@ mod compose_tests {
             .find(|fact| fact.subject == "model-x:weekly")
             .expect("expected a missing fact for the uncalibrated window");
         assert!(fact.reason.contains("no calibration is recorded"));
+    }
+
+    /// A window whose active calibration is per-kind and past review refuses
+    /// naming that calibration and `review_due` (`aub-ov2f`); the planted
+    /// negative is the same window with no per-kind record, which keeps the
+    /// "no calibration is recorded" wording the stale record must not reuse.
+    #[test]
+    fn refusal_3_a_per_kind_calibration_not_current_names_its_health() {
+        let mut inputs = worked_example_inputs();
+        let key = WindowSemanticKey::new("model-x:weekly");
+        inputs.window_calibrations.remove(&key);
+        inputs.per_kind_not_current.insert(
+            key,
+            PerKindCalibrationNotCurrent {
+                calibration_id: "mv-7".to_string(),
+                health: CalibrationHealth::ReviewDue,
+            },
+        );
+        let report = compose_can_run_report(inputs);
+        let fact = refused_of(&report)
+            .missing
+            .iter()
+            .find(|fact| fact.subject == "model-x:weekly")
+            .expect("expected a missing fact for the per-kind window")
+            .clone();
+        assert_eq!(
+            fact.reason,
+            "calibration #mv-7 health is review_due, not current"
+        );
     }
 
     /// Unit, refusal 4 of 7: a cost model missing a token class refuses and

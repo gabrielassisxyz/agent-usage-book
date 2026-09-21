@@ -238,11 +238,16 @@ In JSON the estimated figure carries `evidence_quality: "estimated"`,
 recorded but not current (`review_due`, `suspect`) does not fall back: the
 command refuses naming the health, because a stale measurement is still
 evidence and an estimate must not paper over its review. A calibration is
-`review_due` once `calibration.review_after` has passed since it was fitted.
-That refusal exits 6 (`InsufficientEvidence`) after the report is printed, and
-`aub can-run` does the same when a constraining window's calibration is not
-current. With neither a calibration nor an estimate card the refusal names the
-missing calibration, and the exit stays 0.
+`review_due` once `calibration.review_after` has passed since it was fitted,
+whether it is a scalar calibration or a per-kind one. Every refusal for a
+stored calibration that is not current exits 6 (`InsufficientEvidence`) after
+the report is printed, whatever made it not current: a passed review, a
+superseded cost model, or a per-kind calibration past review. `aub can-run`
+does the same when a constraining window's calibration, scalar or per-kind, is
+not current, and its error names every such window. `aub calibrate show` and
+`aub calibrate history` label a calibration with the same health these
+commands refuse by. With neither a calibration nor an estimate card the refusal
+names the missing calibration, and the exit stays 0.
 
 **Refuses:** to guess at an unreadable transcript. A source that cannot be
 normalized leaves the report `IngestIncomplete` rather than silently omitted
@@ -290,7 +295,8 @@ calibration, a cost model missing a token class, a plan tier mismatch, too
 few historical tasks, or mostly unattributable task records, produces a
 refusal naming every one that applies in the same invocation rather than the
 first one found, and a refusal exits `0` with the refusal rendered, not a
-usage error. It never substitutes a global average task cost, a different
+usage error, except that a refusal a not-current stored calibration took part
+in exits `6` (`InsufficientEvidence`) after the report. It never substitutes a global average task cost, a different
 plan tier's calibration, an estimated-token session, a stale meter reading,
 or an API-list-price conversion for a number it cannot justify.
 

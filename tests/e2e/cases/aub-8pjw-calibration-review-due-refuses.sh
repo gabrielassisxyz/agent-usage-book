@@ -10,7 +10,8 @@
 # a one-second horizon, set through `AUB_CALIBRATION_REVIEW_AFTER`, and the
 # same commands over the same ledger refuse with `review_due`, exit 6, and
 # print no estimate figure: a measurement asking for review is not papered
-# over by an approximation.
+# over by an approximation. The JSON form of the refused spend carries the
+# same refusal and no figure of any kind (`aub-ov2f`).
 #
 # The meter comes from a stub HTTP server answering the can-run worked
 # example's window shape once (`aub-8vpc-window-estimate-fallback.sh`'s
@@ -188,11 +189,46 @@ aub_step() {
         "$AUB_BIN" "$@"
 }
 
+# Succeeds only when TEXT is absent from FILE read as one line: box rails
+# stripped and every line joined by one space, as assert_row_detail_contains
+# reads a detail, so a figure the table wrapped across two lines is still
+# found (`aub-ov2f`).
+text_absent_from_joined_lines() {
+    local text="$1" file="$2" joined
+    joined="$(awk '
+        {
+            line = $0
+            sub(/^(│| )+/, "", line)
+            sub(/( |│)+$/, "", line)
+            joined = joined (joined == "" ? "" : " ") line
+        }
+        END { print joined }
+    ' "$file")"
+    [[ "$joined" != *"$text"* ]]
+}
+
 # A step that passes only when TEXT is absent from an earlier step's stdout:
 # the estimate label and figure have to be shown missing, not just unasserted.
 absent_step() {
     local name="$1" text="$2" from="$3"
-    step "$name" sh -c '! grep -qF -- "$1" "$2"' _ "$text" "$(step_dir "$from")/stdout.bin"
+    step "$name" text_absent_from_joined_lines "$text" "$(step_dir "$from")/stdout.bin"
+}
+
+# Succeeds only when the spend report, the first JSON document on FILE's
+# stdout (the error envelope follows it), refuses every group's window
+# equivalent for review and carries no figure: no interval endpoint, no
+# calibration id and no evidence quality anywhere in it.
+spend_json_withholds_review_due_figures() {
+    jq -se '
+        .[0].groups as $groups
+        | ($groups | length) > 0
+        and all($groups[];
+            .window_equivalent
+            | .status == "unavailable"
+            and any(.missing[]; endswith("calibration health is review_due"))
+            and (has("lower") or has("upper") or has("calibration_id")
+                 or has("evidence_quality") | not))
+    ' "$1" >/dev/null
 }
 
 case_steps() {
@@ -260,6 +296,12 @@ case_steps() {
     aub_step "can-run-review-due-json" can-run --task-kind task --account work-primary \
         --task-model sonnet --cached --format json
     absent_step "can-run-review-due-json-has-no-basis" "rate_card_estimate" 20
+
+    # 22-23. spend's JSON form refuses the same window and prints no figure.
+    aub_step "spend-review-due-json" spend --since 2026-08-25 --days 1 --group-by account \
+        --window-equivalent five_hour --refresh never --format json
+    step "spend-review-due-json-withholds-figures" spend_json_withholds_review_due_figures \
+        "$(step_dir 22)/stdout.bin"
 }
 
 case_assertions() {
@@ -296,4 +338,7 @@ case_assertions() {
     assert_json_field 20 "outcome.status" "refused"
     assert_stdout_contains 20 '"subject":"five_hour"'
     assert_exit 0 21
+    assert_exit 6 22
+    assert_stdout_contains 22 "calibration health is review_due"
+    assert_exit 0 23
 }

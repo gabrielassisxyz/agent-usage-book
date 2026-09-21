@@ -1302,7 +1302,14 @@ mod tests {
             lifecycle: LifecycleState::NeverActivated,
             cost_model_superseded: false,
             drift: None,
-            review_due_at: None,
+            // Dated from the fit time as every production health path dates
+            // it (`aub-ov2f`), with the shipped 30-day `calibration.review_after`
+            // default, so `Current` below is current inside a real horizon
+            // rather than because no horizon was consulted.
+            review_due_at: Some(crate::store::calibration::review_due_at(
+                &calibration,
+                MonotonicDuration::from_seconds(30 * 86_400),
+            )),
         };
         assert_eq!(
             compute_health(&provisional_inputs, ts(600)),
