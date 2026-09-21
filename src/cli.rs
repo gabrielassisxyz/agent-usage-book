@@ -2048,7 +2048,7 @@ pub(crate) fn now_command(
 /// Reads the named session's explicit marker and heartbeat evidence without
 /// taking a sampling attempt. The alias and the status refresh path both call
 /// the same status report after this read.
-fn status_activity_state(
+fn session_activity_state(
     state_dir: &Path,
     session_id: &str,
     report_instant: crate::domain::time::UtcTimestamp,
@@ -4623,7 +4623,7 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
 
     let activity = session_id
         .as_deref()
-        .map(|session| status_activity_state(&config.state.dir, session, timestamp, clock))
+        .map(|session| session_activity_state(&config.state.dir, session, timestamp, clock))
         .transpose()?;
 
     let projection_path = crate::projection::projection_path_in(&config.state.dir);
