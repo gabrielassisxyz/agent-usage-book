@@ -20,7 +20,10 @@
 //!
 //! A line whose top-level type the renderer has no case for is counted by
 //! that type and reported once per type by the caller, never dropped
-//! silently and never fatal.
+//! silently and never fatal. The same holds inside a `message` line: an
+//! unknown role counts as `role:<name>`, an unknown content block as
+//! `block:<type>`, and a turn whose content is not an array as
+//! `content:non_array`.
 //!
 //! May not depend on:
 //! - provider adapters
@@ -81,7 +84,13 @@ fn render_pi_file_with_skipped(body: &str) -> (Vec<TranscriptMessage>, BTreeMap<
             // model and thinking-level records state agent setup, and none of
             // the three is conversation.
             Some("session" | "model_change" | "thinking_level_change") => {}
-            Some("message") => read_pi_message(&value, &mut messages, &mut pending, &mut orphans),
+            Some("message") => read_pi_message(
+                &value,
+                &mut messages,
+                &mut pending,
+                &mut orphans,
+                &mut skipped,
+            ),
             Some(unknown) => {
                 *skipped.entry(unknown.to_string()).or_insert(0) += 1;
             }
@@ -106,36 +115,47 @@ fn render_pi_file_with_skipped(body: &str) -> (Vec<TranscriptMessage>, BTreeMap<
 }
 
 /// One `message` line: user and assistant text render, `toolResult` lines
-/// pair back to their call, and any other role contributes nothing.
+/// pair back to their call, and any other role is counted by name rather
+/// than dropped silently.
 fn read_pi_message(
     value: &serde_json::Value,
     messages: &mut Vec<TranscriptMessage>,
     pending: &mut BTreeMap<String, PendingPiToolUse>,
     orphans: &mut BTreeMap<usize, Vec<String>>,
+    skipped: &mut BTreeMap<String, usize>,
 ) {
     let Some(message) = value.get("message").and_then(serde_json::Value::as_object) else {
         return;
     };
     match message.get("role").and_then(serde_json::Value::as_str) {
-        Some("user" | "assistant") => read_pi_turn(message, messages, pending),
+        Some("user" | "assistant") => read_pi_turn(message, messages, pending, skipped),
         Some("toolResult") => read_pi_tool_result_message(message, messages, pending, orphans),
-        _ => {}
+        Some(role) => {
+            *skipped.entry(format!("role:{role}")).or_insert(0) += 1;
+        }
+        None => {
+            *skipped.entry("role:untyped".to_string()).or_insert(0) += 1;
+        }
     }
 }
 
 /// A user or assistant turn: text, thinking and tool calls out of the
 /// content blocks. A turn left with nothing to show under any flag is
-/// dropped rather than rendered as an empty section.
+/// dropped rather than rendered as an empty section. Content that is not
+/// an array and blocks of an unknown type are counted, never dropped
+/// silently.
 fn read_pi_turn(
     message: &serde_json::Map<String, serde_json::Value>,
     messages: &mut Vec<TranscriptMessage>,
     pending: &mut BTreeMap<String, PendingPiToolUse>,
+    skipped: &mut BTreeMap<String, usize>,
 ) {
     let role = match message.get("role").and_then(serde_json::Value::as_str) {
         Some("user") => TranscriptRole::User,
         _ => TranscriptRole::Assistant,
     };
     let Some(blocks) = message.get("content").and_then(serde_json::Value::as_array) else {
+        *skipped.entry("content:non_array".to_string()).or_insert(0) += 1;
         return;
     };
     let index = messages.len();
@@ -192,7 +212,12 @@ fn read_pi_turn(
                     );
                 }
             }
-            _ => {}
+            Some(block_type) => {
+                *skipped.entry(format!("block:{block_type}")).or_insert(0) += 1;
+            }
+            None => {
+                *skipped.entry("block:untyped".to_string()).or_insert(0) += 1;
+            }
         }
     }
     if !texts.is_empty() {
@@ -328,40 +353,43 @@ mod tests {
     #[test]
     fn plain_rendering_has_two_sections_and_no_tool_or_thinking() {
         let out = rendered(&fixture_body(), false, false);
-        assert!(out.contains("## User\nDo the thing"));
-        assert!(out.contains("## Assistant\nFinished"));
+        assert!(out.contains("## User\n/work/project/brief.md"));
+        assert!(out.contains("## Assistant\nI'll start by orienting"));
         assert!(!out.contains("**Tool:"), "tool traffic needs the flag");
         assert!(
-            !out.contains("read the project file first"),
+            !out.contains("The user has given me a path"),
             "thinking needs the flag"
         );
-        assert!(!out.contains('o'.to_string().repeat(100).as_str()));
+        assert!(
+            !out.contains("Work on bead aub-0000"),
+            "the tool result needs the flag"
+        );
     }
 
-    /// The 2000-character tool result survives whole under
+    /// The real tool result from the sanitized session survives whole under
     /// `--include-tools`, paired back to its `toolCall` by id.
     #[test]
-    fn tools_rendering_keeps_the_2000_character_output_intact() {
-        let big = "o".repeat(2000);
+    fn tools_rendering_keeps_the_real_output_intact() {
         let out = rendered(&fixture_body(), true, false);
         assert!(out.contains("**Tool: read**"));
         assert!(
-            out.contains(&big),
+            out.contains("Work on bead aub-0000"),
             "the full result survives, never truncated"
         );
-        assert!(out.contains("\"/work/project/README.md\""));
+        assert!(out.contains("\"/work/project/brief.md\""));
         assert!(
             !out.contains("**Tool: (unknown)**"),
             "the result pairs back to its call by toolCallId"
         );
-        assert!(!out.contains("read the project file first"));
+        assert!(!out.contains("The user has given me a path"));
     }
 
     /// The thinking block renders as a blockquote, only under its flag.
     #[test]
     fn thinking_rendering_adds_the_blockquote_only_with_the_flag() {
         let out = rendered(&fixture_body(), false, true);
-        assert!(out.contains("> The user wants the thing done; read the project file first."));
+        assert!(out.contains("> The user has given me a path"));
+        assert!(out.contains("> Let me start by reading the AGENTS.md"));
         assert!(!out.contains("**Tool:"));
     }
 
@@ -503,5 +531,22 @@ mod tests {
         let messages = render(body);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].text, "Still here");
+    }
+
+    /// Every dropped shape inside a `message` line is counted by a named
+    /// type: an unknown role, an unknown content block, and a turn whose
+    /// content is not an array. The planted negative pins the counting over
+    /// mere presence: the known text beside the unknown block still renders.
+    #[test]
+    fn dropped_roles_blocks_and_non_array_content_are_counted_by_named_type() {
+        let body = "{\"type\":\"message\",\"id\":\"a\",\"message\":{\"role\":\"system\",\"content\":[{\"type\":\"text\",\"text\":\"bg\"}]}}\n\
+            {\"type\":\"message\",\"id\":\"b\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"something_new\",\"data\":1},{\"type\":\"text\",\"text\":\"Still here\"}]}}\n\
+            {\"type\":\"message\",\"id\":\"c\",\"message\":{\"role\":\"user\",\"content\":\"just a string\"}}\n";
+        let (messages, skipped) = PiTranscriptRenderer.render_file_with_skipped(body);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].text, "Still here");
+        assert_eq!(skipped.get("role:system"), Some(&1));
+        assert_eq!(skipped.get("block:something_new"), Some(&1));
+        assert_eq!(skipped.get("content:non_array"), Some(&1));
     }
 }

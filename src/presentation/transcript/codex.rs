@@ -29,7 +29,9 @@
 //!
 //! A line whose type the renderer has no case for is counted by its most
 //! specific type label and reported once per type by the caller, never
-//! dropped silently and never fatal.
+//! dropped silently and never fatal. The same holds inside a `message`
+//! payload: a role other than `user`, `assistant` or the classified
+//! `developer` instructions counts as `role:<name>`.
 //!
 //! May not depend on:
 //! - provider adapters
@@ -139,7 +141,7 @@ fn read_codex_response_item(
         }
     };
     match payload.get("type").and_then(serde_json::Value::as_str) {
-        Some("message") => read_codex_message(payload, messages),
+        Some("message") => read_codex_message(payload, messages, skipped),
         Some("reasoning") => read_codex_reasoning(payload, messages),
         Some("custom_tool_call" | "function_call") => {
             read_codex_tool_call(payload, messages, pending);
@@ -157,15 +159,26 @@ fn read_codex_response_item(
 }
 
 /// One `message` payload: `user` and `assistant` roles render, `developer`
-/// instructions and any other role do not.
+/// instructions are classified setup and contribute nothing without
+/// counting, and any other role is counted by name rather than dropped
+/// silently.
 fn read_codex_message(
     payload: &serde_json::Map<String, serde_json::Value>,
     messages: &mut Vec<TranscriptMessage>,
+    skipped: &mut BTreeMap<String, usize>,
 ) {
     let role = match payload.get("role").and_then(serde_json::Value::as_str) {
         Some("user") => TranscriptRole::User,
         Some("assistant") => TranscriptRole::Assistant,
-        _ => return,
+        Some("developer") => return,
+        Some(role) => {
+            *skipped.entry(format!("role:{role}")).or_insert(0) += 1;
+            return;
+        }
+        None => {
+            *skipped.entry("role:untyped".to_string()).or_insert(0) += 1;
+            return;
+        }
     };
     let Some(blocks) = payload.get("content").and_then(serde_json::Value::as_array) else {
         return;
@@ -414,24 +427,27 @@ mod tests {
     #[test]
     fn plain_rendering_has_two_sections_and_no_tool_or_thinking() {
         let out = rendered(&fixture_body(), false, false);
-        assert!(out.contains("## User\nDo the thing"));
-        assert!(out.contains("## Assistant\nOn it"));
+        assert!(out.contains("## User\n<subagent_notification>"));
+        assert!(out.contains("What is the existing `aub spend` presentation contract"));
+        assert!(out.contains("## Assistant\nVou ler o brief da tarefa"));
         assert!(!out.contains("**Tool:"), "tool traffic needs the flag");
-        assert!(!out.contains('o'.to_string().repeat(100).as_str()));
+        assert!(
+            !out.contains("quais padrões, fixtures"),
+            "the tool output needs the flag"
+        );
     }
 
-    /// The 2000-character tool output survives whole under
-    /// `--include-tools`, paired back to its function call.
+    /// The tool output from the sanitized real session survives whole
+    /// under `--include-tools`, paired back to its custom call.
     #[test]
-    fn tools_rendering_keeps_the_2000_character_output_intact() {
-        let big = "o".repeat(2000);
+    fn tools_rendering_keeps_the_real_output_intact() {
         let out = rendered(&fixture_body(), true, false);
-        assert!(out.contains("**Tool: read**"));
+        assert!(out.contains("**Tool: exec**"));
         assert!(
-            out.contains(&big),
+            out.contains("quais padrões, fixtures, casos E2E"),
             "the full output survives, never truncated"
         );
-        assert!(out.contains("\"/work/project/README.md\""));
+        assert!(out.contains("01a051wv-4444-7555-8666-777777777777"));
         assert!(
             !out.contains("**Tool: (unknown)**"),
             "the output pairs back to its call by call_id"
@@ -444,7 +460,10 @@ mod tests {
     #[test]
     fn thinking_rendering_shows_no_blockquote_for_the_opaque_reasoning() {
         let out = rendered(&fixture_body(), false, true);
-        assert!(!out.contains('>'), "no thinking text, no blockquote");
+        assert!(
+            !out.lines().any(|line| line.starts_with("> ")),
+            "no thinking text, no blockquote lines"
+        );
     }
 
     /// A `summary` text item a file does carry renders as thinking, only
@@ -528,6 +547,24 @@ mod tests {
     fn developer_messages_contribute_nothing() {
         let body = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"m1\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Be helpful\"}]}}\n";
         assert!(render(body).is_empty());
+    }
+
+    /// An unknown message role is counted by name, while the classified
+    /// `developer` role stays uncounted: understanding a line and counting
+    /// it are different outcomes. The planted negative pins the boundary:
+    /// without the developer arm, setup instructions would report as
+    /// skipped on every real export.
+    #[test]
+    fn unknown_message_roles_are_counted_by_role_name() {
+        let body = "{\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"m1\",\"role\":\"developer\",\"content\":[{\"type\":\"input_text\",\"text\":\"Be helpful\"}]}}\n\
+            {\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"id\":\"m2\",\"role\":\"system\",\"content\":[{\"type\":\"input_text\",\"text\":\"bg\"}]}}\n";
+        let (messages, skipped) = CodexTranscriptRenderer.render_file_with_skipped(body);
+        assert!(messages.is_empty());
+        assert_eq!(skipped.get("role:system"), Some(&1));
+        assert!(
+            !skipped.keys().any(|kind| kind.contains("developer")),
+            "classified setup is never counted: {skipped:?}"
+        );
     }
 
     /// A custom tool call pairs with its output the same way a function call
