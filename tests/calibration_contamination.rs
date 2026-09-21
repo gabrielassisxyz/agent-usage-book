@@ -804,8 +804,11 @@ mod through_fit_and_activate {
                 &training,
                 "--validation",
                 &validation,
+                // Wide enough that the late movement's own held-out residual
+                // (30,000 micros) passes: the contaminated run is refused for
+                // contamination alone.
                 "--max-residual-micros",
-                "1000",
+                "100000",
             ],
         )
     }
