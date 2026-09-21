@@ -8,7 +8,7 @@
 # assertion about output into a measurement of the network.
 
 CASE_ID="037-statusline-reader"
-CASE_DESCRIPTION="aub now observes an account from a fresh status-line record with no endpoint request, falls back to the endpoint when the line is stale, and honours anthropic.statusline = false."
+CASE_DESCRIPTION="aub status --refresh observes an account from a fresh status-line record with no endpoint request, falls back to the endpoint when the line is stale, and honours anthropic.statusline = false."
 
 RECORD_FILE=""
 LEDGER_DB=""
@@ -104,16 +104,16 @@ statusline_step() {
         sh -c 'cat "$1" | "$2" statusline' _ "$payload" "$AUB_BIN"
 }
 
-# now_step NAME CONFIG: one forced `aub now` tick against the synthetic
+# refresh_step NAME CONFIG: one forced `aub status --refresh` tick against the synthetic
 # endpoint, over the named config file.
-now_step() {
+refresh_step() {
     local name="$1" config="$2"
     step "$name" env \
         "HOME=$STATE_DIR/home" \
         "AUB_CONFIG_FILE=$config" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:$ENDPOINT_PORT" \
-        "$AUB_BIN" now --account gmail
+        "$AUB_BIN" status --refresh --account gmail
 }
 
 # age_record SECONDS: rewrites the record's last line with `received_at`
@@ -142,18 +142,18 @@ case_steps() {
     statusline_step "tee-records-the-render" "$REPO_ROOT/tests/fixtures/statusline/payload-five-seven.json"
 
     # 2. The tick finds the line fresh: one observation, no endpoint request.
-    now_step "now-reads-the-fresh-line" "$STATE_DIR/aub.toml"
+    refresh_step "status-reads-the-fresh-line" "$STATE_DIR/aub.toml"
 
     # 3. Age the last line past the ordinary cadence.
     age_record 301
 
     # 4. The tick finds no fresh line: the endpoint answers.
-    now_step "now-falls-back-to-the-endpoint" "$STATE_DIR/aub.toml"
+    refresh_step "status-falls-back-to-the-endpoint" "$STATE_DIR/aub.toml"
 
     # 5. A fresh line with the feature off: the adapter ignores the record
     #    file and the endpoint runs anyway. This is the recovery path.
     age_record -5
-    now_step "now-with-statusline-off" "$STATE_DIR/aub-statusline-off.toml"
+    refresh_step "status-with-statusline-off" "$STATE_DIR/aub-statusline-off.toml"
 
     # 6. Both observations, with the contract each source declared.
     step "query-contracts" sqlite3 "$LEDGER_DB" \

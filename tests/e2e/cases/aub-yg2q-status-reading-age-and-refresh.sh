@@ -1,6 +1,6 @@
 # aub-yg2q: `aub status` says how old the reading it shows is, and
 # `aub status --refresh` takes one forced sampling attempt per selected
-# account through the same sampling path `aub now` uses, then renders the
+# account through the forced sampling path, then renders the
 # grid from the projection that pass published. Run against the release
 # binary because the properties under test are about a process: what the
 # default path does not do (sample), and what the ledger holds after a

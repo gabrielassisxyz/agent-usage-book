@@ -136,16 +136,15 @@ pub struct MeterAccount {
     /// Every provider window behind this account's last successful observation,
     /// as the grouped-grid `aub status` renderer needs them: one grid row per
     /// entry, with the window's stored inputs, its report-time burn rate and
-    /// the freshness of the observation it was read from. Empty for `aub now`,
-    /// which does not render a per-window grid, and for a reading with no
-    /// successful observation behind it. The limiting window is *derived* from
+    /// the freshness of the observation it was read from. Empty for a reading
+    /// with no successful observation behind it. The limiting window is *derived* from
     /// this list (`limiting_status_window`), never stored beside it.
     pub windows: Vec<StatusWindow>,
     /// The provider this account is configured under (`anthropic`, `openai`,
     /// ...), the key the grouped-grid `aub status` renderer groups blocks by
     /// and, until an adapter reports `observed_plan`, the plan label it prints
-    /// under the account name. `None` for `aub now` and for reports assembled
-    /// without configuration.
+    /// under the account name. `None` for reports assembled without
+    /// configuration.
     pub provider: Option<String>,
     /// How old the reading's observation was at the report instant, computed
     /// through the same measurement basis the freshness verdict was derived
@@ -394,8 +393,8 @@ impl MeterReadingProvenance {
     }
 }
 
-/// The status projection: the current compact meter picture.
-/// The status projection: the current compact meter picture.
+/// The status projection: the current compact meter picture, optionally joined
+/// with explicit activity evidence for one named session.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StatusReport {
     pub metadata: ReportMetadata,
@@ -403,6 +402,10 @@ pub struct StatusReport {
     pub provenance: ProvenanceGraph,
     /// Whether the projection behind every reading could be read.
     pub projection_state: ProjectionReadState,
+    /// Activity is present only when the caller named a session. Its absence
+    /// distinguishes an ordinary status read from a named session with no
+    /// evidence.
+    pub activity: Option<ActiveActivityState>,
 }
 
 impl StatusReport {
@@ -425,49 +428,12 @@ impl StatusReport {
             accounts,
             provenance,
             projection_state,
+            activity: None,
         }
     }
-}
-
-/// The live meter report for `aub now`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct NowReport {
-    pub metadata: ReportMetadata,
-    pub accounts: Vec<MeterAccount>,
-    pub provenance: ProvenanceGraph,
-    /// Explicit marker-backed live account activity (`aub-mgv.5`), separate from
-    /// the meter readings above: a moving meter never substitutes for it.
-    pub activity: ActiveActivityState,
-}
-
-impl NowReport {
-    pub fn new(
-        metadata: ReportMetadata,
-        accounts: Vec<MeterAccount>,
-        readings: Vec<MeterReadingProvenance>,
-    ) -> Self {
-        let provenance = ProvenanceGraph::new(readings.into_iter().map(|reading| {
-            (
-                ReportField::MeterQuotaRemaining {
-                    account: reading.account,
-                },
-                reading.node,
-            )
-        }));
-        Self {
-            metadata,
-            accounts,
-            provenance,
-            activity: ActiveActivityState::NoEvidence,
-        }
-    }
-
-    /// Attaches the composed activity state. A report built without evaluating
-    /// any session (no `--session-id` given) keeps the [`NowReport::new`]
-    /// default of [`ActiveActivityState::NoEvidence`], which is the correct
-    /// disposition rather than an omission: nothing was named to claim.
+    /// Attaches the composed activity state for a named session.
     pub fn with_activity(mut self, activity: ActiveActivityState) -> Self {
-        self.activity = activity;
+        self.activity = Some(activity);
         self
     }
 }
@@ -1734,7 +1700,6 @@ mod tests {
 
     carries_metadata!(
         StatusReport,
-        NowReport,
         SpendReport,
         CoverageReport,
         SampleReport,
@@ -1769,17 +1734,6 @@ mod tests {
                     )],
                     crate::report::ProjectionReadState::Read,
                 )) as Box<dyn CarriesMetadata>,
-            ),
-            (
-                "now",
-                Box::new(NowReport::new(
-                    m.clone(),
-                    vec![account.clone()],
-                    vec![MeterReadingProvenance::new(
-                        LogicalName::new("work-a"),
-                        node(),
-                    )],
-                )),
             ),
             (
                 "spend",
@@ -1867,7 +1821,7 @@ mod tests {
     #[test]
     fn every_report_model_carries_the_metadata() {
         let models = every_model(metadata());
-        assert_eq!(models.len(), 12, "every command must have a report model");
+        assert_eq!(models.len(), 11, "every command must have a report model");
 
         for (command, model) in &models {
             let carried = model.metadata();
@@ -2034,14 +1988,6 @@ mod tests {
             )],
             crate::report::ProjectionReadState::Read,
         );
-        let now = NowReport::new(
-            m.clone(),
-            vec![account.clone()],
-            vec![MeterReadingProvenance::new(
-                LogicalName::new("work-a"),
-                node(),
-            )],
-        );
         let spend = SpendReport::new(
             m.clone(),
             day(),
@@ -2148,7 +2094,6 @@ mod tests {
             match field {
                 ReportField::MeterQuotaRemaining { account } => {
                     assert!(status.provenance.resolve(field).is_some(), "{account:?}");
-                    assert!(now.provenance.resolve(field).is_some(), "{account:?}");
                 }
                 ReportField::SpendGroupTokens { key }
                 | ReportField::SpendGroupCredits { key }

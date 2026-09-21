@@ -164,7 +164,7 @@ e-03	aub-6fuo	e2e	run-e2e	sed	tests/e2e/cases/036-opencode-reset-precision.sh	s/
 e-04	aub-6fuo	e2e	run-e2e	sed	tests/e2e/cases/aub-z09n-codex-unstarted-window.sh	s/assert_stdout_contains 12 "primary||not_started|0"/assert_stdout_contains 12 "primary||not_started|1"/		not_started|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-05	aub-71j.5	e2e	run-e2e	sed	tests/e2e/cases/027-failure-semantics.sh	s/assert_exit 4 5/assert_exit 0 5/		class 4|exit-class|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-06	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/013-coverage.sh	s/assert_exit 6 1/assert_exit 0 1/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
-e-07	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/017-now.sh	s/aub work-primary ? · stale/aub work-primary ? · fresh/		stale|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
+e-07	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/017-now.sh	s/? · stale/? · fresh/		stale|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-08	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/013-status-projection.sh	s/assert_stdout_contains 1 "62%"/assert_stdout_contains 1 "63%"/		62%|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-09	aub-71j.8	e2e	run-e2e	sed	tests/e2e/cases/013-restore-drill.sh	s/assert_stdout_contains 7 "archive_verified=true"/assert_stdout_contains 7 "archive_verified=false"/		archive_verified|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-10	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/007-spend.sh	s/assert_json_field 2 "groups\[0\].tokens.output.value" "2092"/assert_json_field 2 "groups[0].tokens.output.value" "2093"/		2093|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh

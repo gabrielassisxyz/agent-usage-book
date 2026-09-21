@@ -4,7 +4,7 @@
 # (aub-mgv.1). Run against the release binary for the same reason 022-024 are.
 
 CASE_ID="025-now-account-switch-boundary"
-CASE_DESCRIPTION="aub now reports the post-switch account once its marker covers the report instant, never the account the session started under."
+CASE_DESCRIPTION="aub status reports the post-switch account once its marker covers the report instant, never the account the session started under."
 
 LEDGER_DB=""
 NOW_NS=""
@@ -36,7 +36,7 @@ case_steps() {
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
         "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
-        "$AUB_BIN" now --account work-primary
+        "$AUB_BIN" status --refresh --account work-primary
 
     # 2. The session starts under account-a 60 seconds ago, switches to
     #    account-b 30 seconds ago, and has a heartbeat 1 second old: fresh
@@ -65,12 +65,11 @@ case_steps() {
 
     # 3. The report instant is now, well after the switch: account-b, never
     #    account-a.
-    step "now-after-switch" env \
+    step "status-after-switch" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
-        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
-        "$AUB_BIN" now --account work-primary --session-id "claude-code:sess-switch-1" --format json
+        "$AUB_BIN" status --account work-primary --session-id "claude-code:sess-switch-1" --format json
 }
 
 case_assertions() {

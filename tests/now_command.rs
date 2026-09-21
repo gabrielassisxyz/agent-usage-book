@@ -1,8 +1,7 @@
 //! Integration, contract and unit tests for `aub now` (aub-eun.7).
 //!
-//! `aub now` forces a persisted sampling attempt for the selected accounts and
-//! renders the resulting current state through the same freshness function and
-//! report models `aub status` uses. These tests hold that contract:
+//! `aub now` delegates to `aub status --refresh`, preserving the selected
+//! accounts and shared output flags. These tests hold that contract:
 //!
 //! - Criterion 1: `now` and `now --account NAME` force an attempt and persist it
 //!   before rendering.
@@ -12,7 +11,7 @@
 //!   reading is rendered.
 //! - Criterion 5: human and JSON output carry exactly one freshness variant per
 //!   account.
-//! - Criterion 6: the command publishes a projection, so a following `status`
+//! - Criterion 6: the alias publishes a projection, so a following `status`
 //!   agrees with it.
 //! - Criterion 7: a `now` immediately followed by a `status` reports the same
 //!   reading and the same freshness.
@@ -32,14 +31,16 @@ use agent_usage_book::domain::time::{
 };
 use agent_usage_book::domain::window::{NominalWindowDuration, WindowResetState, WindowScope};
 use agent_usage_book::logging::{LogicalName, RunId};
+use agent_usage_book::presentation::Style;
 use agent_usage_book::presentation::json::{
-    now_json, now_json_with_explain, validate_now_report_json,
+    status_json, status_json_with_explain, validate_status_report_json,
 };
 use agent_usage_book::presentation::render::{
-    ExplainMode, render_now_report, render_now_report_with_explain,
+    ExplainMode, render_status_report, render_status_report_with_explain,
 };
 use agent_usage_book::report::{
-    LedgerGeneration, LimitingWindow, MeterAccount, NowReport, ReportMetadata,
+    LedgerGeneration, LimitingWindow, MeterAccount, ProjectionReadState, ReportMetadata,
+    StatusReport,
 };
 
 fn aub() -> Command {
@@ -53,9 +54,6 @@ const ANTHROPIC_SUCCESS_BODY: &[u8] = br#"{
     "five_hour": { "utilization": 25.0, "resets_at": "2030-01-01T00:00:00Z" },
     "seven_day": { "utilization": 50.0, "resets_at": "2030-01-01T00:00:00Z" }
 }"#;
-
-/// The fresh line `now` and `status` both render for a 50%-used limiting window.
-const FRESH_SEVEN_DAY_LINE: &str = "50% left · 7d";
 
 struct Environment {
     root: PathBuf,
@@ -181,14 +179,19 @@ fn now_forces_persistence_then_agrees_with_an_immediate_status() {
     let now = env.run(&server.url(), &["-v", "now"]);
     assert_eq!(now.code, 0, "aub now must exit 0: {}", now.stderr);
     assert!(
-        now.stdout
-            .contains(&format!("aub work-a {FRESH_SEVEN_DAY_LINE}")),
+        now.stderr.lines().any(|line| {
+            line == "aub: 'now' is deprecated and will be removed; use 'aub status --refresh' instead"
+        }),
+        "the alias must emit the exact deprecation line: {}",
+        now.stderr
+    );
+    assert!(
+        now.stdout.contains("  work-a  ") && now.stdout.contains(" 50% "),
         "now stdout: {}",
         now.stdout
     );
     assert!(
-        now.stdout
-            .contains(&format!("aub work-b {FRESH_SEVEN_DAY_LINE}")),
+        now.stdout.contains("  work-b  ") && now.stdout.contains(" 50% "),
         "now stdout: {}",
         now.stdout
     );
@@ -200,33 +203,24 @@ fn now_forces_persistence_then_agrees_with_an_immediate_status() {
     assert_eq!(results, 2, "one terminal result per account");
     assert_eq!(evidence, 2, "one response-evidence row per account");
 
-    // The structured log shows the report was emitted after the request was
-    // attempted, which was after the run started. `now` never emits a
-    // report before it has attempted the sample.
-    let order: Vec<&str> = ["run_started", "request_attempted", "report_rendered"]
+    // The delegated status path logs its run and request in order. It does not
+    // add an alias-only report event.
+    let order: Vec<&str> = ["run_started", "request_attempted"]
         .into_iter()
         .filter(|event| now.stderr.contains(event))
         .collect();
     assert_eq!(
         order,
-        vec!["run_started", "request_attempted", "report_rendered"],
-        "stderr must carry the three events in order: {}",
+        vec!["run_started", "request_attempted"],
+        "stderr must carry the status events in order: {}",
         now.stderr
     );
     let started = now.stderr.find("run_started").unwrap();
     let attempted = now.stderr.find("request_attempted").unwrap();
-    let rendered = now.stderr.find("report_rendered").unwrap();
-    assert!(
-        started < attempted && attempted < rendered,
-        "{}",
-        now.stderr
-    );
+    assert!(started < attempted, "{}", now.stderr);
 
-    // Criteria 6 and 7: an immediate status reads the projection `now` just
-    // published. `now` keeps the one-line-per-account form and `status` renders
-    // the grouped grid, so the two no longer match byte for byte; what must
-    // hold is that `status` reads `now`'s freshly published projection as a
-    // fresh reading for both accounts, never the never-observed form.
+    // Criteria 6 and 7: an immediate status reads the projection the alias
+    // just published and sees a fresh reading for both accounts.
     let status = env.run("http://127.0.0.1:9", &["status"]);
     assert_eq!(status.code, 0, "aub status must exit 0: {}", status.stderr);
     let status_out = status.stdout.trim();
@@ -255,18 +249,37 @@ fn now_forces_persistence_then_agrees_with_an_immediate_status() {
 }
 
 #[test]
-fn now_json_carries_exactly_one_freshness_variant_per_account() {
+fn now_alias_stdout_matches_direct_status_refresh() {
+    let env = Environment::new("alias-equality");
+    let server = success_server(4);
+
+    let alias = env.run(&server.url(), &["now", "--account", "work-a"]);
+    let direct = env.run(
+        &server.url(),
+        &["status", "--refresh", "--account", "work-a"],
+    );
+    assert_eq!(alias.code, 0, "alias stderr: {}", alias.stderr);
+    assert_eq!(direct.code, 0, "status stderr: {}", direct.stderr);
+    assert_eq!(alias.stdout, direct.stdout);
+}
+
+#[test]
+fn status_alias_json_carries_exactly_one_freshness_variant_per_account() {
     let env = Environment::new("json");
     let server = success_server(2);
 
     let out = env.run(&server.url(), &["now", "--format", "json"]);
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
 
-    let parsed = validate_now_report_json(out.stdout.trim())
-        .expect("now --format json must conform to schema v1");
-    assert_eq!(parsed.command, "now");
+    let parsed = validate_status_report_json(out.stdout.trim())
+        .expect("now alias --format json must conform to the status schema");
+    assert_eq!(parsed.command, "status");
 
     let doc: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    assert!(
+        doc.get("activity").is_none(),
+        "the alias without --session-id must not add activity: {doc}"
+    );
     let accounts = doc["accounts"].as_array().expect("accounts array");
     assert_eq!(accounts.len(), 2, "one object per configured account");
     for account in accounts {
@@ -286,6 +299,46 @@ fn now_json_carries_exactly_one_freshness_variant_per_account() {
     }
 }
 
+#[test]
+fn now_alias_forwards_session_selector_to_status() {
+    let env = Environment::new("session-alias");
+    let server = success_server(2);
+
+    let out = env.run(
+        &server.url(),
+        &[
+            "now",
+            "--session-id",
+            "claude-code:session-alias",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+
+    let doc: serde_json::Value = serde_json::from_str(out.stdout.trim()).unwrap();
+    assert_eq!(doc["command"], "status");
+    assert_eq!(doc["activity"]["state"], "no_evidence");
+}
+
+#[test]
+fn removed_now_report_symbols_are_absent_from_the_implementation() {
+    let cli = include_str!("../src/cli.rs");
+    let json = include_str!("../src/presentation/json.rs");
+    let render = include_str!("../src/presentation/render.rs");
+    for forbidden in [
+        "NowReport",
+        "render_now_report_with_explain",
+        "now_json_with_explain",
+        "KNOWN_NOW_KEYS",
+    ] {
+        assert!(
+            !cli.contains(forbidden) && !json.contains(forbidden) && !render.contains(forbidden),
+            "removed now symbol remains in the implementation: {forbidden}"
+        );
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Criterion 1 / 4: --account scopes the forced sample
 // -----------------------------------------------------------------------------
@@ -297,9 +350,9 @@ fn account_flag_forces_and_renders_only_the_named_account() {
 
     let out = env.run(&server.url(), &["now", "--account", "work-a"]);
     assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-    assert!(out.stdout.contains("aub work-a"), "stdout: {}", out.stdout);
+    assert!(out.stdout.contains("  work-a  "), "stdout: {}", out.stdout);
     assert!(
-        !out.stdout.contains("aub work-b"),
+        !out.stdout.contains("  work-b  "),
         "work-b must not be sampled or rendered when scoped: {}",
         out.stdout
     );
@@ -334,18 +387,17 @@ fn now_rejects_an_unknown_account_as_a_usage_error() {
 // -----------------------------------------------------------------------------
 
 #[test]
-fn now_accepts_only_format_explain_account_verbosity_and_no_bypass_flag() {
-    // The only flags `now` accepts are format, explain, account and verbosity.
-    // None of them changes what is fetched or whether it is recorded. `--model`
-    // and `--no-color` are refused with their reasons; there is deliberately no
-    // flag that fetches without recording.
+fn now_accepts_status_shared_flags_and_no_bypass_flag() {
+    // The alias accepts the same shared flags as status, including the model
+    // selector and plain rendering. There is deliberately no flag that fetches
+    // without recording.
     let now = AubCommand::Now.flag_policy();
     assert_eq!(now.format, FlagSupport::Accepted);
     assert_eq!(now.explain, FlagSupport::Accepted);
     assert_eq!(now.account, FlagSupport::Accepted);
     assert_eq!(now.verbosity, FlagSupport::Accepted);
-    assert!(matches!(now.model, FlagSupport::Rejected { .. }));
-    assert!(matches!(now.no_color, FlagSupport::Rejected { .. }));
+    assert_eq!(now.model, FlagSupport::Accepted);
+    assert_eq!(now.no_color, FlagSupport::Accepted);
 
     // The planted negative: enumerate the bypass-shaped flags a caller might
     // reach for to skip recording or skip the network, and assert every one is
@@ -486,20 +538,32 @@ fn the_now_renderers_carry_one_freshness_variant_per_account_in_both_formats() {
         None,
     );
 
-    let report = NowReport::new(metadata, vec![fresh, stale, auth], Vec::new());
+    let report = StatusReport::new(
+        metadata,
+        vec![fresh, stale, auth],
+        Vec::new(),
+        ProjectionReadState::Read,
+    );
 
     // Text: exactly one line per account, each carrying its one variant, in the
     // wording the shared meter-reading renderer produces.
-    let text = render_now_report(&report, now, envelope);
-    let lines: Vec<&str> = text.lines().collect();
-    assert_eq!(lines.len(), 3, "one line per account: {text}");
-    assert_eq!(lines[0], "aub work-a 25% left · 5h");
-    assert_eq!(lines[1], "aub work-b ~50% · stale 0s · age exceeded");
-    assert_eq!(lines[2], "aub work-c auth!");
+    let text = render_status_report(&report, now, envelope, Style::plain());
+    assert!(
+        text.contains("  work-a  ") && text.contains("    25% "),
+        "{text}"
+    );
+    assert!(
+        text.contains("  work-b  ") && text.contains("~50% · stale 0s"),
+        "{text}"
+    );
+    assert!(
+        text.contains("  work-c  ") && text.contains("auth!"),
+        "{text}"
+    );
 
-    // JSON: validates against schema v1 and every account carries one freshness.
-    let doc: serde_json::Value = serde_json::from_str(&now_json(&report, run.clone())).unwrap();
-    validate_now_report_json(&doc.to_string()).expect("now JSON conforms to schema v1");
+    // JSON: validates against the status schema and every account carries one freshness.
+    let doc: serde_json::Value = serde_json::from_str(&status_json(&report, run.clone())).unwrap();
+    validate_status_report_json(&doc.to_string()).expect("status JSON conforms to schema v5");
     for account in doc["accounts"].as_array().unwrap() {
         assert_eq!(
             account
@@ -513,14 +577,20 @@ fn the_now_renderers_carry_one_freshness_variant_per_account_in_both_formats() {
     }
 
     // Explain travels through the shared explain block, in both formats.
-    let explained = render_now_report_with_explain(&report, now, envelope, ExplainMode::Summary);
+    let explained = render_status_report_with_explain(
+        &report,
+        now,
+        envelope,
+        ExplainMode::Summary,
+        Style::plain(),
+    );
     assert!(
-        explained.starts_with("aub work-a 25% left · 5h"),
+        explained.starts_with("QUOTA") && explained.contains("  work-a  "),
         "{explained}"
     );
-    let json_explain = now_json_with_explain(&report, run, ExplainMode::Summary);
+    let json_explain = status_json_with_explain(&report, run, ExplainMode::Summary);
     assert_eq!(
-        validate_now_report_json(&json_explain).unwrap().command,
-        "now"
+        validate_status_report_json(&json_explain).unwrap().command,
+        "status"
     );
 }

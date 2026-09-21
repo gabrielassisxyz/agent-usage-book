@@ -5,7 +5,7 @@
 # in progress. Rebuilding the projection from the ledger reconstructs the state.
 #
 # A second account takes its credential from an environment variable
-# (aub-e2uz): the variable resolves in `aub config`, one `aub now` against the
+# (aub-e2uz): the variable resolves in `aub config`, one `aub status --refresh` against the
 # stub provider succeeds with it, and the state directory retains no trace of
 # the value the variable carried.
 
@@ -129,16 +129,16 @@ case_steps() {
         "AUB_TEST_TOKEN=$ENV_MATERIAL" \
         "$AUB_BIN" config
 
-    # 8. One `aub now` for the env-credential account against the stub
+    # 8. One `aub status --refresh` for the env-credential account against the stub
     #    provider: the variable's value is the credential material the request
     #    goes out with, and the attempt succeeds.
-    step "now-env-credential" env \
+    step "status-refresh-env-credential" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
         "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:$PORT" \
         "AUB_TEST_TOKEN=$ENV_MATERIAL" \
-        "$AUB_BIN" now --account env-primary
+        "$AUB_BIN" status --refresh --account env-primary
 
     # 9. The value the variable carried is nowhere in the state directory: not
     #    in the ledger, the spool, the projection, or any diagnostic the run
@@ -186,9 +186,9 @@ case_assertions() {
     assert_exit 0 7
     assert_stdout_contains 7 "accounts"
 
-    # Step 8: now with the env credential succeeded against the stub provider
+    # Step 8: status refresh with the env credential succeeded against the stub provider
     assert_exit 0 8
-    assert_stdout_contains 8 "aub env-primary"
+    assert_stdout_contains 8 "env-primary  anthropic"
 
     # Step 9: the variable's value left no trace in the state directory
     assert_exit 0 9

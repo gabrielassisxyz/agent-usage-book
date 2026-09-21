@@ -5450,7 +5450,9 @@ aub work-primary auth!
 aub work-primary ~38% · stale 9m · collector interrupted
 
 # Never successfully observed
-aub work-primary ? · stale · no successful sample
+aub status
+  work-primary  anthropic
+    ? · stale · no successful sample
 
 # Projection itself missing
 aub ?
