@@ -2683,6 +2683,8 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
                 rate_cards: &window_rate_cards,
                 window_key,
                 timestamp,
+                review_after: config.calibration.review_after,
+                health_refusal: std::cell::Cell::new(None),
             });
     let mut report = assemble_spend(
         &conn,
@@ -2718,15 +2720,24 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             spend_json_with_explain(&report, run, invocation.explain)
         ),
     }
+    let health_refusal = window_resolver
+        .as_ref()
+        .and_then(|resolver| resolver.health_refusal.get());
     if let Some(failure) = refresh_failure {
         Err(Error::IngestIncomplete(failure))
-    } else if report.ingest.unreadable_files.is_empty() {
-        Ok(())
-    } else {
+    } else if !report.ingest.unreadable_files.is_empty() {
         Err(Error::IngestIncomplete(format!(
             "{} file(s) could not be read; the counts above exclude them",
             report.ingest.unreadable_files.len()
         )))
+    } else if let Some(health) = health_refusal {
+        Err(Error::InsufficientEvidence(format!(
+            "window equivalent refused: the stored calibration for window {} is {}, not current",
+            options.window_equivalent.as_deref().unwrap_or_default(),
+            health.label()
+        )))
+    } else {
+        Ok(())
     }
 }
 
@@ -2743,6 +2754,14 @@ struct SpendWindowResolver<'a> {
     rate_cards: &'a crate::valuation::RateBook,
     window_key: &'a str,
     timestamp: UtcTimestamp,
+    /// The resolved `calibration.review_after`, which dates each stored
+    /// calibration's review instant from its fit time (`aub-8pjw`).
+    review_after: MonotonicDuration,
+    /// The health of a stored calibration that refused a group because it was
+    /// not current. A refusal is a per-group answer, so the resolver records it
+    /// here for the command to turn into a non-zero exit once the report is
+    /// rendered: a figure withheld for review must not look like a clean run.
+    health_refusal: std::cell::Cell<Option<crate::calibration::health::CalibrationHealth>>,
 }
 
 impl SpendWindowResolver<'_> {
@@ -2759,27 +2778,7 @@ impl SpendWindowResolver<'_> {
         &self,
         calibration: &crate::store::calibration::WindowCalibration,
     ) -> crate::calibration::health::CalibrationHealth {
-        let facts = crate::calibration::health::CalibrationFacts {
-            plan_tier: calibration.plan_tier().clone(),
-            meter_semantics_id: calibration.meter_semantics_id().clone(),
-            billing_semantics_id: calibration.billing_semantics_id().clone(),
-        };
-        let context = crate::calibration::health::ApplicabilityContext {
-            plan_tier: calibration.plan_tier().clone(),
-            meter_semantics_id: calibration.meter_semantics_id().clone(),
-            billing_semantics_id: calibration.billing_semantics_id().clone(),
-        };
-        crate::calibration::health::compute_health(
-            &crate::calibration::health::HealthInputs {
-                calibration: &facts,
-                context: &context,
-                lifecycle: crate::calibration::health::LifecycleState::Active,
-                cost_model_superseded: false,
-                drift: None,
-                review_due_at: None,
-            },
-            self.timestamp,
-        )
+        stored_window_calibration_health(calibration, self.review_after, self.timestamp)
     }
 
     /// The labelled fallback: window movement read straight off the
@@ -2975,6 +2974,7 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         let calibration = match (spend_window_precedence(health), calibration) {
             (SpendWindowPrecedence::Calibrated, Some(calibration)) => calibration,
             (SpendWindowPrecedence::RefuseHealth(health), _) => {
+                self.health_refusal.set(Some(health));
                 return Ok(window_refusal([crate::evidence::RequiredFact::new(
                     format!(
                         "current calibration for provider {} and window {}: calibration health is {}",
@@ -3024,8 +3024,12 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
             context: &applicability,
             lifecycle: crate::calibration::health::LifecycleState::Active,
             cost_model_superseded: crate::store::cost_model::is_superseded(self.conn, model.id())?,
+            // No drift finding is stored anywhere yet; aub-7j5u decides it.
             drift: None,
-            review_due_at: None,
+            review_due_at: Some(crate::store::calibration::review_due_at(
+                &calibration,
+                self.review_after,
+            )),
         };
         let health = crate::calibration::health::compute_health(&health_inputs, self.timestamp);
         Ok(crate::calibration::conversion::convert(
@@ -7037,6 +7041,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let GatheredWindowCalibrations {
         scalar: window_calibrations,
         per_kind: per_kind_windows,
+        not_current: not_current_calibrations,
     } = match &meter {
         crate::report::can_run::CanRunMeterReadiness::Fresh { windows, .. } => {
             gather_window_calibrations(
@@ -7045,6 +7050,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 &model,
                 plan_tier,
                 &account_config.provider,
+                config.calibration.review_after,
                 timestamp,
             )?
         }
@@ -7053,6 +7059,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             GatheredWindowCalibrations {
                 scalar: std::collections::BTreeMap::new(),
                 per_kind: std::collections::BTreeSet::new(),
+                not_current: std::collections::BTreeMap::new(),
             }
         }
     };
@@ -7148,7 +7155,22 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             &[("report_kind", &LogicalName::new("can-run"))],
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-    Ok(())
+    // A refusal that a stored calibration's health caused exits non-zero
+    // (`aub-8pjw`): the measurement exists and is asking for review, which a
+    // script must be able to tell from a clean answer without parsing prose.
+    // A refusal for a calibration that was never recorded keeps its exit 0.
+    let refused = matches!(
+        report.outcome,
+        crate::report::can_run::CanRunOutcome::Refused(_)
+    );
+    match not_current_calibrations.iter().next() {
+        Some((window, health)) if refused => Err(Error::InsufficientEvidence(format!(
+            "can-run refused: the stored calibration for window {} is {}, not current",
+            window.as_str(),
+            health.label()
+        ))),
+        _ => Ok(()),
+    }
 }
 
 /// Converts every provider-reported window constraining `model` into a
@@ -7163,10 +7185,12 @@ fn gather_window_calibrations(
     model: &crate::domain::window::ModelId,
     plan_tier: &str,
     provider: &str,
+    review_after: MonotonicDuration,
     generated_at: UtcTimestamp,
 ) -> Result<GatheredWindowCalibrations, Error> {
     let mut result = std::collections::BTreeMap::new();
     let mut per_kind = std::collections::BTreeSet::new();
+    let mut not_current = std::collections::BTreeMap::new();
     for window in windows.iter().filter(|w| w.constrains(model)) {
         let scope = crate::store::calibration::CalibrationScope {
             provider: crate::store::cost_model::ProviderKey::new(provider),
@@ -7185,33 +7209,10 @@ fn gather_window_calibrations(
             }
             Some(crate::store::calibration::ActiveCalibration::Scalar(cal)) => cal,
         };
-        // The applicability context mirrors the calibration's own scope
-        // rather than an independently tracked lifecycle: no caller anywhere
-        // in this codebase queries `calibration_lifecycle` for drift
-        // findings or a review horizon yet (`crate::store::reconciliation`
-        // makes the same simplification, `LifecycleState::Active` and no
-        // drift, for the same reason). A genuine plan-tier or semantics
-        // mismatch still surfaces correctly through `load_active_at` itself
-        // returning nothing for a tier nobody fitted.
-        let facts = crate::calibration::health::CalibrationFacts {
-            plan_tier: cal.plan_tier().clone(),
-            meter_semantics_id: cal.meter_semantics_id().clone(),
-            billing_semantics_id: cal.billing_semantics_id().clone(),
-        };
-        let context = crate::calibration::health::ApplicabilityContext {
-            plan_tier: cal.plan_tier().clone(),
-            meter_semantics_id: cal.meter_semantics_id().clone(),
-            billing_semantics_id: cal.billing_semantics_id().clone(),
-        };
-        let health_inputs = crate::calibration::health::HealthInputs {
-            calibration: &facts,
-            context: &context,
-            lifecycle: crate::calibration::health::LifecycleState::Active,
-            cost_model_superseded: false,
-            drift: None,
-            review_due_at: None,
-        };
-        let health = crate::calibration::health::compute_health(&health_inputs, generated_at);
+        let health = stored_window_calibration_health(&cal, review_after, generated_at);
+        if health != crate::calibration::health::CalibrationHealth::Current {
+            not_current.insert(window.semantic_key().clone(), health);
+        }
         let constraint = crate::advice::headroom::CalibratedWindowConstraint::new(
             cal.uncertainty(),
             map_calibration_health(health),
@@ -7227,17 +7228,65 @@ fn gather_window_calibrations(
     Ok(GatheredWindowCalibrations {
         scalar: result,
         per_kind,
+        not_current,
     })
 }
 
+/// The health of one stored scalar window calibration, judged against its own
+/// scope, as `spend --window-equivalent` and `can-run` both read it before any
+/// cost model is in hand.
+///
+/// The applicability context mirrors the calibration's own scope rather than
+/// an independently tracked lifecycle: a genuine plan-tier or semantics
+/// mismatch surfaces through `load_active_at` itself returning nothing for a
+/// tier nobody fitted. The review instant is the fit time plus the configured
+/// `calibration.review_after` (`aub-6omr`, `aub-8pjw`).
+fn stored_window_calibration_health(
+    calibration: &crate::store::calibration::WindowCalibration,
+    review_after: MonotonicDuration,
+    now: UtcTimestamp,
+) -> crate::calibration::health::CalibrationHealth {
+    let facts = crate::calibration::health::CalibrationFacts {
+        plan_tier: calibration.plan_tier().clone(),
+        meter_semantics_id: calibration.meter_semantics_id().clone(),
+        billing_semantics_id: calibration.billing_semantics_id().clone(),
+    };
+    let context = crate::calibration::health::ApplicabilityContext {
+        plan_tier: calibration.plan_tier().clone(),
+        meter_semantics_id: calibration.meter_semantics_id().clone(),
+        billing_semantics_id: calibration.billing_semantics_id().clone(),
+    };
+    crate::calibration::health::compute_health(
+        &crate::calibration::health::HealthInputs {
+            calibration: &facts,
+            context: &context,
+            lifecycle: crate::calibration::health::LifecycleState::Active,
+            cost_model_superseded: false,
+            // No drift finding is stored anywhere yet, and passive validation
+            // defines none; aub-7j5u decides it.
+            drift: None,
+            review_due_at: Some(crate::store::calibration::review_due_at(
+                calibration,
+                review_after,
+            )),
+        },
+        now,
+    )
+}
+
 /// What [`gather_window_calibrations`] found: the scalar lookups can-run
-/// bounds headroom with, and the windows whose active calibration is per-kind.
+/// bounds headroom with, the windows whose active calibration is per-kind, and
+/// the health of every stored calibration that is not current.
 struct GatheredWindowCalibrations {
     scalar: std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
         crate::report::can_run::WindowCalibrationLookup,
     >,
     per_kind: std::collections::BTreeSet<crate::domain::window::WindowSemanticKey>,
+    not_current: std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::calibration::health::CalibrationHealth,
+    >,
 }
 
 /// Converts the percent-of-window rate cards into the same credit constraint a
@@ -13218,6 +13267,8 @@ usage_evidence = "measured"
             rate_cards: &book,
             window_key: "five_hour",
             timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(4_000),
+            review_after: MonotonicDuration::from_seconds(30 * 86_400),
+            health_refusal: std::cell::Cell::new(None),
         };
         let usage = crate::domain::tokens::UsageVector::new(
             crate::domain::tokens::KnownTokenVector::new(
@@ -13247,6 +13298,90 @@ usage_evidence = "measured"
         );
     }
 
+    /// A scalar calibration fitted at `fit_nanos`, built in memory: the health
+    /// decision reads only the calibration's own fields.
+    fn review_window_calibration(fit_nanos: i64) -> crate::store::calibration::WindowCalibration {
+        let scope = crate::store::calibration::CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new("anthropic"),
+            plan_tier: crate::store::calibration::PlanTier::new("default"),
+            window_semantic_key: crate::domain::window::WindowSemanticKey::new("five_hour"),
+        };
+        crate::store::calibration::minimal_fixture(
+            "five_hour-review-calibration",
+            &scope,
+            &crate::domain::ids::MeterSemanticsId::new("fixture-meter-v1"),
+            &crate::domain::ids::BillingSemanticsId::new("fixture-billing-v1"),
+            &crate::domain::provenance::CostModelId::new("fixture-cost-model"),
+            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(100),
+            crate::store::cost_model::ValidityInterval::new(
+                crate::domain::time::UtcTimestamp::from_unix_nanos(0),
+                crate::domain::time::UtcTimestamp::from_unix_nanos(i64::MAX),
+            )
+            .expect("the validity interval is ordered"),
+            crate::domain::time::UtcTimestamp::from_unix_nanos(fit_nanos),
+        )
+    }
+
+    const REVIEW_FIT_NANOS: i64 = 1_000_000_000_000;
+    const ONE_SECOND_NANOS: i64 = 1_000_000_000;
+
+    fn review_after_thirty_days() -> MonotonicDuration {
+        MonotonicDuration::from_seconds(30 * 86_400)
+    }
+
+    fn review_instant_nanos() -> i64 {
+        REVIEW_FIT_NANOS + 30 * 86_400 * ONE_SECOND_NANOS
+    }
+
+    /// The health can-run and spend both read turns `review_due` exactly at
+    /// the fit time plus `calibration.review_after` (`aub-8pjw`): current one
+    /// second before, due at the instant and one second after. The planted
+    /// negative is the second before, which a wiring that passed no review
+    /// instant, or one dated from the wrong base, gets wrong on one side.
+    #[test]
+    fn stored_window_calibration_health_turns_review_due_at_the_configured_instant() {
+        use crate::calibration::health::CalibrationHealth;
+        let calibration = review_window_calibration(REVIEW_FIT_NANOS);
+        let at = |offset: i64| {
+            stored_window_calibration_health(
+                &calibration,
+                review_after_thirty_days(),
+                crate::domain::time::UtcTimestamp::from_unix_nanos(review_instant_nanos() + offset),
+            )
+        };
+        assert_eq!(at(-ONE_SECOND_NANOS), CalibrationHealth::Current);
+        assert_eq!(at(0), CalibrationHealth::ReviewDue);
+        assert_eq!(at(ONE_SECOND_NANOS), CalibrationHealth::ReviewDue);
+    }
+
+    /// The spend resolver judges a stored calibration by its configured
+    /// review instant, at the resolver's own report timestamp, on both sides
+    /// of the boundary.
+    #[test]
+    fn spend_resolver_calibration_health_reads_the_configured_review_instant() {
+        use crate::calibration::health::CalibrationHealth;
+        let (_dir, conn) = calibrate_fixture_db();
+        let book = crate::valuation::RateBook::default();
+        let calibration = review_window_calibration(REVIEW_FIT_NANOS);
+        let health_at = |offset: i64| {
+            let resolver = SpendWindowResolver {
+                conn: &conn,
+                active_cost_model: None,
+                rate_cards: &book,
+                window_key: "five_hour",
+                timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(
+                    review_instant_nanos() + offset,
+                ),
+                review_after: review_after_thirty_days(),
+                health_refusal: std::cell::Cell::new(None),
+            };
+            resolver.calibration_health(&calibration)
+        };
+        assert_eq!(health_at(-ONE_SECOND_NANOS), CalibrationHealth::Current);
+        assert_eq!(health_at(0), CalibrationHealth::ReviewDue);
+        assert_eq!(health_at(ONE_SECOND_NANOS), CalibrationHealth::ReviewDue);
+    }
+
     /// can-run gives a per-kind window no credit constraint and marks it, so
     /// the rate-card estimate does not stand in for a calibration that exists.
     #[test]
@@ -13272,6 +13407,7 @@ usage_evidence = "measured"
             &crate::domain::window::ModelId::new("claude-opus"),
             "default",
             "anthropic",
+            MonotonicDuration::from_seconds(30 * 86_400),
             crate::domain::time::UtcTimestamp::from_unix_nanos(4_000),
         )
         .expect("the lookup must answer");
