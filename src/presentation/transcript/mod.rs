@@ -1,9 +1,10 @@
-//! Session-transcript rendering behind `aub export transcript` (`aub-xpfl`).
+//! Session-transcript rendering behind `aub export transcript` (`aub-xpfl`
+//! ships the command and the claude-code renderer; `aub-51wv` adds the codex
+//! and pi renderers; the opencode renderer is the remaining sibling bead).
 //!
 //! One trait ([`TranscriptRenderer`]) turns a transcript file's raw text into
-//! [`TranscriptMessage`] values, one file per harness ([`claude_code`] ships
-//! with this bead; the codex, pi and opencode renderers are sibling beads
-//! that add a file each and register it by `session.source`), and
+//! [`TranscriptMessage`] values, one file per harness, each registered by
+//! `session.source` in [`renderer_for`], and
 //! [`render_transcript_markdown`] writes the finished [`TranscriptDocument`]
 //! as markdown. The document carries only already-typed values: the caller
 //! resolved the session and read the files, so nothing here touches the
@@ -15,10 +16,16 @@
 //! - the system clock or the filesystem
 
 pub mod claude_code;
+pub mod codex;
+pub mod pi;
+
+use std::collections::BTreeMap;
 
 use crate::domain::time::UtcTimestamp;
 
 pub use claude_code::ClaudeCodeTranscriptRenderer;
+pub use codex::CodexTranscriptRenderer;
+pub use pi::PiTranscriptRenderer;
 
 /// Who said a rendered message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,8 +116,9 @@ pub struct TranscriptDocument {
 }
 
 /// One harness's transcript reader: raw file text in, messages out, in file
-/// order. Sibling beads implement this for their harness and register it in
-/// [`renderer_for`].
+/// order. A line the renderer does not understand is counted by type (see
+/// [`render_file_with_skipped`]), never rendered as prose: a wrong number
+/// here would read as a plausible session.
 pub trait TranscriptRenderer {
     /// The `session.source` value this renderer reads, e.g. `claude-code`.
     fn harness(&self) -> &'static str;
@@ -119,6 +127,17 @@ pub trait TranscriptRenderer {
     /// renderer does not understand is skipped, never rendered as prose: a
     /// wrong number here would read as a plausible session.
     fn render_file(&self, body: &str) -> Vec<TranscriptMessage>;
+
+    /// Reads one transcript file's whole text into messages plus the count
+    /// of skipped lines by type. The default keeps the plain reading and
+    /// reports nothing skipped, so a renderer with no unclassified lines
+    /// (today: claude-code) implements only [`render_file`].
+    fn render_file_with_skipped(
+        &self,
+        body: &str,
+    ) -> (Vec<TranscriptMessage>, BTreeMap<String, usize>) {
+        (self.render_file(body), BTreeMap::new())
+    }
 }
 
 /// The renderer for one harness name, when this binary ships one. A harness
@@ -127,6 +146,8 @@ pub trait TranscriptRenderer {
 pub fn renderer_for(harness: &str) -> Option<&'static dyn TranscriptRenderer> {
     match harness {
         "claude-code" => Some(claude_code_renderer()),
+        "codex" => Some(codex_renderer()),
+        "pi" => Some(pi_renderer()),
         _ => None,
     }
 }
@@ -134,6 +155,23 @@ pub fn renderer_for(harness: &str) -> Option<&'static dyn TranscriptRenderer> {
 fn claude_code_renderer() -> &'static dyn TranscriptRenderer {
     static RENDERER: ClaudeCodeTranscriptRenderer = ClaudeCodeTranscriptRenderer;
     &RENDERER
+}
+
+fn codex_renderer() -> &'static dyn TranscriptRenderer {
+    static RENDERER: CodexTranscriptRenderer = CodexTranscriptRenderer;
+    &RENDERER
+}
+
+fn pi_renderer() -> &'static dyn TranscriptRenderer {
+    static RENDERER: PiTranscriptRenderer = PiTranscriptRenderer;
+    &RENDERER
+}
+
+/// One aggregated skipped-lines report for the end of an export:
+/// `skipped: N lines of type X`. The wording is fixed so the operator can
+/// grep it; the caller prints one line per type, never one per line.
+pub fn format_transcript_skipped_line(skipped_type: &str, count: usize) -> String {
+    format!("skipped: {count} lines of type {skipped_type}")
 }
 
 /// Whether a transcript path is a claude-code subagent transcript:
@@ -476,12 +514,35 @@ mod tests {
 
     #[test]
     fn an_unknown_harness_has_no_renderer() {
-        assert!(renderer_for("codex").is_none());
-        assert!(renderer_for("pi").is_none());
-        assert!(renderer_for("opencode").is_none());
         assert_eq!(
             renderer_for("claude-code").unwrap().harness(),
             "claude-code"
         );
+        assert_eq!(renderer_for("codex").unwrap().harness(), "codex");
+        assert_eq!(renderer_for("pi").unwrap().harness(), "pi");
+        assert!(renderer_for("opencode").is_none());
+        assert!(renderer_for("future-harness").is_none());
+    }
+
+    #[test]
+    fn the_skipped_line_report_spells_the_count_and_the_type() {
+        // The planted negative: a free-form message would still contain both
+        // halves, so this pins the exact wording the operator greps for.
+        assert_eq!(
+            format_transcript_skipped_line("mystery_widget", 2),
+            "skipped: 2 lines of type mystery_widget"
+        );
+    }
+
+    #[test]
+    fn the_default_skipped_reading_reports_nothing() {
+        // The claude-code renderer implements only `render_file`, so the
+        // default arm must keep its reading and report no skipped lines:
+        // adding counting there would change its export output.
+        let body = "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hi\"},\"timestamp\":\"2026-09-06T10:00:00.000Z\"}\n";
+        let renderer = renderer_for("claude-code").unwrap();
+        let (messages, skipped) = renderer.render_file_with_skipped(body);
+        assert_eq!(messages.len(), 1);
+        assert!(skipped.is_empty());
     }
 }

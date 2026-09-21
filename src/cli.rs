@@ -4418,13 +4418,19 @@ fn export_transcript_command(
         include_tools: args.include_tools,
         include_thinking: args.include_thinking,
     };
-    let (rendered_files, missing_paths) = read_transcript_files(renderer, &ordered);
+    let (rendered_files, missing_paths, skipped_counts) = read_transcript_files(renderer, &ordered);
     for (path, error) in &missing_paths {
         if error.kind() == std::io::ErrorKind::NotFound {
             eprintln!("missing: {path}");
         } else {
             eprintln!("unreadable: {path}: {error}");
         }
+    }
+    for (skipped_type, count) in &skipped_counts {
+        eprintln!(
+            "{}",
+            crate::presentation::transcript::format_transcript_skipped_line(skipped_type, *count)
+        );
     }
     let missing = missing_paths.len();
     let document = crate::presentation::transcript::TranscriptDocument {
@@ -4465,28 +4471,40 @@ fn export_transcript_command(
 }
 
 /// Reads every transcript file for one export: rendered files in order,
-/// plus the paths that could not be read with their errors. A file that no
-/// longer exists is reported by path and the export continues with the rest.
+/// the paths that could not be read with their errors, and the skipped-line
+/// counts by type aggregated across files. A file that no longer exists is
+/// reported by path and the export continues with the rest.
+type TranscriptFilesRead = (
+    Vec<crate::presentation::transcript::TranscriptFile>,
+    Vec<(String, std::io::Error)>,
+    std::collections::BTreeMap<String, usize>,
+);
+
 fn read_transcript_files(
     renderer: &dyn crate::presentation::transcript::TranscriptRenderer,
     paths: &[String],
-) -> (
-    Vec<crate::presentation::transcript::TranscriptFile>,
-    Vec<(String, std::io::Error)>,
-) {
+) -> TranscriptFilesRead {
     let mut rendered = Vec::new();
     let mut missing = Vec::new();
+    let mut skipped = std::collections::BTreeMap::new();
     for path in paths {
         match std::fs::read_to_string(path) {
-            Ok(body) => rendered.push(crate::presentation::transcript::TranscriptFile {
-                file_name: crate::presentation::transcript::transcript_file_name(path).to_string(),
-                is_subagent: crate::presentation::transcript::is_subagent_transcript_path(path),
-                messages: renderer.render_file(&body),
-            }),
+            Ok(body) => {
+                let (messages, counts) = renderer.render_file_with_skipped(&body);
+                for (skipped_type, count) in counts {
+                    *skipped.entry(skipped_type).or_insert(0) += count;
+                }
+                rendered.push(crate::presentation::transcript::TranscriptFile {
+                    file_name: crate::presentation::transcript::transcript_file_name(path)
+                        .to_string(),
+                    is_subagent: crate::presentation::transcript::is_subagent_transcript_path(path),
+                    messages,
+                });
+            }
             Err(error) => missing.push((path.clone(), error)),
         }
     }
-    (rendered, missing)
+    (rendered, missing, skipped)
 }
 
 /// The default output path `~/agent-transcripts/<default name>`, creating
@@ -11442,7 +11460,7 @@ mod tests {
         .unwrap();
         let gone = scratch.join("gone.jsonl").to_string_lossy().to_string();
         let renderer = crate::presentation::transcript::renderer_for("claude-code").unwrap();
-        let (rendered, missing) = read_transcript_files(
+        let (rendered, missing, skipped) = read_transcript_files(
             renderer,
             &[
                 parent.to_string_lossy().to_string(),
@@ -11461,6 +11479,47 @@ mod tests {
             std::io::ErrorKind::NotFound,
             "a vanished file reports as missing, not unreadable"
         );
+        assert!(
+            skipped.is_empty(),
+            "the claude-code reading counts nothing skipped"
+        );
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    /// The read loop aggregates skipped-line counts across files, so the
+    /// caller reports each unknown type once at the end of the export.
+    #[test]
+    fn transcript_read_aggregates_skipped_counts_across_files() {
+        let scratch = std::env::temp_dir().join(format!(
+            "aub-51wv-read-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock runs forward")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let first = scratch.join("first.jsonl");
+        let second = scratch.join("second.jsonl");
+        std::fs::write(&first, "{\"type\":\"mystery_widget\",\"payload\":{}}\n").unwrap();
+        std::fs::write(
+            &second,
+            "{\"type\":\"mystery_widget\",\"payload\":{}}\n{\"type\":\"other_widget\",\"payload\":{}}\n",
+        )
+        .unwrap();
+        let renderer = crate::presentation::transcript::renderer_for("codex").unwrap();
+        let (rendered, missing, skipped) = read_transcript_files(
+            renderer,
+            &[
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ],
+        );
+        assert_eq!(rendered.len(), 2);
+        assert!(missing.is_empty());
+        assert!(rendered.iter().all(|file| file.messages.is_empty()));
+        assert_eq!(skipped.get("mystery_widget"), Some(&2));
+        assert_eq!(skipped.get("other_widget"), Some(&1));
         std::fs::remove_dir_all(&scratch).ok();
     }
 
