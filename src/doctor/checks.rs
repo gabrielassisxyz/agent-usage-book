@@ -3462,7 +3462,9 @@ mod tests {
 
         let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
         ctx.db_missing = false;
-        ctx.timestamp = UtcTimestamp::from_unix_nanos(3_000);
+        // The context's own clock, 2023, is inside the card's effective
+        // interval and after the activation: an earlier instant would find no
+        // card in force and pass whether or not the calibration was honoured.
         ctx.db = Some(&conn);
         assert_eq!(window_estimate_in_use(&ctx).status, CheckStatus::Pass);
     }
