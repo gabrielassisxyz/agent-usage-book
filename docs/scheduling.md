@@ -45,6 +45,37 @@ exits non-zero only when it could not persist or operate at all. `aub coverage` 
 mechanism for alarming on a source that has failed for too long; the timer does not need
 to watch its own exit code for that.
 
+## Scheduling the alarm
+
+The sentence above names `aub coverage` as the alarm, and for a long time nothing
+scheduled it. That gap has a measured cost: the `opencode` account stopped authenticating
+on 2026-09-18 and was found on 2026-09-20, by somebody reading a series for an unrelated
+reason. Every layer behaved as designed while it happened, which is exactly why no layer
+raised it.
+
+- **systemd**: [`examples/scheduler/systemd/aub-coverage.service`](../examples/scheduler/systemd/aub-coverage.service)
+  and [`aub-coverage.timer`](../examples/scheduler/systemd/aub-coverage.timer), installed
+  the same way as the sampling pair. The service names an `OnFailure=` unit this
+  repository does not ship: what an alarm should do is the operator's decision, and the
+  exit class is what reaches it.
+- **cron**: [`examples/scheduler/cron/aub-coverage.cron`](../examples/scheduler/cron/aub-coverage.cron),
+  which discards stdout and leaves stderr alone. `aub coverage` prints its box on stdout
+  every run and the breach line on stderr, so that redirect turns cron's own mail into
+  the alarm without mailing an unread box every hour.
+
+**Detection latency, so the hourly cadence can be argued with rather than assumed.** With
+a five-minute sampling interval and the default authentication-backoff threshold of
+three, an account that starts refusing enters backoff about fifteen minutes after its
+first refusal. The doubling hold then costs roughly twelve attempts over the following
+hour, about four percent of a 288-attempt day, which is already under the 98% attempt
+floor. An hourly check therefore surfaces the condition within about two hours of the
+first refusal.
+
+`aub doctor` reports the same condition under `account-in-auth-backoff`, naming the
+account, its streak and the hold. It is a report and not a gate: `aub doctor` exits zero
+with checks failing, by contract, so it tells an operator who is already looking what is
+wrong. It cannot be the thing that makes them look.
+
 ## Scheduling the periodic restore drill
 
 A verified backup proves the archive is intact; it says nothing about whether the

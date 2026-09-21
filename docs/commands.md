@@ -862,6 +862,16 @@ day, while a recovered fault stops reporting on its own. An entry without
 the authority rather than a ledger query because a due-lookup failure can occur
 before the ledger contains a row from which to reconstruct it.
 
+`account-in-auth-backoff` names every configured account the authentication
+backoff is currently holding, with its trailing `auth_required` streak, the
+hold the scheduler would apply past the last rejection, and how long ago the
+account last observed anything. The verdict comes from the same delay function
+the scheduler and the coverage engine call, so the three cannot disagree about
+what backoff means. Like every check that is not a configured floor it reports
+and does not gate: `aub doctor` still exits zero with it failing. The alarm
+that rides an exit code is `aub coverage`, scheduled separately
+(`docs/scheduling.md`).
+
 **Refuses:** to repair anything unless `--fix` is given, and even then it
 refuses anything outside the four permitted repairs; the rest of the check
 registry only reports. `--fix` also refuses combination with

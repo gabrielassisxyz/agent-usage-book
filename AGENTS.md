@@ -544,6 +544,7 @@ holding everything, and do not wait on the file.
 | `src/lib.rs` | the crate root, one `pub mod` line per module |
 | `src/config/mod.rs`, `src/domain/mod.rs`, `src/presentation/mod.rs`, `src/store/mod.rs` | the module declaration surface, one `pub mod` line per submodule |
 | `src/error.rs`, `src/problem_code.rs` | registries, one variant per failure a bead introduces |
+| `src/doctor/mod.rs` | the check registry: one `CheckName` variant, one `EXPECTED` entry and one `as_str` arm per bead that adds a check, plus the array's own length. Found by `aub-k98b`, which added the twenty-sixth |
 | `src/cli.rs` | the command enumeration and `Command::ALL` |
 | `Cargo.toml` | one dependency line per bead that needs one |
 | `src/store/migrations/mod.rs` | the migration registry, one `pub mod` line and one `registry()` entry per schema bead. Take the version number as the highest one present plus one, under reservation of this file: `validate_registry()` refuses a gap or a duplicate, and the pane check subset never runs it, so a collision surfaces only at batch-verify |

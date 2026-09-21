@@ -1,0 +1,31 @@
+# Runs one `aub coverage` check. Paired with aub-coverage.timer.
+#
+# This unit is the alarm, and it is separate from the sampler on purpose.
+# `aub sample` treats a provider's authentication refusal as successfully
+# recorded evidence and exits zero, which is correct: the refusal is the
+# observation. The consequence is that an account whose credential has stopped
+# working keeps the sampler green forever while its series goes dark, so the
+# scheduled path can never raise the alarm by failing.
+#
+# `aub coverage` can. It exits with the ThresholdNotMet class (7) when an
+# account falls below a configured floor, which is what OnFailure below turns
+# into a notification.
+#
+# ExecStart names an absolute path on purpose: systemd services do not run
+# inside an interactive shell and do not read its PATH, so a bare `aub` here
+# would fail with "command not found" the first time the unit runs. Replace
+# /usr/local/bin/aub below with wherever `aub` actually lives on this machine.
+#
+# OnFailure names a unit this repository does not ship, because what an alarm
+# should do is the operator's decision and not a tool's: a desktop
+# notification, a mail, a webhook, an entry in a log somebody reads. Write that
+# unit, name it here, and the exit code above reaches it. Without an OnFailure
+# line the failure is visible only in `systemctl --user status`, which is the
+# same silence this unit exists to break.
+[Unit]
+Description=aub coverage (sampling coverage alarm)
+OnFailure=aub-coverage-alarm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aub coverage

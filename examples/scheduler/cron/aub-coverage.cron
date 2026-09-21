@@ -1,0 +1,21 @@
+# For platforms without systemd. Install with `crontab -e` (per-user) or as a
+# file under /etc/cron.d/ (system-wide; that form needs a user column between
+# the schedule and the command, e.g. "0 * * * * root /usr/local/bin/aub ...").
+#
+# Runs `aub coverage` once an hour. This is the alarm, and it is a separate
+# entry from the sampling one on purpose: `aub sample` treats an authentication
+# refusal as successfully recorded evidence and exits zero, so an account whose
+# credential stopped working keeps the sampler quiet forever while its series
+# goes dark. `aub coverage` exits with the ThresholdNotMet class (7) when an
+# account falls below a configured floor.
+#
+# The redirect is the opposite of the sampling entry's and for the opposite
+# reason. `aub coverage` prints its box on stdout on every run, breach or not,
+# so leaving stdout alone would mail an unread box every hour and train the
+# operator to filter the one mail that matters. The breach line goes to stderr:
+#
+#   aub: <account> attempt coverage 1.4% is below the 98% floor; ...
+#
+# cron mails whatever a job writes, so discarding stdout leaves exactly that
+# line as the alarm. Do not redirect stderr as well.
+0 * * * * /usr/local/bin/aub coverage >/dev/null

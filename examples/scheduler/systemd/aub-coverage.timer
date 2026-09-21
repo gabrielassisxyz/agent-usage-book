@@ -1,0 +1,28 @@
+# Ticks aub-coverage.service once an hour.
+#
+# The cadence is chosen against the detection latency it buys, not by habit.
+# With the shipped five-minute sampling interval and the default
+# authentication-backoff threshold of three, an account that starts refusing
+# enters backoff about fifteen minutes after its first refusal. The doubling
+# hold then costs roughly twelve attempts over the following hour, which is
+# about four percent of a 288-attempt day and therefore already under the
+# ninety-eight percent attempt floor. An hourly check surfaces the condition
+# within about two hours of the first refusal.
+#
+# The number worth comparing that against: the `opencode` account stopped
+# authenticating on 2026-09-18 and was found on 2026-09-20, by a person
+# reading a series for an unrelated reason.
+#
+# Enable with: systemctl --user enable --now aub-coverage.timer
+# (drop --user, and install under /etc/systemd/system/, for a system-wide
+# account instead of a per-user one.)
+[Unit]
+Description=Tick aub coverage every hour
+
+[Timer]
+OnCalendar=hourly
+AccuracySec=1m
+Persistent=true
+
+[Install]
+WantedBy=timers.target

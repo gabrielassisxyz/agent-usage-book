@@ -8,7 +8,7 @@
 //! outside a module; a check written beside the evidence sees the failure the module
 //! itself would flag.
 //!
-//! [`CheckName::EXPECTED`] is the design's full twenty-five-condition list, encoded once
+//! [`CheckName::EXPECTED`] is the design's full twenty-six-condition list, encoded once
 //! so the registry can be compared against it rather than trusted by inspection. An
 //! entry with no registered [`CheckOutcome`] is a failing build
 //! ([`missing_checks`]). During staged implementation an entry whose owning
@@ -57,6 +57,7 @@ pub enum CheckName {
     MeterErrorClassifications,
     SubscriptionIdentityChange,
     CostModelActive,
+    AccountInAuthBackoff,
 }
 
 impl CheckName {
@@ -75,8 +76,12 @@ impl CheckName {
     /// subscription-history table existed for a check to read, and
     /// [`Self::CostModelActive`] added by `aub-6wym` once the `cost-model`
     /// command gave the operator a shipping path to repair what the check
-    /// reports.
-    pub const EXPECTED: [CheckName; 25] = [
+    /// reports, and [`Self::AccountInAuthBackoff`] added by `aub-k98b` because
+    /// an account held at the authentication-backoff ceiling was invisible for
+    /// two days in September 2026: the sampler records the refusal as evidence
+    /// and exits zero by contract, so nothing in the scheduled path could ever
+    /// surface it.
+    pub const EXPECTED: [CheckName; 26] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -102,6 +107,7 @@ impl CheckName {
         Self::MeterErrorClassifications,
         Self::SubscriptionIdentityChange,
         Self::CostModelActive,
+        Self::AccountInAuthBackoff,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -132,6 +138,7 @@ impl CheckName {
             Self::MeterErrorClassifications => "meter-error-classifications",
             Self::SubscriptionIdentityChange => "subscription-identity-change",
             Self::CostModelActive => "cost-model-active",
+            Self::AccountInAuthBackoff => "account-in-auth-backoff",
         }
     }
 }

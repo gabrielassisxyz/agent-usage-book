@@ -178,7 +178,7 @@ case_steps() {
 case_assertions() {
     # Step 1: doctor reports, it does not gate: exit success with failures.
     assert_exit 0 1
-    assert_stdout_contains 1 "Doctor: 25 checks"
+    assert_stdout_contains 1 "Doctor: 26 checks"
     assert_stdout_contains 1 "[PASS] configuration-validity"
     assert_stdout_contains 1 "[PASS] sqlite-and-schema-health"
     assert_stdout_contains 1 "[PASS] strict-and-constraint-integrity"
@@ -266,6 +266,11 @@ case_assertions() {
     assert_stdout_contains 6 "[FAIL] subscription-identity-change"
     # Activation is an operator decision, not a --fix repair: the warn stands.
     assert_stdout_contains 6 "[WARN] cost-model-active"
+    # aub-k98b: the seeded account has no trailing auth_required streak, so the
+    # backoff check passes here. Its failing path is covered by the unit cases;
+    # what this case owns is that the entry exists in the rendered registry at
+    # all, and that adding a check did not turn doctor into a gate.
+    assert_stdout_contains 6 "[PASS] account-in-auth-backoff"
 
     # Step 7: JSON reflects the repaired state.
     assert_exit 0 7

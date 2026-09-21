@@ -77,6 +77,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         meter_error_classifications(ctx),
         subscription_identity_change(ctx),
         cost_model_active(ctx),
+        account_in_auth_backoff(ctx),
     ]
 }
 
@@ -136,6 +137,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::MeterErrorClassifications => "store::meter_attempt",
         CheckName::SubscriptionIdentityChange => "store::subscription_identity",
         CheckName::CostModelActive => "store::cost_model",
+        CheckName::AccountInAuthBackoff => "meter::due",
     }
 }
 
@@ -199,6 +201,9 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::CostModelActive => {
             "a published cost model is active whenever rate cards are imported"
+        }
+        CheckName::AccountInAuthBackoff => {
+            "no configured account is held by the authentication backoff, recomputed from the trailing auth_required streak with the scheduler's own delay function"
         }
     }
 }
@@ -333,6 +338,120 @@ fn recent_attempt_threshold_nanos(ctx: &DoctorContext) -> u64 {
 
 /// One configured account's latest sampling attempt is older than three times the
 /// configured default interval, or it has never had one at all.
+/// No configured account is held by the authentication backoff (`aub-k98b`).
+///
+/// This check exists because every other layer is silent about the condition by
+/// design. An `auth_required` result is recorded evidence, so `aub sample`
+/// commits it and exits zero; the hold itself is recomputed every tick from the
+/// trailing streak and is never written down, so there is no state to query;
+/// and the scheduler therefore keeps exiting zero while an account samples four
+/// times a day instead of 288. On the `opencode` account that ran for two days
+/// before anyone noticed.
+///
+/// The verdict comes from [`crate::meter::due::auth_backoff_delay`], the same
+/// function the scheduler and the coverage engine call, so this check cannot
+/// disagree with them about what backoff means. Two details are inherited from
+/// that call rather than invented here: `credential_changed` is `false`, which
+/// is what the coverage engine passes when reconstructing the same hold from
+/// evidence alone, and a delay at or below the ordinary cadence is not a
+/// postponement at all. Passing `false` is also the fail-loud direction: an
+/// operator who has just replaced a credential already knows, while the account
+/// nobody has looked at is the one this check is for.
+///
+/// It reports and does not gate. `aub doctor` exits zero with this check
+/// failing, which is the documented contract for every check that is not a
+/// configured floor; the alarm that rides an exit code is `aub coverage`, and
+/// `examples/scheduler/` ships the units that run it on a cadence.
+fn account_in_auth_backoff(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.config.accounts.is_empty() {
+        CheckStatus::NotApplicable("no accounts configured".to_string())
+    } else if ctx.db_missing {
+        CheckStatus::NotApplicable(
+            "no ledger database exists yet; nothing has been sampled".to_string(),
+        )
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => {
+                let cadence = ctx.config.sampling.default_interval;
+                let threshold = ctx.config.sampling.auth_backoff_threshold;
+                let cap = ctx.config.sampling.auth_backoff_cap;
+                let mut held = Vec::new();
+                for account in &ctx.config.accounts {
+                    let id = match crate::store::account::account_id_by_identity(
+                        conn,
+                        &account.provider,
+                        &account.name,
+                    ) {
+                        Ok(Some(id)) => id,
+                        // An account never observed is not in backoff; the
+                        // cadence check owns the case where it should have been.
+                        Ok(None) => continue,
+                        Err(error) => {
+                            held.push(format!("{}: {error}", account.name));
+                            continue;
+                        }
+                    };
+                    let streak =
+                        match crate::store::meter_attempt::consecutive_auth_failures_for_account(
+                            conn, id,
+                        ) {
+                            Ok(streak) => streak,
+                            Err(error) => {
+                                held.push(format!("{}: {error}", account.name));
+                                continue;
+                            }
+                        };
+                    let Some(delay) = crate::meter::due::auth_backoff_delay(
+                        cadence, threshold, cap, streak, false,
+                    ) else {
+                        continue;
+                    };
+                    if delay.as_nanos() <= cadence.as_nanos() {
+                        continue;
+                    }
+                    held.push(format!(
+                        "{}: {streak} consecutive auth_required, held {}s past the last rejection, last success {}",
+                        account.name,
+                        delay.as_nanos() / 1_000_000_000,
+                        last_success_phrase(ctx, conn, id),
+                    ));
+                }
+                if held.is_empty() {
+                    CheckStatus::Pass
+                } else {
+                    CheckStatus::Fail(held.join("; "))
+                }
+            }
+        }
+    };
+    outcome(CheckName::AccountInAuthBackoff, status)
+}
+
+/// How long ago the account last observed anything, phrased for the check's own
+/// message. The age is the number that says how long the series has been dark,
+/// which is the question an operator reading this check is actually asking.
+fn last_success_phrase(
+    ctx: &DoctorContext,
+    conn: &Connection,
+    id: crate::store::account::AccountId,
+) -> String {
+    match crate::store::meter_attempt::newest_successful_attempt_for_account(conn, id) {
+        Ok(Some(attempt)) => {
+            let age_nanos = ctx
+                .timestamp
+                .unix_nanos()
+                .saturating_sub(attempt.request_started_at.unix_nanos())
+                .max(0) as u64;
+            format!("{}s ago", age_nanos / 1_000_000_000)
+        }
+        Ok(None) => "never".to_string(),
+        Err(error) => format!("unreadable ({error})"),
+    }
+}
+
 fn sampling_cadence(ctx: &DoctorContext) -> CheckOutcome {
     let status = if ctx.config.accounts.is_empty() {
         CheckStatus::NotApplicable("no accounts configured".to_string())
@@ -1790,6 +1909,177 @@ mod tests {
             },
         )
         .expect("result must insert");
+    }
+
+    /// Seeds one account with `count` consecutive `auth_required` attempts,
+    /// optionally followed by a success, so a case can build the exact streak
+    /// the backoff computation reads.
+    fn seed_auth_streak(
+        conn: &rusqlite::Connection,
+        provider: &str,
+        name: &str,
+        started_at: UtcTimestamp,
+        count: u32,
+        then_success: bool,
+    ) {
+        use crate::domain::attempt::AttemptOutcome;
+        use crate::domain::time::MonotonicDuration;
+        use crate::store::account::observe_account;
+        use crate::store::meter_attempt::{
+            DueReason, NewMeterAttempt, NewMeterAttemptResult, record_meter_attempt_result,
+            start_meter_attempt,
+        };
+        use crate::store::sample_run::{Trigger, start_sample_run};
+        use crate::store::sampling_policy_snapshot::{
+            ResolvedSamplingPolicy, resolve_policy_snapshot,
+        };
+
+        const POLICY: ResolvedSamplingPolicy = ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_millis(300_000),
+            freshness_horizon: MonotonicDuration::from_millis(900_000),
+            reset_edge_policy: String::new(),
+            retry_backoff_policy: String::new(),
+            command_budget: MonotonicDuration::from_millis(60_000),
+            policy_algorithm_version: String::new(),
+        };
+
+        let account =
+            observe_account(conn, provider, name, started_at).expect("account must insert");
+        let run = start_sample_run(conn, Trigger::Manual, started_at, "seed")
+            .expect("sample run must insert");
+        let snapshot = resolve_policy_snapshot(conn, account, started_at, &POLICY)
+            .expect("policy snapshot must insert");
+        let total = count + u32::from(then_success);
+        for index in 0..total {
+            let at = UtcTimestamp::from_unix_nanos(
+                started_at.unix_nanos() + i64::from(index) * 1_000_000_000,
+            );
+            let attempt = start_meter_attempt(
+                conn,
+                &NewMeterAttempt {
+                    run_id: run,
+                    account_id: account,
+                    provider: provider.to_string(),
+                    request_started_at: at,
+                    credential_context_id: Some("ctx".into()),
+                    policy_snapshot_id: snapshot,
+                    due_at: at,
+                    due_reason: DueReason::OrdinaryCadence,
+                    due_basis: None,
+                    provider_contract_id: "endpoint-schema-v3".into(),
+                    meter_semantics_id: "account-5h-v2".into(),
+                },
+            )
+            .expect("attempt must insert");
+            let success = then_success && index == total - 1;
+            let outcome = if success {
+                AttemptOutcome::Success
+            } else {
+                AttemptOutcome::AuthRequired
+            };
+            // The store refuses a refusal with no classification, which is the
+            // invariant that keeps an unexplained failure out of the ledger.
+            let classification = (!success).then(|| "http_401".to_string());
+            record_meter_attempt_result(
+                conn,
+                &NewMeterAttemptResult {
+                    attempt_id: attempt,
+                    completed_at: at,
+                    elapsed: MonotonicDuration::from_millis(10),
+                    outcome,
+                    sanitized_error_classification: classification,
+                    retry_index: None,
+                    clock_anomaly: false,
+                },
+            )
+            .expect("result must insert");
+        }
+    }
+
+    fn backoff_config(state_dir: &std::path::Path, extra: &str) -> Config {
+        let env = RealEnv;
+        let toml = format!(
+            "[state]\ndir = {:?}\n{extra}\n[[accounts]]\nname = \"held\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"/nonexistent\" }}\n",
+            state_dir
+        );
+        let (config, _) = resolve(&Overrides::new(), &env, Some(&toml), "aub.toml")
+            .expect("the backoff fixture config must resolve");
+        config
+    }
+
+    fn backoff_outcome(
+        dir: &std::path::Path,
+        extra: &str,
+        streak: u32,
+        then_success: bool,
+    ) -> CheckStatus {
+        let config = backoff_config(dir, extra);
+        let db_path = dir.join("ledger.sqlite3");
+        std::fs::create_dir_all(dir).expect("the scratch directory must exist");
+        let conn = open_fresh_ledger(&db_path);
+        let seeded_at = UtcTimestamp::from_unix_nanos(1_700_000_000_000_000_000);
+        seed_auth_streak(&conn, "anthropic", "held", seeded_at, streak, then_success);
+        let ctx = DoctorContext {
+            config: &config,
+            timestamp: UtcTimestamp::from_unix_nanos(1_700_000_060_000_000_000),
+            db_path,
+            db: Some(&conn),
+            db_missing: false,
+            db_open_error: None,
+        };
+        account_in_auth_backoff(&ctx).status
+    }
+
+    /// An account past the threshold is named, with its streak and the hold the
+    /// scheduler would apply.
+    #[test]
+    fn an_account_in_auth_backoff_is_named_with_its_streak_and_hold() {
+        let dir = scratch_dir("backoff-held");
+        let status = backoff_outcome(&dir, "", 4, false);
+        let CheckStatus::Fail(detail) = status else {
+            panic!("an account in backoff must fail the check: {status:?}");
+        };
+        assert!(detail.contains("held:"), "the account is named: {detail}");
+        assert!(
+            detail.contains("4 consecutive auth_required"),
+            "the streak is named: {detail}"
+        );
+        assert!(detail.contains("held "), "the hold is named: {detail}");
+        assert!(
+            detail.contains("last success never"),
+            "an account that never succeeded says so: {detail}"
+        );
+    }
+
+    /// Below the threshold there is no hold, so there is nothing to report. The
+    /// planted negative for the case above: a check that reported any streak at
+    /// all would fire here and be ignored within a week.
+    #[test]
+    fn a_streak_below_the_threshold_passes() {
+        let dir = scratch_dir("backoff-short");
+        assert_eq!(backoff_outcome(&dir, "", 2, false), CheckStatus::Pass);
+    }
+
+    /// A success after the refusals resets the streak, so the account passes
+    /// even though the refusals are still in the ledger.
+    #[test]
+    fn a_success_after_the_refusals_clears_the_check() {
+        let dir = scratch_dir("backoff-recovered");
+        assert_eq!(backoff_outcome(&dir, "", 5, true), CheckStatus::Pass);
+    }
+
+    /// The verdict moves with the configured threshold, which is how this case
+    /// proves the check reads the scheduler's own computation instead of
+    /// hardcoding the default three.
+    #[test]
+    fn the_verdict_follows_the_configured_threshold() {
+        let dir = scratch_dir("backoff-threshold");
+        let raised = backoff_outcome(&dir, "[sampling]\nauth_backoff_threshold = 9\n", 4, false);
+        assert_eq!(
+            raised,
+            CheckStatus::Pass,
+            "a streak of four is below a threshold of nine"
+        );
     }
 
     fn open_fresh_ledger(db_path: &std::path::Path) -> rusqlite::Connection {
