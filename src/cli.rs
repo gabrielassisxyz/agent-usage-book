@@ -9388,19 +9388,51 @@ fn calibrate_activate_command(clock: &impl Clock, invocation: &Invocation) -> Re
     Ok(())
 }
 
-/// The `aub ingest transcripts` progress line's exact wording (`aub-va6s`),
-/// factored out so its format is a golden test target independent of
-/// actually running a pass long enough to trigger one.
+/// The `aub ingest transcripts` progress line's exact wording (`aub-va6s`,
+/// `aub-4qk2`), factored out so each phase's format is a golden test target
+/// independent of actually running a pass long enough to trigger one. The
+/// phase word leads, and a rate prints only when its phase measured one,
+/// always with its unit.
 fn format_ingest_progress_line(progress: &crate::ingest::IngestProgress) -> String {
-    format!(
-        "ingest transcripts: progress files={}/{} sessions={} events={} elapsed={}s rate={:.1}/s",
-        progress.files_done,
-        progress.files_total,
-        progress.sessions_written,
-        progress.events_written,
-        progress.elapsed.as_nanos() / 1_000_000_000,
-        progress.rate_events_per_sec,
-    )
+    use crate::ingest::IngestProgress;
+    let seconds =
+        |elapsed: crate::domain::time::MonotonicDuration| elapsed.as_nanos() / 1_000_000_000;
+    let rate = |rate: Option<f64>, unit: &str| {
+        rate.map(|rate| format!(" rate={rate:.1} {unit}"))
+            .unwrap_or_default()
+    };
+    match *progress {
+        IngestProgress::Scanning {
+            files_done,
+            files_total,
+            events_parsed,
+            elapsed,
+            rate_files_per_sec,
+        } => format!(
+            "ingest transcripts: scanning files={files_done}/{files_total} events={events_parsed} elapsed={}s{}",
+            seconds(elapsed),
+            rate(rate_files_per_sec, "files/s"),
+        ),
+        IngestProgress::Deduplicating {
+            events_parsed,
+            elapsed,
+        } => format!(
+            "ingest transcripts: deduplicating events={events_parsed} elapsed={}s",
+            seconds(elapsed),
+        ),
+        IngestProgress::Writing {
+            batches_done,
+            batches_total,
+            events_written,
+            events_total,
+            elapsed,
+            rate_events_per_sec,
+        } => format!(
+            "ingest transcripts: writing batches={batches_done}/{batches_total} events={events_written}/{events_total} elapsed={}s{}",
+            seconds(elapsed),
+            rate(rate_events_per_sec, "events/s"),
+        ),
+    }
 }
 
 /// `aub ingest transcripts`: explicit transcript ingestion as an operation in
@@ -10256,22 +10288,66 @@ mod tests {
         assert_eq!(unchanged_class.to_string(), other_class_text);
     }
 
-    /// The progress line's exact wording is the golden target (`aub-va6s`,
-    /// `aub-mh1c`): files done of total, sessions and events landed so far,
-    /// elapsed, and the rate over the interval since the previous line.
+    /// The `scanning` line's exact wording (`aub-4qk2`): files done of
+    /// total, events parsed so far, elapsed, and files per second since the
+    /// previous line.
     #[test]
-    fn golden_ingest_progress_line_format() {
-        let progress = crate::ingest::IngestProgress {
+    fn golden_ingest_progress_scanning_line_format() {
+        let progress = crate::ingest::IngestProgress::Scanning {
             files_done: 100,
-            files_total: 3830,
-            sessions_written: 12,
-            events_written: 4_567,
-            elapsed: crate::domain::time::MonotonicDuration::from_seconds(37),
-            rate_events_per_sec: 123.456,
+            files_total: 5900,
+            events_parsed: 12_345,
+            elapsed: crate::domain::time::MonotonicDuration::from_seconds(1),
+            rate_files_per_sec: Some(98.24),
         };
         assert_eq!(
             format_ingest_progress_line(&progress),
-            "ingest transcripts: progress files=100/3830 sessions=12 events=4567 elapsed=37s rate=123.5/s"
+            "ingest transcripts: scanning files=100/5900 events=12345 elapsed=1s rate=98.2 files/s"
+        );
+    }
+
+    /// The `deduplicating` line's exact wording (`aub-4qk2`): printed once,
+    /// with no rate, since nothing it counts moves while it runs.
+    #[test]
+    fn golden_ingest_progress_deduplicating_line_format() {
+        let progress = crate::ingest::IngestProgress::Deduplicating {
+            events_parsed: 304_544,
+            elapsed: crate::domain::time::MonotonicDuration::from_seconds(22),
+        };
+        assert_eq!(
+            format_ingest_progress_line(&progress),
+            "ingest transcripts: deduplicating events=304544 elapsed=22s"
+        );
+    }
+
+    /// The `writing` line's exact wording (`aub-4qk2`), with events committed
+    /// per second since the previous line, and the phase-start shape, which
+    /// has no previous line to measure from and so prints no rate.
+    #[test]
+    fn golden_ingest_progress_writing_line_format() {
+        let progress = crate::ingest::IngestProgress::Writing {
+            batches_done: 12,
+            batches_total: 72,
+            events_written: 95_000,
+            events_total: 304_544,
+            elapsed: crate::domain::time::MonotonicDuration::from_seconds(52),
+            rate_events_per_sec: Some(3_113.94),
+        };
+        assert_eq!(
+            format_ingest_progress_line(&progress),
+            "ingest transcripts: writing batches=12/72 events=95000/304544 elapsed=52s rate=3113.9 events/s"
+        );
+        let start = crate::ingest::IngestProgress::Writing {
+            batches_done: 0,
+            batches_total: 72,
+            events_written: 0,
+            events_total: 304_544,
+            elapsed: crate::domain::time::MonotonicDuration::from_seconds(30),
+            rate_events_per_sec: None,
+        };
+        assert_eq!(
+            format_ingest_progress_line(&start),
+            "ingest transcripts: writing batches=0/72 events=0/304544 elapsed=30s"
         );
     }
 

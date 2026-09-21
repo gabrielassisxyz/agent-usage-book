@@ -120,13 +120,7 @@ fn benchmark_a_1000_file_corpus_ingest() {
         &RealClock::new(),
         &mut |_batch| Ok(()),
         &mut |progress| {
-            eprintln!(
-                "benchmark: files={}/{} events={} rate={:.1}/s",
-                progress.files_done,
-                progress.files_total,
-                progress.events_written,
-                progress.rate_events_per_sec
-            );
+            eprintln!("benchmark: {progress:?}");
             Ok(())
         },
     )
