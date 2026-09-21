@@ -2643,7 +2643,10 @@ mod tests {
                 model: model.to_string(),
                 token_class: crate::domain::rate_card::TokenClass::Input,
                 rate_micros,
-                currency: crate::domain::rate_card::CurrencyCode::Usd,
+                denomination: crate::domain::rate_card::RateDenomination::Money(
+                    crate::domain::rate_card::CurrencyCode::Usd,
+                ),
+                window_estimate: None,
                 billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse("2026-08-01").unwrap(),
                 effective_end: None,
@@ -3457,7 +3460,10 @@ mod tests {
                 model: "model-1".to_string(),
                 token_class: crate::domain::rate_card::TokenClass::Input,
                 rate_micros: 3_000_000,
-                currency: crate::domain::rate_card::CurrencyCode::Usd,
+                denomination: crate::domain::rate_card::RateDenomination::Money(
+                    crate::domain::rate_card::CurrencyCode::Usd,
+                ),
+                window_estimate: None,
                 billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse("2026-08-01").unwrap(),
                 effective_end: None,

@@ -14,7 +14,10 @@
 
 use crate::domain::money::{Currency, Money, MoneyPerMillionTokens, Usd};
 use crate::domain::provenance::RateCardId;
-use crate::domain::rate_card::{CurrencyCode, RateCard, ReviewDuePolicy, Schedule, TokenClass};
+use crate::domain::quota::{PercentagePoints, PointsPerMillionTokens};
+use crate::domain::rate_card::{
+    BillingBasis, CurrencyCode, QuotaWindowKind, RateCard, ReviewDuePolicy, Schedule, TokenClass,
+};
 use crate::domain::time::{UtcDate, UtcTimestamp};
 use crate::domain::tokens::{TokenKind, UsageVector};
 
@@ -309,6 +312,49 @@ impl RateBook {
         best
     }
 
+    /// Finds the percent-of-window card in force for a vendor, model, token
+    /// class and named window at an instant (`aub-8vpc`).
+    ///
+    /// Same exact vendor and model matching and same revision tie-break as
+    /// [`Self::find_rate`], over cards of the other basis only. Schedules play
+    /// no part: the importer refuses a schedule on a card of this basis, so
+    /// there is no narrower window to prefer.
+    pub fn find_window_rate(
+        &self,
+        vendor: &str,
+        model: &str,
+        token_class: TokenClass,
+        window: QuotaWindowKind,
+        at: UtcTimestamp,
+    ) -> Option<&RateCard> {
+        let date = at.utc_date();
+        let normalized_vendor = vendor.trim().to_ascii_lowercase();
+        let normalized_model = model.trim().to_ascii_lowercase();
+        let mut best: Option<&RateCard> = None;
+        for card in &self.cards {
+            if card.draft.billing_basis != BillingBasis::PercentOfWindowPerMillionTokens
+                || card
+                    .draft
+                    .window_estimate
+                    .is_none_or(|estimate| estimate.window != window)
+            {
+                continue;
+            }
+            if card.draft.vendor.trim().to_ascii_lowercase() != normalized_vendor
+                || card.draft.model.trim().to_ascii_lowercase() != normalized_model
+                || card.draft.token_class != token_class
+                || date < card.draft.effective_start
+                || card.draft.effective_end.is_some_and(|end| date > end)
+            {
+                continue;
+            }
+            if is_later_revision(best, card) {
+                best = Some(card);
+            }
+        }
+        best
+    }
+
     /// Finds a rate card for an arbitrary / unknown token class name by string match.
     pub fn find_custom_rate(
         &self,
@@ -350,7 +396,12 @@ fn card_exact_date_match(
     token_class: TokenClass,
     date: UtcDate,
 ) -> bool {
-    card.draft.vendor.trim().to_ascii_lowercase() == normalized_vendor
+    // A percent-of-window card states window movement, not a price (`aub-8vpc`).
+    // It is excluded here rather than rejected later, so a class priced only by
+    // an estimate is an honestly missing money rate instead of a figure in the
+    // wrong unit.
+    card.draft.billing_basis == BillingBasis::PerMillionTokens
+        && card.draft.vendor.trim().to_ascii_lowercase() == normalized_vendor
         && card.draft.model.trim().to_ascii_lowercase() == normalized_model
         && card.draft.token_class == token_class
         && date >= card.draft.effective_start
@@ -529,10 +580,17 @@ fn value_scoped<C: Currency>(
         let class = token_kind_to_class(kind);
         match select(class) {
             Some(card) => {
-                if card.draft.currency.as_str() != C::CODE {
+                let Some(currency) = card.draft.denomination.currency() else {
+                    // Unreachable through the selectors above, which exclude
+                    // every non-money card: reaching here would mean one slipped
+                    // through, and an unvalued class is the honest outcome.
+                    missing_rates.push(MissingRate::new(vendor, model, class.as_str(), at));
+                    continue;
+                };
+                if currency.as_str() != C::CODE {
                     return (
                         ValuationOutcome::UnsupportedCurrency {
-                            found: card.draft.currency,
+                            found: currency,
                             expected: C::CODE,
                         },
                         cards,
@@ -558,10 +616,17 @@ fn value_scoped<C: Currency>(
 
         match select_custom(class_name) {
             Some(card) => {
-                if card.draft.currency.as_str() != C::CODE {
+                let Some(currency) = card.draft.denomination.currency() else {
+                    // Unreachable through the selectors above, which exclude
+                    // every non-money card: reaching here would mean one slipped
+                    // through, and an unvalued class is the honest outcome.
+                    missing_rates.push(MissingRate::new(vendor, model, class_name.as_str(), at));
+                    continue;
+                };
+                if currency.as_str() != C::CODE {
                     return (
                         ValuationOutcome::UnsupportedCurrency {
-                            found: card.draft.currency,
+                            found: currency,
                             expected: C::CODE,
                         },
                         cards,
@@ -589,6 +654,115 @@ fn value_scoped<C: Currency>(
         }
     };
     (outcome, cards)
+}
+
+/// What a usage vector moves in one quota window, as a percent-of-window rate
+/// card states it (`aub-8vpc`).
+///
+/// Deliberately not a [`ValuationOutcome`]: that type is parameterized by a
+/// currency and carries an `ApiListPriceEquivalent`, and window movement is
+/// neither money nor credits but a third dimension (invariant 18). The two
+/// share no conversion, and there is no operator between them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowValuationOutcome {
+    /// Every consumed token class was priced by a card of this basis.
+    Complete {
+        points: PercentagePoints,
+        /// The rows that produced the figure, ascending, for the `basis`
+        /// object every surface prints beside an estimated number.
+        rate_card_ids: Vec<i64>,
+    },
+    /// One or more consumed classes had no card of this basis. The subtotal is
+    /// the priced part only, and must never be presented as a total.
+    Incomplete {
+        known_subtotal: PercentagePoints,
+        rate_card_ids: Vec<i64>,
+        missing_rates: Vec<MissingRate>,
+    },
+    /// The movement left `PercentagePoints`' representable range. A clamped
+    /// figure would be a number the evidence does not justify, so the whole
+    /// valuation refuses instead.
+    OutOfRange { token_class: String },
+}
+
+/// Values a `UsageVector` as movement of one named quota window, using only
+/// cards whose basis is `percent_of_window_per_million_tokens` and whose
+/// declared window is `window` (`aub-8vpc`).
+///
+/// A class with a zero count is not consulted and never becomes a missing fact:
+/// a card nobody needed is not a gap. A class with a non-zero count and no card
+/// of this basis is named in `missing_rates`, because a subtotal standing in
+/// for a total is exactly the wrong number this project exists to prevent.
+pub fn value_usage_vector_in_window(
+    book: &RateBook,
+    vendor: &str,
+    model: &str,
+    window: QuotaWindowKind,
+    at: UtcTimestamp,
+    usage: &UsageVector,
+) -> WindowValuationOutcome {
+    let mut raw_total: i64 = 0;
+    let mut rate_card_ids = Vec::new();
+    let mut missing_rates = Vec::new();
+
+    let mut price = |class_name: &str, count: u64| -> Option<String> {
+        if count == 0 {
+            return None;
+        }
+        let Some(class) = TokenClass::parse(class_name) else {
+            missing_rates.push(MissingRate::new(vendor, model, class_name, at));
+            return None;
+        };
+        let Some(card) = book.find_window_rate(vendor, model, class, window, at) else {
+            missing_rates.push(MissingRate::new(vendor, model, class_name, at));
+            return None;
+        };
+        let rate = PointsPerMillionTokens::from_micro_points_per_million(card.draft.rate_micros);
+        let Some(points) = rate.times_tokens(count) else {
+            return Some(class_name.to_string());
+        };
+        raw_total += i64::from(points.get());
+        if i32::try_from(raw_total)
+            .ok()
+            .and_then(PercentagePoints::new)
+            .is_none()
+        {
+            return Some(class_name.to_string());
+        }
+        rate_card_ids.push(card.id);
+        None
+    };
+
+    for &kind in &TokenKind::ALL {
+        if let Some(class) = price(
+            token_kind_to_class(kind).as_str(),
+            usage.known().value(kind),
+        ) {
+            return WindowValuationOutcome::OutOfRange { token_class: class };
+        }
+    }
+    for (class_name, count) in usage.unknown() {
+        if let Some(class) = price(class_name.as_str(), count.value()) {
+            return WindowValuationOutcome::OutOfRange { token_class: class };
+        }
+    }
+
+    rate_card_ids.sort_unstable();
+    rate_card_ids.dedup();
+    let subtotal = PercentagePoints::new(raw_total as i32)
+        .expect("every addend was range-checked as it was accumulated");
+    if missing_rates.is_empty() {
+        WindowValuationOutcome::Complete {
+            points: subtotal,
+            rate_card_ids,
+        }
+    } else {
+        WindowValuationOutcome::Incomplete {
+            known_subtotal: subtotal,
+            rate_card_ids,
+            missing_rates,
+        }
+    }
 }
 
 /// Values a collection of usage vectors and aggregates them into one result.
@@ -639,7 +813,9 @@ mod tests {
     use std::collections::BTreeMap;
 
     use crate::domain::money::Usd;
-    use crate::domain::rate_card::{BillingBasis, Publication, RateCardDraft, ReviewDuePolicy};
+    use crate::domain::rate_card::{
+        BillingBasis, CurrencyCode, Publication, RateCardDraft, RateDenomination, ReviewDuePolicy,
+    };
     use crate::domain::time::UtcTimestamp;
     use crate::domain::tokens::{
         CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
@@ -663,7 +839,8 @@ mod tests {
                 model: model.to_string(),
                 token_class,
                 rate_micros,
-                currency: CurrencyCode::Usd,
+                denomination: RateDenomination::Money(CurrencyCode::Usd),
+                window_estimate: None,
                 billing_basis: BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse(effective_start).unwrap(),
                 effective_end: effective_end.map(|d| UtcDate::parse(d).unwrap()),
@@ -1145,5 +1322,204 @@ mod tests {
         } else {
             220_000
         }
+    }
+
+    // --- percent-of-window valuation (`aub-8vpc`) ----------------------------
+
+    fn window_card(
+        id: i64,
+        token_class: TokenClass,
+        rate_micros: i64,
+        window: crate::domain::rate_card::QuotaWindowKind,
+    ) -> RateCard {
+        let mut card = make_card(
+            id,
+            "anthropic",
+            "claude-fable-5",
+            token_class,
+            rate_micros,
+            "2026-09-01",
+            None,
+        );
+        card.draft.billing_basis = BillingBasis::PercentOfWindowPerMillionTokens;
+        card.draft.denomination =
+            RateDenomination::Points(crate::domain::rate_card::RateUnit::PercentagePoints);
+        card.draft.window_estimate = Some(crate::domain::rate_card::WindowEstimate {
+            window,
+            unit: crate::domain::rate_card::RateUnit::PercentagePoints,
+            quality: crate::domain::rate_card::CardQuality::Estimate,
+        });
+        card
+    }
+
+    fn at() -> UtcTimestamp {
+        UtcDate::parse("2026-09-10").unwrap().start()
+    }
+
+    fn tokens(input: u64, output: u64) -> UsageVector {
+        UsageVector::new(
+            KnownTokenVector::new(
+                InputTokens::new(input),
+                OutputTokens::new(output),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            ),
+            std::collections::BTreeMap::new(),
+            CoverageCompleteness::Complete,
+            EvidenceQuality::Measured,
+        )
+    }
+
+    /// The figure the acceptance criterion names: a million input tokens at
+    /// `rate = "0.85"` move 0.85 points of the window, which is 8_500 in
+    /// `PercentagePoints`' own native units.
+    #[test]
+    fn a_million_tokens_at_zero_point_eight_five_move_that_many_points() {
+        let book = RateBook::new(vec![window_card(
+            1,
+            TokenClass::Input,
+            850_000,
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+        )]);
+        let outcome = value_usage_vector_in_window(
+            &book,
+            "anthropic",
+            "claude-fable-5",
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+            at(),
+            &tokens(1_000_000, 0),
+        );
+        assert_eq!(
+            outcome,
+            WindowValuationOutcome::Complete {
+                points: PercentagePoints::new(8_500).unwrap(),
+                rate_card_ids: vec![1],
+            }
+        );
+    }
+
+    /// The planted negative for the card selection: the same usage against the
+    /// other window finds nothing, so a five-hour estimate can never be read as
+    /// a seven-day one.
+    #[test]
+    fn a_card_for_one_window_does_not_price_the_other() {
+        let book = RateBook::new(vec![window_card(
+            1,
+            TokenClass::Input,
+            850_000,
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+        )]);
+        let outcome = value_usage_vector_in_window(
+            &book,
+            "anthropic",
+            "claude-fable-5",
+            crate::domain::rate_card::QuotaWindowKind::SevenDay,
+            at(),
+            &tokens(1_000_000, 0),
+        );
+        match outcome {
+            WindowValuationOutcome::Incomplete { missing_rates, .. } => {
+                assert_eq!(missing_rates.len(), 1);
+                assert_eq!(missing_rates[0].token_class, "input");
+            }
+            other => panic!("the other window must not be priced: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_consumed_class_the_book_lacks_is_a_named_missing_fact() {
+        let book = RateBook::new(vec![window_card(
+            1,
+            TokenClass::Input,
+            850_000,
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+        )]);
+        let outcome = value_usage_vector_in_window(
+            &book,
+            "anthropic",
+            "claude-fable-5",
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+            at(),
+            &tokens(1_000_000, 500_000),
+        );
+        match outcome {
+            WindowValuationOutcome::Incomplete {
+                known_subtotal,
+                missing_rates,
+                rate_card_ids,
+            } => {
+                assert_eq!(known_subtotal, PercentagePoints::new(8_500).unwrap());
+                assert_eq!(rate_card_ids, vec![1]);
+                assert_eq!(missing_rates.len(), 1);
+                assert_eq!(missing_rates[0].token_class, "output");
+            }
+            other => panic!("an unpriced class must be named: {other:?}"),
+        }
+    }
+
+    /// A class nobody consumed needs no card: a zero count with no card is not
+    /// a gap, and reporting one would make every book incomplete forever.
+    #[test]
+    fn a_zero_count_class_with_no_card_is_not_a_missing_fact() {
+        let book = RateBook::new(vec![window_card(
+            1,
+            TokenClass::Input,
+            850_000,
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+        )]);
+        let outcome = value_usage_vector_in_window(
+            &book,
+            "anthropic",
+            "claude-fable-5",
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+            at(),
+            &tokens(1_000_000, 0),
+        );
+        assert!(matches!(outcome, WindowValuationOutcome::Complete { .. }));
+    }
+
+    /// The two bases never cross: a money card does not price window movement,
+    /// and an estimate card does not price money.
+    #[test]
+    fn the_two_bases_never_price_each_other() {
+        let money = make_card(
+            7,
+            "anthropic",
+            "claude-fable-5",
+            TokenClass::Input,
+            10_000_000,
+            "2026-09-01",
+            None,
+        );
+        let estimate = window_card(
+            8,
+            TokenClass::Input,
+            850_000,
+            crate::domain::rate_card::QuotaWindowKind::FiveHour,
+        );
+        let money_only = RateBook::new(vec![money.clone()]);
+        assert!(matches!(
+            value_usage_vector_in_window(
+                &money_only,
+                "anthropic",
+                "claude-fable-5",
+                crate::domain::rate_card::QuotaWindowKind::FiveHour,
+                at(),
+                &tokens(1_000_000, 0),
+            ),
+            WindowValuationOutcome::Incomplete { .. }
+        ));
+
+        let estimate_only = RateBook::new(vec![estimate]);
+        assert!(matches!(
+            value_usage_vector::<Usd>(
+                &estimate_only,
+                "anthropic",
+                "claude-fable-5",
+                at(),
+                &tokens(1_000_000, 0),
+            ),
+            ValuationOutcome::Incomplete { .. }
+        ));
     }
 }

@@ -5728,10 +5728,20 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
         draft.model,
         draft.token_class.as_str(),
         render_rate_micros(draft.rate_micros),
-        draft.currency.as_str(),
+        draft.denomination.as_str(),
         draft.billing_basis.as_str(),
         interval,
     );
+    if let Some(estimate) = draft.window_estimate {
+        // The label travels with the figure on every surface (`aub-8vpc`): a
+        // listing that showed the rate without saying which window it moves,
+        // and that it is an estimate, would read as a measured price.
+        line.push_str(&format!(
+            " window={} quality={}",
+            estimate.window.as_str(),
+            estimate.quality.as_str(),
+        ));
+    }
     if let Some(published) = draft.publication.published_at {
         line.push_str(&format!(" published={}", published.utc_date().iso()));
     }
