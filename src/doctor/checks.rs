@@ -78,6 +78,7 @@ pub fn build_registry(ctx: &DoctorContext) -> Vec<CheckOutcome> {
         subscription_identity_change(ctx),
         cost_model_active(ctx),
         account_in_auth_backoff(ctx),
+        window_estimate_in_use(ctx),
     ]
 }
 
@@ -138,6 +139,7 @@ fn owner_of(name: CheckName) -> &'static str {
         CheckName::SubscriptionIdentityChange => "store::subscription_identity",
         CheckName::CostModelActive => "store::cost_model",
         CheckName::AccountInAuthBackoff => "meter::due",
+        CheckName::WindowEstimateInUse => "store::rate_card",
     }
 }
 
@@ -204,6 +206,9 @@ fn condition_of(name: CheckName) -> &'static str {
         }
         CheckName::AccountInAuthBackoff => {
             "no configured account is held by the authentication backoff, recomputed from the trailing auth_required streak with the scheduler's own delay function"
+        }
+        CheckName::WindowEstimateInUse => {
+            "no window figure is standing on a percent-of-window rate-card estimate for want of a current calibration"
         }
     }
 }
@@ -1642,6 +1647,99 @@ fn cost_model_active(ctx: &DoctorContext) -> CheckOutcome {
     outcome(CheckName::CostModelActive, status)
 }
 
+/// Percent-of-window estimates currently standing in for a calibration
+/// (`aub-8vpc`).
+///
+/// Informational, never a failure: an estimate is the arrangement working as
+/// designed while the calibration is being earned, and a check that failed on
+/// it would teach the operator to ignore doctor. What it buys is the opposite
+/// of an alarm: the line names the provider and window, and it disappears by
+/// itself the day `aub calibrate` fits that window, which is the only signal
+/// that nothing is approximating any more.
+///
+/// A card is counted only where no active calibration exists for its provider
+/// and window, because that is exactly the condition under which the fallback
+/// fires. `plan_tier` follows the same `default` literal every live caller
+/// carries (see `can-run`'s own note on why no adapter reports another one).
+fn window_estimate_in_use(ctx: &DoctorContext) -> CheckOutcome {
+    let status = if ctx.db_missing {
+        CheckStatus::NotApplicable("no ledger database exists yet".to_string())
+    } else if let Some(error) = &ctx.db_open_error {
+        CheckStatus::Fail(format!("cannot open the ledger database: {error}"))
+    } else {
+        match ctx.db {
+            None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
+            Some(conn) => match crate::store::rate_card::history(conn) {
+                Err(error) => CheckStatus::Fail(format!("cannot read rate cards: {error}")),
+                Ok(cards) => {
+                    let mut in_use: std::collections::BTreeSet<String> =
+                        std::collections::BTreeSet::new();
+                    let mut failure = None;
+                    // Valuation's own in-force rule, not the store's day query:
+                    // that one drops a card on its end day, and a card spend and
+                    // can-run still use must still be reported.
+                    let today = ctx.timestamp.utc_date();
+                    let in_force = cards
+                        .iter()
+                        .filter(|card| crate::valuation::card_in_force_on(card, today));
+                    for card in in_force {
+                        let Some(estimate) = card.draft.window_estimate else {
+                            continue;
+                        };
+                        // A card prices one vendor's tokens, so it stands in only
+                        // for accounts of that provider.
+                        let accounts = ctx.config.accounts.iter().filter(|account| {
+                            card.draft
+                                .vendor
+                                .trim()
+                                .eq_ignore_ascii_case(account.provider.trim())
+                        });
+                        for account in accounts {
+                            let scope = crate::store::calibration::CalibrationScope {
+                                provider: crate::store::cost_model::ProviderKey::new(
+                                    &account.provider,
+                                ),
+                                plan_tier: crate::store::calibration::PlanTier::new("default"),
+                                window_semantic_key: crate::domain::window::WindowSemanticKey::new(
+                                    estimate.window.as_str(),
+                                ),
+                            };
+                            match crate::store::calibration::load_active_at(
+                                conn,
+                                &scope,
+                                ctx.timestamp,
+                            ) {
+                                Ok(Some(_)) => {}
+                                Ok(None) => {
+                                    in_use.insert(format!(
+                                        "{}/{}",
+                                        account.provider,
+                                        estimate.window.as_str()
+                                    ));
+                                }
+                                Err(error) => {
+                                    failure = Some(format!(
+                                        "cannot read the active calibration: {error}"
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                    match (failure, in_use.is_empty()) {
+                        (Some(error), _) => CheckStatus::Fail(error),
+                        (None, true) => CheckStatus::Pass,
+                        (None, false) => CheckStatus::Info(format!(
+                            "window figures come from a rate-card estimate for: {}",
+                            in_use.into_iter().collect::<Vec<_>>().join(", ")
+                        )),
+                    }
+                }
+            },
+        }
+    };
+    outcome(CheckName::WindowEstimateInUse, status)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2124,6 +2222,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2416,6 +2515,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2473,6 +2573,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2528,6 +2629,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -2817,6 +2919,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -3021,6 +3124,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -3127,6 +3231,7 @@ mod tests {
             }
             CheckStatus::Pass
             | CheckStatus::Warn(_)
+            | CheckStatus::Info(_)
             | CheckStatus::Fail(_)
             | CheckStatus::NotApplicable(_)
             | CheckStatus::NotYetAvailable { .. } => {
@@ -3134,6 +3239,277 @@ mod tests {
                     "a resumed account must pass with detail, got {:?}",
                     outcome.status
                 )
+            }
+        }
+    }
+
+    // --- window-estimate-in-use (`aub-8vpc`) ---------------------------------
+
+    /// An account whose provider has no fitted calibration anywhere: the state
+    /// the estimate fallback exists for.
+    fn anthropic_account_config(state_dir: &std::path::Path) -> Config {
+        let env = RealEnv;
+        let toml = format!(
+            "[state]\ndir = {:?}\n\n[[accounts]]\nname = \"work\"\nprovider = \"anthropic\"\n\
+             credential = {{ kind = \"env\", name = \"AUB_8VPC_TEST_CREDENTIAL_UNSET\" }}\n",
+            state_dir
+        );
+        let (config, _) = resolve(&Overrides::new(), &env, Some(&toml), "aub.toml")
+            .expect("account config must resolve");
+        config
+    }
+
+    fn insert_card(conn: &rusqlite::Connection, draft: crate::domain::rate_card::RateCardDraft) {
+        crate::store::rate_card::insert(
+            conn,
+            std::slice::from_ref(&draft),
+            UtcTimestamp::from_unix_nanos(1_000),
+        )
+        .expect("the card must insert");
+    }
+
+    fn money_card() -> crate::domain::rate_card::RateCardDraft {
+        crate::domain::rate_card::RateCardDraft {
+            vendor: "anthropic".to_string(),
+            model: "claude-fable-5".to_string(),
+            token_class: crate::domain::rate_card::TokenClass::Input,
+            rate_micros: 10_000_000,
+            denomination: crate::domain::rate_card::RateDenomination::Money(
+                crate::domain::rate_card::CurrencyCode::Usd,
+            ),
+            billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
+            window_estimate: None,
+            effective_start: crate::domain::time::UtcDate::parse("2020-01-01").unwrap(),
+            effective_end: None,
+            schedule: None,
+            publication: crate::domain::rate_card::Publication {
+                source: Some("vendor pricing page".to_string()),
+                published_at: None,
+            },
+            review_due: crate::domain::rate_card::ReviewDuePolicy::None,
+        }
+    }
+
+    fn estimate_card() -> crate::domain::rate_card::RateCardDraft {
+        crate::domain::rate_card::RateCardDraft {
+            rate_micros: 850_000,
+            denomination: crate::domain::rate_card::RateDenomination::Points(
+                crate::domain::rate_card::RateUnit::PercentagePoints,
+            ),
+            billing_basis: crate::domain::rate_card::BillingBasis::PercentOfWindowPerMillionTokens,
+            window_estimate: Some(crate::domain::rate_card::WindowEstimate {
+                window: crate::domain::rate_card::QuotaWindowKind::FiveHour,
+                unit: crate::domain::rate_card::RateUnit::PercentagePoints,
+                quality: crate::domain::rate_card::CardQuality::Estimate,
+            }),
+            ..money_card()
+        }
+    }
+
+    /// Fits and activates a five-hour calibration for `anthropic`, through the
+    /// repository's own activation gate rather than by writing the lifecycle
+    /// row directly: an activation this check would not honour is not evidence
+    /// that the check honours activations.
+    fn activate_five_hour_calibration(conn: &mut rusqlite::Connection) {
+        use crate::calibration::activation::{
+            ActivationActor, ActivationPolicy, ActivationRequest,
+        };
+        use crate::calibration::contamination::ContaminationVerdict;
+        use crate::domain::provenance::{EvidenceId, WindowCalibrationId};
+        use crate::store::calibration::{CalibrationScope, ExperimentId, PlanTier};
+
+        let scope = CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("default"),
+            window_semantic_key: crate::domain::window::WindowSemanticKey::new("five_hour"),
+        };
+        let meter = crate::domain::ids::MeterSemanticsId::new("meter-v1");
+        let billing = crate::domain::ids::BillingSemanticsId::new("billing-v1");
+        let validity = crate::store::cost_model::ValidityInterval::new(
+            UtcTimestamp::from_unix_nanos(0),
+            UtcTimestamp::from_unix_nanos(i64::MAX),
+        )
+        .expect("the validity interval is ordered");
+        let knowledge = UtcTimestamp::from_unix_nanos(1_000);
+        let experiment = crate::store::calibration::minimal_experiment(
+            "exp-8vpc", &scope, &meter, &billing, validity, knowledge,
+        );
+        crate::store::calibration::insert_experiment(conn, &experiment)
+            .expect("the experiment must insert");
+        let calibration = crate::store::calibration::minimal_fixture(
+            "cal-8vpc",
+            &scope,
+            &meter,
+            &billing,
+            &crate::domain::provenance::CostModelId::new("cm-1"),
+            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(100_000),
+            validity,
+            knowledge,
+        );
+        crate::store::calibration::insert_result(
+            conn,
+            &calibration,
+            &[ExperimentId::new("exp-8vpc")],
+        )
+        .expect("the calibration row must insert");
+
+        // `minimal_fixture` records exactly these evidence identifiers; the
+        // activation gate refuses any other set with an evidence mismatch.
+        let evidence = |tag: &str| -> std::collections::BTreeSet<EvidenceId> {
+            [EvidenceId::new(format!("fixture:{tag}"))]
+                .into_iter()
+                .collect()
+        };
+        let training = evidence("fitting");
+        let validation = evidence("validation");
+        let actor = ActivationActor::new("doctor-test").expect("actor is non-empty");
+        let policy = ActivationPolicy::new(
+            "fixture",
+            crate::domain::credits::Credits::from_micros(0),
+            crate::store::calibration::ConditionNumber::from_micros(30_000_000),
+        )
+        .expect("policy version is non-empty");
+        let verdict = ContaminationVerdict::clean();
+        crate::store::calibration::activate(
+            conn,
+            &WindowCalibrationId::new("cal-8vpc"),
+            UtcTimestamp::from_unix_nanos(2_000),
+            None,
+            &ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &training,
+                validation: &validation,
+                contamination: &verdict,
+            },
+        )
+        .expect("the calibration must activate");
+    }
+
+    #[test]
+    fn an_estimate_card_with_no_calibration_is_reported_as_informational() {
+        let dir = scratch_dir("window-estimate-in-use");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = anthropic_account_config(&dir);
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        insert_card(&conn, estimate_card());
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        let outcome = window_estimate_in_use(&ctx);
+        match &outcome.status {
+            CheckStatus::Info(detail) => {
+                assert!(detail.contains("anthropic/five_hour"), "{detail}");
+            }
+            other @ (CheckStatus::Pass
+            | CheckStatus::PassWithDetail(_)
+            | CheckStatus::Fail(_)
+            | CheckStatus::Warn(_)
+            | CheckStatus::NotApplicable(_)
+            | CheckStatus::NotYetAvailable { .. }) => {
+                panic!("expected an informational finding, got {other:?}")
+            }
+        }
+        assert_eq!(outcome.status.label(), "info");
+    }
+
+    /// The planted negative: a money card for the same vendor, model and class
+    /// is not an estimate and must not raise the line. A check that keyed on
+    /// "any rate card exists" would pass its positive case and fail here.
+    #[test]
+    fn a_money_card_alone_raises_nothing() {
+        let dir = scratch_dir("window-estimate-money-only");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = anthropic_account_config(&dir);
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        insert_card(&conn, money_card());
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        assert_eq!(window_estimate_in_use(&ctx).status, CheckStatus::Pass);
+    }
+
+    /// An estimate card for another vendor stands in for no anthropic
+    /// window, so it must not name one. A check that paired every estimate
+    /// card with every account would report `anthropic/five_hour` here.
+    #[test]
+    fn an_estimate_card_for_another_vendor_raises_nothing() {
+        let dir = scratch_dir("window-estimate-other-vendor");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = anthropic_account_config(&dir);
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        insert_card(
+            &conn,
+            crate::domain::rate_card::RateCardDraft {
+                vendor: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                ..estimate_card()
+            },
+        );
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        assert_eq!(window_estimate_in_use(&ctx).status, CheckStatus::Pass);
+    }
+
+    /// The other state the acceptance criterion names: with a current
+    /// calibration for the same provider and window, the card is inert and the
+    /// line disappears by itself.
+    #[test]
+    fn a_current_calibration_silences_the_line() {
+        let dir = scratch_dir("window-estimate-calibrated");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = anthropic_account_config(&dir);
+        let mut conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        insert_card(&conn, estimate_card());
+        activate_five_hour_calibration(&mut conn);
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        // The context's own clock, 2023, is inside the card's effective
+        // interval and after the activation: an earlier instant would find no
+        // card in force and pass whether or not the calibration was honoured.
+        ctx.db = Some(&conn);
+        assert_eq!(window_estimate_in_use(&ctx).status, CheckStatus::Pass);
+    }
+
+    /// A card whose `effective_end` is today is still in force for spend and
+    /// can-run (`find_window_rate` is end-inclusive), so doctor must still
+    /// name it. The planted negative ends the day before and must stay silent.
+    #[test]
+    fn an_estimate_card_on_its_end_day_is_still_reported() {
+        // The context clock, 1_700_000_000 s, is 2023-11-14 in UTC.
+        for (end, expect_reported) in [("2023-11-14", true), ("2023-11-13", false)] {
+            let dir = scratch_dir(&format!("window-estimate-end-{end}"));
+            std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+            let config = anthropic_account_config(&dir);
+            let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+            insert_card(
+                &conn,
+                crate::domain::rate_card::RateCardDraft {
+                    effective_end: Some(crate::domain::time::UtcDate::parse(end).unwrap()),
+                    ..estimate_card()
+                },
+            );
+
+            let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+            ctx.db_missing = false;
+            ctx.db = Some(&conn);
+            let status = window_estimate_in_use(&ctx).status;
+            if expect_reported {
+                assert!(
+                    matches!(&status, CheckStatus::Info(detail) if detail.contains("anthropic/five_hour")),
+                    "a card ending today is in force: {status:?}"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    CheckStatus::Pass,
+                    "a card that ended yesterday is not"
+                );
             }
         }
     }

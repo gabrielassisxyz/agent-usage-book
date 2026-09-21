@@ -53,7 +53,8 @@ use agent_usage_book::domain::money::Usd;
 use agent_usage_book::domain::provenance::{CostModelId, DerivationId, EvidenceId};
 use agent_usage_book::domain::quota::{QuotaFractionPpm, QuotaRemaining, QuotaUsed};
 use agent_usage_book::domain::rate_card::{
-    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, TokenClass,
+    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, RateDenomination,
+    ReviewDuePolicy, TokenClass,
 };
 use agent_usage_book::domain::time::{
     ClockSkewEnvelope, FakeClock, MeasurementBasis, MonotonicDuration, ProviderObservedAt,
@@ -228,7 +229,8 @@ fn rate_card(
             model: model.to_string(),
             token_class,
             rate_micros,
-            currency: CurrencyCode::Usd,
+            denomination: RateDenomination::Money(CurrencyCode::Usd),
+            window_estimate: None,
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse(start).expect("valid start date"),
             effective_end: end.map(|d| UtcDate::parse(d).expect("valid end date")),

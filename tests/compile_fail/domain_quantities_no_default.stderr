@@ -178,13 +178,13 @@ note: if you're trying to build a new `agent_usage_book::domain::quota::Percenta
    |     pub fn new(value: i32) -> Option<Self> {
    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
-error[E0599]: no associated function or constant named `default` found for struct `Money<C>` in the current scope
+error[E0599]: no associated function or constant named `default` found for struct `agent_usage_book::domain::money::Money<C>` in the current scope
   --> tests/compile_fail/domain_quantities_no_default.rs:33:27
    |
 33 |     let _ = Money::<Usd>::default();
-   |                           ^^^^^^^ associated function or constant not found in `Money<agent_usage_book::domain::money::Usd>`
+   |                           ^^^^^^^ associated function or constant not found in `agent_usage_book::domain::money::Money<agent_usage_book::domain::money::Usd>`
    |
-note: if you're trying to build a new `Money<agent_usage_book::domain::money::Usd>`, consider using `Money::<C>::from_micros` which returns `Money<_>`
+note: if you're trying to build a new `agent_usage_book::domain::money::Money<agent_usage_book::domain::money::Usd>`, consider using `agent_usage_book::domain::money::Money::<C>::from_micros` which returns `agent_usage_book::domain::money::Money<_>`
   --> src/domain/money.rs
    |
    |     pub const fn from_micros(micros: i64) -> Self {

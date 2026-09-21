@@ -79,11 +79,18 @@ pub enum CreditReporting<'model> {
 pub trait WindowEquivalentResolver {
     fn window_semantic_key(&self) -> &str;
 
+    /// `priced_model` is the one vendor and model every member of the group was
+    /// priced under, or `None` when the group spans several. A rate-card
+    /// estimate is keyed by vendor and model like every other card, so a group
+    /// that spans models has no single card to read and the resolver refuses
+    /// rather than picking one (`aub-8vpc`). The calibration path ignores it.
     fn resolve(
         &self,
         account: Option<&str>,
         provider: Option<&str>,
+        priced_model: Option<&PricedModelRef>,
         credits: Option<&Derivation<Credits>>,
+        usage: &UsageVector,
     ) -> Result<WindowEquivalentDerivation, Error>;
 }
 
@@ -856,8 +863,20 @@ fn canonical_groups(
             }
             let account = uniform_account(&members, account_of);
             let provider = uniform_provider(&members);
+            let group_priced_as = members_priced_as(&members);
+            let uniform_priced_model = (group_priced_as.len() == 1)
+                .then(|| group_priced_as.iter().next())
+                .flatten();
             let window_equivalent = window_resolver
-                .map(|resolver| resolver.resolve(account, provider.as_deref(), credits.as_ref()))
+                .map(|resolver| {
+                    resolver.resolve(
+                        account,
+                        provider.as_deref(),
+                        uniform_priced_model,
+                        credits.as_ref(),
+                        &usage,
+                    )
+                })
                 .transpose()?;
             if let Some(result) = &window_equivalent {
                 let mut window_witnesses = Vec::new();
@@ -2328,7 +2347,9 @@ mod tests {
                 &self,
                 account: Option<&str>,
                 provider: Option<&str>,
+                _priced_model: Option<&PricedModelRef>,
                 _credits: Option<&Derivation<Credits>>,
+                _usage: &UsageVector,
             ) -> Result<WindowEquivalentDerivation, Error> {
                 let Some(account) = account else {
                     return Ok(WindowEquivalentDerivation::unavailable(
@@ -2350,7 +2371,9 @@ mod tests {
                             PercentagePoints::new(upper).unwrap(),
                         )
                         .unwrap(),
-                        calibration_id: WindowCalibrationId::new(calibration_id),
+                        basis: crate::report::WindowEquivalentBasis::Calibration(
+                            WindowCalibrationId::new(calibration_id),
+                        ),
                         coverage: CoverageCompleteness::Complete,
                         quality: EvidenceQuality::Estimated {
                             methods: [EstimatorId::new(calibration_id.to_string())]
@@ -2643,7 +2666,10 @@ mod tests {
                 model: model.to_string(),
                 token_class: crate::domain::rate_card::TokenClass::Input,
                 rate_micros,
-                currency: crate::domain::rate_card::CurrencyCode::Usd,
+                denomination: crate::domain::rate_card::RateDenomination::Money(
+                    crate::domain::rate_card::CurrencyCode::Usd,
+                ),
+                window_estimate: None,
                 billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse("2026-08-01").unwrap(),
                 effective_end: None,
@@ -3457,7 +3483,10 @@ mod tests {
                 model: "model-1".to_string(),
                 token_class: crate::domain::rate_card::TokenClass::Input,
                 rate_micros: 3_000_000,
-                currency: crate::domain::rate_card::CurrencyCode::Usd,
+                denomination: crate::domain::rate_card::RateDenomination::Money(
+                    crate::domain::rate_card::CurrencyCode::Usd,
+                ),
+                window_estimate: None,
                 billing_basis: crate::domain::rate_card::BillingBasis::PerMillionTokens,
                 effective_start: UtcDate::parse("2026-08-01").unwrap(),
                 effective_end: None,

@@ -1477,7 +1477,9 @@ mod tests {
         ProviderContractId, SourceNamespace,
     };
     use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
-    use crate::domain::rate_card::{BillingBasis, CurrencyCode, RateCardDraft, TokenClass};
+    use crate::domain::rate_card::{
+        BillingBasis, CurrencyCode, RateCardDraft, RateDenomination, TokenClass,
+    };
     use crate::domain::time::MeasurementBasis;
     use crate::domain::window::{
         NominalWindowDuration, QuantizationSemantics, ReportedResolution, WindowScope,
@@ -1691,7 +1693,8 @@ mod tests {
                 model: "fixture-model".to_string(),
                 token_class: TokenClass::Input,
                 rate_micros: 1_000,
-                currency: CurrencyCode::Usd,
+                denomination: RateDenomination::Money(CurrencyCode::Usd),
+                window_estimate: None,
                 billing_basis: BillingBasis::PerMillionTokens,
                 effective_start: now.utc_date(),
                 effective_end: None,

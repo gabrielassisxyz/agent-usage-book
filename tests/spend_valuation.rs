@@ -8,7 +8,8 @@ use agent_usage_book::domain::provenance::{
     CostModelId, DerivationId, EvidenceId, QuerySemantics, RateCardId, WitnessId,
 };
 use agent_usage_book::domain::rate_card::{
-    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, TokenClass,
+    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, RateDenomination,
+    ReviewDuePolicy, TokenClass,
 };
 use agent_usage_book::domain::time::{UtcDate, UtcTimestamp};
 use agent_usage_book::domain::tokens::{
@@ -49,8 +50,9 @@ fn helper_card(
             model: model.to_string(),
             token_class,
             rate_micros,
-            currency,
+            denomination: RateDenomination::Money(currency),
             billing_basis: BillingBasis::PerMillionTokens,
+            window_estimate: None,
             effective_start: UtcDate::parse(start).expect("valid start date"),
             effective_end: end.map(|d| UtcDate::parse(d).expect("valid end date")),
             schedule: None,

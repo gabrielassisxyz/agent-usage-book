@@ -55,7 +55,7 @@ use agent_usage_book::report::{
     SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance,
     SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendReport, StatusReport,
     TaskOverheadBucket, TaskOverheadReport, TaskReport, Unit, ValueArithmetic,
-    WindowEquivalentDerivation, WindowEquivalentValue,
+    WindowEquivalentBasis, WindowEquivalentDerivation, WindowEquivalentValue,
 };
 use agent_usage_book::store::export::ExportKey;
 
@@ -381,7 +381,9 @@ fn spend_case() -> SeededCommand {
                 PercentagePoints::new(20).unwrap(),
             )
             .unwrap(),
-            calibration_id: WindowCalibrationId::new("cal-window-2026-08"),
+            basis: WindowEquivalentBasis::Calibration(WindowCalibrationId::new(
+                "cal-window-2026-08",
+            )),
             coverage: CoverageCompleteness::Complete,
             quality: EvidenceQuality::Measured,
             provenance: Provenance::new(["cal-window-2026-08".to_string()]),

@@ -13,14 +13,15 @@
 //! the field's meaning.
 
 use crate::domain::rate_card::{
-    BillingBasis, CurrencyCode, HoursParseError, RateCardDraft, RateCardParseError,
-    ReviewDuePolicy, Schedule, TokenClass, parse_day_name, parse_hours_utc, parse_rate_micros,
+    BillingBasis, CardQuality, CurrencyCode, HoursParseError, QuotaWindowKind, RateCardDraft,
+    RateCardParseError, RateDenomination, RateUnit, ReviewDuePolicy, Schedule, TokenClass,
+    WindowEstimate, parse_day_name, parse_hours_utc, parse_rate_micros,
 };
 use crate::domain::time::{UtcDate, UtcTimestamp};
 
 /// The keys a card entry may carry. Anything else is refused, so a field the
 /// importer silently drops is impossible by construction.
-const CARD_KEYS: [&str; 12] = [
+const CARD_KEYS: [&str; 15] = [
     "vendor",
     "model",
     "token_class",
@@ -33,6 +34,9 @@ const CARD_KEYS: [&str; 12] = [
     "source",
     "review_due",
     "schedule",
+    "window",
+    "unit",
+    "quality",
 ];
 
 /// The keys a card's `schedule` table may carry.
@@ -135,6 +139,17 @@ fn check_consistency(cards: &[RateCardDraft]) -> Result<(), RateBookError> {
             {
                 continue;
             }
+            // Two cards of different bases price different dimensions and are
+            // never both in force over the same figure: a money card values
+            // tokens at a price, a percent-of-window card states window
+            // movement. Two percent-of-window cards for different windows are
+            // the same case.
+            if card.billing_basis != other.billing_basis
+                || card.window_estimate.map(|estimate| estimate.window)
+                    != other.window_estimate.map(|estimate| estimate.window)
+            {
+                continue;
+            }
             if !effective_overlap(
                 card.effective_start,
                 card.effective_end,
@@ -229,14 +244,6 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
             reason: format!("rate {error:?}: {reason}"),
         }
     })?;
-    let currency =
-        CurrencyCode::parse(required(index, card, "currency")?).ok_or_else(|| RateBookError {
-            card_index: index,
-            reason: format!(
-                "currency {:?} is not a supported ISO 4217 code",
-                required(index, card, "currency").unwrap_or("")
-            ),
-        })?;
     let billing_basis =
         BillingBasis::parse(required(index, card, "billing_basis")?).ok_or_else(|| {
             RateBookError {
@@ -247,6 +254,7 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
                 ),
             }
         })?;
+    let (denomination, window_estimate) = parse_denomination(index, card, billing_basis)?;
     let effective_start_text = required(index, card, "effective_start")?;
     let effective_start = UtcDate::parse(effective_start_text).ok_or_else(|| RateBookError {
         card_index: index,
@@ -268,8 +276,9 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
         model,
         token_class,
         rate_micros,
-        currency,
+        denomination,
         billing_basis,
+        window_estimate,
         effective_start,
         effective_end,
         schedule,
@@ -282,6 +291,115 @@ fn parse_card(index: usize, card: &toml::Table) -> Result<RateCardDraft, RateBoo
             Some(date) => ReviewDuePolicy::On(date),
         },
     })
+}
+
+/// Reads the keys that state what a rate is counted in, refusing every
+/// combination the two bases do not have (`aub-8vpc`).
+///
+/// The two bases are mutually exclusive about these keys, and the refusals are
+/// deliberately not symmetric prose: a money card that grew a `window` was
+/// written against the wrong basis, and a percent-of-window card that names a
+/// `currency` is claiming a price for something that is not one. Each message
+/// names the card index (through [`RateBookError`]) and the offending field, so
+/// an operator fixes one key per message.
+fn parse_denomination(
+    index: usize,
+    card: &toml::Table,
+    billing_basis: BillingBasis,
+) -> Result<(RateDenomination, Option<WindowEstimate>), RateBookError> {
+    let refuse = |field: &str, reason: &str| RateBookError {
+        card_index: index,
+        reason: format!("{field} {reason}"),
+    };
+    match billing_basis {
+        BillingBasis::PerMillionTokens => {
+            for forbidden in ["window", "unit", "quality"] {
+                if card.contains_key(forbidden) {
+                    return Err(refuse(
+                        forbidden,
+                        "is only accepted on a percent_of_window_per_million_tokens card",
+                    ));
+                }
+            }
+            let text = required(index, card, "currency")?;
+            let currency = CurrencyCode::parse(text).ok_or_else(|| RateBookError {
+                card_index: index,
+                reason: format!("currency {text:?} is not a supported ISO 4217 code"),
+            })?;
+            Ok((RateDenomination::Money(currency), None))
+        }
+        BillingBasis::PercentOfWindowPerMillionTokens => {
+            if card.contains_key("schedule") {
+                // Not in this bead's card syntax, and refused rather than
+                // ignored: a time-of-day window on an approximation of a quota
+                // window is a second window with no consumer, and the valuation
+                // path for this basis never consults one.
+                return Err(refuse(
+                    "schedule",
+                    "is not accepted on a percent_of_window_per_million_tokens card",
+                ));
+            }
+            if card.contains_key("currency") {
+                return Err(refuse(
+                    "currency",
+                    "is refused on a percent_of_window_per_million_tokens card: the rate is \
+                     percentage points of a quota window, not a price",
+                ));
+            }
+            let window_text = required(index, card, "window").map_err(|_| {
+                refuse(
+                    "window",
+                    "is required on a percent_of_window_per_million_tokens card and must be \
+                     five_hour or seven_day",
+                )
+            })?;
+            let window = QuotaWindowKind::parse(window_text).ok_or_else(|| RateBookError {
+                card_index: index,
+                reason: format!("window {window_text:?} is not one of five_hour | seven_day"),
+            })?;
+            let unit_text = required(index, card, "unit").map_err(|_| {
+                refuse(
+                    "unit",
+                    "is required on a percent_of_window_per_million_tokens card and must be \
+                     percentage_points",
+                )
+            })?;
+            let unit = RateUnit::parse(unit_text).ok_or_else(|| RateBookError {
+                card_index: index,
+                reason: format!("unit {unit_text:?} is not percentage_points"),
+            })?;
+            let quality_text = required(index, card, "quality").map_err(|_| {
+                refuse(
+                    "quality",
+                    "is required on a percent_of_window_per_million_tokens card and must be \
+                     estimate: this basis admits approximations only",
+                )
+            })?;
+            let quality = CardQuality::parse(quality_text).ok_or_else(|| RateBookError {
+                card_index: index,
+                reason: format!(
+                    "quality {quality_text:?} is not estimate; a percent_of_window_per_million_tokens \
+                     card is a declared estimate and a measured figure for the same quantity is a \
+                     fitted calibration"
+                ),
+            })?;
+            if optional_string(card, "source").is_none() {
+                return Err(refuse(
+                    "source",
+                    "is required on a percent_of_window_per_million_tokens card: an estimate \
+                     whose origin is not recorded becomes the number",
+                ));
+            }
+            Ok((
+                RateDenomination::Points(unit),
+                Some(WindowEstimate {
+                    window,
+                    unit,
+                    quality,
+                }),
+            ))
+        }
+    }
 }
 
 /// Parses an optional `schedule = { days = [...], hours_utc = "HH:MM-HH:MM" }`
@@ -707,5 +825,153 @@ schedule = { days = ["mon", "tue", "wed", "thu", "fri"], hours_utc = "12:00-18:0
             unscheduled_card("deepseek-v4-flash", "0.22", Some("2026-09-07")),
         );
         assert_eq!(parse(&handoff).expect("a handoff must pass").cards.len(), 2);
+    }
+
+    // --- percent-of-window estimate cards (`aub-8vpc`) ------------------------
+
+    /// One well-formed estimate card. Every refusal below is this text with
+    /// exactly one key changed, so a refusal proves the key it names rather
+    /// than some other difference.
+    const ESTIMATE_CARD: &str = r#"
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "input"
+rate = "0.85"
+billing_basis = "percent_of_window_per_million_tokens"
+window = "five_hour"
+unit = "percentage_points"
+quality = "estimate"
+source = "operator notes, tools aub replaces"
+effective_start = "2026-09-07"
+"#;
+
+    fn refusal(text: &str) -> RateBookError {
+        parse(text).expect_err("the card must be refused")
+    }
+
+    #[test]
+    fn an_estimate_card_parses_with_its_window_unit_and_quality() {
+        let book = parse_ok(ESTIMATE_CARD);
+        let card = &book.cards[0];
+        assert_eq!(
+            card.billing_basis,
+            BillingBasis::PercentOfWindowPerMillionTokens
+        );
+        assert_eq!(card.rate_micros, 850_000);
+        assert_eq!(
+            card.denomination,
+            RateDenomination::Points(RateUnit::PercentagePoints)
+        );
+        assert_eq!(
+            card.window_estimate,
+            Some(WindowEstimate {
+                window: QuotaWindowKind::FiveHour,
+                unit: RateUnit::PercentagePoints,
+                quality: CardQuality::Estimate,
+            })
+        );
+    }
+
+    #[test]
+    fn an_estimate_card_naming_a_currency_is_refused() {
+        let with_currency = ESTIMATE_CARD.replace(
+            "unit = \"percentage_points\"",
+            "unit = \"percentage_points\"\ncurrency = \"USD\"",
+        );
+        let error = refusal(&with_currency);
+        assert_eq!(error.card_index, 0);
+        assert!(error.reason.starts_with("currency "), "{}", error.reason);
+    }
+
+    #[test]
+    fn an_estimate_card_without_a_window_is_refused() {
+        let error = refusal(&ESTIMATE_CARD.replace("window = \"five_hour\"\n", ""));
+        assert!(error.reason.starts_with("window "), "{}", error.reason);
+    }
+
+    #[test]
+    fn an_estimate_card_naming_an_unknown_window_is_refused() {
+        let error = refusal(&ESTIMATE_CARD.replace("five_hour", "one_month"));
+        assert!(
+            error.reason.contains("five_hour | seven_day"),
+            "{}",
+            error.reason
+        );
+    }
+
+    #[test]
+    fn an_estimate_card_without_a_unit_is_refused() {
+        let error = refusal(&ESTIMATE_CARD.replace("unit = \"percentage_points\"\n", ""));
+        assert!(error.reason.starts_with("unit "), "{}", error.reason);
+    }
+
+    #[test]
+    fn an_estimate_card_without_a_quality_is_refused() {
+        let error = refusal(&ESTIMATE_CARD.replace("quality = \"estimate\"\n", ""));
+        assert!(error.reason.starts_with("quality "), "{}", error.reason);
+    }
+
+    /// The one refusal that carries the whole point of the basis: a card of
+    /// this shape may not claim to be measured.
+    #[test]
+    fn an_estimate_card_claiming_to_be_measured_is_refused() {
+        let error = refusal(&ESTIMATE_CARD.replace("\"estimate\"", "\"measured\""));
+        assert!(error.reason.contains("is not estimate"), "{}", error.reason);
+    }
+
+    #[test]
+    fn an_estimate_card_without_a_source_is_refused() {
+        let error = refusal(
+            &ESTIMATE_CARD.replace("source = \"operator notes, tools aub replaces\"\n", ""),
+        );
+        assert!(error.reason.starts_with("source "), "{}", error.reason);
+    }
+
+    #[test]
+    fn a_money_card_carrying_a_window_or_a_quality_is_refused() {
+        for extra in [
+            "window = \"five_hour\"",
+            "quality = \"estimate\"",
+            "unit = \"percentage_points\"",
+        ] {
+            let card = MINIMAL_CARD.replace(
+                "billing_basis = \"per_million_tokens\"",
+                &format!("billing_basis = \"per_million_tokens\"\n{extra}"),
+            );
+            let error = refusal(&card);
+            assert!(
+                error
+                    .reason
+                    .contains("only accepted on a percent_of_window_per_million_tokens card"),
+                "{}",
+                error.reason
+            );
+        }
+    }
+
+    /// A money card and an estimate card for the same vendor, model and class
+    /// price different dimensions, so they are not an overlap. The planted
+    /// negative is the same pair with both cards on one basis, which is.
+    #[test]
+    fn a_money_card_and_an_estimate_card_for_one_class_coexist() {
+        let both = format!("{MINIMAL_CARD}{ESTIMATE_CARD}");
+        assert_eq!(parse(&both).expect("two bases must coexist").cards.len(), 2);
+
+        let two_estimates = format!("{ESTIMATE_CARD}{ESTIMATE_CARD}");
+        let error = refusal(&two_estimates);
+        assert!(error.reason.contains("overlaps card 0"), "{}", error.reason);
+    }
+
+    /// Two estimates for the two different windows are two facts about one
+    /// class, not a conflict.
+    #[test]
+    fn estimates_for_two_windows_are_not_an_overlap() {
+        let weekly = ESTIMATE_CARD.replace("five_hour", "seven_day");
+        let both = format!("{ESTIMATE_CARD}{weekly}");
+        assert_eq!(
+            parse(&both).expect("two windows must coexist").cards.len(),
+            2
+        );
     }
 }

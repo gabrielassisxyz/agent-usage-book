@@ -156,6 +156,7 @@ c-31	aub-eun.11	cargo	cargo test --test sampler_batch named_accounts_are_isolate
 c-32	aub-eu7.2	cargo	cargo test --lib a_deliberately_dropped_event_fails_the_conservation_assertion	replace	src/attribution/account_segment.rs	fn debug_assert_conserves(inputs: &AccountSegmentationInputs, result: &AccountSegmentationResult) {	fn debug_assert_conserves(inputs: &AccountSegmentationInputs, result: &AccountSegmentationResult) {\n    return; // probe: conservation assertion disabled	must fail the conservation assertion	cargo test --lib per_account_usage_plus_unknown_account_equals_total_input_usage	0	test result: ok
 c-33	aub-eu7.3	cargo	cargo test --lib a_deliberately_dropped_window_fails_the_conservation_assertion	replace	src/attribution/segment.rs	fn debug_assert_conserves(inputs: &SegmentationInputs, result: &SegmentationResult) {	fn debug_assert_conserves(inputs: &SegmentationInputs, result: &SegmentationResult) {\n    return; // probe: conservation assertion disabled	must fail the conservation assertion	cargo test --lib rebuilding_with_different_tracker_data_changes_the_attribution	0	test result: ok
 c-34	aub-wyu.2	shell	CARGO_TARGET_DIR="$MUT_TARGET" cargo check -p agent-usage-book	replace	src/domain/tokens.rs	    CacheWrite,\n}	    CacheWrite,\n    ZzProbeKind,\n}	non-exhaustive patterns	cargo metadata --format-version 1 --no-deps >/dev/null && echo metadata-ok	0	metadata-ok
+c-35	aub-nw1l	cargo	cargo test --lib evidence::tests::quality_combine_measured_stays_measured	sed	src/evidence.rs	s/            (Self::Measured, Self::Measured) => Self::Measured,/            (Self::Measured, Self::Measured) => Self::Mixed { methods, uncertainty },/		quality_combine_measured_stays_measured \.\.\. FAILED	cargo test --lib domain::tokens	0	test result: ok
 e-01	aub-vcx.7	e2e	run-e2e	sed	tests/e2e/cases/003-exit-classes.sh	s/assert_exit 4 3/assert_exit 5 3/		class 4|exit-class|assertion|FAIL	run-e2e-sibling	0	002-status.sh
 e-02	aub-71j.7	e2e	run-e2e	sed	tests/e2e/cases/002-status.sh	s/? · stale · no successful sample/? · fresh · sample/		stale|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 e-03	aub-6fuo	e2e	run-e2e	sed	tests/e2e/cases/036-opencode-reset-precision.sh	s/assert_stdout_contains 4 "anomaly_count=0"/assert_stdout_contains 4 "anomaly_count=1"/		anomaly_count|assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
@@ -171,6 +172,8 @@ e-12	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/023-calibrate-controlled-experime
 e-13	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/026-can-run.sh	s/^    assert_exit 0 1$/    assert_exit 1 1/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 sh-34	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/56-migration-schema-pin	plant	src/store/migrations/9999_zz_guard_probe_migration.rs	pub fn zz_guard_probe_migration() {}		012-backup\.sh pins schema=[0-9]+ generation=.*9999_zz_guard_probe_migration\.rs	bin/checks/70-quantity-inventory	0	every pub struct/enum
 sh-35	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/80-gate-coverage "$SCRATCH"	neuter	bin/checks/56-migration-schema-pin			56-migration-schema-pin is neutered with exit 0	bin/checks/70-quantity-inventory	0	every pub struct/enum
+c-36	aub-a56a	cargo	cargo test --lib store::connection::tests::opening_a_second_connection_keeps_the_first_connections_shared_lock	python	src/store/connection.rs	import pathlib; p=pathlib.Path("src/store/connection.rs"); t=p.read_text(); old="    let held = handles"; assert t.count(old)==1; new="    let _probe = File::open(path).unwrap();"+chr(10)+old; p.write_text(t.replace(old,new,1))		opening a second connection released the first connection's shared lock	cargo test --lib store::connection::tests::probe_database_header_refuses_leaf_btree_page_at_offset_zero	0	test result:
+c-37	aub-i2i9	cargo	cargo test --test antigravity_token_refresh extracting_client_material_from_a_large_binary_does_not_hold_it_in_memory	replace	src/auth/token_endpoint.rs	const AGY_SCAN_CHUNK_BYTES: usize = 1 << 20;	const AGY_SCAN_CHUNK_BYTES: usize = 64 * 1024 * 1024;	aub peaked at .*bound	cargo test --test antigravity_token_refresh a_rejected_client_pairing_records_refresh_configuration_failed	0	test result:
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness
@@ -242,6 +245,3 @@ consistency check enforces exactly that.
 - `aub-x5bo`: a one-time proof that following the written pane work-cycle
   surfaces planted lint and format violations; the subset commands it
   exercises are covered by the gate-coverage neutering row `sh-24`.
-- `aub-a56a`, `aub-i2i9`: closed on 2026-09-14 with a recorded can-fail
-  mutation and no row. The rows are owed by `aub-dhsc`; this entry goes when
-  they land.

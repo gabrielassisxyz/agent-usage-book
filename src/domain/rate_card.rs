@@ -62,6 +62,11 @@ impl TokenClass {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BillingBasis {
     PerMillionTokens,
+    /// Percentage points of one named quota window per million tokens
+    /// (`aub-8vpc`). A card of this basis is a declared estimate and states no
+    /// currency: it says how much of a window a million tokens moves, which is
+    /// neither a price nor a credit count.
+    PercentOfWindowPerMillionTokens,
 }
 
 impl BillingBasis {
@@ -69,6 +74,7 @@ impl BillingBasis {
     pub fn as_str(self) -> &'static str {
         match self {
             BillingBasis::PerMillionTokens => "per_million_tokens",
+            BillingBasis::PercentOfWindowPerMillionTokens => "percent_of_window_per_million_tokens",
         }
     }
 
@@ -76,9 +82,103 @@ impl BillingBasis {
     pub fn parse(text: &str) -> Option<Self> {
         match text {
             "per_million_tokens" => Some(BillingBasis::PerMillionTokens),
+            "percent_of_window_per_million_tokens" => {
+                Some(BillingBasis::PercentOfWindowPerMillionTokens)
+            }
             _ => None,
         }
     }
+}
+
+/// Which quota window a percent-of-window card prices against (`aub-8vpc`).
+///
+/// The two windows this project meters. The symbolic forms are the same
+/// `WindowSemanticKey` spellings the meter and the calibration store use, so a
+/// card and a calibration name one window in one spelling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum QuotaWindowKind {
+    FiveHour,
+    SevenDay,
+}
+
+impl QuotaWindowKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            QuotaWindowKind::FiveHour => "five_hour",
+            QuotaWindowKind::SevenDay => "seven_day",
+        }
+    }
+
+    /// Parses the symbolic form. An unknown window is a refused card, never the
+    /// nearest known window.
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "five_hour" => Some(QuotaWindowKind::FiveHour),
+            "seven_day" => Some(QuotaWindowKind::SevenDay),
+            _ => None,
+        }
+    }
+}
+
+/// The non-monetary unit a rate can be quoted in (`aub-8vpc`). One variant
+/// today, and an exhaustive match so a second unit is a compile-time decision
+/// rather than a string comparison somewhere downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateUnit {
+    PercentagePoints,
+}
+
+impl RateUnit {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateUnit::PercentagePoints => "percentage_points",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "percentage_points" => Some(RateUnit::PercentagePoints),
+            _ => None,
+        }
+    }
+}
+
+/// What a card claims about its own evidence (`aub-8vpc`).
+///
+/// One variant, and deliberately so: the only cards allowed to state a rate in
+/// percent of a window are declared estimates. A measured figure for the same
+/// quantity is a fitted calibration, which is a different record with its own
+/// health, and admitting `quality = "measured"` here would give an operator a
+/// way to write one by hand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CardQuality {
+    Estimate,
+}
+
+impl CardQuality {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CardQuality::Estimate => "estimate",
+        }
+    }
+
+    pub fn parse(text: &str) -> Option<Self> {
+        match text {
+            "estimate" => Some(CardQuality::Estimate),
+            _ => None,
+        }
+    }
+}
+
+/// The three keys a percent-of-window card carries together, or none of them
+/// (`aub-8vpc`). Grouped rather than three independent `Option` fields because
+/// a card with a window and no declared quality is not a state this project
+/// has: the group makes it unrepresentable instead of merely refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct WindowEstimate {
+    pub window: QuotaWindowKind,
+    pub unit: RateUnit,
+    pub quality: CardQuality,
 }
 
 /// A currency code. Runtime data, unlike the compile-time currency types in
@@ -108,6 +208,52 @@ impl CurrencyCode {
             "USD" => Some(CurrencyCode::Usd),
             "EUR" => Some(CurrencyCode::Eur),
             _ => None,
+        }
+    }
+}
+
+/// What a rate is denominated in: money, or a non-monetary unit (`aub-8vpc`).
+///
+/// One field on the card rather than an optional currency beside an optional
+/// unit, because "neither" and "both" are not states a rate has. The store's
+/// `currency` column carries [`Self::as_str`] for every card, so a row always
+/// states its own denomination in one place and a percent-of-window row can
+/// never be decoded as money: `CurrencyCode::parse` does not accept the
+/// spelling this writes for one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RateDenomination {
+    Money(CurrencyCode),
+    /// Points of a quota window. The window itself is named by the card's
+    /// [`WindowEstimate`], not here: this says only what the number is counted in.
+    Points(RateUnit),
+}
+
+impl RateDenomination {
+    /// The stored and rendered symbol.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RateDenomination::Money(currency) => currency.as_str(),
+            RateDenomination::Points(unit) => unit.as_str(),
+        }
+    }
+
+    /// Parses a stored symbol back into a denomination, trying money first.
+    /// An unknown symbol is `None`, the same refusal `CurrencyCode::parse`
+    /// makes, because guessing a denomination is the unit confusion this
+    /// project exists to prevent.
+    pub fn parse(text: &str) -> Option<Self> {
+        if let Some(currency) = CurrencyCode::parse(text) {
+            return Some(RateDenomination::Money(currency));
+        }
+        RateUnit::parse(text).map(RateDenomination::Points)
+    }
+
+    /// The currency, for a money rate only. `None` for every other
+    /// denomination, so a caller that wants money has to say so.
+    pub fn currency(self) -> Option<CurrencyCode> {
+        match self {
+            RateDenomination::Money(currency) => Some(currency),
+            RateDenomination::Points(_) => None,
         }
     }
 }
@@ -172,8 +318,17 @@ pub struct RateCardDraft {
     /// The rate in integer micros of [`Self::currency`] per the billing basis.
     /// Exact integer arithmetic, same convention as `Money`.
     pub rate_micros: i64,
-    pub currency: CurrencyCode,
+    /// What [`Self::rate_micros`] is counted in. A money card carries a
+    /// currency; a percent-of-window card carries percentage points.
+    pub denomination: RateDenomination,
     pub billing_basis: BillingBasis,
+    /// The window, unit and declared quality of a percent-of-window card
+    /// (`aub-8vpc`); `None` for every money card. Present exactly when
+    /// [`Self::billing_basis`] is
+    /// [`BillingBasis::PercentOfWindowPerMillionTokens`]: the importer refuses
+    /// either half alone, and the store's pairing trigger refuses a row that
+    /// disagrees.
+    pub window_estimate: Option<WindowEstimate>,
     /// The first day the rate is effective.
     pub effective_start: UtcDate,
     /// The day after which the rate no longer applies; `None` is open-ended.

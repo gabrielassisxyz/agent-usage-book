@@ -21,8 +21,8 @@ use agent_usage_book::presentation::render::{ExplainMode, render_spend_report_wi
 use agent_usage_book::report::{
     IngestSummary, LedgerGeneration, ProvenanceNode, ReportMetadata, SpendGroup,
     SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGroupWindowEquivalentProvenance,
-    SpendGrouping, SpendReport, Unit, ValueArithmetic, WindowEquivalentDerivation,
-    WindowEquivalentValue,
+    SpendGrouping, SpendReport, Unit, ValueArithmetic, WindowEquivalentBasis,
+    WindowEquivalentDerivation, WindowEquivalentValue,
 };
 
 fn node(arithmetic: ValueArithmetic) -> ProvenanceNode {
@@ -40,6 +40,47 @@ fn node(arithmetic: ValueArithmetic) -> ProvenanceNode {
 }
 
 fn report() -> SpendReport {
+    let interval = Interval::new(
+        PercentagePoints::new(100).unwrap(),
+        PercentagePoints::new(250).unwrap(),
+    )
+    .unwrap();
+    report_with(WindowEquivalentDerivation::Available(
+        WindowEquivalentValue {
+            interval,
+            basis: WindowEquivalentBasis::Calibration(WindowCalibrationId::new("calibration-v1")),
+            coverage: CoverageCompleteness::Complete,
+            quality: EvidenceQuality::Estimated {
+                methods: BTreeSet::from([EstimatorId::new("window-calibration:calibration-v1")]),
+                uncertainty: Some(interval),
+            },
+            provenance: Provenance::new(["window-calibration:calibration-v1".to_string()]),
+        },
+    ))
+}
+
+/// The same report with its window figure read off two percent-of-window
+/// rate cards instead of a calibration (`aub-8vpc`): a point interval, the
+/// estimate method and no uncertainty, exactly what the spend resolver builds.
+fn estimated_report() -> SpendReport {
+    let points = PercentagePoints::new(8_500).unwrap();
+    report_with(WindowEquivalentDerivation::Available(
+        WindowEquivalentValue {
+            interval: Interval::new(points, points).unwrap(),
+            basis: WindowEquivalentBasis::RateCardEstimate {
+                rate_card_ids: vec![7, 9],
+            },
+            coverage: CoverageCompleteness::Complete,
+            quality: EvidenceQuality::Estimated {
+                methods: BTreeSet::from([EstimatorId::new("rate-card-estimate")]),
+                uncertainty: None,
+            },
+            provenance: Provenance::new(["rate-card-estimate".to_string()]),
+        },
+    ))
+}
+
+fn report_with(window_equivalent: WindowEquivalentDerivation) -> SpendReport {
     let key = LogicalName::new("day=2026-08-25");
     let usage = UsageVector::new(
         KnownTokenVector::new(
@@ -58,21 +99,6 @@ fn report() -> SpendReport {
         EvidenceQuality::Measured,
         Provenance::new(["cost-model:cost-model-v1".to_string()]),
     ));
-    let interval = Interval::new(
-        PercentagePoints::new(100).unwrap(),
-        PercentagePoints::new(250).unwrap(),
-    )
-    .unwrap();
-    let window_equivalent = WindowEquivalentDerivation::Available(WindowEquivalentValue {
-        interval,
-        calibration_id: WindowCalibrationId::new("calibration-v1"),
-        coverage: CoverageCompleteness::Complete,
-        quality: EvidenceQuality::Estimated {
-            methods: BTreeSet::from([EstimatorId::new("window-calibration:calibration-v1")]),
-            uncertainty: Some(interval),
-        },
-        provenance: Provenance::new(["window-calibration:calibration-v1".to_string()]),
-    });
     let group = SpendGroup::new(
         key.clone(),
         usage,
@@ -162,6 +188,69 @@ fn human_and_json_window_equivalent_contracts_retain_the_same_interval_and_witne
             .to_string()
             .contains("window-calibration:calibration-v1")
     );
+}
+
+/// The estimated case on both surfaces (`aub-8vpc`): the text puts
+/// `(estimated)` immediately after the figure and names the cards, and the
+/// JSON carries the estimate method and the card ids in place of a
+/// calibration id. The calibrated contract above is the planted negative for
+/// the label: its line has no `(estimated)` and its JSON no `basis`.
+#[test]
+fn an_estimated_window_figure_is_labelled_on_both_surfaces() {
+    let report = estimated_report();
+    let human = render_spend_report_with_explain(&report, ExplainMode::Summary);
+    // The box wraps the detail line, so the figure-and-label and the card
+    // list are asserted separately; the label is what must not be separable
+    // from the figure.
+    assert!(
+        human.contains("window equivalent [0.8500, 0.8500] percentage points (estimated)"),
+        "the label must follow the figure: {human}"
+    );
+    assert!(
+        human.contains("rate cards 7, 9"),
+        "the cards must be named: {human}"
+    );
+    assert!(
+        !human.contains("calibration calibration-v1"),
+        "an estimate must not name a calibration: {human}"
+    );
+
+    let json = spend_json_with_explain(
+        &report,
+        RunId::from_string("run-window-estimate".to_string()),
+        ExplainMode::Summary,
+    );
+    validate_spend_report_json(&json).expect("estimated window-equivalent JSON must validate");
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let window = &parsed["groups"][0]["window_equivalent"];
+    assert_eq!(window["lower"], "8500");
+    assert_eq!(window["upper"], "8500");
+    assert_eq!(window["evidence_quality"], "estimated");
+    assert_eq!(window["methods"], serde_json::json!(["rate-card-estimate"]));
+    assert_eq!(
+        window["basis"],
+        serde_json::json!({"kind": "rate_card_estimate", "rate_card_ids": [7, 9]})
+    );
+    assert!(
+        window.get("calibration_id").is_none(),
+        "an estimate carries no calibration id: {window}"
+    );
+}
+
+#[test]
+fn a_calibrated_window_figure_carries_no_estimate_label() {
+    let report = report();
+    let human = render_spend_report_with_explain(&report, ExplainMode::Summary);
+    assert!(!human.contains("(estimated)"), "{human}");
+    let json = spend_json_with_explain(
+        &report,
+        RunId::from_string("run-window-calibrated".to_string()),
+        ExplainMode::Summary,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let window = &parsed["groups"][0]["window_equivalent"];
+    assert!(window.get("basis").is_none(), "{window}");
+    assert!(window.get("methods").is_none(), "{window}");
 }
 
 /// The whitespace-separated cells of the boxed spend table row whose first cell is

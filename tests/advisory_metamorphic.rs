@@ -827,6 +827,7 @@ pub fn verify_law_7(inputs: &Law7Inputs) -> Result<(), String> {
             reason: inputs.stale_reason,
         },
         window_calibrations: BTreeMap::new(),
+        window_estimates: BTreeMap::new(),
         cost_model_missing_token_classes: Vec::new(),
         plan_tier_mismatch: None,
         task: TaskReferenceInput {
@@ -974,6 +975,7 @@ pub fn verify_law_8(inputs: &Law8Inputs) -> Result<(), String> {
             observed_age: Some(MonotonicDuration::from_seconds(10)),
         },
         window_calibrations: BTreeMap::new(), // no current calibration for this window
+        window_estimates: BTreeMap::new(),
         cost_model_missing_token_classes: Vec::new(),
         plan_tier_mismatch: None,
         task,
