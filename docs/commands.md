@@ -190,6 +190,26 @@ on the default. `--explain` names each card a group used with its schedule
 heuristic values at the default card and its group reads estimated with the
 schedule-unresolved method, so an unknown hour never silently becomes a peak.
 
+`--window-equivalent five_hour` (or `seven_day`) adds each group's usage as
+percentage points of that quota window. A current calibration for the
+provider and window always answers first, and its line names the calibration.
+When no calibration is recorded for that provider and window at all, a
+percent-of-window rate card (see `aub rate-card`) answers instead, and the
+figure is followed immediately by `(estimated)` and the ids of the cards
+used:
+
+```text
+window equivalent [0.85, 0.85] percentage points (estimated) from rate card 7
+```
+
+In JSON the estimated figure carries `evidence_quality: "estimated"`,
+`methods: ["rate-card-estimate"]` and `basis: {"kind": "rate_card_estimate",
+"rate_card_ids": [...]}` in place of `calibration_id`. A calibration that is
+recorded but not current (`review_due`, `suspect`) does not fall back: the
+command refuses naming the health, because a stale measurement is still
+evidence and an estimate must not paper over its review. With neither a
+calibration nor an estimate card the refusal names the missing calibration.
+
 **Refuses:** to guess at an unreadable transcript. A source that cannot be
 normalized leaves the report `IngestIncomplete` rather than silently omitted
 or extrapolated from what did parse. `spend` also refuses to answer a quota
@@ -222,6 +242,13 @@ historical cost of `--task-kind TYPE`, can `--task-model MODEL` run now under
 meter sample for the account first, the same sampler path `aub sample
 --account` uses, before advising; `--cached` uses the newest persisted
 reading instead, but only while it still satisfies the freshness policy.
+
+Headroom follows the same precedence as `aub spend --window-equivalent`: a
+current calibration answers, a window with no calibration recorded at all
+takes the rate-card estimate and its headroom line ends in `(estimated)`
+with the cards named, and a calibration that is recorded but not current
+refuses naming its health. The JSON window carries `basis.rate_card_ids` and
+`evidence_quality: "estimated"` in place of `calibration_id`.
 
 **Refuses:** to guess. Any of seven missing prerequisites, a stale meter,
 authentication required, a constraining window with no applicable current
@@ -619,6 +646,33 @@ naming both card indexes: at most one unscheduled card per vendor, model,
 class and date, and no two scheduled cards whose day sets intersect and
 whose hour ranges overlap. A default beside its peak rows always passes.
 
+A card can also state a subscription price as percentage points of a quota
+window per million tokens, and only as a declared estimate:
+
+```toml
+[[card]]
+vendor = "anthropic"
+model = "claude-fable-5"
+token_class = "input"
+billing_basis = "percent_of_window_per_million_tokens"
+window = "five_hour"          # or "seven_day"
+rate = "0.85"                 # 1M input tokens move the window 0.85 points
+unit = "percentage_points"    # in place of currency
+quality = "estimate"          # the only value this basis accepts
+source = "where the figure came from"
+effective_start = "2026-09-01"
+```
+
+The importer refuses such a card when it carries a `currency`, lacks
+`window`, lacks `quality` or states anything but `estimate`, or lacks
+`source`, and refuses `window`, `unit` or `quality` on a
+`per_million_tokens` card; each refusal names the card index and the field.
+These cards are never money and never pass through the cost model. They are
+read only by `aub spend --window-equivalent` and `aub can-run`, and only while
+no calibration is recorded for that provider and window; every figure they
+produce is labelled estimated. Retiring one is an `effective_end`, like any
+card.
+
 **Refuses:** to edit history. A rate book is imported into a new, immutable,
 versioned record; correcting a stale price means importing a new version,
 never mutating one already on record.
@@ -872,6 +926,13 @@ what backoff means. Like every check that is not a configured floor it reports
 and does not gate: `aub doctor` still exits zero with it failing. The alarm
 that rides an exit code is `aub coverage`, scheduled separately
 (`docs/scheduling.md`).
+
+`window-estimate-in-use` reports `INFO`, naming each provider and window
+(`anthropic/five_hour`), while a window figure would come from a
+percent-of-window rate-card estimate rather than a calibration. It is not a
+failure: nothing is wrong while an estimate stands in. It passes silently
+once a calibration exists for every such window, so the day the calibration
+lands the line disappears.
 
 **Refuses:** to repair anything unless `--fix` is given, and even then it
 refuses anything outside the four permitted repairs; the rest of the check

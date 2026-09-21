@@ -150,6 +150,9 @@ mod migration_0041;
 #[path = "0042_multivariate_coefficient_sign.rs"]
 mod migration_0042;
 
+#[path = "0043_rate_card_window_estimate.rs"]
+mod migration_0043;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -198,5 +201,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0040::migration(),
         migration_0041::migration(),
         migration_0042::migration(),
+        migration_0043::migration(),
     ]
 }

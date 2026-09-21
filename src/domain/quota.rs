@@ -179,6 +179,72 @@ impl DomainQuantity for PercentagePoints {
     }
 }
 
+/// Percentage points of one quota window consumed per one million tokens: the
+/// coefficient a percent-of-window rate card states (`aub-8vpc`).
+///
+/// A third dimension, distinct from both `MoneyPerMillionTokens` and
+/// `CreditsPerToken`, with no conversion to either: a card of this basis states
+/// how much of a *named window* a million tokens moves, which is neither a price
+/// nor a credit count. Stored as integer micro-points per million tokens, the same
+/// exact-integer convention the money rate uses, so `"0.85"` is `850_000`.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct PointsPerMillionTokens {
+    micro_points_per_million_tokens: i64,
+}
+
+impl PointsPerMillionTokens {
+    /// Constructs from micro-points per one million tokens, the form the rate
+    /// book parses and the store persists.
+    ///
+    /// `pub(crate)`: a coefficient, held to the same boundary
+    /// `CreditsPerToken` and `CreditsPerPercentagePoint` are held to, so a
+    /// consumer outside the crate cannot mint one and skip the card that is
+    /// supposed to state it. See `src/domain/credits.rs` on why the crate is
+    /// the tightest boundary a domain file can declare.
+    pub(crate) const fn from_micro_points_per_million(
+        micro_points_per_million_tokens: i64,
+    ) -> Self {
+        Self {
+            micro_points_per_million_tokens,
+        }
+    }
+
+    /// The rate in micro-points per one million tokens.
+    pub const fn micro_points_per_million(self) -> i64 {
+        self.micro_points_per_million_tokens
+    }
+
+    /// The window movement `tokens` of this class consume at this rate.
+    ///
+    /// One micro-point is one hundredth of a [`PercentagePoints`] native unit
+    /// (a point is 10_000 of them), so the conversion divides by one hundred
+    /// after amortizing over the million, rounding half away from zero exactly
+    /// as the money rate does. `None` when the product leaves the representable
+    /// range rather than a clamped figure standing in for an impossible one.
+    pub fn times_tokens(self, tokens: u64) -> Option<PercentagePoints> {
+        let micro_points =
+            i128::from(self.micro_points_per_million_tokens) * i128::from(tokens) / 1_000_000;
+        let native = round_half_away(micro_points, 100);
+        i32::try_from(native).ok().and_then(PercentagePoints::new)
+    }
+}
+
+/// Rounds `numerator / denominator` to the nearest integer, ties away from zero:
+/// the policy `Money` and `Credits` both apply at their one division site.
+fn round_half_away(numerator: i128, denominator: i128) -> i128 {
+    let quotient = numerator / denominator;
+    let remainder = numerator % denominator;
+    if remainder.abs() * 2 >= denominator {
+        if numerator >= 0 {
+            quotient + 1
+        } else {
+            quotient - 1
+        }
+    } else {
+        quotient
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -276,5 +342,29 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The rate the acceptance criterion names, and the rounding policy beside
+    /// it: a rate whose product lands between two native units rounds half away
+    /// from zero rather than truncating toward a figure the card did not state.
+    #[test]
+    fn points_per_million_tokens_prices_a_million_tokens_exactly() {
+        let rate = PointsPerMillionTokens::from_micro_points_per_million(850_000);
+        assert_eq!(rate.times_tokens(1_000_000), PercentagePoints::new(8_500));
+        assert_eq!(rate.times_tokens(0), PercentagePoints::new(0));
+        assert_eq!(rate.times_tokens(500_000), PercentagePoints::new(4_250));
+
+        // 150 micro-points is one and a half native units: half away from zero.
+        let fine = PointsPerMillionTokens::from_micro_points_per_million(150);
+        assert_eq!(fine.times_tokens(1_000_000), PercentagePoints::new(2));
+    }
+
+    /// A product outside the representable range refuses instead of clamping: a
+    /// clamped figure is a number the evidence does not justify.
+    #[test]
+    fn points_per_million_tokens_refuses_an_unrepresentable_product() {
+        let rate = PointsPerMillionTokens::from_micro_points_per_million(1_000_000);
+        assert_eq!(rate.times_tokens(1_000_000), PercentagePoints::new(10_000));
+        assert_eq!(rate.times_tokens(1_000_000_000_000), None);
     }
 }

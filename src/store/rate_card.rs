@@ -10,8 +10,9 @@
 use rusqlite::params;
 
 use crate::domain::rate_card::{
-    BillingBasis, CurrencyCode, Publication, RateCard, RateCardDraft, ReviewDuePolicy, Schedule,
-    TokenClass, parse_day_name, parse_hours_utc,
+    BillingBasis, CardQuality, Publication, QuotaWindowKind, RateCard, RateCardDraft,
+    RateDenomination, RateUnit, ReviewDuePolicy, Schedule, TokenClass, WindowEstimate,
+    parse_day_name, parse_hours_utc,
 };
 use crate::domain::time::{Clock, MonotonicDuration, UtcDate, UtcTimestamp};
 use crate::error::Error;
@@ -68,20 +69,21 @@ pub fn insert(
     };
     for draft in drafts {
         let (schedule_days, schedule_hours) = schedule_columns(&draft.schedule);
+        let (window, unit, quality) = window_estimate_columns(&draft.window_estimate);
         let added = connection
             .execute(
                 "INSERT INTO rate_card (
                     vendor, model, token_class, rate_micros, currency, billing_basis,
                     effective_start, effective_end, imported_at, published_at, source, review_due,
-                    schedule_days, schedule_hours
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+                    schedule_days, schedule_hours, \"window\", unit, quality
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)
                 ON CONFLICT DO NOTHING",
                 params![
                     draft.vendor,
                     draft.model,
                     draft.token_class.as_str(),
                     draft.rate_micros,
-                    draft.currency.as_str(),
+                    draft.denomination.as_str(),
                     draft.billing_basis.as_str(),
                     draft.effective_start.iso(),
                     draft.effective_end.map(UtcDate::iso),
@@ -91,6 +93,9 @@ pub fn insert(
                     draft.review_due.iso(),
                     schedule_days,
                     schedule_hours,
+                    window,
+                    unit,
+                    quality,
                 ],
             )
             .map_err(|error| Error::Store(format!("cannot insert rate card: {error}")))?;
@@ -110,7 +115,7 @@ pub fn history(connection: &rusqlite::Connection) -> Result<Vec<RateCard>, Error
         .prepare(
             "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
                     billing_basis, effective_start, effective_end, published_at, source, review_due,
-                    schedule_days, schedule_hours
+                    schedule_days, schedule_hours, \"window\", unit, quality
              FROM rate_card
              ORDER BY vendor, model, token_class, effective_start, id",
         )
@@ -138,7 +143,7 @@ pub fn effective_at(
         .prepare(
             "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
                     billing_basis, effective_start, effective_end, published_at, source, review_due,
-                    schedule_days, schedule_hours
+                    schedule_days, schedule_hours, \"window\", unit, quality
              FROM rate_card
              WHERE effective_start <= ?1
                AND (effective_end IS NULL OR effective_end > ?1)
@@ -159,6 +164,59 @@ fn schedule_columns(schedule: &Option<Schedule>) -> (Option<String>, Option<Stri
     match schedule {
         None => (None, None),
         Some(window) => (Some(window.days_text()), Some(window.hours_text())),
+    }
+}
+
+/// The window estimate as its three stored columns, all three absent for a
+/// money card (`aub-8vpc`). All-or-nothing by construction, matching the
+/// pairing trigger migration 0043 installs.
+fn window_estimate_columns(
+    estimate: &Option<WindowEstimate>,
+) -> (
+    Option<&'static str>,
+    Option<&'static str>,
+    Option<&'static str>,
+) {
+    match estimate {
+        None => (None, None, None),
+        Some(estimate) => (
+            Some(estimate.window.as_str()),
+            Some(estimate.unit.as_str()),
+            Some(estimate.quality.as_str()),
+        ),
+    }
+}
+
+/// The three stored columns back into a [`WindowEstimate`]. A row the
+/// repository wrote always parses; a half-present or unknown value is a corrupt
+/// row, refused like any other unparseable stored column rather than read as a
+/// money card.
+fn parse_window_estimate(
+    window: Option<String>,
+    unit: Option<String>,
+    quality: Option<String>,
+) -> Result<Option<WindowEstimate>, rusqlite::Error> {
+    let corrupt = |message: String| {
+        rusqlite::Error::FromSqlConversionFailure(15, rusqlite::types::Type::Text, message.into())
+    };
+    match (window, unit, quality) {
+        (None, None, None) => Ok(None),
+        (Some(window), Some(unit), Some(quality)) => {
+            let parsed_window = QuotaWindowKind::parse(&window)
+                .ok_or_else(|| corrupt(format!("unknown rate card window {window:?}")))?;
+            let parsed_unit = RateUnit::parse(&unit)
+                .ok_or_else(|| corrupt(format!("unknown rate card unit {unit:?}")))?;
+            let parsed_quality = CardQuality::parse(&quality)
+                .ok_or_else(|| corrupt(format!("unknown rate card quality {quality:?}")))?;
+            Ok(Some(WindowEstimate {
+                window: parsed_window,
+                unit: parsed_unit,
+                quality: parsed_quality,
+            }))
+        }
+        (window, unit, quality) => Err(corrupt(format!(
+            "half-present window estimate {window:?} {unit:?} {quality:?}"
+        ))),
     }
 }
 
@@ -227,7 +285,7 @@ pub fn stale_rate_cards(
         .prepare(
             "SELECT id, imported_at, vendor, model, token_class, rate_micros, currency,
                     billing_basis, effective_start, effective_end, published_at, source, review_due,
-                    schedule_days, schedule_hours
+                    schedule_days, schedule_hours, \"window\", unit, quality
              FROM rate_card
              WHERE review_due IS NOT NULL AND review_due <= ?1
              ORDER BY vendor, model, token_class, effective_start, id",
@@ -257,6 +315,10 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
     let schedule_days: Option<String> = row.get(13)?;
     let schedule_hours: Option<String> = row.get(14)?;
     let schedule = parse_schedule(schedule_days, schedule_hours)?;
+    let window: Option<String> = row.get(15)?;
+    let unit: Option<String> = row.get(16)?;
+    let quality: Option<String> = row.get(17)?;
+    let window_estimate = parse_window_estimate(window, unit, quality)?;
 
     let token_class = TokenClass::parse(&token_class).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
@@ -265,11 +327,11 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
             format!("unknown token class {token_class:?}").into(),
         )
     })?;
-    let currency = CurrencyCode::parse(&currency).ok_or_else(|| {
+    let denomination = RateDenomination::parse(&currency).ok_or_else(|| {
         rusqlite::Error::FromSqlConversionFailure(
             6,
             rusqlite::types::Type::Text,
-            format!("unknown currency {currency:?}").into(),
+            format!("unknown rate denomination {currency:?}").into(),
         )
     })?;
     let billing_basis = BillingBasis::parse(&billing_basis).ok_or_else(|| {
@@ -315,8 +377,9 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
             model,
             token_class,
             rate_micros,
-            currency,
+            denomination,
             billing_basis,
+            window_estimate,
             effective_start,
             effective_end,
             schedule,
@@ -332,7 +395,7 @@ fn row_to_card(row: &rusqlite::Row<'_>) -> Result<RateCard, rusqlite::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::rate_card::parse_rate_micros;
+    use crate::domain::rate_card::{CurrencyCode, parse_rate_micros};
 
     use crate::store::connection::PragmaPolicy;
 
@@ -377,7 +440,8 @@ mod tests {
             model: model.to_string(),
             token_class: class,
             rate_micros: parse_rate_micros(rate).expect("test rate must parse"),
-            currency: CurrencyCode::Usd,
+            denomination: RateDenomination::Money(CurrencyCode::Usd),
+            window_estimate: None,
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse("2026-06-24").unwrap(),
             effective_end: None,

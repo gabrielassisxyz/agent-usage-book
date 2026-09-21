@@ -1,0 +1,257 @@
+#!/usr/bin/env bash
+# Trustworthy-first-release criteria checker (aub-71j.10).
+#
+# PLAN.md section 44 defines the first useful release as seventeen criteria.
+# docs/release-criteria.md lists them and maps each one to the checks that
+# discharge it; this script reads that document as its single source, runs
+# every check, and reports each criterion as one JSON line on stdout.
+#
+# A criterion is `pass` only when every one of its checks passed. It is `fail`
+# when any check failed, `blocked` when a row names the bead that unblocks it,
+# and `unchecked` when no row maps it at all, so a criterion dropped from the
+# table is reported rather than silently omitted. The exit status is 0 only
+# when all seventeen pass; the release workflow (aub-n27.9) consumes exactly
+# that.
+#
+# Usage:
+#   bin/release-criteria [--doc PATH] [--root DIR] [--only N] [--list] [--record]
+#
+#   --doc PATH  criteria document (default docs/release-criteria.md)
+#   --root DIR  directory checks run from (default the repository root)
+#   --only N    run the rows of criterion N only; the verdict still names
+#               every other criterion, as `skipped`, and exits nonzero
+#   --list      validate the table and the existence of every named test
+#               without running anything
+#   --record    after a run, rewrite the document's "Last run" line with the
+#               date, the revision and the verdict
+#
+# Row kinds (the `kind` column of the checks table):
+#   cargo   `cargo test --test <stem of path> -- --exact <target>`, which must
+#           report exactly one test passed; target `*` runs the whole file and
+#           requires at least one passed and none failed
+#   shell   `target` run through bash from the root; `path`, when not `-`,
+#           must exist
+#   e2e     the case file at `path` run alone through tests/e2e/run.sh against
+#           the release binary, with scratch state
+#   blocked the criterion cannot be checked yet; `target` names the bead
+#           that unblocks it
+set -uo pipefail
+
+EXPECTED_CRITERIA=17
+
+DOC=""
+ROOT=""
+ONLY=""
+MODE="run"
+RECORD=0
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --doc) DOC="$2"; shift 2 ;;
+        --root) ROOT="$2"; shift 2 ;;
+        --only) ONLY="$2"; shift 2 ;;
+        --list) MODE="list"; shift ;;
+        --record) RECORD=1; shift ;;
+        -h|--help) sed -n '2,38p' "$0"; exit 0 ;;
+        *) echo "release-criteria: unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+if [ -z "$ROOT" ]; then
+    ROOT="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+fi
+[ -n "$DOC" ] || DOC="$ROOT/docs/release-criteria.md"
+[ -f "$DOC" ] || { echo "release-criteria: no criteria document at $DOC" >&2; exit 2; }
+
+# JSON string escaping for the handful of characters a reason can carry.
+rc_json_string() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/ }"
+    s="${s//$'\n'/ }"
+    printf '"%s"' "$s"
+}
+
+# Prints the body of the fenced ```tsv block that follows the heading named
+# in $1, without its header line.
+rc_table() {
+    awk -v heading="$1" '
+        $0 == heading { in_section = 1; next }
+        in_section && /^## / { exit }
+        in_section && /^```tsv$/ { in_block = 1; header = 1; next }
+        in_block && /^```$/ { exit }
+        in_block { if (header) { header = 0; next } print }
+    ' "$DOC"
+}
+
+declare -A SLUG=()
+while IFS=$'\t' read -r number slug _rest; do
+    [ -n "$number" ] || continue
+    SLUG[$number]="$slug"
+done < <(rc_table "## Criteria")
+
+declare -a ROWS=()
+while IFS= read -r line; do
+    [ -n "$line" ] && ROWS+=("$line")
+done < <(rc_table "## Checks")
+
+declare -A STATUS=()
+declare -A DETAIL=()
+
+# Appends one reason to a criterion and folds the row verdict into the
+# criterion verdict: fail wins over blocked, blocked wins over pass.
+rc_note() {
+    local number="$1" verdict="$2" reason="$3"
+    local current="${STATUS[$number]:-}"
+    case "$verdict" in
+        fail) STATUS[$number]="fail" ;;
+        blocked) [ "$current" = "fail" ] || STATUS[$number]="blocked" ;;
+        pass) [ -n "$current" ] || STATUS[$number]="pass" ;;
+    esac
+    local entry
+    entry="{\"verdict\":$(rc_json_string "$verdict"),\"check\":$(rc_json_string "$reason")}"
+    DETAIL[$number]="${DETAIL[$number]:+${DETAIL[$number]},}$entry"
+}
+
+# The traceability half of every row: the named file exists and, for a cargo
+# row, the named test function is defined in it. Runs in --list mode too, so
+# a renamed test is caught without building anything.
+rc_trace_row() {
+    local kind="$1" target="$2" path="$3"
+    case "$kind" in
+        cargo)
+            [ -f "$ROOT/$path" ] || { echo "missing test file $path"; return 1; }
+            if [ "$target" != "*" ] && ! grep -qE "fn ${target}[[:space:]]*\(" "$ROOT/$path"; then
+                echo "no test fn $target in $path"
+                return 1
+            fi
+            ;;
+        shell|e2e)
+            if [ "$path" != "-" ] && [ ! -e "$ROOT/$path" ]; then
+                echo "missing $path"
+                return 1
+            fi
+            ;;
+        blocked)
+            [ -n "$target" ] || { echo "blocked row names no unblocking bead"; return 1; }
+            ;;
+        *)
+            echo "unknown kind $kind"
+            return 1
+            ;;
+    esac
+    return 0
+}
+
+rc_run_cargo() {
+    local target="$1" path="$2" stem output
+    stem="$(basename "$path" .rs)"
+    if [ "$target" = "*" ]; then
+        output="$(cd "$ROOT" && cargo test --test "$stem" 2>&1)"
+    else
+        output="$(cd "$ROOT" && cargo test --test "$stem" -- --exact "$target" 2>&1)"
+    fi
+    local result
+    result="$(printf '%s\n' "$output" | grep -E '^test result:' | tail -n 1)"
+    if [ "$target" = "*" ]; then
+        printf '%s' "$result" | grep -qE '^test result: ok\. [1-9][0-9]* passed; 0 failed' && return 0
+    else
+        printf '%s' "$result" | grep -qE '^test result: ok\. 1 passed; 0 failed' && return 0
+    fi
+    echo "${result:-no test result: $(printf '%s\n' "$output" | tail -n 1)}"
+    return 1
+}
+
+AUB_RELEASE_BIN=""
+rc_run_e2e() {
+    local path="$1" scratch
+    if [ -z "$AUB_RELEASE_BIN" ]; then
+        (cd "$ROOT" && cargo build --release --quiet) || { echo "release build failed"; return 1; }
+        AUB_RELEASE_BIN="$(cd "$ROOT" && cargo metadata --format-version 1 --no-deps | jq -r '.target_directory')/release/aub"
+    fi
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-release-criteria-XXXXXX")"
+    mkdir -p "$scratch/cases" "$scratch/state" "$scratch/runs"
+    cp "$ROOT/$path" "$scratch/cases/"
+    local output status
+    output="$(cd "$ROOT" && AUB_BIN="$AUB_RELEASE_BIN" tests/e2e/run.sh \
+        --cases-dir "$scratch/cases" --state-dir "$scratch/state" \
+        --runs-dir "$scratch/runs" 2>&1)"
+    status=$?
+    rm -rf "$scratch"
+    [ "$status" -eq 0 ] && return 0
+    echo "e2e case failed: $(printf '%s\n' "$output" | grep -m1 -E 'FAIL' || printf '%s\n' "$output" | tail -n 1)"
+    return 1
+}
+
+rc_run_shell() {
+    local target="$1" output
+    output="$(cd "$ROOT" && bash -c "$target" 2>&1)" && return 0
+    echo "exit nonzero: $(printf '%s\n' "$output" | tail -n 1)"
+    return 1
+}
+
+for row in "${ROWS[@]}"; do
+    IFS=$'\t' read -r number kind target path <<<"$row"
+    if [ -z "${SLUG[$number]:-}" ]; then
+        echo "release-criteria: checks row names unknown criterion $number" >&2
+        exit 2
+    fi
+    if [ -n "$ONLY" ] && [ "$number" != "$ONLY" ]; then
+        continue
+    fi
+    label="$kind $path ${target}"
+    if ! reason="$(rc_trace_row "$kind" "$target" "$path")"; then
+        rc_note "$number" fail "$label: $reason"
+        continue
+    fi
+    if [ "$kind" = "blocked" ]; then
+        rc_note "$number" blocked "blocked on $target"
+        continue
+    fi
+    if [ "$MODE" = "list" ]; then
+        rc_note "$number" pass "$label: traced"
+        continue
+    fi
+    echo "release-criteria: criterion $number: $label" >&2
+    case "$kind" in
+        cargo) reason="$(rc_run_cargo "$target" "$path")" ;;
+        e2e) reason="$(rc_run_e2e "$path")" ;;
+        shell) reason="$(rc_run_shell "$target")" ;;
+    esac
+    if [ $? -eq 0 ]; then
+        rc_note "$number" pass "$label"
+    else
+        rc_note "$number" fail "$label: $reason"
+    fi
+done
+
+passed=0
+unmet=()
+for number in $(seq 1 "$EXPECTED_CRITERIA"); do
+    slug="${SLUG[$number]:-}"
+    if [ -n "$ONLY" ] && [ "$number" != "$ONLY" ]; then
+        verdict="skipped"
+    elif [ -z "$slug" ]; then
+        verdict="unchecked"
+        slug="missing-from-criteria-table"
+    else
+        verdict="${STATUS[$number]:-unchecked}"
+    fi
+    [ "$verdict" = "pass" ] && passed=$((passed + 1)) || unmet+=("$number")
+    printf '{"criterion":%s,"slug":%s,"verdict":%s,"checks":[%s]}\n' \
+        "$number" "$(rc_json_string "$slug")" "$(rc_json_string "$verdict")" "${DETAIL[$number]:-}"
+done
+
+unmet_json="$(IFS=,; printf '%s' "${unmet[*]:-}")"
+printf '{"summary":true,"mode":%s,"passed":%s,"total":%s,"unmet":[%s]}\n' \
+    "$(rc_json_string "$MODE")" "$passed" "$EXPECTED_CRITERIA" "$unmet_json"
+
+if [ "$RECORD" -eq 1 ] && [ "$MODE" = "run" ] && [ -z "$ONLY" ]; then
+    revision="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || echo unknown)"
+    line="Last run: $(date -u +%Y-%m-%d) at $revision: $passed of $EXPECTED_CRITERIA pass"
+    [ ${#unmet[@]} -eq 0 ] || line="$line, unmet ${unmet_json//,/, }"
+    sed -i "s|^Last run: .*|$line|" "$DOC"
+fi
+
+[ ${#unmet[@]} -eq 0 ]

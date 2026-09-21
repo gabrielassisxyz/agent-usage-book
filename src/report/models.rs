@@ -819,13 +819,39 @@ impl SpendGroupCreditsProvenance {
     }
 }
 
-/// A qualified interval of quota-window percentage-point movement. The calibration
-/// identifier travels with the interval because the same credit subtotal can map to
-/// a different movement under another window or another fitted result.
+/// What produced a window-equivalent figure (`aub-8vpc`).
+///
+/// The two are not interchangeable and the difference is not cosmetic: a
+/// calibration is fitted from observed quota movement, and a rate-card estimate
+/// is an approximation the operator typed with its source. Every surface that
+/// renders a figure matches this to decide whether the figure is labelled
+/// `estimated`, so the label cannot be forgotten by a renderer that only looks
+/// at the interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowEquivalentBasis {
+    /// A fitted window calibration whose health was current.
+    Calibration(WindowCalibrationId),
+    /// Percent-of-window rate cards, used only because no current calibration
+    /// exists for this provider and window. The row ids are what the `basis`
+    /// object names, so the operator can read the cards the figure came from.
+    RateCardEstimate { rate_card_ids: Vec<i64> },
+}
+
+impl WindowEquivalentBasis {
+    /// Whether a figure built on this basis is a labelled estimate.
+    pub fn is_estimate(&self) -> bool {
+        matches!(self, Self::RateCardEstimate { .. })
+    }
+}
+
+/// A qualified interval of quota-window percentage-point movement. The basis
+/// travels with the interval because the same credit subtotal can map to a
+/// different movement under another window or another fitted result, and
+/// because a figure that does not carry what produced it cannot be labelled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WindowEquivalentValue {
     pub interval: Interval<PercentagePoints>,
-    pub calibration_id: WindowCalibrationId,
+    pub basis: WindowEquivalentBasis,
     pub coverage: CoverageCompleteness,
     pub quality: EvidenceQuality<PercentagePoints>,
     pub provenance: Provenance,
@@ -876,11 +902,25 @@ impl WindowEquivalentDerivation {
         }
     }
 
-    /// The calibration witness when one was resolved for this result.
+    /// The calibration witness when one was resolved for this result. `None`
+    /// for a refusal and for a rate-card estimate, which has no calibration:
+    /// that absence is what keeps an estimate out of the calibration
+    /// provenance witnesses.
     pub fn calibration_id(&self) -> Option<&WindowCalibrationId> {
         match self {
-            Self::Available(value) => Some(&value.calibration_id),
+            Self::Available(value) => match &value.basis {
+                WindowEquivalentBasis::Calibration(id) => Some(id),
+                WindowEquivalentBasis::RateCardEstimate { .. } => None,
+            },
             Self::Unavailable { .. } => None,
+        }
+    }
+
+    /// Whether this result is a labelled rate-card estimate.
+    pub fn is_estimate(&self) -> bool {
+        match self {
+            Self::Available(value) => value.basis.is_estimate(),
+            Self::Unavailable { .. } => false,
         }
     }
 }

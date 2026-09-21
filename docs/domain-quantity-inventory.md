@@ -74,6 +74,7 @@ own "construction outside the boundary" compile-fail case.
 | --- | --- | --- |
 | `CreditsPerToken` | `credits.rs` | `credits_per_token_construction_outside_boundary.rs` |
 | `CreditsPerPercentagePoint` | `credits.rs` | `credits_per_percentage_point_construction_outside_boundary.rs` (aub-rif.2) |
+| `PointsPerMillionTokens` | `quota.rs` | `points_per_million_tokens_construction_outside_boundary.rs` (aub-8vpc) |
 
 ## Excluded categories
 
@@ -86,6 +87,10 @@ quantity, documented here with its reason for exclusion:
 - `TokenClass` (`rate_card.rs`): tag enum selecting which token stream a rate prices, not a measured quantity.
 - `BillingBasis` (`rate_card.rs`): tag enum selecting the unit a rate is quoted against.
 - `CurrencyCode` (`rate_card.rs`): runtime currency marker enum a rate card carries as imported data; converting into a typed `Money<C>` is a named valuation function (aub-wyu.2), never a cast.
+- `RateUnit` (`rate_card.rs`): tag enum naming the non-monetary unit a percent-of-window rate is counted in (aub-8vpc); today only percentage points of a window.
+- `RateDenomination` (`rate_card.rs`): tag enum stating what a card's rate is counted in, a `CurrencyCode` or a `RateUnit`, so a rate that is not money never decodes as money (aub-8vpc).
+- `QuotaWindowKind` (`rate_card.rs`): tag enum naming the quota window a percent-of-window card states a movement of (`five_hour`, `seven_day`), not a quantity.
+- `CardQuality` (`rate_card.rs`): tag enum for the quality a card declares; only `estimate` exists, which is what labels every figure derived from such a card.
 - `ReviewDuePolicy` (`rate_card.rs`): review-due policy tag for temporal reference data, a date or its recorded absence; replaces the freshness enum where authentication is nonsensical (PLAN.md section 25.3).
 - `RateCardParseError` (`rate_card.rs`): error enum for rate value parse failures.
 - `IntervalError` (`interval.rs`): error enum for interval construction failures.
@@ -130,3 +135,4 @@ quantity, documented here with its reason for exclusion:
 - `RateCard`: a persisted rate card, the storage row identity plus import stamp plus draft; composite record, not a quantity.
 - `Schedule`: the time-of-day window inside which a rate card applies, an ISO weekday set plus a half-open UTC minute window with a validated constructor; a window descriptor, not a quantity.
 - `HoursParseError`: error enum for schedule window parse failures.
+- `WindowEstimate`: the window, unit and declared quality a percent-of-window card carries together (aub-8vpc); a descriptor grouping three tags, not a quantity.

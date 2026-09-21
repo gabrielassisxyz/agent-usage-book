@@ -91,8 +91,8 @@ pub fn migration() -> Migration {
 #[cfg(test)]
 mod tests {
     use crate::domain::rate_card::{
-        BillingBasis, CurrencyCode, Publication, RateCardDraft, ReviewDuePolicy, Schedule,
-        TokenClass,
+        BillingBasis, CurrencyCode, Publication, RateCardDraft, RateDenomination, ReviewDuePolicy,
+        Schedule, TokenClass,
     };
     use crate::domain::time::{Clock, FakeClock, UtcDate, UtcTimestamp};
     use crate::store::connection::{AccessMode, PragmaPolicy};
@@ -148,7 +148,8 @@ mod tests {
             model: "deepseek-v4-flash".to_string(),
             token_class: TokenClass::Input,
             rate_micros,
-            currency: CurrencyCode::Usd,
+            denomination: RateDenomination::Money(CurrencyCode::Usd),
+            window_estimate: None,
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse("2026-09-07").unwrap(),
             effective_end: None,

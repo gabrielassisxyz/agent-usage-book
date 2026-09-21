@@ -34,8 +34,8 @@ use agent_usage_book::domain::credits::Credits;
 use agent_usage_book::domain::freshness::{Freshness, Observed};
 use agent_usage_book::domain::interval::Interval;
 use agent_usage_book::domain::provenance::{
-    CostModelId, DerivationId, EvidenceId, ProvenanceManifest, QuerySemantics, WindowCalibrationId,
-    WitnessId, canonical_inputs_hash,
+    canonical_inputs_hash, CostModelId, DerivationId, EvidenceId, ProvenanceManifest,
+    QuerySemantics, WindowCalibrationId, WitnessId,
 };
 use agent_usage_book::domain::quota::{PercentagePoints, QuotaFractionPpm, QuotaRemaining};
 use agent_usage_book::domain::time::{MeasurementBasis, ReceivedAt, UtcDate, UtcTimestamp};
@@ -54,8 +54,8 @@ use agent_usage_book::report::{
     ProvenanceGraph, ProvenanceNode, ReportField, ReportMetadata, SharePpm, SpendDiagnostic,
     SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
     SpendGroupWindowEquivalentProvenance, SpendReport, StatusReport, TaskOverheadBucket,
-    TaskOverheadReport, TaskReport, Unit, ValueArithmetic, WindowEquivalentDerivation,
-    WindowEquivalentValue,
+    TaskOverheadReport, TaskReport, Unit, ValueArithmetic, WindowEquivalentBasis,
+    WindowEquivalentDerivation, WindowEquivalentValue,
 };
 use agent_usage_book::store::export::ExportKey;
 
@@ -351,7 +351,9 @@ fn spend_case() -> SeededCommand {
                 PercentagePoints::new(20).unwrap(),
             )
             .unwrap(),
-            calibration_id: WindowCalibrationId::new("cal-window-2026-08"),
+            basis: WindowEquivalentBasis::Calibration(WindowCalibrationId::new(
+                "cal-window-2026-08",
+            )),
             coverage: CoverageCompleteness::Complete,
             quality: EvidenceQuality::Measured,
             provenance: Provenance::new(["cal-window-2026-08".to_string()]),

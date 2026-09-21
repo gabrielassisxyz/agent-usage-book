@@ -52,9 +52,46 @@ use crate::report::provenance::ProvenanceGraph;
 pub struct CanRunWindowReport {
     pub semantic_key: WindowSemanticKey,
     pub remaining_fraction_ppm: u32,
-    pub calibration_id: String,
+    /// What converted this window's remaining quota into credits: a fitted
+    /// calibration, or the percent-of-window rate cards standing in for one
+    /// (`aub-8vpc`).
+    pub basis: CanRunWindowBasis,
     pub headroom: Interval<Credits>,
     pub resets_at: Option<UtcTimestamp>,
+}
+
+/// What produced one window's headroom (`aub-8vpc`).
+///
+/// The same distinction `crate::report::WindowEquivalentBasis` draws for
+/// `aub spend`, kept as its own type because this module may not depend on the
+/// spend report's shapes. A renderer matches it to decide whether the headroom
+/// it prints is labelled an estimate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CanRunWindowBasis {
+    Calibration(String),
+    RateCardEstimate { rate_card_ids: Vec<i64> },
+}
+
+impl CanRunWindowBasis {
+    pub fn is_estimate(&self) -> bool {
+        matches!(self, Self::RateCardEstimate { .. })
+    }
+
+    /// The basis as one phrase, for the window line and the summary.
+    pub fn describe(&self) -> String {
+        match self {
+            Self::Calibration(id) => format!("calibration #{id}"),
+            Self::RateCardEstimate { rate_card_ids } => format!(
+                "rate-card estimate (card{} {})",
+                if rate_card_ids.len() == 1 { "" } else { "s" },
+                rate_card_ids
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        }
+    }
 }
 
 /// Historical exact task evidence summary.
@@ -192,6 +229,32 @@ pub struct WindowCalibrationLookup {
     pub constraint: CalibratedWindowConstraint,
 }
 
+/// One window's percent-of-window rate cards, converted into the same credit
+/// constraint shape a calibration produces (`aub-8vpc`).
+///
+/// The conversion itself is the caller's, next to the cost model it needs;
+/// this module only decides when such a constraint is allowed to be used,
+/// which is exactly when no calibration record exists for the window at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WindowEstimateLookup {
+    /// The cards the constraint was derived from, named on every surface the
+    /// figure reaches.
+    pub rate_card_ids: Vec<i64>,
+    pub constraint: CalibratedWindowConstraint,
+}
+
+/// What the percent-of-window cards say about one uncalibrated window
+/// (`aub-8vpc`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WindowEstimate {
+    /// Every token class the active cost model prices has a card in force.
+    Available(WindowEstimateLookup),
+    /// Some classes have a card and some do not. The window refuses naming
+    /// each gap, because a range over the classes that remain would present a
+    /// partial estimate as a bound.
+    Incomplete { missing: Vec<String> },
+}
+
 /// A configured account plan tier that does not match the plan tier the active
 /// calibration was fitted for.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -212,6 +275,9 @@ pub struct CanRunJoinInputs {
     pub model: ModelId,
     pub meter: CanRunMeterReadiness,
     pub window_calibrations: BTreeMap<WindowSemanticKey, WindowCalibrationLookup>,
+    /// The rate-card estimates available per window, consulted only where
+    /// `window_calibrations` holds no entry at all (`aub-8vpc`).
+    pub window_estimates: BTreeMap<WindowSemanticKey, WindowEstimate>,
     pub cost_model_missing_token_classes: Vec<String>,
     pub plan_tier_mismatch: Option<PlanTierMismatch>,
     pub task: TaskReferenceInput,
@@ -224,6 +290,13 @@ pub struct CanRunJoinInputs {
     /// `aub-jsq`'s bound (2026-08-25), read from `crate::config`, never a literal.
     pub headroom_bound: CanRunHeadroomBound,
     pub provenance: ProvenanceGraph,
+}
+
+/// One constraining window's resolved conversion: the credit constraint the
+/// headroom is computed from, and what produced it.
+struct ResolvedWindowConstraint<'a> {
+    constraint: &'a CalibratedWindowConstraint,
+    basis: CanRunWindowBasis,
 }
 
 fn missing_fact(subject: impl Into<String>, reason: impl Into<String>) -> CanRunMissingFact {
@@ -292,7 +365,7 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
     let mut missing: Vec<CanRunMissingFact> = Vec::new();
 
     // 1 & 2: stale meter, authentication required.
-    let known_windows: Vec<(&MeterWindow, &WindowCalibrationLookup)> = match &inputs.meter {
+    let known_windows: Vec<(&MeterWindow, ResolvedWindowConstraint<'_>)> = match &inputs.meter {
         CanRunMeterReadiness::Stale { reason } => {
             missing.push(missing_fact("meter", stale_reason_text(*reason)));
             Vec::new()
@@ -330,12 +403,31 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                 // a refusal naming that exact state.
                 for window in constraining {
                     match inputs.window_calibrations.get(window.semantic_key()) {
-                        None => {
-                            missing.push(missing_fact(
+                        // Precedence (`aub-8vpc`): no calibration record at all
+                        // admits a labelled estimate, and a record that is not
+                        // current does not. A stale measurement is still
+                        // evidence, and an approximation standing in for it
+                        // would hide the review it is asking for.
+                        None => match inputs.window_estimates.get(window.semantic_key()) {
+                            Some(WindowEstimate::Incomplete { missing: gaps }) => {
+                                missing.extend(gaps.iter().map(|gap| {
+                                    missing_fact(window.semantic_key().as_str(), gap.clone())
+                                }));
+                            }
+                            Some(WindowEstimate::Available(estimate)) => known.push((
+                                window,
+                                ResolvedWindowConstraint {
+                                    constraint: &estimate.constraint,
+                                    basis: CanRunWindowBasis::RateCardEstimate {
+                                        rate_card_ids: estimate.rate_card_ids.clone(),
+                                    },
+                                },
+                            )),
+                            None => missing.push(missing_fact(
                                 window.semantic_key().as_str(),
                                 "no calibration is recorded for this window",
-                            ));
-                        }
+                            )),
+                        },
                         Some(lookup) if !lookup.constraint.is_current() => {
                             missing.push(missing_fact(
                                 window.semantic_key().as_str(),
@@ -346,7 +438,15 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                                 ),
                             ));
                         }
-                        Some(lookup) => known.push((window, lookup)),
+                        Some(lookup) => known.push((
+                            window,
+                            ResolvedWindowConstraint {
+                                constraint: &lookup.constraint,
+                                basis: CanRunWindowBasis::Calibration(
+                                    lookup.calibration_id.clone(),
+                                ),
+                            },
+                        )),
                     }
                 }
                 known
@@ -444,7 +544,7 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
 
         let evaluated: Vec<WindowHeadroom<'_>> = known_windows
             .iter()
-            .map(|(window, lookup)| window_credit_headroom(window, Some(&lookup.constraint)))
+            .map(|(window, resolved)| window_credit_headroom(window, Some(resolved.constraint)))
             .collect();
 
         let config = CanRunVerdictConfig {
@@ -455,12 +555,12 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
 
         match assess_can_run(&evaluated, &inputs.task, &config) {
             CanRunAssessment::Ready(ready) => {
-                let calibration_id_of = |key: &WindowSemanticKey| -> String {
+                let basis_of = |key: &WindowSemanticKey| -> CanRunWindowBasis {
                     known_windows
                         .iter()
                         .find(|(window, _)| window.semantic_key() == key)
-                        .map(|(_, lookup)| lookup.calibration_id.clone())
-                        .unwrap_or_default()
+                        .map(|(_, resolved)| resolved.basis.clone())
+                        .expect("every assessed window came from known_windows")
                 };
 
                 let windows: Vec<CanRunWindowReport> = ready
@@ -473,7 +573,7 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                             .remaining_fraction()
                             .as_ppm()
                             .get(),
-                        calibration_id: calibration_id_of(assessment.window.semantic_key()),
+                        basis: basis_of(assessment.window.semantic_key()),
                         headroom: assessment.headroom,
                         resets_at: assessment.window.resets_at(),
                     })
@@ -512,20 +612,42 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                     .expect("headroom is itself a valid interval, shifted by a constant")
                 };
 
-                let calibration_ids: Vec<&str> = windows
-                    .iter()
-                    .map(|window| window.calibration_id.as_str())
-                    .collect();
-                let description = match calibration_ids.as_slice() {
-                    [single] => format!("#{single}, current"),
-                    [first, second] => format!("#{first} and #{second}, both current"),
-                    many => format!(
-                        "{}, all current",
-                        many.iter()
-                            .map(|id| format!("#{id}"))
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
+                // The summary names every basis, estimates included: a line
+                // reading "all current" over a window backed by an estimate
+                // would be the unlabelled figure this bead exists to prevent.
+                let description = if windows.iter().any(|window| window.basis.is_estimate()) {
+                    windows
+                        .iter()
+                        .map(|window| {
+                            format!(
+                                "{} {}",
+                                window.semantic_key.as_str(),
+                                window.basis.describe()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                } else {
+                    let calibration_ids: Vec<&str> = windows
+                        .iter()
+                        .map(|window| match &window.basis {
+                            CanRunWindowBasis::Calibration(id) => id.as_str(),
+                            CanRunWindowBasis::RateCardEstimate { .. } => unreachable!(
+                                "the estimate branch above covers every window carrying one"
+                            ),
+                        })
+                        .collect();
+                    match calibration_ids.as_slice() {
+                        [single] => format!("#{single}, current"),
+                        [first, second] => format!("#{first} and #{second}, both current"),
+                        many => format!(
+                            "{}, all current",
+                            many.iter()
+                                .map(|id| format!("#{id}"))
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ),
+                    }
                 };
 
                 let label_basis = ready
@@ -709,6 +831,7 @@ mod compose_tests {
                 observed_age: Some(MonotonicDuration::from_seconds(41)),
             },
             window_calibrations: calibrations,
+            window_estimates: BTreeMap::new(),
             cost_model_missing_token_classes: Vec::new(),
             plan_tier_mismatch: None,
             task: sufficient_task(),
@@ -763,7 +886,10 @@ mod compose_tests {
             weekly.headroom,
             Interval::new(credits(1000), credits(1100)).unwrap()
         );
-        assert_eq!(weekly.calibration_id, "22");
+        assert_eq!(
+            weekly.basis,
+            CanRunWindowBasis::Calibration("22".to_string())
+        );
 
         let account = ready
             .windows
@@ -1123,5 +1249,180 @@ mod compose_tests {
         ] {
             assert!(!text.contains(forbidden), "found {forbidden:?} in: {text}");
         }
+    }
+
+    // --- the precedence table (`aub-8vpc`) -----------------------------------
+
+    fn estimate_lookup(ids: &[i64], low: i64, high: i64) -> WindowEstimateLookup {
+        let unc = CoefficientUncertainty::new(
+            CreditsPerPercentagePoint::from_micros_per_point(low),
+            CreditsPerPercentagePoint::from_micros_per_point(high),
+        )
+        .expect("valid uncertainty");
+        WindowEstimateLookup {
+            rate_card_ids: ids.to_vec(),
+            constraint: CalibratedWindowConstraint::current(unc),
+        }
+    }
+
+    fn lookup_with_health(id: &str, health: CalibrationHealth) -> WindowCalibrationLookup {
+        let unc = CoefficientUncertainty::new(
+            CreditsPerPercentagePoint::from_micros_per_point(8_000),
+            CreditsPerPercentagePoint::from_micros_per_point(9_000),
+        )
+        .expect("valid uncertainty");
+        WindowCalibrationLookup {
+            calibration_id: id.to_string(),
+            constraint: CalibratedWindowConstraint::new(unc, health),
+        }
+    }
+
+    /// The four cases of the precedence rule over one window, with the literal
+    /// outcome each must produce. The estimate is given a coefficient range
+    /// unlike the calibration's, so a case that silently took the wrong basis
+    /// would produce a different headroom rather than the same number twice.
+    fn precedence_case(
+        calibration: Option<WindowCalibrationLookup>,
+        estimate: Option<WindowEstimateLookup>,
+    ) -> CanRunReport {
+        let mut inputs = worked_example_inputs();
+        inputs
+            .window_calibrations
+            .remove(&WindowSemanticKey::new("account:5h"));
+        if let Some(calibration) = calibration {
+            inputs
+                .window_calibrations
+                .insert(WindowSemanticKey::new("account:5h"), calibration);
+        }
+        if let Some(estimate) = estimate {
+            inputs.window_estimates.insert(
+                WindowSemanticKey::new("account:5h"),
+                WindowEstimate::Available(estimate),
+            );
+        }
+        compose_can_run_report(inputs)
+    }
+
+    fn account_window_of(report: &CanRunReport) -> &CanRunWindowReport {
+        ready_of(report)
+            .windows
+            .iter()
+            .find(|window| window.semantic_key.as_str() == "account:5h")
+            .expect("the account window is reported")
+    }
+
+    #[test]
+    fn a_current_calibration_outranks_an_estimate_for_the_same_window() {
+        let report = precedence_case(
+            Some(interval_calibration("17", 8_000, 9_000)),
+            Some(estimate_lookup(&[3, 4], 1_000, 1_000)),
+        );
+        let window = account_window_of(&report);
+        assert_eq!(
+            window.basis,
+            CanRunWindowBasis::Calibration("17".to_string())
+        );
+        assert!(!window.basis.is_estimate());
+        assert_eq!(
+            window.headroom,
+            Interval::new(credits(3_200), credits(3_600)).unwrap()
+        );
+    }
+
+    #[test]
+    fn no_calibration_at_all_falls_back_to_the_labelled_estimate() {
+        let report = precedence_case(None, Some(estimate_lookup(&[3, 4], 1_000, 1_000)));
+        let window = account_window_of(&report);
+        assert_eq!(
+            window.basis,
+            CanRunWindowBasis::RateCardEstimate {
+                rate_card_ids: vec![3, 4]
+            }
+        );
+        assert_eq!(
+            window.headroom,
+            Interval::new(credits(400), credits(400)).unwrap()
+        );
+        assert!(
+            ready_of(&report)
+                .calibration_summary
+                .description
+                .contains("rate-card estimate (cards 3, 4)"),
+            "{}",
+            ready_of(&report).calibration_summary.description
+        );
+    }
+
+    /// The asymmetry that carries the rule: a measurement asking for review is
+    /// still a measurement, so the estimate does not paper over it.
+    #[test]
+    fn a_review_due_calibration_refuses_instead_of_falling_back() {
+        for health in [
+            CalibrationHealth::ReviewDue,
+            CalibrationHealth::Suspect,
+            CalibrationHealth::Superseded,
+        ] {
+            let report = precedence_case(
+                Some(lookup_with_health("17", health)),
+                Some(estimate_lookup(&[3, 4], 1_000, 1_000)),
+            );
+            let CanRunOutcome::Refused(refused) = &report.outcome else {
+                panic!("a {health:?} calibration must refuse, not estimate");
+            };
+            let fact = refused
+                .missing
+                .iter()
+                .find(|fact| fact.subject == "account:5h")
+                .unwrap_or_else(|| panic!("the window must be named: {refused:?}"));
+            assert!(
+                fact.reason.contains(health.label()),
+                "the refusal names the health: {}",
+                fact.reason
+            );
+        }
+    }
+
+    /// Cards for only some classes refuse the window naming each gap, and
+    /// never fall through to the calibration refusal or to an estimate.
+    #[test]
+    fn an_incomplete_estimate_refuses_naming_the_missing_class() {
+        let mut inputs = worked_example_inputs();
+        inputs
+            .window_calibrations
+            .remove(&WindowSemanticKey::new("account:5h"));
+        inputs.window_estimates.insert(
+            WindowSemanticKey::new("account:5h"),
+            WindowEstimate::Incomplete {
+                missing: vec!["no percent-of-window rate card for a/m/cache_read".to_string()],
+            },
+        );
+        let report = compose_can_run_report(inputs);
+        let CanRunOutcome::Refused(refused) = &report.outcome else {
+            panic!("an incomplete estimate must refuse");
+        };
+        let reasons: Vec<&str> = refused
+            .missing
+            .iter()
+            .filter(|fact| fact.subject == "account:5h")
+            .map(|fact| fact.reason.as_str())
+            .collect();
+        assert_eq!(
+            reasons,
+            ["no percent-of-window rate card for a/m/cache_read"]
+        );
+    }
+
+    #[test]
+    fn neither_a_calibration_nor_an_estimate_refuses_naming_the_calibration() {
+        let report = precedence_case(None, None);
+        let CanRunOutcome::Refused(refused) = &report.outcome else {
+            panic!("an unbacked window must refuse");
+        };
+        let fact = refused
+            .missing
+            .iter()
+            .find(|fact| fact.subject == "account:5h")
+            .expect("the window must be named");
+        assert_eq!(fact.reason, "no calibration is recorded for this window");
     }
 }

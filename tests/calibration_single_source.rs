@@ -681,7 +681,10 @@ fn assert_library_reads(
     let agent_usage_book::report::WindowEquivalentDerivation::Available(value) = converted else {
         panic!("the applicable calibration must convert: {converted:?}");
     };
-    assert_eq!(value.calibration_id.as_str(), expected_id);
+    let agent_usage_book::report::WindowEquivalentBasis::Calibration(used) = &value.basis else {
+        panic!("a fitted calibration must be the basis: {:?}", value.basis);
+    };
+    assert_eq!(used.as_str(), expected_id);
     assert_eq!(value.interval.lower().get(), expected_points);
     assert_eq!(value.interval.upper().get(), expected_points);
 
