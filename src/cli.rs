@@ -6998,6 +6998,15 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     let cost_model_missing_token_classes =
         gather_cost_model_missing_token_classes(&conn, timestamp)?;
 
+    let window_estimates = gather_window_estimates(
+        &conn,
+        &meter,
+        &model,
+        &window_calibrations,
+        &config.models,
+        timestamp,
+    )?;
+
     // The selection period is the full known history: no configuration key
     // bounds it anywhere in this codebase (`crate::report::can_run_evidence`
     // records the same finding for its own caller). A narrower configured
@@ -7027,6 +7036,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         model,
         meter,
         window_calibrations,
+        window_estimates,
         cost_model_missing_token_classes,
         // A plan-tier mismatch is realized through the calibration-health
         // path above (`load_active_at` finds nothing for a tier nobody
@@ -7149,6 +7159,132 @@ fn gather_window_calibrations(
         );
     }
     Ok(result)
+}
+
+/// Converts the percent-of-window rate cards into the same credit constraint a
+/// calibration produces, for every constraining window that has no calibration
+/// record at all (`aub-8vpc`).
+///
+/// **How an estimate becomes credits, and why the result is an interval.** A
+/// card states points of a window per million tokens; the active cost model
+/// states credits per million tokens. Their ratio is credits per percentage
+/// point, computed per token class. The classes rarely agree exactly, and the
+/// true ratio for any real mix of them is a weighted average of the per-class
+/// ratios, so it lies between the smallest and the largest. The constraint is
+/// that range: not a chosen class, and not an average that would read as more
+/// precise than the cards are.
+///
+/// A window whose cards and cost model share no class yields nothing, and the
+/// composition then refuses for that window exactly as it did before.
+fn gather_window_estimates(
+    conn: &rusqlite::Connection,
+    meter: &crate::report::can_run::CanRunMeterReadiness,
+    model: &crate::domain::window::ModelId,
+    calibrations: &std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::report::can_run::WindowCalibrationLookup,
+    >,
+    models: &crate::config::ModelTable,
+    generated_at: UtcTimestamp,
+) -> Result<
+    std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::report::can_run::WindowEstimateLookup,
+    >,
+    Error,
+> {
+    let mut result = std::collections::BTreeMap::new();
+    let crate::report::can_run::CanRunMeterReadiness::Fresh { windows, .. } = meter else {
+        return Ok(result);
+    };
+    let Some(cost_model) = crate::store::cost_model::load_active_at(conn, generated_at)? else {
+        return Ok(result);
+    };
+    let crate::config::PricedModel::Mapped {
+        vendor,
+        model: priced_as,
+    } = models.resolve(model.as_str())
+    else {
+        return Ok(result);
+    };
+    let book = crate::valuation::RateBook::new(crate::store::rate_card::history(conn)?);
+
+    for window in windows.iter().filter(|w| w.constrains(model)) {
+        if calibrations.contains_key(window.semantic_key()) {
+            continue;
+        }
+        let Some(kind) =
+            crate::domain::rate_card::QuotaWindowKind::parse(window.semantic_key().as_str())
+        else {
+            continue;
+        };
+        let mut ratios = Vec::new();
+        let mut rate_card_ids = Vec::new();
+        for kind_of_token in crate::domain::tokens::TokenKind::ALL {
+            let Some(term) = cost_model.term(kind_of_token) else {
+                continue;
+            };
+            let class = crate::valuation::token_kind_to_class(kind_of_token);
+            let Some(card) = book.find_window_rate(&vendor, &priced_as, class, kind, generated_at)
+            else {
+                continue;
+            };
+            let Some(ratio) = credits_per_point_from_estimate(
+                term.coefficient().micros_per_million_tokens(),
+                card.draft.rate_micros,
+            ) else {
+                continue;
+            };
+            ratios.push(ratio);
+            rate_card_ids.push(card.id);
+        }
+        let (Some(lowest), Some(highest)) =
+            (ratios.iter().copied().min(), ratios.iter().copied().max())
+        else {
+            continue;
+        };
+        let uncertainty = crate::store::calibration::CoefficientUncertainty::new(
+            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(lowest),
+            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(highest),
+        )?;
+        rate_card_ids.sort_unstable();
+        rate_card_ids.dedup();
+        result.insert(
+            window.semantic_key().clone(),
+            crate::report::can_run::WindowEstimateLookup {
+                rate_card_ids,
+                // Current by construction, and the label is what keeps that
+                // honest: an estimate has no review horizon and no drift
+                // finding to evaluate, so the health machinery has nothing to
+                // say about it. What the operator must not miss is that the
+                // figure is an approximation, and that travels on the basis.
+                constraint: crate::advice::headroom::CalibratedWindowConstraint::current(
+                    uncertainty,
+                ),
+            },
+        );
+    }
+    Ok(result)
+}
+
+/// Micro-credits per one `PercentagePoints` unit, from one class's cost-model
+/// coefficient and that class's percent-of-window card.
+///
+/// One micro-point is one hundredth of a `PercentagePoints` unit, so the card's
+/// micro-points per million tokens divided by one hundred is its native units
+/// per million tokens, and the cost model's micro-credits over that is the
+/// ratio. `None` for a card whose rate is zero, which would make the ratio
+/// infinite rather than large.
+fn credits_per_point_from_estimate(
+    micro_credits_per_million_tokens: i64,
+    card_micro_points_per_million_tokens: i64,
+) -> Option<i64> {
+    if card_micro_points_per_million_tokens <= 0 {
+        return None;
+    }
+    let numerator = i128::from(micro_credits_per_million_tokens) * 100;
+    let denominator = i128::from(card_micro_points_per_million_tokens);
+    i64::try_from(numerator / denominator).ok()
 }
 
 /// Maps the calibration-fitting subsystem's own

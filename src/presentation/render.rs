@@ -2358,6 +2358,7 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
             CheckStatus::Pass | CheckStatus::PassWithDetail(_) => "PASS".to_string(),
             CheckStatus::Fail(_) => "FAIL".to_string(),
             CheckStatus::Warn(_) => "WARN".to_string(),
+            CheckStatus::Info(_) => "INFO".to_string(),
             CheckStatus::NotApplicable(_) => "N/A ".to_string(),
             CheckStatus::NotYetAvailable { .. } => "TODO".to_string(),
         };
@@ -2365,6 +2366,7 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
         match &outcome.status {
             CheckStatus::Fail(reason)
             | CheckStatus::Warn(reason)
+            | CheckStatus::Info(reason)
             | CheckStatus::NotApplicable(reason)
             | CheckStatus::PassWithDetail(reason) => {
                 line.push_str(&format!(": {reason}"));
@@ -2380,10 +2382,11 @@ pub fn render_doctor_report(report: &DoctorReport) -> String {
         lines.push(line);
     }
     lines.push(format!(
-        "Summary: {} passed, {} failed, {} warned, {} not applicable, {} not yet available",
+        "Summary: {} passed, {} failed, {} warned, {} informational, {} not applicable, {} not yet available",
         report.passed(),
         report.failed(),
         report.warned(),
+        report.informational(),
         report.not_applicable(),
         report.not_yet_available(),
     ));
@@ -3127,11 +3130,19 @@ pub fn render_can_run_report(report: &crate::report::CanRunReport) -> String {
             ));
             for w in &ready.windows {
                 let pct = format!("{:.1}%", w.remaining_fraction_ppm as f64 / 10_000.0);
+                // The label sits on the headroom, which is the number a reader
+                // acts on; naming the basis earlier in the line is not enough,
+                // because the eye stops at the figure (`aub-8vpc`).
+                let estimated = if w.basis.is_estimate() {
+                    " (estimated)"
+                } else {
+                    ""
+                };
                 out.push_str(&format!(
-                    "  - {:<14}  {:>4} remaining  calibration #{}  headroom {} credits\n",
+                    "  - {:<14}  {:>4} remaining  {}  headroom {} credits{estimated}\n",
                     w.semantic_key.as_str(),
                     pct,
-                    w.calibration_id,
+                    w.basis.describe(),
                     format_credit_interval_commas(w.headroom)
                 ));
             }

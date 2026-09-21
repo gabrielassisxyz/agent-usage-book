@@ -1422,7 +1422,10 @@ mod tests {
                 assert_eq!(missing_rates.len(), 1);
                 assert_eq!(missing_rates[0].token_class, "input");
             }
-            other => panic!("the other window must not be priced: {other:?}"),
+            other @ (WindowValuationOutcome::Complete { .. }
+            | WindowValuationOutcome::OutOfRange { .. }) => {
+                panic!("the other window must not be priced: {other:?}")
+            }
         }
     }
 
@@ -1453,7 +1456,10 @@ mod tests {
                 assert_eq!(missing_rates.len(), 1);
                 assert_eq!(missing_rates[0].token_class, "output");
             }
-            other => panic!("an unpriced class must be named: {other:?}"),
+            other @ (WindowValuationOutcome::Complete { .. }
+            | WindowValuationOutcome::OutOfRange { .. }) => {
+                panic!("an unpriced class must be named: {other:?}")
+            }
         }
     }
 

@@ -58,6 +58,7 @@ pub enum CheckName {
     SubscriptionIdentityChange,
     CostModelActive,
     AccountInAuthBackoff,
+    WindowEstimateInUse,
 }
 
 impl CheckName {
@@ -80,8 +81,11 @@ impl CheckName {
     /// an account held at the authentication-backoff ceiling was invisible for
     /// two days in September 2026: the sampler records the refusal as evidence
     /// and exits zero by contract, so nothing in the scheduled path could ever
-    /// surface it.
-    pub const EXPECTED: [CheckName; 26] = [
+    /// surface it, and [`Self::WindowEstimateInUse`] added by `aub-8vpc`
+    /// because a window figure standing on a rate-card estimate has to be
+    /// visible while it lasts and has to disappear by itself the day the
+    /// calibration lands.
+    pub const EXPECTED: [CheckName; 27] = [
         Self::ConfigurationValidity,
         Self::SqliteAndSchemaHealth,
         Self::StrictAndConstraintIntegrity,
@@ -108,6 +112,7 @@ impl CheckName {
         Self::SubscriptionIdentityChange,
         Self::CostModelActive,
         Self::AccountInAuthBackoff,
+        Self::WindowEstimateInUse,
     ];
 
     /// The stable kebab-case name: the public identifier in text and JSON output.
@@ -139,6 +144,7 @@ impl CheckName {
             Self::SubscriptionIdentityChange => "subscription-identity-change",
             Self::CostModelActive => "cost-model-active",
             Self::AccountInAuthBackoff => "account-in-auth-backoff",
+            Self::WindowEstimateInUse => "window-estimate-in-use",
         }
     }
 }
@@ -154,8 +160,16 @@ pub enum CheckStatus {
     PassWithDetail(String),
     Fail(String),
     Warn(String),
+    /// A condition worth stating that is neither a defect nor a pass: nothing
+    /// is wrong, and something about the system is temporarily true in a way
+    /// the operator should know (`aub-8vpc`). Distinct from `Warn`, which names
+    /// a repair, and from `PassWithDetail`, which says the check succeeded: an
+    /// informational finding asks for no action and makes no claim of health.
+    Info(String),
     NotApplicable(String),
-    NotYetAvailable { owning_bead: &'static str },
+    NotYetAvailable {
+        owning_bead: &'static str,
+    },
 }
 
 impl CheckStatus {
@@ -166,6 +180,7 @@ impl CheckStatus {
             Self::Pass | Self::PassWithDetail(_) => "pass",
             Self::Fail(_) => "fail",
             Self::Warn(_) => "warn",
+            Self::Info(_) => "info",
             Self::NotApplicable(_) => "not_applicable",
             Self::NotYetAvailable { .. } => "not_yet_available",
         }
@@ -214,6 +229,13 @@ impl DoctorReport {
         self.outcomes
             .iter()
             .filter(|o| matches!(o.status, CheckStatus::Warn(_)))
+            .count()
+    }
+
+    pub fn informational(&self) -> usize {
+        self.outcomes
+            .iter()
+            .filter(|o| matches!(o.status, CheckStatus::Info(_)))
             .count()
     }
 
@@ -319,6 +341,7 @@ mod tests {
             | CheckStatus::PassWithDetail(_)
             | CheckStatus::Warn(_)
             | CheckStatus::Fail(_)
+            | CheckStatus::Info(_)
             | CheckStatus::NotApplicable(_) => {
                 panic!("expected not-yet-available")
             }

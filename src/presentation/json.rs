@@ -1891,6 +1891,7 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
             match &outcome.status {
                 crate::doctor::CheckStatus::Fail(reason)
                 | crate::doctor::CheckStatus::Warn(reason)
+                | crate::doctor::CheckStatus::Info(reason)
                 | crate::doctor::CheckStatus::NotApplicable(reason)
                 | crate::doctor::CheckStatus::PassWithDetail(reason) => {
                     fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
@@ -1906,10 +1907,11 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
         .join(",");
 
     let mut body = format!(
-        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"warned\":{},\"not_applicable\":{},\"not_yet_available\":{}",
+        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"warned\":{},\"informational\":{},\"not_applicable\":{},\"not_yet_available\":{}",
         report.passed(),
         report.failed(),
         report.warned(),
+        report.informational(),
         report.not_applicable(),
         report.not_yet_available(),
     );
@@ -2034,11 +2036,29 @@ pub fn can_run_json_with_explain(
                         Some(ts) => json_string(&format_time_hh_mm(ts)),
                         None => "null".to_string(),
                     };
+                    // A calibrated window keeps the field it always had; an
+                    // estimated one carries `basis` and `evidence_quality`
+                    // instead, so neither can be read as the other by a
+                    // consumer that checks only one field (`aub-8vpc`).
+                    let basis = match &w.basis {
+                        crate::report::can_run::CanRunWindowBasis::Calibration(id) => {
+                            format!("\"calibration_id\":{}", json_string(id))
+                        }
+                        crate::report::can_run::CanRunWindowBasis::RateCardEstimate {
+                            rate_card_ids,
+                        } => format!(
+                            "\"basis\":{{\"kind\":\"rate_card_estimate\",\"rate_card_ids\":[{}]}},\"evidence_quality\":\"estimated\"",
+                            rate_card_ids
+                                .iter()
+                                .map(i64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    };
                     format!(
-                        "{{\"semantic_key\":{},\"remaining_fraction_ppm\":{},\"calibration_id\":{},\"headroom\":{},\"resets_at\":{}}}",
+                        "{{\"semantic_key\":{},\"remaining_fraction_ppm\":{},{basis},\"headroom\":{},\"resets_at\":{}}}",
                         json_string(w.semantic_key.as_str()),
                         w.remaining_fraction_ppm,
-                        json_string(&w.calibration_id),
                         interval_json(&w.headroom),
                         resets_str
                     )
@@ -3243,6 +3263,7 @@ mod tests {
                 observed_age: Some(MonotonicDuration::from_seconds(41)),
             },
             window_calibrations: calibrations,
+            window_estimates: BTreeMap::new(),
             cost_model_missing_token_classes: Vec::new(),
             plan_tier_mismatch: None,
             task: TaskReferenceInput {
