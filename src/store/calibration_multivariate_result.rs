@@ -607,31 +607,194 @@ fn row_id_of_multivariate(conn: &Connection, id: &WindowCalibrationId) -> Result
     .map_err(|e| Error::Store(format!("cannot resolve calibration '{}': {e}", id.as_str())))
 }
 
+/// A joint candidate and its per-kind result in one scope, shared by this
+/// module's tests and by the tests of the consumers that must match the
+/// per-kind arm of [`ActiveCalibration`].
 #[cfg(test)]
-mod tests {
+pub(crate) mod per_kind_fixture {
     use super::*;
     use std::collections::BTreeSet;
-    use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
 
     use crate::calibration::activation::{ActivationActor, ActivationPolicy};
     use crate::calibration::contamination::{ContaminationThresholds, ContaminationVerdict};
-    use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
-    use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
+    use crate::domain::credits::Credits;
     use crate::domain::provenance::{CostModelId, EvidenceId};
     use crate::domain::quota::QuotaUsed;
-    use crate::domain::time::MonotonicDuration;
     use crate::domain::window::ReportedResolution;
-    use crate::store::calibration::{
-        activate, insert_experiment, insert_result, is_superseded, lifecycle_event_count,
-        load_active_at, minimal_experiment, minimal_fixture,
-    };
     use crate::store::calibration_controlled::{ControlledExperimentRun, insert_begin};
     use crate::store::calibration_multivariate::{
         MultivariateCandidate, insert_multivariate_candidate,
     };
-    use crate::store::connection::PragmaPolicy;
     use crate::store::meter_evidence::ObservationRowId;
+
+    pub(crate) const RESULT_ID: &str = "promoted-mvcand-1";
+
+    pub(crate) fn ts(nanos: i64) -> UtcTimestamp {
+        UtcTimestamp::from_unix_nanos(nanos)
+    }
+
+    pub(crate) fn evidence(tag: &str) -> BTreeSet<EvidenceId> {
+        [EvidenceId::new(tag)].into_iter().collect()
+    }
+
+    fn coefficient(kind: TokenKind, estimate: i64) -> StoredKindCoefficient {
+        StoredKindCoefficient {
+            kind,
+            estimate_micro_ppm_per_token: estimate,
+            std_error_micro_ppm_per_token: 1_000,
+            interval_low_micro_ppm_per_token: estimate - 2_000,
+            interval_high_micro_ppm_per_token: estimate + 2_000,
+        }
+    }
+
+    fn coefficients() -> Vec<StoredKindCoefficient> {
+        vec![
+            coefficient(TokenKind::Input, 500_000),
+            coefficient(TokenKind::Output, 1_000_000),
+        ]
+    }
+
+    /// Seeds, in anthropic's `five_hour` window under `plan_tier`, one
+    /// controlled run on account `acct` and its joint candidate `mvcand-1`.
+    pub(crate) fn seed_run_and_candidate(conn: &mut Connection, plan_tier: &str) {
+        crate::store::calibrate_cli_test_ledger::insert_calibrate_cli_meter_chain(
+            conn,
+            "acct",
+            "five_hour",
+            ts(1_000),
+            10_000,
+        );
+        let baseline: i64 = conn
+            .query_row("SELECT id FROM meter_observation LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let resolution = QuotaFractionPpm::new(10_000).unwrap();
+        let run = ControlledExperimentRun {
+            id: ControlledExperimentId::new("exp-joint"),
+            account: "acct".to_string(),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new(plan_tier),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+            cost_model_id: CostModelId::new("cm"),
+            expected_token_kinds: vec![TokenKind::Input, TokenKind::Output],
+            baseline_observation_id: ObservationRowId::new(baseline),
+            baseline_quota_used: QuotaUsed::new(resolution),
+            baseline_resolution: ReportedResolution::new(resolution).unwrap(),
+            baseline_observed_at: ts(1_000),
+            baseline_plateau_started_at: ts(1_000),
+            contamination_thresholds: ContaminationThresholds::conservative_default(),
+            started_at: ts(1_000),
+            ended_at: None,
+            exclusivity_assertion: "reserved".to_string(),
+        };
+        insert_begin(conn, &run).unwrap();
+        insert_multivariate_candidate(
+            conn,
+            &MultivariateCandidate {
+                id: MultivariateCandidateId::new("mvcand-1"),
+                experiment: run.id.clone(),
+                provider: run.provider.clone(),
+                plan_tier: run.plan_tier.clone(),
+                window_semantic_key: run.window_semantic_key.clone(),
+                coefficients: coefficients(),
+                condition_number: ConditionNumber::from_micros(4_000_000),
+                condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+                fit_residual_ppm: 120,
+                sample_count: 8,
+                inputs: EvidenceDigest::from_inputs(&evidence("training")),
+                statistical_method: "ols".to_string(),
+                statistical_parameters: "{}".to_string(),
+                phase_design: "design".to_string(),
+                validity: ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
+                knowledge_time: ts(2_000),
+            },
+        )
+        .unwrap();
+    }
+
+    /// A per-kind result of `mvcand-1` under `plan_tier`, named `id`.
+    pub(crate) fn result(id: &str, plan_tier: &str) -> MultivariateCalibration {
+        MultivariateCalibration {
+            id: WindowCalibrationId::new(id),
+            candidate: MultivariateCandidateId::new("mvcand-1"),
+            experiment: ControlledExperimentId::new("exp-joint"),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new(plan_tier),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+            coefficients: coefficients(),
+            condition_number: ConditionNumber::from_micros(4_000_000),
+            condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+            fit_residual: QuotaFractionPpm::new(120).unwrap(),
+            held_out_residual: QuotaFractionPpm::new(340).unwrap(),
+            validation_observations: 2,
+            sample_count: 8,
+            inputs: EvidenceDigest::from_inputs(&evidence("training")),
+            fitting_evidence: EvidenceFingerprint::from_inputs(&evidence("training")),
+            validation_evidence: EvidenceFingerprint::from_inputs(&evidence("validation")),
+            validation_method: "held-out-block-residual".to_string(),
+            validation_version: "v1".to_string(),
+            statistical_method: "ols".to_string(),
+            statistical_parameters: "{}".to_string(),
+            phase_design: "design".to_string(),
+            activation_policy_version: "promote-v1".to_string(),
+            aub_version: "0.1.0".to_string(),
+            source_revision: "abc1234".to_string(),
+            validity: ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
+            fit_timestamp: ts(2_000),
+            knowledge_time: ts(2_500),
+        }
+    }
+
+    /// Activates [`RESULT_ID`] at `at` through the real gate.
+    pub(crate) fn activate(
+        conn: &mut Connection,
+        at: i64,
+        supersedes: Option<&WindowCalibrationId>,
+    ) -> Result<CalibrationLifecycleEventId, Error> {
+        let actor = ActivationActor::new("operator").unwrap();
+        let policy = ActivationPolicy::new(
+            "promote-v1",
+            Credits::from_micros(0),
+            ConditionNumber::from_micros(30_000_000),
+        )
+        .unwrap()
+        .with_max_quota_residual(QuotaFractionPpm::new(10_000).unwrap());
+        let verdict = ContaminationVerdict::clean();
+        activate_multivariate(
+            conn,
+            &WindowCalibrationId::new(RESULT_ID),
+            ts(at),
+            supersedes,
+            &ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &evidence("training"),
+                validation: &evidence("validation"),
+                contamination: &verdict,
+            },
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::per_kind_fixture::{activate, evidence, result, seed_run_and_candidate, ts};
+    use super::*;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::calibration::activation::{ActivationActor, ActivationPolicy};
+    use crate::calibration::contamination::ContaminationVerdict;
+    use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
+    use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
+    use crate::domain::provenance::CostModelId;
+    use crate::domain::time::MonotonicDuration;
+    use crate::store::calibration::{
+        insert_experiment, insert_result, is_superseded, lifecycle_event_count, load_active_at,
+        minimal_experiment, minimal_fixture,
+    };
+    use crate::store::connection::PragmaPolicy;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -643,29 +806,11 @@ mod tests {
         }
     }
 
-    fn ts(nanos: i64) -> UtcTimestamp {
-        UtcTimestamp::from_unix_nanos(nanos)
-    }
-
     fn scope() -> CalibrationScope {
         CalibrationScope {
             provider: ProviderKey::new("anthropic"),
             plan_tier: PlanTier::new("pro"),
             window_semantic_key: WindowSemanticKey::new("five_hour"),
-        }
-    }
-
-    fn evidence(tag: &str) -> BTreeSet<EvidenceId> {
-        [EvidenceId::new(tag)].into_iter().collect()
-    }
-
-    fn coefficient(kind: TokenKind, estimate: i64) -> StoredKindCoefficient {
-        StoredKindCoefficient {
-            kind,
-            estimate_micro_ppm_per_token: estimate,
-            std_error_micro_ppm_per_token: 1_000,
-            interval_low_micro_ppm_per_token: estimate - 2_000,
-            interval_high_micro_ppm_per_token: estimate + 2_000,
         }
     }
 
@@ -685,64 +830,8 @@ mod tests {
                 busy_timeout: MonotonicDuration::from_millis(1_000),
             },
         );
-        crate::store::calibrate_cli_test_ledger::insert_calibrate_cli_meter_chain(
-            &conn,
-            "acct",
-            "five_hour",
-            ts(1_000),
-            10_000,
-        );
-        let baseline: i64 = conn
-            .query_row("SELECT id FROM meter_observation LIMIT 1", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        let resolution = QuotaFractionPpm::new(10_000).unwrap();
-        let run = ControlledExperimentRun {
-            id: ControlledExperimentId::new("exp-joint"),
-            account: "acct".to_string(),
-            provider: ProviderKey::new("anthropic"),
-            plan_tier: PlanTier::new("pro"),
-            window_semantic_key: WindowSemanticKey::new("five_hour"),
-            cost_model_id: CostModelId::new("cm"),
-            expected_token_kinds: vec![TokenKind::Input, TokenKind::Output],
-            baseline_observation_id: ObservationRowId::new(baseline),
-            baseline_quota_used: QuotaUsed::new(resolution),
-            baseline_resolution: ReportedResolution::new(resolution).unwrap(),
-            baseline_observed_at: ts(1_000),
-            baseline_plateau_started_at: ts(1_000),
-            contamination_thresholds: ContaminationThresholds::conservative_default(),
-            started_at: ts(1_000),
-            ended_at: None,
-            exclusivity_assertion: "reserved".to_string(),
-        };
-        insert_begin(&conn, &run).unwrap();
+        seed_run_and_candidate(&mut conn, "pro");
         let validity = ValidityInterval::new(ts(1_000), ts(2_000)).unwrap();
-        insert_multivariate_candidate(
-            &mut conn,
-            &MultivariateCandidate {
-                id: MultivariateCandidateId::new("mvcand-1"),
-                experiment: run.id.clone(),
-                provider: run.provider.clone(),
-                plan_tier: run.plan_tier.clone(),
-                window_semantic_key: run.window_semantic_key.clone(),
-                coefficients: vec![
-                    coefficient(TokenKind::Input, 500_000),
-                    coefficient(TokenKind::Output, 1_000_000),
-                ],
-                condition_number: ConditionNumber::from_micros(4_000_000),
-                condition_number_threshold: ConditionNumber::from_micros(30_000_000),
-                fit_residual_ppm: 120,
-                sample_count: 8,
-                inputs: EvidenceDigest::from_inputs(&evidence("training")),
-                statistical_method: "ols".to_string(),
-                statistical_parameters: "{}".to_string(),
-                phase_design: "design".to_string(),
-                validity,
-                knowledge_time: ts(2_000),
-            },
-        )
-        .unwrap();
 
         let meter = MeterSemanticsId::new("meter-v1");
         let billing = BillingSemanticsId::new("billing-v1");
@@ -778,38 +867,7 @@ mod tests {
     }
 
     fn per_kind(id: &str) -> MultivariateCalibration {
-        MultivariateCalibration {
-            id: WindowCalibrationId::new(id),
-            candidate: MultivariateCandidateId::new("mvcand-1"),
-            experiment: ControlledExperimentId::new("exp-joint"),
-            provider: ProviderKey::new("anthropic"),
-            plan_tier: PlanTier::new("pro"),
-            window_semantic_key: WindowSemanticKey::new("five_hour"),
-            coefficients: vec![
-                coefficient(TokenKind::Input, 500_000),
-                coefficient(TokenKind::Output, 1_000_000),
-            ],
-            condition_number: ConditionNumber::from_micros(4_000_000),
-            condition_number_threshold: ConditionNumber::from_micros(30_000_000),
-            fit_residual: QuotaFractionPpm::new(120).unwrap(),
-            held_out_residual: QuotaFractionPpm::new(340).unwrap(),
-            validation_observations: 2,
-            sample_count: 8,
-            inputs: EvidenceDigest::from_inputs(&evidence("training")),
-            fitting_evidence: EvidenceFingerprint::from_inputs(&evidence("training")),
-            validation_evidence: EvidenceFingerprint::from_inputs(&evidence("validation")),
-            validation_method: "held-out-block-residual".to_string(),
-            validation_version: "v1".to_string(),
-            statistical_method: "ols".to_string(),
-            statistical_parameters: "{}".to_string(),
-            phase_design: "design".to_string(),
-            activation_policy_version: "promote-v1".to_string(),
-            aub_version: "0.1.0".to_string(),
-            source_revision: "abc1234".to_string(),
-            validity: ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
-            fit_timestamp: ts(2_000),
-            knowledge_time: ts(2_500),
-        }
+        result(id, "pro")
     }
 
     fn activate_scalar(
@@ -825,7 +883,7 @@ mod tests {
         )
         .unwrap();
         let verdict = ContaminationVerdict::clean();
-        activate(
+        crate::store::calibration::activate(
             conn,
             &WindowCalibrationId::new("scalar-1"),
             ts(at),
@@ -845,28 +903,7 @@ mod tests {
         at: i64,
         supersedes: Option<&WindowCalibrationId>,
     ) -> Result<CalibrationLifecycleEventId, Error> {
-        let actor = ActivationActor::new("operator").unwrap();
-        let policy = ActivationPolicy::new(
-            "promote-v1",
-            Credits::from_micros(0),
-            ConditionNumber::from_micros(30_000_000),
-        )
-        .unwrap()
-        .with_max_quota_residual(QuotaFractionPpm::new(10_000).unwrap());
-        let verdict = ContaminationVerdict::clean();
-        activate_multivariate(
-            conn,
-            &WindowCalibrationId::new("promoted-mvcand-1"),
-            ts(at),
-            supersedes,
-            &ActivationRequest {
-                actor: &actor,
-                policy: &policy,
-                training: &evidence("training"),
-                validation: &evidence("validation"),
-                contamination: &verdict,
-            },
-        )
+        activate(conn, at, supersedes)
     }
 
     fn per_kind_events(conn: &Connection) -> i64 {
