@@ -430,4 +430,16 @@ mod tests {
             !saw_estimated || !matches!(combined, EvidenceQuality::Measured)
         });
     }
+
+    #[test]
+    fn quality_combine_measured_stays_measured() {
+        check_property("quality preservation", 0..256, |seed| {
+            let mut rng = Rng::new(Seed(seed));
+            let mut combined: EvidenceQuality<TokenCount> = EvidenceQuality::Measured;
+            for _ in 0..=rng.next_below(8) {
+                combined = combined.combine(&EvidenceQuality::Measured);
+            }
+            matches!(combined, EvidenceQuality::Measured)
+        });
+    }
 }
