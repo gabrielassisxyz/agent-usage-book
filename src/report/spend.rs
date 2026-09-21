@@ -605,13 +605,17 @@ pub fn assemble_canonical_with_window_equivalent(
     // keeps its raw id and stays `unknown-account` (or whatever the markers
     // said in a test with markers); `kimi-k3` is not a slot because its
     // stripped `kimi` matches no `kimi-k3*` rule, so its account is unchanged.
+    // The opencode provider prefix does the same for the plan that billed the
+    // event (`aub-oo34`): `opencode-go/*` is `opencode-go` and `opencode/*` is
+    // `opencode-free`, over any marker, so sessions from before the marker
+    // plugin and sessions that switch provider mid-conversation both split.
     // This runs at report time over ids already in the ledger, so reverting
     // restores the previous output with no rebuild.
     for event in &events {
         if let Some(id) = event.model.as_deref()
-            && let Some(slot_account) = models.slot_account(id)
+            && let Some(model_account) = models.event_account(id)
         {
-            account_of.insert(event.canonical_id.clone(), slot_account);
+            account_of.insert(event.canonical_id.clone(), model_account);
         }
     }
     // The window counts the ledger read, and the groups sum the filtered
@@ -3331,6 +3335,142 @@ mod tests {
         assert_eq!(
             account_report.groups[0].key.as_str(),
             "account=unknown-account"
+        );
+    }
+
+    /// Account groups as `(key, input)` pairs, sorted by key, for the
+    /// opencode prefix-account cases (`aub-oo34`).
+    fn opencode_account_inputs(
+        conn: &rusqlite::Connection,
+        models: &crate::config::ModelTable,
+    ) -> Vec<(String, u64)> {
+        let report = assemble_canonical(
+            conn,
+            window("2026-09-21", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            models,
+        )
+        .unwrap();
+        let mut pairs: Vec<(String, u64)> = report
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.key.as_str().to_string(),
+                    group.usage.known().input().value(),
+                )
+            })
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// One opencode session that switches from the Go plan to a free Zen
+    /// model between two messages bills each message to its own plan
+    /// (`aub-oo34`). The session carries no marker, which is the shape of
+    /// every opencode session from before the marker plugin: nothing is left
+    /// under `unknown-account`.
+    #[test]
+    fn one_opencode_session_splits_across_go_and_free_by_model_prefix() {
+        let (_root, conn) = canonical_conn("opencode-mixed-session");
+        seed_session_in_harness(&conn, "opencode", "s-mix");
+        let day = UtcDate::parse("2026-09-21").unwrap().start().unix_nanos();
+        seed_event_in_harness(
+            &conn,
+            "opencode",
+            "e-go",
+            day + 10,
+            "s-mix",
+            Some("opencode-go/muse-spark-1.3-contributor"),
+            &[("input", 11)],
+        );
+        seed_event_in_harness(
+            &conn,
+            "opencode",
+            "e-free",
+            day + 20,
+            "s-mix",
+            Some("opencode/muse-spark-1.3-contributor-free"),
+            &[("input", 13)],
+        );
+        assert_eq!(
+            opencode_account_inputs(&conn, &crate::config::ModelTable::default()),
+            vec![
+                ("account=opencode-free".to_string(), 13),
+                ("account=opencode-go".to_string(), 11),
+            ]
+        );
+    }
+
+    /// The prefix outranks the marker (`aub-oo34`): a session the plugin
+    /// marked `opencode-go` whose messages all ran a free Zen model bills
+    /// every one of them to `opencode-free`.
+    #[test]
+    fn the_opencode_prefix_account_beats_the_session_marker() {
+        let (_root, conn) = canonical_conn("opencode-prefix-beats-marker");
+        seed_session_in_harness(&conn, "opencode", "s-marked");
+        let day = UtcDate::parse("2026-09-21").unwrap().start().unix_nanos();
+        seed_marker_in_harness(&conn, "opencode", "s-marked", "opencode-go", day + 1);
+        for (index, input) in [5_u64, 7].into_iter().enumerate() {
+            seed_event_in_harness(
+                &conn,
+                "opencode",
+                &format!("e-free-{index}"),
+                day + 10 + index as i64,
+                "s-marked",
+                Some("opencode/muse-spark-1.3-contributor-free"),
+                &[("input", input)],
+            );
+        }
+        assert_eq!(
+            opencode_account_inputs(&conn, &crate::config::ModelTable::default()),
+            vec![("account=opencode-free".to_string(), 12)]
+        );
+    }
+
+    /// The planted negative for the prefix rule (`aub-oo34`): claude-code,
+    /// codex and pi events keep exactly the accounts their markers and the
+    /// key-slot rule gave them, including the unmarked session under
+    /// `unknown-account`. A rule that matched more than the two opencode
+    /// prefixes would move one of these.
+    #[test]
+    fn the_opencode_prefix_rule_moves_no_claude_codex_or_pi_event() {
+        let (_root, conn) = canonical_conn("opencode-prefix-negative");
+        let day = UtcDate::parse("2026-09-21").unwrap().start().unix_nanos();
+        let fixtures: &[(&str, &str, Option<&str>, &str, u64)] = &[
+            ("claude-code", "s-claude", Some("work"), "claude-opus-5", 3),
+            ("codex", "s-codex", Some("research"), "gpt-5.6-terra", 5),
+            ("pi", "s-pi-slot", Some("work"), "glm-5.3-flash-max-k2", 7),
+            ("pi", "s-pi", None, "deepseek-v4-pro-high", 11),
+        ];
+        for (harness, session, marker, model, input) in fixtures {
+            seed_session_in_harness(&conn, harness, session);
+            if let Some(account) = marker {
+                seed_marker_in_harness(&conn, harness, session, account, day + 1);
+            }
+            seed_event_in_harness(
+                &conn,
+                harness,
+                &format!("e-{session}"),
+                day + 10,
+                session,
+                Some(model),
+                &[("input", *input)],
+            );
+        }
+        assert_eq!(
+            opencode_account_inputs(&conn, &named_flash_table()),
+            vec![
+                ("account=ollama-k2".to_string(), 7),
+                ("account=research".to_string(), 5),
+                ("account=unknown-account".to_string(), 11),
+                ("account=work".to_string(), 3),
+            ]
         );
     }
 
