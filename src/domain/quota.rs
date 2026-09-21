@@ -195,7 +195,15 @@ pub struct PointsPerMillionTokens {
 impl PointsPerMillionTokens {
     /// Constructs from micro-points per one million tokens, the form the rate
     /// book parses and the store persists.
-    pub const fn from_micro_points_per_million(micro_points_per_million_tokens: i64) -> Self {
+    ///
+    /// `pub(crate)`: a coefficient, held to the same boundary
+    /// `CreditsPerToken` and `CreditsPerPercentagePoint` are held to, so a
+    /// consumer outside the crate cannot mint one and skip the card that is
+    /// supposed to state it. See `src/domain/credits.rs` on why the crate is
+    /// the tightest boundary a domain file can declare.
+    pub(crate) const fn from_micro_points_per_million(
+        micro_points_per_million_tokens: i64,
+    ) -> Self {
         Self {
             micro_points_per_million_tokens,
         }

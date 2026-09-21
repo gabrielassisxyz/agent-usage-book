@@ -1,6 +1,6 @@
 # Invariants
 
-This document repeats the 27 invariants from the design (PLAN.md section 42) in
+This document repeats the invariants from the design (PLAN.md section 42) in
 the source tree, each with the module that enforces it and the test, lint or
 database constraint that would catch a violation. A rule in a 5,000 line design
 document is read once by whoever converts it into beads; a rule here is read by
@@ -58,10 +58,11 @@ same thing in both documents.
 | 27 | Coverage denominators come from the sampling policy that was in force over the interval, never from current configuration. | src/coverage.rs | tests::a_cadence_change_mid_interval_follows_the_historical_policy |
 | 28 | At most one rate card is in force per vendor, model, token class and instant. | src/rate_book.rs | tests::two_scheduled_rows_overlapping_on_a_shared_day_are_refused |
 | 29 | A multivariate coefficient is only ever recorded as a candidate, one per token kind the experiment premise named, and never activated by the fit command. | tests/calibrate_fit_multivariate.rs | multivariate_fit_records_a_candidate_and_never_activates |
+| 30 | A window figure derived from a rate-card estimate is labelled estimated on every surface and never outranks a current calibration. | src/report/can_run.rs | tests::a_current_calibration_outranks_an_estimate_for_the_same_window |
 
 ## Enforcement status
 
-Of the 29 invariants above, 29 are enforced by mechanical checks present at HEAD (file paths and tests), and 0 are unenforced and tracked by open beads in the tracker.
+Of the 30 invariants above, 30 are enforced by mechanical checks present at HEAD (file paths and tests), and 0 are unenforced and tracked by open beads in the tracker.
 
 ## Maintaining this document
 

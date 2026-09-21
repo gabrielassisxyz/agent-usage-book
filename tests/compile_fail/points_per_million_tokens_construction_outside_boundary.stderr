@@ -1,0 +1,12 @@
+error[E0624]: associated function `from_micro_points_per_million` is private
+  --> tests/compile_fail/points_per_million_tokens_construction_outside_boundary.rs:12:37
+   |
+12 |       let _ = PointsPerMillionTokens::from_micro_points_per_million(1);
+   |                                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ private associated function
+   |
+  ::: src/domain/quota.rs
+   |
+   | /     pub(crate) const fn from_micro_points_per_million(
+   | |         micro_points_per_million_tokens: i64,
+   | |     ) -> Self {
+   | |_____________- private associated function defined here
