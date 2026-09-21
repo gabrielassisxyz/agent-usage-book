@@ -2894,7 +2894,10 @@ It may become unusable because:
 * plan tier changed;
 * provider or window semantics changed;
 * the referenced cost model was superseded for good reason;
-* passive validation shows statistically significant drift;
+* passive validation shows statistically significant drift (not implemented
+  yet: no drift test exists, so no calibration leaves `Current` by drift
+  today; the review horizon is the only time-based reason, and the design
+  bead for the test is `aub-2kam`);
 * the configured review horizon expired.
 
 An adapter implementation upgrade alone never invalidates a calibration. Only a

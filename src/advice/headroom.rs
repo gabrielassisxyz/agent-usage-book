@@ -34,7 +34,8 @@ pub enum CalibrationHealth {
     Current,
     /// The configured review horizon passed.
     ReviewDue,
-    /// Passive validation produced a statistically significant drift finding.
+    /// Passive validation produced a statistically significant drift finding. Not reachable
+    /// today: no drift test is implemented (design bead aub-2kam).
     Suspect,
     /// A supersession event or cost model supersession retired it.
     Superseded,
