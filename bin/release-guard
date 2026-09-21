@@ -66,6 +66,9 @@ scan_binary() {
     local binary="$1" marker="${2:-}" pattern count=0
     [ -f "$patterns_file" ] || die "forbidden-pattern source is missing: $patterns_file"
     while IFS= read -r pattern || [ -n "$pattern" ]; do
+        # A Windows checkout turns this file into CRLF; a blank line would otherwise arrive as a
+        # lone carriage return and match every binary.
+        pattern="${pattern%$'\r'}"
         case "$pattern" in
             '# === binary-scan patterns end here ==='*) break ;;
             ''|'#'*) continue ;;
@@ -281,6 +284,15 @@ self_test() {
         --target aarch64-apple-darwin \
         --target x86_64-apple-darwin \
         --target x86_64-pc-windows-msvc >/dev/null
+
+    local crlf_patterns saved_patterns
+    crlf_patterns="$scratch/forbidden-patterns-crlf.txt"
+    sed 's/$/\r/' "$patterns_file" >"$crlf_patterns"
+    printf 'plain\r\nwindows\r\nbinary\r\n' >"$scratch/crlf-binary"
+    saved_patterns="$patterns_file"
+    patterns_file="$crlf_patterns"
+    scan_binary "$scratch/crlf-binary"
+    patterns_file="$saved_patterns"
 
     cp "$output/aub-x86_64-unknown-linux-gnu.tar.gz.sha256" "$scratch/checksum.good"
     printf '0  aub-x86_64-unknown-linux-gnu.tar.gz\n' >"$output/aub-x86_64-unknown-linux-gnu.tar.gz.sha256"
