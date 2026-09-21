@@ -714,6 +714,13 @@ pub struct AccountGroupExplain {
     /// The markers that produced the attribution, in a deterministic order. Empty
     /// for the unknown-account group: no marker justified that usage.
     pub markers: Vec<AccountMarkerReference>,
+    /// The ancestor sessions an inherited attribution came from, as
+    /// `source:native` labels in deterministic order. Empty for a direct
+    /// attribution: the markers above belong to the sessions being reported.
+    /// A Codex subagent session with no markers of its own inherits its
+    /// parent's marker timeline (`aub-wvrw`), so its account group names the
+    /// ancestor here and stays distinguishable from a direct row.
+    pub inherited_from: Vec<String>,
 }
 
 /// A stable reference to one persisted account marker and the evidence it carried.

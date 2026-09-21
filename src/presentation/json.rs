@@ -923,7 +923,8 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
 
 /// The marker evidence behind every account group, mirroring the human
 /// `account explain:` block so a contract test can assert the two carry
-/// identical references and evidence classes (aub-mgv.4).
+/// identical references and evidence classes (aub-mgv.4). An inherited
+/// attribution carries the ancestor sessions it came from (`aub-wvrw`).
 fn account_groups_json(groups: &[crate::report::AccountGroupExplain]) -> String {
     groups
         .iter()
@@ -941,8 +942,14 @@ fn account_groups_json(groups: &[crate::report::AccountGroupExplain]) -> String 
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            let inherited = group
+                .inherited_from
+                .iter()
+                .map(|session| json_string(session))
+                .collect::<Vec<_>>()
+                .join(",");
             format!(
-                "{{\"key\":{},\"evidence_class\":{},\"markers\":[{markers}]}}",
+                "{{\"key\":{},\"evidence_class\":{},\"markers\":[{markers}],\"inherited_from\":[{inherited}]}}",
                 json_string(group.key.as_str()),
                 json_string(group.evidence_class.as_str()),
             )

@@ -156,6 +156,9 @@ mod migration_0043;
 #[path = "0044_multivariate_calibration_result.rs"]
 mod migration_0044;
 
+#[path = "0045_codex_subagent_parent.rs"]
+pub(crate) mod migration_0045;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -206,5 +209,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0042::migration(),
         migration_0043::migration(),
         migration_0044::migration(),
+        migration_0045::migration(),
     ]
 }

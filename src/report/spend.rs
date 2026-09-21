@@ -1025,6 +1025,15 @@ fn qualify_tree_unattributed(mut group: SpendGroup) -> SpendGroup {
 /// segmentation, returning the per-event account label and, per distinct
 /// account, the marker evidence that placed it. The report never inspects a
 /// marker itself: [`account_segment::assign`] owns the decision (aub-mgv.4).
+///
+/// A Codex subagent session with no markers of its own inherits the marker
+/// timeline of the first ancestor that carries markers (`aub-wvrw`): the walk
+/// follows `session.parent_native_session_id` in the same source namespace,
+/// recursively, and segments the child's own event timestamps against the
+/// ancestor's intervals with the ancestor's evidence class. A subagent whose
+/// chain reaches no marked session, names a parent never ingested, or cycles
+/// stays in `unknown-account`. A session carrying a marker of its own never
+/// consults its parent.
 fn account_attribution(
     conn: &rusqlite::Connection,
     events: &[CanonicalSpendEvent],
@@ -1048,7 +1057,11 @@ fn account_attribution(
     let mut account_of: BTreeMap<String, String> = BTreeMap::new();
     let mut per_account: BTreeMap<
         String,
-        (AccountEvidenceClass, BTreeSet<AccountMarkerReference>),
+        (
+            AccountEvidenceClass,
+            BTreeSet<AccountMarkerReference>,
+            BTreeSet<String>,
+        ),
     > = BTreeMap::new();
 
     for &index in &sessionless {
@@ -1058,7 +1071,13 @@ fn account_attribution(
         );
         per_account
             .entry(UNKNOWN_ACCOUNT_LABEL.to_string())
-            .or_insert_with(|| (AccountEvidenceClass::Unattributed, BTreeSet::new()));
+            .or_insert_with(|| {
+                (
+                    AccountEvidenceClass::Unattributed,
+                    BTreeSet::new(),
+                    BTreeSet::new(),
+                )
+            });
     }
 
     for ((source, native), indices) in &by_session {
@@ -1066,7 +1085,18 @@ fn account_attribution(
             SourceNamespace::new(source.clone()),
             NativeSessionId::new(native.clone()),
         );
-        let markers = crate::store::session_account_marker::markers_for_session(conn, &session_id)?;
+        let own_markers =
+            crate::store::session_account_marker::markers_for_session(conn, &session_id)?;
+        let (markers, ancestor) = if own_markers.is_empty() {
+            match inherited_marker_timeline(conn, source, native)? {
+                Some((ancestor_label, ancestor_markers)) => {
+                    (ancestor_markers, Some(ancestor_label))
+                }
+                None => (own_markers, None),
+            }
+        } else {
+            (own_markers, None)
+        };
         let usage: Vec<AccountUsageEvent> = indices
             .iter()
             .map(|&i| AccountUsageEvent {
@@ -1086,7 +1116,7 @@ fn account_attribution(
             account_of.insert(events[event_index].canonical_id.clone(), label.clone());
             let entry = per_account
                 .entry(label)
-                .or_insert_with(|| (*class, BTreeSet::new()));
+                .or_insert_with(|| (*class, BTreeSet::new(), BTreeSet::new()));
             if class.takes_precedence_over(entry.0) {
                 entry.0 = *class;
             }
@@ -1101,19 +1131,81 @@ fn account_attribution(
                         });
                     }
                 }
+                if let Some(ancestor_label) = ancestor.as_deref() {
+                    entry.2.insert(ancestor_label.to_string());
+                }
             }
         }
     }
 
     let account_explain = per_account
         .into_iter()
-        .map(|(label, (evidence_class, markers))| AccountGroupExplain {
-            key: LogicalName::new(format!("account={label}")),
-            evidence_class,
-            markers: markers.into_iter().collect(),
-        })
+        .map(
+            |(label, (evidence_class, markers, inherited_from))| AccountGroupExplain {
+                key: LogicalName::new(format!("account={label}")),
+                evidence_class,
+                markers: markers.into_iter().collect(),
+                inherited_from: inherited_from.into_iter().collect(),
+            },
+        )
         .collect();
     Ok((account_of, account_explain))
+}
+
+/// The first ancestor with markers above a markerless session, following the
+/// stored Codex subagent parent links (`aub-wvrw`).
+///
+/// Returns the ancestor's `source:native` label and its markers. `None` when
+/// the session carries no parent, names a parent never ingested, reaches only
+/// unmarked ancestors, or the parent chain cycles: all four stay in
+/// `unknown-account` rather than guessing from the clock or the directory.
+/// The walk is bounded by the session count and terminates on a repeated
+/// session.
+fn inherited_marker_timeline(
+    conn: &rusqlite::Connection,
+    source: &str,
+    native: &str,
+) -> Result<
+    Option<(
+        String,
+        Vec<crate::store::session_account_marker::SessionAccountMarker>,
+    )>,
+    Error,
+> {
+    use std::collections::HashSet;
+
+    let mut visited: HashSet<(String, String)> = HashSet::new();
+    visited.insert((source.to_string(), native.to_string()));
+    let mut current_native = native.to_string();
+    loop {
+        let current = crate::store::session::load_session(
+            conn,
+            &SourceNamespace::new(source.to_string()),
+            &NativeSessionId::new(current_native.clone()),
+        )?;
+        let parent_native = match current.as_ref().and_then(|row| {
+            row.parent_native_session_id()
+                .map(|id| id.as_str().to_string())
+        }) {
+            Some(parent) if !parent.is_empty() => parent,
+            _ => return Ok(None),
+        };
+        let parent_key = (source.to_string(), parent_native.clone());
+        if !visited.insert(parent_key.clone()) {
+            return Ok(None);
+        }
+        let parent_id = SessionId::new(
+            SourceNamespace::new(source.to_string()),
+            NativeSessionId::new(parent_native.clone()),
+        );
+        let parent_markers =
+            crate::store::session_account_marker::markers_for_session(conn, &parent_id)?;
+        if !parent_markers.is_empty() {
+            let label = format!("{source}:{parent_native}");
+            return Ok(Some((label, parent_markers)));
+        }
+        current_native = parent_native;
+    }
 }
 
 /// The four known token kinds of a canonical event as a [`KnownTokenVector`],
@@ -1635,6 +1727,7 @@ mod tests {
                 project_key: ProjectKey::new("project-a"),
                 repository_key: RepositoryKey::new("repository-a"),
                 working_directory: None,
+                parent_native_session_id: None,
                 run_id: None,
             },
         )
@@ -1680,6 +1773,7 @@ mod tests {
                 project_key: ProjectKey::new("project-a"),
                 repository_key: RepositoryKey::new("repository-a"),
                 working_directory: None,
+                parent_native_session_id: None,
                 run_id: None,
             },
         )
@@ -1925,6 +2019,330 @@ mod tests {
             }
         }
         crate::presentation::validate_spend_report_json(&json).unwrap();
+    }
+
+    fn seed_session_with_parent(conn: &rusqlite::Connection, name: &str, parent: Option<&str>) {
+        insert_session(
+            conn,
+            &NewSession {
+                source: SourceNamespace::new("fixture"),
+                native_session_id: crate::domain::ids::NativeSessionId::new(name),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                working_directory: None,
+                parent_native_session_id: parent.map(crate::domain::ids::NativeSessionId::new),
+                run_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    /// A subagent with no markers of its own inherits its parent's marker
+    /// timeline with the parent's evidence class (`aub-wvrw`), and the
+    /// explain names the ancestor session.
+    #[test]
+    fn codex_subagent_without_own_markers_inherits_the_parent_timeline() {
+        use crate::store::session_account_marker::EvidenceDesignation;
+
+        let (_root, conn) = canonical_conn("subagent-inherits");
+        seed_session(&conn, "parent-1");
+        seed_session_with_parent(&conn, "child-1", Some("parent-1"));
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_marker(
+            &conn,
+            "parent-1",
+            "work",
+            day + 1,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(
+            &conn,
+            "e1",
+            day + 20,
+            "child-1",
+            "reported",
+            &[("input", 5)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(by_key["account=work"].usage.known().input().value(), 5);
+        assert!(
+            !by_key.contains_key("account=unknown-account"),
+            "an inherited subagent never lands in unknown-account"
+        );
+        let explain: BTreeMap<&str, &AccountGroupExplain> = report
+            .account_explain
+            .iter()
+            .map(|group| (group.key.as_str(), group))
+            .collect();
+        assert_eq!(
+            explain["account=work"].evidence_class,
+            AccountEvidenceClass::ExplicitLauncherOrHook
+        );
+        assert_eq!(
+            explain["account=work"].inherited_from,
+            vec!["fixture:parent-1".to_string()],
+            "an inherited row names the ancestor session"
+        );
+        let human = crate::presentation::render_spend_report_with_explain(
+            &report,
+            crate::presentation::ExplainMode::Summary,
+        );
+        assert!(
+            human.contains("fixture:parent-1"),
+            "human explain names the ancestor: {human}"
+        );
+        let json = crate::presentation::spend_json_with_explain(
+            &report,
+            crate::logging::RunId::new(now()),
+            crate::presentation::ExplainMode::Summary,
+        );
+        assert!(
+            json.contains("fixture:parent-1"),
+            "json explain names the ancestor"
+        );
+    }
+
+    /// A depth-2 subagent inherits through the chain to the first marked
+    /// ancestor (`aub-wvrw`): the middle session carries no markers itself.
+    #[test]
+    fn codex_depth_two_subagent_inherits_through_the_chain() {
+        use crate::store::session_account_marker::EvidenceDesignation;
+
+        let (_root, conn) = canonical_conn("subagent-depth-two");
+        seed_session(&conn, "grandparent");
+        seed_session_with_parent(&conn, "middle", Some("grandparent"));
+        seed_session_with_parent(&conn, "leaf", Some("middle"));
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_marker(
+            &conn,
+            "grandparent",
+            "work",
+            day + 1,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(&conn, "e1", day + 20, "leaf", "reported", &[("input", 7)]);
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(by_key["account=work"].usage.known().input().value(), 7);
+        let explain: BTreeMap<&str, &AccountGroupExplain> = report
+            .account_explain
+            .iter()
+            .map(|group| (group.key.as_str(), group))
+            .collect();
+        assert_eq!(
+            explain["account=work"].inherited_from,
+            vec!["fixture:grandparent".to_string()]
+        );
+    }
+
+    /// A subagent carrying a marker of its own is attributed by its own
+    /// marker, never by the parent's (`aub-wvrw`).
+    #[test]
+    fn codex_subagent_with_its_own_marker_never_consults_the_parent() {
+        use crate::store::session_account_marker::EvidenceDesignation;
+
+        let (_root, conn) = canonical_conn("subagent-own-marker");
+        seed_session(&conn, "parent-1");
+        seed_session_with_parent(&conn, "child-1", Some("parent-1"));
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_marker(
+            &conn,
+            "parent-1",
+            "parent-account",
+            day + 1,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_marker(
+            &conn,
+            "child-1",
+            "child-account",
+            day + 1,
+            EvidenceDesignation::ExplicitLauncherOrHook,
+        );
+        seed_canonical(
+            &conn,
+            "e1",
+            day + 20,
+            "child-1",
+            "reported",
+            &[("input", 5)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(
+            by_key["account=child-account"]
+                .usage
+                .known()
+                .input()
+                .value(),
+            5
+        );
+        assert!(!by_key.contains_key("account=parent-account"));
+        let explain: BTreeMap<&str, &AccountGroupExplain> = report
+            .account_explain
+            .iter()
+            .map(|group| (group.key.as_str(), group))
+            .collect();
+        assert!(
+            explain["account=child-account"].inherited_from.is_empty(),
+            "a direct attribution names no ancestor"
+        );
+    }
+
+    /// A subagent whose chain reaches no marked session, names an unknown
+    /// parent, or cycles stays in `unknown-account` (`aub-wvrw`).
+    #[test]
+    fn codex_subagent_without_a_marked_ancestor_stays_unknown() {
+        // No marked ancestor anywhere in the chain.
+        let (_root, conn) = canonical_conn("subagent-unmarked-chain");
+        seed_session(&conn, "lonely-parent");
+        seed_session_with_parent(&conn, "lonely-child", Some("lonely-parent"));
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical(
+            &conn,
+            "e1",
+            day + 20,
+            "lonely-child",
+            "reported",
+            &[("input", 5)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(
+            by_key["account=unknown-account"]
+                .usage
+                .known()
+                .input()
+                .value(),
+            5
+        );
+
+        // Unknown parent: the rollout names a session never ingested.
+        let (_root, conn) = canonical_conn("subagent-unknown-parent");
+        seed_session_with_parent(&conn, "orphan", Some("never-ingested"));
+        seed_canonical(&conn, "e2", day + 20, "orphan", "reported", &[("input", 3)]);
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(
+            by_key["account=unknown-account"]
+                .usage
+                .known()
+                .input()
+                .value(),
+            3
+        );
+
+        // Two unmarked sessions pointing at each other terminate unknown
+        // rather than looping.
+        let (_root, conn) = canonical_conn("subagent-true-cycle");
+        seed_session_with_parent(&conn, "loop-a", Some("loop-b"));
+        seed_session_with_parent(&conn, "loop-b", Some("loop-a"));
+        seed_canonical(
+            &conn,
+            "e3",
+            day + 20,
+            "loop-a",
+            "reported",
+            &[("input", 11)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(
+            by_key["account=unknown-account"]
+                .usage
+                .known()
+                .input()
+                .value(),
+            11,
+            "a cyclic parent chain terminates unknown"
+        );
     }
 
     /// The two new dimensions key off what the ledger already carries, and fall

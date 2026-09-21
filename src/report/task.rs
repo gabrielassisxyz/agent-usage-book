@@ -395,6 +395,7 @@ mod tests {
                 project_key: ProjectKey::new("project-a"),
                 repository_key: RepositoryKey::new("repository-a"),
                 working_directory: None,
+                parent_native_session_id: None,
                 run_id: run.map(crate::domain::ids::NativeRunId::new),
             },
         )

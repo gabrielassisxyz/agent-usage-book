@@ -1794,6 +1794,7 @@ mod tests {
                     crate::sessions::UNKNOWN_REPOSITORY,
                 ),
                 working_directory: None,
+                parent_native_session_id: None,
                 run_id: None,
             },
         )

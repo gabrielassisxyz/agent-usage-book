@@ -342,8 +342,8 @@ pub fn persist_ingest_batch(
             tx.execute(
                 "INSERT INTO session (
                     source, native_session_id, start, end, project_key, repository_key,
-                    working_directory, run_id
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                    working_directory, parent_native_session_id, run_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
                 ON CONFLICT (source, native_session_id) DO UPDATE SET
                     start = MIN(start, excluded.start),
                     end = CASE
@@ -351,7 +351,8 @@ pub fn persist_ingest_batch(
                         WHEN excluded.end IS NULL THEN end
                         ELSE MAX(end, excluded.end)
                     END,
-                    working_directory = COALESCE(working_directory, excluded.working_directory)",
+                    working_directory = COALESCE(working_directory, excluded.working_directory),
+                    parent_native_session_id = COALESCE(parent_native_session_id, excluded.parent_native_session_id)",
                 params![
                     session.source.as_str(),
                     session.native_session_id.as_str(),
@@ -360,6 +361,10 @@ pub fn persist_ingest_batch(
                     session.project_key.as_str(),
                     session.repository_key.as_str(),
                     session.working_directory,
+                    session
+                        .parent_native_session_id
+                        .as_ref()
+                        .map(|id| id.as_str()),
                     session.run_id.as_ref().map(|id| id.as_str()),
                 ],
             )
@@ -931,6 +936,7 @@ mod tests {
             project_key: crate::sessions::ProjectKey::new("p"),
             repository_key: crate::sessions::RepositoryKey::new("r"),
             working_directory: None,
+            parent_native_session_id: None,
             run_id: None,
         };
 

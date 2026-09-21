@@ -359,6 +359,7 @@ fn seed_session_with_directory(
             project_key: ProjectKey::new(UNKNOWN_PROJECT),
             repository_key: RepositoryKey::new(UNKNOWN_REPOSITORY),
             working_directory: directory.map(str::to_string),
+            parent_native_session_id: None,
             run_id: None,
         },
     )

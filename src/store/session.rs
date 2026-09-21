@@ -56,6 +56,7 @@ pub struct Session {
     project_key: ProjectKey,
     repository_key: RepositoryKey,
     working_directory: Option<String>,
+    parent_native_session_id: Option<NativeSessionId>,
     run_id: Option<NativeRunId>,
 }
 
@@ -95,6 +96,14 @@ impl Session {
         self.working_directory.as_deref()
     }
 
+    /// The Codex subagent parent thread this session's rollout names, when it
+    /// names one. Same-source native id: a subagent runs inside its parent's
+    /// process under the same credential, so attribution inherits the
+    /// parent's marker timeline (`aub-wvrw`).
+    pub fn parent_native_session_id(&self) -> Option<&NativeSessionId> {
+        self.parent_native_session_id.as_ref()
+    }
+
     pub fn run_id(&self) -> Option<&NativeRunId> {
         self.run_id.as_ref()
     }
@@ -110,6 +119,7 @@ pub struct NewSession {
     pub project_key: ProjectKey,
     pub repository_key: RepositoryKey,
     pub working_directory: Option<String>,
+    pub parent_native_session_id: Option<NativeSessionId>,
     pub run_id: Option<NativeRunId>,
 }
 
@@ -129,12 +139,13 @@ fn session_from_row(row: &Row<'_>) -> Result<Session, Error> {
         project_key: ProjectKey::new(get::<String>(row, 5)?),
         repository_key: RepositoryKey::new(get::<String>(row, 6)?),
         working_directory: get::<Option<String>>(row, 7)?,
-        run_id: get::<Option<String>>(row, 8)?.map(NativeRunId::new),
+        parent_native_session_id: get::<Option<String>>(row, 8)?.map(NativeSessionId::new),
+        run_id: get::<Option<String>>(row, 9)?.map(NativeRunId::new),
     })
 }
 
 const SESSION_COLUMNS: &str = "id, source, native_session_id, start, end, project_key, \
-     repository_key, working_directory, run_id";
+     repository_key, working_directory, parent_native_session_id, run_id";
 
 /// Inserts one session row. A duplicate (source, native session id) pair fails at
 /// the database rather than being silently merged.
@@ -143,8 +154,8 @@ pub fn insert_session(conn: &Connection, session: &NewSession) -> Result<Session
         .query_row(
             "INSERT INTO session (
                 source, native_session_id, start, end, project_key, repository_key,
-                working_directory, run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                working_directory, parent_native_session_id, run_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             RETURNING id",
             params![
                 session.source.as_str(),
@@ -154,6 +165,10 @@ pub fn insert_session(conn: &Connection, session: &NewSession) -> Result<Session
                 session.project_key.as_str(),
                 session.repository_key.as_str(),
                 session.working_directory,
+                session
+                    .parent_native_session_id
+                    .as_ref()
+                    .map(|id| id.as_str()),
                 session.run_id.as_ref().map(|id| id.as_str()),
             ],
             |row| row.get::<_, i64>(0),
@@ -179,8 +194,8 @@ pub fn replace_all_sessions(
         tx.execute(
             "INSERT INTO session (
                 source, native_session_id, start, end, project_key, repository_key,
-                working_directory, run_id
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                working_directory, parent_native_session_id, run_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 session.source.as_str(),
                 session.native_session_id.as_str(),
@@ -189,6 +204,10 @@ pub fn replace_all_sessions(
                 session.project_key.as_str(),
                 session.repository_key.as_str(),
                 session.working_directory,
+                session
+                    .parent_native_session_id
+                    .as_ref()
+                    .map(|id| id.as_str()),
                 session.run_id.as_ref().map(|id| id.as_str()),
             ],
         )
