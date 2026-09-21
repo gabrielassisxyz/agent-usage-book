@@ -569,6 +569,27 @@ impl WindowCalibration {
     }
 }
 
+/// The instant a calibration's configured review horizon passes (`aub-6omr`,
+/// PLAN.md 23.9): `fit_timestamp + review_after`, where `review_after` is the
+/// resolved `calibration.review_after` config value the caller passes in. A
+/// config key rather than a stored column, so one value covers every
+/// calibration and it changes without a migration. `valid_until` is the
+/// physical-world validity of the witness, not a review horizon, so it is not
+/// used here. Saturates rather than wraps on a horizon no clock will reach,
+/// following the timestamp-plus-duration precedent elsewhere in this tree.
+pub fn review_due_at(
+    calibration: &WindowCalibration,
+    review_after: MonotonicDuration,
+) -> UtcTimestamp {
+    let horizon_nanos = i64::try_from(review_after.as_nanos()).unwrap_or(i64::MAX);
+    UtcTimestamp::from_unix_nanos(
+        calibration
+            .fit_timestamp()
+            .unix_nanos()
+            .saturating_add(horizon_nanos),
+    )
+}
+
 /// One activation or supersession event on a calibration result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalibrationEventKind {
@@ -2841,5 +2862,29 @@ mod tests {
             CoefficientUncertainty::new(ppp(1_000), ppp(500)).is_err(),
             "an inverted uncertainty interval is rejected too"
         );
+    }
+
+    /// The review instant is the fit time plus the configured horizon
+    /// (`aub-6omr`): pinned at a known fit instant, with the planted negative
+    /// reading `valid_until` as the base instead.
+    #[test]
+    fn review_due_at_is_fit_timestamp_plus_the_configured_horizon() {
+        let cal = calibration("wc-review-due", interval(100, 300), 1_000, 900_000);
+        let horizon = MonotonicDuration::from_seconds(30 * 86_400);
+        assert_eq!(
+            review_due_at(&cal, horizon),
+            UtcTimestamp::from_unix_nanos(1_000 + 30 * 86_400 * 1_000_000_000)
+        );
+
+        // The planted negative: `valid_until` is the physical-world validity
+        // of the witness, not a review horizon, so basing the instant on it
+        // answers a different question and must not equal the pinned value.
+        let from_valid_until = UtcTimestamp::from_unix_nanos(
+            cal.validity()
+                .valid_until()
+                .unix_nanos()
+                .saturating_add(i64::try_from(horizon.as_nanos()).unwrap_or(i64::MAX)),
+        );
+        assert_ne!(review_due_at(&cal, horizon), from_valid_until);
     }
 }

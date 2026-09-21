@@ -24,9 +24,10 @@
 //! `environment`, `file`, `default`.
 //!
 //! Scope, stated rather than left implicit: the four scalar sections (`state`,
-//! `sampling`, `freshness`, `coverage`) plus the doctor review horizons
-//! (`backup.review_after`, `drill.max_age`, `adapter_semantics.max_comparison_age`, and
-//! `doctor.meter_anomaly_horizon`) go through the full four-level order and are
+//! `sampling`, `freshness`, `coverage`) plus the review horizons
+//! (`backup.review_after`, `drill.max_age`, `adapter_semantics.max_comparison_age`,
+//! `doctor.meter_anomaly_horizon`, and `calibration.review_after`) go through
+//! the full four-level order and are
 //! individually provenance-tracked, since those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
 //! `transcripts`, `tracker`, `layout` and `valuation.default_rate_book` are populated from the
@@ -462,6 +463,18 @@ pub struct AdapterSemanticsConfig {
     pub max_comparison_age: MonotonicDuration,
 }
 
+/// The review horizon for window calibrations (`aub-6omr`, PLAN.md 23.9), the
+/// same shape as [`BackupConfig`] and [`DrillConfig`] and for the same reason:
+/// `doctor` needs a configured threshold to turn the age of a calibration
+/// since its fit into a pass/review-due verdict. A config key rather than a
+/// column written at activation, so one value covers every calibration and it
+/// changes without a migration. Defaults to `30d`: a calibration older than
+/// that becomes `ReviewDue`.
+#[derive(Debug, Clone)]
+pub struct CalibrationConfig {
+    pub review_after: MonotonicDuration,
+}
+
 /// The thresholds `aub doctor` uses to distinguish current health from retained
 /// evidence. The 15-minute anomaly horizon spans several normal sampling cycles,
 /// so an ongoing detector fault remains visible while a corrected false-positive
@@ -667,6 +680,7 @@ pub struct Config {
     pub backup: BackupConfig,
     pub drill: DrillConfig,
     pub adapter_semantics: AdapterSemanticsConfig,
+    pub calibration: CalibrationConfig,
     pub doctor: DoctorConfig,
     pub export: ExportConfig,
     pub anthropic: AnthropicConfig,
@@ -702,6 +716,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "backup",
     "drill",
     "adapter_semantics",
+    "calibration",
     "doctor",
     "export",
     "anthropic",
@@ -764,6 +779,7 @@ const BACKUP_KEYS: &[&str] = &[
 ];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
+const CALIBRATION_KEYS: &[&str] = &["review_after"];
 const DOCTOR_KEYS: &[&str] = &["meter_anomaly_horizon"];
 const EXPORT_KEYS: &[&str] = &["clipboard_command"];
 const ANTHROPIC_KEYS: &[&str] = &["refresh", "statusline"];
@@ -985,6 +1001,9 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
         .and_then(toml::Value::as_table)
     {
         check_keys(t, ADAPTER_SEMANTICS_KEYS, "adapter_semantics", file_display)?;
+    }
+    if let Some(t) = table.get("calibration").and_then(toml::Value::as_table) {
+        check_keys(t, CALIBRATION_KEYS, "calibration", file_display)?;
     }
     if let Some(t) = table.get("doctor").and_then(toml::Value::as_table) {
         check_keys(t, DOCTOR_KEYS, "doctor", file_display)?;
@@ -1902,6 +1921,18 @@ pub fn resolve(
         )?,
     };
 
+    let calibration = CalibrationConfig {
+        review_after: resolve_duration(
+            "calibration.review_after",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "calibration", "review_after"),
+            Some("30d"),
+            &file_display,
+            &mut provenance,
+        )?,
+    };
+
     let doctor = DoctorConfig {
         meter_anomaly_horizon: resolve_duration(
             "doctor.meter_anomaly_horizon",
@@ -2195,6 +2226,7 @@ pub fn resolve(
             backup,
             drill,
             adapter_semantics,
+            calibration,
             doctor,
             export,
             anthropic,
@@ -2373,6 +2405,7 @@ impl Config {
             "adapter_semantics.max_comparison_age" => {
                 format_config_duration(self.adapter_semantics.max_comparison_age)
             }
+            "calibration.review_after" => format_config_duration(self.calibration.review_after),
             "doctor.meter_anomaly_horizon" => {
                 format_config_duration(self.doctor.meter_anomaly_horizon)
             }
@@ -3707,6 +3740,105 @@ provider = "codex"
         assert!(err.to_string().contains("doctor.nope"), "{err}");
     }
 
+    /// `calibration.review_after` (`aub-6omr`): the horizon a window
+    /// calibration stays current after it was fitted. Defaults to `30d` with
+    /// default provenance, and resolves from the file with file provenance.
+    #[test]
+    fn calibration_review_after_defaults_to_thirty_days() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert_eq!(
+            config.calibration.review_after,
+            MonotonicDuration::from_seconds(30 * 86_400)
+        );
+        assert_eq!(
+            provenance.get("calibration.review_after"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    /// The file value wins over the default, the environment wins over the
+    /// file, and the flag wins over everything below it: the full four-level
+    /// order, checked in both directions like every other duration key.
+    #[test]
+    fn calibration_review_after_resolves_from_file_environment_and_flag() {
+        let file = "[calibration]\nreview_after = \"14d\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(
+            config.calibration.review_after,
+            MonotonicDuration::from_seconds(14 * 86_400)
+        );
+        assert_eq!(
+            provenance.get("calibration.review_after"),
+            Some(ConfigSource::File)
+        );
+
+        let env = plain_env().set("AUB_CALIBRATION_REVIEW_AFTER", "7d");
+        let (config, provenance) = resolve_with(Overrides::new(), env, Some(file)).unwrap();
+        assert_eq!(
+            config.calibration.review_after,
+            MonotonicDuration::from_seconds(7 * 86_400)
+        );
+        assert_eq!(
+            provenance.get("calibration.review_after"),
+            Some(ConfigSource::Environment)
+        );
+
+        let overrides = Overrides::new().set("calibration.review_after", "1d");
+        let env = plain_env().set("AUB_CALIBRATION_REVIEW_AFTER", "7d");
+        let (config, provenance) = resolve_with(overrides, env, Some(file)).unwrap();
+        assert_eq!(
+            config.calibration.review_after,
+            MonotonicDuration::from_seconds(86_400)
+        );
+        assert_eq!(
+            provenance.get("calibration.review_after"),
+            Some(ConfigSource::Flag)
+        );
+    }
+
+    /// The near-miss spelling stays refused: `calibration.review-after` with
+    /// a hyphen is an unknown key, not a quiet default.
+    #[test]
+    fn calibration_review_after_with_a_hyphen_is_an_unknown_key() {
+        let file = "[calibration]\n\"review-after\" = \"30d\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            err.to_string().contains("calibration.review-after"),
+            "{err}"
+        );
+    }
+
+    /// A duration `backup.review_after` rejects is rejected here with the same
+    /// message shape: both keys parse through the same duration code, so only
+    /// the key name differs.
+    #[test]
+    fn calibration_review_after_rejects_what_backup_review_after_rejects() {
+        let backup_file = "[backup]\nreview_after = \"5w\"\n";
+        let backup_err =
+            resolve_with(Overrides::new(), plain_env(), Some(backup_file)).unwrap_err();
+        assert_eq!(backup_err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(
+            backup_err.to_string().contains("backup.review_after"),
+            "{backup_err}"
+        );
+
+        let file = "[calibration]\nreview_after = \"5w\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        let message = err.to_string();
+        assert!(message.contains("calibration.review_after"), "{message}");
+        let backup_suffix = backup_err
+            .to_string()
+            .strip_prefix("backup.review_after: ")
+            .unwrap()
+            .to_string();
+        let suffix = message
+            .strip_prefix("calibration.review_after: ")
+            .expect("the refusal names the key first, like the backup one");
+        assert_eq!(suffix, backup_suffix);
+    }
+
     #[test]
     fn the_can_run_policy_has_the_jsq_decided_defaults() {
         let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
@@ -4476,6 +4608,8 @@ backup.keep_weekly                    4                                        d
 backup.keep_yearly                    2                                        default
 backup.review_after                   36h                                      file
 backup.scheduled                      true                                     default
+
+calibration.review_after              30d                                      default
 
 can_run.ample_margin_multiple         2                                        default
 can_run.headroom_bound                low                                      default

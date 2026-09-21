@@ -300,6 +300,9 @@ without the section prefix (the full box for a two-account config):
 │    review_after             36h                                        file  │
 │    scheduled                true                                    default  │
 │                                                                              │
+│  calibration                                                                 │
+│    review_after             30d                                     default  │
+│                                                                              │
 │  can_run                                                                     │
 │    ample_margin_multiple    2                                       default  │
 │    headroom_bound           low                                     default  │
@@ -376,6 +379,11 @@ ones they did not. Values longer than the room to the source column end in
 source `default`, never a value that looks like it came from a file. It also
 never prints credential material, only the kind and reference (`file:<path>`,
 `env:<NAME>`, `none`) of the key that names one.
+
+`calibration.review_after` (default `30d`) sets how long a window calibration
+stays current after it was fitted: the review instant is the fit time plus
+this horizon, and a calibration past it becomes `ReviewDue` instead of
+`Current`. It takes the same duration syntax as `backup.review_after`.
 
 #### The sampling schedule, and why its defaults are what they are
 

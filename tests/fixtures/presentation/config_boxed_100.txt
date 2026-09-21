@@ -30,6 +30,9 @@
 │    review_after             36h                                                            file  │
 │    scheduled                true                                                        default  │
 │                                                                                                  │
+│  calibration                                                                                     │
+│    review_after             30d                                                         default  │
+│                                                                                                  │
 │  can_run                                                                                         │
 │    ample_margin_multiple    2                                                           default  │
 │    headroom_bound           low                                                         default  │
