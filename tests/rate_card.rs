@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use agent_usage_book::domain::rate_card::{
-    BillingBasis, CurrencyCode, RateCardDraft, ReviewDuePolicy, TokenClass,
+    BillingBasis, CurrencyCode, RateCardDraft, RateDenomination, ReviewDuePolicy, TokenClass,
 };
 use agent_usage_book::domain::time::{FakeClock, UtcDate, UtcTimestamp};
 use agent_usage_book::rate_book;
@@ -149,7 +149,8 @@ fn a_missing_publication_reference_is_recorded_as_missing() {
         model: "claude-fable-5".to_string(),
         token_class: TokenClass::Input,
         rate_micros: 10_000_000,
-        currency: CurrencyCode::Usd,
+        denomination: RateDenomination::Money(CurrencyCode::Usd),
+        window_estimate: None,
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-06-24").unwrap(),
         effective_end: None,
@@ -193,7 +194,8 @@ fn the_effective_book_is_the_one_true_today() {
         model: "claude-sonnet-5".to_string(),
         token_class: TokenClass::Input,
         rate_micros: 3_000_000,
-        currency: CurrencyCode::Usd,
+        denomination: RateDenomination::Money(CurrencyCode::Usd),
+        window_estimate: None,
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-08-31").unwrap(),
         effective_end: None,
@@ -269,7 +271,8 @@ fn two_fully_open_cards_do_not_duplicate_on_reimport() {
         model: "claude-fable-5".to_string(),
         token_class: TokenClass::Output,
         rate_micros: 50_000_000,
-        currency: CurrencyCode::Usd,
+        denomination: RateDenomination::Money(CurrencyCode::Usd),
+        window_estimate: None,
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-06-24").unwrap(),
         effective_end: None,
@@ -311,7 +314,8 @@ fn direct_update_and_delete_are_refused_by_the_table() {
         model: "claude-fable-5".to_string(),
         token_class: TokenClass::Input,
         rate_micros: 10_000_000,
-        currency: CurrencyCode::Usd,
+        denomination: RateDenomination::Money(CurrencyCode::Usd),
+        window_estimate: None,
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-06-24").unwrap(),
         effective_end: None,

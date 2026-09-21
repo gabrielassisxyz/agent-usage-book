@@ -2423,7 +2423,7 @@ fn golden_doctor_human_output_justified_state_and_omission_state() {
         residual: None,
     };
     let output_omitted = render_doctor_report(&report_omitted);
-    let expected_omitted = "Doctor: 1 checks\n  [N/A ] unexplained-residual: no eligible reconciliation intervals in recent window\nSummary: 0 passed, 0 failed, 0 warned, 1 not applicable, 0 not yet available";
+    let expected_omitted = "Doctor: 1 checks\n  [N/A ] unexplained-residual: no eligible reconciliation intervals in recent window\nSummary: 0 passed, 0 failed, 0 warned, 0 informational, 1 not applicable, 0 not yet available";
     assert_eq!(output_omitted, expected_omitted);
 
     // Justified case: eligible intervals exist and show discrepancy
@@ -2459,7 +2459,7 @@ fn golden_doctor_human_output_justified_state_and_omission_state() {
         residual: Some(health),
     };
     let output_justified = render_doctor_report(&report_justified);
-    let expected_justified = "Doctor: 1 checks\n  [FAIL] unexplained-residual: rolling residual discrepancy: interval [1000000 .. 3000000] credits; pattern: step change in residual: possible plan or provider accounting transition; pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable\nSummary: 0 passed, 1 failed, 0 warned, 0 not applicable, 0 not yet available\n\nDoctor: Rolling Residual Health\n  window: 30d (6 eligible intervals, minimum: 5)\n  residual interval: [1000000 .. 3000000] credits\n  residual fraction: +20.00%\n  verdict: discrepancy\n  pattern: step change in residual: possible plan or provider accounting transition\n  pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable";
+    let expected_justified = "Doctor: 1 checks\n  [FAIL] unexplained-residual: rolling residual discrepancy: interval [1000000 .. 3000000] credits; pattern: step change in residual: possible plan or provider accounting transition; pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable\nSummary: 0 passed, 1 failed, 0 warned, 0 informational, 0 not applicable, 0 not yet available\n\nDoctor: Rolling Residual Health\n  window: 30d (6 eligible intervals, minimum: 5)\n  residual interval: [1000000 .. 3000000] credits\n  residual fraction: +20.00%\n  verdict: discrepancy\n  pattern: step change in residual: possible plan or provider accounting transition\n  pointer: check calibration health (aub doctor missing-active-calibrations) to verify whether calibration has become inapplicable";
     assert_eq!(output_justified, expected_justified);
 }
 
@@ -3202,6 +3202,7 @@ fn human_and_versioned_json_results_agree_on_names_states_reasons_and_repairs() 
         let expected_reason = match &outcome.status {
             CheckStatus::Fail(reason)
             | CheckStatus::Warn(reason)
+            | CheckStatus::Info(reason)
             | CheckStatus::NotApplicable(reason)
             | CheckStatus::PassWithDetail(reason) => Some(reason.as_str()),
             CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => None,
@@ -3326,6 +3327,7 @@ fn doctor_reasons_never_carry_credential_values() {
             let reason = match &outcome.status {
                 CheckStatus::Fail(reason)
                 | CheckStatus::Warn(reason)
+                | CheckStatus::Info(reason)
                 | CheckStatus::NotApplicable(reason)
                 | CheckStatus::PassWithDetail(reason) => reason.as_str(),
                 CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => continue,
@@ -3371,6 +3373,7 @@ fn registry_reasons_contain_no_absolute_state_path() {
         let reason = match &outcome.status {
             CheckStatus::Fail(reason)
             | CheckStatus::Warn(reason)
+            | CheckStatus::Info(reason)
             | CheckStatus::NotApplicable(reason)
             | CheckStatus::PassWithDetail(reason) => reason.as_str(),
             CheckStatus::Pass | CheckStatus::NotYetAvailable { .. } => continue,

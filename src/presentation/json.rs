@@ -1104,9 +1104,35 @@ fn window_equivalent_json(result: &crate::report::WindowEquivalentDerivation) ->
         crate::report::WindowEquivalentDerivation::Available(value) => {
             let interval_json = interval_json(&value.interval);
             let interval = strip_braces(&interval_json);
+            // The two bases render different fields deliberately: a consumer
+            // that reads `calibration_id` gets nothing from an estimate, and a
+            // consumer that reads `basis.rate_card_ids` gets nothing from a
+            // calibration, so neither can be mistaken for the other by a
+            // reader that forgot to check `evidence_quality` (`aub-8vpc`).
+            let basis = match &value.basis {
+                crate::report::WindowEquivalentBasis::Calibration(id) => {
+                    format!("\"calibration_id\":{}", json_string(id.as_str()))
+                }
+                crate::report::WindowEquivalentBasis::RateCardEstimate { rate_card_ids } => {
+                    format!(
+                        "\"basis\":{{\"kind\":\"rate_card_estimate\",\"rate_card_ids\":[{}]}},\"methods\":[{}]",
+                        rate_card_ids
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        value
+                            .quality
+                            .methods()
+                            .iter()
+                            .map(|method| json_string(method.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                }
+            };
             format!(
-                "{{{interval},\"calibration_id\":{},\"coverage\":{},\"evidence_quality\":{},\"provenance\":{}}}",
-                json_string(value.calibration_id.as_str()),
+                "{{{interval},{basis},\"coverage\":{},\"evidence_quality\":{},\"provenance\":{}}}",
                 json_string(coverage_name(&value.coverage)),
                 json_string(quality_name(&value.quality)),
                 provenance_json(&value.provenance),
@@ -1865,6 +1891,7 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
             match &outcome.status {
                 crate::doctor::CheckStatus::Fail(reason)
                 | crate::doctor::CheckStatus::Warn(reason)
+                | crate::doctor::CheckStatus::Info(reason)
                 | crate::doctor::CheckStatus::NotApplicable(reason)
                 | crate::doctor::CheckStatus::PassWithDetail(reason) => {
                     fields.push_str(&format!(",\"reason\":{}", json_string(reason)));
@@ -1880,10 +1907,11 @@ pub fn doctor_report_json(report: &crate::doctor::DoctorReport, run: RunId) -> S
         .join(",");
 
     let mut body = format!(
-        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"warned\":{},\"not_applicable\":{},\"not_yet_available\":{}",
+        "\"check\":\"registry\",\"checks\":[{checks_json}],\"passed\":{},\"failed\":{},\"warned\":{},\"informational\":{},\"not_applicable\":{},\"not_yet_available\":{}",
         report.passed(),
         report.failed(),
         report.warned(),
+        report.informational(),
         report.not_applicable(),
         report.not_yet_available(),
     );
@@ -2008,11 +2036,29 @@ pub fn can_run_json_with_explain(
                         Some(ts) => json_string(&format_time_hh_mm(ts)),
                         None => "null".to_string(),
                     };
+                    // A calibrated window keeps the field it always had; an
+                    // estimated one carries `basis` and `evidence_quality`
+                    // instead, so neither can be read as the other by a
+                    // consumer that checks only one field (`aub-8vpc`).
+                    let basis = match &w.basis {
+                        crate::report::can_run::CanRunWindowBasis::Calibration(id) => {
+                            format!("\"calibration_id\":{}", json_string(id))
+                        }
+                        crate::report::can_run::CanRunWindowBasis::RateCardEstimate {
+                            rate_card_ids,
+                        } => format!(
+                            "\"basis\":{{\"kind\":\"rate_card_estimate\",\"rate_card_ids\":[{}]}},\"evidence_quality\":\"estimated\"",
+                            rate_card_ids
+                                .iter()
+                                .map(i64::to_string)
+                                .collect::<Vec<_>>()
+                                .join(",")
+                        ),
+                    };
                     format!(
-                        "{{\"semantic_key\":{},\"remaining_fraction_ppm\":{},\"calibration_id\":{},\"headroom\":{},\"resets_at\":{}}}",
+                        "{{\"semantic_key\":{},\"remaining_fraction_ppm\":{},{basis},\"headroom\":{},\"resets_at\":{}}}",
                         json_string(w.semantic_key.as_str()),
                         w.remaining_fraction_ppm,
-                        json_string(&w.calibration_id),
                         interval_json(&w.headroom),
                         resets_str
                     )
@@ -3217,6 +3263,7 @@ mod tests {
                 observed_age: Some(MonotonicDuration::from_seconds(41)),
             },
             window_calibrations: calibrations,
+            window_estimates: BTreeMap::new(),
             cost_model_missing_token_classes: Vec::new(),
             plan_tier_mismatch: None,
             task: TaskReferenceInput {
@@ -3256,6 +3303,56 @@ mod tests {
         assert!(headroom.get("lower").is_some(), "{value}");
         assert!(headroom.get("upper").is_some(), "{value}");
         assert!(value["provenance"]["sources"].is_array(), "{value}");
+        let calibrated_window = &value["outcome"]["windows"][0];
+        assert_eq!(calibrated_window["calibration_id"], "17");
+        assert!(calibrated_window.get("basis").is_none(), "{value}");
+        assert!(
+            !crate::presentation::render::render_can_run_report(&ready_report)
+                .contains("(estimated)")
+        );
+
+        // The same window backed by rate cards instead (`aub-8vpc`): the JSON
+        // names the cards and the evidence quality in place of the calibration
+        // id, and the headroom line ends in the label.
+        let mut estimated_inputs = inputs.clone();
+        let calibration = estimated_inputs
+            .window_calibrations
+            .remove(&WindowSemanticKey::new("account:5h"))
+            .expect("the account window was calibrated above");
+        estimated_inputs.window_estimates.insert(
+            WindowSemanticKey::new("account:5h"),
+            crate::report::can_run::WindowEstimate::Available(
+                crate::report::can_run::WindowEstimateLookup {
+                    rate_card_ids: vec![3, 4],
+                    constraint: calibration.constraint,
+                },
+            ),
+        );
+        let estimated_report = compose_can_run_report(estimated_inputs);
+        let estimated_json = can_run_json(&estimated_report, run.clone());
+        validate_can_run_report_json(&estimated_json)
+            .expect("estimated report validates its own contract");
+        let estimated: serde_json::Value =
+            serde_json::from_str(&estimated_json).expect("valid JSON expected");
+        let estimated_window = &estimated["outcome"]["windows"][0];
+        assert_eq!(estimated_window["evidence_quality"], "estimated");
+        assert_eq!(
+            estimated_window["basis"],
+            serde_json::json!({"kind": "rate_card_estimate", "rate_card_ids": [3, 4]})
+        );
+        assert!(
+            estimated_window.get("calibration_id").is_none(),
+            "{estimated}"
+        );
+        let estimated_text = crate::presentation::render::render_can_run_report(&estimated_report);
+        let headroom_line = estimated_text
+            .lines()
+            .find(|line| line.contains("account:5h") && line.contains("headroom"))
+            .unwrap_or_else(|| panic!("no headroom line: {estimated_text}"));
+        assert!(
+            headroom_line.trim_end().ends_with("credits (estimated)"),
+            "{headroom_line}"
+        );
 
         let mut stale_inputs = inputs;
         stale_inputs.meter = CanRunMeterReadiness::Stale {

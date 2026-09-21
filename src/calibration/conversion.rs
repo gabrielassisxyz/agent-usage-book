@@ -15,7 +15,7 @@ use crate::domain::provenance::CostModelId;
 use crate::domain::quota::PercentagePoints;
 use crate::domain::window::WindowSemanticKey;
 use crate::evidence::{Derivation, EstimatorId, EvidenceQuality, Provenance, RequiredFact};
-use crate::report::{WindowEquivalentDerivation, WindowEquivalentValue};
+use crate::report::{WindowEquivalentBasis, WindowEquivalentDerivation, WindowEquivalentValue};
 use crate::store::calibration::{PlanTier, WindowCalibration};
 use crate::store::cost_model::ProviderKey;
 
@@ -123,7 +123,7 @@ pub fn convert(
 
     WindowEquivalentDerivation::Available(WindowEquivalentValue {
         interval,
-        calibration_id: calibration.id().clone(),
+        basis: WindowEquivalentBasis::Calibration(calibration.id().clone()),
         coverage,
         quality,
         provenance,
@@ -324,8 +324,8 @@ mod tests {
         assert_eq!(value.interval.lower().get(), 100);
         assert_eq!(value.interval.upper().get(), 100);
         assert_eq!(
-            value.calibration_id,
-            WindowCalibrationId::new("calibration-v1")
+            value.basis,
+            WindowEquivalentBasis::Calibration(WindowCalibrationId::new("calibration-v1"))
         );
         assert_eq!(value.coverage, CoverageCompleteness::Complete);
         assert!(matches!(value.quality, EvidenceQuality::Estimated { .. }));
@@ -471,7 +471,7 @@ mod tests {
         let WindowEquivalentDerivation::Available(research) = research else {
             panic!("research stratum should use its applicable calibration")
         };
-        assert_ne!(work.calibration_id, research.calibration_id);
+        assert_ne!(work.basis, research.basis);
         assert_eq!(work.interval.lower().get(), 100);
         assert_eq!(research.interval.lower().get(), 50);
         assert_ne!(work.interval, research.interval);

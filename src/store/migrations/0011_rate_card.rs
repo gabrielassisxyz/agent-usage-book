@@ -96,7 +96,8 @@ pub fn migration() -> Migration {
 #[cfg(test)]
 mod tests {
     use crate::domain::rate_card::{
-        BillingBasis, CurrencyCode, Publication, RateCardDraft, ReviewDuePolicy, TokenClass,
+        BillingBasis, CurrencyCode, Publication, RateCardDraft, RateDenomination, ReviewDuePolicy,
+        TokenClass,
     };
     use crate::domain::time::{Clock, FakeClock, UtcDate, UtcTimestamp};
     use crate::store::connection::{AccessMode, PragmaPolicy};
@@ -153,7 +154,8 @@ mod tests {
             model: "claude-fable-5".to_string(),
             token_class: TokenClass::Input,
             rate_micros,
-            currency: CurrencyCode::Usd,
+            denomination: RateDenomination::Money(CurrencyCode::Usd),
+            window_estimate: None,
             billing_basis: BillingBasis::PerMillionTokens,
             effective_start: UtcDate::parse("2026-06-24").unwrap(),
             effective_end: None,

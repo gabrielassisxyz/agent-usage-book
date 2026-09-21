@@ -178,7 +178,7 @@ case_steps() {
 case_assertions() {
     # Step 1: doctor reports, it does not gate: exit success with failures.
     assert_exit 0 1
-    assert_stdout_contains 1 "Doctor: 26 checks"
+    assert_stdout_contains 1 "Doctor: 27 checks"
     assert_stdout_contains 1 "[PASS] configuration-validity"
     assert_stdout_contains 1 "[PASS] sqlite-and-schema-health"
     assert_stdout_contains 1 "[PASS] strict-and-constraint-integrity"
@@ -218,12 +218,15 @@ case_assertions() {
     assert_stdout_contains 1 "[WARN] cost-model-active"
     assert_stdout_contains 1 'run `aub cost-model activate anthropic-claude-messages-v1`'
     assert_stdout_contains 1 "[repairable with --fix]"
+    # The one rate card here is a money card, so no estimate stands in for a
+    # calibration and the informational line stays silent.
+    assert_stdout_contains 1 "[PASS] window-estimate-in-use"
 
     # Step 2: the versioned JSON carries every expected check name.
     assert_exit 0 2
     assert_json_field 2 "command" "doctor"
     assert_json_field 2 "schema" "5"
-    for name in configuration-validity sqlite-and-schema-health strict-and-constraint-integrity pending-evidence sampling-cadence unresolved-authentication transcript-roots parser-failures unmapped-accounts missing-active-calibrations stale-rate-cards projection-versus-database-generation backup-age meter-anomalies unexplained-residual heuristic-dedup-counts clock-skew local-filesystem-and-wal-suitability accumulated-diagnostic-material adapter-semantics-comparison-age last-sample-tick sampling-failure-counts meter-error-classifications subscription-identity-change cost-model-active; do
+    for name in configuration-validity sqlite-and-schema-health strict-and-constraint-integrity pending-evidence sampling-cadence unresolved-authentication transcript-roots parser-failures unmapped-accounts missing-active-calibrations stale-rate-cards projection-versus-database-generation backup-age meter-anomalies unexplained-residual heuristic-dedup-counts clock-skew local-filesystem-and-wal-suitability accumulated-diagnostic-material adapter-semantics-comparison-age last-sample-tick sampling-failure-counts meter-error-classifications subscription-identity-change cost-model-active window-estimate-in-use; do
         assert_stdout_contains 2 "\"name\":\"$name\""
     done
     assert_stdout_contains 2 '"name":"unmapped-accounts","status":"fail"'

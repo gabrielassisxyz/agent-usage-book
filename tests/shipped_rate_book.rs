@@ -324,14 +324,15 @@ fn parse_cards(text: &str) -> RateBook {
 /// book, so a parsed fixture can never exhibit the overlap this check owns.
 fn draft_with_schedule(schedule: Option<Schedule>) -> RateCardDraft {
     use agent_usage_book::domain::rate_card::{
-        BillingBasis, CurrencyCode, Publication, ReviewDuePolicy,
+        BillingBasis, CurrencyCode, Publication, RateDenomination, ReviewDuePolicy,
     };
     RateCardDraft {
         vendor: "ollama".to_string(),
         model: "deepseek-v4-flash".to_string(),
         token_class: TokenClass::Input,
         rate_micros: 440_000,
-        currency: CurrencyCode::Usd,
+        denomination: RateDenomination::Money(CurrencyCode::Usd),
+        window_estimate: None,
         billing_basis: BillingBasis::PerMillionTokens,
         effective_start: UtcDate::parse("2026-09-07").unwrap(),
         effective_end: None,

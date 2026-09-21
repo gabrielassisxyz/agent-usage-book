@@ -38,7 +38,7 @@ use super::quota::PercentagePoints;
 /// Rounds `numerator / denominator` to the nearest integer, ties away from zero. The
 /// same policy `Money` uses, applied at the one place division happens in this module:
 /// `CreditsPerToken::times_tokens`'s division by one million.
-fn round_div(numerator: i128, denominator: i128) -> i128 {
+pub(crate) fn round_div(numerator: i128, denominator: i128) -> i128 {
     let quotient = numerator / denominator;
     let remainder = numerator % denominator;
     if remainder.abs() * 2 >= denominator {
