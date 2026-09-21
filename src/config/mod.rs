@@ -426,6 +426,13 @@ pub struct BackupConfig {
     pub keep_weekly: usize,
     pub keep_monthly: usize,
     pub keep_yearly: usize,
+    /// Whether the scheduled invocation (`aub backup --scheduled`, the form
+    /// the shipped timer and cron entry call) performs a backup (aub-7xmr).
+    /// Default true, so a fresh machine's schedule protects it without
+    /// setup. Setting it false turns the scheduled run into a no-op that
+    /// names this key and exits zero, without touching the installed unit.
+    /// A manual `aub backup` never reads this key.
+    pub scheduled: bool,
 }
 
 /// The periodic restore drill's own review policy, the same shape as
@@ -753,6 +760,7 @@ const BACKUP_KEYS: &[&str] = &[
     "keep_weekly",
     "keep_monthly",
     "keep_yearly",
+    "scheduled",
 ];
 const DRILL_KEYS: &[&str] = &["max_age", "result"];
 const ADAPTER_SEMANTICS_KEYS: &[&str] = &["max_comparison_age"];
@@ -1848,6 +1856,15 @@ pub fn resolve(
             &file_display,
             &mut provenance,
         )?,
+        scheduled: resolve_bool(
+            "backup.scheduled",
+            overrides,
+            env,
+            file_raw(file.as_ref(), "backup", "scheduled"),
+            Some("true"),
+            &file_display,
+            &mut provenance,
+        )?,
     };
 
     let drill_result = file
@@ -2350,6 +2367,7 @@ impl Config {
             "backup.keep_weekly" => self.backup.keep_weekly.to_string(),
             "backup.keep_monthly" => self.backup.keep_monthly.to_string(),
             "backup.keep_yearly" => self.backup.keep_yearly.to_string(),
+            "backup.scheduled" => self.backup.scheduled.to_string(),
             "drill.max_age" => format_config_duration(self.drill.max_age),
             "drill.result" => self.drill.result.as_ref()?.display().to_string(),
             "adapter_semantics.max_comparison_age" => {
@@ -3760,6 +3778,46 @@ provider = "codex"
         assert!(err.to_string().contains("can_run.nope"), "{err}");
     }
 
+    /// `backup.scheduled` defaults to true, so a fresh machine's timer
+    /// protects it without setup (aub-7xmr). The planted negative is a
+    /// default of false, which would ship the schedule disabled.
+    #[test]
+    fn backup_scheduled_defaults_to_true() {
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
+        assert!(config.backup.scheduled);
+        assert_eq!(
+            provenance.get("backup.scheduled"),
+            Some(ConfigSource::Default)
+        );
+    }
+
+    /// An explicit `backup.scheduled = false` resolves and carries file
+    /// provenance, which is what the scheduled run reads to stand down.
+    #[test]
+    fn backup_scheduled_is_set_from_the_file() {
+        let file = "[backup]\nscheduled = false\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert!(!config.backup.scheduled);
+        assert_eq!(provenance.get("backup.scheduled"), Some(ConfigSource::File));
+    }
+
+    /// The near-miss spelling stays refused: `backup.schedule` without the
+    /// trailing `d` is an unknown key, not a quiet default-true.
+    #[test]
+    fn backup_schedule_without_the_d_is_still_an_unknown_key() {
+        let file = "[backup]\nschedule = false\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert!(err.to_string().contains("backup.schedule"), "{err}");
+    }
+
+    #[test]
+    fn a_non_boolean_backup_scheduled_is_a_usage_error() {
+        let file = "[backup]\nscheduled = \"yes\"\n";
+        let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
+        assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
+        assert!(err.to_string().contains("backup.scheduled"), "{err}");
+    }
+
     #[test]
     fn account_exclusivity_policy_accepted_spellings() {
         let file = r#"
@@ -4417,6 +4475,7 @@ backup.keep_monthly                   6                                        d
 backup.keep_weekly                    4                                        default
 backup.keep_yearly                    2                                        default
 backup.review_after                   36h                                      file
+backup.scheduled                      true                                     default
 
 can_run.ample_margin_multiple         2                                        default
 can_run.headroom_bound                low                                      default

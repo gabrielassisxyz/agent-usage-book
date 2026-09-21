@@ -845,9 +845,9 @@ impl Command {
                 "--today (default) | --yesterday | --since YYYY-MM-DD | --until YYYY-MM-DD | --days N | --group-by day|session|project|repository|harness|model|task|account (repeatable) | filters (repeatable, OR-ed): --harness --account --project --repo --task --model --session NAME | --credits | --window-equivalent WINDOW (implies --credits) | --refresh auto|never|force | --value api-list",
             ),
             Command::Config => Some("--set key=value (repeatable), --config-file PATH"),
-            Command::Backup => {
-                Some("[DESTINATION] | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]")
-            }
+            Command::Backup => Some(
+                "[--scheduled] [DESTINATION] | verify DESTINATION | restore ARCHIVE DEST [--surviving DIR]",
+            ),
             Command::Ingest => Some("transcripts [--source NAME] [--changed-only]"),
             Command::Rebuild => Some("transcripts | attribution"),
             Command::Export => Some(
@@ -5992,10 +5992,18 @@ fn render_rate_card(card: &crate::domain::rate_card::RateCard) -> String {
 /// configuration); `aub backup verify DEST` clears and recomputes the
 /// verification result of one archive; `aub backup restore ARCHIVE DEST
 /// [--surviving DIR]` is the recovery path (`aub-sth.13`, docs/recovery.md).
+/// `aub backup --scheduled` is the form the shipped timer and cron entry call
+/// (aub-7xmr): it honours `backup.scheduled` and treats a missing destination
+/// as not configured rather than as a usage error, so a fresh installation
+/// does not alarm daily for a feature it never set up.
 /// The archive module owns the cut and verification protocol, while this layer
 /// only resolves configuration and renders the typed summary.
 fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
-    match invocation.rest.as_slice() {
+    let args = parse_backup_args(&invocation.rest)?;
+    if args.scheduled {
+        return scheduled_backup_command(clock, &args.positional);
+    }
+    match args.positional.as_slice() {
         [subcommand, rest @ ..] if subcommand == "restore" => {
             return restore_command(clock, rest);
         }
@@ -6019,6 +6027,75 @@ fn backup_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Err
             )));
         }
     }
+    Ok(())
+}
+
+/// What `aub backup` was asked to do once `--scheduled` is split out: the
+/// flag itself, and the remaining positional arguments in order. Split out so
+/// the flag handling is unit-testable without a state directory on disk.
+#[derive(Debug)]
+struct BackupArgs {
+    scheduled: bool,
+    positional: Vec<String>,
+}
+
+/// Splits `--scheduled` out of a backup invocation's trailing arguments.
+/// `--scheduled` only creates an archive, so combining it with `verify` or
+/// `restore` is refused rather than silently ignored.
+fn parse_backup_args(rest: &[String]) -> Result<BackupArgs, Error> {
+    let mut scheduled = false;
+    let mut positional = Vec::with_capacity(rest.len());
+    for arg in rest {
+        if arg == "--scheduled" {
+            scheduled = true;
+        } else {
+            positional.push(arg.clone());
+        }
+    }
+    if scheduled
+        && positional
+            .first()
+            .is_some_and(|first| first == "verify" || first == "restore")
+    {
+        return Err(Error::Usage(
+            "backup --scheduled creates an archive; it does not apply to `verify` or `restore`"
+                .into(),
+        ));
+    }
+    Ok(BackupArgs {
+        scheduled,
+        positional,
+    })
+}
+
+/// The scheduled backup run (aub-7xmr): with `backup.scheduled = false` it
+/// prints one line naming the key and exits zero without writing; with no
+/// destination configured (neither an explicit argument nor
+/// `backup.destination`) it prints one line saying backups are not configured
+/// and exits zero. Every other failure keeps its existing exit class, so the
+/// unit's `OnFailure=` hook fires exactly as it does for a manual run.
+fn scheduled_backup_command(clock: &impl Clock, positional: &[String]) -> Result<(), Error> {
+    let config = resolve_backup_config()?;
+    if !config.backup.scheduled {
+        println!("backup: scheduled run disabled by backup.scheduled=false; no archive written");
+        return Ok(());
+    }
+    let destination = match positional {
+        [] => config.backup.destination.clone(),
+        [destination] => Some(std::path::Path::new(destination).to_path_buf()),
+        rest => {
+            return Err(Error::Usage(format!(
+                "backup requires [DEST], `verify DEST` or `restore ARCHIVE DEST`, got {rest:?}"
+            )));
+        }
+    };
+    let Some(destination) = destination else {
+        println!(
+            "backup: backups are not configured (no backup.destination); scheduled run does nothing"
+        );
+        return Ok(());
+    };
+    create_backup_archive(clock, &destination)?;
     Ok(())
 }
 
@@ -10057,6 +10134,41 @@ mod tests {
             backup_resolve_destination(None, &bare).is_err(),
             "with neither an argument nor a configured destination the command must refuse"
         );
+    }
+
+    /// `--scheduled` is stripped from the positionals and reported as a flag
+    /// (aub-7xmr): the scheduled path sees the same destination arguments a
+    /// manual run would. The planted negative is a parser that leaves the
+    /// flag in the positionals, which would then be treated as a destination
+    /// path.
+    #[test]
+    fn backup_scheduled_flag_is_parsed_out_of_the_positionals() {
+        let args = parse_backup_args(&["--scheduled".to_string()]).unwrap();
+        assert!(args.scheduled);
+        assert!(args.positional.is_empty());
+        let args = parse_backup_args(&["--scheduled".to_string(), "/tmp/x".to_string()]).unwrap();
+        assert!(args.scheduled);
+        assert_eq!(args.positional, vec!["/tmp/x".to_string()]);
+        let args = parse_backup_args(&["/tmp/x".to_string()]).unwrap();
+        assert!(!args.scheduled);
+        assert_eq!(args.positional, vec!["/tmp/x".to_string()]);
+    }
+
+    /// `--scheduled` only creates an archive: combining it with `verify` or
+    /// `restore` is a usage error naming the flag, never a silently ignored
+    /// option on a different subcommand.
+    #[test]
+    fn backup_scheduled_with_verify_or_restore_is_a_usage_error() {
+        for rest in [
+            vec!["verify"],
+            vec!["verify", "/tmp/x"],
+            vec!["restore", "/tmp/a", "/tmp/b"],
+        ] {
+            let mut full = vec!["--scheduled".to_string()];
+            full.extend(rest.iter().map(|s| s.to_string()));
+            let err = parse_backup_args(&full).unwrap_err();
+            assert!(err.to_string().contains("--scheduled"), "{err}");
+        }
     }
 
     /// `aub sample` opens its ledger with the configured `sampling.request_timeout`,

@@ -28,6 +28,7 @@
 │    keep_weekly              4                                                           default  │
 │    keep_yearly              2                                                           default  │
 │    review_after             36h                                                            file  │
+│    scheduled                true                                                        default  │
 │                                                                                                  │
 │  can_run                                                                                         │
 │    ample_margin_multiple    2                                                           default  │
