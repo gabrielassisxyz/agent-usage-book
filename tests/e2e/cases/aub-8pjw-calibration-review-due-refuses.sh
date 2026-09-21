@@ -174,6 +174,14 @@ httpd.serve_forever()
         fi
     done
     PORT=$(cat "$STATE_DIR/port.txt")
+
+    # A spend row whose window-equivalent figure the table wrapped across two
+    # detail lines, for the absence check to prove it still sees one.
+    printf '%s\n' \
+        '│  work-primary     1,000 tokens                     │' \
+        '│    window equivalent                               │' \
+        '│    [1.2030, 1.2030] percentage points (estimated)  │' \
+        > "$STATE_DIR/wrapped-figure.txt"
 }
 
 # The review horizon every aub step runs under: the configured default until
@@ -205,6 +213,11 @@ text_absent_from_joined_lines() {
         END { print joined }
     ' "$file")"
     [[ "$joined" != *"$text"* ]]
+}
+
+# The inverse, for the step that proves the absence check sees a wrapped figure.
+text_present_in_joined_lines() {
+    ! text_absent_from_joined_lines "$@"
 }
 
 # A step that passes only when TEXT is absent from an earlier step's stdout:
@@ -302,6 +315,12 @@ case_steps() {
         --window-equivalent five_hour --refresh never --format json
     step "spend-review-due-json-withholds-figures" spend_json_withholds_review_due_figures \
         "$(step_dir 22)/stdout.bin"
+
+    # 24. The absence check reads wrapped table lines as one: it finds the
+    #     figure in a row the table split mid-phrase, so no absence above
+    #     passes for a figure that merely wrapped.
+    step "absence-check-sees-a-wrapped-figure" text_present_in_joined_lines \
+        "window equivalent [" "$STATE_DIR/wrapped-figure.txt"
 }
 
 case_assertions() {
@@ -341,4 +360,5 @@ case_assertions() {
     assert_exit 6 22
     assert_stdout_contains 22 "calibration health is review_due"
     assert_exit 0 23
+    assert_exit 0 24
 }

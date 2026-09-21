@@ -1352,6 +1352,14 @@ mod tests {
             compute_health(&current_inputs, ts(600)),
             crate::calibration::health::CalibrationHealth::Current
         );
+        let review_due_at = current_inputs
+            .review_due_at
+            .expect("the review instant is derived");
+        assert_eq!(
+            compute_health(&current_inputs, review_due_at),
+            crate::calibration::health::CalibrationHealth::ReviewDue,
+            "activation does not exempt a calibration from its review horizon"
+        );
     }
 
     /// The lifecycle event records who activated, when, under which policy
