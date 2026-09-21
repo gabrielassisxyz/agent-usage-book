@@ -5,6 +5,23 @@
 //! difference in `[-1_000_000, 1_000_000]`. `QuotaUsed` and `QuotaRemaining` are
 //! distinct despite sharing a display unit, because they are complements and mixing
 //! them inverts a decision without changing the shape of anything.
+//!
+//! **A quota level is deliberately dimensionless, and a provider that states its
+//! window in currency does not change that (`aub-4z5c`, decided 2026-09-20).**
+//! The OpenCode console reports `usedMicroCents` and `limitMicroCents`, so its
+//! adapter divides them into a fraction here and carries neither integer into the
+//! domain. That is not an oversight to be fixed by adding a money field.
+//!
+//! Three reasons, in the order they decided it. No consumer asks a meter for
+//! money: `aub spend` values tokens against a rate card, credits come from a cost
+//! model, and calibration fits `CreditsPerPercentagePoint` from quota movement.
+//! One provider of five states a currency at all, so a field carrying it would be
+//! absent from four fifths of every reading while offering a second way to ask a
+//! window what it cost, which is the ambiguity invariant 18 exists to prevent.
+//! And nothing is lost by waiting: the evidence capsule retains the provider's own
+//! micro-cent strings verbatim, and `MeterResponseEvidence` is an irreplaceable
+//! class retained forever, so the day a consumer appears the series can be rebuilt
+//! from evidence rather than re-measured.
 
 use std::ops::{Add, Mul, Sub};
 
