@@ -1184,8 +1184,9 @@ const FIRST_BURST_BLOCK_AT: i64 = 1_060 * SECOND;
 /// Two readings of a third account's window around the joint burst's first
 /// block, moved by exactly that block's movement under the fixture's truth:
 /// the held-out series a per-kind result is validated against. Seeds the
-/// cost model in force at `begin` too.
-fn seed_joint_holdout_readings(state: &StateDir, fixture: &ArmFixture) {
+/// cost model in force at `begin` too. `unexplained_ppm` is movement added to
+/// the second reading that no token explains.
+fn seed_joint_holdout_readings(state: &StateDir, fixture: &ArmFixture, unexplained_ppm: i64) {
     let first_block_ppm: f64 = fixture.blocks[0]
         .counts
         .iter()
@@ -1214,7 +1215,7 @@ fn seed_joint_holdout_readings(state: &StateDir, fixture: &ArmFixture) {
         &conn,
         &holdout,
         FIRST_BURST_BLOCK_AT + 23 * SECOND,
-        BASELINE_PPM + first_block_ppm.round() as i64,
+        BASELINE_PPM + first_block_ppm.round() as i64 + unexplained_ppm,
     );
 }
 
@@ -1240,7 +1241,7 @@ fn a_joint_candidate_is_promoted_to_a_per_kind_result_and_activated() {
     let state = StateDir::new();
     let fixture = parse_fixture(INDEPENDENT_ARMS);
     seed_burst(&state, &fixture, TokenKind::ALL.to_vec());
-    seed_joint_holdout_readings(&state, &fixture);
+    seed_joint_holdout_readings(&state, &fixture, 0);
     let fit = fit_json(&state);
     let candidate_id = fit["candidate_id"].as_str().unwrap().to_string();
 
@@ -1391,6 +1392,75 @@ fn a_joint_candidate_is_promoted_to_a_per_kind_result_and_activated() {
     assert_eq!(active["is_active"], true);
     assert_eq!(active["health"], "current");
     assert_eq!(show["entries"], serde_json::json!([]));
+}
+
+/// The planted negative of the promotion test: the same burst, the same
+/// holdout readings, but the holdout moved 40,000 ppm more than the tokens
+/// between them explain. The held-out residual records that miss rather than
+/// the fit's own residual, and activation under the default one-point bound
+/// refuses it naming the residual and the bound, writing nothing.
+#[test]
+fn a_held_out_series_the_coefficients_miss_is_recorded_and_refused_at_activation() {
+    let state = StateDir::new();
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    seed_burst(&state, &fixture, TokenKind::ALL.to_vec());
+    seed_joint_holdout_readings(&state, &fixture, 40_000);
+    let fit = fit_json(&state);
+    let candidate_id = fit["candidate_id"].as_str().unwrap().to_string();
+    let conn = open_test_ledger(&state);
+    let training = evidence_of_account(&conn, ACCOUNT);
+    let validation = evidence_of_account(&conn, "holdout");
+
+    let promote = run_aub_ok(
+        &state,
+        &[
+            "calibrate",
+            "promote",
+            &candidate_id,
+            "--training",
+            &training,
+            "--validation",
+            &validation,
+            "--format",
+            "json",
+        ],
+    );
+    let held_out: i64 = promote["held_out_residual"]["value"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    assert!(
+        (38_000..42_000).contains(&held_out),
+        "the residual is the holdout's unexplained movement: {held_out}"
+    );
+
+    let result_id = format!("promoted-{candidate_id}");
+    let refused = run_aub(
+        &state,
+        &[
+            "calibrate",
+            "activate",
+            &result_id,
+            "--training",
+            &training,
+            "--validation",
+            &validation,
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&refused.stderr).into_owned();
+    assert_ne!(refused.status.code(), Some(0), "{stderr}");
+    assert!(
+        stderr.contains(&held_out.to_string()) && stderr.contains("10000"),
+        "the refusal names the residual and the bound: {stderr}"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM calibration_multivariate_lifecycle"
+        ),
+        0
+    );
 }
 
 fn fit_json(state: &StateDir) -> serde_json::Value {
