@@ -34,8 +34,8 @@ use agent_usage_book::domain::credits::Credits;
 use agent_usage_book::domain::freshness::{Freshness, Observed};
 use agent_usage_book::domain::interval::Interval;
 use agent_usage_book::domain::provenance::{
-    canonical_inputs_hash, CostModelId, DerivationId, EvidenceId, ProvenanceManifest,
-    QuerySemantics, WindowCalibrationId, WitnessId,
+    CostModelId, DerivationId, EvidenceId, ProvenanceManifest, QuerySemantics, WindowCalibrationId,
+    WitnessId, canonical_inputs_hash,
 };
 use agent_usage_book::domain::quota::{PercentagePoints, QuotaFractionPpm, QuotaRemaining};
 use agent_usage_book::domain::time::{MeasurementBasis, ReceivedAt, UtcDate, UtcTimestamp};
