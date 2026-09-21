@@ -606,3 +606,384 @@ fn row_id_of_multivariate(conn: &Connection, id: &WindowCalibrationId) -> Result
     )
     .map_err(|e| Error::Store(format!("cannot resolve calibration '{}': {e}", id.as_str())))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::calibration::activation::{ActivationActor, ActivationPolicy};
+    use crate::calibration::contamination::{ContaminationThresholds, ContaminationVerdict};
+    use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
+    use crate::domain::ids::{BillingSemanticsId, MeterSemanticsId};
+    use crate::domain::provenance::{CostModelId, EvidenceId};
+    use crate::domain::quota::QuotaUsed;
+    use crate::domain::time::MonotonicDuration;
+    use crate::domain::window::ReportedResolution;
+    use crate::store::calibration::{
+        activate, insert_experiment, insert_result, is_superseded, lifecycle_event_count,
+        load_active_at, minimal_experiment, minimal_fixture,
+    };
+    use crate::store::calibration_controlled::{ControlledExperimentRun, insert_begin};
+    use crate::store::calibration_multivariate::{
+        MultivariateCandidate, insert_multivariate_candidate,
+    };
+    use crate::store::connection::PragmaPolicy;
+    use crate::store::meter_evidence::ObservationRowId;
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    struct Scratch(PathBuf);
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn ts(nanos: i64) -> UtcTimestamp {
+        UtcTimestamp::from_unix_nanos(nanos)
+    }
+
+    fn scope() -> CalibrationScope {
+        CalibrationScope {
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("pro"),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+        }
+    }
+
+    fn evidence(tag: &str) -> BTreeSet<EvidenceId> {
+        [EvidenceId::new(tag)].into_iter().collect()
+    }
+
+    fn coefficient(kind: TokenKind, estimate: i64) -> StoredKindCoefficient {
+        StoredKindCoefficient {
+            kind,
+            estimate_micro_ppm_per_token: estimate,
+            std_error_micro_ppm_per_token: 1_000,
+            interval_low_micro_ppm_per_token: estimate - 2_000,
+            interval_high_micro_ppm_per_token: estimate + 2_000,
+        }
+    }
+
+    /// A migrated ledger holding one ended controlled run, its joint
+    /// candidate `mvcand-1`, and one promoted-but-inactive scalar result
+    /// `scalar-1` in the same scope.
+    fn ledger() -> (Scratch, Connection) {
+        let dir = std::env::temp_dir().join(format!(
+            "aub-per-kind-result-test-{}-{}",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let mut conn = crate::store::test_schema::open_migrated(
+            &dir.join("ledger.db"),
+            &PragmaPolicy {
+                busy_timeout: MonotonicDuration::from_millis(1_000),
+            },
+        );
+        crate::store::calibrate_cli_test_ledger::insert_calibrate_cli_meter_chain(
+            &conn,
+            "acct",
+            "five_hour",
+            ts(1_000),
+            10_000,
+        );
+        let baseline: i64 = conn
+            .query_row("SELECT id FROM meter_observation LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        let resolution = QuotaFractionPpm::new(10_000).unwrap();
+        let run = ControlledExperimentRun {
+            id: ControlledExperimentId::new("exp-joint"),
+            account: "acct".to_string(),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("pro"),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+            cost_model_id: CostModelId::new("cm"),
+            expected_token_kinds: vec![TokenKind::Input, TokenKind::Output],
+            baseline_observation_id: ObservationRowId::new(baseline),
+            baseline_quota_used: QuotaUsed::new(resolution),
+            baseline_resolution: ReportedResolution::new(resolution).unwrap(),
+            baseline_observed_at: ts(1_000),
+            baseline_plateau_started_at: ts(1_000),
+            contamination_thresholds: ContaminationThresholds::conservative_default(),
+            started_at: ts(1_000),
+            ended_at: None,
+            exclusivity_assertion: "reserved".to_string(),
+        };
+        insert_begin(&conn, &run).unwrap();
+        let validity = ValidityInterval::new(ts(1_000), ts(2_000)).unwrap();
+        insert_multivariate_candidate(
+            &mut conn,
+            &MultivariateCandidate {
+                id: MultivariateCandidateId::new("mvcand-1"),
+                experiment: run.id.clone(),
+                provider: run.provider.clone(),
+                plan_tier: run.plan_tier.clone(),
+                window_semantic_key: run.window_semantic_key.clone(),
+                coefficients: vec![
+                    coefficient(TokenKind::Input, 500_000),
+                    coefficient(TokenKind::Output, 1_000_000),
+                ],
+                condition_number: ConditionNumber::from_micros(4_000_000),
+                condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+                fit_residual_ppm: 120,
+                sample_count: 8,
+                inputs: EvidenceDigest::from_inputs(&evidence("training")),
+                statistical_method: "ols".to_string(),
+                statistical_parameters: "{}".to_string(),
+                phase_design: "design".to_string(),
+                validity,
+                knowledge_time: ts(2_000),
+            },
+        )
+        .unwrap();
+
+        let meter = MeterSemanticsId::new("meter-v1");
+        let billing = BillingSemanticsId::new("billing-v1");
+        insert_experiment(
+            &conn,
+            &minimal_experiment(
+                "exp-scalar",
+                &scope(),
+                &meter,
+                &billing,
+                validity,
+                ts(2_000),
+            ),
+        )
+        .unwrap();
+        let scalar = minimal_fixture(
+            "scalar-1",
+            &scope(),
+            &meter,
+            &billing,
+            &CostModelId::new("cm-v1"),
+            CreditsPerPercentagePoint::from_micros_per_point(100_000),
+            validity,
+            ts(2_000),
+        );
+        insert_result(
+            &mut conn,
+            &scalar,
+            &[crate::store::calibration::ExperimentId::new("exp-scalar")],
+        )
+        .unwrap();
+        (Scratch(dir), conn)
+    }
+
+    fn per_kind(id: &str) -> MultivariateCalibration {
+        MultivariateCalibration {
+            id: WindowCalibrationId::new(id),
+            candidate: MultivariateCandidateId::new("mvcand-1"),
+            experiment: ControlledExperimentId::new("exp-joint"),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("pro"),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+            coefficients: vec![
+                coefficient(TokenKind::Input, 500_000),
+                coefficient(TokenKind::Output, 1_000_000),
+            ],
+            condition_number: ConditionNumber::from_micros(4_000_000),
+            condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+            fit_residual: QuotaFractionPpm::new(120).unwrap(),
+            held_out_residual: QuotaFractionPpm::new(340).unwrap(),
+            validation_observations: 2,
+            sample_count: 8,
+            inputs: EvidenceDigest::from_inputs(&evidence("training")),
+            fitting_evidence: EvidenceFingerprint::from_inputs(&evidence("training")),
+            validation_evidence: EvidenceFingerprint::from_inputs(&evidence("validation")),
+            validation_method: "held-out-block-residual".to_string(),
+            validation_version: "v1".to_string(),
+            statistical_method: "ols".to_string(),
+            statistical_parameters: "{}".to_string(),
+            phase_design: "design".to_string(),
+            activation_policy_version: "promote-v1".to_string(),
+            aub_version: "0.1.0".to_string(),
+            source_revision: "abc1234".to_string(),
+            validity: ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
+            fit_timestamp: ts(2_000),
+            knowledge_time: ts(2_500),
+        }
+    }
+
+    fn activate_scalar(
+        conn: &mut Connection,
+        at: i64,
+        supersedes: Option<&WindowCalibrationId>,
+    ) -> Result<CalibrationLifecycleEventId, Error> {
+        let actor = ActivationActor::new("fixture").unwrap();
+        let policy = ActivationPolicy::new(
+            "fixture",
+            Credits::from_micros(0),
+            ConditionNumber::from_micros(30_000_000),
+        )
+        .unwrap();
+        let verdict = ContaminationVerdict::clean();
+        activate(
+            conn,
+            &WindowCalibrationId::new("scalar-1"),
+            ts(at),
+            supersedes,
+            &ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &evidence("fixture:fitting"),
+                validation: &evidence("fixture:validation"),
+                contamination: &verdict,
+            },
+        )
+    }
+
+    fn activate_per_kind(
+        conn: &mut Connection,
+        at: i64,
+        supersedes: Option<&WindowCalibrationId>,
+    ) -> Result<CalibrationLifecycleEventId, Error> {
+        let actor = ActivationActor::new("operator").unwrap();
+        let policy = ActivationPolicy::new(
+            "promote-v1",
+            Credits::from_micros(0),
+            ConditionNumber::from_micros(30_000_000),
+        )
+        .unwrap()
+        .with_max_quota_residual(QuotaFractionPpm::new(10_000).unwrap());
+        let verdict = ContaminationVerdict::clean();
+        activate_multivariate(
+            conn,
+            &WindowCalibrationId::new("promoted-mvcand-1"),
+            ts(at),
+            supersedes,
+            &ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &evidence("training"),
+                validation: &evidence("validation"),
+                contamination: &verdict,
+            },
+        )
+    }
+
+    fn per_kind_events(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM calibration_multivariate_lifecycle",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Every figure written reads back, the coefficients in insertion order.
+    #[test]
+    fn a_per_kind_result_round_trips_with_its_coefficients() {
+        let (_scratch, mut conn) = ledger();
+        let result = per_kind("promoted-mvcand-1");
+        insert_multivariate_result(&mut conn, &result).unwrap();
+        let loaded = load_multivariate_result(&conn, &result.id)
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded, result);
+        assert_eq!(list_all_multivariate_results(&conn).unwrap(), vec![result]);
+        assert!(
+            load_multivariate_result(&conn, &WindowCalibrationId::new("scalar-1"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// One calibration id names one result: a per-kind result cannot take an
+    /// id a scalar one holds, a scalar one cannot take a per-kind id, and a
+    /// candidate is promoted once.
+    #[test]
+    fn one_calibration_id_names_one_result_across_both_shapes() {
+        let (_scratch, mut conn) = ledger();
+        assert!(insert_multivariate_result(&mut conn, &per_kind("scalar-1")).is_err());
+        insert_multivariate_result(&mut conn, &per_kind("promoted-mvcand-1")).unwrap();
+        assert!(
+            insert_multivariate_result(&mut conn, &per_kind("promoted-mvcand-1-again")).is_err(),
+            "a second result for one candidate is refused"
+        );
+        let meter = MeterSemanticsId::new("meter-v1");
+        let billing = BillingSemanticsId::new("billing-v1");
+        let clash = minimal_fixture(
+            "promoted-mvcand-1",
+            &scope(),
+            &meter,
+            &billing,
+            &CostModelId::new("cm-v1"),
+            CreditsPerPercentagePoint::from_micros_per_point(100_000),
+            ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
+            ts(2_000),
+        );
+        let refused = insert_result(
+            &mut conn,
+            &clash,
+            &[crate::store::calibration::ExperimentId::new("exp-scalar")],
+        );
+        assert!(
+            refused.is_err(),
+            "a scalar result cannot take a per-kind id"
+        );
+    }
+
+    /// A per-kind activation supersedes the active scalar calibration: the
+    /// scope's answer changes shape at the event and not before, the scalar
+    /// reads as superseded, and the event names it. The same activation that
+    /// names no predecessor is refused.
+    #[test]
+    fn a_per_kind_activation_supersedes_the_active_scalar_calibration() {
+        let (_scratch, mut conn) = ledger();
+        insert_multivariate_result(&mut conn, &per_kind("promoted-mvcand-1")).unwrap();
+        activate_scalar(&mut conn, 3_000, None).unwrap();
+
+        assert!(activate_per_kind(&mut conn, 4_000, None).is_err());
+        assert_eq!(per_kind_events(&conn), 0);
+
+        let scalar_id = WindowCalibrationId::new("scalar-1");
+        activate_per_kind(&mut conn, 4_000, Some(&scalar_id)).unwrap();
+        assert_eq!(per_kind_events(&conn), 1);
+        assert!(matches!(
+            load_active_at(&conn, &scope(), ts(3_999)).unwrap(),
+            Some(ActiveCalibration::Scalar(_))
+        ));
+        match load_active_at(&conn, &scope(), ts(4_000)).unwrap() {
+            Some(ActiveCalibration::PerKind(active)) => {
+                assert_eq!(active.id.as_str(), "promoted-mvcand-1");
+            }
+            other => panic!("the per-kind result must be active: {other:?}"),
+        }
+        assert!(is_superseded(&conn, &scalar_id).unwrap());
+        let events = multivariate_activation_events_for(
+            &conn,
+            &WindowCalibrationId::new("promoted-mvcand-1"),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].kind, CalibrationEventKind::Supersession);
+        assert_eq!(events[0].supersedes, Some(scalar_id));
+    }
+
+    /// A scalar activation over an active per-kind calibration is refused
+    /// naming the bead that owns it, and writes nothing.
+    #[test]
+    fn a_scalar_activation_over_an_active_per_kind_calibration_is_refused() {
+        let (_scratch, mut conn) = ledger();
+        insert_multivariate_result(&mut conn, &per_kind("promoted-mvcand-1")).unwrap();
+        activate_per_kind(&mut conn, 3_000, None).unwrap();
+        let per_kind_id = WindowCalibrationId::new("promoted-mvcand-1");
+        let refusal = activate_scalar(&mut conn, 4_000, Some(&per_kind_id)).unwrap_err();
+        assert!(
+            refusal
+                .to_string()
+                .contains("aub-scalar-supersedes-per-kind-ufpq"),
+            "{refusal}"
+        );
+        assert_eq!(lifecycle_event_count(&conn).unwrap(), 0);
+        assert!(!is_multivariate_superseded(&conn, &per_kind_id).unwrap());
+    }
+}

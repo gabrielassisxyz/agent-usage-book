@@ -1446,4 +1446,116 @@ mod tests {
         );
         assert!(ActivationActor::new("operator").is_ok());
     }
+
+    fn per_kind_recorded(
+        training: &BTreeSet<EvidenceId>,
+        validation: &BTreeSet<EvidenceId>,
+        residual_ppm: i32,
+        condition_micros: i64,
+    ) -> RecordedValidation {
+        RecordedValidation {
+            policy_version: "ap-v1".to_string(),
+            held_out_residual: Some(HeldOutResidual::QuotaPpm(
+                QuotaFractionPpm::new(residual_ppm).unwrap(),
+            )),
+            condition_number: Some(ConditionNumber::from_micros(condition_micros)),
+            fitting_evidence: EvidenceFingerprint::from_inputs(training),
+            validation_evidence: EvidenceFingerprint::from_inputs(validation),
+        }
+    }
+
+    fn per_kind_policy(max_condition_micros: i64, max_residual_ppm: i32) -> ActivationPolicy {
+        ActivationPolicy::new(
+            "ap-v1",
+            Credits::from_micros(0),
+            ConditionNumber::from_micros(max_condition_micros),
+        )
+        .unwrap()
+        .with_max_quota_residual(QuotaFractionPpm::new(max_residual_ppm).unwrap())
+    }
+
+    /// A per-kind result whose condition number sits exactly on the bound is
+    /// accepted, and the same result one micro over it is refused naming both
+    /// figures, through the same gate a scalar result passes.
+    #[test]
+    fn a_per_kind_result_at_the_condition_bound_passes_and_one_micro_over_is_refused() {
+        let training = evidence(&["t-1", "t-2"]);
+        let validation = evidence(&["v-1", "v-2"]);
+        let (actor, _, verdict) = passing_parts();
+        let bound = per_kind_policy(12_000_000, 10_000);
+        let at_bound = per_kind_recorded(&training, &validation, 2_196, 12_000_000);
+        check_activation(
+            &request(&actor, &bound, &training, &validation, &verdict),
+            &at_bound,
+        )
+        .expect("a condition number on the bound is within it");
+
+        let over = per_kind_recorded(&training, &validation, 2_196, 12_000_001);
+        let refusal = check_activation(
+            &request(&actor, &bound, &training, &validation, &verdict),
+            &over,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refusal,
+            ActivationRefusal::IllConditioned {
+                condition_number: ConditionNumber::from_micros(12_000_001),
+                threshold: ConditionNumber::from_micros(12_000_000),
+            }
+        );
+        let message = refusal.to_string();
+        assert!(
+            message.contains("12000001") && message.contains("12000000"),
+            "{message}"
+        );
+    }
+
+    /// A per-kind held-out residual is judged against the quota bound in its
+    /// own unit: on the bound passes, one ppm over is refused, and a policy
+    /// stating only a credit bound refuses rather than passes it. The credit
+    /// bound of zero in these policies would refuse any scalar residual, so a
+    /// pass here cannot come from reading the quota residual as credits.
+    #[test]
+    fn a_per_kind_residual_is_judged_in_quota_ppm_and_never_against_the_credit_bound() {
+        let training = evidence(&["t-1", "t-2"]);
+        let validation = evidence(&["v-1", "v-2"]);
+        let (actor, _, verdict) = passing_parts();
+        let bound = per_kind_policy(30_000_000, 2_196);
+        check_activation(
+            &request(&actor, &bound, &training, &validation, &verdict),
+            &per_kind_recorded(&training, &validation, 2_196, 1_000_000),
+        )
+        .expect("a residual on the quota bound is within it");
+
+        let refusal = check_activation(
+            &request(&actor, &bound, &training, &validation, &verdict),
+            &per_kind_recorded(&training, &validation, 2_197, 1_000_000),
+        )
+        .unwrap_err();
+        match &refusal {
+            ActivationRefusal::HeldOutQuotaResidualExceedsPolicy {
+                residual, maximum, ..
+            } => {
+                assert_eq!(residual.get(), 2_197);
+                assert_eq!(maximum.get(), 2_196);
+            }
+            other => panic!("wrong refusal: {other}"),
+        }
+
+        let credit_only = ActivationPolicy::new(
+            "ap-v1",
+            Credits::from_micros(1_000_000_000),
+            ConditionNumber::from_micros(30_000_000),
+        )
+        .unwrap();
+        let refusal = check_activation(
+            &request(&actor, &credit_only, &training, &validation, &verdict),
+            &per_kind_recorded(&training, &validation, 0, 1_000_000),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(refusal, ActivationRefusal::MissingQuotaResidualBound { .. }),
+            "{refusal}"
+        );
+    }
 }
