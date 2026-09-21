@@ -2959,7 +2959,7 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
                 Some(active) => {
                     match crate::calibration::conversion::require_scalar_calibration(active) {
                         Ok(calibration) => Some(calibration),
-                        Err(refusal) => return Ok(refusal),
+                        Err(refusal) => return Ok(*refusal),
                     }
                 }
             };

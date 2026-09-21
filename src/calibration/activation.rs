@@ -1539,7 +1539,17 @@ mod tests {
                 assert_eq!(residual.get(), 2_197);
                 assert_eq!(maximum.get(), 2_196);
             }
-            other => panic!("wrong refusal: {other}"),
+            other @ (ActivationRefusal::PolicyVersionMismatch { .. }
+            | ActivationRefusal::EvidenceMismatch { .. }
+            | ActivationRefusal::OverlappingEvidence { .. }
+            | ActivationRefusal::Contaminated { .. }
+            | ActivationRefusal::IllConditioned { .. }
+            | ActivationRefusal::MissingHeldOutResidual
+            | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
+            | ActivationRefusal::IncompleteCostModel { .. }) => {
+                panic!("wrong refusal: {other}")
+            }
         }
 
         let credit_only = ActivationPolicy::new(

@@ -67,7 +67,7 @@ impl WindowConversionContext {
 /// through the cost model the joint fit exists to test (PLAN.md 22.1).
 pub fn require_scalar_calibration(
     active: ActiveCalibration,
-) -> Result<WindowCalibration, WindowEquivalentDerivation> {
+) -> Result<WindowCalibration, Box<WindowEquivalentDerivation>> {
     match active {
         ActiveCalibration::Scalar(calibration) => Ok(calibration),
         ActiveCalibration::PerKind(calibration) => {
@@ -75,13 +75,13 @@ pub fn require_scalar_calibration(
                 format!("window-calibration:{}", calibration.id.as_str()),
                 format!("provider:{}", calibration.provider.as_str()),
             ]);
-            Err(unavailable(
+            Err(Box::new(unavailable(
                 [RequiredFact::new(format!(
                     "scalar credits-per-point calibration: the active calibration '{}' is per-kind, and a per-kind calibration converts tokens of each kind, not credits",
                     calibration.id.as_str()
                 ))],
                 provenance,
-            ))
+            )))
         }
     }
 }
