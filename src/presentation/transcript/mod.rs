@@ -1,6 +1,6 @@
 //! Session-transcript rendering behind `aub export transcript` (`aub-xpfl`
 //! ships the command and the claude-code renderer; `aub-51wv` adds the codex
-//! and pi renderers; the opencode renderer is the remaining sibling bead).
+//! and pi renderers; `aub-m76e` adds the opencode renderer).
 //!
 //! One trait ([`TranscriptRenderer`]) turns a transcript file's raw text into
 //! [`TranscriptMessage`] values, one file per harness, each registered by
@@ -10,6 +10,11 @@
 //! resolved the session and read the files, so nothing here touches the
 //! store, the clock, or the filesystem.
 //!
+//! The opencode renderer keeps the same trait: opencode sessions live in a
+//! database rather than files, so the caller reads the session's rows through
+//! the store and formats one interchange line per row (see
+//! [`opencode::opencode_line`]) before calling the renderer.
+//!
 //! May not depend on:
 //! - provider adapters
 //! - store or calibration (boundary rule 09)
@@ -17,6 +22,7 @@
 
 pub mod claude_code;
 pub mod codex;
+pub mod opencode;
 pub mod pi;
 
 use std::collections::BTreeMap;
@@ -25,6 +31,7 @@ use crate::domain::time::UtcTimestamp;
 
 pub use claude_code::ClaudeCodeTranscriptRenderer;
 pub use codex::CodexTranscriptRenderer;
+pub use opencode::{OpencodeTranscriptRenderer, opencode_line};
 pub use pi::PiTranscriptRenderer;
 
 /// Who said a rendered message.
@@ -148,6 +155,7 @@ pub fn renderer_for(harness: &str) -> Option<&'static dyn TranscriptRenderer> {
         "claude-code" => Some(claude_code_renderer()),
         "codex" => Some(codex_renderer()),
         "pi" => Some(pi_renderer()),
+        "opencode" => Some(opencode_renderer()),
         _ => None,
     }
 }
@@ -164,6 +172,11 @@ fn codex_renderer() -> &'static dyn TranscriptRenderer {
 
 fn pi_renderer() -> &'static dyn TranscriptRenderer {
     static RENDERER: PiTranscriptRenderer = PiTranscriptRenderer;
+    &RENDERER
+}
+
+fn opencode_renderer() -> &'static dyn TranscriptRenderer {
+    static RENDERER: OpencodeTranscriptRenderer = OpencodeTranscriptRenderer;
     &RENDERER
 }
 
@@ -513,14 +526,14 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_harness_has_no_renderer() {
+    fn every_shipped_harness_has_a_renderer_and_unknown_ones_do_not() {
         assert_eq!(
             renderer_for("claude-code").unwrap().harness(),
             "claude-code"
         );
         assert_eq!(renderer_for("codex").unwrap().harness(), "codex");
         assert_eq!(renderer_for("pi").unwrap().harness(), "pi");
-        assert!(renderer_for("opencode").is_none());
+        assert_eq!(renderer_for("opencode").unwrap().harness(), "opencode");
         assert!(renderer_for("future-harness").is_none());
     }
 
