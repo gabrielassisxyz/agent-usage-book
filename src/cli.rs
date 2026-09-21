@@ -14390,6 +14390,8 @@ usage_evidence = "measured"
             "--policy-version",
             "ap-v9",
             "--max-residual-micros=500",
+            "--max-residual-ppm",
+            "2500",
             "--max-condition-micros",
             "700",
         ]
@@ -14403,7 +14405,25 @@ usage_evidence = "measured"
         assert_eq!(args.validation, vec!["s-3".to_string()]);
         assert_eq!(args.policy_version.as_deref(), Some("ap-v9"));
         assert_eq!(args.max_residual_micros, 500);
+        assert_eq!(args.max_residual_ppm, 2_500);
         assert_eq!(args.max_condition_micros, 700);
+        let past_the_quota: Vec<String> = [
+            "wc-17",
+            "--training",
+            "s-1",
+            "--validation",
+            "s-3",
+            "--max-residual-ppm=1000001",
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        match calibrate_parse_activate(&past_the_quota) {
+            Err(Error::Usage(message)) => {
+                assert!(message.contains("--max-residual-ppm"), "{message}");
+            }
+            other => panic!("a bound past the whole quota must be refused, got {other:?}"),
+        }
         let missing: Vec<String> = ["wc-17".to_string()].to_vec();
         match calibrate_parse_activate(&missing) {
             Err(Error::Usage(message)) => assert!(message.contains("--training"), "{message}"),
