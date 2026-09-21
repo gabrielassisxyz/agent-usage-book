@@ -1013,10 +1013,15 @@ fn a_single_kind_premise_fits_the_univariate_candidate_from_the_run() {
     );
     let json: serde_json::Value = serde_json::from_str(stdout.trim()).expect("stdout must be JSON");
 
+    // A controlled run adds exactly one key to the univariate contract: the
+    // contamination verdict an experiment-table fit has no run to judge.
+    let mut expected_keys = UNIVARIATE_JSON_KEYS.to_vec();
+    expected_keys.push("contamination");
+    expected_keys.sort_unstable();
     assert_eq!(
         json_keys(&json),
-        UNIVARIATE_JSON_KEYS.to_vec(),
-        "the controlled-run fit reports the univariate contract, with no key added or removed"
+        expected_keys,
+        "the controlled-run fit reports the univariate contract plus its contamination verdict"
     );
     assert_eq!(json["experiment_id"], SINGLE_KIND_EXPERIMENT);
     assert_eq!(json["provider"], "anthropic");

@@ -8260,9 +8260,16 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
             let outcome = crate::calibration::multivariate_fit::fit_controlled_run_and_record(
                 &mut conn, run, clock,
             )?;
+            let contamination = calibrate_fit_contamination(&conn, run, clock.now())?;
             match invocation.format {
-                OutputFormat::Text => print!("{}", render_calibrate_fit_multivariate(&outcome)),
-                OutputFormat::Json => println!("{}", calibrate_fit_multivariate_json(&outcome)),
+                OutputFormat::Text => print!(
+                    "{}",
+                    render_calibrate_fit_multivariate(&outcome, &contamination)
+                ),
+                OutputFormat::Json => println!(
+                    "{}",
+                    calibrate_fit_multivariate_json(&outcome, &contamination)
+                ),
             }
             return Ok(());
         }
@@ -8279,6 +8286,12 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
                 clock,
             )?
         }
+    };
+    // Only a controlled run records the premise and thresholds a verdict is
+    // judged against; an experiment-table fit reports no verdict at all.
+    let contamination = match controlled_run.as_ref() {
+        Some(run) => Some(calibrate_fit_contamination(&conn, run, clock.now())?),
+        None => None,
     };
 
     match invocation.format {
@@ -8326,9 +8339,12 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
                     println!("  - {}", diag.message());
                 }
             }
+            if let Some(contamination) = &contamination {
+                print!("{}", render_calibrate_fit_contamination(contamination));
+            }
         }
         OutputFormat::Json => {
-            let json = serde_json::json!({
+            let mut json = serde_json::json!({
                 "candidate_id": fit_result.candidate.id.as_str(),
                 "experiment_id": fit_result.candidate.experiment.as_str(),
                 "provider": fit_result.candidate.provider.as_str(),
@@ -8369,16 +8385,104 @@ fn calibrate_fit(clock: &impl Clock, invocation: &Invocation) -> Result<(), Erro
                     }
                 }).collect::<Vec<_>>(),
             });
+            if let Some(contamination) = &contamination {
+                json["contamination"] = calibrate_fit_contamination_json(contamination);
+            }
             println!("{json}");
         }
     }
     Ok(())
 }
 
+/// What `calibrate fit` can say about a controlled run's contamination: the
+/// detector's verdict, or why the local credits it needs cannot be stated.
+enum CalibrateFitContamination {
+    Evaluated(crate::calibration::contamination::ContaminationVerdict),
+    Unavailable(String),
+}
+
+/// Evaluates the run the fit just read. A run whose local credits cannot be
+/// priced, as a joint run in a ledger with no cost model, reports the verdict
+/// as unavailable instead of refusing the fit or inventing a zero.
+fn calibrate_fit_contamination(
+    conn: &rusqlite::Connection,
+    run: &crate::store::calibration_controlled::ControlledExperimentRun,
+    now: UtcTimestamp,
+) -> Result<CalibrateFitContamination, Error> {
+    match crate::calibration::fitter::evaluate_controlled_run_contamination(conn, run, now) {
+        Ok(verdict) => Ok(CalibrateFitContamination::Evaluated(verdict)),
+        Err(Error::InsufficientEvidence(reason)) => {
+            Ok(CalibrateFitContamination::Unavailable(reason))
+        }
+        Err(other) => Err(other),
+    }
+}
+
+/// Whether a verdict refuses `calibrate activate`. An overlapping session
+/// alone does not: the marker timeline cannot tell the run's own arm sessions
+/// from another's, and `cal-2026-09-14-bianca` fired it on eleven sessions
+/// that were all the run's own. Every other signal refuses.
+fn contamination_refuses_activation(
+    verdict: &crate::calibration::contamination::ContaminationVerdict,
+) -> bool {
+    verdict.findings().iter().any(|finding| {
+        finding.signal != crate::calibration::contamination::ContaminationSignal::OverlappingSession
+    })
+}
+
+fn render_calibrate_fit_contamination(contamination: &CalibrateFitContamination) -> String {
+    match contamination {
+        CalibrateFitContamination::Unavailable(reason) => {
+            format!("Contamination: unavailable: {reason}\n")
+        }
+        CalibrateFitContamination::Evaluated(verdict) => {
+            let mut out = if !verdict.is_contaminated() {
+                "Contamination: clean\n".to_string()
+            } else if contamination_refuses_activation(verdict) {
+                "Contamination: contaminated; activation will refuse\n".to_string()
+            } else {
+                "Contamination: contaminated; reported only, activation does not refuse on overlapping sessions\n".to_string()
+            };
+            for finding in verdict.findings() {
+                out.push_str(&format!(
+                    "  - {}: {}\n",
+                    finding.signal.label(),
+                    finding.detail
+                ));
+            }
+            out
+        }
+    }
+}
+
+/// The `contamination` object of the fit JSON, documented in
+/// `docs/commands.md` under `aub calibrate`.
+fn calibrate_fit_contamination_json(
+    contamination: &CalibrateFitContamination,
+) -> serde_json::Value {
+    match contamination {
+        CalibrateFitContamination::Unavailable(reason) => serde_json::json!({
+            "verdict": "unavailable",
+            "reason": reason,
+            "findings": [],
+            "refuses_activation": true,
+        }),
+        CalibrateFitContamination::Evaluated(verdict) => serde_json::json!({
+            "verdict": if verdict.is_contaminated() { "contaminated" } else { "clean" },
+            "findings": verdict.findings().iter().map(|finding| serde_json::json!({
+                "signal": finding.signal.label(),
+                "detail": finding.detail,
+            })).collect::<Vec<_>>(),
+            "refuses_activation": contamination_refuses_activation(verdict),
+        }),
+    }
+}
+
 /// The text report of a multivariate fit: one line per fitted kind, then the
 /// identifiability figures the candidate was accepted under.
 fn render_calibrate_fit_multivariate(
     outcome: &crate::calibration::multivariate_fit::MultivariateFitOutcome,
+    contamination: &CalibrateFitContamination,
 ) -> String {
     let candidate = &outcome.candidate;
     let kinds = candidate
@@ -8445,6 +8549,7 @@ fn render_calibrate_fit_multivariate(
             excluded.reason()
         ));
     }
+    out.push_str(&render_calibrate_fit_contamination(contamination));
     out.push_str("Activation:   not performed; activate with `aub calibrate activate`\n");
     out
 }
@@ -8453,6 +8558,7 @@ fn render_calibrate_fit_multivariate(
 /// under `aub calibrate`.
 fn calibrate_fit_multivariate_json(
     outcome: &crate::calibration::multivariate_fit::MultivariateFitOutcome,
+    contamination: &CalibrateFitContamination,
 ) -> serde_json::Value {
     let candidate = &outcome.candidate;
     serde_json::json!({
@@ -8497,6 +8603,7 @@ fn calibrate_fit_multivariate_json(
                 "reason": ex.reason(),
             })
         }).collect::<Vec<_>>(),
+        "contamination": calibrate_fit_contamination_json(contamination),
         "activated": false,
     })
 }
@@ -9193,9 +9300,10 @@ fn calibrate_parse_activate(rest: &[String]) -> Result<CalibrateActivateArgs, Er
 /// residual and condition number inside the stated policy bounds. Any failure
 /// refuses before anything is written, through the store's typed refusal.
 ///
-/// Contamination is presented as clean because the fitter already rejects
-/// contaminated series at fit time; re-evaluating contamination from the
-/// ledger at activation time is later work, recorded on the bead.
+/// A result fitted from a controlled run is refused when that run is
+/// contaminated, judged from the ledger at activation time by the same
+/// verdict `calibrate fit` reports: nothing at fit time rejects a contaminated
+/// series, so this is where the verdict is enforced.
 pub(crate) fn calibrate_activate_validated(
     conn: &mut rusqlite::Connection,
     args: &CalibrateActivateArgs,
@@ -9231,7 +9339,7 @@ pub(crate) fn calibrate_activate_validated(
         crate::store::calibration::ConditionNumber::from_micros(args.max_condition_micros),
     )
     .map_err(|refusal| Error::Usage(format!("invalid activation policy: {refusal}")))?;
-    let verdict = crate::calibration::contamination::ContaminationVerdict::clean();
+    let verdict = calibrate_activate_source_contamination(conn, &id, now)?;
     let request = crate::calibration::activation::ActivationRequest {
         actor: &actor,
         policy: &policy,
@@ -9263,6 +9371,35 @@ pub(crate) fn calibrate_activate_validated(
         uncertainty_low_micros_per_point: calibration.uncertainty().lower().micros_per_point(),
         uncertainty_high_micros_per_point: calibration.uncertainty().upper().micros_per_point(),
     })
+}
+
+/// The contamination verdict standing against a result: every source
+/// experiment that is a controlled run is evaluated, and one whose verdict
+/// refuses activation is refused through the store's contaminated-run
+/// refusal. An experiment-table source records no exclusivity premise and no
+/// thresholds, so it contributes no finding.
+fn calibrate_activate_source_contamination(
+    conn: &rusqlite::Connection,
+    id: &crate::domain::provenance::WindowCalibrationId,
+    now: UtcTimestamp,
+) -> Result<crate::calibration::contamination::ContaminationVerdict, Error> {
+    let mut standing = crate::calibration::contamination::ContaminationVerdict::clean();
+    for experiment in crate::store::calibration::source_experiments(conn, id)? {
+        let Some(run) = crate::store::calibration_controlled::load_by_experiment_id(
+            conn,
+            &crate::store::calibration_controlled::ControlledExperimentId::new(experiment.as_str()),
+        )?
+        else {
+            continue;
+        };
+        let verdict =
+            crate::calibration::fitter::evaluate_controlled_run_contamination(conn, &run, now)?;
+        if contamination_refuses_activation(&verdict) {
+            crate::calibration::fitter::refuse_contaminated_controlled_run(conn, &run, now)?;
+            standing = verdict;
+        }
+    }
+    Ok(standing)
 }
 
 fn calibrate_activate_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
