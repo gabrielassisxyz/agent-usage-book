@@ -6,8 +6,8 @@
 //! estimates.
 //!
 //! The three field vocabularies do not agree, and the differences are not
-//! cosmetic: pi reports `reasoning` separately and Claude Code does not, Codex
-//! splits cache into read and write while pi names them `cacheRead` and
+//! cosmetic: pi, Codex and opencode each report a reasoning count and Claude
+//! Code does not, Codex splits cache into read and write while pi names them `cacheRead` and
 //! `cacheWrite`, and Claude Code alone breaks cache creation down by ephemeral
 //! lifetime. A normalisation that silently drops a field it does not recognise
 //! understates the source it least understands, so every token class a source
@@ -15,6 +15,9 @@
 //! usage vector's unknown-component map. The one deliberate exception is the
 //! total: `total_tokens` / `totalTokens` is a derived sum, not a token class,
 //! and the token model deliberately has no total slot (see `domain::tokens`).
+//! The reasoning counts are the other exception, and each parser's doc says
+//! how its source's count relates to `output`: `output` means every token the
+//! model generated, in every harness.
 //!
 //! Codex reports cumulatively, not per-delta: each `token_count` record carries
 //! the running total for the session, so summing them multiplies the real
@@ -382,6 +385,13 @@ fn claude_cache_write_fallback(
 /// and is neither an event nor a quarantine. Codex provides no stable per-event
 /// identifier, so no strong dedup identity is reported.
 ///
+/// `reasoning_output_tokens` is a breakdown of `output_tokens`, not a bucket
+/// beside it: across 400 of 400 real events measured on 2026-09-20,
+/// `input_tokens + output_tokens == total_tokens` with the reasoning count
+/// already inside that output (`aub-i589`). `output` is priced whole, so the
+/// breakdown is ignored rather than carried as an unknown component, which
+/// the cost model would refuse and which would double count if priced.
+///
 /// The model comes from the `turn_context` records, which is the only place a
 /// rollout states it: `session_meta` names `model_provider` and not the model,
 /// and a `token_count` payload carries `info`, `rate_limits` and `type` only.
@@ -398,11 +408,11 @@ const CODEX_KNOWN: [(&str, TokenKind); 4] = [
     ("cached_input_tokens", TokenKind::CacheRead),
     ("cache_write_input_tokens", TokenKind::CacheWrite),
 ];
-const CODEX_IGNORED: [&str; 1] = ["total_tokens"];
+const CODEX_IGNORED: [&str; 2] = ["total_tokens", "reasoning_output_tokens"];
 
 impl ParserAdapter for CodexParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("codex-1")
+        ParserVersion::new("codex-2")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -558,9 +568,15 @@ fn parse_codex_line(line: &str) -> Result<CodexLine, QuarantineClass> {
 /// record's stable identifier through: pi writes it at the top level as `id`,
 /// and `message.id` is honoured first where a record carries one. The record's
 /// top-level `timestamp` is the event time, and the session comes from the
-/// `{"type":"session","id":...}` header line. `reasoning` is a token class
-/// outside the four known kinds and survives in the unknown map; the `cost`
-/// object nested inside `usage` is money, not usage, and is ignored.
+/// `{"type":"session","id":...}` header line. The `cost` object nested inside
+/// `usage` is money, not usage, and is ignored.
+///
+/// `reasoning` is a breakdown of `output`, not a bucket beside it: across 400
+/// of 400 real events measured on 2026-09-20,
+/// `input + output + cacheRead + cacheWrite == totalTokens` with the reasoning
+/// count already inside that output (`aub-i589`). `output` is priced whole, so
+/// the breakdown is ignored; adding it to `output` would count those tokens
+/// twice.
 pub struct PiParser;
 
 const PI_KNOWN: [(&str, TokenKind); 4] = [
@@ -569,11 +585,11 @@ const PI_KNOWN: [(&str, TokenKind); 4] = [
     ("cacheRead", TokenKind::CacheRead),
     ("cacheWrite", TokenKind::CacheWrite),
 ];
-const PI_IGNORED: [&str; 1] = ["totalTokens"];
+const PI_IGNORED: [&str; 2] = ["totalTokens", "reasoning"];
 
 impl ParserAdapter for PiParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("pi-1")
+        ParserVersion::new("pi-2")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -672,9 +688,18 @@ fn parse_pi_line(
 /// `data` carries `tokens: {input, output, reasoning, cache: {write, read}}`
 /// beside `role`, `modelID`, `providerID` and `time: {created, completed}`.
 /// The nested cache pair is flattened into the vocabulary the shared
-/// `extract_usage` helper reads, `total` is a derived sum and is ignored the
-/// way the other sources' totals are, and `reasoning` has no canonical kind
-/// so it survives in the unknown map, never folded into output. `message.id`
+/// `extract_usage` helper reads, and `total` is a derived sum and is ignored the
+/// way the other sources' totals are.
+///
+/// `reasoning` is added to `output`. Unlike pi and Codex, opencode's reasoning
+/// is a bucket beside `output`, not inside it: across 3341 of 3341 real
+/// events measured on 2026-09-20,
+/// `input + output + cache.read + cache.write + reasoning == total`
+/// (`aub-i589`). A reasoning token is priced as an output token of the same
+/// model, so folding it into `output` values it exactly, with no separate
+/// cost model term. The fold happens after each count is validated, so a
+/// negative or non-integer `output` or `reasoning` still quarantines rather
+/// than being rescued by the sum. `message.id`
 /// is the stable event identifier, the strong identity dedup collapses
 /// replays on. A user row carries no tokens and is skipped silently, the way
 /// a record without a usage object is; an assistant row without one
@@ -692,7 +717,7 @@ const OPENCODE_IGNORED: [&str; 1] = ["total"];
 
 impl ParserAdapter for OpencodeParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("opencode-1")
+        ParserVersion::new("opencode-2")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -795,7 +820,14 @@ fn parse_opencode_row(
             flat.insert("cache_write".to_string(), write.clone());
         }
     }
-    let counts = extract_usage(&flat, &OPENCODE_KNOWN, &OPENCODE_IGNORED, &["input"])?;
+    let reasoning = flat.remove("reasoning");
+    let mut counts = extract_usage(&flat, &OPENCODE_KNOWN, &OPENCODE_IGNORED, &["input"])?;
+    if let Some(reasoning) = reasoning {
+        counts.output = counts
+            .output
+            .checked_add(count_value(&reasoning)?)
+            .ok_or(QuarantineClass::WrongFieldType)?;
+    }
     let occurred_at = message
         .get("time")
         .and_then(Value::as_object)
@@ -1048,7 +1080,7 @@ mod tests {
     #[test]
     fn opencode_declares_its_parser_and_input_format_versions() {
         let parser = OpencodeParser;
-        assert_eq!(parser.parser_version().as_str(), "opencode-1");
+        assert_eq!(parser.parser_version().as_str(), "opencode-2");
         assert_eq!(parser.input_format_version().as_str(), "opencode-sqlite-v1");
         assert!(parser.is_database_source());
     }
@@ -1422,18 +1454,110 @@ mod tests {
         assert_eq!(codex_model(&output).as_deref(), Some("gpt-5.6-terra"));
     }
 
-    /// pi's `reasoning` field is a token class outside the four known kinds and
-    /// survives in the unknown map rather than being dropped.
+    /// pi's `reasoning` is a breakdown inside `output`: it reaches neither the
+    /// unknown map nor the output count. The planted negative is the opencode
+    /// fold applied to pi, which would make `output` 55 and double count.
     #[test]
-    fn pi_reasoning_survives_in_the_unknown_map() {
+    fn pi_reasoning_is_inside_output_and_is_not_carried() {
         let parser = PiParser;
         let input = r#"{"message":{"id":"m1","usage":{"input":100,"output":50,"reasoning":5}}}"#;
         let output = parser.parse(input, &location());
         let event = &output.events()[0];
+        assert!(
+            event.usage().unknown().is_empty(),
+            "reasoning must not reach the unknown map: {:?}",
+            event.usage().unknown()
+        );
         assert_eq!(
-            event.usage().unknown().get("reasoning").map(|c| c.value()),
-            Some(5),
-            "reasoning must survive as an unknown component"
+            event.usage().known().output().value(),
+            50,
+            "output must equal the source's output exactly"
+        );
+    }
+
+    /// Codex's `reasoning_output_tokens` is a breakdown inside `output_tokens`,
+    /// over every native fixture that carries one: `output` stays the source's
+    /// own figure and no unknown component remains.
+    #[test]
+    fn codex_reasoning_is_inside_output_and_is_not_carried() {
+        let cases = [
+            ("codex-real-shape.jsonl", 404),
+            ("codex-cache.jsonl", 100),
+            ("codex-model-change.jsonl", 100),
+        ];
+        for (fixture, expected_output) in cases {
+            let output =
+                CodexParser.parse(&read_fixture(fixture), &SourceLocation::new(fixture, 1));
+            assert!(output.quarantined().is_empty(), "fixture {fixture}");
+            let last = output.events().last().expect("one cumulative event");
+            assert!(
+                last.usage().unknown().is_empty(),
+                "fixture {fixture}: {:?}",
+                last.usage().unknown()
+            );
+            assert_eq!(
+                last.usage().known().output().value(),
+                expected_output,
+                "fixture {fixture}"
+            );
+        }
+    }
+
+    fn opencode_row(tokens: &str) -> crate::store::opencode::OpencodeMessageRow {
+        crate::store::opencode::OpencodeMessageRow {
+            message_id: "msg_1".to_string(),
+            session_id: "ses_1".to_string(),
+            time_created_ms: 1_788_220_800_000,
+            data: format!(
+                r#"{{"role":"assistant","modelID":"m","providerID":"p","tokens":{tokens}}}"#
+            ),
+        }
+    }
+
+    fn parse_opencode(tokens: &str) -> Result<Option<NormalizedUsageEvent>, QuarantineClass> {
+        parse_opencode_row(
+            &opencode_row(tokens),
+            &BTreeMap::new(),
+            &location(),
+            OpencodeParser.parser_version(),
+        )
+    }
+
+    /// opencode's `reasoning` is a bucket beside `output`, priced as output,
+    /// so it lands in `TokenKind::Output` and leaves no unknown component.
+    #[test]
+    fn opencode_reasoning_is_folded_into_output() {
+        let event = parse_opencode(
+            r#"{"input":54601,"output":201,"reasoning":582,"cache":{"write":0,"read":4608},"total":59992}"#,
+        )
+        .expect("a valid row")
+        .expect("an assistant row is an event");
+        assert_eq!(event.usage().known().output().value(), 783);
+        assert_eq!(event.usage().known().input().value(), 54_601);
+        assert_eq!(event.usage().known().cache_read().value(), 4_608);
+        assert!(
+            event.usage().unknown().is_empty(),
+            "{:?}",
+            event.usage().unknown()
+        );
+        let without = parse_opencode(r#"{"input":10,"output":4}"#)
+            .expect("a valid row")
+            .expect("an assistant row is an event");
+        assert_eq!(without.usage().known().output().value(), 4);
+    }
+
+    /// A negative `output` still quarantines when a reasoning count would lift
+    /// the sum above zero, and a negative `reasoning` quarantines instead of
+    /// being dropped from a priced figure.
+    #[test]
+    fn opencode_negative_counts_quarantine_despite_the_fold() {
+        assert_eq!(
+            parse_opencode(r#"{"input":10,"output":-5,"reasoning":582}"#).err(),
+            Some(QuarantineClass::WrongFieldType)
+        );
+        assert_eq!(
+            parse_opencode(r#"{"input":10,"output":5,"reasoning":-2}"#).err(),
+            Some(QuarantineClass::WrongFieldType)
         );
     }
 
@@ -1522,10 +1646,8 @@ mod tests {
         let first = &output.events()[0];
         assert_eq!(first.strong_identity(), Some("rec-real-0001"));
         assert_eq!(first.usage().known().input().value(), 19_221);
-        assert_eq!(
-            first.usage().unknown().get("reasoning").map(|c| c.value()),
-            Some(202)
-        );
+        assert_eq!(first.usage().known().output().value(), 302);
+        assert!(first.usage().unknown().is_empty());
         assert_eq!(
             first.occurred_at(),
             UtcTimestamp::parse_rfc3339("2026-08-25T23:33:39.627Z")

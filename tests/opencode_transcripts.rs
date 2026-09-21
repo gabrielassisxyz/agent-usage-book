@@ -182,8 +182,8 @@ fn session_of(event: &agent_usage_book::transcripts::NormalizedUsageEvent) -> (S
 }
 
 /// The fixture parses into the expected canonical events: input, output and
-/// both cache kinds where the source carries them, `reasoning` under unknown
-/// components, the message id as the canonical id, and one quarantine for
+/// both cache kinds where the source carries them, `reasoning` folded into
+/// output because opencode reports it beside output, the message id as the canonical id, and one quarantine for
 /// the assistant message without `tokens`.
 #[test]
 fn parses_the_seed_fixture_into_canonical_events() {
@@ -192,20 +192,14 @@ fn parses_the_seed_fixture_into_canonical_events() {
     let output = parse_db(&db_path);
 
     let actual: Vec<(u64, u64, u64, u64)> = output.events().iter().map(known_of).collect();
-    assert_eq!(actual, vec![(120, 34, 9, 5), (40, 12, 3, 0), (10, 4, 0, 0)]);
-
-    let reasoning: Vec<Option<u64>> = output
-        .events()
-        .iter()
-        .map(|event| {
-            event
-                .usage()
-                .unknown()
-                .get("reasoning")
-                .map(|count| count.value())
-        })
-        .collect();
-    assert_eq!(reasoning, vec![Some(7), None, Some(2)]);
+    assert_eq!(actual, vec![(120, 41, 9, 5), (40, 12, 3, 0), (10, 6, 0, 0)]);
+    assert!(
+        output
+            .events()
+            .iter()
+            .all(|event| event.usage().unknown().is_empty()),
+        "no reasoning component survives the fold"
+    );
 
     let ids: Vec<&str> = output
         .events()
@@ -299,8 +293,8 @@ fn replays_across_files_collapse_to_one_canonical_event() {
         .expect("the replayed message survives");
     assert_eq!(
         replayed.usage().known().output().value(),
-        90,
-        "the larger output wins across the replay"
+        97,
+        "the larger output, reasoning included, wins across the replay"
     );
 }
 
