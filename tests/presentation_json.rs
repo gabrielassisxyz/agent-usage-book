@@ -432,3 +432,104 @@ proptest! {
         prop_assert_eq!(round_trip.sources(), provenance.sources());
     }
 }
+
+fn per_kind_result_view() -> agent_usage_book::report::CalibratePerKindResultView {
+    use agent_usage_book::report::{CalibrateKindCoefficientView, CalibratePerKindResultView};
+    let coefficient = |kind: &str, estimate: i64, std_error: i64| CalibrateKindCoefficientView {
+        kind_label: kind.to_string(),
+        estimate_micro_ppm_per_token: estimate,
+        std_error_micro_ppm_per_token: std_error,
+        interval_low_micro_ppm_per_token: estimate - 2 * std_error,
+        interval_high_micro_ppm_per_token: estimate + 2 * std_error,
+    };
+    CalibratePerKindResultView {
+        calibration_id: "promoted-mvcand-exp-1-00000000000000ab".to_string(),
+        candidate_id: "mvcand-exp-1-00000000000000ab".to_string(),
+        experiment_id: "exp-1".to_string(),
+        provider: "anthropic".to_string(),
+        plan_tier: "pro".to_string(),
+        window_semantic_key: "five_hour".to_string(),
+        coefficients: vec![
+            coefficient("input", 672_000, 22_500),
+            coefficient("output", 4_484_000, 90_000),
+            coefficient("cache_read", -3_000, 2_000),
+            coefficient("cache_write", 701_000, 30_000),
+        ],
+        condition_number_micros: 7_250_000,
+        condition_number_threshold_micros: 30_000_000,
+        fit_residual_ppm: 2_196,
+        held_out_residual_ppm: 3_140,
+        validation_observations: 6,
+        sample_count: 16,
+        statistical_method: "ols-through-origin".to_string(),
+        statistical_parameters: "{\"ridge\":0}".to_string(),
+        phase_design: "controlled-run=exp-1;kinds=input,output,cache_read,cache_write".to_string(),
+        validation_method: "held-out-block-residual".to_string(),
+        validation_version: "v1".to_string(),
+        inputs_digest_hex: "00000000000000ab".to_string(),
+        inputs_count: 40,
+        fitting_evidence_digest_hex: "00000000000000cd".to_string(),
+        validation_evidence_digest_hex: "00000000000000ef".to_string(),
+        fit_timestamp_nanos: 1_500,
+        activation_policy_version: "promote-v1".to_string(),
+        aub_version: "0.1.0".to_string(),
+        source_revision: "abc1234".to_string(),
+    }
+}
+
+fn assert_matches_fixture(generated_json: &str, fixture: &str) {
+    let parsed_generated: serde_json::Value =
+        serde_json::from_str(generated_json).expect("generated JSON must parse");
+    let fixture_path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/presentation")
+        .join(fixture);
+    let fixture_content = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("fixture {fixture} must exist: {e}"));
+    let parsed_fixture: serde_json::Value =
+        serde_json::from_str(&fixture_content).expect("fixture must parse as JSON");
+    assert_eq!(
+        parsed_generated, parsed_fixture,
+        "generated JSON must match golden {fixture}"
+    );
+}
+
+/// `calibrate promote --format json` for a joint candidate: one coefficient
+/// per kind with its interval, the condition number and both residuals in
+/// their own units, and no credits-per-point `fitted` field.
+#[test]
+fn contract_calibrate_per_kind_promote_json_matches_golden_fixture() {
+    let report = agent_usage_book::report::CalibratePerKindPromoteReport {
+        metadata: test_metadata(),
+        result: per_kind_result_view(),
+    };
+    let json = agent_usage_book::presentation::json::calibrate_per_kind_promote_json(
+        &report,
+        test_run_id(),
+    );
+    assert_matches_fixture(&json, "calibrate_per_kind_promote_v5.json");
+}
+
+/// `calibrate show --format json` with an active per-kind calibration: the
+/// scalar `entries` stay empty and the per-kind entry carries its result,
+/// health, activation state and lifecycle events.
+#[test]
+fn contract_calibrate_per_kind_show_json_matches_golden_fixture() {
+    let report = agent_usage_book::report::CalibrateShowReport {
+        metadata: test_metadata(),
+        entries: Vec::new(),
+        per_kind_entries: vec![agent_usage_book::report::CalibratePerKindEntry {
+            result: per_kind_result_view(),
+            health_label: "current".to_string(),
+            is_active: true,
+            events: vec![agent_usage_book::report::CalibrateLifecycleEventView {
+                kind_label: "supersession".to_string(),
+                event_at_nanos: 1_900,
+                actor: "operator".to_string(),
+                activation_policy_version: "promote-v1".to_string(),
+                supersedes: Some("promoted-cand-1".to_string()),
+            }],
+        }],
+    };
+    let json = agent_usage_book::presentation::json::calibrate_show_json(&report, test_run_id());
+    assert_matches_fixture(&json, "calibrate_per_kind_show_v5.json");
+}
