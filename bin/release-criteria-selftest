@@ -1,0 +1,102 @@
+#!/usr/bin/env bash
+# Proves bin/release-criteria's verdict mechanics against scratch documents
+# (aub-71j.10), with shell rows only, so it needs no toolchain and runs in
+# well under a second. Each scenario is a near copy of the all-pass document
+# that differs in one row, and each asserts both the exit status and the
+# criterion the machine-readable output names.
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd)"
+checker="$repo_root/bin/release-criteria"
+scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-release-criteria-selftest-XXXXXX")"
+trap 'rm -rf "$scratch"' EXIT
+
+failures=0
+fail() {
+    echo "release-criteria-selftest: $1" >&2
+    failures=$((failures + 1))
+}
+
+mkdir -p "$scratch/tests"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$scratch/ok.sh"
+printf '#!/usr/bin/env bash\necho broken on purpose\nexit 1\n' >"$scratch/bad.sh"
+printf '#[test]\nfn present_test() {}\n' >"$scratch/tests/present.rs"
+chmod +x "$scratch/ok.sh" "$scratch/bad.sh"
+
+# write_doc FILE [NUMBER KIND TARGET PATH]: every criterion mapped to ok.sh,
+# except criterion NUMBER, whose row is replaced by the given one (or dropped
+# when KIND is `none`).
+write_doc() {
+    local file="$1" swap="${2:-}" kind="${3:-}" target="${4:-}" path="${5:-}"
+    {
+        printf '# scratch\n\n## Last run\n\nLast run: never\n\n## Criteria\n\n```tsv\nnumber\tslug\tcriterion\n'
+        for n in $(seq 1 17); do printf '%s\tcriterion-%s\ttext %s\n' "$n" "$n" "$n"; done
+        printf '```\n\n## Checks\n\n```tsv\nnumber\tkind\ttarget\tpath\n'
+        for n in $(seq 1 17); do
+            if [ "$n" = "$swap" ]; then
+                [ "$kind" = "none" ] || printf '%s\t%s\t%s\t%s\n' "$n" "$kind" "$target" "$path"
+            else
+                printf '%s\tshell\t./ok.sh\tok.sh\n' "$n"
+            fi
+        done
+        printf '```\n'
+    } >"$file"
+}
+
+# expect NAME DOC STATUS REGEX [ARGS...]: runs the checker and asserts the exit
+# status class (0 or nonzero) and that stdout matches REGEX.
+expect() {
+    local name="$1" doc="$2" want="$3" regex="$4"
+    shift 4
+    local out status
+    out="$("$checker" --doc "$doc" --root "$scratch" "$@" 2>/dev/null)"
+    status=$?
+    if [ "$want" = "0" ] && [ "$status" -ne 0 ]; then
+        fail "$name: expected exit 0, got $status"
+    elif [ "$want" = "nonzero" ] && [ "$status" -eq 0 ]; then
+        fail "$name: expected a nonzero exit, got 0"
+    fi
+    if ! printf '%s\n' "$out" | grep -qE -- "$regex"; then
+        fail "$name: output does not match $regex"
+        printf '%s\n' "$out" | tail -n 3 >&2
+    fi
+}
+
+write_doc "$scratch/all-pass.md"
+expect "all pass" "$scratch/all-pass.md" 0 '^\{"summary":true,"mode":"run","passed":17,"total":17,"unmet":\[\]\}$'
+
+write_doc "$scratch/one-fails.md" 9 shell ./bad.sh bad.sh
+expect "one failing check" "$scratch/one-fails.md" nonzero '^\{"criterion":9,"slug":"criterion-9","verdict":"fail",'
+expect "one failing check, summary" "$scratch/one-fails.md" nonzero '"passed":16,"total":17,"unmet":\[9\]\}$'
+
+write_doc "$scratch/dropped.md" 4 none
+expect "dropped row" "$scratch/dropped.md" nonzero '^\{"criterion":4,"slug":"criterion-4","verdict":"unchecked","checks":\[\]\}$'
+
+write_doc "$scratch/blocked.md" 12 blocked aub-zzz.1 -
+expect "blocked row" "$scratch/blocked.md" nonzero '^\{"criterion":12,.*"verdict":"blocked",.*blocked on aub-zzz\.1'
+
+write_doc "$scratch/renamed.md" 15 cargo renamed_away tests/present.rs
+expect "renamed test, list mode" "$scratch/renamed.md" nonzero '^\{"criterion":15,.*"verdict":"fail",.*no test fn renamed_away in tests/present.rs' --list
+
+write_doc "$scratch/traced.md" 15 cargo present_test tests/present.rs
+expect "present test, list mode" "$scratch/traced.md" 0 '"passed":17,"total":17' --list
+
+write_doc "$scratch/missing-path.md" 2 shell ./gone.sh gone.sh
+expect "missing script" "$scratch/missing-path.md" nonzero '^\{"criterion":2,.*"verdict":"fail",.*missing gone.sh'
+
+# A failing row alongside a passing one still fails the criterion.
+write_doc "$scratch/mixed.md" 6 shell ./bad.sh bad.sh
+printf '6\tshell\t./ok.sh\tok.sh\n' >"$scratch/extra-row"
+sed -i "/^6\tshell\t.\/bad.sh/r $scratch/extra-row" "$scratch/mixed.md"
+expect "mixed rows" "$scratch/mixed.md" nonzero '^\{"criterion":6,.*"verdict":"fail",'
+
+write_doc "$scratch/record.md" 3 shell ./bad.sh bad.sh
+"$checker" --doc "$scratch/record.md" --root "$scratch" --record >/dev/null 2>&1
+grep -qE '^Last run: [0-9]{4}-[0-9]{2}-[0-9]{2} at [^ ]+: 16 of 17 pass, unmet 3$' "$scratch/record.md" \
+    || fail "record: the Last run line was not rewritten with the verdict"
+
+if [ "$failures" -ne 0 ]; then
+    echo "release-criteria-selftest: $failures scenario(s) failed" >&2
+    exit 1
+fi
+echo "release-criteria-selftest: all scenarios passed"
