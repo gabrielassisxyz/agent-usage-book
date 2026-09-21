@@ -1669,13 +1669,20 @@ fn window_estimate_in_use(ctx: &DoctorContext) -> CheckOutcome {
     } else {
         match ctx.db {
             None => CheckStatus::Fail("no open connection to the ledger database".to_string()),
-            Some(conn) => match crate::store::rate_card::effective_at(conn, ctx.timestamp) {
+            Some(conn) => match crate::store::rate_card::history(conn) {
                 Err(error) => CheckStatus::Fail(format!("cannot read rate cards: {error}")),
                 Ok(cards) => {
                     let mut in_use: std::collections::BTreeSet<String> =
                         std::collections::BTreeSet::new();
                     let mut failure = None;
-                    for card in &cards {
+                    // Valuation's own in-force rule, not the store's day query:
+                    // that one drops a card on its end day, and a card spend and
+                    // can-run still use must still be reported.
+                    let today = ctx.timestamp.utc_date();
+                    let in_force = cards
+                        .iter()
+                        .filter(|card| crate::valuation::card_in_force_on(card, today));
+                    for card in in_force {
                         let Some(estimate) = card.draft.window_estimate else {
                             continue;
                         };
@@ -3467,5 +3474,43 @@ mod tests {
         // card in force and pass whether or not the calibration was honoured.
         ctx.db = Some(&conn);
         assert_eq!(window_estimate_in_use(&ctx).status, CheckStatus::Pass);
+    }
+
+    /// A card whose `effective_end` is today is still in force for spend and
+    /// can-run (`find_window_rate` is end-inclusive), so doctor must still
+    /// name it. The planted negative ends the day before and must stay silent.
+    #[test]
+    fn an_estimate_card_on_its_end_day_is_still_reported() {
+        // The context clock, 1_700_000_000 s, is 2023-11-14 in UTC.
+        for (end, expect_reported) in [("2023-11-14", true), ("2023-11-13", false)] {
+            let dir = scratch_dir(&format!("window-estimate-end-{end}"));
+            std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+            let config = anthropic_account_config(&dir);
+            let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+            insert_card(
+                &conn,
+                crate::domain::rate_card::RateCardDraft {
+                    effective_end: Some(crate::domain::time::UtcDate::parse(end).unwrap()),
+                    ..estimate_card()
+                },
+            );
+
+            let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+            ctx.db_missing = false;
+            ctx.db = Some(&conn);
+            let status = window_estimate_in_use(&ctx).status;
+            if expect_reported {
+                assert!(
+                    matches!(&status, CheckStatus::Info(detail) if detail.contains("anthropic/five_hour")),
+                    "a card ending today is in force: {status:?}"
+                );
+            } else {
+                assert_eq!(
+                    status,
+                    CheckStatus::Pass,
+                    "a card that ended yesterday is not"
+                );
+            }
+        }
     }
 }

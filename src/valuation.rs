@@ -343,8 +343,7 @@ impl RateBook {
             if card.draft.vendor.trim().to_ascii_lowercase() != normalized_vendor
                 || card.draft.model.trim().to_ascii_lowercase() != normalized_model
                 || card.draft.token_class != token_class
-                || date < card.draft.effective_start
-                || card.draft.effective_end.is_some_and(|end| date > end)
+                || !card_in_force_on(card, date)
             {
                 continue;
             }
@@ -404,8 +403,16 @@ fn card_exact_date_match(
         && card.draft.vendor.trim().to_ascii_lowercase() == normalized_vendor
         && card.draft.model.trim().to_ascii_lowercase() == normalized_model
         && card.draft.token_class == token_class
-        && date >= card.draft.effective_start
-        && card.draft.effective_end.is_none_or(|end| date <= end)
+        && card_in_force_on(card, date)
+}
+
+/// The one in-force rule for a card on a day, whichever its basis: the
+/// interval is end-inclusive, so a card whose `effective_end` is a date still
+/// applies on that date. Anything that reports which cards valuation uses
+/// reads this rather than restating it, so the two cannot disagree about a
+/// card's last day.
+pub fn card_in_force_on(card: &RateCard, date: UtcDate) -> bool {
+    date >= card.draft.effective_start && card.draft.effective_end.is_none_or(|end| date <= end)
 }
 
 /// True when `card` outranks the current best default: the later
