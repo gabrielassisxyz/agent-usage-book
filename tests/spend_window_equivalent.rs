@@ -21,8 +21,8 @@ use agent_usage_book::presentation::render::{ExplainMode, render_spend_report_wi
 use agent_usage_book::report::{
     IngestSummary, LedgerGeneration, ProvenanceNode, ReportMetadata, SpendGroup,
     SpendGroupCreditsProvenance, SpendGroupProvenance, SpendGroupWindowEquivalentProvenance,
-    SpendGrouping, SpendReport, Unit, ValueArithmetic, WindowEquivalentDerivation,
-    WindowEquivalentValue,
+    SpendGrouping, SpendReport, Unit, ValueArithmetic, WindowEquivalentBasis,
+    WindowEquivalentDerivation, WindowEquivalentValue,
 };
 
 fn node(arithmetic: ValueArithmetic) -> ProvenanceNode {
@@ -65,7 +65,7 @@ fn report() -> SpendReport {
     .unwrap();
     let window_equivalent = WindowEquivalentDerivation::Available(WindowEquivalentValue {
         interval,
-        calibration_id: WindowCalibrationId::new("calibration-v1"),
+        basis: WindowEquivalentBasis::Calibration(WindowCalibrationId::new("calibration-v1")),
         coverage: CoverageCompleteness::Complete,
         quality: EvidenceQuality::Estimated {
             methods: BTreeSet::from([EstimatorId::new("window-calibration:calibration-v1")]),

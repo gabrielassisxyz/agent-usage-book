@@ -2857,6 +2857,13 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         None if options.credits => CreditReporting::NoActiveModel,
         None => CreditReporting::NotRequested,
     };
+    // Loaded whenever a window equivalent was asked for, not only when the
+    // fallback fires: whether a calibration exists is a per-group question, and
+    // a book read lazily inside the resolver would be read once per group.
+    let window_rate_cards = match options.window_equivalent {
+        Some(_) => crate::valuation::RateBook::new(crate::store::rate_card::history(&conn)?),
+        None => crate::valuation::RateBook::default(),
+    };
     let window_resolver =
         options
             .window_equivalent
@@ -2864,6 +2871,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
             .map(|window_key| SpendWindowResolver {
                 conn: &conn,
                 active_cost_model: active_cost_model.as_ref(),
+                rate_cards: &window_rate_cards,
                 window_key,
                 timestamp,
             });
@@ -2920,9 +2928,136 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
 struct SpendWindowResolver<'a> {
     conn: &'a rusqlite::Connection,
     active_cost_model: Option<&'a crate::store::cost_model::CostModel>,
+    /// Every rate card in the book, for the estimate fallback. Loaded once per
+    /// run rather than per group: the resolver is called once per spend group
+    /// and a query per group would read the same rows back repeatedly.
+    rate_cards: &'a crate::valuation::RateBook,
     window_key: &'a str,
     timestamp: UtcTimestamp,
 }
+
+impl SpendWindowResolver<'_> {
+    /// The health of one stored calibration against its own scope, computed
+    /// before the cost model is required.
+    ///
+    /// The precedence rule has to know whether a calibration is current in
+    /// order to decide whether an estimate may stand in for it, and it has to
+    /// know that even when no cost model is active: refusing for a missing cost
+    /// model first would make a `review_due` calibration indistinguishable from
+    /// no calibration, which is exactly the distinction this rule turns on.
+    /// Cost-model supersession is evaluated later, where the model is in hand.
+    fn calibration_health(
+        &self,
+        calibration: &crate::store::calibration::WindowCalibration,
+    ) -> crate::calibration::health::CalibrationHealth {
+        let facts = crate::calibration::health::CalibrationFacts {
+            plan_tier: calibration.plan_tier().clone(),
+            meter_semantics_id: calibration.meter_semantics_id().clone(),
+            billing_semantics_id: calibration.billing_semantics_id().clone(),
+        };
+        let context = crate::calibration::health::ApplicabilityContext {
+            plan_tier: calibration.plan_tier().clone(),
+            meter_semantics_id: calibration.meter_semantics_id().clone(),
+            billing_semantics_id: calibration.billing_semantics_id().clone(),
+        };
+        crate::calibration::health::compute_health(
+            &crate::calibration::health::HealthInputs {
+                calibration: &facts,
+                context: &context,
+                lifecycle: crate::calibration::health::LifecycleState::Active,
+                cost_model_superseded: false,
+                drift: None,
+                review_due_at: None,
+            },
+            self.timestamp,
+        )
+    }
+
+    /// The labelled fallback: window movement read straight off the
+    /// percent-of-window cards, with no calibration and no cost model in the
+    /// path (`aub-8vpc`).
+    ///
+    /// The interval is a point, and deliberately so: the card states one
+    /// figure and no uncertainty, so widening it here would invent a bound the
+    /// operator never wrote. What keeps the figure honest is the label, which
+    /// travels on the basis rather than in the interval.
+    fn estimate(
+        &self,
+        provider: &str,
+        priced_model: Option<&crate::report::PricedModelRef>,
+        usage: &crate::domain::tokens::UsageVector,
+    ) -> crate::report::WindowEquivalentDerivation {
+        let missing_calibration = || {
+            window_refusal([crate::evidence::RequiredFact::new(format!(
+                "active calibration for provider {} and window {}",
+                provider, self.window_key
+            ))])
+        };
+        let Some(window) = crate::domain::rate_card::QuotaWindowKind::parse(self.window_key) else {
+            return missing_calibration();
+        };
+        let Some(priced_model) = priced_model else {
+            return window_refusal([crate::evidence::RequiredFact::new(
+                "one priced model per group for a rate-card estimate",
+            )]);
+        };
+        let outcome = crate::valuation::value_usage_vector_in_window(
+            self.rate_cards,
+            &priced_model.vendor,
+            &priced_model.model,
+            window,
+            self.timestamp,
+            usage,
+        );
+        let (points, rate_card_ids) = match outcome {
+            crate::valuation::WindowValuationOutcome::Complete {
+                points,
+                rate_card_ids,
+            } => (points, rate_card_ids),
+            // No card of this basis priced anything, so nothing stood in for the
+            // calibration: the refusal is the one the operator would have seen
+            // before any estimate existed.
+            crate::valuation::WindowValuationOutcome::Incomplete {
+                rate_card_ids,
+                missing_rates,
+                ..
+            } if rate_card_ids.is_empty() => {
+                let _ = missing_rates;
+                return missing_calibration();
+            }
+            crate::valuation::WindowValuationOutcome::Incomplete { missing_rates, .. } => {
+                return window_refusal(missing_rates.iter().map(|missing| {
+                    crate::evidence::RequiredFact::new(format!(
+                        "percent-of-window rate card for {}/{}/{}",
+                        missing.vendor, missing.model, missing.token_class
+                    ))
+                }));
+            }
+            crate::valuation::WindowValuationOutcome::OutOfRange { token_class } => {
+                return window_refusal([crate::evidence::RequiredFact::new(format!(
+                    "window movement within the representable range for token class {token_class}"
+                ))]);
+            }
+        };
+        crate::report::WindowEquivalentDerivation::Available(crate::report::WindowEquivalentValue {
+            interval: crate::domain::interval::Interval::new(points, points)
+                .expect("a point interval is ordered"),
+            basis: crate::report::WindowEquivalentBasis::RateCardEstimate { rate_card_ids },
+            coverage: usage.coverage().clone(),
+            quality: crate::evidence::EvidenceQuality::Estimated {
+                methods: [crate::evidence::EstimatorId::new(RATE_CARD_ESTIMATE_METHOD)]
+                    .into_iter()
+                    .collect(),
+                uncertainty: None,
+            },
+            provenance: crate::evidence::Provenance::new([RATE_CARD_ESTIMATE_METHOD.to_string()]),
+        })
+    }
+}
+
+/// The estimator id every rate-card estimate carries, in the one spelling both
+/// the JSON `methods` array and the provenance use.
+const RATE_CARD_ESTIMATE_METHOD: &str = "rate-card-estimate";
 
 impl WindowEquivalentResolver for SpendWindowResolver<'_> {
     fn window_semantic_key(&self) -> &str {
@@ -2933,7 +3068,9 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         &self,
         account: Option<&str>,
         provider: Option<&str>,
+        priced_model: Option<&crate::report::PricedModelRef>,
         credits: Option<&crate::evidence::Derivation<crate::domain::credits::Credits>>,
+        usage: &crate::domain::tokens::UsageVector,
     ) -> Result<crate::report::WindowEquivalentDerivation, Error> {
         let Some(account) = account.filter(|account| {
             !account.is_empty() && *account != crate::report::UNKNOWN_ACCOUNT_LABEL
@@ -2947,6 +3084,38 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
                 "provider identity",
             )]));
         };
+
+        let scope = crate::store::calibration::CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new(provider),
+            plan_tier: crate::store::calibration::PlanTier::new("default"),
+            window_semantic_key: crate::domain::window::WindowSemanticKey::new(self.window_key),
+        };
+        let calibration =
+            crate::store::calibration::load_active_at(self.conn, &scope, self.timestamp)?;
+
+        // Precedence, and the asymmetry in it (`aub-8vpc`): no calibration at
+        // all falls back to a labelled estimate, while a calibration that is
+        // merely not current does not. A stale measurement is still evidence,
+        // and an approximation quietly standing in its place would paper over
+        // the review it is asking for.
+        let Some(calibration) = calibration else {
+            return Ok(self.estimate(provider, priced_model, usage));
+        };
+        let health = self.calibration_health(&calibration);
+        if !matches!(
+            health,
+            crate::calibration::health::CalibrationHealth::Current
+        ) {
+            return Ok(window_refusal([crate::evidence::RequiredFact::new(
+                format!(
+                    "current calibration for provider {} and window {}: calibration health is {}",
+                    provider,
+                    self.window_key,
+                    health.label()
+                ),
+            )]));
+        }
+
         let Some(model) = self.active_cost_model else {
             return Ok(window_refusal([crate::evidence::RequiredFact::new(
                 "active cost model",
@@ -2955,22 +3124,6 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         let Some(credits) = credits else {
             return Ok(window_refusal([crate::evidence::RequiredFact::new(
                 "qualified credits",
-            )]));
-        };
-
-        let scope = crate::store::calibration::CalibrationScope {
-            provider: crate::store::cost_model::ProviderKey::new(provider),
-            plan_tier: crate::store::calibration::PlanTier::new("default"),
-            window_semantic_key: crate::domain::window::WindowSemanticKey::new(self.window_key),
-        };
-        let Some(calibration) =
-            crate::store::calibration::load_active_at(self.conn, &scope, self.timestamp)?
-        else {
-            return Ok(window_refusal([crate::evidence::RequiredFact::new(
-                format!(
-                    "active calibration for provider {} and window {}",
-                    provider, self.window_key
-                ),
             )]));
         };
 

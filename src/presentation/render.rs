@@ -1950,13 +1950,33 @@ fn render_window_equivalent(result: &WindowEquivalentDerivation) -> String {
                 Some(term) => term,
                 None => coverage_term(&value.coverage),
             };
-            format!(
-                "window equivalent [{}, {}] percentage points ({}; calibration {})",
+            let figure = format!(
+                "window equivalent [{}, {}] percentage points",
                 render_percentage_points(value.interval.lower()),
                 render_percentage_points(value.interval.upper()),
-                qualification.term(),
-                value.calibration_id.as_str(),
-            )
+            );
+            match &value.basis {
+                crate::report::WindowEquivalentBasis::Calibration(id) => format!(
+                    "{figure} ({}; calibration {})",
+                    qualification.term(),
+                    id.as_str(),
+                ),
+                // The label goes immediately after the figure, before anything
+                // else, because a reader who stops at the end of the number
+                // must already have been told what kind of number it is
+                // (`aub-8vpc`).
+                crate::report::WindowEquivalentBasis::RateCardEstimate { rate_card_ids } => {
+                    format!(
+                        "{figure} (estimated) from rate card{} {}",
+                        if rate_card_ids.len() == 1 { "" } else { "s" },
+                        rate_card_ids
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", "),
+                    )
+                }
+            }
         }
         WindowEquivalentDerivation::Unavailable { missing, .. } => format!(
             "window equivalent unavailable: {}",

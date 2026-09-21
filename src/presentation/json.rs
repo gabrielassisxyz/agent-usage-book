@@ -1104,9 +1104,35 @@ fn window_equivalent_json(result: &crate::report::WindowEquivalentDerivation) ->
         crate::report::WindowEquivalentDerivation::Available(value) => {
             let interval_json = interval_json(&value.interval);
             let interval = strip_braces(&interval_json);
+            // The two bases render different fields deliberately: a consumer
+            // that reads `calibration_id` gets nothing from an estimate, and a
+            // consumer that reads `basis.rate_card_ids` gets nothing from a
+            // calibration, so neither can be mistaken for the other by a
+            // reader that forgot to check `evidence_quality` (`aub-8vpc`).
+            let basis = match &value.basis {
+                crate::report::WindowEquivalentBasis::Calibration(id) => {
+                    format!("\"calibration_id\":{}", json_string(id.as_str()))
+                }
+                crate::report::WindowEquivalentBasis::RateCardEstimate { rate_card_ids } => {
+                    format!(
+                        "\"basis\":{{\"kind\":\"rate_card_estimate\",\"rate_card_ids\":[{}]}},\"methods\":[{}]",
+                        rate_card_ids
+                            .iter()
+                            .map(i64::to_string)
+                            .collect::<Vec<_>>()
+                            .join(","),
+                        value
+                            .quality
+                            .methods()
+                            .iter()
+                            .map(|method| json_string(method.as_str()))
+                            .collect::<Vec<_>>()
+                            .join(","),
+                    )
+                }
+            };
             format!(
-                "{{{interval},\"calibration_id\":{},\"coverage\":{},\"evidence_quality\":{},\"provenance\":{}}}",
-                json_string(value.calibration_id.as_str()),
+                "{{{interval},{basis},\"coverage\":{},\"evidence_quality\":{},\"provenance\":{}}}",
                 json_string(coverage_name(&value.coverage)),
                 json_string(quality_name(&value.quality)),
                 provenance_json(&value.provenance),
