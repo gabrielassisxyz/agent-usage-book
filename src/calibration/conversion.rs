@@ -16,7 +16,7 @@ use crate::domain::quota::PercentagePoints;
 use crate::domain::window::WindowSemanticKey;
 use crate::evidence::{Derivation, EstimatorId, EvidenceQuality, Provenance, RequiredFact};
 use crate::report::{WindowEquivalentBasis, WindowEquivalentDerivation, WindowEquivalentValue};
-use crate::store::calibration::{PlanTier, WindowCalibration};
+use crate::store::calibration::{ActiveCalibration, PlanTier, WindowCalibration};
 use crate::store::cost_model::ProviderKey;
 
 use super::health::CalibrationHealth;
@@ -56,6 +56,32 @@ impl WindowConversionContext {
             meter_semantics_id,
             billing_semantics_id,
             cost_model_id,
+        }
+    }
+}
+
+/// The scalar calibration a credit conversion needs, out of whichever shape is
+/// active. A per-kind calibration relates each token kind to meter movement and
+/// carries no credits-per-point coefficient, so it yields the refusal the
+/// conversion reports in place of a number: deriving one would price the kinds
+/// through the cost model the joint fit exists to test (PLAN.md 22.1).
+pub fn require_scalar_calibration(
+    active: ActiveCalibration,
+) -> Result<WindowCalibration, WindowEquivalentDerivation> {
+    match active {
+        ActiveCalibration::Scalar(calibration) => Ok(calibration),
+        ActiveCalibration::PerKind(calibration) => {
+            let provenance = Provenance::new([
+                format!("window-calibration:{}", calibration.id.as_str()),
+                format!("provider:{}", calibration.provider.as_str()),
+            ]);
+            Err(unavailable(
+                [RequiredFact::new(format!(
+                    "scalar credits-per-point calibration: the active calibration '{}' is per-kind, and a per-kind calibration converts tokens of each kind, not credits",
+                    calibration.id.as_str()
+                ))],
+                provenance,
+            ))
         }
     }
 }

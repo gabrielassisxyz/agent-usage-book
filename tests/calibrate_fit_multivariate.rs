@@ -1178,69 +1178,219 @@ fn a_running_experiment_is_refused_before_fitting() {
     assert!(stderr.contains("is still running"), "{stderr}");
 }
 
-/// A joint candidate has one coefficient per token kind and the result table
-/// carries a single scalar, so promotion refuses rather than reducing the
-/// coefficients through a cost model, which would reintroduce the assumption
-/// the joint fit exists to test. The refusal names the bead that owns the
-/// multivariate result shape.
+/// The joint burst's first block spends at this instant.
+const FIRST_BURST_BLOCK_AT: i64 = 1_060 * SECOND;
+
+/// Two readings of a third account's window around the joint burst's first
+/// block, moved by exactly that block's movement under the fixture's truth:
+/// the held-out series a per-kind result is validated against. Seeds the
+/// cost model in force at `begin` too.
+fn seed_joint_holdout_readings(state: &StateDir, fixture: &ArmFixture) {
+    let first_block_ppm: f64 = fixture.blocks[0]
+        .counts
+        .iter()
+        .map(|(kind, count)| {
+            let truth = fixture
+                .truth_ppm_per_token
+                .iter()
+                .find(|(k, _)| k == kind)
+                .map(|(_, v)| *v)
+                .unwrap();
+            truth * *count as f64
+        })
+        .sum();
+    let mut conn = open_test_ledger(state);
+    // Activation evaluates the run's contamination, whose flat-credits signal
+    // prices the run's own spend under the cost model in force at `begin`.
+    seed_initial_cost_model(&mut conn, UtcTimestamp::from_unix_nanos(500 * SECOND)).unwrap();
+    let holdout = meter_chain_for(&conn, "holdout");
+    reading(
+        &conn,
+        &holdout,
+        FIRST_BURST_BLOCK_AT - 7 * SECOND,
+        BASELINE_PPM,
+    );
+    reading(
+        &conn,
+        &holdout,
+        FIRST_BURST_BLOCK_AT + 23 * SECOND,
+        BASELINE_PPM + first_block_ppm.round() as i64,
+    );
+}
+
+fn run_aub_ok(state: &StateDir, args: &[&str]) -> serde_json::Value {
+    let output = run_aub(state, args);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    serde_json::from_slice(&output.stdout).expect("stdout must be JSON")
+}
+
+/// A joint candidate recorded by `calibrate fit` is promoted to a per-kind
+/// result carrying one coefficient per kind the premise named, the condition
+/// number and the held-out residual, listed by `history` with no lifecycle
+/// event; `activate` refuses it one micro under its condition number, naming
+/// both figures, and accepts it at that number, and only that last step
+/// writes a lifecycle row.
 #[test]
-fn promoting_a_joint_candidate_is_refused_naming_the_successor_bead() {
+fn a_joint_candidate_is_promoted_to_a_per_kind_result_and_activated() {
     let state = StateDir::new();
     let fixture = parse_fixture(INDEPENDENT_ARMS);
     seed_burst(&state, &fixture, TokenKind::ALL.to_vec());
+    seed_joint_holdout_readings(&state, &fixture);
+    let fit = fit_json(&state);
+    let candidate_id = fit["candidate_id"].as_str().unwrap().to_string();
 
-    let fit = run_aub(
-        &state,
-        &[
-            "calibrate",
-            "fit",
-            "--experiment",
-            EXPERIMENT,
-            "--format",
-            "json",
-        ],
-    );
-    assert_eq!(fit.status.code(), Some(0));
-    let json: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&fit.stdout).trim()).unwrap();
-    let candidate_id = json["candidate_id"]
-        .as_str()
-        .expect("a candidate id")
-        .to_string();
+    let conn = open_test_ledger(&state);
+    let training = evidence_of_account(&conn, ACCOUNT);
+    let validation = evidence_of_account(&conn, "holdout");
+    let lifecycle_rows = |conn: &Connection| {
+        count(conn, "SELECT COUNT(*) FROM calibration_lifecycle")
+            + count(
+                conn,
+                "SELECT COUNT(*) FROM calibration_multivariate_lifecycle",
+            )
+    };
+    assert_eq!(lifecycle_rows(&conn), 0);
 
-    let promote = run_aub(
+    let promote = run_aub_ok(
         &state,
         &[
             "calibrate",
             "promote",
             &candidate_id,
             "--training",
-            "ev-training",
+            &training,
             "--validation",
-            "ev-validation",
+            &validation,
+            "--format",
+            "json",
         ],
     );
-    let stderr = String::from_utf8_lossy(&promote.stderr).into_owned();
-    assert_ne!(
-        promote.status.code(),
-        Some(0),
-        "a joint candidate must not be promoted"
-    );
+    let result_id = format!("promoted-{candidate_id}");
+    assert_eq!(promote["calibration_id"], result_id.as_str());
+    assert_eq!(promote["coefficient_shape"], "per_kind");
+    assert_eq!(promote["activated"], false);
     assert!(
-        stderr.contains("no scalar result shape yet"),
-        "the refusal must state why a joint candidate cannot be promoted: {stderr}"
+        promote.get("fitted").is_none(),
+        "a per-kind result carries no scalar coefficient: {promote}"
     );
+    let coefficients = promote["coefficients"].as_array().unwrap();
+    let fitted = fit["coefficients"].as_array().unwrap();
+    assert_eq!(coefficients.len(), fitted.len());
+    for kind in TokenKind::ALL {
+        let promoted = coefficients
+            .iter()
+            .find(|c| c["token_kind"] == kind.label())
+            .unwrap_or_else(|| panic!("no promoted coefficient for {}", kind.label()));
+        let fitted = fitted
+            .iter()
+            .find(|c| c["token_kind"] == kind.label())
+            .unwrap();
+        let micro = |value: &serde_json::Value| (value.as_f64().unwrap() * 1e6).round() as i64;
+        assert_eq!(
+            promoted["estimate"]["value"],
+            micro(&fitted["estimate_ppm_per_token"]).to_string(),
+            "{} estimate",
+            kind.label()
+        );
+        assert_eq!(
+            promoted["interval"]["lower"],
+            micro(&fitted["interval_low_ppm_per_token"]).to_string()
+        );
+        assert_eq!(
+            promoted["interval"]["upper"],
+            micro(&fitted["interval_high_ppm_per_token"]).to_string()
+        );
+    }
+    let condition_micros = fit["condition_number_micros"].as_i64().unwrap();
+    assert_eq!(
+        promote["condition_number"]["value"],
+        condition_micros.to_string()
+    );
+    let held_out: i64 = promote["held_out_residual"]["value"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     assert!(
-        stderr.contains("aub-multivariate-result-shape-2hvt"),
-        "the refusal must name the bead that owns the multivariate result shape: {stderr}"
+        (0..2_000).contains(&held_out),
+        "the holdout moved by the fixture's truth, so the coefficients predict it closely: {held_out}"
+    );
+    assert_eq!(promote["validation_observations"], 2);
+    assert_eq!(lifecycle_rows(&conn), 0, "promotion never activates");
+
+    let history = run_aub_ok(&state, &["calibrate", "history", "--format", "json"]);
+    let listed = &history["per_kind_entries"][0];
+    assert_eq!(listed["calibration_id"], result_id.as_str());
+    assert_eq!(listed["events"], serde_json::json!([]));
+    assert_eq!(listed["health"], "provisional");
+
+    let activate = |bound: i64| {
+        run_aub(
+            &state,
+            &[
+                "calibrate",
+                "activate",
+                &result_id,
+                "--training",
+                &training,
+                "--validation",
+                &validation,
+                "--max-condition-micros",
+                &bound.to_string(),
+                "--format",
+                "json",
+            ],
+        )
+    };
+    let refused = activate(condition_micros - 1);
+    let stderr = format!(
+        "{}{}",
+        String::from_utf8_lossy(&refused.stderr),
+        String::from_utf8_lossy(&refused.stdout)
+    );
+    assert_ne!(refused.status.code(), Some(0), "over the bound: {stderr}");
+    assert!(
+        stderr.contains(&condition_micros.to_string())
+            && stderr.contains(&(condition_micros - 1).to_string()),
+        "the refusal names the condition number and the bound: {stderr}"
+    );
+    assert_eq!(
+        lifecycle_rows(&conn),
+        0,
+        "a refused activation writes nothing"
     );
 
-    let conn = open_test_ledger(&state);
+    let accepted = activate(condition_micros);
     assert_eq!(
-        count(&conn, "SELECT COUNT(*) FROM window_calibration_result"),
-        0,
-        "a refused promotion records no result"
+        accepted.status.code(),
+        Some(0),
+        "at the bound: {}",
+        String::from_utf8_lossy(&accepted.stderr)
     );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM calibration_multivariate_lifecycle"
+        ),
+        1
+    );
+    assert_eq!(
+        lifecycle_rows(&conn),
+        1,
+        "exactly one row, at the last step"
+    );
+
+    let show = run_aub_ok(&state, &["calibrate", "show", "--format", "json"]);
+    let active = &show["per_kind_entries"][0];
+    assert_eq!(active["calibration_id"], result_id.as_str());
+    assert_eq!(active["is_active"], true);
+    assert_eq!(active["health"], "current");
+    assert_eq!(show["entries"], serde_json::json!([]));
 }
 
 fn fit_json(state: &StateDir) -> serde_json::Value {

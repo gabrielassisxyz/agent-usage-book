@@ -47,6 +47,7 @@ use crate::calibration::contamination::{
 use crate::calibration::fitter::FitObservation;
 use crate::domain::credits::{Credits, CreditsPerPercentagePoint};
 use crate::domain::provenance::EvidenceId;
+use crate::domain::quota::QuotaFractionPpm;
 use crate::error::Error;
 use crate::store::calibration::{ConditionNumber, EvidenceFingerprint};
 
@@ -72,13 +73,20 @@ impl fmt::Display for ActivationConfigError {
 impl std::error::Error for ActivationConfigError {}
 
 /// The activation policy an explicit activation is judged under: a version
-/// plus the two numeric bounds. The version is recorded on the lifecycle
-/// event; the bounds are the caller's configuration for this activation, not
-/// source constants.
+/// plus the numeric bounds. The version is recorded on the lifecycle event;
+/// the bounds are the caller's configuration for this activation, not source
+/// constants.
+///
+/// A held-out residual is judged in the unit it was recorded in: a scalar
+/// result's in credits, a per-kind result's in quota parts per million. The
+/// quota bound is optional because a caller that activates only scalar results
+/// has no reason to state one; a per-kind result judged under a policy
+/// without it is refused rather than passed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivationPolicy {
     version: String,
     max_out_of_sample_residual: Credits,
+    max_quota_residual: Option<QuotaFractionPpm>,
     max_condition_number: ConditionNumber,
 }
 
@@ -95,8 +103,20 @@ impl ActivationPolicy {
         Ok(Self {
             version,
             max_out_of_sample_residual,
+            max_quota_residual: None,
             max_condition_number,
         })
+    }
+
+    /// The same policy with a bound on a held-out residual recorded in quota
+    /// parts per million, the unit a per-kind result records.
+    pub fn with_max_quota_residual(mut self, maximum: QuotaFractionPpm) -> Self {
+        self.max_quota_residual = Some(maximum);
+        self
+    }
+
+    pub fn max_quota_residual(&self) -> Option<QuotaFractionPpm> {
+        self.max_quota_residual
     }
 
     pub fn version(&self) -> &str {
@@ -180,6 +200,16 @@ pub enum ActivationRefusal {
         maximum: Credits,
         policy_version: String,
     },
+    /// The recorded held-out residual, in quota parts per million, exceeds
+    /// the policy's quota bound.
+    HeldOutQuotaResidualExceedsPolicy {
+        residual: QuotaFractionPpm,
+        maximum: QuotaFractionPpm,
+        policy_version: String,
+    },
+    /// The result records its held-out residual in quota parts per million
+    /// and the policy states no bound in that unit, so nothing can judge it.
+    MissingQuotaResidualBound { policy_version: String },
     /// The referenced cost model covers no term for a token class the
     /// calibration workload carries. This is the cache-write completeness
     /// rule (PLAN.md 23.8): no window calibration becomes active unless its
@@ -251,6 +281,23 @@ impl fmt::Display for ActivationRefusal {
                 residual.micros(),
                 maximum.micros()
             ),
+            Self::HeldOutQuotaResidualExceedsPolicy {
+                residual,
+                maximum,
+                policy_version,
+            } => write!(
+                formatter,
+                "activation refused: held-out residual {} ppm of quota exceeds the \
+                 activation policy maximum {} ppm (policy {policy_version})",
+                residual.get(),
+                maximum.get()
+            ),
+            Self::MissingQuotaResidualBound { policy_version } => write!(
+                formatter,
+                "activation refused: the result records its held-out residual in ppm of \
+                 quota and policy {policy_version} states no bound in that unit; a credit \
+                 bound cannot judge a quota residual"
+            ),
             Self::IncompleteCostModel {
                 cost_model_id,
                 missing,
@@ -288,6 +335,15 @@ pub struct ActivationRequest<'a> {
     pub contamination: &'a ContaminationVerdict,
 }
 
+/// A held-out residual in the unit its result recorded it in. The two are
+/// different quantities: credits a scalar coefficient failed to explain, and
+/// quota movement a per-kind prediction missed by.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeldOutResidual {
+    Credits(Credits),
+    QuotaPpm(QuotaFractionPpm),
+}
+
 /// What the result row says about its own validation: the policy version its
 /// diagnostics were recorded under, the held-out residual, the condition
 /// number, and the two evidence fingerprints the presented sets must
@@ -295,7 +351,7 @@ pub struct ActivationRequest<'a> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecordedValidation {
     pub policy_version: String,
-    pub held_out_residual: Option<Credits>,
+    pub held_out_residual: Option<HeldOutResidual>,
     pub condition_number: Option<ConditionNumber>,
     pub fitting_evidence: EvidenceFingerprint,
     pub validation_evidence: EvidenceFingerprint,
@@ -383,13 +439,27 @@ pub fn check_activation(
     }
     match recorded.held_out_residual {
         None => Err(ActivationRefusal::MissingHeldOutResidual),
-        Some(residual) => {
+        Some(HeldOutResidual::Credits(residual)) => {
             let maximum = request.policy.max_out_of_sample_residual();
             if residual > maximum {
                 return Err(ActivationRefusal::HeldOutResidualExceedsPolicy {
                     residual,
                     maximum,
                     policy_version: request.policy.version().to_string(),
+                });
+            }
+            Ok(())
+        }
+        Some(HeldOutResidual::QuotaPpm(residual)) => {
+            let policy_version = request.policy.version().to_string();
+            let Some(maximum) = request.policy.max_quota_residual() else {
+                return Err(ActivationRefusal::MissingQuotaResidualBound { policy_version });
+            };
+            if residual.get() > maximum.get() {
+                return Err(ActivationRefusal::HeldOutQuotaResidualExceedsPolicy {
+                    residual,
+                    maximum,
+                    policy_version,
                 });
             }
             Ok(())
@@ -552,7 +622,7 @@ mod tests {
     ) -> RecordedValidation {
         RecordedValidation {
             policy_version: policy_version.to_string(),
-            held_out_residual: residual,
+            held_out_residual: residual.map(HeldOutResidual::Credits),
             condition_number: condition,
             fitting_evidence: EvidenceFingerprint::from_inputs(training),
             validation_evidence: EvidenceFingerprint::from_inputs(validation),
@@ -679,6 +749,8 @@ mod tests {
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
             | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::HeldOutQuotaResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
             | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
@@ -723,6 +795,8 @@ mod tests {
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
             | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::HeldOutQuotaResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
             | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
@@ -833,6 +907,8 @@ mod tests {
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
+            | ActivationRefusal::HeldOutQuotaResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
             | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
@@ -923,6 +999,8 @@ mod tests {
             | ActivationRefusal::IllConditioned { .. }
             | ActivationRefusal::MissingHeldOutResidual
             | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::HeldOutQuotaResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
             | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
@@ -962,6 +1040,8 @@ mod tests {
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::MissingHeldOutResidual
             | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::HeldOutQuotaResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
             | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }
@@ -1015,6 +1095,8 @@ mod tests {
             | ActivationRefusal::Contaminated { .. }
             | ActivationRefusal::MissingHeldOutResidual
             | ActivationRefusal::HeldOutResidualExceedsPolicy { .. }
+            | ActivationRefusal::HeldOutQuotaResidualExceedsPolicy { .. }
+            | ActivationRefusal::MissingQuotaResidualBound { .. }
             | ActivationRefusal::IncompleteCostModel { .. }) => {
                 panic!("wrong refusal: {other}")
             }

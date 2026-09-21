@@ -3266,7 +3266,7 @@ pub fn render_calibrate_show_entry(entry: &crate::report::CalibrateShowEntry) ->
 
 /// Renders the `calibrate show` report: one block per active scope.
 pub fn render_calibrate_show_report(report: &crate::report::CalibrateShowReport) -> String {
-    if report.entries.is_empty() {
+    if report.entries.is_empty() && report.per_kind_entries.is_empty() {
         return "no active calibration; fit and activate one with `aub calibrate fit` and `aub calibrate activate`"
             .to_string();
     }
@@ -3274,15 +3274,122 @@ pub fn render_calibrate_show_report(report: &crate::report::CalibrateShowReport)
         .entries
         .iter()
         .map(render_calibrate_show_entry)
+        .chain(report.per_kind_entries.iter().map(|entry| {
+            let heading = if entry.is_active {
+                format!(
+                    "active per-kind window calibration {}\n",
+                    entry.result.calibration_id
+                )
+            } else {
+                format!(
+                    "per-kind window calibration {} ({})\n",
+                    entry.result.calibration_id, entry.health_label
+                )
+            };
+            format!(
+                "{heading}\n{}health:          {}\n",
+                render_calibrate_per_kind_result(&entry.result),
+                entry.health_label
+            )
+        }))
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// Renders the body every report shares for a per-kind result: one line per
+/// kind with its estimate and interval, the condition number against the
+/// threshold it was accepted under, and both residuals. No credits-per-point
+/// line appears, because a per-kind result has no such figure.
+pub fn render_calibrate_per_kind_result(
+    result: &crate::report::CalibratePerKindResultView,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "provider/window: {} / {}\n",
+        result.provider, result.window_semantic_key
+    ));
+    out.push_str(&format!("plan:            {}\n", result.plan_tier));
+    out.push_str(&format!(
+        "evidence:        candidate {} of experiment {}\n",
+        result.candidate_id, result.experiment_id
+    ));
+    out.push_str(&format!("method:          {}\n", result.statistical_method));
+    out.push_str("coefficients (micro-ppm of quota per token):\n");
+    for coefficient in &result.coefficients {
+        out.push_str(&format!(
+            "  - {:<12} {} [{}..={}] (std error {})\n",
+            coefficient.kind_label,
+            coefficient.estimate_micro_ppm_per_token,
+            coefficient.interval_low_micro_ppm_per_token,
+            coefficient.interval_high_micro_ppm_per_token,
+            coefficient.std_error_micro_ppm_per_token
+        ));
+    }
+    out.push_str(&format!(
+        "condition:       {} micros (threshold {})\n",
+        result.condition_number_micros, result.condition_number_threshold_micros
+    ));
+    out.push_str(&format!(
+        "residual:        {} ppm of quota\n",
+        result.fit_residual_ppm
+    ));
+    out.push_str(&format!(
+        "held-out:        {} ppm of quota over {} validation observations ({} {})\n",
+        result.held_out_residual_ppm,
+        result.validation_observations,
+        result.validation_method,
+        result.validation_version
+    ));
+    out.push_str(&format!(
+        "input hash:      {} (count {})\n",
+        result.inputs_digest_hex, result.inputs_count
+    ));
+    out.push_str(&format!(
+        "fitter:          {} / revision {}\n",
+        result.aub_version, result.source_revision
+    ));
+    out.push_str(&format!(
+        "fit date:        {} nanos\n",
+        result.fit_timestamp_nanos
+    ));
+    out
+}
+
+fn render_calibrate_lifecycle_events(
+    out: &mut String,
+    events: &[crate::report::CalibrateLifecycleEventView],
+) {
+    if events.is_empty() {
+        out.push_str("  events: none (provisional)\n");
+        return;
+    }
+    out.push_str("  events:\n");
+    for event in events {
+        match &event.supersedes {
+            Some(predecessor) => out.push_str(&format!(
+                "    - {} at {} by {} (policy {}) supersedes {}\n",
+                event.kind_label,
+                event.event_at_nanos,
+                event.actor,
+                event.activation_policy_version,
+                predecessor
+            )),
+            None => out.push_str(&format!(
+                "    - {} at {} by {} (policy {})\n",
+                event.kind_label,
+                event.event_at_nanos,
+                event.actor,
+                event.activation_policy_version
+            )),
+        }
+    }
 }
 
 /// Renders the `calibrate history` report: every calibration with its health
 /// state and its activation and supersession events. Each entry carries its
 /// fitted value with its residual and uncertainty, never a bare coefficient.
 pub fn render_calibrate_history_report(report: &crate::report::CalibrateHistoryReport) -> String {
-    if report.entries.is_empty() {
+    if report.entries.is_empty() && report.per_kind_entries.is_empty() {
         return "no calibrations recorded".to_string();
     }
     let mut out = String::new();
@@ -3312,30 +3419,17 @@ pub fn render_calibrate_history_report(report: &crate::report::CalibrateHistoryR
             "  fit date: {} nanos\n",
             entry.fit_timestamp_nanos
         ));
-        if entry.events.is_empty() {
-            out.push_str("  events: none (provisional)\n");
-        } else {
-            out.push_str("  events:\n");
-            for event in &entry.events {
-                match &event.supersedes {
-                    Some(predecessor) => out.push_str(&format!(
-                        "    - {} at {} by {} (policy {}) supersedes {}\n",
-                        event.kind_label,
-                        event.event_at_nanos,
-                        event.actor,
-                        event.activation_policy_version,
-                        predecessor
-                    )),
-                    None => out.push_str(&format!(
-                        "    - {} at {} by {} (policy {})\n",
-                        event.kind_label,
-                        event.event_at_nanos,
-                        event.actor,
-                        event.activation_policy_version
-                    )),
-                }
-            }
+        render_calibrate_lifecycle_events(&mut out, &entry.events);
+    }
+    for entry in &report.per_kind_entries {
+        out.push_str(&format!(
+            "per-kind calibration {} ({})\n",
+            entry.result.calibration_id, entry.health_label
+        ));
+        for line in render_calibrate_per_kind_result(&entry.result).lines() {
+            out.push_str(&format!("  {line}\n"));
         }
+        render_calibrate_lifecycle_events(&mut out, &entry.events);
     }
     out
 }
@@ -3405,6 +3499,41 @@ pub fn render_calibrate_promote_report(report: &crate::report::CalibratePromoteR
         report.result_id, report.activation_policy_version
     ));
     out
+}
+
+/// Renders the `calibrate promote` report for a joint candidate: the per-kind
+/// result recorded, and the statement that nothing was activated.
+pub fn render_calibrate_per_kind_promote_report(
+    report: &crate::report::CalibratePerKindPromoteReport,
+) -> String {
+    let result = &report.result;
+    format!(
+        "per-kind calibration {} recorded from joint candidate {}\n{}not activated; activate with `aub calibrate activate {} --policy-version {}`\n",
+        result.calibration_id,
+        result.candidate_id,
+        render_calibrate_per_kind_result(result),
+        result.calibration_id,
+        result.activation_policy_version
+    )
+}
+
+/// Renders the `calibrate activate` report for a per-kind result.
+pub fn render_calibrate_per_kind_activate_report(
+    report: &crate::report::CalibratePerKindActivateReport,
+) -> String {
+    let predecessor = report
+        .supersedes
+        .as_ref()
+        .map(|id| format!(" (supersedes {id})"))
+        .unwrap_or_default();
+    format!(
+        "per-kind calibration {} active{predecessor} by {} under policy {} at {}\n{}",
+        report.result.calibration_id,
+        report.actor,
+        report.activation_policy_version,
+        report.event_at_nanos,
+        render_calibrate_per_kind_result(&report.result)
+    )
 }
 
 /// Renders the `calibrate activate` report: the explicit activation just

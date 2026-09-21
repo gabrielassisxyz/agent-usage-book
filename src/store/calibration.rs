@@ -79,6 +79,11 @@ impl CalibrationLifecycleEventId {
     pub const fn value(self) -> i64 {
         self.0
     }
+
+    /// Wraps an event rowid read from either lifecycle table.
+    pub(crate) const fn from_raw(value: i64) -> Self {
+        Self(value)
+    }
 }
 
 /// The semantic identifier of a calibration experiment.
@@ -577,20 +582,49 @@ pub enum CalibrationEventKind {
 }
 
 impl CalibrationEventKind {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Activation => "activation",
             Self::Supersession => "supersession",
         }
     }
 
-    fn from_kind_label(label: &str) -> Result<Self, Error> {
+    pub(crate) fn from_kind_label(label: &str) -> Result<Self, Error> {
         match label {
             "activation" => Ok(Self::Activation),
             "supersession" => Ok(Self::Supersession),
             other => Err(Error::Store(format!(
                 "unknown calibration event kind '{other}'"
             ))),
+        }
+    }
+}
+
+/// The calibration active in one scope, in whichever shape it was recorded.
+///
+/// A scalar calibration converts credits into percentage points; a per-kind one
+/// relates each token kind to meter movement directly and carries no
+/// credits-per-point coefficient at all. Every consumer matches both arms, so a
+/// reader that can only use a scalar says so rather than reading a per-kind
+/// calibration as if the scope were uncalibrated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActiveCalibration {
+    Scalar(WindowCalibration),
+    PerKind(crate::store::calibration_multivariate_result::MultivariateCalibration),
+}
+
+impl ActiveCalibration {
+    pub fn id(&self) -> &WindowCalibrationId {
+        match self {
+            Self::Scalar(calibration) => calibration.id(),
+            Self::PerKind(calibration) => &calibration.id,
+        }
+    }
+
+    pub fn scope(&self) -> CalibrationScope {
+        match self {
+            Self::Scalar(calibration) => calibration.scope(),
+            Self::PerKind(calibration) => calibration.scope(),
         }
     }
 }
@@ -1559,7 +1593,9 @@ pub fn activate(
 
     let recorded = RecordedValidation {
         policy_version: calibration.activation_policy_version().to_string(),
-        held_out_residual: calibration.out_of_sample_residual(),
+        held_out_residual: calibration
+            .out_of_sample_residual()
+            .map(crate::calibration::activation::HeldOutResidual::Credits),
         condition_number: calibration.condition_number(),
         fitting_evidence: calibration.fitting_evidence(),
         validation_evidence: calibration.validation_evidence(),
@@ -1568,39 +1604,13 @@ pub fn activate(
 
     let scope = calibration.scope();
     let active_before = load_active_at_in(&tx, &scope, instant_before(event_at))?;
-
-    match (active_before.as_ref(), supersedes) {
-        (None, None) => {}
-        (None, Some(named)) => {
-            return Err(Error::Store(format!(
-                "first activation of '{}' in its scope names predecessor '{}', which is not active",
-                id.as_str(),
-                named.as_str()
-            )));
-        }
-        (Some(active), None) => {
-            return Err(Error::Store(format!(
-                "activation of '{}' must supersede the active calibration '{}'",
-                id.as_str(),
-                active.id().as_str()
-            )));
-        }
-        (Some(active), Some(named)) => {
-            if active.id() != named {
-                return Err(Error::Store(format!(
-                    "activation of '{}' supersedes '{}' but '{}' is active in that scope",
-                    id.as_str(),
-                    named.as_str(),
-                    active.id().as_str()
-                )));
-            }
-            if id == named {
-                return Err(Error::Store(format!(
-                    "activation of '{}' would supersede itself",
-                    id.as_str()
-                )));
-            }
-        }
+    check_predecessor(active_before.as_ref(), id, supersedes)?;
+    if let Some(ActiveCalibration::PerKind(active)) = &active_before {
+        return Err(Error::Store(format!(
+            "activation of scalar calibration '{}' would supersede the per-kind calibration '{}', and the scalar lifecycle cannot name a per-kind predecessor yet; tracked by {SCALAR_SUPERSEDES_PER_KIND_BEAD}",
+            id.as_str(),
+            active.id.as_str()
+        )));
     }
 
     let result_db_id = resolve_result_db_id(&tx, id)?;
@@ -1643,46 +1653,131 @@ pub fn activate(
     Ok(CalibrationLifecycleEventId(event_id))
 }
 
+/// The bead that owns letting a scalar activation supersede an active
+/// per-kind calibration.
+const SCALAR_SUPERSEDES_PER_KIND_BEAD: &str = "aub-scalar-supersedes-per-kind-ufpq";
+
+/// The predecessor rule every activation obeys, whichever shape it activates:
+/// the first activation in a scope names no predecessor, and every later one
+/// names the calibration active just before it, never itself.
+pub(crate) fn check_predecessor(
+    active_before: Option<&ActiveCalibration>,
+    id: &WindowCalibrationId,
+    supersedes: Option<&WindowCalibrationId>,
+) -> Result<(), Error> {
+    match (active_before, supersedes) {
+        (None, None) => Ok(()),
+        (None, Some(named)) => Err(Error::Store(format!(
+            "first activation of '{}' in its scope names predecessor '{}', which is not active",
+            id.as_str(),
+            named.as_str()
+        ))),
+        (Some(active), None) => Err(Error::Store(format!(
+            "activation of '{}' must supersede the active calibration '{}'",
+            id.as_str(),
+            active.id().as_str()
+        ))),
+        (Some(active), Some(named)) => {
+            if active.id() != named {
+                return Err(Error::Store(format!(
+                    "activation of '{}' supersedes '{}' but '{}' is active in that scope",
+                    id.as_str(),
+                    named.as_str(),
+                    active.id().as_str()
+                )));
+            }
+            if id == named {
+                return Err(Error::Store(format!(
+                    "activation of '{}' would supersede itself",
+                    id.as_str()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// The calibration active for `scope` as of knowledge instant `knowledge_time`: the
 /// result of the latest lifecycle event at or before that instant whose result sits
-/// in the scope. `None` before the scope's first activation.
+/// in the scope, read across the scalar and the per-kind lifecycle tables.
+/// `None` before the scope's first activation.
 pub fn load_active_at(
     conn: &Connection,
     scope: &CalibrationScope,
     knowledge_time: UtcTimestamp,
-) -> Result<Option<WindowCalibration>, Error> {
+) -> Result<Option<ActiveCalibration>, Error> {
     load_active_at_in(conn, scope, knowledge_time)
+}
+
+/// Which lifecycle table the latest event in a scope came from, and the row id
+/// of the result it activated.
+enum LatestActivation {
+    Scalar(i64),
+    PerKind(i64),
 }
 
 fn load_active_at_in(
     conn: &Connection,
     scope: &CalibrationScope,
     knowledge_time: UtcTimestamp,
-) -> Result<Option<WindowCalibration>, Error> {
-    let sql = format!(
-        "SELECT {RESULT_COLUMNS} FROM window_calibration_result
-         WHERE id = (
-            SELECT l.calibration_result_id
-            FROM calibration_lifecycle l
-            JOIN window_calibration_result r ON r.id = l.calibration_result_id
-            WHERE l.event_at <= ?1
-              AND r.provider = ?2 AND r.plan_tier = ?3 AND r.window_semantic_key = ?4
-            ORDER BY l.event_at DESC, l.id DESC
-            LIMIT 1
-         )"
-    );
-    conn.query_row(
-        &sql,
-        params![
-            knowledge_time.unix_nanos(),
-            scope.provider.as_str(),
-            scope.plan_tier.as_str(),
-            scope.window_semantic_key.as_str(),
-        ],
-        |row| result_from_row(row).map_err(store_error_to_sql),
-    )
-    .optional()
-    .map_err(|e| Error::Store(format!("cannot load the active calibration: {e}")))
+) -> Result<Option<ActiveCalibration>, Error> {
+    // A tie at one instant across the two tables is broken towards the
+    // per-kind event, so the answer is deterministic; the predecessor rule
+    // makes such a tie a chain fork the activation itself refuses.
+    let latest = conn
+        .query_row(
+            "SELECT shape, result_row FROM (
+                SELECT 0 AS shape, l.calibration_result_id AS result_row,
+                       l.event_at AS event_at, l.id AS event_row
+                FROM calibration_lifecycle l
+                JOIN window_calibration_result r ON r.id = l.calibration_result_id
+                WHERE l.event_at <= ?1
+                  AND r.provider = ?2 AND r.plan_tier = ?3 AND r.window_semantic_key = ?4
+                UNION ALL
+                SELECT 1, m.window_calibration_multivariate_result_id, m.event_at, m.id
+                FROM calibration_multivariate_lifecycle m
+                JOIN window_calibration_multivariate_result r
+                  ON r.id = m.window_calibration_multivariate_result_id
+                WHERE m.event_at <= ?1
+                  AND r.provider = ?2 AND r.plan_tier = ?3 AND r.window_semantic_key = ?4
+             )
+             ORDER BY event_at DESC, shape DESC, event_row DESC
+             LIMIT 1",
+            params![
+                knowledge_time.unix_nanos(),
+                scope.provider.as_str(),
+                scope.plan_tier.as_str(),
+                scope.window_semantic_key.as_str(),
+            ],
+            |row| {
+                let shape: i64 = row.get(0)?;
+                let result_row: i64 = row.get(1)?;
+                Ok(if shape == 0 {
+                    LatestActivation::Scalar(result_row)
+                } else {
+                    LatestActivation::PerKind(result_row)
+                })
+            },
+        )
+        .optional()
+        .map_err(|e| Error::Store(format!("cannot load the active calibration: {e}")))?;
+    match latest {
+        None => Ok(None),
+        Some(LatestActivation::Scalar(row)) => conn
+            .query_row(
+                &format!("SELECT {RESULT_COLUMNS} FROM window_calibration_result WHERE id = ?1"),
+                params![row],
+                |row| result_from_row(row).map_err(store_error_to_sql),
+            )
+            .map(|calibration| Some(ActiveCalibration::Scalar(calibration)))
+            .map_err(|e| Error::Store(format!("cannot load the active calibration: {e}"))),
+        Some(LatestActivation::PerKind(row)) => {
+            crate::store::calibration_multivariate_result::load_multivariate_result_by_row(
+                conn, row,
+            )
+            .map(|calibration| calibration.map(ActiveCalibration::PerKind))
+        }
+    }
 }
 
 /// The current-applicable calibration for `scope` as of `knowledge_time`:
@@ -1696,15 +1791,21 @@ fn load_active_at_in(
 /// no active calibration returns `None`; a scope whose active calibration
 /// is incomplete is an error, never a silent `None`, so the refusal cannot
 /// be mistaken for an uncalibrated window.
+///
+/// A per-kind calibration references no cost model, so the completeness rule
+/// has nothing to judge on it and it is returned as it is.
 pub fn load_current_applicable(
     conn: &Connection,
     scope: &CalibrationScope,
     knowledge_time: UtcTimestamp,
-) -> Result<Option<WindowCalibration>, Error> {
+) -> Result<Option<ActiveCalibration>, Error> {
     let Some(active) = load_active_at_in(conn, scope, knowledge_time)? else {
         return Ok(None);
     };
-    require_cost_model_complete(conn, &active)?;
+    match &active {
+        ActiveCalibration::Scalar(calibration) => require_cost_model_complete(conn, calibration)?,
+        ActiveCalibration::PerKind(_) => {}
+    }
     Ok(Some(active))
 }
 
@@ -1823,15 +1924,19 @@ fn resolve_result_db_id(conn: &Connection, id: &WindowCalibrationId) -> Result<i
 
 /// One nanosecond before `at`: the instant `load_active_at` reads to find the state a
 /// new event at `at` replaces.
-fn instant_before(at: UtcTimestamp) -> UtcTimestamp {
+pub(crate) fn instant_before(at: UtcTimestamp) -> UtcTimestamp {
     UtcTimestamp::from_unix_nanos(at.unix_nanos().saturating_sub(1))
 }
 
-/// Returns distinct calibration scopes that have ever had a result fitted.
+/// Returns distinct calibration scopes that have ever had a result fitted, of
+/// either shape.
 pub fn fitted_calibration_scopes(conn: &Connection) -> Result<Vec<CalibrationScope>, Error> {
     let mut statement = conn
         .prepare(
-            "SELECT DISTINCT provider, plan_tier, window_semantic_key FROM window_calibration_result",
+            "SELECT provider, plan_tier, window_semantic_key FROM window_calibration_result
+             UNION
+             SELECT provider, plan_tier, window_semantic_key
+             FROM window_calibration_multivariate_result",
         )
         .map_err(|e| Error::Store(format!("cannot list calibration scopes: {e}")))?;
     let rows = statement
@@ -2245,11 +2350,17 @@ pub fn list_all_results(conn: &Connection) -> Result<Vec<WindowCalibration>, Err
 
 /// Whether a later lifecycle event names this calibration as superseded: a
 /// calibration is retired exactly when another calibration's activation
-/// records it as the predecessor, never by editing a flag on its own row.
+/// records it as the predecessor, never by editing a flag on its own row. The
+/// successor may be scalar or per-kind.
 pub fn is_superseded(conn: &Connection, id: &WindowCalibrationId) -> Result<bool, Error> {
     conn.query_row(
         "SELECT EXISTS(
             SELECT 1 FROM calibration_lifecycle
+            WHERE supersedes_result_id = (
+                SELECT id FROM window_calibration_result WHERE calibration_id = ?1
+            )
+            UNION ALL
+            SELECT 1 FROM calibration_multivariate_lifecycle
             WHERE supersedes_result_id = (
                 SELECT id FROM window_calibration_result WHERE calibration_id = ?1
             )

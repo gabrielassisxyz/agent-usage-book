@@ -43,17 +43,24 @@ use crate::attribution::account_segment::{
 use crate::domain::credits::Credits;
 use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
 use crate::domain::provenance::EvidenceId;
+use crate::domain::quota::QuotaFractionPpm;
 use crate::domain::time::{Clock, UtcTimestamp};
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, TokenKind,
 };
 use crate::error::Error;
-use crate::store::calibration::{ConditionNumber, EvidenceDigest, ExcludedSample};
+use crate::store::calibration::{
+    CandidateId, ConditionNumber, EvidenceDigest, EvidenceFingerprint, ExcludedSample,
+    promoted_result_id,
+};
 use crate::store::calibration::{StoredUsageEvent, load_experiment_usage};
-use crate::store::calibration_controlled::ControlledExperimentRun;
+use crate::store::calibration_controlled::{ControlledExperimentRun, load_by_experiment_id};
 use crate::store::calibration_multivariate::{
     MultivariateCandidate, MultivariateCandidateId, StoredKindCoefficient,
     insert_multivariate_candidate, load_multivariate_candidate, observations_for_run,
+};
+use crate::store::calibration_multivariate_result::{
+    MultivariateCalibration, insert_multivariate_result, load_multivariate_result_for_candidate,
 };
 use crate::store::cost_model::ValidityInterval;
 use crate::store::session_account_marker::markers_for_session;
@@ -471,6 +478,192 @@ fn mean_absolute_residual_ppm(result: &MultivariateFitResult, blocks: &[SettledB
         })
         .sum();
     total / used.len() as f64
+}
+
+/// The validation procedure a promoted per-kind result records: the mean
+/// absolute settled-block residual of [`held_out_block_residual`], over
+/// evidence disjoint from the fit.
+pub const PER_KIND_VALIDATION_METHOD: &str = "held-out-block-residual";
+
+/// The version of that procedure, recorded on the result.
+pub const PER_KIND_VALIDATION_VERSION: &str = "v1";
+
+/// The held-out residual of a joint candidate: the validation readings are
+/// folded into settled blocks over the run account's own usage, exactly as
+/// the fit folded its readings, each block's movement is predicted from the
+/// recorded coefficients, and the mean absolute miss over the blocks that
+/// carry a fitted kind is returned in quota parts per million, the unit of the
+/// candidate's own fit residual. Returns the residual and the number of
+/// validation readings it read.
+///
+/// Refuses when the readings hold no such block, because a residual over no
+/// movement would read as a perfect validation of nothing.
+pub fn held_out_block_residual(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    coefficients: &[StoredKindCoefficient],
+    validation: &[crate::store::calibration::StoredFitObservation],
+) -> Result<(QuotaFractionPpm, u32), Error> {
+    let mut observations: Vec<FitObservation> = validation
+        .iter()
+        .map(|obs| {
+            FitObservation::new(
+                obs.evidence_id.clone(),
+                obs.at,
+                obs.quota_used_ppm,
+                obs.reported_resolution_ppm,
+                obs.quantization,
+                Credits::from_micros(0),
+            )
+        })
+        .collect();
+    observations
+        .sort_by(|a, b| (a.at, a.evidence_id.as_str()).cmp(&(b.at, b.evidence_id.as_str())));
+    let (usable, _) = partition_usable_observations(&observations);
+    let (Some(first), Some(last)) = (usable.first(), usable.last()) else {
+        return Err(Error::InsufficientEvidence(
+            "held-out validation holds no usable reading".into(),
+        ));
+    };
+    let usage = load_experiment_usage(conn, first.at, last.at)?;
+    let markers = markers_by_session(conn, &usage)?;
+    let (own_usage, _) = retain_account_usage(usage, &markers, &run.account)?;
+    let mut events: Vec<(UtcTimestamp, KnownTokenVector)> =
+        aggregate_event_tokens(own_usage)?.into_values().collect();
+    events.sort_by_key(|(at, _)| *at);
+
+    let predicted_ppm = |tokens: KnownTokenVector| -> f64 {
+        coefficients
+            .iter()
+            .map(|c| c.estimate_micro_ppm_per_token as f64 / MICRO * tokens.value(c.kind) as f64)
+            .sum()
+    };
+    let misses: Vec<f64> = settled_blocks(&usable, &events)
+        .into_iter()
+        .filter(|block| coefficients.iter().any(|c| block.tokens.value(c.kind) > 0))
+        .map(|block| (predicted_ppm(block.tokens) - block.delta_ppm).abs())
+        .collect();
+    if misses.is_empty() {
+        return Err(Error::InsufficientEvidence(format!(
+            "held-out validation holds no settled block of account '{}' usage in a fitted kind, so there is no movement to predict",
+            run.account
+        )));
+    }
+    let mean = misses.iter().sum::<f64>() / misses.len() as f64;
+    let residual = i32::try_from(mean.round() as i64)
+        .ok()
+        .and_then(QuotaFractionPpm::new)
+        .ok_or_else(|| {
+            Error::InsufficientEvidence(format!(
+                "held-out residual {mean:.0} ppm is not a fraction of the quota; the coefficients do not describe this window"
+            ))
+        })?;
+    let readings = u32::try_from(validation.len())
+        .map_err(|_| Error::Internal("validation reading count out of u32 range".into()))?;
+    Ok((residual, readings))
+}
+
+/// Records a per-kind result from a joint candidate: the coefficients, their
+/// intervals and the condition number exactly as the candidate recorded them,
+/// plus the held-out residual over validation evidence disjoint from the fit.
+///
+/// Refused rather than approximated whenever the figures would not be the
+/// candidate's own: a training set that is not the evidence the candidate was
+/// fitted from, a validation set that overlaps it, validation evidence the
+/// ledger does not hold, or a candidate already promoted. No coefficient is
+/// refitted: the joint candidate records its method, parameters and phase
+/// design itself, which is what the scalar path refits to recover.
+///
+/// Never activates anything.
+pub fn promote_multivariate_candidate(
+    conn: &mut Connection,
+    promotion: &super::fitter::CandidatePromotion<'_>,
+    clock: &impl Clock,
+) -> Result<MultivariateCalibration, Error> {
+    let candidate_id = MultivariateCandidateId::new(promotion.candidate_id.as_str());
+    let candidate = load_multivariate_candidate(conn, &candidate_id)?.ok_or_else(|| {
+        Error::Usage(format!(
+            "no joint calibration candidate '{}'; fit one with `aub calibrate fit`",
+            candidate_id.as_str()
+        ))
+    })?;
+    super::fitter::check_promotion_evidence(promotion)?;
+    let training_digest = EvidenceDigest::from_inputs(promotion.training);
+    if training_digest != candidate.inputs {
+        return Err(Error::Usage(format!(
+            "promote '{}': --training names {} evidence ids digesting to {:016x}, and the candidate was fitted from {} digesting to {:016x}",
+            candidate_id.as_str(),
+            training_digest.count(),
+            training_digest.digest(),
+            candidate.inputs.count(),
+            candidate.inputs.digest(),
+        )));
+    }
+    if let Some(existing) = load_multivariate_result_for_candidate(conn, &candidate_id)? {
+        return Err(Error::Usage(format!(
+            "promote '{}': already promoted as result '{}'; a result is immutable, and a second row would be a second identity for one fit",
+            candidate_id.as_str(),
+            existing.id.as_str()
+        )));
+    }
+    let run = load_by_experiment_id(conn, &candidate.experiment)?.ok_or_else(|| {
+        Error::InsufficientEvidence(format!(
+            "no controlled experiment '{}' behind joint candidate '{}'",
+            candidate.experiment.as_str(),
+            candidate_id.as_str()
+        ))
+    })?;
+    let stored_validation = super::fitter::load_validation_observations(
+        conn,
+        candidate_id.as_str(),
+        &candidate.provider,
+        &candidate.window_semantic_key,
+        promotion.validation,
+    )?;
+    let (held_out_residual, validation_observations) =
+        held_out_block_residual(conn, &run, &candidate.coefficients, &stored_validation)?;
+    let fit_residual = i32::try_from(candidate.fit_residual_ppm)
+        .ok()
+        .and_then(QuotaFractionPpm::new)
+        .ok_or_else(|| {
+            Error::Store(format!(
+                "joint candidate '{}' records fit residual {} ppm, outside a quota fraction",
+                candidate_id.as_str(),
+                candidate.fit_residual_ppm
+            ))
+        })?;
+
+    let result = MultivariateCalibration {
+        id: promoted_result_id(&CandidateId::new(candidate_id.as_str())),
+        candidate: candidate_id,
+        experiment: candidate.experiment.clone(),
+        provider: candidate.provider.clone(),
+        plan_tier: candidate.plan_tier.clone(),
+        window_semantic_key: candidate.window_semantic_key.clone(),
+        coefficients: candidate.coefficients.clone(),
+        condition_number: candidate.condition_number,
+        condition_number_threshold: candidate.condition_number_threshold,
+        fit_residual,
+        held_out_residual,
+        validation_observations,
+        sample_count: candidate.sample_count,
+        inputs: candidate.inputs,
+        fitting_evidence: EvidenceFingerprint::from_inputs(promotion.training),
+        validation_evidence: EvidenceFingerprint::from_inputs(promotion.validation),
+        validation_method: PER_KIND_VALIDATION_METHOD.to_string(),
+        validation_version: PER_KIND_VALIDATION_VERSION.to_string(),
+        statistical_method: candidate.statistical_method.clone(),
+        statistical_parameters: candidate.statistical_parameters.clone(),
+        phase_design: candidate.phase_design.clone(),
+        activation_policy_version: promotion.activation_policy_version.to_string(),
+        aub_version: crate::build_info::crate_version().to_string(),
+        source_revision: crate::build_info::source_revision().to_string(),
+        validity: candidate.validity,
+        fit_timestamp: candidate.knowledge_time,
+        knowledge_time: clock.now(),
+    };
+    insert_multivariate_result(conn, &result)?;
+    Ok(result)
 }
 
 #[cfg(test)]

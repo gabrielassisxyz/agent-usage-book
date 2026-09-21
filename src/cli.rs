@@ -868,7 +868,7 @@ impl Command {
                 "record OBSERVATION_ID WINDOW --surface NAME --surface-percent N [--granularity-percent N] [--read-at RFC3339] [--detail TEXT] | uncompared OBSERVATION_ID",
             ),
             Command::Calibrate => Some(
-                "begin --account NAME [--plan-tier TIER] --window KEY [--cost-model ID] [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
+                "begin --account NAME [--plan-tier TIER] --window KEY [--cost-model ID] [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-residual-ppm N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status => Some("--refresh | --session-id SESSION"),
@@ -2954,7 +2954,15 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
             window_semantic_key: crate::domain::window::WindowSemanticKey::new(self.window_key),
         };
         let calibration =
-            crate::store::calibration::load_active_at(self.conn, &scope, self.timestamp)?;
+            match crate::store::calibration::load_active_at(self.conn, &scope, self.timestamp)? {
+                None => None,
+                Some(active) => {
+                    match crate::calibration::conversion::require_scalar_calibration(active) {
+                        Ok(calibration) => Some(calibration),
+                        Err(refusal) => return Ok(refusal),
+                    }
+                }
+            };
 
         // Precedence, and the asymmetry in it (`aub-8vpc`): no calibration at
         // all falls back to a labelled estimate, while a calibration that is
@@ -7026,7 +7034,10 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     // reporting one.
     let plan_tier = "default";
 
-    let window_calibrations = match &meter {
+    let GatheredWindowCalibrations {
+        scalar: window_calibrations,
+        per_kind: per_kind_windows,
+    } = match &meter {
         crate::report::can_run::CanRunMeterReadiness::Fresh { windows, .. } => {
             gather_window_calibrations(
                 &conn,
@@ -7039,7 +7050,10 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         }
         crate::report::can_run::CanRunMeterReadiness::Stale { .. }
         | crate::report::can_run::CanRunMeterReadiness::AuthRequired => {
-            std::collections::BTreeMap::new()
+            GatheredWindowCalibrations {
+                scalar: std::collections::BTreeMap::new(),
+                per_kind: std::collections::BTreeSet::new(),
+            }
         }
     };
 
@@ -7051,6 +7065,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         &meter,
         &model,
         &window_calibrations,
+        &per_kind_windows,
         &config.models,
         timestamp,
     )?;
@@ -7149,23 +7164,26 @@ fn gather_window_calibrations(
     plan_tier: &str,
     provider: &str,
     generated_at: UtcTimestamp,
-) -> Result<
-    std::collections::BTreeMap<
-        crate::domain::window::WindowSemanticKey,
-        crate::report::can_run::WindowCalibrationLookup,
-    >,
-    Error,
-> {
+) -> Result<GatheredWindowCalibrations, Error> {
     let mut result = std::collections::BTreeMap::new();
+    let mut per_kind = std::collections::BTreeSet::new();
     for window in windows.iter().filter(|w| w.constrains(model)) {
         let scope = crate::store::calibration::CalibrationScope {
             provider: crate::store::cost_model::ProviderKey::new(provider),
             plan_tier: crate::store::calibration::PlanTier::new(plan_tier),
             window_semantic_key: window.semantic_key().clone(),
         };
-        let Some(cal) = crate::store::calibration::load_active_at(conn, &scope, generated_at)?
-        else {
-            continue;
+        // A per-kind calibration has no credits-per-point interval to bound
+        // headroom with. Its window gets no constraint, and is recorded so the
+        // rate-card estimate, which stands in only where no calibration record
+        // exists, does not stand in for it either.
+        let cal = match crate::store::calibration::load_active_at(conn, &scope, generated_at)? {
+            None => continue,
+            Some(crate::store::calibration::ActiveCalibration::PerKind(_)) => {
+                per_kind.insert(window.semantic_key().clone());
+                continue;
+            }
+            Some(crate::store::calibration::ActiveCalibration::Scalar(cal)) => cal,
         };
         // The applicability context mirrors the calibration's own scope
         // rather than an independently tracked lifecycle: no caller anywhere
@@ -7206,7 +7224,20 @@ fn gather_window_calibrations(
             },
         );
     }
-    Ok(result)
+    Ok(GatheredWindowCalibrations {
+        scalar: result,
+        per_kind,
+    })
+}
+
+/// What [`gather_window_calibrations`] found: the scalar lookups can-run
+/// bounds headroom with, and the windows whose active calibration is per-kind.
+struct GatheredWindowCalibrations {
+    scalar: std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::report::can_run::WindowCalibrationLookup,
+    >,
+    per_kind: std::collections::BTreeSet<crate::domain::window::WindowSemanticKey>,
 }
 
 /// Converts the percent-of-window rate cards into the same credit constraint a
@@ -7235,6 +7266,7 @@ fn gather_window_estimates(
         crate::domain::window::WindowSemanticKey,
         crate::report::can_run::WindowCalibrationLookup,
     >,
+    per_kind_calibrated: &std::collections::BTreeSet<crate::domain::window::WindowSemanticKey>,
     models: &crate::config::ModelTable,
     generated_at: UtcTimestamp,
 ) -> Result<
@@ -7261,7 +7293,9 @@ fn gather_window_estimates(
     let book = crate::valuation::RateBook::new(crate::store::rate_card::history(conn)?);
 
     for window in windows.iter().filter(|w| w.constrains(model)) {
-        if calibrations.contains_key(window.semantic_key()) {
+        if calibrations.contains_key(window.semantic_key())
+            || per_kind_calibrated.contains(window.semantic_key())
+        {
             continue;
         }
         let Some(kind) =
@@ -8830,15 +8864,25 @@ pub(crate) fn assemble_calibrate_show(
     now: UtcTimestamp,
 ) -> Result<CalibrateShowReport, Error> {
     let mut entries = Vec::new();
+    let mut per_kind_entries = Vec::new();
     for scope in crate::store::calibration::fitted_calibration_scopes(conn)? {
-        if let Some(calibration) = crate::store::calibration::load_active_at(conn, &scope, now)? {
-            entries.push(calibrate_show_entry_for(conn, &calibration, now, true)?);
+        match crate::store::calibration::load_active_at(conn, &scope, now)? {
+            None => {}
+            Some(crate::store::calibration::ActiveCalibration::Scalar(calibration)) => {
+                entries.push(calibrate_show_entry_for(conn, &calibration, now, true)?);
+            }
+            Some(crate::store::calibration::ActiveCalibration::PerKind(calibration)) => {
+                per_kind_entries.push(calibrate_per_kind_entry(conn, &calibration)?);
+            }
         }
     }
     entries.sort_by(|left, right| left.calibration_id.cmp(&right.calibration_id));
+    per_kind_entries
+        .sort_by(|left, right| left.result.calibration_id.cmp(&right.result.calibration_id));
     Ok(CalibrateShowReport {
         metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
         entries,
+        per_kind_entries,
     })
 }
 
@@ -8869,17 +8913,7 @@ pub(crate) fn assemble_calibrate_history(
     for calibration in crate::store::calibration::list_all_results(conn)? {
         let mut events = Vec::new();
         for event in crate::store::calibration::activation_events_for(conn, calibration.id())? {
-            let kind_label = match event.kind {
-                crate::store::calibration::CalibrationEventKind::Activation => "activation",
-                crate::store::calibration::CalibrationEventKind::Supersession => "supersession",
-            };
-            events.push(CalibrateLifecycleEventView {
-                kind_label: kind_label.to_string(),
-                event_at_nanos: event.event_at.unix_nanos(),
-                actor: event.actor.as_str().to_string(),
-                activation_policy_version: event.activation_policy_version.clone(),
-                supersedes: event.supersedes.map(|id| id.as_str().to_string()),
-            });
+            events.push(calibrate_lifecycle_event_view(event));
         }
         entries.push(CalibrateHistoryEntry {
             calibration_id: calibration.id().as_str().to_string(),
@@ -8895,9 +8929,15 @@ pub(crate) fn assemble_calibrate_history(
             events,
         });
     }
+    let per_kind_entries =
+        crate::store::calibration_multivariate_result::list_all_multivariate_results(conn)?
+            .iter()
+            .map(|result| calibrate_per_kind_entry(conn, result))
+            .collect::<Result<Vec<_>, Error>>()?;
     Ok(CalibrateHistoryReport {
         metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
         entries,
+        per_kind_entries,
     })
 }
 
@@ -8917,21 +8957,130 @@ fn calibrate_history_command(clock: &impl Clock, invocation: &Invocation) -> Res
     Ok(())
 }
 
-/// Loads one calibration result by its semantic id, or explains which id is
-/// missing.
+fn calibrate_lifecycle_event_view(
+    event: crate::store::calibration::ActivationEvent,
+) -> CalibrateLifecycleEventView {
+    let kind_label = match event.kind {
+        crate::store::calibration::CalibrationEventKind::Activation => "activation",
+        crate::store::calibration::CalibrationEventKind::Supersession => "supersession",
+    };
+    CalibrateLifecycleEventView {
+        kind_label: kind_label.to_string(),
+        event_at_nanos: event.event_at.unix_nanos(),
+        actor: event.actor.as_str().to_string(),
+        activation_policy_version: event.activation_policy_version,
+        supersedes: event.supersedes.map(|id| id.as_str().to_string()),
+    }
+}
+
+/// A per-kind result in the shape every calibrate report shows it.
+fn calibrate_per_kind_result_view(
+    result: &crate::store::calibration_multivariate_result::MultivariateCalibration,
+) -> crate::report::CalibratePerKindResultView {
+    crate::report::CalibratePerKindResultView {
+        calibration_id: result.id.as_str().to_string(),
+        candidate_id: result.candidate.as_str().to_string(),
+        experiment_id: result.experiment.as_str().to_string(),
+        provider: result.provider.as_str().to_string(),
+        plan_tier: result.plan_tier.as_str().to_string(),
+        window_semantic_key: result.window_semantic_key.as_str().to_string(),
+        coefficients: result
+            .coefficients
+            .iter()
+            .map(|c| crate::report::CalibrateKindCoefficientView {
+                kind_label: c.kind.label().to_string(),
+                estimate_micro_ppm_per_token: c.estimate_micro_ppm_per_token,
+                std_error_micro_ppm_per_token: c.std_error_micro_ppm_per_token,
+                interval_low_micro_ppm_per_token: c.interval_low_micro_ppm_per_token,
+                interval_high_micro_ppm_per_token: c.interval_high_micro_ppm_per_token,
+            })
+            .collect(),
+        condition_number_micros: result.condition_number.micros(),
+        condition_number_threshold_micros: result.condition_number_threshold.micros(),
+        fit_residual_ppm: result.fit_residual.get(),
+        held_out_residual_ppm: result.held_out_residual.get(),
+        validation_observations: result.validation_observations,
+        sample_count: result.sample_count,
+        statistical_method: result.statistical_method.clone(),
+        statistical_parameters: result.statistical_parameters.clone(),
+        phase_design: result.phase_design.clone(),
+        validation_method: result.validation_method.clone(),
+        validation_version: result.validation_version.clone(),
+        inputs_digest_hex: format!("{:016x}", result.inputs.digest()),
+        inputs_count: result.inputs.count(),
+        fitting_evidence_digest_hex: format!("{:016x}", result.fitting_evidence.as_u64()),
+        validation_evidence_digest_hex: format!("{:016x}", result.validation_evidence.as_u64()),
+        fit_timestamp_nanos: result.fit_timestamp.unix_nanos(),
+        activation_policy_version: result.activation_policy_version.clone(),
+        aub_version: result.aub_version.clone(),
+        source_revision: result.source_revision.clone(),
+    }
+}
+
+/// One per-kind calibration with its lifecycle events and health. Its health
+/// is decided by its lifecycle alone: applicability is judged against the
+/// calibration's own scope here exactly as `calibrate_health_label` does for a
+/// scalar one, no drift finding or review horizon is consulted for either, and
+/// a per-kind result references no cost model whose supersession could
+/// retire it.
+fn calibrate_per_kind_entry(
+    conn: &rusqlite::Connection,
+    result: &crate::store::calibration_multivariate_result::MultivariateCalibration,
+) -> Result<crate::report::CalibratePerKindEntry, Error> {
+    use crate::calibration::health::{CalibrationHealth, LifecycleState};
+    let events: Vec<CalibrateLifecycleEventView> =
+        crate::store::calibration_multivariate_result::multivariate_activation_events_for(
+            conn, &result.id,
+        )?
+        .into_iter()
+        .map(calibrate_lifecycle_event_view)
+        .collect();
+    let state = if events.is_empty() {
+        LifecycleState::NeverActivated
+    } else if crate::store::calibration_multivariate_result::is_multivariate_superseded(
+        conn, &result.id,
+    )? {
+        LifecycleState::Superseded
+    } else {
+        LifecycleState::Active
+    };
+    let health = match state {
+        LifecycleState::NeverActivated => CalibrationHealth::Provisional,
+        LifecycleState::Superseded => CalibrationHealth::Superseded,
+        LifecycleState::Active => CalibrationHealth::Current,
+    };
+    Ok(crate::report::CalibratePerKindEntry {
+        result: calibrate_per_kind_result_view(result),
+        health_label: health.label().to_string(),
+        is_active: state == LifecycleState::Active,
+        events,
+    })
+}
+
+/// Loads one scalar calibration result by its semantic id, or explains which
+/// id is missing. A per-kind id is refused by name: the readers of this
+/// function compare credits-per-point coefficients, which it has none of.
 fn calibrate_load_result(
     conn: &rusqlite::Connection,
     id: &str,
 ) -> Result<crate::store::calibration::WindowCalibration, Error> {
-    crate::store::calibration::load_result(
+    let calibration_id = crate::domain::provenance::WindowCalibrationId::new(id);
+    if let Some(calibration) = crate::store::calibration::load_result(conn, &calibration_id)? {
+        return Ok(calibration);
+    }
+    if crate::store::calibration_multivariate_result::load_multivariate_result(
         conn,
-        &crate::domain::provenance::WindowCalibrationId::new(id),
+        &calibration_id,
     )?
-    .ok_or_else(|| {
-        Error::Usage(format!(
-            "no calibration '{id}'; list them with `aub calibrate history`"
-        ))
-    })
+    .is_some()
+    {
+        return Err(Error::Usage(format!(
+            "calibration '{id}' is per-kind and has no credits-per-point coefficient to compare; read its coefficients with `aub calibrate history`"
+        )));
+    }
+    Err(Error::Usage(format!(
+        "no calibration '{id}'; list them with `aub calibrate history`"
+    )))
 }
 
 /// Assembles the `calibrate compare` report: the percentage difference
@@ -9077,14 +9226,21 @@ fn calibrate_split_evidence(raw: &str) -> Vec<String> {
         .collect()
 }
 
+/// What `calibrate promote` recorded, in the shape its candidate had.
+pub(crate) enum CalibratePromoteOutcome {
+    Scalar(crate::report::CalibratePromoteReport),
+    PerKind(crate::report::CalibratePerKindPromoteReport),
+}
+
 /// The testable core of `calibrate promote`: records a result from a fitted
-/// candidate and never activates it (invariant 14).
+/// candidate and never activates it (invariant 14). A joint candidate becomes
+/// a per-kind result; its coefficients are never reduced to one scalar.
 pub(crate) fn calibrate_promote_validated(
     conn: &mut rusqlite::Connection,
     args: &CalibratePromoteArgs,
     clock: &impl Clock,
     now: UtcTimestamp,
-) -> Result<crate::report::CalibratePromoteReport, Error> {
+) -> Result<CalibratePromoteOutcome, Error> {
     let candidate_id = crate::store::calibration::CandidateId::new(&args.candidate_id);
     let training: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
         .training
@@ -9102,37 +9258,68 @@ pub(crate) fn calibrate_promote_validated(
         validation: &validation,
         activation_policy_version: &args.policy_version,
     };
+    let joint = crate::store::calibration_multivariate::load_multivariate_candidate(
+        conn,
+        &crate::store::calibration_multivariate::MultivariateCandidateId::new(&args.candidate_id),
+    )?;
+    if joint.is_some() {
+        let result = crate::calibration::multivariate_fit::promote_multivariate_candidate(
+            conn, &promotion, clock,
+        )?;
+        return Ok(CalibratePromoteOutcome::PerKind(
+            crate::report::CalibratePerKindPromoteReport {
+                metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+                result: calibrate_per_kind_result_view(&result),
+            },
+        ));
+    }
     let promoted = crate::calibration::fitter::promote_candidate(conn, &promotion, clock)?;
-    Ok(crate::report::CalibratePromoteReport {
-        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
-        result_id: promoted.result_id,
-        candidate_id: promoted.candidate_id,
-        experiment_id: promoted.experiment_id,
-        provider: promoted.provider,
-        plan_tier: promoted.plan_tier,
-        window_semantic_key: promoted.window_semantic_key,
-        fitted_micros_per_point: promoted.fitted_micros_per_point,
-        fit_residual_micros: promoted.fit_residual_micros,
-        held_out_residual_micros: promoted.held_out_residual_micros,
-        validation_observations: promoted.validation_observations,
-        fitting_evidence_digest_hex: promoted.fitting_evidence_digest_hex,
-        validation_evidence_digest_hex: promoted.validation_evidence_digest_hex,
-        validation_method: promoted.validation_method,
-        validation_version: promoted.validation_version,
-        activation_policy_version: promoted.activation_policy_version,
-        uncertainty_low_micros_per_point: promoted.uncertainty_low_micros_per_point,
-        uncertainty_high_micros_per_point: promoted.uncertainty_high_micros_per_point,
-    })
+    Ok(CalibratePromoteOutcome::Scalar(
+        crate::report::CalibratePromoteReport {
+            metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+            result_id: promoted.result_id,
+            candidate_id: promoted.candidate_id,
+            experiment_id: promoted.experiment_id,
+            provider: promoted.provider,
+            plan_tier: promoted.plan_tier,
+            window_semantic_key: promoted.window_semantic_key,
+            fitted_micros_per_point: promoted.fitted_micros_per_point,
+            fit_residual_micros: promoted.fit_residual_micros,
+            held_out_residual_micros: promoted.held_out_residual_micros,
+            validation_observations: promoted.validation_observations,
+            fitting_evidence_digest_hex: promoted.fitting_evidence_digest_hex,
+            validation_evidence_digest_hex: promoted.validation_evidence_digest_hex,
+            validation_method: promoted.validation_method,
+            validation_version: promoted.validation_version,
+            activation_policy_version: promoted.activation_policy_version,
+            uncertainty_low_micros_per_point: promoted.uncertainty_low_micros_per_point,
+            uncertainty_high_micros_per_point: promoted.uncertainty_high_micros_per_point,
+        },
+    ))
 }
 
 fn calibrate_promote_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Error> {
     let args = calibrate_parse_promote(&invocation.rest[1..])?;
     let mut conn = open_ledger(clock)?;
     let now = clock.now();
-    let report = calibrate_promote_validated(&mut conn, &args, clock, now)?;
-    match invocation.format {
-        OutputFormat::Text => print!("{}", render_calibrate_promote_report(&report)),
-        OutputFormat::Json => println!("{}", calibrate_promote_json(&report, RunId::new(now))),
+    match (
+        calibrate_promote_validated(&mut conn, &args, clock, now)?,
+        invocation.format,
+    ) {
+        (CalibratePromoteOutcome::Scalar(report), OutputFormat::Text) => {
+            print!("{}", render_calibrate_promote_report(&report));
+        }
+        (CalibratePromoteOutcome::Scalar(report), OutputFormat::Json) => {
+            println!("{}", calibrate_promote_json(&report, RunId::new(now)));
+        }
+        (CalibratePromoteOutcome::PerKind(report), OutputFormat::Text) => print!(
+            "{}",
+            crate::presentation::render::render_calibrate_per_kind_promote_report(&report)
+        ),
+        (CalibratePromoteOutcome::PerKind(report), OutputFormat::Json) => println!(
+            "{}",
+            crate::presentation::json::calibrate_per_kind_promote_json(&report, RunId::new(now))
+        ),
     }
     Ok(())
 }
@@ -9143,6 +9330,11 @@ fn calibrate_promote_command(clock: &impl Clock, invocation: &Invocation) -> Res
 /// of its own by design, so every caller names the bounds it judges under.
 const CALIBRATE_ACTIVATE_DEFAULT_MAX_RESIDUAL_MICROS: i64 = 100_000;
 const CALIBRATE_ACTIVATE_DEFAULT_MAX_CONDITION_MICROS: i64 = 30_000_000;
+/// The default bound on a per-kind result's held-out residual: one percentage
+/// point of quota, the resolution the providers this binary reads report
+/// usage at, so a residual under it is indistinguishable from the meter's own
+/// rounding.
+const CALIBRATE_ACTIVATE_DEFAULT_MAX_RESIDUAL_PPM: i32 = 10_000;
 
 #[derive(Debug)]
 pub(crate) struct CalibrateActivateArgs {
@@ -9152,11 +9344,12 @@ pub(crate) struct CalibrateActivateArgs {
     pub(crate) training: Vec<String>,
     pub(crate) validation: Vec<String>,
     pub(crate) max_residual_micros: i64,
+    pub(crate) max_residual_ppm: i32,
     pub(crate) max_condition_micros: i64,
 }
 
 fn calibrate_parse_activate(rest: &[String]) -> Result<CalibrateActivateArgs, Error> {
-    let usage = "calibrate activate requires ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]";
+    let usage = "calibrate activate requires ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-residual-ppm N] [--max-condition-micros N]";
     let mut args = CalibrateActivateArgs {
         calibration_id: String::new(),
         actor: "operator".to_string(),
@@ -9164,6 +9357,7 @@ fn calibrate_parse_activate(rest: &[String]) -> Result<CalibrateActivateArgs, Er
         training: Vec::new(),
         validation: Vec::new(),
         max_residual_micros: CALIBRATE_ACTIVATE_DEFAULT_MAX_RESIDUAL_MICROS,
+        max_residual_ppm: CALIBRATE_ACTIVATE_DEFAULT_MAX_RESIDUAL_PPM,
         max_condition_micros: CALIBRATE_ACTIVATE_DEFAULT_MAX_CONDITION_MICROS,
     };
     let mut rest = rest.iter();
@@ -9225,6 +9419,11 @@ fn calibrate_parse_activate(rest: &[String]) -> Result<CalibrateActivateArgs, Er
                     "--max-residual-micros must be an integer number of micro-credits, got {value:?}"
                 ))
             })?;
+        } else if arg == "--max-residual-ppm" {
+            let raw = calibrate_next_arg(&mut rest, "--max-residual-ppm")?;
+            args.max_residual_ppm = calibrate_parse_residual_ppm(&raw)?;
+        } else if let Some(value) = arg.strip_prefix("--max-residual-ppm=") {
+            args.max_residual_ppm = calibrate_parse_residual_ppm(value)?;
         } else if arg == "--max-condition-micros" {
             let raw = calibrate_next_arg(&mut rest, "--max-condition-micros")?;
             args.max_condition_micros = raw.parse().map_err(|_| {
@@ -9268,6 +9467,40 @@ fn calibrate_parse_activate(rest: &[String]) -> Result<CalibrateActivateArgs, Er
     Ok(args)
 }
 
+fn calibrate_parse_residual_ppm(raw: &str) -> Result<i32, Error> {
+    raw.parse::<i32>()
+        .ok()
+        .filter(|ppm| crate::domain::quota::QuotaFractionPpm::new(*ppm).is_some())
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "--max-residual-ppm must be an integer from 0 to 1000000 parts per million of quota, got {raw:?}"
+            ))
+        })
+}
+
+/// The activation policy `calibrate activate` judges under, for either shape:
+/// the credit residual bound a scalar result is read against, the quota bound
+/// a per-kind result is read against, and the condition bound both share.
+fn calibrate_activation_policy(
+    args: &CalibrateActivateArgs,
+    policy_version: String,
+) -> Result<crate::calibration::activation::ActivationPolicy, Error> {
+    let quota_bound = crate::domain::quota::QuotaFractionPpm::new(args.max_residual_ppm)
+        .ok_or_else(|| {
+            Error::Usage(format!(
+                "--max-residual-ppm {} is not a fraction of the quota",
+                args.max_residual_ppm
+            ))
+        })?;
+    Ok(crate::calibration::activation::ActivationPolicy::new(
+        policy_version,
+        crate::domain::credits::Credits::from_micros(args.max_residual_micros),
+        crate::store::calibration::ConditionNumber::from_micros(args.max_condition_micros),
+    )
+    .map_err(|refusal| Error::Usage(format!("invalid activation policy: {refusal}")))?
+    .with_max_quota_residual(quota_bound))
+}
+
 /// Performs the explicit activation `calibrate activate` names: the request
 /// judges exactly the evidence the result recorded (same digests), over
 /// disjoint training and validation sets, with the recorded held-out
@@ -9283,7 +9516,6 @@ pub(crate) fn calibrate_activate_validated(
     args: &CalibrateActivateArgs,
     now: UtcTimestamp,
 ) -> Result<CalibrateActivateReport, Error> {
-    use crate::domain::credits::Credits;
     let id = crate::domain::provenance::WindowCalibrationId::new(&args.calibration_id);
     let calibration = crate::store::calibration::load_result(conn, &id)?.ok_or_else(|| {
         Error::Usage(format!(
@@ -9307,13 +9539,14 @@ pub(crate) fn calibrate_activate_validated(
         .policy_version
         .clone()
         .unwrap_or_else(|| calibration.activation_policy_version().to_string());
-    let policy = crate::calibration::activation::ActivationPolicy::new(
-        policy_version.clone(),
-        Credits::from_micros(args.max_residual_micros),
-        crate::store::calibration::ConditionNumber::from_micros(args.max_condition_micros),
-    )
-    .map_err(|refusal| Error::Usage(format!("invalid activation policy: {refusal}")))?;
-    let verdict = calibrate_activate_source_contamination(conn, &id, now)?;
+    let policy = calibrate_activation_policy(args, policy_version.clone())?;
+    let sources = crate::store::calibration::source_experiments(conn, &id)?
+        .into_iter()
+        .map(|experiment| {
+            crate::store::calibration_controlled::ControlledExperimentId::new(experiment.as_str())
+        })
+        .collect::<Vec<_>>();
+    let verdict = calibrate_activate_source_contamination(conn, &sources, now)?;
     let request = crate::calibration::activation::ActivationRequest {
         actor: &actor,
         policy: &policy,
@@ -9321,12 +9554,7 @@ pub(crate) fn calibrate_activate_validated(
         validation: &validation,
         contamination: &verdict,
     };
-    let scope = calibration.scope();
-    let supersedes = match crate::store::calibration::load_active_at(conn, &scope, now)? {
-        None => None,
-        Some(current) if current.id().as_str() == args.calibration_id => None,
-        Some(current) => Some(current.id().clone()),
-    };
+    let supersedes = calibrate_activation_predecessor(conn, &calibration.scope(), &id, now)?;
     crate::store::calibration::activate(conn, &id, now, supersedes.as_ref(), &request)?;
     Ok(CalibrateActivateReport {
         metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
@@ -9347,6 +9575,80 @@ pub(crate) fn calibrate_activate_validated(
     })
 }
 
+/// The calibration a new activation in `scope` must name as its predecessor:
+/// whichever is active there now, of either shape, unless it is the one
+/// being activated.
+fn calibrate_activation_predecessor(
+    conn: &rusqlite::Connection,
+    scope: &crate::store::calibration::CalibrationScope,
+    id: &crate::domain::provenance::WindowCalibrationId,
+    now: UtcTimestamp,
+) -> Result<Option<crate::domain::provenance::WindowCalibrationId>, Error> {
+    Ok(
+        match crate::store::calibration::load_active_at(conn, scope, now)? {
+            None => None,
+            Some(current) if current.id() == id => None,
+            Some(current) => Some(current.id().clone()),
+        },
+    )
+}
+
+/// The explicit activation of a per-kind result: the same evidence, policy,
+/// contamination and predecessor rules as a scalar one, with the held-out
+/// residual judged against the quota bound in the unit it was recorded in.
+pub(crate) fn calibrate_activate_per_kind_validated(
+    conn: &mut rusqlite::Connection,
+    args: &CalibrateActivateArgs,
+    result: &crate::store::calibration_multivariate_result::MultivariateCalibration,
+    now: UtcTimestamp,
+) -> Result<crate::report::CalibratePerKindActivateReport, Error> {
+    let training: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
+        .training
+        .iter()
+        .map(crate::domain::provenance::EvidenceId::new)
+        .collect();
+    let validation: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> = args
+        .validation
+        .iter()
+        .map(crate::domain::provenance::EvidenceId::new)
+        .collect();
+    let actor = crate::calibration::activation::ActivationActor::new(&args.actor)
+        .map_err(|refusal| Error::Usage(format!("invalid --actor: {refusal}")))?;
+    let policy_version = args
+        .policy_version
+        .clone()
+        .unwrap_or_else(|| result.activation_policy_version.clone());
+    let policy = calibrate_activation_policy(args, policy_version.clone())?;
+    let verdict = calibrate_activate_source_contamination(
+        conn,
+        std::slice::from_ref(&result.experiment),
+        now,
+    )?;
+    let request = crate::calibration::activation::ActivationRequest {
+        actor: &actor,
+        policy: &policy,
+        training: &training,
+        validation: &validation,
+        contamination: &verdict,
+    };
+    let supersedes = calibrate_activation_predecessor(conn, &result.scope(), &result.id, now)?;
+    crate::store::calibration_multivariate_result::activate_multivariate(
+        conn,
+        &result.id,
+        now,
+        supersedes.as_ref(),
+        &request,
+    )?;
+    Ok(crate::report::CalibratePerKindActivateReport {
+        metadata: ReportMetadata::new(now, now, calibrate_ledger_generation(conn), None),
+        result: calibrate_per_kind_result_view(result),
+        supersedes: supersedes.map(|id| id.as_str().to_string()),
+        actor: args.actor.clone(),
+        activation_policy_version: policy_version,
+        event_at_nanos: now.unix_nanos(),
+    })
+}
+
 /// The contamination verdict standing against a result: every source
 /// experiment that is a controlled run is evaluated, and one whose verdict
 /// refuses activation is refused through the store's contaminated-run
@@ -9354,15 +9656,13 @@ pub(crate) fn calibrate_activate_validated(
 /// thresholds, so it contributes no finding.
 fn calibrate_activate_source_contamination(
     conn: &rusqlite::Connection,
-    id: &crate::domain::provenance::WindowCalibrationId,
+    sources: &[crate::store::calibration_controlled::ControlledExperimentId],
     now: UtcTimestamp,
 ) -> Result<crate::calibration::contamination::ContaminationVerdict, Error> {
     let mut standing = crate::calibration::contamination::ContaminationVerdict::clean();
-    for experiment in crate::store::calibration::source_experiments(conn, id)? {
-        let Some(run) = crate::store::calibration_controlled::load_by_experiment_id(
-            conn,
-            &crate::store::calibration_controlled::ControlledExperimentId::new(experiment.as_str()),
-        )?
+    for experiment in sources {
+        let Some(run) =
+            crate::store::calibration_controlled::load_by_experiment_id(conn, experiment)?
         else {
             continue;
         };
@@ -9380,6 +9680,27 @@ fn calibrate_activate_command(clock: &impl Clock, invocation: &Invocation) -> Re
     let args = calibrate_parse_activate(&invocation.rest[1..])?;
     let mut conn = open_ledger(clock)?;
     let now = clock.now();
+    let per_kind = crate::store::calibration_multivariate_result::load_multivariate_result(
+        &conn,
+        &crate::domain::provenance::WindowCalibrationId::new(&args.calibration_id),
+    )?;
+    if let Some(result) = per_kind {
+        let report = calibrate_activate_per_kind_validated(&mut conn, &args, &result, now)?;
+        match invocation.format {
+            OutputFormat::Text => println!(
+                "{}",
+                crate::presentation::render::render_calibrate_per_kind_activate_report(&report)
+            ),
+            OutputFormat::Json => println!(
+                "{}",
+                crate::presentation::json::calibrate_per_kind_activate_json(
+                    &report,
+                    RunId::new(now)
+                )
+            ),
+        }
+        return Ok(());
+    }
     let report = calibrate_activate_validated(&mut conn, &args, now)?;
     match invocation.format {
         OutputFormat::Text => println!("{}", render_calibrate_activate_report(&report)),
@@ -13542,6 +13863,7 @@ usage_evidence = "measured"
                 training: vec!["s-1".to_string(), "s-2".to_string()],
                 validation: vec!["s-3".to_string()],
                 max_residual_micros: 100_000,
+                max_residual_ppm: 10_000,
                 max_condition_micros: 30_000_000,
             }
         }
@@ -13957,6 +14279,7 @@ usage_evidence = "measured"
         let empty = CalibrateShowReport {
             metadata: show.metadata.clone(),
             entries: Vec::new(),
+            per_kind_entries: Vec::new(),
         };
         let empty_text = render_calibrate_show_report(&empty);
         assert!(empty_text.contains("no active calibration"), "{empty_text}");
@@ -13964,6 +14287,7 @@ usage_evidence = "measured"
         let empty_history = CalibrateHistoryReport {
             metadata: show.metadata.clone(),
             entries: Vec::new(),
+            per_kind_entries: Vec::new(),
         };
         fx::assert_no_bare_coefficient(&render_calibrate_history_report(&empty_history));
     }

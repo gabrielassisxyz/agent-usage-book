@@ -54,7 +54,9 @@ use agent_usage_book::domain::window::{
 use agent_usage_book::evidence::{
     CoverageCompleteness, Derivation, EvidenceQuality, Provenance, Qualified,
 };
-use agent_usage_book::store::calibration::{CalibrationScope, PlanTier, load_active_at};
+use agent_usage_book::store::calibration::{
+    ActiveCalibration, CalibrationScope, PlanTier, load_active_at,
+};
 use agent_usage_book::store::connection::{self, AccessMode, PragmaPolicy};
 use agent_usage_book::store::cost_model::ProviderKey;
 use agent_usage_book::store::meter_attempt::{
@@ -630,10 +632,13 @@ fn assert_library_reads(
         plan_tier: PlanTier::new("default"),
         window_semantic_key: WindowSemanticKey::new("five_hour"),
     };
-    let calibration = load_active_at(&conn, &scope, at)
+    let active = load_active_at(&conn, &scope, at)
         .expect("the active calibration must load")
         .expect("one calibration must be active");
-    assert_eq!(calibration.id().as_str(), expected_id);
+    assert_eq!(active.id().as_str(), expected_id);
+    let ActiveCalibration::Scalar(calibration) = active else {
+        panic!("the seeded calibration is scalar: {active:?}");
+    };
 
     let model = agent_usage_book::store::cost_model::load_active_at(&conn, at)
         .expect("the active cost model must load")

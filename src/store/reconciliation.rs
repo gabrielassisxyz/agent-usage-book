@@ -28,7 +28,7 @@ use crate::reconciliation::{
     reconcile,
 };
 use crate::store::account::AccountId;
-use crate::store::calibration::{CalibrationScope, PlanTier, WindowCalibration};
+use crate::store::calibration::{ActiveCalibration, CalibrationScope, PlanTier, WindowCalibration};
 use crate::store::cost_model::ProviderKey;
 use crate::store::meter_evidence::ObservationRowId;
 
@@ -130,8 +130,15 @@ pub fn reconcile_candidate_from_store(
         window_semantic_key: window_key.clone(),
     };
 
+    // Reconciliation converts meter movement into credits through a
+    // credits-per-point coefficient. A per-kind calibration has none, so it
+    // leaves the interval without an applicable calibration, which the
+    // eligibility check reports by name rather than as an uncalibrated scope.
     let active_calibration =
-        crate::store::calibration::load_active_at(conn, &scope, knowledge_time)?;
+        match crate::store::calibration::load_active_at(conn, &scope, knowledge_time)? {
+            Some(ActiveCalibration::Scalar(calibration)) => Some(calibration),
+            Some(ActiveCalibration::PerKind(_)) | None => None,
+        };
     let calibration_health = if let Some(ref cal) = active_calibration {
         let facts = CalibrationFacts {
             plan_tier: cal.plan_tier().clone(),

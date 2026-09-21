@@ -276,6 +276,18 @@ const POPULATION: &[(&str, Populate)] = &[
         "window_calibration_multivariate_coefficient",
         populate_window_calibration_multivariate_coefficient,
     ),
+    (
+        "window_calibration_multivariate_result",
+        populate_window_calibration_multivariate_result,
+    ),
+    (
+        "window_calibration_multivariate_result_coefficient",
+        populate_window_calibration_multivariate_result_coefficient,
+    ),
+    (
+        "calibration_multivariate_lifecycle",
+        populate_calibration_multivariate_lifecycle,
+    ),
     ("attribution_segment", populate_attribution_segment),
     ("ingest_quarantine", populate_ingest_quarantine),
     ("ingestion_generation", populate_ingestion_generation),
@@ -745,6 +757,46 @@ fn populate_window_calibration_multivariate_coefficient(
             (2, 1, 'output', 1, 0, 1, 1),
             (3, 1, 'cache_read', 1, 0, 1, 1),
             (4, 1, 'cache_write', 1, 0, 1, 1)",
+    )
+}
+
+fn populate_window_calibration_multivariate_result(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    // Condition number on its floor of one, both residuals on the zero floor,
+    // the two-observation validation floor, and zero counts; the id differs
+    // from every scalar result's, which a trigger enforces across the shapes.
+    exec(
+        conn,
+        "window_calibration_multivariate_result",
+        "INSERT INTO window_calibration_multivariate_result (id, calibration_id, window_calibration_multivariate_candidate_id, provider, plan_tier, window_semantic_key, condition_number_micros, condition_number_threshold_micros, fit_residual_ppm, held_out_residual_ppm, validation_observation_count, sample_count, inputs_digest, inputs_count, fitting_evidence_digest, validation_evidence_digest, validation_method, validation_version, statistical_method, statistical_parameters, phase_design, activation_policy_version, aub_version, source_revision, valid_from, valid_until, knowledge_time) VALUES
+            (1, 'matrix-mv-result-1', 1, 'anthropic', 'pro', 'matrix-key-1', 1000000, 1000001, 0, 0, 2, 0, '0123456789abcdef', 0, '0123456789abcdef', 'fedcba9876543210', 'held-out-block-residual', 'v1', 'ols-through-origin', '{}', 'matrix-design', 'promote-v1', '0.0.0', 'matrix-revision', 700, 700, 720)",
+    )
+}
+
+fn populate_window_calibration_multivariate_result_coefficient(
+    conn: &rusqlite::Connection,
+) -> Result<(), String> {
+    // A zero estimate one standard error wide, the sign rule's boundary, next
+    // to degenerate intervals on the other kinds.
+    exec(
+        conn,
+        "window_calibration_multivariate_result_coefficient",
+        "INSERT INTO window_calibration_multivariate_result_coefficient (id, window_calibration_multivariate_result_id, token_kind, estimate_micro_ppm_per_token, std_error_micro_ppm_per_token, interval_low_micro_ppm_per_token, interval_high_micro_ppm_per_token) VALUES
+            (1, 1, 'input', 1, 0, 1, 1),
+            (2, 1, 'output', 1, 0, 1, 1),
+            (3, 1, 'cache_read', -2, 1, -4, 0),
+            (4, 1, 'cache_write', 1, 0, 1, 1)",
+    )
+}
+
+fn populate_calibration_multivariate_lifecycle(conn: &rusqlite::Connection) -> Result<(), String> {
+    // A per-kind activation superseding the scalar result active since 30.
+    exec(
+        conn,
+        "calibration_multivariate_lifecycle",
+        "INSERT INTO calibration_multivariate_lifecycle (id, window_calibration_multivariate_result_id, event_kind, event_at, supersedes_result_id, supersedes_multivariate_result_id, actor, activation_policy_version, fitting_evidence_digest, validation_evidence_digest) VALUES
+            (1, 1, 'supersession', 730, 1, NULL, 'matrix-actor', 'promote-v1', '0123456789abcdef', 'fedcba9876543210')",
     )
 }
 
