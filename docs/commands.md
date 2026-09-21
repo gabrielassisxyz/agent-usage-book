@@ -943,6 +943,29 @@ database is opened read-only and parsed whole, never sliced by lines.
 never writes or deletes a meter attempt, a response, an observation, a
 calibration, or any other irreplaceable evidence.
 
+**Progress:** while it runs, `aub ingest transcripts` writes one line per
+progress report to stderr, whatever the log level, naming the phase it is in:
+
+```
+ingest transcripts: scanning files=100/5900 events=12345 elapsed=1s rate=98.2 files/s
+ingest transcripts: deduplicating events=304544 elapsed=22s
+ingest transcripts: writing batches=12/72 events=95000/304544 elapsed=52s rate=3113.9 events/s
+```
+
+- `scanning` prints every 100 files or 30 seconds, whichever comes first, and
+  once more for the last file. `events` counts the usage events parsed so far,
+  and `rate` is files read per second since the previous line.
+- `deduplicating` prints exactly once, when the last file is parsed. It covers
+  deduplication, session resolution and batch splitting, which print nothing
+  else until the first batch is written.
+- `writing` prints once when the first batch starts (`batches=0/N`, no rate),
+  then after a committed batch whenever a second or more has passed since the
+  previous line, and always after the last batch, which reads `batches=N/N`.
+  `rate` is events committed per second since the previous line.
+
+A line prints a rate only once time has passed since the previous line, and
+every rate carries its unit. The two summary lines on stdout are unchanged.
+
 ## `aub rebuild`
 
 **Answers:** can the transcript-derived materializations be rebuilt from

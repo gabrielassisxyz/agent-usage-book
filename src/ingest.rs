@@ -28,13 +28,14 @@
 //! file consumed while its events are still unlanded would let a later
 //! `--changed-only` pass skip exactly the rows a crash dropped.
 //!
-//! The pass also reports its own progress to a caller-supplied sink, at
-//! least once every [`PROGRESS_FILE_INTERVAL`] files or
-//! [`PROGRESS_TIME_INTERVAL`], whichever comes first (`aub-va6s`): files done
-//! of the total discovered, sessions and usage events landed so far, and how
-//! long the pass has run. A first ingest over a large corpus can hold the
-//! writer lock, in bounded batches, for many minutes; without this, a
-//! process printing nothing for that long reads as hung rather than working.
+//! The pass also reports its own progress to a caller-supplied sink, named
+//! by the phase it is in (`aub-va6s`, `aub-4qk2`): `scanning` at least once
+//! every [`PROGRESS_FILE_INTERVAL`] files or [`PROGRESS_TIME_INTERVAL`],
+//! `deduplicating` once when parsing ends, and `writing` once when the
+//! persist loop starts and then after committed batches. A first ingest over
+//! a large corpus can hold the writer lock, in bounded batches, for many
+//! minutes; without this, a process printing nothing for that long reads as
+//! hung rather than working.
 //!
 //! Two modes. The default pass parses every discovered file whole, and each
 //! file's fresh parse replaces its previous contribution, so a parser-version
@@ -160,37 +161,61 @@ const PROGRESS_FILE_INTERVAL: u64 = 100;
 /// visibly.
 const PROGRESS_TIME_INTERVAL: MonotonicDuration = MonotonicDuration::from_seconds(30);
 
+/// The shortest spacing between two `writing` lines (`aub-4qk2`). The gate
+/// is checked after every committed batch, and a pass of many small batches
+/// would otherwise print one line per batch.
+const WRITING_MIN_INTERVAL: MonotonicDuration = MonotonicDuration::from_seconds(1);
+
 /// One progress snapshot the pass reports to `progress_sink`, so a long first
-/// ingest is distinguishable from a hung one (`aub-va6s`).
+/// ingest is distinguishable from a hung one (`aub-va6s`). Each phase carries
+/// only the fields it can fill (`aub-4qk2`): one line shape reused across
+/// three phases read as the same work with a meaningless rate.
+///
+/// Every rate is measured over the interval since the previous line of its
+/// phase (`aub-mh1c`), not since the pass started: a rate averaged over the
+/// whole pass would hide a fresh regression behind however fast the pass ran
+/// before it. A rate is `None` when no time has passed since that line, where
+/// there is nothing to divide by.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct IngestProgress {
-    /// Files fully accounted for (parsed, skipped or found unreadable) so far.
-    pub files_done: u64,
-    /// Files discovered across the covered sources, the denominator.
-    pub files_total: u64,
-    /// Session rows landed by every batch committed so far.
-    pub sessions_written: u64,
-    /// Canonical usage events landed by every batch committed so far, newly
-    /// written plus already-ingested, the same convention [`LandedBatch::events`]
-    /// uses for one batch.
-    pub events_written: u64,
-    /// Time elapsed since the pass started, on the monotonic clock.
-    pub elapsed: MonotonicDuration,
-    /// Events landed per second over the interval since the previous report
-    /// (`aub-mh1c`), not since the pass started: a rate averaged over the
-    /// whole pass would hide a fresh regression behind however fast the pass
-    /// ran before it. Zero while the discovery-and-parse loop is still
-    /// running, since nothing has landed yet at that point.
-    pub rate_events_per_sec: f64,
+pub enum IngestProgress {
+    /// The discovery-and-parse loop.
+    Scanning {
+        /// Files fully accounted for (parsed, skipped or found unreadable).
+        files_done: u64,
+        /// Files discovered across the covered sources, the denominator.
+        files_total: u64,
+        /// Usage events parsed so far, before deduplication.
+        events_parsed: u64,
+        elapsed: MonotonicDuration,
+        rate_files_per_sec: Option<f64>,
+    },
+    /// Parsing has ended and deduplication and session resolution are about
+    /// to run, which print nothing else until the first batch is written.
+    Deduplicating {
+        events_parsed: u64,
+        elapsed: MonotonicDuration,
+    },
+    /// The persist loop.
+    Writing {
+        /// Batches fully committed, of `batches_total`.
+        batches_done: u64,
+        batches_total: u64,
+        /// Canonical events committed so far, newly written plus
+        /// already-ingested, the convention [`LandedBatch::events`] uses.
+        events_written: u64,
+        /// Canonical events the pass will write, after deduplication.
+        events_total: u64,
+        elapsed: MonotonicDuration,
+        rate_events_per_sec: Option<f64>,
+    },
 }
 
-/// Decides when the pass is due to report progress, and remembers where it
-/// last reported from. Files done only advances during the discovery-and-parse
-/// loop; the elapsed side keeps firing through the persist loop that follows.
+/// Decides when the pass is due to report progress, and remembers the count
+/// and the instant of the previous line so each rate covers only the interval
+/// since it.
 struct ProgressGate {
     started_at: MonotonicInstant,
-    last_report_files: u64,
-    last_report_events: u64,
+    last_report_count: u64,
     last_report_at: MonotonicInstant,
 }
 
@@ -198,35 +223,39 @@ impl ProgressGate {
     fn new(now: MonotonicInstant) -> Self {
         Self {
             started_at: now,
-            last_report_files: 0,
-            last_report_events: 0,
+            last_report_count: 0,
             last_report_at: now,
         }
     }
 
-    /// Whether a report is due at `files_done`, `events_written` and `now`.
-    /// When due, resets the gate's own bookkeeping so the next report waits a
-    /// full interval again, and returns the rate: events landed since the
-    /// last report divided by the wall time since the last report
-    /// (`aub-mh1c`), the interval the progress line's `rate` field names.
-    fn due(&mut self, files_done: u64, events_written: u64, now: MonotonicInstant) -> Option<f64> {
-        let by_files = files_done.saturating_sub(self.last_report_files) >= PROGRESS_FILE_INTERVAL;
-        let interval = now.duration_since(self.last_report_at);
-        let by_time = interval >= PROGRESS_TIME_INTERVAL;
-        if !by_files && !by_time {
-            return None;
-        }
-        let events_delta = events_written.saturating_sub(self.last_report_events);
-        let seconds = interval.as_nanos() as f64 / 1_000_000_000.0;
-        let rate = if seconds > 0.0 {
-            events_delta as f64 / seconds
-        } else {
-            0.0
-        };
-        self.last_report_files = files_done;
-        self.last_report_events = events_written;
+    /// A `scanning` line is due every [`PROGRESS_FILE_INTERVAL`] files or
+    /// [`PROGRESS_TIME_INTERVAL`], whichever comes first.
+    fn scanning_due(&self, files_done: u64, now: MonotonicInstant) -> bool {
+        files_done.saturating_sub(self.last_report_count) >= PROGRESS_FILE_INTERVAL
+            || now.duration_since(self.last_report_at) >= PROGRESS_TIME_INTERVAL
+    }
+
+    /// A `writing` line is due after a committed batch once
+    /// [`WRITING_MIN_INTERVAL`] has passed since the previous line. The file
+    /// side of the gate is frozen in this phase, so every batch is a
+    /// candidate, and a pass is never silent for longer than one batch takes.
+    fn writing_due(&self, now: MonotonicInstant) -> bool {
+        now.duration_since(self.last_report_at) >= WRITING_MIN_INTERVAL
+    }
+
+    /// Records a line at `count` (files while scanning, events while
+    /// writing) and returns the rate of `count` per second since the
+    /// previous line, or `None` when no time has passed since it.
+    fn mark(&mut self, count: u64, now: MonotonicInstant) -> Option<f64> {
+        let seconds = now.duration_since(self.last_report_at).as_nanos() as f64 / 1_000_000_000.0;
+        let delta = count.saturating_sub(self.last_report_count);
+        self.last_report_count = count;
         self.last_report_at = now;
-        Some(rate)
+        (seconds > 0.0).then(|| delta as f64 / seconds)
+    }
+
+    fn reported_count(&self) -> u64 {
+        self.last_report_count
     }
 
     fn elapsed(&self, now: MonotonicInstant) -> MonotonicDuration {
@@ -250,11 +279,12 @@ impl ProgressGate {
 /// stable identifiers while the pass is still running. A sink error is a run
 /// error: diagnostics that silently stop mid-pass would read as progress.
 ///
-/// `progress_sink` observes progress at least once every
-/// [`PROGRESS_FILE_INTERVAL`] files or [`PROGRESS_TIME_INTERVAL`], whichever
-/// comes first, across both the discovery-and-parse phase and the persist
-/// phase that follows it (`aub-va6s`). Like `batch_sink`, a sink error is a
-/// run error.
+/// `progress_sink` observes one [`IngestProgress`] per line, in phase order:
+/// `Scanning` on the file-or-time gate and once more for the last file,
+/// exactly one `Deduplicating`, then `Writing` at the start of the persist
+/// loop, after committed batches at most once per [`WRITING_MIN_INTERVAL`],
+/// and always for the last batch (`aub-va6s`, `aub-4qk2`). Like `batch_sink`,
+/// a sink error is a run error.
 pub fn run(
     conn: &mut Connection,
     config: &Config,
@@ -304,14 +334,13 @@ pub fn run(
             // covered by one counter rather than three that could drift.
             files_done += 1;
             let file_check_at = clock.monotonic_now();
-            if let Some(rate) = progress.due(files_done, 0, file_check_at) {
-                progress_sink(&IngestProgress {
+            if progress.scanning_due(files_done, file_check_at) {
+                progress_sink(&IngestProgress::Scanning {
                     files_done,
                     files_total,
-                    sessions_written: 0,
-                    events_written: 0,
+                    events_parsed: events.len() as u64,
                     elapsed: progress.elapsed(file_check_at),
-                    rate_events_per_sec: rate,
+                    rate_files_per_sec: progress.mark(files_done, file_check_at),
                 })?;
             }
 
@@ -418,6 +447,25 @@ pub fn run(
         }
     }
 
+    // The last file's own line: the gate above fires before a file is
+    // parsed, so without this the final count and its events never print.
+    let scan_done_at = clock.monotonic_now();
+    if files_done > progress.reported_count() {
+        progress_sink(&IngestProgress::Scanning {
+            files_done,
+            files_total,
+            events_parsed: events.len() as u64,
+            elapsed: progress.elapsed(scan_done_at),
+            rate_files_per_sec: progress.mark(files_done, scan_done_at),
+        })?;
+    }
+    // Printed once, before the stretch that has no progress of its own:
+    // deduplication, session resolution and batch splitting.
+    progress_sink(&IngestProgress::Deduplicating {
+        events_parsed: events.len() as u64,
+        elapsed: progress.elapsed(scan_done_at),
+    })?;
+
     // One deduplication over the whole pass, exactly like the report path:
     // one message replayed across two configured roots is still one message.
     let deduplicated = deduplicate(events);
@@ -519,6 +567,17 @@ pub fn run(
         }
     }
     let total_chunks = chunks.len();
+    let events_total = persist_events.len() as u64;
+    let writing_started_at = clock.monotonic_now();
+    progress.mark(0, writing_started_at);
+    progress_sink(&IngestProgress::Writing {
+        batches_done: 0,
+        batches_total: total_chunks as u64,
+        events_written: 0,
+        events_total,
+        elapsed: progress.elapsed(writing_started_at),
+        rate_events_per_sec: None,
+    })?;
 
     let mut batches: Vec<LandedBatch> = Vec::new();
     let mut totals = crate::store::ingest::PersistOutcome {
@@ -644,29 +703,24 @@ pub fn run(
             batch_sink(&landed)?;
             batches.push(landed);
 
-            // Files done stopped advancing once the persist loop began; the
-            // elapsed side of the gate is what keeps firing here, so a long
-            // sequence of batches still reports rather than going silent
-            // between the last file parsed and the pass's own return.
+            cursor += consumed;
+            let chunk_done = cursor >= chunk.len();
+            // The last batch always reports, so the final line reads N/N.
             let batch_check_at = clock.monotonic_now();
-            if let Some(rate) = progress.due(
-                files_done,
-                totals.events_written.value() + totals.events_already_ingested.value(),
-                batch_check_at,
-            ) {
-                progress_sink(&IngestProgress {
-                    files_done,
-                    files_total,
-                    sessions_written: totals.sessions_upserted.value(),
-                    events_written: totals.events_written.value()
-                        + totals.events_already_ingested.value(),
+            if (last && chunk_done) || progress.writing_due(batch_check_at) {
+                let events_written =
+                    totals.events_written.value() + totals.events_already_ingested.value();
+                progress_sink(&IngestProgress::Writing {
+                    batches_done: index as u64 + u64::from(chunk_done),
+                    batches_total: total_chunks as u64,
+                    events_written,
+                    events_total,
                     elapsed: progress.elapsed(batch_check_at),
-                    rate_events_per_sec: rate,
+                    rate_events_per_sec: progress.mark(events_written, batch_check_at),
                 })?;
             }
 
-            cursor += consumed;
-            if cursor >= chunk.len() {
+            if chunk_done {
                 break;
             }
         }
@@ -915,94 +969,113 @@ mod progress_gate_tests {
         clock.monotonic_now()
     }
 
-    /// The acceptance criterion's literal numbers (`aub-va6s`): every 100
-    /// files or 30 seconds, whichever first. The symbolic tests below prove
-    /// the gate logic against the constants; this one pins the constants
-    /// themselves, since a gate that used the right logic against the wrong
-    /// numbers would still pass every other test here.
+    /// The acceptance criterion's literal numbers (`aub-va6s`, `aub-4qk2`):
+    /// scanning every 100 files or 30 seconds, writing at most once a second.
+    /// The symbolic tests below prove the gate logic against the constants;
+    /// this one pins the constants themselves.
     #[test]
-    fn the_configured_interval_is_exactly_100_files_or_30_seconds() {
+    fn the_configured_intervals_are_100_files_30_seconds_and_1_second() {
         assert_eq!(PROGRESS_FILE_INTERVAL, 100);
         assert_eq!(PROGRESS_TIME_INTERVAL, MonotonicDuration::from_seconds(30));
+        assert_eq!(WRITING_MIN_INTERVAL, MonotonicDuration::from_seconds(1));
     }
 
     /// The file-count side fires at exactly [`PROGRESS_FILE_INTERVAL`] files
     /// since the last report, not one file later or earlier (`aub-va6s`).
     #[test]
     fn the_file_interval_fires_at_exactly_the_boundary() {
-        let mut gate = ProgressGate::new(instant(0));
+        let gate = ProgressGate::new(instant(0));
         assert!(
-            gate.due(PROGRESS_FILE_INTERVAL - 1, 0, instant(0))
-                .is_none(),
+            !gate.scanning_due(PROGRESS_FILE_INTERVAL - 1, instant(0)),
             "one file short of the interval must not report"
         );
         assert!(
-            gate.due(PROGRESS_FILE_INTERVAL, 0, instant(0)).is_some(),
+            gate.scanning_due(PROGRESS_FILE_INTERVAL, instant(0)),
             "exactly at the interval must report"
         );
     }
 
     /// The elapsed-time side fires at exactly [`PROGRESS_TIME_INTERVAL`]
-    /// since the last report, independent of the file count: this is what
-    /// keeps a report going out while files done has stopped advancing, in
-    /// the persist loop.
+    /// since the last report, independent of the file count: one file that
+    /// takes a long time to parse still gets a line.
     #[test]
     fn the_time_interval_fires_at_exactly_the_boundary_regardless_of_file_count() {
-        let mut gate = ProgressGate::new(instant(0));
+        let gate = ProgressGate::new(instant(0));
         let just_under = PROGRESS_TIME_INTERVAL.as_nanos() - 1;
         assert!(
-            gate.due(0, 0, instant(just_under)).is_none(),
+            !gate.scanning_due(0, instant(just_under)),
             "one nanosecond short of the interval must not report"
         );
         assert!(
-            gate.due(0, 0, instant(PROGRESS_TIME_INTERVAL.as_nanos()))
-                .is_some(),
+            gate.scanning_due(0, instant(PROGRESS_TIME_INTERVAL.as_nanos())),
             "exactly at the interval must report even with zero files done"
         );
     }
 
-    /// A fired report resets both sides of the gate, so the *next* report
-    /// waits a full interval from the point it fired, not from the pass's
-    /// start.
+    /// A marked report resets the gate, so the *next* report waits a full
+    /// interval from the point it fired, not from the pass's start.
     #[test]
-    fn firing_resets_the_gate_so_the_next_report_waits_a_full_interval_again() {
+    fn marking_resets_the_gate_so_the_next_report_waits_a_full_interval_again() {
         let mut gate = ProgressGate::new(instant(0));
-        assert!(gate.due(PROGRESS_FILE_INTERVAL, 0, instant(0)).is_some());
+        gate.mark(PROGRESS_FILE_INTERVAL, instant(0));
         assert!(
-            gate.due(PROGRESS_FILE_INTERVAL + 1, 0, instant(0))
-                .is_none(),
-            "one file past a just-fired report must not report again"
+            !gate.scanning_due(PROGRESS_FILE_INTERVAL + 1, instant(0)),
+            "one file past a just-marked report must not report again"
         );
-        assert!(
-            gate.due(2 * PROGRESS_FILE_INTERVAL, 0, instant(0))
-                .is_some()
-        );
+        assert!(gate.scanning_due(2 * PROGRESS_FILE_INTERVAL, instant(0)));
     }
 
-    /// The rate is events landed since the previous report divided by the
-    /// wall time since the previous report, not an average over the whole
-    /// pass (`aub-mh1c`): a fast start followed by a slow patch must show the
-    /// slow patch's own rate, not one blended with the fast start.
+    /// The rate is the count's delta since the previous line divided by the
+    /// wall time since it, not an average over the whole pass (`aub-mh1c`):
+    /// a fast start followed by a slow patch must show the slow patch's own
+    /// rate. With no time passed there is nothing to divide by, and the rate
+    /// is absent rather than zero (`aub-4qk2`).
     #[test]
-    fn the_rate_is_the_delta_since_the_previous_report_not_a_running_average() {
+    fn the_rate_is_the_delta_since_the_previous_line_and_absent_over_zero_time() {
         let mut gate = ProgressGate::new(instant(0));
-        // First report: 100 files and 1000 events land in the first second.
-        let rate = gate
-            .due(PROGRESS_FILE_INTERVAL, 1_000, instant(1_000_000_000))
-            .expect("due at the file boundary");
-        assert_eq!(rate, 1_000.0, "1000 events over 1 second is 1000/s");
-
-        // Second report: only 100 more events land, but it takes 10 seconds.
-        // A running average over the whole pass (1100 events / 11s ~= 100/s)
-        // would still read close to the first rate; the per-interval rate
-        // must show the regression instead.
-        let rate = gate
-            .due(2 * PROGRESS_FILE_INTERVAL, 1_100, instant(11_000_000_000))
-            .expect("due at the second file boundary");
+        assert_eq!(gate.mark(1_000, instant(1_000_000_000)), Some(1_000.0));
         assert_eq!(
-            rate, 10.0,
-            "100 events over the 10s since the last report is 10/s, not the pass-wide average"
+            gate.mark(1_100, instant(11_000_000_000)),
+            Some(10.0),
+            "100 more over the 10s since the last line is 10/s, not the pass-wide average"
         );
+        assert_eq!(gate.mark(1_200, instant(11_000_000_000)), None);
+    }
+
+    /// The writing gate over a sequence of batch commit times (`aub-4qk2`):
+    /// the phase-start line is marked at 0, a batch under one second later
+    /// prints nothing, the first batch at or past one second prints, and the
+    /// spacing then restarts from that line. Batches committed every 0.4s for
+    /// 40s never leave more than a second and a batch between two lines, and
+    /// never print two lines under a second apart.
+    #[test]
+    fn the_writing_gate_prints_at_most_once_a_second_and_never_goes_30s_silent() {
+        let mut gate = ProgressGate::new(instant(0));
+        gate.mark(0, instant(0));
+        let second = WRITING_MIN_INTERVAL.as_nanos();
+        assert!(!gate.writing_due(instant(second - 1)));
+        assert!(gate.writing_due(instant(second)));
+
+        let mut gate = ProgressGate::new(instant(0));
+        gate.mark(0, instant(0));
+        let step = 400_000_000;
+        let mut printed = vec![0u64];
+        for batch in 1..=100u64 {
+            let at = batch * step;
+            if gate.writing_due(instant(at)) {
+                gate.mark(batch, instant(at));
+                printed.push(at);
+            }
+        }
+        for pair in printed.windows(2) {
+            let gap = pair[1] - pair[0];
+            assert!(gap >= second, "two writing lines {gap}ns apart");
+            assert!(
+                gap < PROGRESS_TIME_INTERVAL.as_nanos(),
+                "a writing gap of {gap}ns"
+            );
+        }
+        assert_eq!(printed.len(), 1 + 100 / 3);
     }
 }
 
