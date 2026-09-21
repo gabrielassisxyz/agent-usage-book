@@ -172,6 +172,8 @@ e-12	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/023-calibrate-controlled-experime
 e-13	aub-71j.9	e2e	run-e2e	sed	tests/e2e/cases/026-can-run.sh	s/^    assert_exit 0 1$/    assert_exit 1 1/		assertion|FAIL	run-e2e-sibling	0	003-exit-classes.sh
 sh-34	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/56-migration-schema-pin	plant	src/store/migrations/9999_zz_guard_probe_migration.rs	pub fn zz_guard_probe_migration() {}		012-backup\.sh pins schema=[0-9]+ generation=.*9999_zz_guard_probe_migration\.rs	bin/checks/70-quantity-inventory	0	every pub struct/enum
 sh-35	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/80-gate-coverage "$SCRATCH"	neuter	bin/checks/56-migration-schema-pin			56-migration-schema-pin is neutered with exit 0	bin/checks/70-quantity-inventory	0	every pub struct/enum
+c-36	aub-a56a	cargo	cargo test --lib store::connection::tests::opening_a_second_connection_keeps_the_first_connections_shared_lock	python	src/store/connection.rs	import pathlib; p=pathlib.Path("src/store/connection.rs"); t=p.read_text(); old="    let held = handles"; assert t.count(old)==1; new="    let _probe = File::open(path).unwrap();"+chr(10)+old; p.write_text(t.replace(old,new,1))		opening a second connection released the first connection's shared lock	cargo test --lib store::connection::tests::probe_database_header_refuses_leaf_btree_page_at_offset_zero	0	test result:
+c-37	aub-i2i9	cargo	cargo test --test antigravity_token_refresh extracting_client_material_from_a_large_binary_does_not_hold_it_in_memory	replace	src/auth/token_endpoint.rs	const AGY_SCAN_CHUNK_BYTES: usize = 1 << 20;	const AGY_SCAN_CHUNK_BYTES: usize = 64 * 1024 * 1024;	aub peaked at .*bound	cargo test --test antigravity_token_refresh a_rejected_client_pairing_records_refresh_configuration_failed	0	test result:
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness
@@ -243,6 +245,3 @@ consistency check enforces exactly that.
 - `aub-x5bo`: a one-time proof that following the written pane work-cycle
   surfaces planted lint and format violations; the subset commands it
   exercises are covered by the gate-coverage neutering row `sh-24`.
-- `aub-a56a`, `aub-i2i9`: closed on 2026-09-14 with a recorded can-fail
-  mutation and no row. The rows are owed by `aub-dhsc`; this entry goes when
-  they land.
