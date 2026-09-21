@@ -18,7 +18,12 @@ damaged.
    from configuration, so the command and the health check can no longer
    disagree. A backup command that reports `verified=false` has not produced
    a usable archive; treat that run as failed and re-run it. A failed run
-   prunes nothing and does not advance the pointer.
+   prunes nothing and does not advance the pointer. The scheduled form is
+   `aub backup --scheduled`, the command the shipped timer and cron entry
+   call (`docs/scheduling.md`): with `backup.scheduled = false` it prints
+   one line naming the key and exits zero without writing, and with no
+   `backup.destination` configured it prints one line saying backups are not
+   configured and exits zero. A manual `aub backup` ignores the key.
 2. **Point `doctor` at the root.** Set `backup.destination` in the
    configuration file to the same root (see the [configuration
    sketch](PLAN.md#47-suggested-configuration-sketch)). `aub doctor` reads
@@ -72,4 +77,7 @@ then retire it by hand.
 
 A backup that is created but never pointed at with `backup.destination`, or
 never re-verified, satisfies none of this beyond the moment it was written:
-the policy is the schedule, not the one command that starts it.
+the policy is the schedule, not the one command that starts it. Install the
+shipped backup pair (`docs/scheduling.md`) so step 1 happens daily; the
+schedule is what turns the procedure above into the policy rather than a
+to-do.
