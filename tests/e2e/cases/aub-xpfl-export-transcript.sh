@@ -4,6 +4,8 @@
 # resolution cases (`aaaa0001` claude-code, `aaaa0002` codex, the `01a0318b`
 # codex pair) with real transcript files on disk for the claude-code session:
 # a parent file and one `subagents/agent-x.jsonl` sharing its session id.
+# The codex pair carries no transcript files: since aub-51wv ships the codex
+# renderer, its latest renders as a heading over an empty conversation.
 
 CASE_ID="aub-xpfl-export-transcript"
 CASE_DESCRIPTION="export transcript resolves an id prefix, renders the session as markdown, and delivers it to stdout, file or clipboard command."
@@ -87,7 +89,7 @@ JSONL
     step "render to stdout" aub_export transcript aaaa0001 -p
     step "ambiguous prefix fails" aub_export transcript aaaa -p
     step "latest resolves the ambiguity" aub_export transcript aaaa --latest -p
-    step "codex has no renderer yet" aub_export transcript 01a0318b --harness codex --latest -p
+    step "codex renders with its own renderer" aub_export transcript 01a0318b --harness codex --latest -p
     step "unknown id names itself" aub_export transcript zzzz -p
     step "clipboard command receives the markdown" aub_export transcript aaaa0001 -c
     step "default file output" aub_export transcript aaaa0001 -o
@@ -129,8 +131,12 @@ case_assertions() {
     assert_exit 0 6
     assert_stdout_contains 6 "# claude-code · proj-alpha · aaaa0001-1111-4222-8333-444444444444"
 
-    assert_exit 2 7
-    assert_stderr_contains 7 "no transcript renderer for harness 'codex'"
+    # The codex renderer (aub-51wv) renders the latest codex session: the
+    # seeded pair carries no transcript files, so the export is the heading
+    # over an empty conversation, and the `no transcript renderer` failure
+    # the parent bead pinned now belongs to opencode alone.
+    assert_exit 0 7
+    assert_stdout_contains 7 "# codex · proj-gamma · 01a0318b-2bbb"
 
     assert_exit 2 8
     assert_stderr_contains 8 "no session matches 'zzzz'"
