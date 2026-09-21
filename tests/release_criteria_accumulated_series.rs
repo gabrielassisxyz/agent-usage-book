@@ -284,8 +284,7 @@ fn release_criterion_16_accumulated_attempts_carry_the_policy_in_force_and_denom
     for (attempt_id, started_at, snapshot_id) in &attempts {
         let in_force = snapshots
             .iter()
-            .filter(|s| s.1 <= *started_at)
-            .last()
+            .rfind(|s| s.1 <= *started_at)
             .unwrap_or_else(|| panic!("attempt {attempt_id} started before any policy"));
         assert_eq!(
             *snapshot_id, in_force.0,

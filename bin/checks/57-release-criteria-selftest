@@ -8,4 +8,7 @@ set -uo pipefail
 
 repo_root="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
 "$repo_root/bin/release-criteria-selftest" || exit 1
-"$repo_root/bin/release-criteria" --list >/dev/null
+if ! trace="$("$repo_root/bin/release-criteria" --list)"; then
+    printf '%s\n' "$trace" | grep -v '"verdict":"pass","checks"' >&2
+    exit 1
+fi

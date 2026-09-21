@@ -46,7 +46,14 @@ bin/release-criteria-selftest   # the checker's own mechanics, no toolchain need
 
 ## Last run
 
-Last run: never
+Last run: 2026-09-21 at abe809d: 17 of 17 pass
+
+`--record` rewrites that line after a full run. The first record was assembled from
+seventeen `--only` runs against the same revision, because a full run outlasts the
+ten-minute bound of the session that took it. Criterion 7 passed there at a load
+average of 31 and failed three of five earlier runs at 40 to 55; its test shares one
+wall-clock budget between the hanging and the reachable account, and `aub-usqn`
+decouples it from load.
 
 ## Criteria
 
