@@ -50,12 +50,12 @@ use agent_usage_book::logging::LogicalName;
 use agent_usage_book::report::coverage::CoverageFailureTally;
 use agent_usage_book::report::{
     CalibrateReport, CoverageAccount, CoverageReport, CoverageThreshold, ExportReport,
-    IngestSummary, LedgerGeneration, MeterAccount, MeterReadingProvenance, NowReport,
-    ProjectionReadState, ProvenanceGraph, ProvenanceNode, ReportField, ReportMetadata, SharePpm,
-    SpendDiagnostic, SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance,
-    SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendReport, StatusReport,
-    TaskOverheadBucket, TaskOverheadReport, TaskReport, Unit, ValueArithmetic,
-    WindowEquivalentDerivation, WindowEquivalentValue,
+    IngestSummary, LedgerGeneration, MeterAccount, MeterReadingProvenance, ProjectionReadState,
+    ProvenanceGraph, ProvenanceNode, ReportField, ReportMetadata, SharePpm, SpendDiagnostic,
+    SpendDiagnosticProvenance, SpendGroup, SpendGroupCreditsProvenance, SpendGroupProvenance,
+    SpendGroupWindowEquivalentProvenance, SpendReport, StatusReport, TaskOverheadBucket,
+    TaskOverheadReport, TaskReport, Unit, ValueArithmetic, WindowEquivalentDerivation,
+    WindowEquivalentValue,
 };
 use agent_usage_book::store::export::ExportKey;
 
@@ -246,36 +246,6 @@ fn status_case() -> SeededCommand {
     );
     SeededCommand {
         name: "status",
-        expected: accounts_expected_fields(&report.accounts),
-        graph: report.provenance,
-    }
-}
-
-fn now_case() -> SeededCommand {
-    let account_name = LogicalName::new("primary");
-    let reading_node = node(
-        &["meter-obs-101"],
-        None,
-        "by-account",
-        "now",
-        1,
-        1,
-        ValueArithmetic::Direct,
-    );
-    let accounts = vec![MeterAccount::new(
-        account_name.clone(),
-        Freshness::Fresh {
-            observed: observed_reading(400_000),
-            latest_attempt: AttemptId::new(2),
-        },
-    )];
-    let report = NowReport::new(
-        test_metadata(),
-        accounts,
-        vec![MeterReadingProvenance::new(account_name, reading_node)],
-    );
-    SeededCommand {
-        name: "now",
         expected: accounts_expected_fields(&report.accounts),
         graph: report.provenance,
     }
@@ -638,7 +608,6 @@ fn task_overhead_case() -> SeededCommand {
 fn seeded_commands() -> Vec<SeededCommand> {
     vec![
         status_case(),
-        now_case(),
         spend_case(),
         coverage_case(),
         export_case(),

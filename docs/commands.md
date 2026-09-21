@@ -31,12 +31,19 @@ all render with exit 0 so a status bar never treats degraded output as process
 failure.
 
 `--refresh` asks the command to take one forced sampling attempt per selected
-account before rendering, through the same sampling path `aub now` uses, and
+account before rendering, through the forced sampling path, and
 then to render the grid from the projection that pass published. Without the
 flag no attempt is ever taken, so the default stays a read of the ledger. An
 account whose refresh attempt fails is not an error: it renders its last known
 reading with its age, which is the fact an operator comparing against a live
 tool needs.
+
+`--session-id SESSION` additionally reads that session's explicit account
+markers and heartbeat without taking a sampling attempt. When the evidence
+supports a live claim, status prints the same `spending` line as the former
+live command; conflicting, absent or inactive evidence prints the corresponding
+typed activity state. Without `--session-id`, the JSON document has no
+`activity` key and text output has no activity line.
 
 Text output goes through one style layer (`src/presentation/style.rs`), which
 also answers `--no-color` where every other command refuses it. Colour is on
@@ -75,29 +82,20 @@ auth-required account shows `auth!` in place of the grid; an unreadable
 projection is the bare `aub ?`. `--format json` carries every window under
 `accounts[].windows[]`, not only the limiting one, and the reading
 observation's age as the machine-readable `observation_age_nanos` beside the
-freshness variant (schema v4; a reading with no observation behind it omits
+freshness variant (schema v5; a reading with no observation behind it omits
 the field). `--model NAME` narrows both the grid rows and the reading to the
 account-wide and named-model windows.
 
 ## `aub now`
 
-**Answers:** how much quota does each configured account have right now?
+**Deprecated:** `aub now` is a deprecated alias and will be removed in a later
+release. It writes
+`aub: 'now' is deprecated and will be removed; use 'aub status --refresh' instead`
+to stderr, then runs `aub status --refresh` with the same arguments. Its stdout
+and exit code are the status command's output and result.
 
-**Refuses:** to answer from a cache. Unlike `status`, `now` always forces a
-fresh sampling attempt first and renders the result that attempt produced;
-there is no flag that fetches and discards, and there is no mode that reads
-the last published projection instead of sampling.
-
-`--session-id SESSION` additionally asks whether that session is actively
-spending right now. The answer is one of four typed states: an explicit
-launcher-or-hook marker with a fresh heartbeat both covering this instant
-(`explicit_marker_evidence`, the only state that names an account and prints
-a `spending` line), nothing named or found (`no_evidence`), two explicit
-markers naming different accounts for the exact same instant with no way to
-order them (`conflicting_evidence`), or a marker whose session the heartbeat
-policy no longer finds live (`inactive`). Neither a moving meter nor an
-ambient credential ever substitutes for either half of that claim, and
-without `--session-id` the state is always `no_evidence`.
+**Refuses:** no independent report or sampling path; use `aub status` for the
+cached projection and `aub status --refresh` for a forced sample.
 
 ## `aub spend`
 

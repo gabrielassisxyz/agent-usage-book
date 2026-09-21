@@ -27,13 +27,13 @@ use crate::presentation::boxed::{
 };
 use crate::presentation::json::{
     calibrate_activate_json, calibrate_compare_json, calibrate_history_json,
-    calibrate_promote_json, calibrate_show_json, coverage_json, now_json_with_explain,
-    spend_json_with_explain, status_json_with_explain,
+    calibrate_promote_json, calibrate_show_json, coverage_json, spend_json_with_explain,
+    status_json_with_explain,
 };
 use crate::presentation::render::{
     render_calibrate_activate_report, render_calibrate_compare_report,
     render_calibrate_history_report, render_calibrate_promote_report, render_calibrate_show_report,
-    render_coverage_report, render_coverage_threshold_message, render_now_report_with_explain,
+    render_coverage_report, render_coverage_threshold_message,
     render_spend_report_with_explain_and_style, render_status_report_with_explain,
 };
 use crate::report::ReportEnvelope;
@@ -47,7 +47,7 @@ use crate::report::{
     CalibrateActivateReport, CalibrateCompareReport, CalibrateCostModelCoverage,
     CalibrateCostModelKindCoverage, CalibrateHistoryEntry, CalibrateHistoryReport,
     CalibrateLifecycleEventView, CalibrateShowEntry, CalibrateShowReport, LedgerGeneration,
-    MeterAccount, NowReport, ReportMetadata, SpendFilter, SpendGrouping, StatusReport,
+    MeterAccount, ReportMetadata, SpendFilter, SpendGrouping, StatusReport,
 };
 use crate::store::export::ExportKey;
 
@@ -486,12 +486,8 @@ impl Command {
                 format: FlagSupport::Accepted,
                 explain: FlagSupport::Accepted,
                 account: FlagSupport::Accepted,
-                model: FlagSupport::Rejected {
-                    reason: "now reports every window; only status takes a --model selector",
-                },
-                no_color: FlagSupport::Rejected {
-                    reason: "now prints no color",
-                },
+                model: FlagSupport::Accepted,
+                no_color: FlagSupport::Accepted,
                 verbosity: FlagSupport::Accepted,
             },
             Command::ClearDiagnostics => FlagPolicy {
@@ -716,9 +712,7 @@ impl Command {
             Command::Sample => Some(
                 "observe provider endpoints for due or selected accounts, recording session markers and evidence",
             ),
-            Command::Now => Some(
-                "force a persisted sampling attempt for the selected accounts and render the resulting state",
-            ),
+            Command::Now => Some("deprecated alias for status --refresh"),
             Command::ClearDiagnostics => Some("clear retained diagnostic provider bodies"),
             Command::Drill => Some(
                 "damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive",
@@ -777,7 +771,7 @@ impl Command {
             Command::Sample => Some(
                 "are configured accounts due for meter sampling, and what did the endpoints observe?",
             ),
-            Command::Now => Some("how much quota does each configured account have right now?"),
+            Command::Now => Some("what does the deprecated status --refresh alias report?"),
             Command::ClearDiagnostics => Some("how many retained diagnostic bodies were cleared?"),
             Command::Drill => Some(
                 "does the documented recovery procedure actually recover a damaged state directory, and is that still true today?",
@@ -877,7 +871,7 @@ impl Command {
                 "begin --account NAME [--plan-tier TIER] --window KEY [--cost-model ID] [--expect-kinds K,...] [--experiment ID] --assert-exclusive | status [--experiment ID] | end [--experiment ID] | fit [--experiment ID] | passive [--account NAME] [--window KEY] | show | history | compare CANDIDATE ACTIVE | promote CANDIDATE --training E,... --validation E,... [--policy-version V] | activate ID [--actor NAME] [--training E,...] [--validation E,...] [--policy-version V] [--max-residual-micros N] [--max-condition-micros N]",
             ),
             Command::Now => Some("[--session-id SESSION]"),
-            Command::Status => Some("--refresh"),
+            Command::Status => Some("--refresh | --session-id SESSION"),
             Command::CanRun => {
                 Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
             }
@@ -2038,197 +2032,36 @@ fn name_busy_wait(error: Error, busy_timeout: crate::domain::time::MonotonicDura
     error
 }
 
-/// `aub now`: force a persisted sampling attempt for the selected accounts
-/// and render the resulting current state.
+/// `aub now` is kept as a deprecated spelling of `aub status --refresh`.
 pub(crate) fn now_command(
     clock: &impl Clock,
     level: Level,
     invocation: &Invocation,
 ) -> Result<(), Error> {
-    let timestamp = clock.now();
-    let run = RunId::new(timestamp);
-    let command = LogicalName::new("now");
-    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
-    logger
-        .emit(
-            timestamp,
-            DiagnosticEvent::RunStarted,
-            &[("command", &command)],
-        )
-        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+    eprintln!("aub: 'now' is deprecated and will be removed; use 'aub status --refresh' instead");
+    let mut status_invocation = invocation.clone();
+    status_invocation.command = Command::Status;
+    status_invocation.rest.insert(0, "--refresh".to_string());
+    status(clock, level, &status_invocation)
+}
 
-    // `--session-id` names the session the live report evaluates for explicit
-    // marker-backed activity (aub-mgv.5). Absent, the report evaluates nothing
-    // and carries `ActiveActivityState::NoEvidence`: there is no substitute
-    // session to guess at from the currently selected account or profile.
-    let mut session_id: Option<String> = None;
-    let mut args = invocation.rest.iter();
-    while let Some(arg) = args.next() {
-        match arg.as_str() {
-            "--session-id" => {
-                let val = args
-                    .next()
-                    .ok_or_else(|| Error::Usage("--session-id requires a value".into()))?;
-                session_id = Some(val.clone());
-            }
-            other if other.starts_with("--session-id=") => {
-                let val = other.strip_prefix("--session-id=").unwrap();
-                if val.is_empty() {
-                    return Err(Error::Usage("--session-id requires a value".into()));
-                }
-                session_id = Some(val.to_string());
-            }
-            other => {
-                return Err(Error::Usage(format!(
-                    "unknown argument: {other}; run aub now --help for options"
-                )));
-            }
-        }
-    }
-
-    let env = crate::config::RealEnv;
-    let file_path = resolve_config_file_path(None, &env);
-    let file_contents = std::fs::read_to_string(&file_path).ok();
-    let (config, _provenance) = crate::config::resolve(
-        &crate::config::Overrides::new(),
-        &env,
-        file_contents.as_deref(),
-        &file_path,
-    )?;
-
-    if let Some(name) = &invocation.account
-        && !config.accounts.iter().any(|acc| acc.name == *name)
-    {
-        return Err(Error::Usage(format!(
-            "unknown account '{name}': now --account names a configured account"
-        )));
-    }
-
-    // State readiness check before any network request or attempt start.
-    crate::store::startup::ensure_state_dir_ready(
-        &config.state.dir,
-        &crate::store::startup::ProcMounts,
-    )?;
-
-    let db_path = config
-        .state
-        .dir
-        .join(crate::store::connection::LEDGER_DATABASE_FILE);
+/// Reads the named session's explicit marker and heartbeat evidence without
+/// taking a sampling attempt. The alias and the status refresh path both call
+/// the same status report after this read.
+fn status_activity_state(
+    state_dir: &Path,
+    session_id: &str,
+    report_instant: crate::domain::time::UtcTimestamp,
+    clock: &impl Clock,
+) -> Result<crate::report::ActiveActivityState, Error> {
+    crate::store::startup::ensure_state_dir_ready(state_dir, &crate::store::startup::ProcMounts)?;
+    let db_path = state_dir.join(crate::store::connection::LEDGER_DATABASE_FILE);
     let busy_policy = crate::store::connection::PragmaPolicy {
         busy_timeout: crate::domain::time::MonotonicDuration::from_millis(500),
     };
     let mut conn = crate::store::rate_card::open_ledger(&db_path, busy_policy.busy_timeout, clock)?;
-    crate::store::spool::drain_pending(&mut conn, &config.state.dir)?;
-    let repo = crate::store::repository::Repository::new(&db_path, busy_policy);
-
-    // Composed once, independent of which accounts get sampled below: activity
-    // evidence answers "who is spending right now," not "what did this
-    // invocation poll."
-    let activity = now_activity_state(&conn, session_id.as_deref(), timestamp)?;
-
-    let target_accounts: Vec<&crate::config::AccountConfig> = match &invocation.account {
-        Some(name) => config
-            .accounts
-            .iter()
-            .filter(|acc| acc.name == *name)
-            .collect(),
-        None => config.accounts.iter().collect(),
-    };
-
-    if target_accounts.is_empty() {
-        // No account to sample: there is nothing to fetch and nothing to
-        // record, so this is not an unrecorded-fetch path. The empty current
-        // state is the whole answer.
-        let metadata = ReportMetadata::new(timestamp, timestamp, LedgerGeneration::new(0), None);
-        let report = NowReport::new(metadata, Vec::new(), Vec::new()).with_activity(activity);
-        emit_now_report(&report, run, timestamp, invocation);
-        return Ok(());
-    }
-
-    logger
-        .emit(
-            timestamp,
-            DiagnosticEvent::RequestAttempted,
-            &[("command", &command)],
-        )
-        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-
-    let batch_report = forced_sampling_batch(
-        &repo,
-        &config,
-        &target_accounts,
-        invocation.verbosity > 0,
-        clock,
-    )?;
-
-    // A disposition that failed to record the attempt or its terminal fact is a
-    // persistence failure, reported with the store class. The projection is not
-    // read and no reading is rendered: an unrecorded observation is never shown
-    // as though it were durable (correctness invariant 5).
-    sampling_disposition_error(&batch_report.accounts)?;
-
-    // Rendering reads the projection the batch just published and runs it
-    // through the same freshness function and report models `status` uses, so a
-    // `now` cannot disagree with a `status` taken a moment later.
-    let projection_path = crate::projection::projection_path_in(&config.state.dir);
-    let (accounts, ledger_generation) =
-        match crate::projection::reader::read_projection(&projection_path) {
-            crate::projection::reader::ProjectionRead::Available(projection) => {
-                let accounts = projection_accounts(
-                    &config,
-                    &projection,
-                    invocation.account.as_deref(),
-                    invocation.model.as_deref(),
-                    clock,
-                );
-                logger
-                    .emit(
-                        timestamp,
-                        DiagnosticEvent::ProjectionRead,
-                        &[("state", &LogicalName::new("ok"))],
-                    )
-                    .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-                let generation = LedgerGeneration::new(projection.ledger_generation.value());
-                (accounts, generation)
-            }
-            crate::projection::reader::ProjectionRead::Unavailable(unavailable) => {
-                // The batch reported no persistence failure, so the projection it
-                // published should be readable now. If it is not, the state
-                // directory is the fault: report it with the store class rather
-                // than render an empty answer as if nothing were configured.
-                return Err(Error::Store(format!(
-                    "sampled accounts but the published projection could not be read: {}",
-                    unavailable.reason()
-                )));
-            }
-        };
-
-    let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
-    let report = NowReport::new(metadata, accounts, Vec::new()).with_activity(activity);
-    emit_now_report(&report, run, timestamp, invocation);
-    logger
-        .emit(
-            timestamp,
-            DiagnosticEvent::ReportRendered,
-            &[("report_kind", &LogicalName::new("now"))],
-        )
-        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
-    Ok(())
-}
-
-/// Composes `now`'s activity state for the named session, or
-/// [`crate::report::ActiveActivityState::NoEvidence`] when `--session-id` was not
-/// given: absent a named session there is nothing to evaluate, never a guess from
-/// the currently selected account.
-fn now_activity_state(
-    conn: &rusqlite::Connection,
-    session_id: Option<&str>,
-    report_instant: crate::domain::time::UtcTimestamp,
-) -> Result<crate::report::ActiveActivityState, Error> {
-    let Some(sess_str) = session_id else {
-        return Ok(crate::report::ActiveActivityState::NoEvidence);
-    };
-    let session_id = if let Some((src, nat)) = sess_str.split_once(':') {
+    crate::store::spool::drain_pending(&mut conn, state_dir)?;
+    let session_id = if let Some((src, nat)) = session_id.split_once(':') {
         crate::domain::ids::SessionId::new(
             crate::domain::ids::SourceNamespace::new(src),
             crate::domain::ids::NativeSessionId::new(nat),
@@ -2236,11 +2069,11 @@ fn now_activity_state(
     } else {
         crate::domain::ids::SessionId::new(
             crate::domain::ids::SourceNamespace::new("cli"),
-            crate::domain::ids::NativeSessionId::new(sess_str),
+            crate::domain::ids::NativeSessionId::new(session_id),
         )
     };
-    let markers = crate::store::session_account_marker::markers_for_session(conn, &session_id)?;
-    let heartbeat = crate::store::session_heartbeat::latest_heartbeat(conn, &session_id)?;
+    let markers = crate::store::session_account_marker::markers_for_session(&conn, &session_id)?;
+    let heartbeat = crate::store::session_heartbeat::latest_heartbeat(&conn, &session_id)?;
     Ok(crate::report::compose_active_activity(
         &markers,
         heartbeat.as_ref(),
@@ -2250,7 +2083,7 @@ fn now_activity_state(
 }
 
 /// Returns the store-class error for the first disposition that failed to record
-/// its attempt or terminal fact. Shared by `sample` and `now`: both treat a
+/// its attempt or terminal fact. Shared by `sample` and status refresh: both treat a
 /// persistence failure as fatal and neither renders a reading after one.
 ///
 /// A spooled-but-uncommitted result is deliberately a different class from a
@@ -2321,30 +2154,6 @@ fn record_sampling_failure_counts(
     crate::store::sampling_failure_counts::reconcile_sampling_failure_counts(
         state_dir, &failures, now,
     )
-}
-
-/// Writes the `now` report in the requested format. One freshness variant per
-/// account travels in either format because both read the same [`NowReport`].
-fn emit_now_report(
-    report: &NowReport,
-    run: RunId,
-    timestamp: crate::domain::time::UtcTimestamp,
-    invocation: &Invocation,
-) {
-    match invocation.format {
-        OutputFormat::Text => println!(
-            "{}",
-            render_now_report_with_explain(
-                report,
-                timestamp,
-                status_clock_skew_envelope(),
-                invocation.explain,
-            )
-        ),
-        OutputFormat::Json => {
-            println!("{}", now_json_with_explain(report, run, invocation.explain))
-        }
-    }
 }
 
 /// `aub doctor`: the check registry (`aub-n27.7`) by default, the deeper
@@ -4531,14 +4340,29 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
 
-    // The command's own flag: a bare `--refresh` asks for one sampling attempt
-    // per selected account before the grid renders. Anything else left in the
-    // argument surface is rejected here, where `reject_positionals` stands for
-    // every other command.
+    // The command's own flags: `--refresh` asks for one sampling attempt per
+    // selected account before the grid renders, while `--session-id` reads
+    // marker and heartbeat evidence without sampling. Anything else left in
+    // the argument surface is rejected here.
     let mut refresh = false;
-    for arg in &invocation.rest {
+    let mut session_id = None;
+    let mut args = invocation.rest.iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
             "--refresh" => refresh = true,
+            "--session-id" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| Error::Usage("--session-id requires a value".into()))?;
+                session_id = Some(value.clone());
+            }
+            other if other.starts_with("--session-id=") => {
+                let value = other.strip_prefix("--session-id=").unwrap();
+                if value.is_empty() {
+                    return Err(Error::Usage("--session-id requires a value".into()));
+                }
+                session_id = Some(value.to_string());
+            }
             other => {
                 return Err(Error::Usage(format!(
                     "unknown argument: {other}; run aub --help for command usage"
@@ -4552,9 +4376,10 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
     // computation and formatting. Nothing else runs here by default, which the
     // source contract test below and the boundary rules both hold this
     // function to. The one exception is the flag-gated branch below: a
-    // `--refresh` the operator asked for takes the same forced sampling pass
-    // `aub now` takes, through the same helper; without the flag no sampling
-    // attempt is made and the command stays a read of the ledger.
+    // `--refresh` takes the forced sampling pass; without it no sampling
+    // attempt is made. A named session is the only other path that opens the
+    // ledger, and it reads only the marker and heartbeat evidence needed for
+    // the activity claim.
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
@@ -4586,6 +4411,11 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
             .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
         status_refresh_attempts(&config, account_selector, invocation.verbosity > 0, clock)?;
     }
+
+    let activity = session_id
+        .as_deref()
+        .map(|session| status_activity_state(&config.state.dir, session, timestamp, clock))
+        .transpose()?;
 
     let projection_path = crate::projection::projection_path_in(&config.state.dir);
     let (projection_state, accounts, ledger_generation) =
@@ -4634,6 +4464,10 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
 
     let metadata = ReportMetadata::new(timestamp, timestamp, ledger_generation, None);
     let report = StatusReport::new(metadata, accounts, vec![], projection_state);
+    let report = match activity {
+        Some(activity) => report.with_activity(activity),
+        None => report,
+    };
     match format {
         OutputFormat::Text => {
             // The style layer owns the colour decision from the terminal, the
@@ -4657,7 +4491,7 @@ fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(
 }
 
 /// The flag-gated sampling pass `aub status --refresh` runs: one forced
-/// attempt per selected account through the same helper `aub now` uses, and
+/// attempt per selected account through the shared forced sampler, and
 /// nothing rendered here. The rendering reads the projection afterwards in
 /// [`fn status`]'s ordinary path, so an account whose attempt failed renders
 /// its last known reading with its age rather than an error, and the command
@@ -4699,9 +4533,9 @@ fn status_refresh_attempts(
     Ok(())
 }
 
-/// The forced sampling pass `aub now` and `aub status --refresh` share: one
-/// batch account per selected account, one forced attempt each through the
-/// sampling orchestrator, and no rendering. A per-account failure (unreachable
+/// The forced sampling pass behind `aub status --refresh`: one batch account
+/// per selected account, one forced attempt each through the sampling
+/// orchestrator, and no rendering. A per-account failure (unreachable
 /// endpoint, held lease, failed credential preflight) is a recorded disposition
 /// the caller's projection read then reflects as an unchanged reading, not a
 /// batch error; only a failure to record the run itself surfaces here.
@@ -10132,10 +9966,10 @@ mod tests {
     }
 
     /// `--model` is a parsed token for every command, both the `--model M` and
-    /// `--model=M` spellings, and the parser honours the policy: status keeps
-    /// the single-value selector, spend hands each occurrence to its own
-    /// option parser as a repeatable filter (aub-satk), and every other
-    /// command rejects with the policy's reason.
+    /// `--model=M` spellings, and the parser honours the policy: status and its
+    /// deprecated alias keep the single-value selector, spend hands each
+    /// occurrence to its own option parser as a repeatable filter (aub-satk),
+    /// and every other command rejects with the policy's reason.
     #[test]
     fn the_parser_honours_the_model_policy_for_every_command() {
         for spelling in [
@@ -10156,7 +9990,7 @@ mod tests {
         }
 
         for command in Command::ALL {
-            if command == Command::Status {
+            if matches!(command, Command::Status | Command::Now) {
                 continue;
             }
             let result = parse_invocation(args(&[command.name(), "--model", "m"]));
@@ -10177,7 +10011,7 @@ mod tests {
                 },
                 FlagSupport::Accepted => {
                     panic!(
-                        "{command:?} declares --model accepted as a selector, but status is the only selector"
+                        "{command:?} declares --model accepted as a selector, but status and now are the only selectors"
                     )
                 }
             }
@@ -10210,10 +10044,39 @@ mod tests {
         assert_eq!(invocation.model, None);
     }
 
+    /// Status keeps the session selector as a command option, so both the
+    /// read-only activity form and the refresh-plus-activity form reach the
+    /// status dispatcher instead of being rejected as unknown arguments.
+    #[test]
+    fn status_accepts_session_id_with_or_without_refresh() {
+        for argv in [
+            vec!["status", "--session-id", "claude-code:session-a"],
+            vec!["status", "--refresh", "--session-id=claude-code:session-a"],
+        ] {
+            let parsed = parse_invocation(args(&argv)).expect("status session selector parses");
+            let Request::Run(invocation) = parsed else {
+                panic!("expected a runnable status invocation")
+            };
+            assert_eq!(invocation.command, Command::Status);
+            assert!(
+                invocation
+                    .rest
+                    .iter()
+                    .any(|arg| { arg == "--session-id" || arg.starts_with("--session-id=") })
+            );
+            assert!(
+                invocation
+                    .rest
+                    .iter()
+                    .any(|arg| arg.contains("claude-code:session-a"))
+            );
+        }
+    }
+
     /// `--no-color` is a parsed token for every command, and the parser honours
     /// the policy: a rejection emits the policy's reason, an acceptance lands as
-    /// the invocation's no_color. Status is the one command that accepts it,
-    /// because its rendering goes through the style layer that the flag turns
+    /// the invocation's no_color. Status and its deprecated alias accept it,
+    /// because their rendering goes through the style layer that the flag turns
     /// off; every other command still takes the rejection arm.
     #[test]
     fn the_parser_honours_the_no_color_policy_for_every_command() {
@@ -10266,14 +10129,11 @@ mod tests {
             let refused_flags = command.refused_flags();
             if refused_flags.is_empty() {
                 // A command whose policy accepts every shared flag has no
-                // refusal line to state, and status is the one such command:
-                // it accepts --no-color to turn the style layer off, and its
-                // refusal boundary is behavioural, stated in docs/commands.md.
-                // Any other command arriving here has grown an all-accepting
-                // policy and must state its refusal boundary somewhere.
-                assert_eq!(
-                    command,
-                    Command::Status,
+                // refusal line to state. Status and its deprecated alias are
+                // the only such commands; their behavioural boundaries are
+                // stated in docs/commands.md.
+                assert!(
+                    matches!(command, Command::Status | Command::Now),
                     "{command:?} help has no refusal boundary"
                 );
             }
@@ -10288,6 +10148,29 @@ mod tests {
                 "{command:?} help must state its format support"
             );
         }
+    }
+
+    #[test]
+    fn status_and_now_command_surface_documents_the_session_alias() {
+        let help = help_text();
+        assert!(help.contains("now      deprecated alias for status --refresh"));
+        assert!(help.contains("answers: what does the deprecated status --refresh alias report?"));
+        assert!(help.contains("options: --refresh | --session-id SESSION"));
+        assert!(help.contains("options: [--session-id SESSION]"));
+
+        let docs = include_str!("../docs/commands.md");
+        let status = docs
+            .split("## `aub status`")
+            .nth(1)
+            .expect("status must remain in the command docs");
+        assert!(status.contains("--session-id SESSION"));
+        let now = docs
+            .split("## `aub now`")
+            .nth(1)
+            .expect("now must remain in the command docs");
+        assert!(now.contains(
+            "aub: 'now' is deprecated and will be removed; use 'aub status --refresh' instead"
+        ));
     }
 
     /// `docs/commands.md` names every shipping command in a `## \`aub NAME\``
@@ -11711,7 +11594,7 @@ usage_evidence = "measured"
     ///
     /// The one named exception is the flag-gated branch (aub-yg2q): a bare
     /// `--refresh` routes through `status_refresh_attempts`, which takes the
-    /// same forced sampling pass `aub now` takes. The scan below still holds
+    /// forced sampling pass. The scan below still holds
     /// the default path to the read-only contract: without the flag the
     /// command references no sampling helper at all, and the behaviour (no
     /// attempt without the flag, exactly one attempt with it) is owned by the
@@ -11722,7 +11605,7 @@ usage_evidence = "measured"
         // The status path is fn status and the helpers it alone uses, so the
         // scan covers the bodies that carry its work, not just its own text.
         // The refresh branch (`status_refresh_attempts`, sharing
-        // `forced_sampling_batch` with `now`) is deliberately not scanned: it
+        // `forced_sampling_batch` with the deprecated alias) is deliberately not scanned: it
         // is the sampling path the operator explicitly asked for, and the
         // default path's contract is what this scan protects.
         let status_body = [

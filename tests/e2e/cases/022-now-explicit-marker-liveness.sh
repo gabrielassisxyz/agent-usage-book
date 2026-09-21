@@ -1,10 +1,10 @@
-# aub-mgv.5: `aub now --session-id` claims a session is actively spending only
+# aub-mgv.5: `aub status --session-id` claims a session is actively spending only
 # when an explicit session/account marker AND a fresh heartbeat both cover the
 # report instant, run against the release binary because the property under
 # test is what a real process reads back from a real SQLite ledger, not one
 # function call.
 #
-# The endpoint is unreachable (loopback port 9), matching every other `now`
+# The endpoint is unreachable (loopback port 9), matching every other refresh
 # e2e case: the meter reading itself is irrelevant to this bead, whose
 # correctness invariant is that activity evidence is composed independently of
 # meter movement. The marker and heartbeat are seeded directly with sqlite3,
@@ -12,7 +12,7 @@
 # `aub` ships no command that only records a heartbeat.
 
 CASE_ID="022-now-explicit-marker-liveness"
-CASE_DESCRIPTION="An explicit marker with a fresh heartbeat makes aub now report the session as actively spending, in both human and JSON output."
+CASE_DESCRIPTION="An explicit marker with a fresh heartbeat makes aub status report the session as actively spending, in both human and JSON output."
 
 LEDGER_DB=""
 NOW_NS=""
@@ -38,17 +38,25 @@ CFG_EOF
 }
 
 case_steps() {
-    # 1. Bootstrap: migrates the ledger and forces one attempt. No marker or
-    #    heartbeat exists yet, so activity is no_evidence even with a session
-    #    named.
-    step "bootstrap-no-evidence" env \
+    # 1. Bootstrap the projection without naming a session. The endpoint is
+    #    unreachable, but the resulting stale projection lets the activity line
+    #    be rendered by the following read-only status commands.
+    step "bootstrap-projection" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
         "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
-        "$AUB_BIN" -v now --account work-primary --session-id "claude-code:sess-explicit-1" --format json
+        "$AUB_BIN" status --refresh --account work-primary
 
-    # 2. Seed an explicit marker 5 seconds old and a heartbeat 1 second old:
+    # 2. A named session is read without refresh. No marker or heartbeat exists
+    #    yet, so activity is no_evidence and no sample is taken.
+    step "status-no-evidence" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_STATE_DIR=$STATE_DIR" \
+        "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
+        "$AUB_BIN" status --account work-primary --session-id "claude-code:sess-explicit-1" --format json
+
+    # 3. Seed an explicit marker 5 seconds old and a heartbeat 1 second old:
     #    both comfortably within the 15-minute default liveness horizon.
     step "seed-marker-and-heartbeat" sqlite3 "$LEDGER_DB" "
         INSERT INTO session_account_marker
@@ -64,41 +72,39 @@ case_steps() {
             ('claude-code', 'sess-explicit-1', $((NOW_NS - 1000000000)), 'turn_end');
     "
 
-    # 3. Now the same session reports as spending, in human text.
-    step "now-spending-human" env \
+    # 4. Now the same session reports as spending, in human text.
+    step "status-spending-human" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
-        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
-        "$AUB_BIN" now --account work-primary --session-id "claude-code:sess-explicit-1"
+        "$AUB_BIN" status --account work-primary --session-id "claude-code:sess-explicit-1"
 
-    # 4. And in versioned JSON, carrying the evidence class and both
+    # 5. And in versioned JSON, carrying the evidence class and both
     #    provenance identifiers.
-    step "now-spending-json" env \
+    step "status-spending-json" env \
         "HOME=$STATE_DIR/home" \
         "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
-        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
-        "$AUB_BIN" now --account work-primary --session-id "claude-code:sess-explicit-1" --format json
+        "$AUB_BIN" status --account work-primary --session-id "claude-code:sess-explicit-1" --format json
 }
 
 case_assertions() {
-    # Step 1: no marker, no heartbeat yet: no_evidence, and no "spending" claim
+    # Step 2: no marker, no heartbeat yet: no_evidence, and no "spending" claim
     # anywhere in the JSON.
     assert_exit 0 1
-    assert_stdout_contains 1 '"activity":{"state":"no_evidence"}'
-    assert_stderr_contains 1 "report_rendered"
-
-    # Step 2: seeding succeeds.
     assert_exit 0 2
+    assert_stdout_contains 2 '"activity":{"state":"no_evidence"}'
 
-    # Step 3: human text now names the account, the marker and the heartbeat.
+    # Step 3: seeding succeeds.
     assert_exit 0 3
-    assert_stdout_contains 3 "aub session: spending account=work-primary marker=session_account_marker:1 heartbeat=session_heartbeat:1"
 
-    # Step 4: JSON carries the same evidence class and both provenance
-    # identifiers.
+    # Step 4: human text names the account, the marker and the heartbeat.
     assert_exit 0 4
-    assert_stdout_contains 4 '"command":"now"'
-    assert_stdout_contains 4 '"activity":{"state":"explicit_marker_evidence","account":"work-primary","marker":"session_account_marker:1","heartbeat":"session_heartbeat:1"}'
+    assert_stdout_contains 4 "aub session: spending account=work-primary marker=session_account_marker:1 heartbeat=session_heartbeat:1"
+
+    # Step 5: JSON carries the same evidence class and both provenance
+    # identifiers.
+    assert_exit 0 5
+    assert_stdout_contains 5 '"command":"status"'
+    assert_stdout_contains 5 '"activity":{"state":"explicit_marker_evidence","account":"work-primary","marker":"session_account_marker:1","heartbeat":"session_heartbeat:1"}'
 }

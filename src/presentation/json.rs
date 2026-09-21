@@ -27,8 +27,8 @@ use crate::presentation::render::{
 use crate::problem_code::ProblemCode;
 use crate::report::{
     ActiveActivityState, CanRunOutcome, CanRunReport, CoverageReport, LedgerGeneration,
-    LivenessGap, NowReport, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport,
-    TaskIdentityRow, TaskIngestReport, TaskOverheadReport, TaskReport,
+    LivenessGap, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport, TaskIdentityRow,
+    TaskIngestReport, TaskOverheadReport, TaskReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 
@@ -332,12 +332,9 @@ pub fn validate_envelope_strict(json_str: &str) -> Result<ParsedEnvelope, JsonCo
     Ok(parsed)
 }
 
-/// Validates the `accounts` array shared by the `status` and `now` contracts:
-/// every entry names an account and carries exactly one freshness variant, and
-/// each variant carries the fields that variant's renderer emits. `status` and
-/// `now` map the same [`crate::report::MeterAccount`] into JSON through the same
-/// `status_account_json`, so they validate through this one function rather than
-/// through two copies that could drift apart.
+/// Validates the `accounts` array in the status contract: every entry names an
+/// account and carries exactly one freshness variant, and each variant carries
+/// the fields that the status renderer emits.
 fn validate_freshness_accounts(
     obj: &serde_json::Map<String, serde_json::Value>,
 ) -> Result<(), JsonContractError> {
@@ -394,7 +391,7 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_STATUS_KEYS: [&str; 9] = [
+    const KNOWN_STATUS_KEYS: [&str; 10] = [
         "schema",
         "command",
         "run",
@@ -403,6 +400,7 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
         "ledger_generation",
         "accounts",
         "projection",
+        "activity",
         "explain",
     ];
     for key in obj.keys() {
@@ -449,9 +447,106 @@ pub fn validate_status_report_json(json_str: &str) -> Result<ParsedEnvelope, Jso
                 })?;
         validate_explain_object(explain_obj)?;
     }
+    if let Some(activity_val) = obj.get("activity") {
+        validate_activity_object(activity_val)?;
+    }
     validate_freshness_accounts(obj)?;
     validate_status_windows(obj)?;
     Ok(parsed)
+}
+
+/// Validates the optional activity object carried when status evaluates a
+/// named session. It is absent from an ordinary status read.
+fn validate_activity_object(value: &serde_json::Value) -> Result<(), JsonContractError> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "activity",
+            message: "expected object".to_string(),
+        })?;
+    let state = object
+        .get("state")
+        .and_then(serde_json::Value::as_str)
+        .ok_or(JsonContractError::MissingField("activity.state"))?;
+    let allowed = match state {
+        "no_evidence" => &["state"][..],
+        "explicit_marker_evidence" => &["state", "account", "marker", "heartbeat"][..],
+        "conflicting_evidence" => &["state", "accounts"][..],
+        "inactive" => &[
+            "state",
+            "account",
+            "marker",
+            "liveness",
+            "last_heartbeat_at",
+            "heartbeat",
+        ][..],
+        other => {
+            return Err(JsonContractError::InvalidFormat {
+                field: "activity.state",
+                message: format!("unknown activity state '{other}'"),
+            });
+        }
+    };
+    for key in object.keys() {
+        if !allowed.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(format!(
+                "activity.{key}"
+            )));
+        }
+    }
+    match state {
+        "no_evidence" => {}
+        "explicit_marker_evidence" => {
+            for field in ["account", "marker", "heartbeat"] {
+                if !object.contains_key(field) {
+                    return Err(JsonContractError::MissingField("activity detail"));
+                }
+            }
+        }
+        "conflicting_evidence" => {
+            if !object
+                .get("accounts")
+                .and_then(serde_json::Value::as_array)
+                .is_some_and(|accounts| accounts.iter().all(serde_json::Value::is_string))
+            {
+                return Err(JsonContractError::InvalidFormat {
+                    field: "activity.accounts",
+                    message: "expected an array of strings".to_string(),
+                });
+            }
+        }
+        "inactive" => {
+            for field in ["account", "marker", "liveness"] {
+                if !object.contains_key(field) {
+                    return Err(JsonContractError::MissingField("activity detail"));
+                }
+            }
+            match object.get("liveness").and_then(serde_json::Value::as_str) {
+                Some("never_observed") => {}
+                Some("aged") => {
+                    if !object.contains_key("last_heartbeat_at")
+                        || !object.contains_key("heartbeat")
+                    {
+                        return Err(JsonContractError::MissingField("activity heartbeat"));
+                    }
+                }
+                Some(other) => {
+                    return Err(JsonContractError::InvalidFormat {
+                        field: "activity.liveness",
+                        message: format!("unknown liveness state '{other}'"),
+                    });
+                }
+                None => {
+                    return Err(JsonContractError::InvalidFormat {
+                        field: "activity.liveness",
+                        message: "expected a string".to_string(),
+                    });
+                }
+            }
+        }
+        _ => unreachable!("activity state was validated above"),
+    }
+    Ok(())
 }
 
 /// Every `accounts[].windows[]` entry (schema v3) carries the full set of
@@ -492,51 +587,6 @@ fn validate_status_windows(
         }
     }
     Ok(())
-}
-
-/// Validates that a now report JSON string strictly conforms to the current schema version.
-pub fn validate_now_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonContractError> {
-    let (parsed, value) = JsonEnvelope::parse(json_str)?;
-    if parsed.command != "now" {
-        return Err(JsonContractError::InvalidFormat {
-            field: "command",
-            message: format!("expected 'now', got '{}'", parsed.command),
-        });
-    }
-    let obj = value
-        .as_object()
-        .ok_or_else(|| JsonContractError::InvalidFormat {
-            field: "root",
-            message: "expected object".to_string(),
-        })?;
-    const KNOWN_NOW_KEYS: [&str; 9] = [
-        "schema",
-        "command",
-        "run",
-        "generated_at",
-        "knowledge_at",
-        "ledger_generation",
-        "accounts",
-        "activity",
-        "explain",
-    ];
-    for key in obj.keys() {
-        if !KNOWN_NOW_KEYS.contains(&key.as_str()) {
-            return Err(JsonContractError::UnexpectedField(key.clone()));
-        }
-    }
-    if let Some(explain_val) = obj.get("explain") {
-        let explain_obj =
-            explain_val
-                .as_object()
-                .ok_or_else(|| JsonContractError::InvalidFormat {
-                    field: "explain",
-                    message: "expected explain object".to_string(),
-                })?;
-        validate_explain_object(explain_obj)?;
-    }
-    validate_freshness_accounts(obj)?;
-    Ok(parsed)
 }
 
 /// Validates that a spend report JSON string strictly conforms to the current schema version.
@@ -682,6 +732,9 @@ pub fn status_json_with_explain(report: &StatusReport, run: RunId, explain: Expl
             json_string(reason),
         ));
     }
+    if let Some(activity) = &report.activity {
+        body.push_str(&format!(",\"activity\":{}", active_activity_json(activity)));
+    }
     if explain != ExplainMode::Off {
         body.push_str(&format!(
             ",\"explain\":{}",
@@ -691,36 +744,7 @@ pub fn status_json_with_explain(report: &StatusReport, run: RunId, explain: Expl
     JsonEnvelope::new("status", run, report.metadata.clone()).to_json_with(&body)
 }
 
-/// The now report under the envelope: one object per account with its freshness.
-pub fn now_json(report: &NowReport, run: RunId) -> String {
-    now_json_with_explain(report, run, ExplainMode::Off)
-}
-
-/// The now report under the envelope, optionally including explain provenance.
-pub fn now_json_with_explain(report: &NowReport, run: RunId, explain: ExplainMode) -> String {
-    let accounts = report
-        .accounts
-        .iter()
-        .map(status_account_json)
-        .collect::<Vec<_>>()
-        .join(",");
-    let mut body = format!(
-        "\"accounts\":[{accounts}],\"activity\":{}",
-        active_activity_json(&report.activity)
-    );
-    if explain != ExplainMode::Off {
-        body.push_str(&format!(
-            ",\"explain\":{}",
-            explain_json(&report.provenance, explain)
-        ));
-    }
-    JsonEnvelope::new("now", run, report.metadata.clone()).to_json_with(&body)
-}
-
-/// The composed activity state (`aub-mgv.5`), always present: absence of a key
-/// would leave a consumer unable to tell "evaluated, no evidence" from "this
-/// build predates the field," exactly the ambiguity a versioned schema exists to
-/// remove.
+/// The composed activity state (`aub-mgv.5`) for a named session.
 fn active_activity_json(activity: &ActiveActivityState) -> String {
     match activity {
         ActiveActivityState::NoEvidence => {
@@ -883,7 +907,7 @@ pub fn spend_json_with_explain(report: &SpendReport, run: RunId, explain: Explai
     if explain != ExplainMode::Off {
         // explain_json always yields a `{...}` object; splice the spend-only
         // account_groups array in before its closing brace rather than
-        // widening the signature shared by status, now, coverage and export.
+        // widening the signature shared by status, coverage and export.
         let mut explain_body = explain_json(&report.provenance, explain);
         if !report.account_explain.is_empty() {
             explain_body.pop();
@@ -2742,7 +2766,7 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
     // Every quota window behind the reading, not only the limiting one (schema
     // v3). Carried only when a successful observation stood behind the reading,
     // by the field's absence otherwise, the same convention `included_scopes`
-    // uses. `aub now` builds no window list, so its document is unchanged.
+    // uses.
     if !account.windows.is_empty() {
         let windows = account
             .windows

@@ -36,7 +36,7 @@ pub use models::{
     CoverageErrorClassification, CoverageReport, CoverageReset, CoverageThreshold, DoctorReport,
     ExportReport, IngestReport, IngestSummary, IngestionGeneration, LedgerGeneration,
     LimitingWindow, MeterAccount, MeterExplanation, MeterReadingProvenance, MeterWindowExplanation,
-    NowReport, PricedCardRef, PricedModelRef, ProjectionReadState, ReportMetadata, SampleAttempt,
+    PricedCardRef, PricedModelRef, ProjectionReadState, ReportMetadata, SampleAttempt,
     SampleReport, SharePpm, SpendDiagnostic, SpendDiagnosticProvenance, SpendFilter,
     SpendFilterExcluded, SpendFilterOutcome, SpendGroup, SpendGroupCreditsProvenance,
     SpendGroupProvenance, SpendGroupWindowEquivalentProvenance, SpendGrouping, SpendReport,

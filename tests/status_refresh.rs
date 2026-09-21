@@ -1,7 +1,7 @@
 //! End-to-end integration tests for `aub status --refresh` (aub-yg2q).
 //!
 //! `--refresh` asks `aub status` to take one forced sampling attempt per
-//! selected account through the same sampling path `aub now` uses, then
+//! selected account through the forced sampling path, then
 //! render the grid from the projection that attempt published. These tests
 //! hold the contract against the real binary and the synthetic provider:
 //!
@@ -213,12 +213,16 @@ fn refresh_takes_exactly_one_attempt_for_the_selected_account_and_renders_it() {
 #[test]
 fn plain_status_takes_no_sampling_attempt() {
     let env = Environment::new("plain");
-    // One scripted success per account for the seeding `now`; the later plain
-    // status must not consume any of them.
+    // One scripted success per account for the seeding refresh; the later plain
+    // and named status reads must not consume any of them.
     let server = success_server(2);
 
-    let now = env.run(&server.url(), &["now"]);
-    assert_eq!(now.code, 0, "aub now seeds the ledger: {}", now.stderr);
+    let refresh = env.run(&server.url(), &["status", "--refresh"]);
+    assert_eq!(
+        refresh.code, 0,
+        "status --refresh seeds the ledger: {}",
+        refresh.stderr
+    );
     let (attempts, results, evidence) = env.store_rows();
     // One seeding attempt per configured account, each reaching a terminal
     // result and carrying its response evidence.
@@ -237,8 +241,38 @@ fn plain_status_takes_no_sampling_attempt() {
         "plain status renders the stored reading: {}",
         status.stdout
     );
+    let plain_json = env.run(UNREACHABLE, &["status", "--format", "json"]);
+    assert_eq!(
+        plain_json.code, 0,
+        "plain status JSON: {}",
+        plain_json.stderr
+    );
+    let plain_document: serde_json::Value =
+        serde_json::from_str(plain_json.stdout.trim()).expect("plain status JSON must parse");
+    assert!(
+        plain_document.get("activity").is_none(),
+        "a status read without --session-id has no activity key: {plain_document}"
+    );
+
+    let named = env.run(
+        UNREACHABLE,
+        &[
+            "status",
+            "--session-id",
+            "claude-code:status-without-refresh",
+            "--format",
+            "json",
+        ],
+    );
+    assert_eq!(named.code, 0, "named status JSON: {}", named.stderr);
+    let named_document: serde_json::Value =
+        serde_json::from_str(named.stdout.trim()).expect("named status JSON must parse");
+    assert_eq!(
+        named_document["activity"]["state"], "no_evidence",
+        "a named session with no marker is explicit no_evidence"
+    );
     let (after, results_after, evidence_after) = env.store_rows();
-    assert_eq!(after, 2, "plain status took no attempt: {after}");
+    assert_eq!(after, 2, "plain and named status took no attempt: {after}");
     assert_eq!(results_after, 2, "no terminal result was added");
     assert_eq!(evidence_after, 2, "no response evidence was added");
 }
@@ -250,12 +284,16 @@ fn plain_status_takes_no_sampling_attempt() {
 #[test]
 fn a_failed_refresh_falls_back_to_the_stored_reading() {
     let env = Environment::new("fallback");
-    // One scripted success per account for the seeding `now`; the refresh
+    // One scripted success per account for the seeding refresh; the refresh
     // below dials the unreachable endpoint and must not consume any of them.
     let server = success_server(2);
 
-    let now = env.run(&server.url(), &["now"]);
-    assert_eq!(now.code, 0, "aub now seeds a good reading: {}", now.stderr);
+    let refresh = env.run(&server.url(), &["status", "--refresh"]);
+    assert_eq!(
+        refresh.code, 0,
+        "status --refresh seeds a good reading: {}",
+        refresh.stderr
+    );
     let (attempts, _, _) = env.store_rows();
     assert_eq!(attempts, 2, "one seeding attempt per account: {attempts}");
 

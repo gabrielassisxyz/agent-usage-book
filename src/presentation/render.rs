@@ -27,7 +27,7 @@ use crate::presentation::style::Style;
 use crate::presentation::vocabulary::{Qualification, coverage_term, quality_term};
 use crate::report::models::{UNKNOWN_ACCOUNT_LABEL, UNKNOWN_HARNESS_LABEL, UNKNOWN_MODEL_LABEL};
 use crate::report::{
-    ActiveActivityState, CoverageReport, LivenessGap, NowReport, PricedCardRef, PricedModelRef,
+    ActiveActivityState, CoverageReport, LivenessGap, PricedCardRef, PricedModelRef,
     ProvenanceGraph, SpendFilterOutcome, SpendGroup, SpendReport, StatusReport, TaskOverheadReport,
     TaskReport, WindowEquivalentDerivation,
 };
@@ -164,20 +164,19 @@ pub fn render_status_report_with_explain(
             line.push_str(" · ");
             line.push_str(reason);
         }
+        append_activity_line(&mut line, report.activity.as_ref());
         return line;
     }
-    let grid = render_status_grid(&report.accounts, now, envelope, style);
-    let mut rendered = if explain == ExplainMode::Off {
-        grid
-    } else {
-        let explain_text = render_explain(&report.provenance, explain);
-        if grid.is_empty() {
-            explain_text
-        } else {
-            format!("{grid}\n\n{explain_text}")
-        }
-    };
+    let mut rendered = render_status_grid(&report.accounts, now, envelope, style);
+    append_activity_line(&mut rendered, report.activity.as_ref());
     if explain != ExplainMode::Off {
+        let explain_text = render_explain(&report.provenance, explain);
+        if !explain_text.is_empty() {
+            if !rendered.is_empty() {
+                rendered.push_str("\n\n");
+            }
+            rendered.push_str(&explain_text);
+        }
         let meter_explain = render_meter_explain(&report.accounts, explain);
         if !meter_explain.is_empty() {
             if !rendered.is_empty() {
@@ -720,40 +719,9 @@ fn render_meter_explain(accounts: &[crate::report::MeterAccount], explain: Expla
     }
 }
 
-/// Renders a now live report.
-pub fn render_now_report(
-    report: &NowReport,
-    now: UtcTimestamp,
-    envelope: ClockSkewEnvelope,
-) -> String {
-    render_now_report_with_explain(report, now, envelope, ExplainMode::Off)
-}
-
-/// Renders a now live report, optionally including the explain block.
-///
-/// `now` and `status` render one account line the same way, through the same
-/// [`meter_account_lines`] helper: a `now` immediately followed by a `status`
-/// cannot disagree on the text because neither has its own line format.
-pub fn render_now_report_with_explain(
-    report: &NowReport,
-    now: UtcTimestamp,
-    envelope: ClockSkewEnvelope,
-    explain: ExplainMode,
-) -> String {
-    // The now command keeps today's rendering byte for byte in every mode: its
-    // dispatch is another change's edit surface, so it passes the plain style
-    // until its own change threads a measured one through.
-    let mut lines = meter_account_lines(&report.accounts, now, envelope, Style::plain());
-    if let Some(activity_line) = render_activity_line(&report.activity) {
-        lines.push(activity_line);
-    }
-    join_report_with_explain(lines, &report.provenance, explain)
-}
-
-/// The one line naming `aub-mgv.5`'s composed activity state, or `None` when the
-/// report evaluated no session at all (no `--session-id` was given). A bare `aub
-/// now` therefore reads identically to `aub status`, a contract this bead does
-/// not touch; the line appears only once something was actually evaluated.
+/// The one line naming `aub-mgv.5`'s composed activity state. An ordinary
+/// status report has no activity value, while a named session with no evidence
+/// has an explicit `NoEvidence` value and therefore still has no text line.
 fn render_activity_line(activity: &ActiveActivityState) -> Option<String> {
     match activity {
         ActiveActivityState::NoEvidence => None,
@@ -780,65 +748,14 @@ fn render_activity_line(activity: &ActiveActivityState) -> Option<String> {
     }
 }
 
-/// One `aub <account> <reading>` line per account, in order, through the shared
-/// meter-reading fragment renderer so wording lives in one place.
-fn meter_account_lines(
-    accounts: &[crate::report::MeterAccount],
-    now: UtcTimestamp,
-    envelope: ClockSkewEnvelope,
-    style: Style,
-) -> Vec<String> {
-    accounts
-        .iter()
-        .map(|account| {
-            let reading = render_meter_reading(
-                &account.reading,
-                METER_UNIT,
-                PERCENT,
-                now,
-                envelope,
-                account
-                    .limiting_window
-                    .as_ref()
-                    .map(LimitingWindowDisplay::from),
-            );
-            // A fresh reading carries a remaining fraction, so its tone is the
-            // account's state at a glance. Stale and auth-required readings
-            // have no fraction to tone and keep their text as the whole
-            // answer; the words never change either way, because freshness is
-            // conveyed in text and never by colour alone.
-            let reading = match &account.reading {
-                Freshness::Fresh { observed, .. } => {
-                    style.paint(style.tone(observed.value().as_ppm()), &reading)
-                }
-                // Two arms rather than one alternation: boundary rule 10 reads
-                // a `Freshness::X { .. }` that is not directly followed by
-                // `=>` as a construction, and the first half of an
-                // alternation is followed by `|`.
-                Freshness::Stale { .. } => reading,
-                Freshness::AuthRequired { .. } => reading,
-            };
-            format!("aub {} {}", account.account.as_str(), reading)
-        })
-        .collect()
-}
-
-/// Joins account lines and, when asked, the explain block below them.
-fn join_report_with_explain(
-    lines: Vec<String>,
-    provenance: &ProvenanceGraph,
-    explain: ExplainMode,
-) -> String {
-    let report_text = lines.join("\n");
-    if explain == ExplainMode::Off {
-        return report_text;
+fn append_activity_line(rendered: &mut String, activity: Option<&ActiveActivityState>) {
+    let Some(activity_line) = activity.and_then(render_activity_line) else {
+        return;
+    };
+    if !rendered.is_empty() {
+        rendered.push('\n');
     }
-    let explain_text = render_explain(provenance, explain);
-    if report_text.is_empty() {
-        explain_text
-    } else {
-        format!("{report_text}\n\n{explain_text}")
-    }
+    rendered.push_str(&activity_line);
 }
 
 /// The unit every token count is rendered in.

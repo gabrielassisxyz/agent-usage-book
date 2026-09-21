@@ -17,7 +17,7 @@ commands:
   coverage did the sampler attempt what the policy owed, and did those attempts observe?
   import   import explicitly selected legacy evidence with durable provenance
   sample   observe provider endpoints for due or selected accounts, recording session markers and evidence
-  now      force a persisted sampling attempt for the selected accounts and render the resulting state
+  now      deprecated alias for status --refresh
   clear-diagnostics clear retained diagnostic provider bodies
   drill    damage a scratch state directory and prove the documented recovery procedure, or run it against a real archive
   task     ingest issue-tracker task-claim events and report per-task usage and overhead
@@ -30,7 +30,7 @@ commands:
 status:
   answers: how much quota does each configured account have left?
   format: text | json
-  options: --refresh
+  options: --refresh | --session-id SESSION
 
 spend:
   answers: how many canonical tokens were used, grouped by the requested dimensions and kept by the requested filters?
@@ -104,8 +104,7 @@ sample:
   options: --due | --account NAME | --if-due | --session-id SESSION | --run-id RUN | --require-success
 
 now:
-  answers: how much quota does each configured account have right now?
-  refuses: --model (now reports every window; only status takes a --model selector); --no-color (now prints no color)
+  answers: what does the deprecated status --refresh alias report?
   format: text | json
   options: [--session-id SESSION]
 
