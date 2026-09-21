@@ -1772,10 +1772,17 @@ fn load_active_at_in(
             .map(|calibration| Some(ActiveCalibration::Scalar(calibration)))
             .map_err(|e| Error::Store(format!("cannot load the active calibration: {e}"))),
         Some(LatestActivation::PerKind(row)) => {
-            crate::store::calibration_multivariate_result::load_multivariate_result_by_row(
+            // An activation event that names a per-kind row the lookup cannot return is a broken
+            // ledger, not an uncalibrated scope: answering None would let spend fall back to a
+            // rate-card estimate in silence. The scalar arm errors the same way.
+            match crate::store::calibration_multivariate_result::load_multivariate_result_by_row(
                 conn, row,
-            )
-            .map(|calibration| calibration.map(ActiveCalibration::PerKind))
+            )? {
+                Some(calibration) => Ok(Some(ActiveCalibration::PerKind(calibration))),
+                None => Err(Error::Store(format!(
+                    "cannot load the active calibration: per-kind result row {row} is named by an activation but cannot be read"
+                ))),
+            }
         }
     }
 }

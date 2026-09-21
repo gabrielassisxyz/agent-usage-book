@@ -1005,6 +1005,28 @@ mod tests {
         assert_eq!(events[0].supersedes, Some(scalar_id));
     }
 
+    /// An activation that names a per-kind row the lookup cannot return is a
+    /// broken ledger and errors, like the scalar arm: answering "no
+    /// calibration" would let spend fall back to a rate-card estimate in
+    /// silence. The planted negative is the same ledger with the controlled
+    /// run intact, which resolves to the per-kind result.
+    #[test]
+    fn an_unreadable_active_per_kind_row_errors_rather_than_reading_as_uncalibrated() {
+        let (_scratch, mut conn) = ledger();
+        insert_multivariate_result(&mut conn, &per_kind("promoted-mvcand-1")).unwrap();
+        activate_per_kind(&mut conn, 3_000, None).unwrap();
+        assert!(matches!(
+            load_active_at(&conn, &scope(), ts(3_000)).unwrap(),
+            Some(ActiveCalibration::PerKind(_))
+        ));
+        conn.execute_batch(
+            "PRAGMA foreign_keys = OFF; DROP TRIGGER calibration_controlled_run_no_delete; DELETE FROM calibration_controlled_run;",
+        )
+        .unwrap();
+        let refusal = load_active_at(&conn, &scope(), ts(3_000)).unwrap_err();
+        assert!(refusal.to_string().contains("cannot be read"), "{refusal}");
+    }
+
     /// A scalar activation over an active per-kind calibration is refused
     /// naming the bead that owns it, and writes nothing.
     #[test]
