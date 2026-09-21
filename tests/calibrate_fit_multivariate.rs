@@ -1699,3 +1699,52 @@ fn round_floats(value: &mut serde_json::Value) {
         _ => {}
     }
 }
+
+/// The joint fit reports the run's contamination verdict like the univariate
+/// one (`aub-lhfh`): priced under a cost model, the burst is clean, and the
+/// same burst with the meter moving 50,000 ppm past the settlement grace is
+/// contaminated by extended settlement drift, with its candidate recorded.
+#[test]
+fn the_joint_fit_reports_settlement_drift_past_the_grace() {
+    let fixture = parse_fixture(INDEPENDENT_ARMS);
+    let seed = |state: &StateDir, late_ppm: i64| {
+        let ended_at = seed_burst_ending(
+            state,
+            &fixture,
+            TokenKind::ALL.to_vec(),
+            RunEnd::AfterLastSettle,
+        );
+        let mut conn = open_test_ledger(state);
+        seed_initial_cost_model(&mut conn, UtcTimestamp::from_unix_nanos(500 * SECOND)).unwrap();
+        let chain = meter_chain(&conn);
+        let settled_ppm = newest_reading_ppm(&conn);
+        let past_grace = ended_at + 3_600 * SECOND;
+        reading(&conn, &chain, past_grace + 100 * SECOND, settled_ppm);
+        reading(
+            &conn,
+            &chain,
+            past_grace + 200 * SECOND,
+            settled_ppm + late_ppm,
+        );
+    };
+
+    let clean = StateDir::new();
+    seed(&clean, 0);
+    let clean_json = fit_json(&clean);
+    assert_eq!(
+        clean_json["contamination"]["verdict"], "clean",
+        "{clean_json}"
+    );
+
+    let late = StateDir::new();
+    seed(&late, 50_000);
+    let json = fit_json(&late);
+    assert_eq!(json["fit_kind"], "multivariate");
+    assert_eq!(json["contamination"]["verdict"], "contaminated", "{json}");
+    assert_eq!(
+        json["contamination"]["findings"][0]["signal"],
+        "extended_settlement_drift"
+    );
+    assert_eq!(json["contamination"]["refuses_activation"], true);
+    assert_same_fit(&json, &clean_json, "the meter moved past the grace");
+}
