@@ -1679,7 +1679,15 @@ fn window_estimate_in_use(ctx: &DoctorContext) -> CheckOutcome {
                         let Some(estimate) = card.draft.window_estimate else {
                             continue;
                         };
-                        for account in &ctx.config.accounts {
+                        // A card prices one vendor's tokens, so it stands in only
+                        // for accounts of that provider.
+                        let accounts = ctx.config.accounts.iter().filter(|account| {
+                            card.draft
+                                .vendor
+                                .trim()
+                                .eq_ignore_ascii_case(account.provider.trim())
+                        });
+                        for account in accounts {
                             let scope = crate::store::calibration::CalibrationScope {
                                 provider: crate::store::cost_model::ProviderKey::new(
                                     &account.provider,
@@ -3301,45 +3309,56 @@ mod tests {
         };
         use crate::calibration::contamination::ContaminationVerdict;
         use crate::domain::provenance::{EvidenceId, WindowCalibrationId};
-        use crate::store::calibration::EvidenceDigest;
+        use crate::store::calibration::{CalibrationScope, ExperimentId, PlanTier};
 
-        let training: std::collections::BTreeSet<EvidenceId> = (1..=3)
-            .map(|n| EvidenceId::new(format!("cal-8vpc-fitting-{n}")))
-            .collect();
-        let validation: std::collections::BTreeSet<EvidenceId> = (1..=2)
-            .map(|n| EvidenceId::new(format!("cal-8vpc-validation-{n}")))
-            .collect();
-        let hex = |set: &std::collections::BTreeSet<EvidenceId>| {
-            format!("{:016x}", EvidenceDigest::from_inputs(set).digest())
+        let scope = CalibrationScope {
+            provider: crate::store::cost_model::ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("default"),
+            window_semantic_key: crate::domain::window::WindowSemanticKey::new("five_hour"),
         };
-        conn.execute(
-            "INSERT INTO window_calibration_result (
-                calibration_id, provider, plan_tier, window_semantic_key, meter_semantics_id,
-                billing_semantics_id, cost_model_id, fitted_micros_per_point,
-                equivalent_full_window_capacity_micros, fit_residual_micros,
-                uncertainty_low_micros, uncertainty_high_micros, lag_estimate_nanos,
-                lag_handling, sample_count, fit_timestamp, inputs_digest, inputs_count,
-                fitting_evidence_digest, validation_evidence_digest, validation_method,
-                validation_version, out_of_sample_residual_micros, statistical_method,
-                statistical_parameters, condition_number_micros,
-                observation_coverage_requirement, settling_policy, excluded_samples,
-                activation_policy_version, aub_version, source_revision, valid_from,
-                valid_until, knowledge_time
-            ) VALUES (
-                'cal-8vpc', 'anthropic', 'default', 'five_hour', 'meter-v1',
-                'billing-v1', 'cm-1', 100000, 12000000, 4200, 99000, 101000, 90000000000,
-                'shifted-by-estimate', 40, 1000, '0123456789abcdef', 3, ?1, ?2,
-                'holdout', 'v2', 7000, 'ols', '{\"ridge\":0}', 3500000, 'ninety-percent',
-                'plateau-3', '[]', 'ap-v1', '0.1.0', 'abc1234', 0, 4000000000000000000, 1000
-            )",
-            rusqlite::params![hex(&training), hex(&validation)],
+        let meter = crate::domain::ids::MeterSemanticsId::new("meter-v1");
+        let billing = crate::domain::ids::BillingSemanticsId::new("billing-v1");
+        let validity = crate::store::cost_model::ValidityInterval::new(
+            UtcTimestamp::from_unix_nanos(0),
+            UtcTimestamp::from_unix_nanos(i64::MAX),
+        )
+        .expect("the validity interval is ordered");
+        let knowledge = UtcTimestamp::from_unix_nanos(1_000);
+        let experiment = crate::store::calibration::minimal_experiment(
+            "exp-8vpc", &scope, &meter, &billing, validity, knowledge,
+        );
+        crate::store::calibration::insert_experiment(conn, &experiment)
+            .expect("the experiment must insert");
+        let calibration = crate::store::calibration::minimal_fixture(
+            "cal-8vpc",
+            &scope,
+            &meter,
+            &billing,
+            &crate::domain::provenance::CostModelId::new("cm-1"),
+            crate::domain::credits::CreditsPerPercentagePoint::from_micros_per_point(100_000),
+            validity,
+            knowledge,
+        );
+        crate::store::calibration::insert_result(
+            conn,
+            &calibration,
+            &[ExperimentId::new("exp-8vpc")],
         )
         .expect("the calibration row must insert");
 
+        // `minimal_fixture` records exactly these evidence identifiers; the
+        // activation gate refuses any other set with an evidence mismatch.
+        let evidence = |tag: &str| -> std::collections::BTreeSet<EvidenceId> {
+            [EvidenceId::new(format!("fixture:{tag}"))]
+                .into_iter()
+                .collect()
+        };
+        let training = evidence("fitting");
+        let validation = evidence("validation");
         let actor = ActivationActor::new("doctor-test").expect("actor is non-empty");
         let policy = ActivationPolicy::new(
-            "ap-v1",
-            crate::domain::credits::Credits::from_micros(1_000_000),
+            "fixture",
+            crate::domain::credits::Credits::from_micros(0),
             crate::store::calibration::ConditionNumber::from_micros(30_000_000),
         )
         .expect("policy version is non-empty");
@@ -3398,6 +3417,30 @@ mod tests {
         let config = anthropic_account_config(&dir);
         let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
         insert_card(&conn, money_card());
+
+        let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
+        ctx.db_missing = false;
+        ctx.db = Some(&conn);
+        assert_eq!(window_estimate_in_use(&ctx).status, CheckStatus::Pass);
+    }
+
+    /// An estimate card for another vendor stands in for no anthropic
+    /// window, so it must not name one. A check that paired every estimate
+    /// card with every account would report `anthropic/five_hour` here.
+    #[test]
+    fn an_estimate_card_for_another_vendor_raises_nothing() {
+        let dir = scratch_dir("window-estimate-other-vendor");
+        std::fs::create_dir_all(&dir).expect("scratch dir must be creatable");
+        let config = anthropic_account_config(&dir);
+        let conn = open_fresh_ledger(&dir.join("ledger.sqlite3"));
+        insert_card(
+            &conn,
+            crate::domain::rate_card::RateCardDraft {
+                vendor: "openai".to_string(),
+                model: "gpt-5".to_string(),
+                ..estimate_card()
+            },
+        );
 
         let mut ctx = empty_ctx(&config, dir.join("ledger.sqlite3"));
         ctx.db_missing = false;
