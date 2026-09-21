@@ -5059,6 +5059,8 @@ The critical invariants are:
 29. A multivariate coefficient is only ever recorded as a candidate, one per
     token kind the experiment premise named, and never activated by the fit
     command.
+30. A window figure derived from a rate-card estimate is labelled estimated on
+    every surface and never outranks a current calibration.
 
 These are more important than most implementation choices.
 
