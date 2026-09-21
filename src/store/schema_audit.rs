@@ -15,7 +15,8 @@
 //!
 //! A quantity column is an `INTEGER` column, not the rowid and not a foreign key, whose
 //! name marks it as carrying a magnitude: a `_micros`, `_nanos`, `_ppm`, `_count`,
-//! `_bytes` or `_index` suffix, or a `token`/`credits`/`quota` stem. Instant columns
+//! `_bytes` or `_index` suffix, a `token`/`credits`/`quota` stem, or the bare name `count`
+//! (which holds every token count in `usage_component`, `aub-xgdl`). Instant columns
 //! (`_at`, `_from`, `_until`, `_time`, `_ts`, `_start`, plus `start`, `end`, `resets_at`,
 //! `due_at`, `mtime_nanos`) are magnitudes too, but a UTC instant has no domain range to
 //! assert, so they are not in scope.
@@ -179,15 +180,19 @@ pub const QUANTITY_CHECK_EXEMPT: &[(&str, &str, &str)] = &[
 ];
 
 /// Column-name stems and suffixes that mark an `INTEGER` column as a magnitude with a
-/// domain range worth asserting. Timestamp columns are magnitudes too but a UTC instant
-/// has no range, so they are excluded by [`is_timestamp_column`].
+/// domain range worth asserting. Bare `count` is a token-count column in
+/// `usage_component.count` (`aub-xgdl`) and is included via [`is_token_count_column`].
+/// Timestamp columns are magnitudes too but a UTC instant has no range, so they are
+/// excluded by [`is_timestamp_column`].
 fn is_quantity_column(name: &str) -> bool {
     const SUFFIXES: [&str; 6] = ["_micros", "_nanos", "_ppm", "_count", "_bytes", "_index"];
     const STEMS: [&str; 3] = ["token", "credits", "quota"];
     if is_timestamp_column(name) {
         return false;
     }
-    SUFFIXES.iter().any(|s| name.ends_with(s)) || STEMS.iter().any(|s| name.contains(s))
+    is_token_count_column(name)
+        || SUFFIXES.iter().any(|s| name.ends_with(s))
+        || STEMS.iter().any(|s| name.contains(s))
 }
 
 /// A UTC instant column: a magnitude with no domain range to assert. `mtime_nanos` is
@@ -445,6 +450,7 @@ mod tests {
     fn quantity_and_timestamp_classification() {
         assert!(is_quantity_column("credits_per_token_micros"));
         assert!(is_quantity_column("sample_count"));
+        assert!(is_quantity_column("count"));
         assert!(is_quantity_column("quota_used_ppm"));
         assert!(is_quantity_column("nominal_duration_nanos"));
         assert!(!is_quantity_column("valid_from"));

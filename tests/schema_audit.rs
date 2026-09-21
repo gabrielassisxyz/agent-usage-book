@@ -380,6 +380,35 @@ fn the_audit_flags_a_bare_quantity_column_and_clears_a_checked_one() {
     );
 }
 
+/// A bare `count` column (as used in `usage_component`) is audited as a quantity column (`aub-xgdl`).
+#[test]
+fn the_audit_flags_a_bare_count_column_and_clears_a_checked_one() {
+    let db = TestDb::new();
+    let conn = db.open_migrated();
+    conn.execute_batch("CREATE TABLE bare_count (count INTEGER NOT NULL) STRICT")
+        .unwrap();
+    conn.execute_batch(
+        "CREATE TABLE checked_count (count INTEGER NOT NULL CHECK (count >= 0)) STRICT",
+    )
+    .unwrap();
+
+    let findings = audit(&conn).expect("the audit must run");
+    let flagged = |table: &str| {
+        findings.findings().iter().any(|f| {
+            matches!(
+                f,
+                SchemaFinding::QuantityColumnWithoutCheck { table: t, column }
+                    if t == table && column == "count"
+            )
+        })
+    };
+    assert!(flagged("bare_count"), "audit missed a bare count column");
+    assert!(
+        !flagged("checked_count"),
+        "audit flagged a checked count column"
+    );
+}
+
 /// The ppm floor is not exemptible: a bare `*_ppm` column is a finding even though a
 /// same-named non-ppm column could be exempted.
 #[test]
