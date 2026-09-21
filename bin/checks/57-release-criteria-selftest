@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Runs bin/release-criteria-selftest (aub-71j.10): the verdict mechanics of the
+# trustworthy-first-release checker, against scratch documents, plus a trace of
+# the live criteria table. The full run builds and tests everything and belongs
+# to the release workflow; the trace is cheap and catches a renamed or deleted
+# test the table still names, on every push rather than at the next tag.
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
+"$repo_root/bin/release-criteria-selftest" || exit 1
+"$repo_root/bin/release-criteria" --list >/dev/null
