@@ -70,12 +70,12 @@ JSONL
         VALUES ('codex','51wv-codex-1',NULL,'proj-codex','repo-e2e',100,150),
                ('pi','51wv-pi-1',NULL,'proj-pi','repo-e2e',200,250);
         INSERT INTO usage_event (canonical_event_id, session_id, evidence_kind, source_provenance, parser_version, created_at)
-        VALUES ('ce-51wv-codex','51wv-codex-1','transcript','$CODEX_TRANSCRIPT','codex-2',100),
+        VALUES ('ce-51wv-codex','51wv-codex-1','transcript','$CODEX_TRANSCRIPT','codex-3',100),
                ('ce-51wv-pi','51wv-pi-1','transcript','$PI_TRANSCRIPT','pi-2',200);
         INSERT INTO usage_component (event_id, token_class, count)
         VALUES (1,'input',10),(2,'input',10);
         INSERT INTO usage_occurrence (source_namespace, native_event_id, parser_version, source_file, occurred_at, event_id)
-        VALUES ('codex','ne-51wv-codex','codex-2','$CODEX_TRANSCRIPT',100,1),
+        VALUES ('codex','ne-51wv-codex','codex-3','$CODEX_TRANSCRIPT',100,1),
                ('pi','ne-51wv-pi','pi-2','$PI_TRANSCRIPT',200,2);
     "
 

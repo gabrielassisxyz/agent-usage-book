@@ -185,7 +185,9 @@ both. Attribution is decided by the marker-interval segmentation, never by this
 command; usage no marker can justify lands in the `unknown-account` group, which
 is reported as its own partial group rather than merged or dropped. `--explain`
 on an account group names the exact markers behind the attribution and their
-evidence class.
+evidence class. A Codex subagent session with no markers of its own inherits
+its parent's marker timeline, and `--explain` names the ancestor session for
+an inherited row so it stays distinguishable from a direct one.
 
 Two rules read the account off an event's stored model id instead, and each
 replaces the marker attribution for the events it matches:

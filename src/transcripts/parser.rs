@@ -303,6 +303,12 @@ pub struct NormalizedUsageEvent {
     occurred_at: Option<UtcTimestamp>,
     session: Option<SessionId>,
     working_directory: Option<String>,
+    /// The Codex subagent parent thread, when the rollout's `session_meta`
+    /// names one (`source.subagent.thread_spawn.parent_thread_id`). Carried
+    /// per event so ingest can persist the per-session link without re-reading
+    /// the transcript; `None` for a top-level session and for sources that
+    /// never name a parent.
+    parent_session: Option<SessionId>,
     /// A source-provided sequence number for the record, when the source
     /// writes one. The strongest available ordering discriminator for a
     /// cumulative series: a sequence survives clock skew and identical
@@ -327,6 +333,7 @@ impl NormalizedUsageEvent {
             occurred_at: None,
             session: None,
             working_directory: None,
+            parent_session: None,
             sequence: None,
         }
     }
@@ -340,6 +347,14 @@ impl NormalizedUsageEvent {
     /// The same event attributed to the session its source names.
     pub fn with_session(mut self, session: SessionId) -> Self {
         self.session = Some(session);
+        self
+    }
+
+    /// The same event carrying the Codex subagent parent thread its rollout
+    /// names, when it names one. `None` stays `None`: a top-level session
+    /// records no parent rather than an invented one.
+    pub fn with_parent_session(mut self, parent: Option<SessionId>) -> Self {
+        self.parent_session = parent;
         self
     }
 
@@ -369,6 +384,13 @@ impl NormalizedUsageEvent {
 
     pub fn session(&self) -> Option<&SessionId> {
         self.session.as_ref()
+    }
+
+    /// The Codex subagent parent thread this event's rollout names, when it
+    /// names one. `None` for a top-level session and for sources that never
+    /// name a parent.
+    pub fn parent_session(&self) -> Option<&SessionId> {
+        self.parent_session.as_ref()
     }
 
     /// The working directory the transcript states the session ran in, when

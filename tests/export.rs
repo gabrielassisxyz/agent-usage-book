@@ -94,6 +94,7 @@ fn seed_session_with_usage_and_directory(
             project_key: ProjectKey::new(format!("proj-{index}")),
             repository_key: RepositoryKey::new(format!("repo-{index}")),
             working_directory: working_directory.map(str::to_string),
+            parent_native_session_id: None,
             run_id: run.map(NativeRunId::new),
         },
     )

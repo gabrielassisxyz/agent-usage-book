@@ -378,6 +378,63 @@ pub fn markers_for_session(
     Ok(result)
 }
 
+/// The markers that govern a session, with the ancestor that supplied them.
+///
+/// A session with markers of its own is governed by those markers and names
+/// no ancestor. A markerless session inherits the timeline of the first
+/// marked ancestor above it, following the stored Codex subagent parent
+/// links (`aub-wvrw`) in the same source namespace, recursively. The ancestor
+/// label is `source:native`, the same label the spend explain prints.
+///
+/// Returns an empty marker list and no ancestor when the session carries no
+/// parent, names a parent never ingested, reaches only unmarked ancestors, or
+/// the parent chain cycles: all four stay in `unknown-account` rather than
+/// guessing from the clock or the directory. The walk terminates on a
+/// repeated session.
+pub fn governing_marker_timeline(
+    conn: &rusqlite::Connection,
+    session_id: &SessionId,
+) -> Result<(Vec<SessionAccountMarker>, Option<String>), Error> {
+    let own = markers_for_session(conn, session_id)?;
+    if !own.is_empty() {
+        return Ok((own, None));
+    }
+    use std::collections::HashSet;
+
+    let source = session_id.source().as_str().to_string();
+    let mut visited: HashSet<(String, String)> = HashSet::new();
+    visited.insert((source.clone(), session_id.native().as_str().to_string()));
+    let mut current_native = session_id.native().as_str().to_string();
+    loop {
+        let current = crate::store::session::load_session(
+            conn,
+            &SourceNamespace::new(source.clone()),
+            &crate::domain::ids::NativeSessionId::new(current_native.clone()),
+        )?;
+        let parent_native = match current.as_ref().and_then(|row| {
+            row.parent_native_session_id()
+                .map(|id| id.as_str().to_string())
+        }) {
+            Some(parent) if !parent.is_empty() => parent,
+            _ => return Ok((Vec::new(), None)),
+        };
+        let parent_key = (source.clone(), parent_native.clone());
+        if !visited.insert(parent_key.clone()) {
+            return Ok((Vec::new(), None));
+        }
+        let parent_id = SessionId::new(
+            SourceNamespace::new(source.clone()),
+            crate::domain::ids::NativeSessionId::new(parent_native.clone()),
+        );
+        let parent_markers = markers_for_session(conn, &parent_id)?;
+        if !parent_markers.is_empty() {
+            let label = format!("{source}:{parent_native}");
+            return Ok((parent_markers, Some(label)));
+        }
+        current_native = parent_native;
+    }
+}
+
 /// Reads all markers in the database in deterministic order.
 pub fn all_markers(conn: &rusqlite::Connection) -> Result<Vec<SessionAccountMarker>, Error> {
     let mut stmt = conn

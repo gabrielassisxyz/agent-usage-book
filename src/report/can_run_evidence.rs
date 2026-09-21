@@ -213,7 +213,10 @@ fn gather_task_history_samples(
 /// The worst (least confident) [`AccountEvidenceClass`] any of this task's own
 /// attributed events resolves to, across every session it touched. An event
 /// with no session identity at all resolves to [`AccountEvidenceClass::Unattributed`]
-/// directly: there is no marker timeline to consult.
+/// directly: there is no marker timeline to consult. A Codex subagent session
+/// with no markers of its own resolves through its governing marker timeline
+/// (`aub-wvrw`), so one subagent event inside a claimed task no longer makes
+/// the whole task `Unattributed`.
 fn task_account_evidence_class(
     conn: &rusqlite::Connection,
     task_events: &[&CanonicalSpendEvent],
@@ -232,10 +235,11 @@ fn task_account_evidence_class(
                         SourceNamespace::new(source.clone()),
                         NativeSessionId::new(native.clone()),
                     );
-                    let markers = crate::store::session_account_marker::markers_for_session(
-                        conn,
-                        &session_id,
-                    )?;
+                    let (markers, _) =
+                        crate::store::session_account_marker::governing_marker_timeline(
+                            conn,
+                            &session_id,
+                        )?;
                     markers_by_session.insert(
                         key.clone(),
                         markers.iter().map(|marker| marker.boundary()).collect(),
@@ -329,7 +333,47 @@ mod tests {
                 project_key: ProjectKey::new("project-a"),
                 repository_key: RepositoryKey::new("repository-a"),
                 working_directory: None,
+                parent_native_session_id: None,
                 run_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_session_with_parent(conn: &rusqlite::Connection, name: &str, parent: &str) {
+        insert_session(
+            conn,
+            &NewSession {
+                source: SourceNamespace::new("fixture"),
+                native_session_id: NativeSessionId::new(name),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                working_directory: None,
+                parent_native_session_id: Some(NativeSessionId::new(parent)),
+                run_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn seed_marker(conn: &rusqlite::Connection, native: &str, account: &str, observed_nanos: i64) {
+        crate::store::session_account_marker::insert_marker(
+            conn,
+            &crate::store::session_account_marker::NewSessionAccountMarker {
+                session_id: crate::domain::ids::SessionId::new(
+                    SourceNamespace::new("fixture"),
+                    NativeSessionId::new(native),
+                ),
+                observed_at: UtcTimestamp::from_unix_nanos(observed_nanos),
+                source_ordering_key: None,
+                logical_account: account.to_owned(),
+                resolved_account_id: None,
+                marker_source: crate::store::session_account_marker::MarkerSource::new("hook"),
+                run_id: None,
+                evidence_designation:
+                    crate::store::session_account_marker::EvidenceDesignation::ExplicitLauncherOrHook,
             },
         )
         .unwrap();
@@ -663,5 +707,67 @@ mod tests {
             report.verdict,
             DistributionVerdict::InsufficientEvidence { min_samples: 12 }
         ));
+    }
+
+    /// A Codex subagent event inside a claimed task inherits its parent's
+    /// marker timeline (`aub-wvrw`): the task keeps an explicit evidence
+    /// class instead of falling to `Unattributed` and out of the reference
+    /// distribution as `unknown_account_attribution`.
+    #[test]
+    fn a_subagent_event_inside_a_task_inherits_the_parent_account() {
+        let mut conn = open_test_ledger("subagent-inherits");
+        seed_session(&conn, "parent-1");
+        seed_session_with_parent(&conn, "child-1", "parent-1");
+        let day = day_nanos("2026-08-25");
+        let one_hour = 3_600_000_000_000;
+        seed_marker(&conn, "parent-1", "work", day + 1);
+        seed_canonical(&conn, "e1", day + one_hour, "child-1", &[("input", 1000)]);
+        crate::store::task_event::ingest(
+            &conn,
+            SourceNamespace::new("beads-a"),
+            &FixtureReader(vec![
+                tracker_event(
+                    1,
+                    "T1",
+                    Some("open"),
+                    Some("in_progress"),
+                    "2026-08-25T00:30:00Z",
+                ),
+                tracker_event(
+                    2,
+                    "T1",
+                    Some("in_progress"),
+                    Some("closed"),
+                    "2026-08-25T02:00:00Z",
+                ),
+            ]),
+        )
+        .unwrap();
+        seed_resolved_kind(&conn, "T1", "task");
+        crate::store::cost_model::seed_initial_cost_model(
+            &mut conn,
+            UtcTimestamp::from_unix_nanos(0),
+        )
+        .unwrap();
+
+        let period = SelectionPeriod {
+            start: UtcTimestamp::from_unix_nanos(0),
+            end: UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+        };
+        let samples = gather_task_history_samples(
+            &conn,
+            TaskKind::Task,
+            period,
+            UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        assert_eq!(
+            samples[0].account_evidence,
+            AccountEvidenceClass::ExplicitLauncherOrHook,
+            "a subagent event inherits its parent marker instead of going unattributed"
+        );
     }
 }

@@ -63,7 +63,6 @@ use crate::store::calibration_multivariate_result::{
     MultivariateCalibration, insert_multivariate_result, load_multivariate_result_for_candidate,
 };
 use crate::store::cost_model::ValidityInterval;
-use crate::store::session_account_marker::markers_for_session;
 
 /// Which fitter `calibrate fit` runs for an experiment, decided by its premise.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -176,7 +175,10 @@ fn settled_blocks(
     blocks
 }
 
-/// The account-marker timeline of every session the usage rows name.
+/// The account-marker timeline of every session the usage rows name. A Codex
+/// subagent session with no markers of its own resolves through its governing
+/// marker timeline (`aub-wvrw`), so the child's tokens count under the
+/// parent's account in the block tokens as well as in the meter delta.
 pub(super) fn markers_by_session(
     conn: &Connection,
     usage: &[StoredUsageEvent],
@@ -190,10 +192,9 @@ pub(super) fn markers_by_session(
             SourceNamespace::new(source.clone()),
             NativeSessionId::new(native.clone()),
         );
-        let boundaries = markers_for_session(conn, &session_id)?
-            .iter()
-            .map(|marker| marker.boundary())
-            .collect();
+        let (governing, _) =
+            crate::store::session_account_marker::governing_marker_timeline(conn, &session_id)?;
+        let boundaries = governing.iter().map(|marker| marker.boundary()).collect();
         markers.insert((source.clone(), native.clone()), boundaries);
     }
     Ok(markers)
@@ -806,5 +807,108 @@ mod tests {
     fn readings_without_spend_yield_no_block() {
         let usable = vec![reading("r0", 0, 100_000), reading("r1", 10, 100_000)];
         assert!(settled_blocks(&usable, &[]).is_empty());
+    }
+
+    /// A Codex subagent's usage counts under its parent's account
+    /// (`aub-wvrw`): the marker timeline comes from the first marked
+    /// ancestor, so the child's block tokens join the run instead of being
+    /// left out while the meter delta keeps them.
+    #[test]
+    fn subagent_usage_counts_under_the_parent_account() {
+        use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
+        use crate::domain::time::MonotonicDuration;
+        use crate::sessions::{ProjectKey, RepositoryKey};
+        use crate::store::connection::PragmaPolicy;
+        use crate::store::session::{NewSession, insert_session};
+        use crate::store::session_account_marker::{
+            EvidenceDesignation, MarkerSource, NewSessionAccountMarker,
+        };
+
+        let dir = std::env::temp_dir().join(format!(
+            "aub-calibration-subagent-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock must be after the epoch")
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let conn = crate::store::test_schema::open_migrated(
+            &dir.join("ledger.db"),
+            &PragmaPolicy {
+                busy_timeout: MonotonicDuration::from_millis(100),
+            },
+        );
+
+        insert_session(
+            &conn,
+            &NewSession {
+                source: SourceNamespace::new("codex"),
+                native_session_id: NativeSessionId::new("parent-1"),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                working_directory: None,
+                parent_native_session_id: None,
+                run_id: None,
+            },
+        )
+        .unwrap();
+        insert_session(
+            &conn,
+            &NewSession {
+                source: SourceNamespace::new("codex"),
+                native_session_id: NativeSessionId::new("child-1"),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: ProjectKey::new("project-a"),
+                repository_key: RepositoryKey::new("repository-a"),
+                working_directory: None,
+                parent_native_session_id: Some(NativeSessionId::new("parent-1")),
+                run_id: None,
+            },
+        )
+        .unwrap();
+        crate::store::session_account_marker::insert_marker(
+            &conn,
+            &NewSessionAccountMarker {
+                session_id: SessionId::new(
+                    SourceNamespace::new("codex"),
+                    NativeSessionId::new("parent-1"),
+                ),
+                observed_at: UtcTimestamp::from_unix_nanos(1),
+                source_ordering_key: None,
+                logical_account: "work".to_owned(),
+                resolved_account_id: None,
+                marker_source: MarkerSource::new("hook"),
+                run_id: None,
+                evidence_designation: EvidenceDesignation::ExplicitLauncherOrHook,
+            },
+        )
+        .unwrap();
+
+        let usage = vec![StoredUsageEvent {
+            canonical_event_id: "child-turn".to_string(),
+            timestamp: UtcTimestamp::from_unix_nanos(20),
+            model_id: None,
+            token_class: "input".to_string(),
+            count: 5,
+            session: Some(("codex".to_string(), "child-1".to_string())),
+        }];
+
+        let markers = markers_by_session(&conn, &usage).unwrap();
+        assert_eq!(markers.len(), 1);
+        assert!(
+            !markers[&("codex".to_string(), "child-1".to_string())].is_empty(),
+            "the child resolves through its parent marker timeline"
+        );
+
+        let (kept, _) = retain_account_usage(usage, &markers, "work").unwrap();
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].canonical_event_id, "child-turn");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

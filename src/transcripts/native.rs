@@ -413,7 +413,7 @@ const CODEX_IGNORED: [&str; 2] = ["total_tokens", "reasoning_output_tokens"];
 
 impl ParserAdapter for CodexParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("codex-2")
+        ParserVersion::new("codex-3")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -432,6 +432,7 @@ impl ParserAdapter for CodexParser {
     fn parse(&self, input: &str, location: &SourceLocation) -> ParseOutput {
         let mut last: Option<(UsageCounts, Option<UtcTimestamp>, Option<String>)> = None;
         let mut session: Option<SessionId> = None;
+        let mut parent_session: Option<SessionId> = None;
         let mut working_directory: Option<String> = None;
         let mut model: Option<String> = None;
         let mut quarantined = Vec::new();
@@ -452,6 +453,9 @@ impl ParserAdapter for CodexParser {
                 }
                 Ok(CodexLine::Session(header)) => {
                     session = Some(header.id);
+                    if header.parent.is_some() {
+                        parent_session = header.parent;
+                    }
                     if header.model.is_some() {
                         model = header.model;
                     }
@@ -482,6 +486,7 @@ impl ParserAdapter for CodexParser {
                     },
                     self.parser_version(),
                 )
+                .with_parent_session(parent_session.clone())
             })
             .into_iter()
             .collect();
@@ -489,11 +494,13 @@ impl ParserAdapter for CodexParser {
     }
 }
 
-/// What a Codex `session_meta` header names: the session, the model when a
-/// rollout states one there, and the working directory the session ran in
-/// (`cwd` in the header payload).
+/// What a Codex `session_meta` header names: the session, the subagent parent
+/// thread when the rollout is a subagent (`source.subagent.thread_spawn.
+/// parent_thread_id`), the model when a rollout states one there, and the
+/// working directory the session ran in (`cwd` in the header payload).
 struct CodexSession {
     id: SessionId,
+    parent: Option<SessionId>,
     model: Option<String>,
     working_directory: Option<String>,
 }
@@ -506,6 +513,29 @@ enum CodexLine {
     Session(CodexSession),
     TurnContext(String),
     Nothing,
+}
+
+/// The subagent parent thread a Codex `session_meta` payload names, when it
+/// names one (`source.subagent.thread_spawn.parent_thread_id`).
+///
+/// A top-level session carries `"source":"exec"` (or another string) there and
+/// yields nothing, as does a missing `source`. A malformed `source` object (a
+/// `subagent` that is not an object, a `thread_spawn` that is not an object,
+/// or a `parent_thread_id` that is not a non-empty string) yields nothing
+/// without an error: the rollout is still a usable session, it simply records
+/// no parent link.
+fn codex_parent_thread_id(payload: &serde_json::Map<String, Value>) -> Option<SessionId> {
+    let source = payload.get("source")?;
+    let source_object = source.as_object()?;
+    let subagent = source_object.get("subagent")?;
+    let subagent_object = subagent.as_object()?;
+    let spawn = subagent_object.get("thread_spawn")?;
+    let spawn_object = spawn.as_object()?;
+    let parent = spawn_object.get("parent_thread_id")?.as_str()?;
+    if parent.is_empty() {
+        return None;
+    }
+    Some(session_id(CODEX_NAMESPACE, parent))
 }
 
 fn parse_codex_line(line: &str) -> Result<CodexLine, QuarantineClass> {
@@ -525,12 +555,14 @@ fn parse_codex_line(line: &str) -> Result<CodexLine, QuarantineClass> {
             .and_then(Value::as_str)
             .filter(|dir| !dir.is_empty())
             .map(str::to_string);
+        let parent = codex_parent_thread_id(payload);
         return Ok(payload
             .get("id")
             .and_then(Value::as_str)
             .map(|native| {
                 CodexLine::Session(CodexSession {
                     id: session_id(CODEX_NAMESPACE, native),
+                    parent,
                     model,
                     working_directory,
                 })
@@ -1184,6 +1216,16 @@ mod tests {
         assert_eq!(parser.parser_version().as_str(), "opencode-4");
         assert_eq!(parser.input_format_version().as_str(), "opencode-sqlite-v1");
         assert!(parser.is_database_source());
+    }
+
+    /// Codex declares `codex-3`, so `ingest --changed-only` re-derives every
+    /// existing rollout and fills `parent_native_session_id` for sessions
+    /// ingested before the subagent column existed (`aub-wvrw`).
+    #[test]
+    fn codex_declares_its_parser_and_input_format_versions() {
+        let parser = CodexParser;
+        assert_eq!(parser.parser_version().as_str(), "codex-3");
+        assert_eq!(parser.input_format_version().as_str(), "codex-jsonl-v1");
     }
 
     /// A database source has no text form: empty input parses to nothing, and
@@ -2028,5 +2070,83 @@ mod tests {
             ],
             "each event carries what its own line stated"
         );
+    }
+
+    /// A Codex `session_meta` with a `thread_spawn` source yields the parent
+    /// thread id (`aub-wvrw`): the subagent's usage inherits the parent's
+    /// account-marker timeline.
+    #[test]
+    fn codex_session_meta_with_thread_spawn_yields_the_parent_thread_id() {
+        let parser = CodexParser;
+        let output = parser.parse(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"child-1","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent-1","depth":1,"agent_role":"analyzer"}}}}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#,
+            ),
+            &location(),
+        );
+        assert_eq!(output.events().len(), 1);
+        let parent = output.events()[0]
+            .parent_session()
+            .expect("subagent rollout must carry its parent");
+        assert_eq!(parent.native().as_str(), "parent-1");
+        assert_eq!(parent.source().as_str(), CODEX_NAMESPACE);
+    }
+
+    /// A top-level Codex session carries a string `source` (`"exec"`) and
+    /// records no parent (`aub-wvrw`).
+    #[test]
+    fn codex_session_meta_with_a_string_source_records_no_parent() {
+        let parser = CodexParser;
+        let output = parser.parse(
+            concat!(
+                r#"{"type":"session_meta","payload":{"id":"s1","source":"exec"}}"#,
+                "\n",
+                r#"{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":10,"output_tokens":5}}}}"#,
+            ),
+            &location(),
+        );
+        assert_eq!(output.events().len(), 1);
+        assert_eq!(output.events()[0].parent_session(), None);
+    }
+
+    /// A malformed `source` object records no parent without an error
+    /// (`aub-wvrw`): the rollout is still a usable session, it simply carries
+    /// no parent link. Each case is a different malformation of the same
+    /// `source.subagent.thread_spawn.parent_thread_id` path.
+    #[test]
+    fn codex_session_meta_with_a_malformed_source_records_no_parent_without_an_error() {
+        let parser = CodexParser;
+        let cases = [
+            // No source at all.
+            r#"{"type":"session_meta","payload":{"id":"s1"}}"#,
+            // subagent is not an object.
+            r#"{"type":"session_meta","payload":{"id":"s1","source":{"subagent":"x"}}}"#,
+            // thread_spawn is not an object.
+            r#"{"type":"session_meta","payload":{"id":"s1","source":{"subagent":{"thread_spawn":"x"}}}}"#,
+            // parent_thread_id is not a string.
+            r#"{"type":"session_meta","payload":{"id":"s1","source":{"subagent":{"thread_spawn":{"parent_thread_id":42}}}}}"#,
+            // parent_thread_id is empty.
+            r#"{"type":"session_meta","payload":{"id":"s1","source":{"subagent":{"thread_spawn":{"parent_thread_id":""}}}}}"#,
+            // parent_thread_id missing.
+            r#"{"type":"session_meta","payload":{"id":"s1","source":{"subagent":{"thread_spawn":{"depth":1}}}}}"#,
+        ];
+        for line in cases {
+            let input = format!(
+                "{line}\n{{\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"info\":{{\"total_token_usage\":{{\"input_tokens\":10,\"output_tokens\":5}}}}}}}}"
+            );
+            let output = parser.parse(&input, &location());
+            assert_eq!(output.events().len(), 1, "line: {line}");
+            assert_eq!(
+                output.events()[0].parent_session(),
+                None,
+                "malformed source must yield no parent: {line}"
+            );
+            assert!(
+                output.quarantined().is_empty(),
+                "malformed source must not quarantine: {line}"
+            );
+        }
     }
 }

@@ -1726,6 +1726,8 @@ fn render_spend_filter_exclusion(outcome: &SpendFilterOutcome) -> String {
 /// unless the report was grouped by account. Each line names the account, its
 /// effective evidence class, and the exact markers that produced it, so the
 /// human output carries the same references the JSON explain does (aub-mgv.4).
+/// An inherited attribution names the ancestor session it came from
+/// (`aub-wvrw`), so an inherited row stays distinguishable from a direct one.
 fn render_account_explain(report: &SpendReport) -> String {
     if report.account_explain.is_empty() {
         return String::new();
@@ -1742,11 +1744,18 @@ fn render_account_explain(report: &SpendReport) -> String {
                 .collect::<Vec<_>>()
                 .join(", ")
         };
-        lines.push(format!(
+        let mut line = format!(
             "  {}  evidence_class={}  markers=[{markers}]",
             group.key.as_str(),
             group.evidence_class.as_str()
-        ));
+        );
+        if !group.inherited_from.is_empty() {
+            line.push_str(&format!(
+                "  inherited_from=[{}]",
+                group.inherited_from.join(", ")
+            ));
+        }
+        lines.push(line);
     }
     lines.join("\n")
 }

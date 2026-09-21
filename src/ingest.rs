@@ -901,7 +901,10 @@ fn collision_descriptors(
 /// state, so it produces no row: an invented bound would be a fabricated fact.
 /// Project and repository resolve from the pass-wide first-wins directories
 /// through the configured alias tables and layout roots; a session with no
-/// stated directory stays in the unknown buckets.
+/// stated directory stays in the unknown buckets. The Codex subagent parent
+/// link rides the same pass: the first stated parent per session wins, so a
+/// later disagreeing parent never overwrites the one the transcript stated
+/// first.
 fn session_pass<'a>(
     events: impl IntoIterator<Item = &'a NormalizedUsageEvent>,
     directories: &BTreeMap<(String, String), Option<String>>,
@@ -911,6 +914,7 @@ fn session_pass<'a>(
 ) -> Vec<NewSession> {
     let mut bounds: BTreeMap<(String, String), (Option<UtcTimestamp>, Option<UtcTimestamp>)> =
         BTreeMap::new();
+    let mut parents: BTreeMap<(String, String), String> = BTreeMap::new();
     for event in events {
         let Some(session) = event.session() else {
             continue;
@@ -919,10 +923,15 @@ fn session_pass<'a>(
             session.source().as_str().to_string(),
             session.native().as_str().to_string(),
         );
-        let entry = bounds.entry(key).or_insert((None, None));
+        let entry = bounds.entry(key.clone()).or_insert((None, None));
         if let Some(at) = event.occurred_at() {
             entry.0 = Some(entry.0.map_or(at, |start| start.min(at)));
             entry.1 = Some(entry.1.map_or(at, |end| end.max(at)));
+        }
+        if let Some(parent) = event.parent_session()
+            && !parents.contains_key(&key)
+        {
+            parents.insert(key, parent.native().as_str().to_string());
         }
     }
     bounds
@@ -932,6 +941,10 @@ fn session_pass<'a>(
                 .get(&(namespace.clone(), native.clone()))
                 .cloned()
                 .flatten();
+            let parent_native_session_id = parents
+                .get(&(namespace.clone(), native.clone()))
+                .cloned()
+                .map(crate::domain::ids::NativeSessionId::new);
             Some(NewSession {
                 source: SourceNamespace::new(namespace),
                 native_session_id: crate::domain::ids::NativeSessionId::new(native),
@@ -949,6 +962,7 @@ fn session_pass<'a>(
                     working_directory.as_deref(),
                 ),
                 working_directory,
+                parent_native_session_id,
                 run_id: None,
             })
         })
@@ -1181,5 +1195,80 @@ mod batch_split_tests {
         let batches = split_into_batches(&[], 10, 10);
         assert_eq!(batches.len(), 1);
         assert!(batches[0].is_empty());
+    }
+
+    /// The Codex subagent parent link survives the session pass (`aub-wvrw`):
+    /// a child event carrying `parent_session` yields a session row naming the
+    /// parent, a top-level event yields none, and the first stated parent
+    /// wins. The planted negative is a pass that drops the parent: the row
+    /// would carry none and attribution could never inherit it.
+    #[test]
+    fn session_pass_carries_the_codex_subagent_parent_link() {
+        use crate::domain::ids::SessionId;
+
+        fn event_with_parent(
+            session_native: &str,
+            parent_native: Option<&str>,
+            at_nanos: i64,
+        ) -> NormalizedUsageEvent {
+            let usage = UsageVector::new(
+                KnownTokenVector::new(
+                    InputTokens::new(10),
+                    OutputTokens::new(5),
+                    CacheReadTokens::new(0),
+                    CacheWriteTokens::new(0),
+                ),
+                BTreeMap::new(),
+                CoverageCompleteness::Complete,
+                EvidenceQuality::Measured,
+            );
+            let event = NormalizedUsageEvent::new(
+                usage,
+                EvidenceClassification::Reported,
+                Provenance::new(vec!["corpus/a.jsonl".to_string()]),
+                ParserVersion::new("test-1"),
+            )
+            .with_session(SessionId::new(
+                SourceNamespace::new("codex"),
+                NativeSessionId::new(session_native),
+            ))
+            .with_occurred_at(UtcTimestamp::from_unix_nanos(at_nanos));
+            match parent_native {
+                Some(parent) => event.with_parent_session(Some(SessionId::new(
+                    SourceNamespace::new("codex"),
+                    NativeSessionId::new(parent),
+                ))),
+                None => event,
+            }
+        }
+
+        let events = vec![
+            event_with_parent("child-1", Some("parent-1"), 1_000),
+            event_with_parent("top-1", None, 2_000),
+            event_with_parent("child-1", Some("parent-2"), 3_000),
+        ];
+        let sessions = session_pass(
+            &events,
+            &BTreeMap::new(),
+            &crate::config::AliasTable::new(BTreeMap::new()).unwrap(),
+            &crate::config::AliasTable::new(BTreeMap::new()).unwrap(),
+            &crate::config::layout::LayoutRoots::default(),
+        );
+        let by_native: BTreeMap<&str, &NewSession> = sessions
+            .iter()
+            .map(|session| (session.native_session_id.as_str(), session))
+            .collect();
+        assert_eq!(
+            by_native["child-1"]
+                .parent_native_session_id
+                .as_ref()
+                .map(|id| id.as_str()),
+            Some("parent-1"),
+            "the first stated parent wins over a later disagreeing one"
+        );
+        assert_eq!(
+            by_native["top-1"].parent_native_session_id, None,
+            "a top-level session records no parent"
+        );
     }
 }

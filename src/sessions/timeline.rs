@@ -135,6 +135,7 @@ pub fn rebuild_sessions(
                     working_dir.as_deref(),
                 ),
                 working_directory: working_dir,
+                parent_native_session_id: None,
                 run_id: None,
             }
         })
