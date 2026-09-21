@@ -1,0 +1,351 @@
+#!/usr/bin/env bash
+# Release boundary for aub-n27.9. It keeps event selection, artifact identity,
+# privacy scanning, checksums and matrix completeness in one executable contract.
+set -euo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/.." && pwd)"
+workflow="${RELEASE_GUARD_WORKFLOW:-$repo_root/.github/workflows/release.yml}"
+patterns_file="$repo_root/docs/forbidden-patterns.txt"
+
+die() {
+    echo "release-guard: $*" >&2
+    exit 1
+}
+
+usage() {
+    cat <<'EOF'
+usage:
+  bin/release-guard context --event EVENT --ref REF --revision SHA --output FILE
+  bin/release-guard prepare --binary PATH --target TARGET --tag TAG --revision SHA [--forbidden-marker TEXT] --output DIR
+  bin/release-guard verify-set --directory DIR --tag TAG --revision SHA --target TARGET [--target TARGET ...]
+  bin/release-guard self-test
+EOF
+}
+
+manifest_version() {
+    awk '
+        $0 == "[package]" { package = 1; next }
+        package && /^\[/ { exit }
+        package && /^[[:space:]]*version[[:space:]]*=/ {
+            value = $0
+            sub(/^[^=]*=[[:space:]]*"/, "", value)
+            sub(/"[[:space:]]*$/, "", value)
+            print value
+            exit
+        }
+    ' "$repo_root/Cargo.toml"
+}
+
+assert_revision() {
+    local revision="$1"
+    [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || die "revision must be a full lowercase git sha: $revision"
+}
+
+assert_tag() {
+    local tag="$1" version
+    version="$(manifest_version)"
+    [ -n "$version" ] || die "Cargo.toml has no package version"
+    [ "$tag" = "v$version" ] || die "tag $tag does not match crate version $version"
+}
+
+sha256_file() {
+    local path="$1"
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$path" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$path" | awk '{print $1}'
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$path" | awk '{print $NF}'
+    else
+        die "no SHA-256 implementation is available"
+    fi
+}
+
+scan_binary() {
+    local binary="$1" marker="${2:-}" pattern count=0
+    [ -f "$patterns_file" ] || die "forbidden-pattern source is missing: $patterns_file"
+    while IFS= read -r pattern || [ -n "$pattern" ]; do
+        case "$pattern" in
+            '# === binary-scan patterns end here ==='*) break ;;
+            ''|'#'*) continue ;;
+        esac
+        count=$((count + 1))
+        if LC_ALL=C grep -a -qiF -- "$pattern" "$binary"; then
+            die "$(basename "$binary") contains forbidden pattern: $pattern"
+        fi
+    done <"$patterns_file"
+    [ "$count" -gt 0 ] || die "forbidden-pattern source contains no binary patterns"
+    if [ -n "$marker" ] && LC_ALL=C grep -a -qF -- "$marker" "$binary"; then
+        die "$(basename "$binary") contains its build workspace: $marker"
+    fi
+}
+
+context() {
+    local event="" ref="" revision="" output=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --event) event="$2"; shift 2 ;;
+            --ref) ref="$2"; shift 2 ;;
+            --revision) revision="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            *) die "context: unknown argument $1" ;;
+        esac
+    done
+    [ -n "$event" ] && [ -n "$ref" ] && [ -n "$revision" ] && [ -n "$output" ] || die "context: missing argument"
+    assert_revision "$revision"
+    local tag publish
+    case "$event:$ref" in
+        push:refs/tags/v*) tag="${ref#refs/tags/}"; publish=true ;;
+        workflow_dispatch:refs/heads/*) tag="v$(manifest_version)"; publish=false ;;
+        *) die "event $event at $ref is not a release or dry-run trigger" ;;
+    esac
+    assert_tag "$tag"
+    {
+        printf 'release_tag=%s\n' "$tag"
+        printf 'revision=%s\n' "$revision"
+        printf 'publish=%s\n' "$publish"
+    } >>"$output"
+}
+
+prepare() {
+    local binary="" target="" tag="" revision="" marker="" output=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --binary) binary="$2"; shift 2 ;;
+            --target) target="$2"; shift 2 ;;
+            --tag) tag="$2"; shift 2 ;;
+            --revision) revision="$2"; shift 2 ;;
+            --forbidden-marker) marker="$2"; shift 2 ;;
+            --output) output="$2"; shift 2 ;;
+            *) die "prepare: unknown argument $1" ;;
+        esac
+    done
+    [ -n "$binary" ] && [ -n "$target" ] && [ -n "$tag" ] && [ -n "$revision" ] && [ -n "$output" ] || die "prepare: missing argument"
+    [ -x "$binary" ] || die "release binary is not executable: $binary"
+    assert_revision "$revision"
+    assert_tag "$tag"
+
+    local version reported archive_name archive scratch packaged_binary checksum toolchain
+    version="$(manifest_version)"
+    reported="$("$binary")"
+    reported="${reported%$'\r'}"
+    [ "$reported" = "aub $version ($revision)" ] || die "binary reports '$reported', expected 'aub $version ($revision)'"
+    scan_binary "$binary" "$marker"
+
+    mkdir -p "$output"
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-release-guard.XXXXXX")"
+    trap 'rm -rf "$scratch"' EXIT
+    packaged_binary=aub
+    case "$target" in *-windows-*) packaged_binary=aub.exe ;; esac
+    cp "$binary" "$scratch/$packaged_binary"
+    toolchain="$(awk -F'"' '/^[[:space:]]*channel[[:space:]]*=/{print $2; exit}' "$repo_root/rust-toolchain.toml")"
+    [ -n "$toolchain" ] || die "rust-toolchain.toml has no pinned channel"
+    {
+        printf 'version=%s\n' "$version"
+        printf 'revision=%s\n' "$revision"
+        printf 'target=%s\n' "$target"
+        printf 'toolchain=%s\n' "$toolchain"
+    } >"$scratch/RELEASE-METADATA"
+
+    archive_name="aub-$target.tar.gz"
+    archive="$output/$archive_name"
+    tar -C "$scratch" -czf "$archive" "$packaged_binary" RELEASE-METADATA
+    checksum="$(sha256_file "$archive")"
+    printf '%s  %s\n' "$checksum" "$archive_name" >"$archive.sha256"
+    printf 'prepared %s and %s.sha256\n' "$archive" "$archive"
+    rm -rf "$scratch"
+    trap - EXIT
+}
+
+metadata_value() {
+    local archive="$1" key="$2"
+    tar -xOzf "$archive" RELEASE-METADATA | awk -F= -v key="$key" '$1 == key {sub(/^[^=]*=/, ""); print; exit}'
+}
+
+verify_checksum() {
+    local archive="$1" expected actual named
+    local checksum_file="$archive.sha256"
+    [ -f "$checksum_file" ] || die "missing checksum for $(basename "$archive")"
+    read -r expected named <"$checksum_file"
+    named="${named#\*}"
+    [ "$named" = "$(basename "$archive")" ] || die "checksum names $named instead of $(basename "$archive")"
+    actual="$(sha256_file "$archive")"
+    [ "$actual" = "$expected" ] || die "checksum mismatch for $(basename "$archive")"
+}
+
+verify_set() {
+    local directory="" tag="" revision="" target version archive seen_targets=" "
+    local targets=()
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --directory) directory="$2"; shift 2 ;;
+            --tag) tag="$2"; shift 2 ;;
+            --revision) revision="$2"; shift 2 ;;
+            --target) targets+=("$2"); shift 2 ;;
+            *) die "verify-set: unknown argument $1" ;;
+        esac
+    done
+    [ -n "$directory" ] && [ -n "$tag" ] && [ -n "$revision" ] && [ "${#targets[@]}" -gt 0 ] || die "verify-set: missing argument"
+    assert_revision "$revision"
+    assert_tag "$tag"
+    version="$(manifest_version)"
+
+    local actual_count
+    actual_count="$(find "$directory" -maxdepth 1 -type f -name 'aub-*.tar.gz' | wc -l)"
+    [ "$actual_count" -eq "${#targets[@]}" ] || die "artifact set has $actual_count archives; expected ${#targets[@]}"
+    : >"$directory/SHA256SUMS"
+    for target in "${targets[@]}"; do
+        case "$seen_targets" in
+            *" $target "*) die "target appears more than once: $target" ;;
+        esac
+        seen_targets="$seen_targets$target "
+        archive="$directory/aub-$target.tar.gz"
+        [ -f "$archive" ] || die "missing artifact for $target"
+        verify_checksum "$archive"
+        [ "$(metadata_value "$archive" version)" = "$version" ] || die "$(basename "$archive") carries the wrong version"
+        [ "$(metadata_value "$archive" revision)" = "$revision" ] || die "$(basename "$archive") carries the wrong revision"
+        [ "$(metadata_value "$archive" target)" = "$target" ] || die "$(basename "$archive") carries the wrong target"
+        cat "$archive.sha256" >>"$directory/SHA256SUMS"
+    done
+    LC_ALL=C sort -o "$directory/SHA256SUMS" "$directory/SHA256SUMS"
+    printf 'verified %s platform artifacts for %s at %s\n' "${#targets[@]}" "$tag" "$revision"
+}
+
+assert_workflow_line() {
+    local pattern="$1" description="$2"
+    grep -qE -- "$pattern" "$workflow" || die "workflow does not enforce $description"
+}
+
+expect_failure() {
+    local description="$1" output
+    shift
+    if output="$("$@" 2>&1)"; then
+        die "self-test: $description unexpectedly passed"
+    fi
+    LAST_FAILURE_LINE="$(printf '%s\n' "$output" | tail -n 1)"
+    [ -n "$LAST_FAILURE_LINE" ] || die "self-test: $description failed without a diagnostic"
+}
+
+self_test() {
+    [ -f "$workflow" ] || die "release workflow is missing"
+    assert_workflow_line '^  push:$' 'tag-triggered releases'
+    assert_workflow_line "tags: \['v\*'\]" 'the v* tag filter'
+    assert_workflow_line '^  workflow_dispatch:$' 'a manual dry run'
+    assert_workflow_line 'fail-fast: false' 'completion of the whole platform matrix'
+    assert_workflow_line 'run: bin/release-criteria$' 'the trustworthy-first-release gate'
+    assert_workflow_line "if: needs.plan.outputs.publish == 'true'" 'publication only after a tag plan'
+    assert_workflow_line 'run: gh release create .*dist/\* --verify-tag --generate-notes' 'one workflow-owned GitHub Release'
+    assert_workflow_line 'needs: \[plan, build\]' 'verification after every platform build'
+    assert_workflow_line 'needs: \[plan, verify\]' 'publication after set verification'
+    if grep -qE '^  (pull_request|schedule|repository_dispatch):' "$workflow"; then
+        die "workflow contains an unsupported trigger"
+    fi
+    [ "$(grep -c 'gh release create' "$workflow")" -eq 1 ] || die "workflow must have exactly one publication command"
+    if grep -q 'gh release upload' "$workflow"; then
+        die "workflow uploads release assets outside the single create command"
+    fi
+    local build_block expected_target
+    build_block="$(awk '/^  build:/{inside=1} inside && /^  verify:/{exit} inside{print}' "$workflow")"
+    [ "$(grep -c -- '- target:' <<<"$build_block")" -eq 5 ] || die "workflow matrix must contain exactly five targets"
+    for expected_target in \
+        x86_64-unknown-linux-gnu \
+        aarch64-unknown-linux-gnu \
+        aarch64-apple-darwin \
+        x86_64-apple-darwin \
+        x86_64-pc-windows-msvc; do
+        [ "$(grep -c -- "- target: $expected_target" <<<"$build_block")" -eq 1 ] || die "workflow matrix does not contain exactly one $expected_target leg"
+    done
+    grep -q 'uses: actions-rust-lang/setup-rust-toolchain@v1' <<<"$build_block" || die "workflow does not install the pinned toolchain"
+    if grep -q 'rust-toolchain@stable' <<<"$build_block"; then
+        die "workflow bypasses rust-toolchain.toml with an unpinned toolchain"
+    fi
+
+    local scratch revision version fake output context_file bad_doc target
+    local criterion_1 criterion_2 criterion_3 criterion_4 criterion_5 criterion_6
+    local criterion_7_tag criterion_7_revision criterion_8 mutated_workflow
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-release-self-test.XXXXXX")"
+    trap 'rm -rf "$scratch"' EXIT
+    revision=0123456789abcdef0123456789abcdef01234567
+    version="$(manifest_version)"
+    fake="$scratch/aub"
+    printf '#!/usr/bin/env bash\nprintf '\''aub %%s (%%s)\\n'\'' '\''%s'\'' '\''%s'\''\n' "$version" "$revision" >"$fake"
+    chmod +x "$fake"
+    output="$scratch/dist"
+    for target in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu aarch64-apple-darwin x86_64-apple-darwin x86_64-pc-windows-msvc; do
+        prepare --binary "$fake" --target "$target" --tag "v$version" --revision "$revision" --output "$output" >/dev/null
+    done
+    verify_set --directory "$output" --tag "v$version" --revision "$revision" \
+        --target x86_64-unknown-linux-gnu \
+        --target aarch64-unknown-linux-gnu \
+        --target aarch64-apple-darwin \
+        --target x86_64-apple-darwin \
+        --target x86_64-pc-windows-msvc >/dev/null
+
+    cp "$output/aub-x86_64-unknown-linux-gnu.tar.gz.sha256" "$scratch/checksum.good"
+    printf '0  aub-x86_64-unknown-linux-gnu.tar.gz\n' >"$output/aub-x86_64-unknown-linux-gnu.tar.gz.sha256"
+    expect_failure 'a checksum mutation' "$0" verify-set --directory "$output" --tag "v$version" --revision "$revision" --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu --target aarch64-apple-darwin --target x86_64-apple-darwin --target x86_64-pc-windows-msvc
+    criterion_3="$LAST_FAILURE_LINE"
+    cp "$scratch/checksum.good" "$output/aub-x86_64-unknown-linux-gnu.tar.gz.sha256"
+    mv "$output/aub-aarch64-unknown-linux-gnu.tar.gz" "$scratch/missing.tar.gz"
+    expect_failure 'an incomplete matrix' "$0" verify-set --directory "$output" --tag "v$version" --revision "$revision" --target x86_64-unknown-linux-gnu --target aarch64-unknown-linux-gnu --target aarch64-apple-darwin --target x86_64-apple-darwin --target x86_64-pc-windows-msvc
+    criterion_2="$LAST_FAILURE_LINE"
+    mv "$scratch/missing.tar.gz" "$output/aub-aarch64-unknown-linux-gnu.tar.gz"
+
+    expect_failure 'a version/tag mismatch' "$0" prepare --binary "$fake" --target test-target --tag v999.0.0 --revision "$revision" --output "$scratch/mismatch"
+    criterion_7_tag="$LAST_FAILURE_LINE"
+    expect_failure 'a binary/source-revision mismatch' "$0" prepare --binary "$fake" --target test-target --tag "v$version" --revision fedcba9876543210fedcba9876543210fedcba98 --output "$scratch/revision-mismatch"
+    criterion_7_revision="$LAST_FAILURE_LINE"
+    printf '\n# sk-ant-deliberate-self-test\n' >>"$fake"
+    expect_failure 'a forbidden binary string' "$0" prepare --binary "$fake" --target test-target --tag "v$version" --revision "$revision" --output "$scratch/forbidden"
+    criterion_6="$LAST_FAILURE_LINE"
+
+    context_file="$scratch/context"
+    context --event workflow_dispatch --ref refs/heads/main --revision "$revision" --output "$context_file"
+    grep -q '^publish=false$' "$context_file" || die "self-test: dry run selected publication"
+    : >"$context_file"
+    context --event push --ref "refs/tags/v$version" --revision "$revision" --output "$context_file"
+    grep -q '^publish=true$' "$context_file" || die "self-test: a matching tag did not select publication"
+    expect_failure 'a non-tag push' "$0" context --event push --ref refs/heads/main --revision "$revision" --output "$scratch/rejected-context"
+    criterion_1="$LAST_FAILURE_LINE"
+
+    bad_doc="$scratch/release-criteria.md"
+    awk '!/^17[[:space:]]/' "$repo_root/docs/release-criteria.md" >"$bad_doc"
+    expect_failure 'an unchecked release criterion' "$repo_root/bin/release-criteria" --doc "$bad_doc" --root "$repo_root" --list
+    criterion_5="$LAST_FAILURE_LINE"
+
+    mutated_workflow="$scratch/no-release-command.yml"
+    sed '/gh release create/d' "$workflow" >"$mutated_workflow"
+    expect_failure 'a workflow without a release creator' env RELEASE_GUARD_WORKFLOW="$mutated_workflow" "$0" self-test
+    criterion_4="$LAST_FAILURE_LINE"
+
+    mutated_workflow="$scratch/no-dry-run.yml"
+    sed '/^  workflow_dispatch:$/d' "$workflow" >"$mutated_workflow"
+    expect_failure 'a workflow without dry-run dispatch' env RELEASE_GUARD_WORKFLOW="$mutated_workflow" "$0" self-test
+    criterion_8="$LAST_FAILURE_LINE"
+
+    echo "release-guard self-test: trigger, matrix, checksum, criteria, privacy and provenance refusals passed."
+    printf 'CRITERION 1 | mutation: non-tag push requested publication context | ran: bin/release-guard context | caught by: context trigger guard | said: %s\n' "$criterion_1"
+    printf 'CRITERION 2 | mutation: one supported-platform archive removed | ran: bin/release-guard verify-set | caught by: complete matrix guard | said: %s\n' "$criterion_2"
+    printf 'CRITERION 3 | mutation: one archive checksum replaced | ran: bin/release-guard verify-set | caught by: checksum round trip | said: %s\n' "$criterion_3"
+    printf 'CRITERION 4 | mutation: the sole GitHub Release creation command removed | ran: bin/release-guard self-test | caught by: workflow topology guard | said: %s\n' "$criterion_4"
+    printf 'CRITERION 5 | mutation: criterion 17 removed from the release table | ran: bin/release-criteria --list | caught by: trustworthy criteria checker | said: %s\n' "$criterion_5"
+    printf 'CRITERION 6 | mutation: forbidden credential prefix appended to a runnable binary | ran: bin/release-guard prepare | caught by: artifact privacy scan | said: %s\n' "$criterion_6"
+    printf 'CRITERION 7 | mutation: tag changed and expected revision changed | ran: bin/release-guard prepare | caught by: tag and provenance guards | said: %s; %s\n' "$criterion_7_tag" "$criterion_7_revision"
+    printf 'CRITERION 8 | mutation: workflow_dispatch removed | ran: bin/release-guard self-test | caught by: dry-run trigger guard | said: %s\n' "$criterion_8"
+    echo 'CRITERION 9 | unmeasured: the real five-runner workflow_dispatch belongs to review after this workflow reaches GitHub'
+    rm -rf "$scratch"
+    trap - EXIT
+}
+
+command_name="${1:-}"
+[ -n "$command_name" ] || { usage >&2; exit 2; }
+shift
+case "$command_name" in
+    context) context "$@" ;;
+    prepare) prepare "$@" ;;
+    verify-set) verify_set "$@" ;;
+    self-test) self_test "$@" ;;
+    -h|--help) usage ;;
+    *) usage >&2; die "unknown command $command_name" ;;
+esac

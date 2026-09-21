@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Runs bin/release-guard self-test (aub-n27.9): the tag, version, provenance, privacy, checksum and
+# matrix-completeness refusals of the release workflow's guard, against scratch artefacts. The
+# workflow itself only runs on a tag or a manual dispatch, so without this check a broken guard
+# would be found at the next release rather than on the push that broke it. It takes about a second.
+set -uo pipefail
+
+repo_root="$(cd -- "$(dirname -- "$0")/../.." && pwd)"
+"$repo_root/bin/release-guard" self-test || exit 1

@@ -3,12 +3,49 @@ name: release
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  upload:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.plan.outputs.release_tag }}
+      revision: ${{ steps.plan.outputs.revision }}
+      publish: ${{ steps.plan.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: plan
+        name: Resolve the tag and publication mode
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          GIT_REF: ${{ github.ref }}
+          REVISION: ${{ github.sha }}
+        run: bin/release-guard context --event "$EVENT_NAME" --ref "$GIT_REF" --revision "$REVISION" --output "$GITHUB_OUTPUT"
+      - name: Prove the release workflow contract
+        run: bin/release-guard self-test
+
+  criteria:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # With no toolchain input this action installs rust-toolchain.toml verbatim.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          rustflags: ''
+      - name: Install the syscall tracer required by release criterion 6
+        run: sudo apt-get update && sudo apt-get install --yes strace
+      - name: Require all trustworthy-first-release criteria
+        run: bin/release-criteria
+
+  build:
+    needs: [plan, criteria]
     strategy:
       fail-fast: false
       matrix:
@@ -20,20 +57,84 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-latest
           - target: x86_64-apple-darwin
-            os: macos-13
+            os: macos-15-intel
           - target: x86_64-pc-windows-msvc
             os: windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      # Every target builds on a runner of its own architecture. Cross-compiling would
-      # mean carrying a C toolchain per target as soon as a dependency bundles C sources,
-      # and the runners to avoid that are free for a public repository.
-      - uses: taiki-e/upload-rust-binary-action@v1
         with:
-          bin: aub
+          fetch-depth: 0
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
           target: ${{ matrix.target }}
-          archive: $bin-$target
-          checksum: sha256
-          token: ${{ secrets.GITHUB_TOKEN }}
+          rustflags: ''
+      - name: Build, scan and package
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          REVISION: ${{ needs.plan.outputs.revision }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          cargo build --release --locked --target "$TARGET"
+          binary="target/$TARGET/release/aub"
+          case "$TARGET" in *-windows-*) binary="$binary.exe" ;; esac
+          bin/release-guard prepare \
+            --binary "$binary" \
+            --target "$TARGET" \
+            --tag "$RELEASE_TAG" \
+            --revision "$REVISION" \
+            --forbidden-marker "$GITHUB_WORKSPACE" \
+            --output dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aub-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  verify:
+    needs: [plan, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: aub-*
+          path: dist
+          merge-multiple: true
+      - name: Require a complete, consistent platform set
+        env:
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+          REVISION: ${{ needs.plan.outputs.revision }}
+        run: |
+          bin/release-guard verify-set \
+            --directory dist \
+            --tag "$RELEASE_TAG" \
+            --revision "$REVISION" \
+            --target x86_64-unknown-linux-gnu \
+            --target aarch64-unknown-linux-gnu \
+            --target aarch64-apple-darwin \
+            --target x86_64-apple-darwin \
+            --target x86_64-pc-windows-msvc
+      - uses: actions/upload-artifact@v7
+        with:
+          name: aub-release-${{ needs.plan.outputs.release_tag }}
+          path: dist/*
+          if-no-files-found: error
+
+  release:
+    needs: [plan, verify]
+    if: needs.plan.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v7
+        with:
+          name: aub-release-${{ needs.plan.outputs.release_tag }}
+          path: dist
+      - name: Create the GitHub Release with the verified set
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ needs.plan.outputs.release_tag }}
+        run: gh release create "$RELEASE_TAG" dist/* --verify-tag --generate-notes
