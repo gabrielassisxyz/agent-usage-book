@@ -986,6 +986,55 @@ mod tests {
         assert_eq!(end, 12_000);
     }
 
+    /// The Codex subagent parent link keeps the first stored parent
+    /// (`aub-wvrw`): a second ingest naming a different parent never
+    /// overwrites the one the transcript stated first, through the same
+    /// `COALESCE` upsert that keeps the first working directory.
+    #[test]
+    fn subagent_parent_upsert_keeps_the_first_stored_parent() {
+        let (_scratch, mut conn) = fixture_conn();
+        let now = UtcTimestamp::from_unix_nanos(1_000_000);
+
+        let session_with_parent = |parent: Option<&str>| NewSession {
+            source: SourceNamespace::new("codex"),
+            native_session_id: NativeSessionId::new("child-1"),
+            start: UtcTimestamp::from_unix_nanos(1_000),
+            end: None,
+            project_key: crate::sessions::ProjectKey::new("p"),
+            repository_key: crate::sessions::RepositoryKey::new("r"),
+            working_directory: None,
+            parent_native_session_id: parent.map(NativeSessionId::new),
+            run_id: None,
+        };
+
+        let mut first = pass_of(
+            vec![strong_event("m1", "corpus/a.jsonl", 5_000, 10, 5)],
+            now,
+        );
+        first.sessions = vec![session_with_parent(Some("parent-1"))];
+        land(&mut conn, &first).unwrap();
+
+        let mut second = pass_of(
+            vec![strong_event("m2", "corpus/a.jsonl", 6_000, 10, 5)],
+            now,
+        );
+        second.sessions = vec![session_with_parent(Some("parent-2"))];
+        land(&mut conn, &second).unwrap();
+
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT parent_native_session_id FROM session WHERE native_session_id = 'child-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stored.as_deref(),
+            Some("parent-1"),
+            "a second ingest with a different parent keeps the first"
+        );
+    }
+
     /// A pass quarantines what its parsers emitted, and a replayed quarantine
     /// item merges into the stored row rather than duplicating it, so the
     /// reproduction property holds for the quarantine table too.

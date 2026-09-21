@@ -57,48 +57,81 @@ pub fn migration() -> Migration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::domain::time::MonotonicDuration;
+    use crate::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
     use crate::store::connection::{AccessMode, PragmaPolicy, open};
+    use crate::store::migrate::run_migrations;
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
 
-    /// The bead's migration round-trip: the column arrives with the step,
-    /// carries a stored parent link, the reversal removes it, and re-applying
-    /// the step brings it back. The reversal is manual SQL under test, never
-    /// a framework path. The database opens through the one setup function,
-    /// never around it.
+    struct ScratchDir(PathBuf);
+
+    impl ScratchDir {
+        fn new() -> Self {
+            let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = std::env::temp_dir().join(format!(
+                "aub-migration-0045-test-{}-{suffix}",
+                std::process::id()
+            ));
+            std::fs::create_dir(&path).expect("scratch dir must be creatable");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn migrate_to(conn: &mut rusqlite::Connection, max_version: u32) {
+        let selected: Vec<_> = crate::store::migrations::registry()
+            .into_iter()
+            .filter(|m| m.version <= max_version)
+            .collect();
+        run_migrations(
+            conn,
+            &selected,
+            None,
+            &FakeClock::new(UtcTimestamp::from_unix_nanos(1_000)),
+        )
+        .expect("selected migrations must run");
+    }
+
+    /// The bead's migration round-trip: the registry drives the ledger to
+    /// version 44, the step adds the column, it carries a stored parent link,
+    /// the reversal removes it, and re-applying the step brings it back. The
+    /// reversal is manual SQL under test, never a framework path.
     #[test]
     fn subagent_parent_round_trips_through_up_and_down() {
-        let suffix = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = std::env::temp_dir().join(format!(
-            "aub-migration-0045-test-{}-{suffix}.sqlite3",
-            std::process::id()
-        ));
-        let conn = open(
-            &path,
+        let scratch = ScratchDir::new();
+        let mut conn = open(
+            &scratch.path().join("round-trip.db"),
             AccessMode::ReadWrite,
             &PragmaPolicy {
                 busy_timeout: MonotonicDuration::from_millis(1000),
             },
         )
         .expect("round-trip database must open");
-        conn.execute_batch(
-            "CREATE TABLE session (
-                id INTEGER PRIMARY KEY,
-                source TEXT NOT NULL,
-                native_session_id TEXT NOT NULL,
-                start INTEGER NOT NULL,
-                end INTEGER,
-                project_key TEXT NOT NULL,
-                repository_key TEXT NOT NULL,
-                run_id TEXT,
-                working_directory TEXT,
-                UNIQUE (source, native_session_id)
-            ) STRICT;",
-        )
-        .expect("pre-step session table must create");
+        migrate_to(&mut conn, 44);
+
+        let columns: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('session')")
+            .expect("pragma must prepare")
+            .query_map([], |row| row.get(0))
+            .expect("pragma must query")
+            .map(|name| name.expect("column name must read"))
+            .collect();
+        assert!(
+            !columns.contains(&"parent_native_session_id".to_string()),
+            "version 44 carries no parent column: {columns:?}"
+        );
 
         apply(&conn).expect("up must apply");
         conn.execute(
@@ -143,8 +176,5 @@ mod tests {
             stored, None,
             "down drops the stored parent links with the column"
         );
-
-        drop(conn);
-        std::fs::remove_file(&path).expect("round-trip database must clean up");
     }
 }

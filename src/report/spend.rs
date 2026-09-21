@@ -1085,18 +1085,8 @@ fn account_attribution(
             SourceNamespace::new(source.clone()),
             NativeSessionId::new(native.clone()),
         );
-        let own_markers =
-            crate::store::session_account_marker::markers_for_session(conn, &session_id)?;
-        let (markers, ancestor) = if own_markers.is_empty() {
-            match inherited_marker_timeline(conn, source, native)? {
-                Some((ancestor_label, ancestor_markers)) => {
-                    (ancestor_markers, Some(ancestor_label))
-                }
-                None => (own_markers, None),
-            }
-        } else {
-            (own_markers, None)
-        };
+        let (markers, ancestor) =
+            crate::store::session_account_marker::governing_marker_timeline(conn, &session_id)?;
         let usage: Vec<AccountUsageEvent> = indices
             .iter()
             .map(|&i| AccountUsageEvent {
@@ -1150,62 +1140,6 @@ fn account_attribution(
         )
         .collect();
     Ok((account_of, account_explain))
-}
-
-/// The first ancestor with markers above a markerless session, following the
-/// stored Codex subagent parent links (`aub-wvrw`).
-///
-/// Returns the ancestor's `source:native` label and its markers. `None` when
-/// the session carries no parent, names a parent never ingested, reaches only
-/// unmarked ancestors, or the parent chain cycles: all four stay in
-/// `unknown-account` rather than guessing from the clock or the directory.
-/// The walk is bounded by the session count and terminates on a repeated
-/// session.
-fn inherited_marker_timeline(
-    conn: &rusqlite::Connection,
-    source: &str,
-    native: &str,
-) -> Result<
-    Option<(
-        String,
-        Vec<crate::store::session_account_marker::SessionAccountMarker>,
-    )>,
-    Error,
-> {
-    use std::collections::HashSet;
-
-    let mut visited: HashSet<(String, String)> = HashSet::new();
-    visited.insert((source.to_string(), native.to_string()));
-    let mut current_native = native.to_string();
-    loop {
-        let current = crate::store::session::load_session(
-            conn,
-            &SourceNamespace::new(source.to_string()),
-            &NativeSessionId::new(current_native.clone()),
-        )?;
-        let parent_native = match current.as_ref().and_then(|row| {
-            row.parent_native_session_id()
-                .map(|id| id.as_str().to_string())
-        }) {
-            Some(parent) if !parent.is_empty() => parent,
-            _ => return Ok(None),
-        };
-        let parent_key = (source.to_string(), parent_native.clone());
-        if !visited.insert(parent_key.clone()) {
-            return Ok(None);
-        }
-        let parent_id = SessionId::new(
-            SourceNamespace::new(source.to_string()),
-            NativeSessionId::new(parent_native.clone()),
-        );
-        let parent_markers =
-            crate::store::session_account_marker::markers_for_session(conn, &parent_id)?;
-        if !parent_markers.is_empty() {
-            let label = format!("{source}:{parent_native}");
-            return Ok(Some((label, parent_markers)));
-        }
-        current_native = parent_native;
-    }
 }
 
 /// The four known token kinds of a canonical event as a [`KnownTokenVector`],
@@ -2117,6 +2051,66 @@ mod tests {
         assert!(
             json.contains("fixture:parent-1"),
             "json explain names the ancestor"
+        );
+    }
+
+    /// An inherited attribution keeps the ancestor marker's evidence class,
+    /// not only the launcher-or-hook one (`aub-wvrw`): a child under a
+    /// provider-identity marker carries that class.
+    #[test]
+    fn codex_subagent_inherits_the_ancestor_evidence_class() {
+        use crate::store::session_account_marker::EvidenceDesignation;
+
+        let (_root, conn) = canonical_conn("subagent-inherits-class");
+        seed_session(&conn, "parent-1");
+        seed_session_with_parent(&conn, "child-1", Some("parent-1"));
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_marker(
+            &conn,
+            "parent-1",
+            "work",
+            day + 1,
+            EvidenceDesignation::ExplicitProviderIdentity,
+        );
+        seed_canonical(
+            &conn,
+            "e1",
+            day + 20,
+            "child-1",
+            "reported",
+            &[("input", 5)],
+        );
+        crate::store::ingestion_generation::advance(&conn).unwrap();
+
+        let report = assemble_canonical(
+            &conn,
+            window("2026-08-25", 1),
+            now(),
+            vec![SpendGrouping::Account],
+            false,
+            None,
+            None,
+            CreditReporting::NotRequested,
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        let by_key: BTreeMap<&str, &SpendGroup> =
+            report.groups.iter().map(|g| (g.key.as_str(), g)).collect();
+        assert_eq!(by_key["account=work"].usage.known().input().value(), 5);
+        let explain: BTreeMap<&str, &AccountGroupExplain> = report
+            .account_explain
+            .iter()
+            .map(|group| (group.key.as_str(), group))
+            .collect();
+        assert_eq!(
+            explain["account=work"].evidence_class,
+            AccountEvidenceClass::ExplicitProviderIdentity,
+            "the child carries the ancestor marker's class"
+        );
+        assert_eq!(
+            explain["account=work"].inherited_from,
+            vec!["fixture:parent-1".to_string()]
         );
     }
 

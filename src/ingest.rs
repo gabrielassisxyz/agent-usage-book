@@ -1245,6 +1245,7 @@ mod batch_split_tests {
         let events = vec![
             event_with_parent("child-1", Some("parent-1"), 1_000),
             event_with_parent("top-1", None, 2_000),
+            event_with_parent("child-1", Some("parent-2"), 3_000),
         ];
         let sessions = session_pass(
             &events,
@@ -1262,7 +1263,8 @@ mod batch_split_tests {
                 .parent_native_session_id
                 .as_ref()
                 .map(|id| id.as_str()),
-            Some("parent-1")
+            Some("parent-1"),
+            "the first stated parent wins over a later disagreeing one"
         );
         assert_eq!(
             by_native["top-1"].parent_native_session_id, None,

@@ -2191,6 +2191,11 @@ pub fn load_passive_observations(
 }
 
 /// Counts distinct sessions overlapping with the given interval for an account.
+///
+/// A Codex subagent session with no markers of its own counts when its
+/// governing marker timeline (`aub-wvrw`) names the account: the first marked
+/// ancestor above it in the same source namespace. A session carrying markers
+/// of its own counts only by those markers, never by its parent.
 pub fn count_overlapping_sessions(
     conn: &Connection,
     account_id: AccountId,
@@ -2199,7 +2204,28 @@ pub fn count_overlapping_sessions(
     end_at: UtcTimestamp,
 ) -> Result<i64, Error> {
     conn.query_row(
-        "SELECT COUNT(DISTINCT sess.id)
+        "WITH RECURSIVE ancestry(child_source, child_native, ancestor_source, ancestor_native, depth) AS (
+            SELECT source, native_session_id, source, native_session_id, 0 FROM session
+            UNION ALL
+            SELECT ancestry.child_source, ancestry.child_native, s.source, s.native_session_id, ancestry.depth + 1
+            FROM ancestry
+            JOIN session cur ON cur.source = ancestry.ancestor_source AND cur.native_session_id = ancestry.ancestor_native
+            JOIN session s ON s.source = cur.source AND s.native_session_id = cur.parent_native_session_id
+            WHERE cur.parent_native_session_id IS NOT NULL
+              AND length(cur.parent_native_session_id) > 0
+              AND ancestry.depth < 50
+         ),
+         first_marked(child_source, child_native, min_depth) AS (
+            SELECT child_source, child_native, MIN(depth) FROM ancestry
+            WHERE depth > 0
+              AND EXISTS (
+                SELECT 1 FROM session_account_marker m
+                WHERE m.session_source = ancestry.ancestor_source
+                  AND m.session_native = ancestry.ancestor_native
+              )
+            GROUP BY child_source, child_native
+         )
+         SELECT COUNT(DISTINCT sess.id)
          FROM session sess
          WHERE sess.start <= ?2
            AND (sess.end IS NULL OR sess.end >= ?1)
@@ -2209,6 +2235,27 @@ pub fn count_overlapping_sessions(
                    WHERE m.session_source = sess.source
                      AND m.session_native = sess.native_session_id
                      AND (m.resolved_account_id = ?3 OR m.logical_account = ?4)
+               )
+               OR (
+                   NOT EXISTS (
+                       SELECT 1 FROM session_account_marker m0
+                       WHERE m0.session_source = sess.source
+                         AND m0.session_native = sess.native_session_id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM ancestry
+                       JOIN first_marked fm ON fm.child_source = ancestry.child_source
+                         AND fm.child_native = ancestry.child_native
+                       WHERE ancestry.child_source = sess.source
+                         AND ancestry.child_native = sess.native_session_id
+                         AND ancestry.depth = fm.min_depth
+                         AND EXISTS (
+                           SELECT 1 FROM session_account_marker m
+                           WHERE m.session_source = ancestry.ancestor_source
+                             AND m.session_native = ancestry.ancestor_native
+                             AND (m.resolved_account_id = ?3 OR m.logical_account = ?4)
+                         )
+                   )
                )
                OR NOT EXISTS (SELECT 1 FROM session_account_marker)
            )",

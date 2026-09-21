@@ -413,7 +413,7 @@ const CODEX_IGNORED: [&str; 2] = ["total_tokens", "reasoning_output_tokens"];
 
 impl ParserAdapter for CodexParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("codex-2")
+        ParserVersion::new("codex-3")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -1216,6 +1216,16 @@ mod tests {
         assert_eq!(parser.parser_version().as_str(), "opencode-4");
         assert_eq!(parser.input_format_version().as_str(), "opencode-sqlite-v1");
         assert!(parser.is_database_source());
+    }
+
+    /// Codex declares `codex-3`, so `ingest --changed-only` re-derives every
+    /// existing rollout and fills `parent_native_session_id` for sessions
+    /// ingested before the subagent column existed (`aub-wvrw`).
+    #[test]
+    fn codex_declares_its_parser_and_input_format_versions() {
+        let parser = CodexParser;
+        assert_eq!(parser.parser_version().as_str(), "codex-3");
+        assert_eq!(parser.input_format_version().as_str(), "codex-jsonl-v1");
     }
 
     /// A database source has no text form: empty input parses to nothing, and

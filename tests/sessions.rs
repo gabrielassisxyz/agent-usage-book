@@ -820,3 +820,174 @@ fn ingest_reports_a_dot_named_layout_repository_once() {
         assert_eq!(row.project_key().as_str(), UNKNOWN_PROJECT);
     }
 }
+
+/// A Codex subagent rollout ingested beside its parent lands under the
+/// parent's account in spend, and still does after a transcripts rebuild
+/// (`aub-wvrw`): the parent link is re-derived from the transcript, the
+/// marker survives the rebuild, and the child's usage never lands in
+/// `unknown-account`.
+#[test]
+fn codex_subagent_usage_lands_under_the_parent_account_through_ingest_and_rebuild() {
+    use agent_usage_book::domain::time::UtcDate;
+    use agent_usage_book::report::SpendGrouping;
+    use agent_usage_book::report::spend::{CreditReporting, SpendWindow, assemble_canonical};
+    use agent_usage_book::store::retention::{RebuildGroup, delete_rebuildable};
+
+    let scratch = ScratchDir::new();
+    let corpus = scratch.path().join("corpus");
+    std::fs::create_dir(&corpus).expect("corpus dir must be creatable");
+
+    let parent_rollout = concat!(
+        "{\"timestamp\":\"2026-08-25T12:00:00.000Z\",\"type\":\"session_meta\",",
+        "\"payload\":{\"id\":\"parent-1\",\"source\":\"exec\",\"cwd\":\"/work/project\"}}\n",
+        "{\"timestamp\":\"2026-08-25T12:00:10.000Z\",\"type\":\"event_msg\",",
+        "\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":",
+        "{\"input_tokens\":10,\"output_tokens\":5,\"cached_input_tokens\":0,",
+        "\"cache_write_input_tokens\":0,\"total_tokens\":15}}}}\n",
+    );
+    let child_rollout = concat!(
+        "{\"timestamp\":\"2026-08-25T12:01:00.000Z\",\"type\":\"session_meta\",",
+        "\"payload\":{\"id\":\"child-1\",\"source\":{\"subagent\":{\"thread_spawn\":",
+        "{\"parent_thread_id\":\"parent-1\",\"depth\":1,\"agent_role\":\"analyzer\"}}},",
+        "\"cwd\":\"/work/project\"}}\n",
+        "{\"timestamp\":\"2026-08-25T12:01:10.000Z\",\"type\":\"event_msg\",",
+        "\"payload\":{\"type\":\"token_count\",\"info\":{\"total_token_usage\":",
+        "{\"input_tokens\":7,\"output_tokens\":3,\"cached_input_tokens\":0,",
+        "\"cache_write_input_tokens\":0,\"total_tokens\":10}}}}\n",
+    );
+    std::fs::write(corpus.join("parent.jsonl"), parent_rollout).expect("parent must write");
+    std::fs::write(corpus.join("child.jsonl"), child_rollout).expect("child must write");
+
+    let config_text = format!(
+        "[[transcripts]]\nname = \"codex\"\nroot = \"{}\"\n\
+         pattern = \"**/*.jsonl\"\nformat = \"codex\"\n",
+        corpus.display()
+    );
+    let (config, _) = resolve_config(
+        &Overrides::new(),
+        &FakeEnv::new(),
+        Some(&config_text),
+        "/virtual/aub.toml",
+    )
+    .expect("codex config must resolve");
+    let (_ledger_scratch, mut conn) = fixture_conn();
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(2_000_000));
+    run_ingest(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("codex ingest must succeed");
+
+    let stored = load_all_sessions(&conn).unwrap();
+    assert_eq!(stored.len(), 2);
+    let child = stored
+        .iter()
+        .find(|row| row.native_session_id().as_str() == "child-1")
+        .expect("child session must be stored");
+    assert_eq!(
+        child.parent_native_session_id().map(|id| id.as_str()),
+        Some("parent-1"),
+        "ingest records the thread_spawn parent"
+    );
+
+    let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+    agent_usage_book::store::session_account_marker::insert_marker(
+        &conn,
+        &agent_usage_book::store::session_account_marker::NewSessionAccountMarker {
+            session_id: session("codex", "parent-1"),
+            observed_at: UtcTimestamp::from_unix_nanos(day + 1),
+            source_ordering_key: None,
+            logical_account: "work".to_owned(),
+            resolved_account_id: None,
+            marker_source:
+                agent_usage_book::store::session_account_marker::MarkerSource::new("hook"),
+            run_id: None,
+            evidence_designation:
+                agent_usage_book::store::session_account_marker::EvidenceDesignation::ExplicitLauncherOrHook,
+        },
+    )
+    .unwrap();
+
+    let window = SpendWindow::starting(UtcDate::parse("2026-08-25").unwrap(), 1).unwrap();
+    let now = UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap();
+    let report = assemble_canonical(
+        &conn,
+        window,
+        now,
+        vec![SpendGrouping::Account],
+        false,
+        None,
+        None,
+        CreditReporting::NotRequested,
+        &agent_usage_book::config::ModelTable::default(),
+    )
+    .expect("spend must assemble");
+    let by_key: std::collections::BTreeMap<&str, _> = report
+        .groups
+        .iter()
+        .map(|group| (group.key.as_str(), group))
+        .collect();
+    assert!(
+        !by_key.contains_key("account=unknown-account"),
+        "an inherited subagent never lands in unknown-account: {:?}",
+        by_key.keys().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        by_key["account=work"].usage.known().input().value(),
+        17,
+        "parent and child inputs land under the parent account"
+    );
+
+    delete_rebuildable(&mut conn, RebuildGroup::Transcripts).expect("rebuild sweep must succeed");
+    run_ingest(
+        &mut conn,
+        &config,
+        &IngestOptions::default(),
+        &clock,
+        &mut |_| Ok(()),
+        &mut |_| Ok(()),
+    )
+    .expect("re-ingest must succeed");
+
+    let stored = load_all_sessions(&conn).unwrap();
+    let child = stored
+        .iter()
+        .find(|row| row.native_session_id().as_str() == "child-1")
+        .expect("child session must survive the rebuild");
+    assert_eq!(
+        child.parent_native_session_id().map(|id| id.as_str()),
+        Some("parent-1"),
+        "the rebuild re-derives the parent link from the transcript"
+    );
+
+    let report = assemble_canonical(
+        &conn,
+        window,
+        now,
+        vec![SpendGrouping::Account],
+        false,
+        None,
+        None,
+        CreditReporting::NotRequested,
+        &agent_usage_book::config::ModelTable::default(),
+    )
+    .expect("spend must assemble after the rebuild");
+    let by_key: std::collections::BTreeMap<&str, _> = report
+        .groups
+        .iter()
+        .map(|group| (group.key.as_str(), group))
+        .collect();
+    assert!(
+        !by_key.contains_key("account=unknown-account"),
+        "the rebuild keeps the child out of unknown-account"
+    );
+    assert_eq!(
+        by_key["account=work"].usage.known().input().value(),
+        17,
+        "the rebuild keeps the child under the parent account"
+    );
+}
