@@ -176,6 +176,25 @@ is reported as its own partial group rather than merged or dropped. `--explain`
 on an account group names the exact markers behind the attribution and their
 evidence class.
 
+Two rules read the account off an event's stored model id instead, and each
+replaces the marker attribution for the events it matches:
+
+- **The provider prefix.** Two prefixes ship built in: `opencode-go/*` is
+  account `opencode-go`, the paid OpenCode Go plan, and `opencode/*` is account
+  `opencode-free`, the free Zen models. A marker cannot make this split,
+  because one opencode session can switch provider between two messages, and a
+  marker only covers the events after it.
+- **The key slot.** An id whose `[[models]]` rule (or built-in vendor) still
+  matches once a trailing `-k1`, `-k2` or `-k3` is stripped reports account
+  `<vendor>-<slot>`, so `glm-5.3-flash-max-k2` under a `glm-5.3-flash*` rule
+  for vendor `ollama` is account `ollama-k2`. `kimi-k3` is not a slot, because
+  its stripped `kimi` matches no `kimi-k3*` rule.
+
+The prefix is consulted first, so an opencode id ending in `-k2` stays under its
+plan. Both rules are applied when the report runs, over ids already in the
+ledger, so they cover events recorded before they existed. Ids neither rule
+matches keep their marker attribution.
+
 Valuation is keyed by the vendor and model the `[[models]]` table resolves from
 each event's stored model id, never by the harness the transcript came from.
 `--explain` names that pair per group, and a footer line names any id nothing

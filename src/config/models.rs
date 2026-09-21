@@ -168,6 +168,17 @@ const BUILT_IN_VENDORS: &[(&str, &str)] = &[
     ("opencode-go/*", "opencode"),
 ];
 
+/// Model-id prefixes that name the account an event was billed to, whatever
+/// marker its session carries (`aub-oo34`). opencode stores
+/// `<providerID>/<modelID>` per message, and the provider is the plan: the paid
+/// OpenCode Go subscription or the free Zen models. A session marker cannot say
+/// this, because it is written once per session and only covers events after
+/// it, while one opencode session can switch provider between two messages.
+const BUILT_IN_ACCOUNT_PREFIXES: &[(&str, &str)] = &[
+    ("opencode-go/", "opencode-go"),
+    ("opencode/", "opencode-free"),
+];
+
 impl ModelTable {
     /// Builds a table from its rules in file order, rejecting a repeated pattern
     /// and a pattern an earlier one already covers entirely. Both are dead
@@ -286,6 +297,27 @@ impl ModelTable {
             }
         }
         None
+    }
+
+    /// The account a built-in model-id prefix names for `model_id`, or `None`
+    /// when no prefix matches (`aub-oo34`).
+    pub fn prefix_account(&self, model_id: &str) -> Option<&'static str> {
+        BUILT_IN_ACCOUNT_PREFIXES
+            .iter()
+            .find(|(prefix, _)| model_id.starts_with(prefix))
+            .map(|(_, account)| *account)
+    }
+
+    /// The account the model id alone decides for one event, replacing its
+    /// marker attribution, or `None` when the id decides nothing and the
+    /// marker stands. The prefix rule is consulted before the key-slot rule:
+    /// the prefix names the plan that billed the event, so a `-kN` tail on an
+    /// opencode id is part of the model name, not a slot.
+    pub fn event_account(&self, model_id: &str) -> Option<String> {
+        if let Some(account) = self.prefix_account(model_id) {
+            return Some(account.to_string());
+        }
+        self.slot_account(model_id)
     }
 }
 
@@ -654,6 +686,54 @@ mod tests {
             table.slot_account("unknown-model-k1"),
             None,
             "an id with a slot but matching no rule keeps no slot"
+        );
+    }
+
+    /// The provider prefix decides the opencode account (`aub-oo34`):
+    /// `opencode-go/` is the paid Go plan and `opencode/` the free Zen models.
+    /// Ids from any other vendor, including one that merely contains
+    /// `opencode`, match no prefix and leave the account to the markers.
+    #[test]
+    fn the_opencode_provider_prefix_names_the_account() {
+        let table = ModelTable::default();
+        assert_eq!(
+            table.prefix_account("opencode-go/muse-spark-1.3-contributor"),
+            Some("opencode-go")
+        );
+        assert_eq!(
+            table.prefix_account("opencode/muse-spark-1.3-contributor-free"),
+            Some("opencode-free")
+        );
+        for id in [
+            "anthropic/claude-opus-5",
+            "claude-opus-5",
+            "gpt-5.6-terra",
+            "deepseek-v4-pro-high-k2",
+            "my-opencode/model",
+            "opencode",
+            "",
+        ] {
+            assert_eq!(table.prefix_account(id), None, "prefix account of {id:?}");
+            assert_eq!(table.event_account(id), table.slot_account(id), "{id:?}");
+        }
+    }
+
+    /// When both rules could apply, the prefix wins: the built-in
+    /// `opencode-go/*` vendor would otherwise read the `-k2` tail as a key
+    /// slot and bill the event to an `opencode-k2` account nobody has.
+    #[test]
+    fn the_prefix_rule_outranks_the_key_slot_rule() {
+        let table = ModelTable::new(vec![
+            ModelRule::new("glm-5.3*", "ollama", "glm-5.3").unwrap(),
+        ])
+        .unwrap();
+        let id = "opencode-go/glm-5.3-k2";
+        assert_eq!(table.slot_account(id), Some("opencode-k2".to_string()));
+        assert_eq!(table.event_account(id), Some("opencode-go".to_string()));
+        assert_eq!(
+            table.event_account("glm-5.3-high-k2"),
+            Some("ollama-k2".to_string()),
+            "an id no prefix names still reports its slot"
         );
     }
 }

@@ -87,6 +87,12 @@ window. Repeat `--group-by day|session|project|repository` for nested subtotals 
 `--refresh auto|never|force` to control transcript ingest. `--format json` emits the
 versioned envelope with a `{value, unit}` per token kind.
 
+`--group-by account` attributes usage through the session markers, with two rules that
+read the account off the model id instead: the built-in provider prefixes put
+`opencode-go/*` under `opencode-go` and `opencode/*` under `opencode-free`, and a
+`-k1`/`-k2`/`-k3` key slot on a mapped id becomes the account `<vendor>-<slot>`. Both are
+described in [docs/commands.md](docs/commands.md).
+
 ## Scheduling
 
 `aub` has no daemon: something external has to invoke `aub sample` on a cadence, and the
