@@ -565,8 +565,11 @@ harness, start time and project, and `--latest` renders the most recent of
 them; choosing silently was rejected because the wrong transcript reads as a
 plausible session. A claude-code subagent transcript
 (`<session>/subagents/agent-*.jsonl`) renders after the parent under a
-`## Subagent <file>` heading. A harness with no renderer yet fails with `no
-transcript renderer for harness '<name>'`, never with an empty document.
+`## Subagent <file>` heading. Claude-code, codex and pi sessions render; a
+harness with no renderer yet (opencode) fails with `no transcript renderer
+for harness '<name>'`, never with an empty document. Lines the codex or pi
+renderer has no case for are counted and reported once per type on stderr as
+`skipped: N lines of type X`, never dropped silently and never fatal.
 
 Four destinations: `-o` with no path writes
 `~/agent-transcripts/<YYYY-MM-DD>-<project>-<uuid8>.md` and prints the path;
