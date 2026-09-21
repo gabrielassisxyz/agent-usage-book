@@ -285,9 +285,16 @@ snapshot_target() {
 # from row N fires a guard in row N+1, which then reports a mismatch for its
 # own mutation. git checkout/clean here touch only this private scratch
 # repository, never the live checkout.
+#
+# The migrated-schema template cache lives in the target directory and is keyed
+# on the scratch commit, which no mutation changes. Left in place, a template
+# built before a row that edits a migration serves that row the unmutated
+# schema, and a template built under such a row serves its broken schema to
+# every row after it.
 reset_tree() {
     git -C "$SCRATCH" checkout -q -- . 2>/dev/null
     git -C "$SCRATCH" clean -fdq 2>/dev/null
+    rm -rf "$MUT_TARGET/aub-test-schema-cache"
     true
 }
 
@@ -337,6 +344,14 @@ run_row() {
         fi
         if ! ( cd "$SCRATCH" && apply_mutation "$mut" "$target" "$mut_arg" "$mut_arg2" ); then
             echo "ERROR $guard: mutation failed to apply"
+            reset_tree
+            return 0
+        fi
+        # A sed address or pattern that no longer matches exits 0 and edits
+        # nothing, and the row then reads as a dead guard. Refuse to judge a
+        # guard against a mutation that did not happen.
+        if [ "$mut" != "plant" ] && [ "$mut" != "delete" ] && git -C "$SCRATCH" diff --quiet -- "$target"; then
+            echo "ERROR $guard: mutation changed nothing in $target"
             reset_tree
             return 0
         fi
@@ -392,6 +407,13 @@ run_row() {
     fi
     if [ "$scope" = "cargo" ] && ! grep -qE 'test result:|^test .* \.\.\. (ok|FAILED)' "$out"; then
         echo "ERROR $guard ($beads): cargo produced no test result (build failure? see $out)"
+        reset_tree
+        return 0
+    fi
+    # A filter naming a test path that does not exist runs zero tests and
+    # reports ok, which would otherwise read as a dead guard.
+    if [ "$scope" = "cargo" ] && ! grep -qE 'test result: .* ([1-9][0-9]* passed|[1-9][0-9]* failed)' "$out"; then
+        echo "ERROR $guard ($beads): the command ran no test (filter matched nothing? see $out)"
         reset_tree
         return 0
     fi
@@ -652,6 +674,8 @@ Last successful full run: none yet (self-test fixture).
 guard	beads	scope	command	mut	target	mut_arg	mut_arg2	expect_re	sibling	sib_expect	sib_re
 syn-ok	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	./test2.sh	0	guard2 silent
 syn-dead	aub-selftest	shell	./test.sh	append	data.txt	# nothing observable		guard fired	./test2.sh	0	guard2 silent
+syn-noop	aub-selftest	shell	./test.sh	sed	data.txt	s/no-such-text/MARK/		guard fired	./test2.sh	0	guard2 silent
+syn-notest	aub-selftest	cargo	echo 'test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out'	append	data.txt	MARK		guard fired	./test2.sh	0	guard2 silent
 syn-wrongsig	aub-selftest	shell	./test.sh	append	data.txt	MARK		no-such-signature	./test2.sh	0	guard2 silent
 syn-badsib	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	printf 'MARK2\n' >> data2.txt; ./test2.sh	0	guard2 silent
 syn-dup	aub-selftest	shell	./test.sh	append	data.txt	MARK		guard fired	./test2.sh	0	guard2 silent
@@ -679,6 +703,10 @@ EOF
     case "$out" in *GUARD-OK*) : ;; *) echo "self-test: syn-ok was not ok: $out" >&2; fail=1 ;; esac
     out="$(selftest_run dead "$good_inv" "syn-dead")"
     case "$out" in *DEAD*) : ;; *) echo "self-test: syn-dead was not reported dead: $out" >&2; fail=1 ;; esac
+    out="$(selftest_run noop "$good_inv" "syn-noop")"
+    case "$out" in *"ERROR syn-noop: mutation changed nothing"*) : ;; *) echo "self-test: a mutation that edited nothing was not an error: $out" >&2; fail=1 ;; esac
+    out="$(selftest_run notest "$good_inv" "syn-notest")"
+    case "$out" in *"ERROR syn-notest"*"ran no test"*) : ;; *) echo "self-test: a run of zero tests was not an error: $out" >&2; fail=1 ;; esac
     selftest_run deadrun "$good_inv" "syn-dead" >/dev/null 2>&1; rc=$?
     case "$rc" in 1) : ;; *) echo "self-test: dead guard did not fail the run (rc=$rc)" >&2; fail=1 ;; esac
     out="$(selftest_run wrongsig "$good_inv" "syn-wrongsig")"
