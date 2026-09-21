@@ -16,7 +16,8 @@
 //!   references, retired it ([`Superseded`]);
 //! - it was never activated ([`Provisional`]);
 //! - passive validation produced a statistically significant drift finding
-//!   ([`Suspect`]);
+//!   ([`Suspect`]; modelled but not implemented, because no drift test exists
+//!   yet, the design bead is aub-2kam);
 //! - the configured review horizon passed ([`ReviewDue`]).
 //!
 //! An adapter *implementation* upgrade never invalidates a calibration; only a
@@ -43,12 +44,17 @@ use crate::store::calibration::PlanTier;
 pub enum CalibrationHealth {
     /// Fitted but never activated. It may be displayed; it is not authoritative.
     Provisional,
-    /// Activated, applicable, no drift finding, within its review horizon.
+    /// Activated, applicable, no drift finding, within its review horizon. No
+    /// drift finding can exist yet: nothing produces one (bead aub-2kam).
     Current,
     /// The configured review horizon passed. Still displayable, no longer a
     /// silent routing input.
     ReviewDue,
     /// Passive validation produced a statistically significant drift finding.
+    /// Unreachable from live data today: no passive-validation drift test is
+    /// implemented, so no real calibration can enter this state and the review
+    /// horizon is the only time-based reason a calibration leaves `Current`.
+    /// The design bead for that test is aub-2kam.
     Suspect,
     /// A supersession event, or a supersession of the referenced cost model,
     /// retired it.
@@ -89,6 +95,9 @@ pub enum LifecycleState {
 /// A statistically significant drift finding from passive validation. Carries
 /// the identity of the finding, never a magnitude to widen a band by: its
 /// existence is what moves the state.
+///
+/// No producer exists yet: the drift test that would emit one is designed in
+/// bead aub-2kam, so this value is never constructed from live data.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignificantDrift {
     /// The validation run or finding this came from, for the operator to chase.
@@ -127,7 +136,11 @@ pub struct HealthInputs<'a> {
     pub lifecycle: LifecycleState,
     /// The referenced cost model has a supersession recorded against it.
     pub cost_model_superseded: bool,
-    /// A statistically significant drift finding, if passive validation made one.
+    /// A statistically significant drift finding, if passive validation made
+    /// one. None is ever made: no drift test is implemented and no producer
+    /// for this input exists, so every caller passes `None` on purpose and a
+    /// real calibration cannot become `Suspect` today. The test's design
+    /// bead is aub-2kam.
     pub drift: Option<&'a SignificantDrift>,
     /// The instant the review horizon passes, if one is configured. Computed by
     /// the caller from the fit time and the configured horizon.
@@ -138,8 +151,8 @@ pub struct HealthInputs<'a> {
 ///
 /// The checks run in a fixed order of precedence, because more than one can hold
 /// at once and the most fundamental fact should win: an inapplicable calibration
-/// is inapplicable whatever its age, and a superseded one is retired whether or
-/// not the tier also drifted. The order is
+/// is inapplicable whatever its age, and a superseded one is retired whether
+/// or not it is also inapplicable. The order is
 /// `Inapplicable > Superseded > Provisional > Suspect > ReviewDue > Current`.
 ///
 /// Every transition away from `Current` is triggered by a named condition rather
