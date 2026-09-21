@@ -1,0 +1,13 @@
+# For platforms without systemd. Install with `crontab -e` (per-user) or as a
+# file under /etc/cron.d/ (system-wide; that form needs a user column between
+# the schedule and the command, e.g. "23 3 * * * root /usr/local/bin/aub ...").
+#
+# Runs `aub backup --scheduled` once a day, at 03:23. The command honours
+# `backup.scheduled` (default true): with the key set to false, or with no
+# `backup.destination` configured, it prints one line and exits zero without
+# writing; every other failure keeps its usual exit class.
+#
+# cron mails stdout by default, and a healthy cut prints one result line
+# every run; redirect it so a quiet cadence does not fill a mailbox.
+# stderr is left alone: it carries aub's own diagnostic log.
+23 3 * * * /usr/local/bin/aub backup --scheduled >/dev/null

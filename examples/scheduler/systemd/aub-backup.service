@@ -1,0 +1,29 @@
+# Runs one `aub backup --scheduled` cut. Paired with aub-backup.timer.
+#
+# The scheduled form honours `backup.scheduled` (default true): with the key
+# set to false the run prints one line naming the key and exits zero without
+# writing, so disabling the schedule never means editing or removing this
+# unit. With no `backup.destination` configured it likewise exits zero,
+# printing one line saying backups are not configured, so a fresh
+# installation does not alarm daily for a feature it never set up. Every
+# other failure keeps its usual exit class, which is what OnFailure below
+# turns into a notification.
+#
+# ExecStart names an absolute path on purpose: systemd services do not run
+# inside an interactive shell and do not read its PATH, so a bare `aub` here
+# would fail with "command not found" the first time the unit runs. Replace
+# /usr/local/bin/aub below with wherever `aub` actually lives on this machine.
+#
+# OnFailure names a unit this repository does not ship, because what an alarm
+# should do is the operator's decision and not a tool's: a desktop
+# notification, a mail, a webhook, an entry in a log somebody reads. Write that
+# unit, name it here, and the exit code above reaches it. Without an OnFailure
+# line the failure is visible only in `systemctl --user status`, which is the
+# same silence this unit exists to break.
+[Unit]
+Description=aub backup --scheduled (daily ledger archive)
+OnFailure=aub-backup-alarm.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/aub backup --scheduled

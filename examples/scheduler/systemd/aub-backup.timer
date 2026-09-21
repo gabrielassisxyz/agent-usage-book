@@ -1,0 +1,21 @@
+# Ticks aub-backup.service once a day.
+#
+# The cadence is chosen against `backup.review_after` (default 48h): a daily
+# cut meets the horizon with one missed day of slack, and Persistent=true
+# replays a missed run after downtime rather than skipping a day. The
+# fifteen-minute randomized delay keeps machines that share an install image
+# from cutting their archives in the same minute.
+#
+# Enable with: systemctl --user enable --now aub-backup.timer
+# (drop --user, and install under /etc/systemd/system/, for a system-wide
+# account instead of a per-user one.)
+[Unit]
+Description=Tick aub backup --scheduled every day
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=15min
+
+[Install]
+WantedBy=timers.target
