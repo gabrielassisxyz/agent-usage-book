@@ -6,6 +6,17 @@ formats it accepts. That block is generated from the same policy the parser
 enforces, so it cannot drift from behaviour and this document does not repeat
 it.
 
+Every command also accepts `--help` or `-h` anywhere after its name, and `aub
+help <command>` prints the same thing: the command's usage line, its summary
+and its block from `aub --help`. The help flag is checked before any argument
+reaches the command, so the command never runs and nothing is read or written.
+
+A path the command writes to (the `backup` destination, the `backup restore`
+archive and destination, the `drill` archive and scratch destination) is
+refused when it starts with `-`, with a usage error naming the token, so a
+mistyped flag cannot become a directory on disk. A path that really starts
+with `-` is spelled `./-name`.
+
 What `--help` does not carry is the behavioural boundary: not which flags a
 command rejects, but what it will never do regardless of how it is called.
 That boundary is what decides whether a command is safe to put in a timer, a
