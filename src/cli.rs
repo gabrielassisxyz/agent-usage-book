@@ -932,6 +932,9 @@ pub enum Request {
     Version,
     /// `--help` or `-h`: print the command list.
     Help,
+    /// `aub <command> --help`, `-h` anywhere after the command name, or `aub help
+    /// <command>`: print that command's usage without running it.
+    CommandHelp(Command),
     /// A command to run.
     Run(Invocation),
 }
@@ -958,6 +961,7 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
     match name {
         "--help" | "-h" => return Ok(Request::Help),
         "--version" | "-V" => return Ok(Request::Version),
+        "help" => return parse_help_request(args),
         _ => {}
     }
     let command = Command::from_name(name).ok_or_else(|| {
@@ -965,6 +969,16 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
             "unknown argument: {name}; run aub --help to list commands"
         ))
     })?;
+    // Checked before any argument reaches the command, so a help flag can never
+    // be taken as a value; `aub backup --help` once wrote an archive into a
+    // directory named `--help`.
+    let args: Vec<OsString> = args.collect();
+    if args
+        .iter()
+        .any(|arg| matches!(arg.to_str(), Some("--help" | "-h")))
+    {
+        return Ok(Request::CommandHelp(command));
+    }
 
     let mut format = OutputFormat::Text;
     let mut explain = ExplainMode::Off;
@@ -972,7 +986,7 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
     let mut model = None;
     let mut no_color = false;
     let mut rest = Vec::new();
-    let mut args = args.peekable();
+    let mut args = args.into_iter().peekable();
     while let Some(arg) = args.next() {
         let arg = arg
             .to_str()
@@ -1047,6 +1061,29 @@ pub fn parse_invocation<I: IntoIterator<Item = OsString>>(args: I) -> Result<Req
         no_color,
         rest,
     }))
+}
+
+/// `aub help` alone is the top-level help; `aub help <command>` is that
+/// command's help.
+fn parse_help_request(mut args: impl Iterator<Item = OsString>) -> Result<Request, Error> {
+    let Some(target) = args.next() else {
+        return Ok(Request::Help);
+    };
+    let name = target
+        .to_str()
+        .ok_or_else(|| Error::Usage("argument is not valid UTF-8".into()))?;
+    let command = Command::from_name(name).ok_or_else(|| {
+        Error::Usage(format!(
+            "unknown command: {name}; run aub --help to list commands"
+        ))
+    })?;
+    if let Some(extra) = args.next() {
+        return Err(Error::Usage(format!(
+            "help takes one command, got an extra argument: {}",
+            extra.to_string_lossy()
+        )));
+    }
+    Ok(Request::CommandHelp(command))
 }
 
 fn parse_explain(command: Command, value: Option<&str>) -> Result<ExplainMode, Error> {
@@ -1146,6 +1183,29 @@ pub fn help_text() -> String {
     lines.join("\n")
 }
 
+/// One command's help: the usage line `aub <command> <options>`, its one-line
+/// summary, then the same answers/refuses/format lines the top-level help
+/// carries for it.
+pub fn command_help_text(command: Command) -> String {
+    let usage = match command.options_help() {
+        Some(options) => format!("aub {} {options}", command.name()),
+        None => format!("aub {}", command.name()),
+    };
+    let mut lines = vec![usage];
+    if let Some(summary) = command.summary() {
+        lines.push(format!("  {summary}"));
+    }
+    if let Some(question) = command.question() {
+        lines.push(format!("  answers: {question}"));
+    }
+    let refused = command.refused_flags();
+    if !refused.is_empty() {
+        lines.push(format!("  refuses: {}", refused.join("; ")));
+    }
+    lines.push(format!("  format: {}", command.format_help()));
+    lines.join("\n")
+}
+
 /// Parse the command surface and route it to bounded workflows.
 pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
     let invocation = match parse_invocation(args)? {
@@ -1159,6 +1219,10 @@ pub fn run<I: IntoIterator<Item = OsString>>(args: I) -> Result<(), Error> {
         }
         Request::Help => {
             println!("{}", help_text());
+            return Ok(());
+        }
+        Request::CommandHelp(command) => {
+            println!("{}", command_help_text(command));
             return Ok(());
         }
         Request::Run(invocation) => invocation,
@@ -5944,6 +6008,18 @@ struct BackupArgs {
     positional: Vec<String>,
 }
 
+/// Refuses a dash-prefixed token where it would become a path something is
+/// written to, so a mistyped flag never turns into a directory on disk. A path
+/// that really starts with `-` stays reachable as `./-name`.
+fn refuse_dash_path(token: &str, role: &str) -> Result<(), Error> {
+    if token.starts_with('-') {
+        return Err(Error::Usage(format!(
+            "unknown argument: {token}; a {role} starting with - must be spelled ./{token}"
+        )));
+    }
+    Ok(())
+}
+
 /// Splits `--scheduled` out of a backup invocation's trailing arguments.
 /// `--scheduled` only creates an archive, so combining it with `verify` or
 /// `restore` is refused rather than silently ignored.
@@ -5966,6 +6042,9 @@ fn parse_backup_args(rest: &[String]) -> Result<BackupArgs, Error> {
             "backup --scheduled creates an archive; it does not apply to `verify` or `restore`"
                 .into(),
         ));
+    }
+    if let [destination] = positional.as_slice() {
+        refuse_dash_path(destination, "DESTINATION")?;
     }
     Ok(BackupArgs {
         scheduled,
@@ -6481,6 +6560,8 @@ fn parse_restore_args(rest: &[String]) -> Result<(PathBuf, PathBuf, Option<PathB
     let destination = args
         .next()
         .ok_or_else(|| Error::Usage("restore requires ARCHIVE and DEST".into()))?;
+    refuse_dash_path(archive, "ARCHIVE")?;
+    refuse_dash_path(destination, "DEST")?;
     let mut surviving = None;
     let mut positionals = Vec::new();
     while let Some(arg) = args.next() {
@@ -6620,15 +6701,20 @@ fn parse_drill_args(rest: &[String]) -> Result<DrillArgs, Error> {
                      corrupted-projection, malformed-spool-record or unsupported-schema-version"
                 ))
             })?;
+            refuse_dash_path(scratch, "SCRATCH_DEST")?;
             Ok(DrillArgs::Seed {
                 case,
                 scratch: PathBuf::from(scratch),
             })
         }
-        [flag, archive, scratch] if flag == "--archive" => Ok(DrillArgs::Archive {
-            archive: PathBuf::from(archive),
-            scratch: PathBuf::from(scratch),
-        }),
+        [flag, archive, scratch] if flag == "--archive" => {
+            refuse_dash_path(archive, "ARCHIVE")?;
+            refuse_dash_path(scratch, "SCRATCH_DEST")?;
+            Ok(DrillArgs::Archive {
+                archive: PathBuf::from(archive),
+                scratch: PathBuf::from(scratch),
+            })
+        }
         other => Err(Error::Usage(format!(
             "drill requires `--seed CASE SCRATCH_DEST` or `--archive ARCHIVE SCRATCH_DEST`, got {other:?}"
         ))),
@@ -10558,6 +10644,64 @@ mod tests {
         }
     }
 
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn usage_message(result: Result<impl std::fmt::Debug, Error>) -> String {
+        match result {
+            Err(Error::Usage(message)) => message,
+            other => panic!("expected a usage error, got {other:?}"),
+        }
+    }
+
+    /// A dash-prefixed token is never taken as a path something is written to
+    /// (aub-lv12): `aub backup --help` once wrote an archive into `./--help`.
+    /// The planted negative is a parser that keeps the token as a destination,
+    /// which would return Ok here.
+    #[test]
+    fn dash_prefixed_written_paths_are_refused_by_name() {
+        let message = usage_message(parse_backup_args(&strings(&["-x"])));
+        assert!(
+            message.contains("-x") && message.contains("./-x"),
+            "{message}"
+        );
+        let message = usage_message(parse_backup_args(&strings(&["--scheduled", "-x"])));
+        assert!(message.contains("-x"), "{message}");
+        let message = usage_message(parse_restore_args(&strings(&["-a", "b"])));
+        assert!(message.contains("-a"), "{message}");
+        let message = usage_message(parse_restore_args(&strings(&["a", "-b"])));
+        assert!(message.contains("-b"), "{message}");
+        let message =
+            usage_message(parse_drill_args(&strings(&["--archive", "-a", "s"])).map(|_| ()));
+        assert!(message.contains("-a"), "{message}");
+        let message =
+            usage_message(parse_drill_args(&strings(&["--archive", "a", "-s"])).map(|_| ()));
+        assert!(message.contains("-s"), "{message}");
+        let message = usage_message(
+            parse_drill_args(&strings(&["--seed", "truncated-database", "-s"])).map(|_| ()),
+        );
+        assert!(message.contains("-s"), "{message}");
+    }
+
+    /// The escape for a path that really starts with `-` is `./-name`, and it
+    /// reaches every parser unchanged.
+    #[test]
+    fn dot_slash_spelling_of_a_dash_path_is_accepted() {
+        let args = parse_backup_args(&strings(&["./-dir"])).unwrap();
+        assert_eq!(args.positional, strings(&["./-dir"]));
+        let (archive, dest, _) = parse_restore_args(&strings(&["./-a", "./-b"])).unwrap();
+        assert_eq!(archive, PathBuf::from("./-a"));
+        assert_eq!(dest, PathBuf::from("./-b"));
+        match parse_drill_args(&strings(&["--archive", "./-a", "./-s"])).unwrap() {
+            DrillArgs::Archive { archive, scratch } => {
+                assert_eq!(archive, PathBuf::from("./-a"));
+                assert_eq!(scratch, PathBuf::from("./-s"));
+            }
+            DrillArgs::Seed { .. } => panic!("parsed as a seed drill"),
+        }
+    }
+
     /// `aub sample` opens its ledger with the configured `sampling.request_timeout`,
     /// not a hardcoded value (`aub-va6s`): a config naming a busy timeout
     /// wider than the old hardcoded 500ms must actually reach the pragma
@@ -11384,6 +11528,53 @@ mod tests {
                     assert_eq!(after.verbosity, 2, "{command:?}");
                 }
                 other => panic!("{command:?} did not parse verbosity uniformly: {other:?}"),
+            }
+        }
+    }
+
+    /// `--help` / `-h` anywhere after a command name is that command's help
+    /// request, before any argument reaches the command (aub-lv12), and `aub
+    /// help <command>` is the same request.
+    #[test]
+    fn command_help_is_recognised_in_any_position_after_the_command() {
+        for command in Command::ALL {
+            let name = command.name();
+            for flag in ["--help", "-h"] {
+                for line in [
+                    vec![name, flag],
+                    vec![name, "x", flag],
+                    vec![name, "x", "y", flag, "z"],
+                ] {
+                    assert_eq!(
+                        parse_invocation(args(&line)).unwrap(),
+                        Request::CommandHelp(command),
+                        "{line:?}"
+                    );
+                }
+            }
+            assert_eq!(
+                parse_invocation(args(&["help", name])).unwrap(),
+                Request::CommandHelp(command)
+            );
+        }
+        assert_eq!(parse_invocation(args(&["help"])).unwrap(), Request::Help);
+        let message = usage_message(parse_invocation(args(&["help", "nope"])));
+        assert!(message.contains("nope"), "{message}");
+    }
+
+    /// The per-command help opens with `aub <command>` followed by the options
+    /// line the top-level help lists for it.
+    #[test]
+    fn command_help_text_opens_with_the_usage_line() {
+        for command in Command::ALL {
+            let text = command_help_text(command);
+            let first = text.lines().next().unwrap();
+            assert!(
+                first.starts_with(&format!("aub {}", command.name())),
+                "{first}"
+            );
+            if let Some(options) = command.options_help() {
+                assert!(first.contains(options), "{first}");
             }
         }
     }
@@ -12985,7 +13176,7 @@ usage_evidence = "measured"
                     vec!["--provider".to_string(), "anthropic".to_string()]
                 );
             }
-            other @ (Request::Version | Request::Help) => {
+            other @ (Request::Version | Request::Help | Request::CommandHelp(_)) => {
                 panic!("unexpected parse result: {other:?}")
             }
         }
