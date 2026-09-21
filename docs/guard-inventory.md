@@ -63,8 +63,7 @@ run below is recorded as pass or fail only.
 
 ## Last successful full run
 
-Last successful full run: none yet (inventory created with aub-71j.7, awaiting
-the first recorded full pass).
+Last successful full run: 2026-09-21 (bin/guard-mutations, scope all, 82 rows)
 
 The runner rewrites this line itself on a full-scope pass.
 
