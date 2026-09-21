@@ -698,8 +698,11 @@ fn parse_pi_line(
 /// (`aub-i589`). A reasoning token is priced as an output token of the same
 /// model, so folding it into `output` values it exactly, with no separate
 /// cost model term. The fold happens after each count is validated, so a
-/// negative or non-integer `output` or `reasoning` still quarantines rather
-/// than being rescued by the sum. `message.id`
+/// negative or non-integer `reasoning`, or a non-integer `output`, still
+/// quarantines rather than being rescued by the sum. A negative `output` is
+/// opencode's own subtraction gone below zero, not a bad count, and is read
+/// back into the provider's count only when the row's total confirms it; see
+/// `opencode_generated_from_difference`. `message.id`
 /// is the stable event identifier, the strong identity dedup collapses
 /// replays on. A user row carries no tokens and is skipped silently, the way
 /// a record without a usage object is; an assistant row without one
@@ -717,7 +720,7 @@ const OPENCODE_IGNORED: [&str; 1] = ["total"];
 
 impl ParserAdapter for OpencodeParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("opencode-2")
+        ParserVersion::new("opencode-3")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -821,8 +824,12 @@ fn parse_opencode_row(
         }
     }
     let reasoning = flat.remove("reasoning");
+    let generated = opencode_generated_from_difference(&flat, reasoning.as_ref())?;
+    if let Some(generated) = generated {
+        flat.insert("output".to_string(), Value::from(generated));
+    }
     let mut counts = extract_usage(&flat, &OPENCODE_KNOWN, &OPENCODE_IGNORED, &["input"])?;
-    if let Some(reasoning) = reasoning {
+    if let (None, Some(reasoning)) = (generated, reasoning) {
         counts.output = counts
             .output
             .checked_add(count_value(&reasoning)?)
@@ -858,6 +865,52 @@ fn parse_opencode_row(
         context,
         parser_version,
     )))
+}
+
+/// The generated count behind a negative opencode `output`, or `None` when
+/// `output` is not a negative integer and the ordinary fold applies.
+///
+/// opencode does not store the provider's output count: it stores
+/// `outputTokens - reasoningTokens`, and before it clamped that difference at
+/// zero (1.14.45) it wrote it negative whenever a provider reported more
+/// reasoning than output (`aub-o6bc`). The provider's own count is then
+/// `output + reasoning`, which is what the fold computes for every other row.
+/// It is accepted only when the row proves the reading: a reasoning count is
+/// present, the sum is not negative, and the row's `total` equals
+/// `input + output + reasoning + cache.read + cache.write`. Any other negative
+/// `output` still quarantines as a wrong type.
+fn opencode_generated_from_difference(
+    flat: &serde_json::Map<String, Value>,
+    reasoning: Option<&Value>,
+) -> Result<Option<u64>, QuarantineClass> {
+    let Some(difference) = flat
+        .get("output")
+        .and_then(Value::as_i64)
+        .filter(|output| *output < 0)
+    else {
+        return Ok(None);
+    };
+    let reasoning = count_value(reasoning.ok_or(QuarantineClass::WrongFieldType)?)?;
+    let generated = reasoning
+        .checked_add_signed(difference)
+        .ok_or(QuarantineClass::WrongFieldType)?;
+    let component =
+        |key: &str| -> Result<u64, QuarantineClass> { flat.get(key).map_or(Ok(0), count_value) };
+    let components = [
+        component("input")?,
+        generated,
+        component("cache_read")?,
+        component("cache_write")?,
+    ];
+    let summed = components
+        .iter()
+        .try_fold(0_u64, |sum, count| sum.checked_add(*count))
+        .ok_or(QuarantineClass::WrongFieldType)?;
+    let total = flat.get("total").ok_or(QuarantineClass::WrongFieldType)?;
+    if count_value(total)? != summed {
+        return Err(QuarantineClass::WrongFieldType);
+    }
+    Ok(Some(generated))
 }
 
 /// A millisecond timestamp as opencode writes it, or `None` for a value that
@@ -1080,7 +1133,7 @@ mod tests {
     #[test]
     fn opencode_declares_its_parser_and_input_format_versions() {
         let parser = OpencodeParser;
-        assert_eq!(parser.parser_version().as_str(), "opencode-2");
+        assert_eq!(parser.parser_version().as_str(), "opencode-3");
         assert_eq!(parser.input_format_version().as_str(), "opencode-sqlite-v1");
         assert!(parser.is_database_source());
     }
@@ -1546,19 +1599,51 @@ mod tests {
         assert_eq!(without.usage().known().output().value(), 4);
     }
 
-    /// A negative `output` still quarantines when a reasoning count would lift
-    /// the sum above zero, and a negative `reasoning` quarantines instead of
-    /// being dropped from a priced figure.
+    /// The real shape opencode 1.4.11 to 1.14.41 wrote when a provider reported
+    /// more reasoning than output: `output` is `outputTokens - reasoning`
+    /// gone negative, and the row's total confirms it. The generated count is
+    /// the provider's own `output + reasoning`, never zero and never the
+    /// absolute value. The planted negative is the same row with a positive
+    /// output, which folds the ordinary way.
     #[test]
-    fn opencode_negative_counts_quarantine_despite_the_fold() {
-        assert_eq!(
-            parse_opencode(r#"{"input":10,"output":-5,"reasoning":582}"#).err(),
-            Some(QuarantineClass::WrongFieldType)
-        );
-        assert_eq!(
-            parse_opencode(r#"{"input":10,"output":5,"reasoning":-2}"#).err(),
-            Some(QuarantineClass::WrongFieldType)
-        );
+    fn opencode_negative_output_is_read_back_into_the_provider_count() {
+        let event = parse_opencode(
+            r#"{"total":59468,"input":19296,"output":-5,"reasoning":241,"cache":{"write":0,"read":39936}}"#,
+        )
+        .expect("a total-confirmed difference is a valid row")
+        .expect("an assistant row is an event");
+        assert_eq!(event.usage().known().output().value(), 236);
+        assert_eq!(event.usage().known().input().value(), 19_296);
+        assert_eq!(event.usage().known().cache_read().value(), 39_936);
+        assert!(event.usage().unknown().is_empty());
+        let positive = parse_opencode(
+            r#"{"total":59478,"input":19296,"output":5,"reasoning":241,"cache":{"write":0,"read":39936}}"#,
+        )
+        .expect("a valid row")
+        .expect("an assistant row is an event");
+        assert_eq!(positive.usage().known().output().value(), 246);
+    }
+
+    /// A negative `output` is read back only when the row proves the reading:
+    /// with no reasoning to subtract from, with a sum below zero, or with a
+    /// total that disagrees or is absent, it quarantines as a wrong type. A
+    /// negative `reasoning` quarantines instead of being dropped from a priced
+    /// figure.
+    #[test]
+    fn opencode_unconfirmed_negative_counts_quarantine() {
+        for tokens in [
+            r#"{"total":59473,"input":19296,"output":-5,"cache":{"write":0,"read":39936}}"#,
+            r#"{"total":59228,"input":19296,"output":-245,"reasoning":241,"cache":{"write":0,"read":39936}}"#,
+            r#"{"total":59478,"input":19296,"output":-5,"reasoning":241,"cache":{"write":0,"read":39936}}"#,
+            r#"{"input":19296,"output":-5,"reasoning":241,"cache":{"write":0,"read":39936}}"#,
+            r#"{"input":10,"output":5,"reasoning":-2}"#,
+        ] {
+            assert_eq!(
+                parse_opencode(tokens).err(),
+                Some(QuarantineClass::WrongFieldType),
+                "{tokens}"
+            );
+        }
     }
 
     /// The real Claude Code shape: strings, objects and an array inside `usage`
