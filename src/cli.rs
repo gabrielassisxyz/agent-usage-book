@@ -13107,6 +13107,106 @@ usage_evidence = "measured"
         rest[..end].to_string()
     }
 
+    /// A ledger whose `anthropic/default/five_hour` scope has an active
+    /// per-kind calibration and nothing else calibrated.
+    fn per_kind_active_ledger() -> (
+        crate::store::calibrate_cli_test_ledger::CalibrateCliTestLedgerDir,
+        rusqlite::Connection,
+    ) {
+        use crate::store::calibration_multivariate_result::{
+            insert_multivariate_result, per_kind_fixture,
+        };
+        let (dir, mut conn) = calibrate_fixture_db();
+        per_kind_fixture::seed_run_and_candidate(&mut conn, "default");
+        insert_multivariate_result(
+            &mut conn,
+            &per_kind_fixture::result(per_kind_fixture::RESULT_ID, "default"),
+        )
+        .expect("the per-kind result must insert");
+        per_kind_fixture::activate(&mut conn, 3_000, None).expect("the per-kind result activates");
+        (dir, conn)
+    }
+
+    /// `spend --window-equivalent` over a window whose active calibration is
+    /// per-kind names that calibration as the reason no conversion exists.
+    /// The planted negative is the fallback a per-kind scope must not take:
+    /// read as uncalibrated, the same window would go to the rate-card
+    /// estimate and report a missing rate card instead.
+    #[test]
+    fn spend_window_equivalent_names_an_active_per_kind_calibration_rather_than_estimating() {
+        let (_dir, conn) = per_kind_active_ledger();
+        let book = crate::valuation::RateBook::default();
+        let resolver = SpendWindowResolver {
+            conn: &conn,
+            active_cost_model: None,
+            rate_cards: &book,
+            window_key: "five_hour",
+            timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(4_000),
+        };
+        let usage = crate::domain::tokens::UsageVector::new(
+            crate::domain::tokens::KnownTokenVector::new(
+                crate::domain::tokens::InputTokens::new(10),
+                crate::domain::tokens::OutputTokens::new(10),
+                crate::domain::tokens::CacheReadTokens::new(0),
+                crate::domain::tokens::CacheWriteTokens::new(0),
+            ),
+            std::collections::BTreeMap::new(),
+            crate::evidence::CoverageCompleteness::Complete,
+            crate::evidence::EvidenceQuality::Measured,
+        );
+        let derivation = resolver
+            .resolve(Some("acct"), Some("anthropic"), None, None, &usage)
+            .expect("the resolver must answer");
+        let missing: Vec<String> = derivation
+            .missing()
+            .expect("a per-kind scope converts nothing")
+            .iter()
+            .map(|fact| fact.as_str().to_string())
+            .collect();
+        assert!(
+            missing
+                .iter()
+                .any(|fact| fact.contains("per-kind") && fact.contains("promoted-mvcand-1")),
+            "{missing:?}"
+        );
+    }
+
+    /// can-run gives a per-kind window no credit constraint and marks it, so
+    /// the rate-card estimate does not stand in for a calibration that exists.
+    #[test]
+    fn can_run_marks_a_per_kind_window_and_bounds_nothing_with_it() {
+        use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
+        use crate::domain::window::{
+            MeterWindow, NominalWindowDuration, QuantizationSemantics, ReportedResolution,
+            WindowScope, WindowSemanticKey,
+        };
+        let (_dir, conn) = per_kind_active_ledger();
+        let window = MeterWindow::new(
+            WindowSemanticKey::new("five_hour"),
+            WindowScope::AccountWide,
+            QuotaUsed::new(QuotaFractionPpm::new(100_000).unwrap()),
+            ReportedResolution::new(QuotaFractionPpm::new(10_000).unwrap()).unwrap(),
+            QuantizationSemantics::Exact,
+            crate::domain::time::UtcTimestamp::from_unix_nanos(18_000_000_000_000),
+            NominalWindowDuration::from_nanos(18_000_000_000_000),
+        );
+        let gathered = gather_window_calibrations(
+            &conn,
+            std::slice::from_ref(&window),
+            &crate::domain::window::ModelId::new("claude-opus"),
+            "default",
+            "anthropic",
+            crate::domain::time::UtcTimestamp::from_unix_nanos(4_000),
+        )
+        .expect("the lookup must answer");
+        assert!(gathered.scalar.is_empty());
+        assert!(
+            gathered
+                .per_kind
+                .contains(&WindowSemanticKey::new("five_hour"))
+        );
+    }
+
     /// A scratch ledger for the `calibrate` unit tests: a migrated database in
     /// a temp directory that removes itself. The tests drive
     /// [`calibrate_begin_validated`] and [`calibrate_resolve_experiment`]
