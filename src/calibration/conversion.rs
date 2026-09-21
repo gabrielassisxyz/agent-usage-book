@@ -16,7 +16,7 @@ use crate::domain::quota::PercentagePoints;
 use crate::domain::window::WindowSemanticKey;
 use crate::evidence::{Derivation, EstimatorId, EvidenceQuality, Provenance, RequiredFact};
 use crate::report::{WindowEquivalentBasis, WindowEquivalentDerivation, WindowEquivalentValue};
-use crate::store::calibration::{PlanTier, WindowCalibration};
+use crate::store::calibration::{ActiveCalibration, PlanTier, WindowCalibration};
 use crate::store::cost_model::ProviderKey;
 
 use super::health::CalibrationHealth;
@@ -56,6 +56,32 @@ impl WindowConversionContext {
             meter_semantics_id,
             billing_semantics_id,
             cost_model_id,
+        }
+    }
+}
+
+/// The scalar calibration a credit conversion needs, out of whichever shape is
+/// active. A per-kind calibration relates each token kind to meter movement and
+/// carries no credits-per-point coefficient, so it yields the refusal the
+/// conversion reports in place of a number: deriving one would price the kinds
+/// through the cost model the joint fit exists to test (PLAN.md 22.1).
+pub fn require_scalar_calibration(
+    active: ActiveCalibration,
+) -> Result<WindowCalibration, Box<WindowEquivalentDerivation>> {
+    match active {
+        ActiveCalibration::Scalar(calibration) => Ok(calibration),
+        ActiveCalibration::PerKind(calibration) => {
+            let provenance = Provenance::new([
+                format!("window-calibration:{}", calibration.id.as_str()),
+                format!("provider:{}", calibration.provider.as_str()),
+            ]);
+            Err(Box::new(unavailable(
+                [RequiredFact::new(format!(
+                    "scalar credits-per-point calibration: the active calibration '{}' is per-kind, and a per-kind calibration converts tokens of each kind, not credits",
+                    calibration.id.as_str()
+                ))],
+                provenance,
+            )))
         }
     }
 }
@@ -475,5 +501,69 @@ mod tests {
         assert_eq!(work.interval.lower().get(), 100);
         assert_eq!(research.interval.lower().get(), 50);
         assert_ne!(work.interval, research.interval);
+    }
+
+    fn per_kind_calibration()
+    -> crate::store::calibration_multivariate_result::MultivariateCalibration {
+        use crate::store::calibration::{ConditionNumber, EvidenceDigest, EvidenceFingerprint};
+        let evidence: std::collections::BTreeSet<crate::domain::provenance::EvidenceId> =
+            [crate::domain::provenance::EvidenceId::new("ev")]
+                .into_iter()
+                .collect();
+        crate::store::calibration_multivariate_result::MultivariateCalibration {
+            id: WindowCalibrationId::new("promoted-mvcand-1"),
+            candidate: crate::store::calibration_multivariate::MultivariateCandidateId::new(
+                "mvcand-1",
+            ),
+            experiment: crate::store::calibration_controlled::ControlledExperimentId::new("exp"),
+            provider: ProviderKey::new("anthropic"),
+            plan_tier: PlanTier::new("pro"),
+            window_semantic_key: WindowSemanticKey::new("five_hour"),
+            coefficients: Vec::new(),
+            condition_number: ConditionNumber::from_micros(1_000_000),
+            condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+            fit_residual: crate::domain::quota::QuotaFractionPpm::new(0).unwrap(),
+            held_out_residual: crate::domain::quota::QuotaFractionPpm::new(0).unwrap(),
+            validation_observations: 2,
+            sample_count: 2,
+            inputs: EvidenceDigest::from_inputs(&evidence),
+            fitting_evidence: EvidenceFingerprint::from_inputs(&evidence),
+            validation_evidence: EvidenceFingerprint::from_inputs(&evidence),
+            validation_method: "m".to_string(),
+            validation_version: "v1".to_string(),
+            statistical_method: "ols".to_string(),
+            statistical_parameters: "{}".to_string(),
+            phase_design: "d".to_string(),
+            activation_policy_version: "p".to_string(),
+            aub_version: "0".to_string(),
+            source_revision: "r".to_string(),
+            validity: crate::store::cost_model::ValidityInterval::new(
+                UtcTimestamp::from_unix_nanos(0),
+                UtcTimestamp::from_unix_nanos(1),
+            )
+            .unwrap(),
+            fit_timestamp: UtcTimestamp::from_unix_nanos(1),
+            knowledge_time: UtcTimestamp::from_unix_nanos(1),
+        }
+    }
+
+    /// A scalar active calibration is handed on unchanged; a per-kind one is
+    /// a named refusal carrying its id, never a coefficient derived from its
+    /// per-kind figures.
+    #[test]
+    fn only_a_scalar_calibration_reaches_the_credit_conversion() {
+        let scalar = require_scalar_calibration(ActiveCalibration::Scalar(calibration()))
+            .expect("a scalar calibration converts credits");
+        assert_eq!(scalar, calibration());
+
+        let refusal =
+            require_scalar_calibration(ActiveCalibration::PerKind(per_kind_calibration()))
+                .expect_err("a per-kind calibration has no credits-per-point coefficient");
+        let facts = missing(&refusal);
+        assert_eq!(facts.len(), 1, "{facts:?}");
+        assert!(
+            facts[0].contains("per-kind") && facts[0].contains("promoted-mvcand-1"),
+            "{facts:?}"
+        );
     }
 }

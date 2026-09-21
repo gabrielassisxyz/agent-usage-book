@@ -874,10 +874,34 @@ experiment's validity window; `--validation` is refused when it is empty, when i
 overlaps the training set (the overlap is named), and when the ledger holds no
 observation of the experiment's provider and window for one of its ids. Promoting
 one candidate twice is refused naming the result already recorded, since a result
-is immutable and a second row would be a second identity for one fit. A joint
-multivariate candidate is refused outright: a result carries one scalar
-coefficient and a joint fit has one per token kind, and reducing them through a
-cost model would reintroduce the assumption the joint fit exists to test.
+is immutable and a second row would be a second identity for one fit.
+
+A joint multivariate candidate is promoted to a per-kind result in
+`window_calibration_multivariate_result`, with one row per kind the premise named
+in `window_calibration_multivariate_result_coefficient`. Its coefficients are
+never reduced to one credits-per-point scalar, because pricing them through a
+cost model would record as truth the assumption the joint fit exists to test. The
+result carries the candidate's coefficients with their standard errors and
+intervals, its condition number and the threshold it was accepted under, its fit
+residual, and a held-out residual: the validation readings are folded into
+settled blocks over the run account's own usage, exactly as the fit folds its
+readings, and the result records the mean absolute distance between each block's
+movement and the movement the coefficients predict, in ppm of quota. Validation
+readings that hold no block of the run account's usage in a fitted kind are
+refused, since there is no movement to predict. The training, overlap,
+missing-evidence and second-promotion refusals are the scalar ones. With
+`--format json` the report carries `calibration_id`, `coefficient_shape`
+(`"per_kind"`), `candidate_id`, `experiment_id`, `provider`, `plan_tier`,
+`window_semantic_key`, `coefficients` (one object per kind with `token_kind`,
+`estimate` and `std_error` in `micro_ppm_per_token`, and `interval`),
+`condition_number`, `condition_number_threshold` (both in `micros`),
+`fit_residual`, `held_out_residual` (both in `ppm`), `validation_observations`,
+`sample_count`, `statistical_method`, `statistical_parameters`, `phase_design`,
+`validation_method` (`held-out-block-residual`), `validation_version`,
+`inputs_digest`, `inputs_count`, `fitting_evidence_digest`,
+`validation_evidence_digest`, `fit_timestamp_nanos`, `activation_policy_version`,
+`fitter_version`, `source_revision`, and `activated` (always `false`). There is
+no `fitted` field.
 
 Promotion records evidence and never activates (Invariant 14): it writes no
 `calibration_lifecycle` row, `calibrate history` lists the new result with no
@@ -918,6 +942,26 @@ run's own arm sessions from another's, and every session a burst opens on the
 account is marked inside the run. A run whose local credits cannot be priced is
 refused with the insufficient-evidence class. A result whose source experiment
 is not a controlled run is not judged for contamination.
+
+`activate` of a per-kind result goes through the same gate: the recorded policy
+version and evidence digests, disjoint training and validation sets, the source
+run's contamination verdict, `--max-condition-micros` against the recorded
+condition number, and the held-out residual against `--max-residual-ppm` (ppm of
+quota, 10000 by default, the one-percentage-point resolution providers report
+usage at). `--max-residual-micros` bounds a scalar result's residual in credits
+and never judges a per-kind one. Its event is written to
+`calibration_multivariate_lifecycle`, and the active calibration of a scope is
+the latest event across that table and `calibration_lifecycle`, so a per-kind
+activation supersedes an active scalar calibration and names it. A scalar
+activation over an active per-kind calibration is refused naming
+`aub-scalar-supersedes-per-kind-ufpq`, because `calibration_lifecycle` cannot yet
+name a per-kind predecessor. `calibrate show` and `calibrate history` list
+per-kind results under `per_kind_entries`, beside the scalar `entries`, each with
+its `health`, `is_active` and `events`; `calibrate compare` refuses a per-kind id
+by name. A consumer that converts credits into percentage points, `spend
+--window-equivalent` and the `can-run` headroom, reports the window as needing a
+scalar calibration rather than falling back to a rate-card estimate, since the
+window does have a calibration and it is not one credits can be read through.
 
 Subcommand `passive` generates candidates from
 uncontrolled, recorded observations across clean intervals under strict

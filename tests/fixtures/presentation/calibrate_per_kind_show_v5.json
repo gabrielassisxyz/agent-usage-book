@@ -1,0 +1,128 @@
+{
+  "command": "calibrate-show",
+  "entries": [],
+  "generated_at": 2000,
+  "knowledge_at": 1000,
+  "ledger_generation": 7,
+  "per_kind_entries": [
+    {
+      "activation_policy_version": "promote-v1",
+      "calibration_id": "promoted-mvcand-exp-1-00000000000000ab",
+      "candidate_id": "mvcand-exp-1-00000000000000ab",
+      "coefficient_shape": "per_kind",
+      "coefficients": [
+        {
+          "estimate": {
+            "unit": "micro_ppm_per_token",
+            "value": "672000"
+          },
+          "interval": {
+            "lower": "627000",
+            "unit": "micro_ppm_per_token",
+            "upper": "717000"
+          },
+          "std_error": {
+            "unit": "micro_ppm_per_token",
+            "value": "22500"
+          },
+          "token_kind": "input"
+        },
+        {
+          "estimate": {
+            "unit": "micro_ppm_per_token",
+            "value": "4484000"
+          },
+          "interval": {
+            "lower": "4304000",
+            "unit": "micro_ppm_per_token",
+            "upper": "4664000"
+          },
+          "std_error": {
+            "unit": "micro_ppm_per_token",
+            "value": "90000"
+          },
+          "token_kind": "output"
+        },
+        {
+          "estimate": {
+            "unit": "micro_ppm_per_token",
+            "value": "-3000"
+          },
+          "interval": {
+            "lower": "-7000",
+            "unit": "micro_ppm_per_token",
+            "upper": "1000"
+          },
+          "std_error": {
+            "unit": "micro_ppm_per_token",
+            "value": "2000"
+          },
+          "token_kind": "cache_read"
+        },
+        {
+          "estimate": {
+            "unit": "micro_ppm_per_token",
+            "value": "701000"
+          },
+          "interval": {
+            "lower": "641000",
+            "unit": "micro_ppm_per_token",
+            "upper": "761000"
+          },
+          "std_error": {
+            "unit": "micro_ppm_per_token",
+            "value": "30000"
+          },
+          "token_kind": "cache_write"
+        }
+      ],
+      "condition_number": {
+        "unit": "micros",
+        "value": "7250000"
+      },
+      "condition_number_threshold": {
+        "unit": "micros",
+        "value": "30000000"
+      },
+      "events": [
+        {
+          "activation_policy_version": "promote-v1",
+          "actor": "operator",
+          "event_at_nanos": 1900,
+          "kind": "supersession",
+          "supersedes": "promoted-cand-1"
+        }
+      ],
+      "experiment_id": "exp-1",
+      "fit_residual": {
+        "unit": "ppm",
+        "value": "2196"
+      },
+      "fit_timestamp_nanos": 1500,
+      "fitter_version": "0.1.0",
+      "fitting_evidence_digest": "00000000000000cd",
+      "health": "current",
+      "held_out_residual": {
+        "unit": "ppm",
+        "value": "3140"
+      },
+      "inputs_count": 40,
+      "inputs_digest": "00000000000000ab",
+      "is_active": true,
+      "phase_design": "controlled-run=exp-1;kinds=input,output,cache_read,cache_write",
+      "plan_tier": "pro",
+      "provider": "anthropic",
+      "sample_count": 16,
+      "source_revision": "abc1234",
+      "statistical_method": "ols-through-origin",
+      "statistical_parameters": "{\"ridge\":0}",
+      "validation_evidence_digest": "00000000000000ef",
+      "validation_method": "held-out-block-residual",
+      "validation_observations": 6,
+      "validation_version": "v1",
+      "window_semantic_key": "five_hour"
+    }
+  ],
+  "run": "run-1000-2000-1",
+  "schema": 5
+}

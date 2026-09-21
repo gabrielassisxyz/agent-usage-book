@@ -95,6 +95,9 @@ pub enum DurableClass {
     WindowCalibrationCandidate,
     WindowCalibrationMultivariateCandidate,
     WindowCalibrationMultivariateCoefficient,
+    WindowCalibrationMultivariateResult,
+    WindowCalibrationMultivariateResultCoefficient,
+    CalibrationMultivariateLifecycle,
     WindowCalibrationResult,
     WindowCalibrationSourceExperiment,
     CalibrationLifecycle,
@@ -165,6 +168,9 @@ impl DurableClass {
             | Self::WindowCalibrationCandidate
             | Self::WindowCalibrationMultivariateCandidate
             | Self::WindowCalibrationMultivariateCoefficient
+            | Self::WindowCalibrationMultivariateResult
+            | Self::WindowCalibrationMultivariateResultCoefficient
+            | Self::CalibrationMultivariateLifecycle
             | Self::WindowCalibrationResult
             | Self::WindowCalibrationSourceExperiment
             | Self::CalibrationLifecycle => DurableClassCategory::VersionedInterpretation,
@@ -214,6 +220,9 @@ impl DurableClass {
             | Self::WindowCalibrationCandidate
             | Self::WindowCalibrationMultivariateCandidate
             | Self::WindowCalibrationMultivariateCoefficient
+            | Self::WindowCalibrationMultivariateResult
+            | Self::WindowCalibrationMultivariateResultCoefficient
+            | Self::CalibrationMultivariateLifecycle
             | Self::WindowCalibrationResult
             | Self::WindowCalibrationSourceExperiment
             | Self::CalibrationLifecycle
@@ -300,6 +309,13 @@ impl DurableClass {
             Self::WindowCalibrationMultivariateCoefficient => {
                 Some("window_calibration_multivariate_coefficient")
             }
+            Self::WindowCalibrationMultivariateResult => {
+                Some("window_calibration_multivariate_result")
+            }
+            Self::WindowCalibrationMultivariateResultCoefficient => {
+                Some("window_calibration_multivariate_result_coefficient")
+            }
+            Self::CalibrationMultivariateLifecycle => Some("calibration_multivariate_lifecycle"),
             Self::WindowCalibrationResult => Some("window_calibration_result"),
             Self::WindowCalibrationSourceExperiment => Some("window_calibration_source_experiment"),
             Self::CalibrationLifecycle => Some("calibration_lifecycle"),
@@ -399,6 +415,9 @@ impl DurableClass {
             | Self::WindowCalibrationCandidate
             | Self::WindowCalibrationMultivariateCandidate
             | Self::WindowCalibrationMultivariateCoefficient
+            | Self::WindowCalibrationMultivariateResult
+            | Self::WindowCalibrationMultivariateResultCoefficient
+            | Self::CalibrationMultivariateLifecycle
             | Self::WindowCalibrationResult
             | Self::WindowCalibrationSourceExperiment
             | Self::CalibrationLifecycle
@@ -449,6 +468,9 @@ impl DurableClass {
             Self::WindowCalibrationCandidate,
             Self::WindowCalibrationMultivariateCandidate,
             Self::WindowCalibrationMultivariateCoefficient,
+            Self::WindowCalibrationMultivariateResult,
+            Self::WindowCalibrationMultivariateResultCoefficient,
+            Self::CalibrationMultivariateLifecycle,
             Self::WindowCalibrationResult,
             Self::WindowCalibrationSourceExperiment,
             Self::CalibrationLifecycle,
@@ -505,6 +527,9 @@ impl DurableClass {
             Self::WindowCalibrationCandidate,
             Self::WindowCalibrationMultivariateCandidate,
             Self::WindowCalibrationMultivariateCoefficient,
+            Self::WindowCalibrationMultivariateResult,
+            Self::WindowCalibrationMultivariateResultCoefficient,
+            Self::CalibrationMultivariateLifecycle,
             Self::WindowCalibrationResult,
             Self::WindowCalibrationSourceExperiment,
             Self::CalibrationLifecycle,

@@ -52,8 +52,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use agent_usage_book::calibration::activation::{
-    ActivationActor, ActivationPolicy, ActivationRefusal, ActivationRequest, RecordedValidation,
-    check_activation, check_evidence_disjoint, held_out_residual,
+    ActivationActor, ActivationPolicy, ActivationRefusal, ActivationRequest, HeldOutResidual,
+    RecordedValidation, check_activation, check_evidence_disjoint, held_out_residual,
 };
 use agent_usage_book::calibration::contamination::{
     ContaminationInputs, ContaminationMeterPoint, ContaminationSignal, ContaminationThresholds,
@@ -1309,7 +1309,7 @@ fn check_rejection_10_held_out_residual_exceeds_policy() -> Result<(), String> {
 
     let recorded = RecordedValidation {
         policy_version: "policy-v1".into(),
-        held_out_residual: Some(Credits::from_micros(45_000)), // 45,000 exceeds 10,000
+        held_out_residual: Some(HeldOutResidual::Credits(Credits::from_micros(45_000))), // 45,000 exceeds 10,000
         condition_number: Some(ConditionNumber::from_micros(5_000_000)),
         fitting_evidence: EvidenceFingerprint::from_inputs(&training),
         validation_evidence: EvidenceFingerprint::from_inputs(&validation),
@@ -1535,7 +1535,7 @@ fn test_overfitting_fits_training_fails_held_out_activation_refused() {
 
     let recorded = RecordedValidation {
         policy_version: "held-out-policy-v1".into(),
-        held_out_residual: Some(held_out_res),
+        held_out_residual: Some(HeldOutResidual::Credits(held_out_res)),
         condition_number: Some(ConditionNumber::from_micros(2_000_000)),
         fitting_evidence: EvidenceFingerprint::from_inputs(&train_ids),
         validation_evidence: EvidenceFingerprint::from_inputs(&val_ids),

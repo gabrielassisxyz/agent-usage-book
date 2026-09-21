@@ -92,11 +92,13 @@ pub struct CalibrateShowEntry {
 }
 
 /// The `calibrate show` report: every currently active calibration, one entry
-/// per scope. Empty when no scope has an active calibration.
+/// per scope. Empty when no scope has an active calibration. A scope whose
+/// active calibration is per-kind appears in `per_kind_entries` instead.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalibrateShowReport {
     pub metadata: ReportMetadata,
     pub entries: Vec<CalibrateShowEntry>,
+    pub per_kind_entries: Vec<CalibratePerKindEntry>,
 }
 
 /// One row of `calibrate history`: a calibration with its health state and its
@@ -116,11 +118,13 @@ pub struct CalibrateHistoryEntry {
     pub events: Vec<CalibrateLifecycleEventView>,
 }
 
-/// The `calibrate history` report: every calibration result in the ledger.
+/// The `calibrate history` report: every calibration result in the ledger,
+/// the per-kind ones in `per_kind_entries`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CalibrateHistoryReport {
     pub metadata: ReportMetadata,
     pub entries: Vec<CalibrateHistoryEntry>,
+    pub per_kind_entries: Vec<CalibratePerKindEntry>,
 }
 
 /// The `calibrate compare` report: the difference between a candidate and the
@@ -222,6 +226,79 @@ pub struct CalibrateActivateReport {
     pub fit_residual_micros: i64,
     pub uncertainty_low_micros_per_point: i64,
     pub uncertainty_high_micros_per_point: i64,
+}
+
+/// One token kind's coefficient on a per-kind calibration, in micro-ppm of
+/// quota per token, with its standard error and interval.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibrateKindCoefficientView {
+    pub kind_label: String,
+    pub estimate_micro_ppm_per_token: i64,
+    pub std_error_micro_ppm_per_token: i64,
+    pub interval_low_micro_ppm_per_token: i64,
+    pub interval_high_micro_ppm_per_token: i64,
+}
+
+/// A per-kind calibration result as every calibrate report shows it: one
+/// coefficient per kind with its interval, the condition number it was fitted
+/// under, and both residuals in quota parts per million. There is no
+/// credits-per-point figure here, because a per-kind result has none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibratePerKindResultView {
+    pub calibration_id: String,
+    pub candidate_id: String,
+    pub experiment_id: String,
+    pub provider: String,
+    pub plan_tier: String,
+    pub window_semantic_key: String,
+    pub coefficients: Vec<CalibrateKindCoefficientView>,
+    pub condition_number_micros: i64,
+    pub condition_number_threshold_micros: i64,
+    pub fit_residual_ppm: u32,
+    pub held_out_residual_ppm: u32,
+    pub validation_observations: u32,
+    pub sample_count: u32,
+    pub statistical_method: String,
+    pub statistical_parameters: String,
+    pub phase_design: String,
+    pub validation_method: String,
+    pub validation_version: String,
+    pub inputs_digest_hex: String,
+    pub inputs_count: usize,
+    pub fitting_evidence_digest_hex: String,
+    pub validation_evidence_digest_hex: String,
+    pub fit_timestamp_nanos: i64,
+    pub activation_policy_version: String,
+    pub aub_version: String,
+    pub source_revision: String,
+}
+
+/// A per-kind calibration as `show` and `history` list it: the result, its
+/// health, whether it is the active one, and its lifecycle events.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibratePerKindEntry {
+    pub result: CalibratePerKindResultView,
+    pub health_label: String,
+    pub is_active: bool,
+    pub events: Vec<CalibrateLifecycleEventView>,
+}
+
+/// The `calibrate promote` report for a joint candidate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibratePerKindPromoteReport {
+    pub metadata: ReportMetadata,
+    pub result: CalibratePerKindResultView,
+}
+
+/// The `calibrate activate` report for a per-kind result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CalibratePerKindActivateReport {
+    pub metadata: ReportMetadata,
+    pub result: CalibratePerKindResultView,
+    pub supersedes: Option<String>,
+    pub actor: String,
+    pub activation_policy_version: String,
+    pub event_at_nanos: i64,
 }
 
 #[cfg(test)]

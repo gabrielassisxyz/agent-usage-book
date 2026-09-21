@@ -1253,9 +1253,6 @@ pub const PROMOTION_VALIDATION_VERSION: &str = "v1";
 /// under the policy the promotion named.
 pub const PROMOTION_ACTIVATION_POLICY_VERSION: &str = "promote-v1";
 
-/// The bead that owns giving a joint multivariate candidate a result shape.
-const MULTIVARIATE_RESULT_SHAPE_BEAD: &str = "aub-multivariate-result-shape-2hvt";
-
 /// What a promotion was asked to record: which candidate, judged against which
 /// training and validation evidence.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1307,36 +1304,16 @@ pub fn promote_candidate(
 ) -> Result<PromotedCandidate, Error> {
     use crate::store::calibration::{
         EvidenceFingerprint, WindowCalibration, WindowCalibrationFields, insert_result,
-        load_observations_by_evidence, load_result, promoted_result_id,
+        load_result, promoted_result_id,
     };
 
-    let candidate = match load_candidate(conn, promotion.candidate_id)? {
-        Some(candidate) => candidate,
-        None => return Err(missing_candidate_error(conn, promotion.candidate_id)?),
-    };
-
-    if promotion.training.is_empty() {
-        return Err(Error::Usage(format!(
-            "promote '{}': --training names no evidence; a result records the evidence its coefficient was fitted from",
-            promotion.candidate_id.as_str()
-        )));
-    }
-    if promotion.validation.is_empty() {
-        return Err(Error::Usage(format!(
-            "promote '{}': --validation names no evidence; there is no held-out residual to compute and activation refuses a result without one",
-            promotion.candidate_id.as_str()
-        )));
-    }
-    crate::calibration::activation::check_evidence_disjoint(
-        promotion.training,
-        promotion.validation,
-    )
-    .map_err(|refusal| {
+    let candidate = load_candidate(conn, promotion.candidate_id)?.ok_or_else(|| {
         Error::Usage(format!(
-            "promote '{}': {refusal}",
+            "no calibration candidate '{}'; fit one with `aub calibrate fit`",
             promotion.candidate_id.as_str()
         ))
     })?;
+    check_promotion_evidence(promotion)?;
 
     // The recorded fitting evidence is the set the caller named, so it is only
     // honest if that set is the one the candidate was fitted from. The digest
@@ -1403,31 +1380,13 @@ pub fn promote_candidate(
         )));
     }
 
-    let stored_validation = load_observations_by_evidence(
+    let stored_validation = load_validation_observations(
         conn,
+        candidate.id.as_str(),
         &experiment.provider,
         &experiment.window_semantic_key,
         promotion.validation,
     )?;
-    let found: BTreeSet<EvidenceId> = stored_validation
-        .iter()
-        .map(|obs| obs.evidence_id.clone())
-        .collect();
-    let missing: Vec<&str> = promotion
-        .validation
-        .iter()
-        .filter(|id| !found.contains(*id))
-        .map(EvidenceId::as_str)
-        .collect();
-    if !missing.is_empty() {
-        return Err(Error::InsufficientEvidence(format!(
-            "promote '{}': the ledger holds no observation of provider '{}' window '{}' for validation evidence [{}]",
-            candidate.id.as_str(),
-            experiment.provider.as_str(),
-            experiment.window_semantic_key.as_str(),
-            missing.join(", "),
-        )));
-    }
 
     // The validation series is held out of the fit, so it lies outside the
     // experiment's own validity window; the credit series has to reach it for
@@ -1515,24 +1474,60 @@ pub fn promote_candidate(
     })
 }
 
-/// The refusal for an id that names no univariate candidate: a joint fit is a
-/// different refusal from a typo, because the joint candidate exists and has
-/// no scalar result shape to promote it into (PLAN.md 22.1).
-fn missing_candidate_error(conn: &Connection, id: &CandidateId) -> Result<Error, Error> {
-    let multivariate = crate::store::calibration_multivariate::load_multivariate_candidate(
-        conn,
-        &crate::store::calibration_multivariate::MultivariateCandidateId::new(id.as_str()),
-    )?;
-    if multivariate.is_some() {
-        return Ok(Error::Usage(format!(
-            "promote '{}': a joint candidate has no scalar result shape yet, because a result records one coefficient and a joint fit has one per token kind; reducing them through a cost model would reintroduce the assumption the joint fit exists to test. Tracked by {MULTIVARIATE_RESULT_SHAPE_BEAD}",
-            id.as_str()
+/// The evidence rules every promotion obeys, whichever shape it records: both
+/// sets are named, and they share no identifier.
+pub(crate) fn check_promotion_evidence(promotion: &CandidatePromotion<'_>) -> Result<(), Error> {
+    if promotion.training.is_empty() {
+        return Err(Error::Usage(format!(
+            "promote '{}': --training names no evidence; a result records the evidence its coefficient was fitted from",
+            promotion.candidate_id.as_str()
         )));
     }
-    Ok(Error::Usage(format!(
-        "no calibration candidate '{}'; fit one with `aub calibrate fit`",
-        id.as_str()
-    )))
+    if promotion.validation.is_empty() {
+        return Err(Error::Usage(format!(
+            "promote '{}': --validation names no evidence; there is no held-out residual to compute and activation refuses a result without one",
+            promotion.candidate_id.as_str()
+        )));
+    }
+    crate::calibration::activation::check_evidence_disjoint(
+        promotion.training,
+        promotion.validation,
+    )
+    .map_err(|refusal| {
+        Error::Usage(format!(
+            "promote '{}': {refusal}",
+            promotion.candidate_id.as_str()
+        ))
+    })
+}
+
+/// The validation observations a promotion names, refusing when the ledger
+/// holds none for some of them in the result's provider and window.
+pub(crate) fn load_validation_observations(
+    conn: &Connection,
+    candidate_id: &str,
+    provider: &crate::store::cost_model::ProviderKey,
+    window: &crate::domain::window::WindowSemanticKey,
+    validation: &BTreeSet<EvidenceId>,
+) -> Result<Vec<crate::store::calibration::StoredFitObservation>, Error> {
+    let stored = crate::store::calibration::load_observations_by_evidence(
+        conn, provider, window, validation,
+    )?;
+    let found: BTreeSet<&EvidenceId> = stored.iter().map(|obs| &obs.evidence_id).collect();
+    let missing: Vec<&str> = validation
+        .iter()
+        .filter(|id| !found.contains(id))
+        .map(EvidenceId::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return Err(Error::InsufficientEvidence(format!(
+            "promote '{candidate_id}': the ledger holds no observation of provider '{}' window '{}' for validation evidence [{}]",
+            provider.as_str(),
+            window.as_str(),
+            missing.join(", "),
+        )));
+    }
+    Ok(stored)
 }
 
 #[cfg(test)]

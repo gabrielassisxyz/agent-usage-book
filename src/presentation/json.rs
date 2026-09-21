@@ -2414,6 +2414,105 @@ fn calibrate_show_entry_json(entry: &crate::report::CalibrateShowEntry) -> Strin
     )
 }
 
+/// Serializes the fields every report shares for a per-kind result. The body
+/// carries `"coefficient_shape":"per_kind"` so a reader can tell it from a
+/// scalar result without inferring the shape from which keys are absent.
+fn calibrate_per_kind_result_fields(result: &crate::report::CalibratePerKindResultView) -> String {
+    let coefficients = result
+        .coefficients
+        .iter()
+        .map(|c| {
+            format!(
+                "{{\"token_kind\":{},\"estimate\":{},\"std_error\":{},\"interval\":{{\"lower\":{},\"upper\":{},\"unit\":{}}}}}",
+                json_string(&c.kind_label),
+                quantity_json(
+                    &c.estimate_micro_ppm_per_token.to_string(),
+                    "micro_ppm_per_token"
+                ),
+                quantity_json(
+                    &c.std_error_micro_ppm_per_token.to_string(),
+                    "micro_ppm_per_token"
+                ),
+                json_string(&c.interval_low_micro_ppm_per_token.to_string()),
+                json_string(&c.interval_high_micro_ppm_per_token.to_string()),
+                json_string("micro_ppm_per_token")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!(
+        "\"calibration_id\":{},\"coefficient_shape\":\"per_kind\",\"candidate_id\":{},\"experiment_id\":{},\"provider\":{},\"plan_tier\":{},\"window_semantic_key\":{},\"coefficients\":[{}],\"condition_number\":{},\"condition_number_threshold\":{},\"fit_residual\":{},\"held_out_residual\":{},\"validation_observations\":{},\"sample_count\":{},\"statistical_method\":{},\"statistical_parameters\":{},\"phase_design\":{},\"validation_method\":{},\"validation_version\":{},\"inputs_digest\":{},\"inputs_count\":{},\"fitting_evidence_digest\":{},\"validation_evidence_digest\":{},\"fit_timestamp_nanos\":{},\"activation_policy_version\":{},\"fitter_version\":{},\"source_revision\":{}",
+        json_string(&result.calibration_id),
+        json_string(&result.candidate_id),
+        json_string(&result.experiment_id),
+        json_string(&result.provider),
+        json_string(&result.plan_tier),
+        json_string(&result.window_semantic_key),
+        coefficients,
+        quantity_json(&result.condition_number_micros.to_string(), "micros"),
+        quantity_json(
+            &result.condition_number_threshold_micros.to_string(),
+            "micros"
+        ),
+        quantity_json(&result.fit_residual_ppm.to_string(), "ppm"),
+        quantity_json(&result.held_out_residual_ppm.to_string(), "ppm"),
+        result.validation_observations,
+        result.sample_count,
+        json_string(&result.statistical_method),
+        json_string(&result.statistical_parameters),
+        json_string(&result.phase_design),
+        json_string(&result.validation_method),
+        json_string(&result.validation_version),
+        json_string(&result.inputs_digest_hex),
+        result.inputs_count,
+        json_string(&result.fitting_evidence_digest_hex),
+        json_string(&result.validation_evidence_digest_hex),
+        result.fit_timestamp_nanos,
+        json_string(&result.activation_policy_version),
+        json_string(&result.aub_version),
+        json_string(&result.source_revision)
+    )
+}
+
+fn calibrate_lifecycle_events_json(
+    events: &[crate::report::CalibrateLifecycleEventView],
+) -> String {
+    events
+        .iter()
+        .map(|event| {
+            let supersedes = match &event.supersedes {
+                Some(id) => json_string(id),
+                None => "null".to_string(),
+            };
+            format!(
+                "{{\"kind\":{},\"event_at_nanos\":{},\"actor\":{},\"activation_policy_version\":{},\"supersedes\":{}}}",
+                json_string(&event.kind_label),
+                event.event_at_nanos,
+                json_string(&event.actor),
+                json_string(&event.activation_policy_version),
+                supersedes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
+fn calibrate_per_kind_entries_json(entries: &[crate::report::CalibratePerKindEntry]) -> String {
+    entries
+        .iter()
+        .map(|entry| {
+            format!(
+                "{{{},\"health\":{},\"is_active\":{},\"events\":[{}]}}",
+                calibrate_per_kind_result_fields(&entry.result),
+                json_string(&entry.health_label),
+                entry.is_active,
+                calibrate_lifecycle_events_json(&entry.events)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// Serializes a `calibrate show` report under the JSON envelope.
 pub fn calibrate_show_json(report: &crate::report::CalibrateShowReport, run: RunId) -> String {
     let entries = report
@@ -2422,7 +2521,10 @@ pub fn calibrate_show_json(report: &crate::report::CalibrateShowReport, run: Run
         .map(calibrate_show_entry_json)
         .collect::<Vec<_>>()
         .join(",");
-    let body = format!("\"entries\":[{entries}]");
+    let body = format!(
+        "\"entries\":[{entries}],\"per_kind_entries\":[{}]",
+        calibrate_per_kind_entries_json(&report.per_kind_entries)
+    );
     JsonEnvelope::new("calibrate-show", run, report.metadata.clone()).to_json_with(&body)
 }
 
@@ -2435,25 +2537,7 @@ pub fn calibrate_history_json(
         .entries
         .iter()
         .map(|entry| {
-            let events = entry
-                .events
-                .iter()
-                .map(|event| {
-                    let supersedes = match &event.supersedes {
-                        Some(id) => json_string(id),
-                        None => "null".to_string(),
-                    };
-                    format!(
-                        "{{\"kind\":{},\"event_at_nanos\":{},\"actor\":{},\"activation_policy_version\":{},\"supersedes\":{}}}",
-                        json_string(&event.kind_label),
-                        event.event_at_nanos,
-                        json_string(&event.actor),
-                        json_string(&event.activation_policy_version),
-                        supersedes
-                    )
-                })
-                .collect::<Vec<_>>()
-                .join(",");
+            let events = calibrate_lifecycle_events_json(&entry.events);
             format!(
                 "{{\"calibration_id\":{},\"provider\":{},\"window_semantic_key\":{},\"plan_tier\":{},\"fitted\":{},\"fit_residual\":{},\"uncertainty\":{{\"lower\":{},\"upper\":{},\"unit\":{}}},\"fit_timestamp_nanos\":{},\"health\":{},\"events\":[{}]}}",
                 json_string(&entry.calibration_id),
@@ -2475,7 +2559,10 @@ pub fn calibrate_history_json(
         })
         .collect::<Vec<_>>()
         .join(",");
-    let body = format!("\"entries\":[{entries}]");
+    let body = format!(
+        "\"entries\":[{entries}],\"per_kind_entries\":[{}]",
+        calibrate_per_kind_entries_json(&report.per_kind_entries)
+    );
     JsonEnvelope::new("calibrate-history", run, report.metadata.clone()).to_json_with(&body)
 }
 
@@ -2552,6 +2639,40 @@ pub fn calibrate_promote_json(
         json_string("micros_per_point")
     );
     JsonEnvelope::new("calibrate-promote", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `calibrate promote` report for a joint candidate.
+pub fn calibrate_per_kind_promote_json(
+    report: &crate::report::CalibratePerKindPromoteReport,
+    run: RunId,
+) -> String {
+    let body = format!(
+        "{},\"activated\":false",
+        calibrate_per_kind_result_fields(&report.result)
+    );
+    JsonEnvelope::new("calibrate-promote", run, report.metadata.clone()).to_json_with(&body)
+}
+
+/// Serializes a `calibrate activate` report for a per-kind result.
+pub fn calibrate_per_kind_activate_json(
+    report: &crate::report::CalibratePerKindActivateReport,
+    run: RunId,
+) -> String {
+    let supersedes = match &report.supersedes {
+        Some(id) => json_string(id),
+        None => "null".to_string(),
+    };
+    // The activation policy version is the result's own: the gate refuses any
+    // other, so the shared fields already carry it and a second key would
+    // duplicate it.
+    let body = format!(
+        "{},\"supersedes\":{},\"actor\":{},\"event_at_nanos\":{}",
+        calibrate_per_kind_result_fields(&report.result),
+        supersedes,
+        json_string(&report.actor),
+        report.event_at_nanos
+    );
+    JsonEnvelope::new("calibrate-activate", run, report.metadata.clone()).to_json_with(&body)
 }
 
 /// Serializes a `calibrate activate` report under the JSON envelope.
