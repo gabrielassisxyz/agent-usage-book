@@ -1002,6 +1002,31 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     let cal1_witness = WitnessId::WindowCalibration(WindowCalibrationId::new("wcr-proof-1"));
     assert!(res1.provenance().witnesses().contains(&cal1_witness));
 
+    // The same interval under a review horizon that has already passed: the
+    // eligibility condition asks for a current calibration, and one due for
+    // review is not current here any more than in spend or can-run (aub-ov2f).
+    let review_due = reconcile_candidate_from_store(
+        &conn,
+        account,
+        obs1_id,
+        obs2_id,
+        &window_key,
+        &cost_model_id,
+        UtcTimestamp::from_unix_nanos(1_500),
+        UtcTimestamp::from_unix_nanos(2_500),
+        MonotonicDuration::from_nanos(0),
+    )
+    .expect("reconcile candidate under a passed review horizon");
+    match review_due {
+        ReconciliationOutcome::NotComputed { failing_conditions } => assert_eq!(
+            failing_conditions,
+            vec![EligibilityCondition::ApplicableCurrentCalibration]
+        ),
+        ReconciliationOutcome::Computed(_) => {
+            panic!("a calibration past its review instant must not reconcile")
+        }
+    }
+
     // 4. Append and activate superseding calibration 2: fitted = 200_000 micros per point
     insert_calibration(
         &conn,
