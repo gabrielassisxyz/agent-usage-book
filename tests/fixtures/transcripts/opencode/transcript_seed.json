@@ -1,0 +1,172 @@
+{
+  "schema": "opencode-sqlite-v1",
+  "note": "Shapes recorded from the operator's live opencode.db on 2026-09-21 (part table columns; part type values text, tool, reasoning, step-start, step-finish; tool state shapes completed/error/running with input, output and error fields; reasoning text present on some rows, empty on others). Every id, timestamp, prose string and tool payload here is invented for this fixture; only the key shapes mirror the live database. Tests build a scratch opencode.db from this file at runtime; the live database is never copied into the repository and never read by a test.",
+  "part_schema": "part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, data TEXT NOT NULL)",
+  "sessions": [
+    {
+      "id": "ses_m76e_fixture",
+      "project_id": "proj_m76e",
+      "directory": "work/fixture-project",
+      "title": "Fixture transcript session",
+      "time_created_ms": 1788220900000,
+      "time_updated_ms": 1788220990000
+    }
+  ],
+  "messages": [
+    {
+      "id": "msg_m76e_user",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220900000,
+      "time_updated_ms": 1788220900000,
+      "data": {
+        "role": "user",
+        "time": { "created": 1788220900000 },
+        "agent": "build",
+        "model": { "providerID": "fixture-provider", "modelID": "fixture-model-a" }
+      }
+    },
+    {
+      "id": "msg_m76e_tool",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220910000,
+      "time_updated_ms": 1788220950000,
+      "data": {
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "time": { "created": 1788220910000, "completed": 1788220950000 },
+        "cost": 0.002,
+        "tokens": { "input": 120, "output": 34, "reasoning": 0, "cache": { "write": 5, "read": 9 }, "total": 168 }
+      }
+    },
+    {
+      "id": "msg_m76e_think",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220960000,
+      "time_updated_ms": 1788220990000,
+      "data": {
+        "role": "assistant",
+        "mode": "build",
+        "agent": "build",
+        "time": { "created": 1788220960000, "completed": 1788220990000 },
+        "cost": 0.001,
+        "tokens": { "input": 60, "output": 12, "reasoning": 7, "cache": { "write": 0, "read": 3 }, "total": 82 }
+      }
+    }
+  ],
+  "parts": [
+    {
+      "id": "prt_m76e_01",
+      "message_id": "msg_m76e_user",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220900000,
+      "time_updated_ms": 1788220900000,
+      "data": {
+        "type": "text",
+        "text": "Render the usage summary for review.",
+        "time": { "start": 1788220900000, "end": 1788220900000 }
+      }
+    },
+    {
+      "id": "prt_m76e_02",
+      "message_id": "msg_m76e_tool",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220910000,
+      "time_updated_ms": 1788220910000,
+      "data": {
+        "snapshot": "4b19ae7833245d3ac953acc5ed6835aeefeddc97b8c7b8b8b8b8b8b8b8b8b8b8",
+        "type": "step-start"
+      }
+    },
+    {
+      "id": "prt_m76e_03",
+      "message_id": "msg_m76e_tool",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220920000,
+      "time_updated_ms": 1788220920000,
+      "data": {
+        "type": "text",
+        "text": "I will read the ledger first.",
+        "time": { "start": 1788220920000, "end": 1788220920000 }
+      }
+    },
+    {
+      "id": "prt_m76e_04",
+      "message_id": "msg_m76e_tool",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220930000,
+      "time_updated_ms": 1788220940000,
+      "data": {
+        "type": "tool",
+        "tool": "read",
+        "callID": "call_m76e_1",
+        "state": {
+          "status": "completed",
+          "input": { "path": "/work/fixture-project/summary.md", "offset": 0, "limit": 40 },
+          "output": "# Usage summary\n\nWeek 38 opened with three providers reporting against the same window, and the ledger joined them into one number per model.\n\n- claude-code: 120400 input, 34210 output across 41 sessions\n- codex: 88210 input, 12980 output across 17 sessions\n- pi: 41020 input, 8030 output across 9 sessions\n\nThe join key is the canonical event id, so replays collapse instead of doubling. Cache reads dominate the input side on every provider, which is why the summary leads with them.\n\nTrailing line to prove the output survives whole: 0123456789abcdef."
+        }
+      }
+    },
+    {
+      "id": "prt_m76e_05",
+      "message_id": "msg_m76e_tool",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220950000,
+      "time_updated_ms": 1788220950000,
+      "data": {
+        "reason": "tool-calls",
+        "type": "step-finish",
+        "tokens": { "total": 168, "input": 120, "output": 34, "reasoning": 0, "cache": { "write": 5, "read": 9 } },
+        "cost": 0.002
+      }
+    },
+    {
+      "id": "prt_m76e_06",
+      "message_id": "msg_m76e_think",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220960000,
+      "time_updated_ms": 1788220960000,
+      "data": {
+        "snapshot": "9c27bd8944356e4bd46b7cdd6f791eefcc88ff00d11c2d2e3f4a5b6c7d8e9f0a1",
+        "type": "step-start"
+      }
+    },
+    {
+      "id": "prt_m76e_07",
+      "message_id": "msg_m76e_think",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220970000,
+      "time_updated_ms": 1788220980000,
+      "data": {
+        "type": "reasoning",
+        "text": "The ledger numbers check out against the meter, so the summary can go out as is.",
+        "time": { "start": 1788220970000, "end": 1788220980000 }
+      }
+    },
+    {
+      "id": "prt_m76e_08",
+      "message_id": "msg_m76e_think",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220990000,
+      "time_updated_ms": 1788220990000,
+      "data": {
+        "type": "text",
+        "text": "The summary is ready for review.",
+        "time": { "start": 1788220990000, "end": 1788220990000 }
+      }
+    },
+    {
+      "id": "prt_m76e_09",
+      "message_id": "msg_m76e_think",
+      "session_id": "ses_m76e_fixture",
+      "time_created_ms": 1788220990000,
+      "time_updated_ms": 1788220990000,
+      "data": {
+        "reason": "length",
+        "type": "step-finish",
+        "tokens": { "total": 82, "input": 60, "output": 12, "reasoning": 7, "cache": { "write": 0, "read": 3 } },
+        "cost": 0.001
+      }
+    }
+  ]
+}

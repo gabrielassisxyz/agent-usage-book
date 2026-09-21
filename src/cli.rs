@@ -4474,7 +4474,11 @@ fn export_transcript_command(
         include_tools: args.include_tools,
         include_thinking: args.include_thinking,
     };
-    let (rendered_files, missing_paths, skipped_counts) = read_transcript_files(renderer, &ordered);
+    let (rendered_files, missing_paths, skipped_counts) = if session.source.as_str() == "opencode" {
+        read_opencode_transcript(renderer, &ordered, &session)?
+    } else {
+        read_transcript_files(renderer, &ordered)
+    };
     for (path, error) in &missing_paths {
         if error.kind() == std::io::ErrorKind::NotFound {
             eprintln!("missing: {path}");
@@ -4561,6 +4565,65 @@ fn read_transcript_files(
         }
     }
     (rendered, missing, skipped)
+}
+
+/// Reads one opencode session's transcript from its database (`aub-m76e`).
+/// The ledger's source file for an opencode session is the database path
+/// itself, so the first listed file is opened read-only through the store's
+/// one opencode connection function and its rows become the renderer's
+/// interchange lines. A ledger session with no recorded source, or one the
+/// database no longer holds, fails here rather than rendering an empty
+/// document.
+fn read_opencode_transcript(
+    renderer: &dyn crate::presentation::transcript::TranscriptRenderer,
+    paths: &[String],
+    session: &crate::store::transcript_session::TranscriptSession,
+) -> Result<TranscriptFilesRead, Error> {
+    let db_path = paths.first().ok_or_else(|| {
+        Error::IngestIncomplete(format!(
+            "export transcript: no transcript source recorded for session '{}'",
+            session.native_session_id.as_str()
+        ))
+    })?;
+    let connection = crate::store::opencode::open_opencode_database(std::path::Path::new(db_path))?;
+    let rows = crate::store::opencode::read_session_transcript_rows(
+        &connection,
+        session.native_session_id.as_str(),
+    )?;
+    if rows.is_empty()
+        && !crate::store::opencode::opencode_session_exists(
+            &connection,
+            session.native_session_id.as_str(),
+        )?
+    {
+        return Err(Error::IngestIncomplete(format!(
+            "session {} not found in {db_path}",
+            session.native_session_id.as_str()
+        )));
+    }
+    let mut body = String::new();
+    for row in &rows {
+        body.push_str(&crate::presentation::transcript::opencode::opencode_line(
+            row.message_id.as_str(),
+            row.role.as_str(),
+            row.part_data.as_str(),
+        ));
+        body.push('\n');
+    }
+    let (messages, counts) = renderer.render_file_with_skipped(&body);
+    let mut skipped = std::collections::BTreeMap::new();
+    for (skipped_type, count) in counts {
+        *skipped.entry(skipped_type).or_insert(0) += count;
+    }
+    Ok((
+        vec![crate::presentation::transcript::TranscriptFile {
+            file_name: crate::presentation::transcript::transcript_file_name(db_path).to_string(),
+            is_subagent: false,
+            messages,
+        }],
+        Vec::new(),
+        skipped,
+    ))
 }
 
 /// The default output path `~/agent-transcripts/<default name>`, creating

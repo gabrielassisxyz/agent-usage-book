@@ -86,6 +86,87 @@ pub fn read_message_rows(
     })
 }
 
+/// One message part of an opencode session transcript: the message identity
+/// and role from the `message` row, the raw `part.data` JSON beside it. The
+/// role is the only interpreted field here (it decides which conversation
+/// side a part belongs to); every part shape stays raw JSON, and the
+/// transcript renderer owns how each part type maps, the way the usage parser
+/// owns the token vocabulary inside `data`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeTranscriptRow {
+    /// The stable message identifier (`message.id`), grouping parts of one turn.
+    pub message_id: String,
+    /// The message role from `message.data.role` (`user` or `assistant`),
+    /// empty when the row carries none.
+    pub role: String,
+    /// The stable part identifier (`part.id`).
+    pub part_id: String,
+    /// The raw `part.data` JSON: the part `type` and its payload.
+    pub part_data: String,
+}
+
+/// Reads every part of one opencode session in conversation order: messages by
+/// their row time, parts within a message by theirs, ties broken by id so the
+/// read is deterministic across runs. A session pruned from the database reads
+/// as no rows; the caller tells that apart from an empty session through
+/// [`opencode_session_exists`].
+pub fn read_session_transcript_rows(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Vec<OpencodeTranscriptRow>, Error> {
+    let mut statement = connection
+        .prepare(
+            "SELECT m.id, m.data, p.id, p.data FROM message m \
+             JOIN part p ON p.message_id = m.id \
+             WHERE m.session_id = ?1 \
+             ORDER BY m.time_created, m.id, p.time_created, p.id",
+        )
+        .map_err(|error| {
+            Error::IngestIncomplete(format!("cannot read opencode transcript: {error}"))
+        })?;
+    let rows = statement
+        .query_map([session_id], |row| {
+            let message_data: String = row.get(1)?;
+            let role = serde_json::from_str::<serde_json::Value>(&message_data)
+                .ok()
+                .and_then(|data| data.get("role")?.as_str().map(str::to_string))
+                .unwrap_or_default();
+            Ok(OpencodeTranscriptRow {
+                message_id: row.get(0)?,
+                role,
+                part_id: row.get(2)?,
+                part_data: row.get(3)?,
+            })
+        })
+        .map_err(|error| {
+            Error::IngestIncomplete(format!("cannot query opencode transcript: {error}"))
+        })?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|error| {
+        Error::IngestIncomplete(format!("cannot decode opencode transcript row: {error}"))
+    })
+}
+
+/// Whether the opencode `session` table holds the id: a ledger session with no
+/// rows from [`read_session_transcript_rows`] and no session row here was
+/// pruned from the database, which the transcript export reports by id rather
+/// than rendering an empty document.
+pub fn opencode_session_exists(
+    connection: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<bool, Error> {
+    let mut statement = connection
+        .prepare("SELECT 1 FROM session WHERE id = ?1")
+        .map_err(|error| {
+            Error::IngestIncomplete(format!("cannot read opencode sessions: {error}"))
+        })?;
+    let mut rows = statement.query([session_id]).map_err(|error| {
+        Error::IngestIncomplete(format!("cannot query opencode sessions: {error}"))
+    })?;
+    rows.next().map(|row| row.is_some()).map_err(|error| {
+        Error::IngestIncomplete(format!("cannot decode opencode session row: {error}"))
+    })
+}
+///
 /// The working directories the opencode `session` table states, by session id.
 ///
 /// The message rows carry no directory; the session row does
