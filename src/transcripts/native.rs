@@ -702,7 +702,16 @@ fn parse_pi_line(
 /// quarantines rather than being rescued by the sum. A negative `output` is
 /// opencode's own subtraction gone below zero, not a bad count, and is read
 /// back into the provider's count only when the row's total confirms it; see
-/// `opencode_generated_from_difference`. `message.id`
+/// `opencode_generated_from_difference`. Since 1.14.45 opencode clamps that
+/// same difference at zero, so a row where the provider reported more
+/// reasoning than output stores `output: 0` and the total is the only
+/// surviving trace of the provider's count; such a row is read back as
+/// `total - input - cache.read - cache.write` only when the total is present
+/// and below the component sum, see `opencode_generated_from_difference`.
+/// A row with `output: 0` whose total equals the component sum keeps the
+/// ordinary fold, and a row with `output: 0` and no total keeps the ordinary
+/// fold as well, because there is then nothing to confirm the clamped
+/// reading against. `message.id`
 /// is the stable event identifier, the strong identity dedup collapses
 /// replays on. A user row carries no tokens and is skipped silently, the way
 /// a record without a usage object is; an assistant row without one
@@ -720,7 +729,7 @@ const OPENCODE_IGNORED: [&str; 1] = ["total"];
 
 impl ParserAdapter for OpencodeParser {
     fn parser_version(&self) -> ParserVersion {
-        ParserVersion::new("opencode-3")
+        ParserVersion::new("opencode-4")
     }
 
     fn input_format_version(&self) -> InputFormatVersion {
@@ -867,47 +876,85 @@ fn parse_opencode_row(
     )))
 }
 
-/// The generated count behind a negative opencode `output`, or `None` when
-/// `output` is not a negative integer and the ordinary fold applies.
+/// The generated count behind an opencode `output` that is not the provider's
+/// own count, or `None` when the ordinary fold applies.
 ///
 /// opencode does not store the provider's output count: it stores
-/// `outputTokens - reasoningTokens`, and before it clamped that difference at
-/// zero (1.14.45) it wrote it negative whenever a provider reported more
-/// reasoning than output (`aub-o6bc`). The provider's own count is then
-/// `output + reasoning`, which is what the fold computes for every other row.
-/// It is accepted only when the row proves the reading: a reasoning count is
-/// present, the sum is not negative, and the row's `total` equals
-/// `input + output + reasoning + cache.read + cache.write`. Any other negative
-/// `output` still quarantines as a wrong type.
+/// `outputTokens - reasoningTokens`, clamped at zero since 1.14.45 and
+/// negative before that whenever a provider reported more reasoning than
+/// output (`aub-o6bc`, `aub-rjy9`). The provider's own count is recovered
+/// only when the row proves the reading. For a negative `output` that proof
+/// is a present reasoning count, a non-negative sum, and a `total` equal to
+/// `input + generated + cache.read + cache.write`, where `generated` is
+/// `output + reasoning`. For a zero `output` the proof is a present `total`
+/// below `input + reasoning + cache.read + cache.write`, and the generated
+/// count is `total - input - cache.read - cache.write`. A zero `output`
+/// whose total equals the component sum keeps the ordinary fold, as does a
+/// zero `output` with no total, because there is then nothing to confirm the
+/// clamped reading against. Any other negative or inconsistent `output`
+/// still quarantines as a wrong type.
 fn opencode_generated_from_difference(
     flat: &serde_json::Map<String, Value>,
     reasoning: Option<&Value>,
 ) -> Result<Option<u64>, QuarantineClass> {
-    let Some(difference) = flat
+    let component =
+        |key: &str| -> Result<u64, QuarantineClass> { flat.get(key).map_or(Ok(0), count_value) };
+    if let Some(difference) = flat
         .get("output")
         .and_then(Value::as_i64)
         .filter(|output| *output < 0)
-    else {
+    {
+        let reasoning = count_value(reasoning.ok_or(QuarantineClass::WrongFieldType)?)?;
+        let generated = reasoning
+            .checked_add_signed(difference)
+            .ok_or(QuarantineClass::WrongFieldType)?;
+        let components = [
+            component("input")?,
+            generated,
+            component("cache_read")?,
+            component("cache_write")?,
+        ];
+        let summed = components
+            .iter()
+            .try_fold(0_u64, |sum, count| sum.checked_add(*count))
+            .ok_or(QuarantineClass::WrongFieldType)?;
+        let total = flat.get("total").ok_or(QuarantineClass::WrongFieldType)?;
+        if count_value(total)? != summed {
+            return Err(QuarantineClass::WrongFieldType);
+        }
+        return Ok(Some(generated));
+    }
+    if flat.get("output").and_then(Value::as_u64) != Some(0) {
+        return Ok(None);
+    }
+    let Some(total_value) = flat.get("total") else {
         return Ok(None);
     };
-    let reasoning = count_value(reasoning.ok_or(QuarantineClass::WrongFieldType)?)?;
-    let generated = reasoning
-        .checked_add_signed(difference)
+    let total = count_value(total_value)?;
+    let input = component("input")?;
+    let cache_read = component("cache_read")?;
+    let cache_write = component("cache_write")?;
+    let base = input
+        .checked_add(cache_read)
+        .and_then(|sum| sum.checked_add(cache_write))
         .ok_or(QuarantineClass::WrongFieldType)?;
-    let component =
-        |key: &str| -> Result<u64, QuarantineClass> { flat.get(key).map_or(Ok(0), count_value) };
-    let components = [
-        component("input")?,
-        generated,
-        component("cache_read")?,
-        component("cache_write")?,
-    ];
-    let summed = components
-        .iter()
-        .try_fold(0_u64, |sum, count| sum.checked_add(*count))
+    let generated = total
+        .checked_sub(base)
         .ok_or(QuarantineClass::WrongFieldType)?;
-    let total = flat.get("total").ok_or(QuarantineClass::WrongFieldType)?;
-    if count_value(total)? != summed {
+    let Some(reasoning_value) = reasoning else {
+        if generated == 0 {
+            return Ok(None);
+        }
+        return Err(QuarantineClass::WrongFieldType);
+    };
+    let reasoning_count = count_value(reasoning_value)?;
+    let component_sum = base
+        .checked_add(reasoning_count)
+        .ok_or(QuarantineClass::WrongFieldType)?;
+    if total == component_sum {
+        return Ok(None);
+    }
+    if total > component_sum {
         return Err(QuarantineClass::WrongFieldType);
     }
     Ok(Some(generated))
@@ -1133,7 +1180,7 @@ mod tests {
     #[test]
     fn opencode_declares_its_parser_and_input_format_versions() {
         let parser = OpencodeParser;
-        assert_eq!(parser.parser_version().as_str(), "opencode-3");
+        assert_eq!(parser.parser_version().as_str(), "opencode-4");
         assert_eq!(parser.input_format_version().as_str(), "opencode-sqlite-v1");
         assert!(parser.is_database_source());
     }
@@ -1644,6 +1691,64 @@ mod tests {
                 "{tokens}"
             );
         }
+    }
+
+    /// A clamped row stores `output: 0` where the provider reported more
+    /// reasoning than output, and the total is the only surviving trace of
+    /// the provider's count. The generated count is the difference the total
+    /// still proves, not the full reasoning count. The planted negative is
+    /// the same row with the total at the component sum, which keeps the
+    /// ordinary fold.
+    #[test]
+    fn opencode_clamped_zero_output_is_read_back_from_the_total() {
+        let event = parse_opencode(
+            r#"{"total":39852,"input":39469,"output":0,"reasoning":387,"cache":{"write":0,"read":0}}"#,
+        )
+        .expect("a clamped row is a valid row")
+        .expect("an assistant row is an event");
+        assert_eq!(
+            event.usage().known().output().value(),
+            383,
+            "the total proves 383 generated tokens, not the 387 reasoning tokens"
+        );
+        assert_eq!(event.usage().known().input().value(), 39_469);
+        assert!(event.usage().unknown().is_empty());
+        let unclamped = parse_opencode(
+            r#"{"total":39856,"input":39469,"output":0,"reasoning":387,"cache":{"write":0,"read":0}}"#,
+        )
+        .expect("a valid row")
+        .expect("an assistant row is an event");
+        assert_eq!(
+            unclamped.usage().known().output().value(),
+            387,
+            "a total at the component sum keeps the ordinary fold"
+        );
+    }
+
+    /// A clamped total that would imply a negative generated count is not a
+    /// count the source could have written, so it quarantines as a wrong
+    /// type rather than recording a wrapped figure.
+    #[test]
+    fn opencode_clamped_total_below_input_plus_cache_quarantines() {
+        assert_eq!(
+            parse_opencode(
+                r#"{"total":39000,"input":39469,"output":0,"reasoning":387,"cache":{"write":0,"read":0}}"#,
+            )
+            .err(),
+            Some(QuarantineClass::WrongFieldType),
+        );
+    }
+
+    /// A row with `output: 0` and no total keeps the ordinary fold, because
+    /// there is nothing to confirm the clamped reading against.
+    #[test]
+    fn opencode_zero_output_without_a_total_keeps_the_ordinary_fold() {
+        let event = parse_opencode(
+            r#"{"input":39469,"output":0,"reasoning":387,"cache":{"write":0,"read":0}}"#,
+        )
+        .expect("a valid row")
+        .expect("an assistant row is an event");
+        assert_eq!(event.usage().known().output().value(), 387);
     }
 
     /// The real Claude Code shape: strings, objects and an array inside `usage`
