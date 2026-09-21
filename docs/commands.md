@@ -300,6 +300,7 @@ without the section prefix (the full box for a two-account config):
 │    keep_weekly              4                                       default  │
 │    keep_yearly              2                                       default  │
 │    review_after             36h                                        file  │
+│    scheduled                true                                    default  │
 │                                                                              │
 │  can_run                                                                     │
 │    ample_margin_multiple    2                                       default  │
@@ -684,7 +685,7 @@ never mutating one already on record.
 **Answers:** is there a consistent, verified archive of the durable state,
 and does it restore?
 
-Usage: `aub backup [DESTINATION]` writes a new dated archive under the
+Usage: `aub backup [--scheduled] [DESTINATION]` writes a new dated archive under the
 destination root (the explicit argument wins, otherwise
 `backup.destination`); `aub backup verify DESTINATION` re-checks one
 archive; `aub backup restore ARCHIVE DEST` recovers from one archive.
@@ -692,6 +693,14 @@ Each run keeps a series of dated archives under tiered retention
 (`backup.keep_daily`, `keep_weekly`, `keep_monthly`, `keep_yearly`); an
 archive is retained when any bucket keeps it, and the most recent verified
 archive is never pruned.
+
+`aub backup --scheduled` is the form the shipped timer and cron entry call
+(`docs/scheduling.md`). It reads `backup.scheduled` (default `true`): with
+the key set to `false` it prints one line naming the key and exits zero
+without writing, and with no `backup.destination` configured it prints one
+line saying backups are not configured and exits zero. A manual `aub backup`
+ignores the key. Every other failure keeps its usual exit class, so the
+unit's `OnFailure=` hook fires.
 
 **Refuses:** to report verified without checking. Creating and verifying an
 archive both run the same checksum, manifest and SQLite integrity checks, so

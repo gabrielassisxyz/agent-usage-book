@@ -24,6 +24,8 @@ const EXAMPLES_INVOKING_THE_BINARY: &[&str] = &[
     "examples/hooks/aub-session-start.sh",
     "examples/scheduler/systemd/aub-drill.service",
     "examples/scheduler/cron/aub-drill.cron",
+    "examples/scheduler/systemd/aub-backup.service",
+    "examples/scheduler/cron/aub-backup.cron",
 ];
 
 fn repo_root() -> PathBuf {
@@ -158,4 +160,58 @@ fn systemd_drill_service_example_verifies() {
 #[test]
 fn systemd_drill_timer_example_verifies() {
     verify_systemd_unit("examples/scheduler/systemd/aub-drill.timer");
+}
+
+#[test]
+fn systemd_backup_service_example_verifies() {
+    verify_systemd_unit("examples/scheduler/systemd/aub-backup.service");
+}
+
+#[test]
+fn systemd_backup_timer_example_verifies() {
+    verify_systemd_unit("examples/scheduler/systemd/aub-backup.timer");
+}
+
+/// The backup pair runs the scheduled form daily (aub-7xmr): the service
+/// invokes `aub backup --scheduled` and carries the alarm hook, the timer is
+/// daily, persistent and jittered, and the cron entry runs the same command.
+/// A naive edit that drops the flag would schedule a manual-form cut that
+/// ignores the disable key, and a timer edit that drops the jitter would
+/// herd machines sharing an install image into the same minute.
+#[test]
+fn backup_pair_runs_the_scheduled_form_daily() {
+    let root = repo_root();
+    let service_path = "examples/scheduler/systemd/aub-backup.service";
+    let service = std::fs::read_to_string(root.join(service_path))
+        .unwrap_or_else(|error| panic!("read {service_path}: {error}"));
+    assert!(
+        service.contains("/usr/local/bin/aub backup --scheduled"),
+        "{service_path}: expected the scheduled invocation, found none"
+    );
+    assert!(
+        service.contains("OnFailure=aub-backup-alarm.service"),
+        "{service_path}: expected the alarm hook, found none"
+    );
+    let timer_path = "examples/scheduler/systemd/aub-backup.timer";
+    let timer = std::fs::read_to_string(root.join(timer_path))
+        .unwrap_or_else(|error| panic!("read {timer_path}: {error}"));
+    for key in [
+        "OnCalendar=daily",
+        "Persistent=true",
+        "RandomizedDelaySec=15min",
+    ] {
+        assert!(
+            timer.lines().any(|line| line.trim() == key),
+            "{timer_path}: expected a {key} line, found none"
+        );
+    }
+    let cron_path = "examples/scheduler/cron/aub-backup.cron";
+    let cron = std::fs::read_to_string(root.join(cron_path))
+        .unwrap_or_else(|error| panic!("read {cron_path}: {error}"));
+    assert!(
+        cron.lines()
+            .filter(|line| !line.trim_start().starts_with('#'))
+            .any(|line| line.contains("/usr/local/bin/aub backup --scheduled")),
+        "{cron_path}: expected a non-comment line running the scheduled invocation"
+    );
 }

@@ -101,6 +101,32 @@ reruns integrity and foreign-key checking rather than making one request, so the
 shipped cadence is monthly rather than minutely. `ARCHIVE` in both examples must name
 the same destination `aub backup` is scheduled to write.
 
+## Scheduling the backup
+
+`aub backup` runs on a schedule by default: install the backup pair and a
+fresh machine archives its ledger daily without further setup.
+
+- **systemd**: [`examples/scheduler/systemd/aub-backup.service`](../examples/scheduler/systemd/aub-backup.service)
+  and [`aub-backup.timer`](../examples/scheduler/systemd/aub-backup.timer), installed and
+  enabled the same way as the sampling timer above. The service runs
+  `aub backup --scheduled` and names an `OnFailure=` unit this repository
+  does not ship, the same arrangement as the coverage pair: what an alarm
+  should do is the operator's decision, and the exit class is what reaches it.
+  The timer is daily with a fifteen-minute randomized delay, which meets the
+  48h `review_after` default with one missed day of slack.
+- **cron**: [`examples/scheduler/cron/aub-backup.cron`](../examples/scheduler/cron/aub-backup.cron),
+  which runs the same command daily and discards stdout the way the drill
+  entry does, leaving stderr alone for the diagnostic log.
+
+One key disables the scheduled run without removing the unit:
+`backup.scheduled` (default `true`). `aub backup --scheduled` with
+`backup.scheduled = false` prints one line naming the key and exits zero,
+writing nothing; a manual `aub backup` ignores the key entirely. A scheduled
+run with no `backup.destination` configured is not a failure: it prints one
+line saying backups are not configured and exits zero, so a fresh
+installation does not fire its alarm every day for a feature it never set
+up. Every other failure keeps its usual exit class, so `OnFailure=` fires.
+
 ## The hook integration
 
 An explicit session/account marker from the launcher is the strongest evidence `aub` can
@@ -142,7 +168,8 @@ launcher keybinding, at a copy of it with `ACCOUNT` filled in.
 4. Wire the session-start hook into whatever starts an agent session on this machine.
 5. `aub status` should move from `never observed` to a fresh reading within one sampling
    interval.
-6. Schedule `aub backup` by whatever means this machine already schedules periodic
-   jobs (PLAN.md section 38), then configure `[backup]` and `[drill]` in `aub.toml` and
-   install the drill timer or cron entry pointed at the same archive path. `doctor`
-   should report both ages once each has run once.
+6. Install the backup pair (`aub-backup.service` / `aub-backup.timer`, or the
+   cron entry) pointed at that path, then configure `[backup]` and `[drill]`
+   in `aub.toml` and install the drill timer or cron entry pointed at the
+   same archive path. `doctor` should report both ages once each has run
+   once.
