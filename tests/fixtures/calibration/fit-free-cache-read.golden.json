@@ -34,6 +34,12 @@
   "condition_number": 1.015342071,
   "condition_number_micros": 1015342,
   "condition_number_threshold": 30.0,
+  "contamination": {
+    "findings": [],
+    "reason": "no active cost model at the start of controlled experiment 'exp-multivariate' to price its local credits",
+    "refuses_activation": true,
+    "verdict": "unavailable"
+  },
   "excluded_samples": [],
   "experiment_id": "exp-multivariate",
   "fit_kind": "multivariate",

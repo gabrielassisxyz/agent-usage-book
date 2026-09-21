@@ -14,6 +14,7 @@ use std::fmt;
 
 use rusqlite::Connection;
 
+use crate::calibration::contamination::ContaminationVerdict;
 use crate::calibration::multivariate_fit::{markers_by_session, retain_account_usage};
 use crate::calibration::settlement::SettlementPolicy;
 use crate::cost_model::convert as convert_usage;
@@ -35,7 +36,8 @@ use crate::store::calibration::{
     load_experiment_usage, load_latest_experiment,
 };
 use crate::store::calibration_controlled::{
-    ControlledExperimentId, ControlledExperimentRun, load_by_experiment_id as load_controlled_run,
+    ControlledExperimentId, ControlledExperimentRun, evaluate_contamination_for_run,
+    load_by_experiment_id as load_controlled_run, refuse_activation_for_contaminated_run,
 };
 use crate::store::calibration_multivariate::observations_for_run;
 use crate::store::cost_model::{ValidityInterval, load_active_at as load_active_cost_model_at};
@@ -1111,6 +1113,88 @@ pub fn fit_controlled_run_univariate_and_record(
 
     let stored_obs = observations_for_run(conn, run, clock.now())?;
     fit_observations_and_record(conn, &experiment, stored_obs, Some(&run.account), clock)
+}
+
+/// The credits the run's own account spent between `begin` and `end`, priced
+/// under the cost model in force when the run started: the local half of the
+/// flat-credits contamination signal. A ledger with no such cost model, or one
+/// that cannot price a kind the run spent, refuses as insufficient evidence
+/// rather than answering zero, which the signal would read as hidden traffic.
+pub fn controlled_run_local_credits(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+) -> Result<Credits, Error> {
+    let ended_at = run
+        .ended_at
+        .ok_or_else(|| still_running_refusal(run.id.as_str()))?;
+    let cost_model = load_active_cost_model_at(conn, run.started_at)?.ok_or_else(|| {
+        Error::InsufficientEvidence(format!(
+            "no active cost model at the start of controlled experiment '{}' to price its local credits",
+            run.id.as_str()
+        ))
+    })?;
+    let (series, _unattributed) = credit_series(
+        conn,
+        &cost_model,
+        run.started_at,
+        ended_at,
+        Some(&run.account),
+    )?;
+    Ok(Credits::from_micros(
+        series.iter().map(|(_, credits)| credits.micros()).sum(),
+    ))
+}
+
+/// The instant a run's contamination is evaluated at: `now`, cut short just
+/// before the reset of the window instance the controlled work ended in. A
+/// reading after that reset measures the next window, and its drop to the new
+/// window's usage is not settlement drift: on 2026-09-14 the session window of
+/// `cal-2026-09-14-bianca` reset 2.5 h after `end`, and an unbounded tail read
+/// the 910,000 ppm to 0 drop as extended settlement drift.
+pub fn contamination_evaluation_instant(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    now: UtcTimestamp,
+) -> Result<UtcTimestamp, Error> {
+    let Some(ended_at) = run.ended_at else {
+        return Ok(now);
+    };
+    let window_reset = observations_for_run(conn, run, ended_at)?
+        .last()
+        .map(|reading| reading.resets_at)
+        .filter(|resets_at| *resets_at > ended_at);
+    Ok(match window_reset {
+        Some(resets_at) => now.min(UtcTimestamp::from_unix_nanos(
+            resets_at.unix_nanos().saturating_sub(1),
+        )),
+        None => now,
+    })
+}
+
+/// The run's contamination verdict as `fit` reports it and `activate` judges
+/// it: the ledger-backed detector over the run's own local credits, at the
+/// instant [`contamination_evaluation_instant`] bounds.
+pub fn evaluate_controlled_run_contamination(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    now: UtcTimestamp,
+) -> Result<ContaminationVerdict, Error> {
+    let local_credits = controlled_run_local_credits(conn, run)?;
+    let at = contamination_evaluation_instant(conn, run, now)?;
+    evaluate_contamination_for_run(conn, run, local_credits, at)
+}
+
+/// The activation gate over the same evidence as
+/// [`evaluate_controlled_run_contamination`], refusing through the store's
+/// own contaminated-run refusal.
+pub fn refuse_contaminated_controlled_run(
+    conn: &Connection,
+    run: &ControlledExperimentRun,
+    now: UtcTimestamp,
+) -> Result<(), Error> {
+    let local_credits = controlled_run_local_credits(conn, run)?;
+    let at = contamination_evaluation_instant(conn, run, now)?;
+    refuse_activation_for_contaminated_run(conn, run, local_credits, at)
 }
 
 /// Turns stored readings into a candidate: the usage the experiment's validity

@@ -823,8 +823,8 @@ bound. With
 `pairwise_correlations` (`first`, `second`, `correlation`), `fit_residual_ppm` (the
 mean absolute block residual), `residual_percentage_points`, `statistical_method`,
 `statistical_parameters`, `phase_design`, `usable_observations`, `sample_count`,
-`inputs_digest`, `inputs_count`, `excluded_samples`, and `activated` (always
-`false`). The candidate and its coefficients live in
+`inputs_digest`, `inputs_count`, `excluded_samples`, `contamination` (below), and
+`activated` (always `false`). The candidate and its coefficients live in
 `window_calibration_multivariate_candidate` and
 `window_calibration_multivariate_coefficient`, immutable like every other
 calibration record (Invariant 29). `activate` takes `--max-condition-micros` and
@@ -862,6 +862,37 @@ lifecycle event, and the operator activates it explicitly afterwards. With
 `held_out_residual`, `validation_observations`, `fitting_evidence_digest`,
 `validation_evidence_digest`, `validation_method`, `validation_version`,
 `activation_policy_version`, `uncertainty`, and `activated` (always `false`).
+
+`fit` on a controlled run reports the run's contamination verdict, on the
+univariate and the joint path alike; a fit of an experiment with no controlled
+run reports none, because only a run records the exclusivity premise and the
+thresholds a verdict is judged against. The verdict is evaluated from the ledger
+when `fit` runs, with the four signals `begin` recorded thresholds for: quota
+moving inside the idle plateau before the run (`pre_burn_idle_movement`), quota
+still moving past `end` plus the settlement grace (`extended_settlement_drift`),
+meter movement while the run's own account spent no priced credits
+(`flat_credits_with_meter_movement`), and another session marked against the
+run's account inside the run (`overlapping_session`). The local credits are the
+run account's usage between `begin` and `end`, priced under the cost model in
+force at `begin`. Readings are read up to the instant before the window the
+run ended in resets, since a reading after that reset measures the next window
+and its drop is not settlement drift. With `--format json` the report carries
+`contamination` with `verdict` (`"clean"`, `"contaminated"`, or `"unavailable"`
+when no cost model can price the run's local credits, a joint run in a ledger with
+none, with `reason` saying why), `findings` (one object per fired signal with
+`signal` and `detail`), and `refuses_activation`. The text report prints a
+`Contamination:` line with the verdict and one line per finding. A contaminated
+verdict never stops the fit from recording its candidate.
+
+`activate` of a result fitted from a controlled run evaluates the same verdict
+at activation time and refuses, before anything is written, with the
+contaminated-run refusal naming the run and the first fired signal, when any
+signal other than `overlapping_session` fired. An overlapping session alone is
+reported by `fit` and does not refuse: the marker timeline cannot tell the
+run's own arm sessions from another's, and every session a burst opens on the
+account is marked inside the run. A run whose local credits cannot be priced is
+refused with the insufficient-evidence class. A result whose source experiment
+is not a controlled run is not judged for contamination.
 
 Subcommand `passive` generates candidates from
 uncontrolled, recorded observations across clean intervals under strict
