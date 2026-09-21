@@ -5054,8 +5054,9 @@ The critical invariants are:
     credits, never against the lowest remaining percentage alone.
 27. Coverage denominators come from the sampling policy that was in force over the
     interval, never from current configuration.
-28. At most one rate card is in force per vendor, model, token class and
-    instant.
+28. At most one rate card is in force per vendor, model, token class, billing
+    basis, window and instant: a money card and a percent-of-window card for
+    one class coexist, and a money card has no window.
 29. A multivariate coefficient is only ever recorded as a candidate, one per
     token kind the experiment premise named, and never activated by the fit
     command.
