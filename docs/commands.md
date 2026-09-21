@@ -239,8 +239,12 @@ In JSON the estimated figure carries `evidence_quality: "estimated"`,
 "rate_card_ids": [...]}` in place of `calibration_id`. A calibration that is
 recorded but not current (`review_due`, `suspect`) does not fall back: the
 command refuses naming the health, because a stale measurement is still
-evidence and an estimate must not paper over its review. With neither a
-calibration nor an estimate card the refusal names the missing calibration.
+evidence and an estimate must not paper over its review. A calibration is
+`review_due` once `calibration.review_after` has passed since it was fitted.
+That refusal exits 6 (`InsufficientEvidence`) after the report is printed, and
+`aub can-run` does the same when a constraining window's calibration is not
+current. With neither a calibration nor an estimate card the refusal names the
+missing calibration, and the exit stays 0.
 
 **Refuses:** to guess at an unreadable transcript. A source that cannot be
 normalized leaves the report `IngestIncomplete` rather than silently omitted

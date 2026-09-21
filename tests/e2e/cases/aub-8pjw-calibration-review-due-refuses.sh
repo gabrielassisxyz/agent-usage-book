@@ -1,29 +1,23 @@
-# aub-8vpc: a percent-of-window rate card stands in for a missing calibration,
-# labelled estimated on every surface, and loses to a current calibration.
+# aub-8pjw: a stored window calibration whose review instant has passed makes
+# `aub spend --window-equivalent` and `aub can-run` refuse, naming its health
+# and exiting non-zero, even with a percent-of-window estimate card in force.
 #
-# One ledger walks the precedence rule in order, through the shipped binary:
-# neither a calibration nor an estimate card (both commands refuse naming the
-# calibration), an estimate card and no calibration (both answer, labelled
-# `(estimated)`, and doctor reports the estimate in use), then a current
-# calibration beside the same card (both answer from the calibration, with no
-# label, and doctor's line is gone).
-#
-# The fourth row of the table, a calibration that is recorded but not
-# current, is walked through the binary by
-# `aub-8pjw-calibration-review-due-refuses.sh`, which passes a calibration's
-# configured review instant. The `suspect` row still has no CLI path, since no
-# drift finding is stored (aub-7j5u); it is pinned where the decision is made,
-# by `spend_window_precedence_tests::the_spend_precedence_table` in
-# `src/cli.rs` and `a_review_due_calibration_refuses_instead_of_falling_back`
-# in `src/report/can_run.rs`.
+# One ledger walks a five_hour calibration from current to review-due through
+# the shipped binary. The review instant is the calibration's fit time plus
+# `calibration.review_after` (`aub-6omr`). First the default horizon of 30
+# days applies: both commands answer from the calibration, unlabelled, and the
+# estimate cards stay inert (the planted negative). Then the case waits past
+# a one-second horizon, set through `AUB_CALIBRATION_REVIEW_AFTER`, and the
+# same commands over the same ledger refuse with `review_due`, exit 6, and
+# print no estimate figure: a measurement asking for review is not papered
+# over by an approximation.
 #
 # The meter comes from a stub HTTP server answering the can-run worked
-# example's window shape once (`026-can-run.sh`'s pattern); every later can-run
-# reads that persisted sample with `--cached`, so the server is killed right
-# after the first one.
+# example's window shape once (`aub-8vpc-window-estimate-fallback.sh`'s
+# pattern); every later can-run reads that persisted sample with `--cached`.
 
-CASE_ID="aub-8vpc-window-estimate-fallback"
-CASE_DESCRIPTION="aub spend --window-equivalent and aub can-run fall back to a labelled rate-card estimate only when no calibration is recorded, and a current calibration outranks it."
+CASE_ID="aub-8pjw-calibration-review-due-refuses"
+CASE_DESCRIPTION="aub spend --window-equivalent and aub can-run refuse, naming review_due and exiting non-zero, once a stored calibration passes its configured review instant, and answer from it before."
 
 CONFIG=""
 LEDGER_DB=""
@@ -181,16 +175,21 @@ httpd.serve_forever()
     PORT=$(cat "$STATE_DIR/port.txt")
 }
 
+# The review horizon every aub step runs under: the configured default until
+# the case walks the calibration past its review instant.
+REVIEW_AFTER="30d"
+
 aub_step() {
     local name="$1"
     shift
     step "$name" env "HOME=$STATE_DIR/home" "AUB_STATE_DIR=$STATE_DIR" \
         "AUB_CONFIG_FILE=$CONFIG" "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:${PORT:-9}" \
+        "AUB_CALIBRATION_REVIEW_AFTER=$REVIEW_AFTER" \
         "$AUB_BIN" "$@"
 }
 
 # A step that passes only when TEXT is absent from an earlier step's stdout:
-# the label and the doctor line have to be shown missing, not just unasserted.
+# the estimate label and figure have to be shown missing, not just unasserted.
 absent_step() {
     local name="$1" text="$2" from="$3"
     step "$name" sh -c '! grep -qF -- "$1" "$2"' _ "$text" "$(step_dir "$from")/stdout.bin"
@@ -198,7 +197,7 @@ absent_step() {
 
 case_steps() {
     # 1-4. Usage, task boundaries, task identity and account attribution,
-    #      seeded exactly as 026-can-run.sh does.
+    #      seeded exactly as aub-8vpc-window-estimate-fallback.sh does.
     aub_step "ingest-transcripts" ingest transcripts
     aub_step "task-ingest" task ingest
     step "seed-task-identity" sqlite3 "$LEDGER_DB" "
@@ -222,50 +221,45 @@ case_steps() {
          ('claude-code', 's3', 1787632200000000000, NULL, 'work-primary', NULL, 'hook', NULL, NULL, 'launcher_or_hook');
     "
 
-    # 5-7. A cost model and a calibration for every window except five_hour,
-    #      the one this case is about.
+    # 5-9. A cost model, a calibration for every window, and the estimate
+    #      cards for five_hour, which must stay inert while it is current.
     aub_step "seed-cost-model" cost-model activate anthropic_claude_messages_v1
     aub_step "seed-calibration-seven-day" __calibration-fixture seven_day 100
     aub_step "seed-calibration-seven-day-sonnet" __calibration-fixture seven_day_sonnet 40
+    aub_step "seed-calibration-five-hour" __calibration-fixture five_hour 100
+    aub_step "import-estimates" rate-card import "$STATE_DIR/estimates.toml"
 
-    # 8-10. Neither a calibration nor an estimate card for five_hour.
-    aub_step "spend-neither" spend --since 2026-08-25 --days 1 --group-by account \
+    # 10-13. Before the review instant (the default 30-day horizon): both
+    #        commands answer from the calibration, with no estimate label.
+    aub_step "spend-current" spend --since 2026-08-25 --days 1 --group-by account \
         --window-equivalent five_hour --refresh never
-    aub_step "can-run-neither" can-run --task-kind task --account work-primary --task-model sonnet
-    aub_step "can-run-neither-json" can-run --task-kind task --account work-primary \
-        --task-model sonnet --cached --format json
+    absent_step "spend-current-not-from-cards" "from rate cards" 10
+    aub_step "can-run-current" can-run --task-kind task --account work-primary --task-model sonnet
+    absent_step "can-run-current-unlabelled" "(estimated)" 12
 
     kill "$SERVER_PID" 2>/dev/null || true
     wait "$SERVER_PID" 2>/dev/null || true
     SERVER_PID=""
     PORT=""
 
-    # 11-17. The estimate cards, and still no five_hour calibration.
-    aub_step "import-estimates" rate-card import "$STATE_DIR/estimates.toml"
-    aub_step "spend-estimate" spend --since 2026-08-25 --days 1 --group-by account \
-        --window-equivalent five_hour --refresh never
-    aub_step "spend-estimate-json" spend --since 2026-08-25 --days 1 --group-by account \
-        --window-equivalent five_hour --refresh never --format json
-    aub_step "can-run-estimate" can-run --task-kind task --account work-primary \
-        --task-model sonnet --cached
-    aub_step "can-run-estimate-json" can-run --task-kind task --account work-primary \
-        --task-model sonnet --cached --format json
-    aub_step "doctor-estimate" doctor
-    aub_step "rate-card-reimport" rate-card import "$STATE_DIR/estimates.toml"
+    # 14. Past the review instant: every calibration above was fitted at
+    #     least a second before the commands below run, under a one-second
+    #     horizon.
+    step "wait-past-review-instant" sleep 1
 
-    # 18-26. A current five_hour calibration beside the same cards.
-    aub_step "seed-calibration-five-hour" __calibration-fixture five_hour 100
-    aub_step "spend-calibrated" spend --since 2026-08-25 --days 1 --group-by account \
+    # 15-21. The same ledger, now review-due: both refuse, naming the health,
+    #        exit non-zero, and print no estimate figure.
+    REVIEW_AFTER="1s"
+    aub_step "spend-review-due" spend --since 2026-08-25 --days 1 --group-by account \
         --window-equivalent five_hour --refresh never
-    absent_step "spend-calibrated-unlabelled" "(estimated)" 19
-    aub_step "can-run-calibrated" can-run --task-kind task --account work-primary \
+    absent_step "spend-review-due-not-from-cards" "from rate cards" 15
+    absent_step "spend-review-due-no-figure" "window equivalent [" 15
+    aub_step "can-run-review-due" can-run --task-kind task --account work-primary \
         --task-model sonnet --cached
-    absent_step "can-run-calibrated-unlabelled" "(estimated)" 21
-    aub_step "doctor-calibrated" doctor
-    absent_step "doctor-calibrated-silent" "anthropic/five_hour" 23
-    aub_step "can-run-calibrated-json" can-run --task-kind task --account work-primary \
+    absent_step "can-run-review-due-no-estimate" "(estimated)" 18
+    aub_step "can-run-review-due-json" can-run --task-kind task --account work-primary \
         --task-model sonnet --cached --format json
-    absent_step "can-run-calibrated-json-has-no-basis" "rate_card_estimate" 25
+    absent_step "can-run-review-due-json-has-no-basis" "rate_card_estimate" 20
 }
 
 case_assertions() {
@@ -275,52 +269,31 @@ case_assertions() {
     fi
 
     local n
-    for n in 1 2 3 4 5 6 7; do
+    for n in 1 2 3 4 5 6 7 8 9; do
         assert_exit 0 "$n"
     done
+    assert_stdout_contains 9 "added=4"
 
-    # Neither a calibration nor a card: both refuse naming the calibration.
-    assert_exit 0 8
-    assert_row_detail_contains 8 "^│  work-primary " \
-        "window equivalent unavailable: active calibration for provider anthropic and window five_hour"
-    assert_exit 0 9
-    assert_stdout_contains 9 "no calibration is recorded for this window"
+    # Current: the calibration answers and the cards are inert.
     assert_exit 0 10
-    assert_json_field 10 "outcome.status" "refused"
-    assert_stdout_contains 10 '"subject":"five_hour","reason":"no calibration is recorded for this window"'
-
-    # The cards and no calibration: both answer, labelled, and doctor says so.
+    assert_row_detail_contains 10 "^│  work-primary " "calibration five_hour-fixture-calibration"
     assert_exit 0 11
-    assert_stdout_contains 11 "added=4"
     assert_exit 0 12
-    assert_row_detail_contains 12 "^│  work-primary " \
-        "window equivalent [1.2030, 1.2030] percentage points (estimated) from rate cards 1, 2"
+    assert_stdout_matches 12 "five_hour .*calibration #five_hour-fixture-calibration.*headroom .* credits$"
     assert_exit 0 13
-    assert_json_field 13 "groups[0].window_equivalent.evidence_quality" "estimated"
-    assert_json_field 13 "groups[0].window_equivalent.methods[0]" "rate-card-estimate"
-    assert_json_field 13 "groups[0].window_equivalent.basis.rate_card_ids[0]" "1"
-    assert_json_field 13 "groups[0].window_equivalent.basis.rate_card_ids[1]" "2"
-    assert_json_field 13 "groups[0].window_equivalent.lower" "12030"
-    assert_exit 0 14
-    assert_stdout_matches 14 "five_hour .*headroom .* credits \\(estimated\\)$"
-    assert_stdout_matches 14 "seven_day .*headroom .* credits$"
-    assert_exit 0 15
-    assert_stdout_contains 15 '"basis":{"kind":"rate_card_estimate","rate_card_ids":[1,2,3,4]},"evidence_quality":"estimated"'
-    assert_stdout_contains 16 "[INFO] window-estimate-in-use: window figures come from a rate-card estimate for: anthropic/five_hour"
-    assert_exit 0 17
-    assert_stdout_contains 17 "added=0 unchanged=4"
 
-    # A current calibration beside the same cards: it answers, unlabelled.
-    assert_exit 0 18
+    # Review-due: both refuse naming the health, and exit 6.
+    assert_exit 0 14
+    assert_exit 6 15
+    assert_row_detail_contains 15 "^│  work-primary " \
+        "window equivalent unavailable: current calibration for provider anthropic and window five_hour: calibration health is review_due"
+    assert_exit 0 16
+    assert_exit 0 17
+    assert_exit 6 18
+    assert_stdout_contains 18 "review_due"
     assert_exit 0 19
-    assert_row_detail_contains 19 "^│  work-primary " "calibration five_hour-fixture-calibration"
-    assert_exit 0 20
+    assert_exit 6 20
+    assert_json_field 20 "outcome.status" "refused"
+    assert_stdout_contains 20 '"subject":"five_hour"'
     assert_exit 0 21
-    assert_stdout_matches 21 "five_hour .*calibration #five_hour-fixture-calibration.*headroom .* credits$"
-    assert_exit 0 22
-    assert_stdout_contains 23 "[PASS] window-estimate-in-use"
-    assert_exit 0 24
-    assert_exit 0 25
-    assert_stdout_contains 25 '"semantic_key":"five_hour"'
-    assert_exit 0 26
 }
