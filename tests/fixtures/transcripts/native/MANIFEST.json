@@ -1,5 +1,20 @@
 {
   "formats": {
+    "agy": {
+      "input_format_version": "agy-transcript-jsonl-v1",
+      "real_capture": "agy-real-shape.jsonl",
+      "shapes": {
+        "SimpleSession": { "fixture": "agy-simple-session.jsonl" },
+        "NestedSubagentPaths": { "not_applicable": "nested paths are a discovery concern; one Antigravity brain directory contains one transcript stream" },
+        "TruncatedFile": { "fixture": "agy-truncated.jsonl" },
+        "PartiallyWrittenFinalRecord": { "fixture": "agy-truncated.jsonl" },
+        "FileRotation": { "not_applicable": "file rotation is a discovery and ingestion concern; the parser normalizes one file's content and never sees the rotation boundary" },
+        "MalformedRecords": { "fixture": "agy-malformed.jsonl" },
+        "ModelChangeMidSession": { "not_applicable": "Antigravity writes no model identity, so a model change is not observable in this format" },
+        "CacheReadsAndWrites": { "not_applicable": "Antigravity writes no usage fields; the estimator reconstructs input and output characters only" },
+        "NoNativeUsageField": { "fixture": "agy-simple-session.jsonl" }
+      }
+    },
     "claude-code": {
       "input_format_version": "claude-code-jsonl-v1",
       "real_capture": "claude-real-shape.jsonl",

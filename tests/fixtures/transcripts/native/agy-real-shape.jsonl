@@ -1,0 +1,2 @@
+{"type":"USER_INPUT","content":"request"}
+{"type":"PLANNER_RESPONSE","created_at":"2026-09-20T10:00:00Z","thinking":"plan","content":"answer","tool_calls":[{"name":"read","args":{"path":"fixture.txt"}}]}

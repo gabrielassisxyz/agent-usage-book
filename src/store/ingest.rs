@@ -483,7 +483,7 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
 
-    use crate::dedup::{canonical_identity, canonical_payload_digest};
+    use crate::dedup::{HeuristicKey, canonical_identity, canonical_payload_digest};
     use crate::domain::ids::NativeSessionId;
     use crate::domain::time::{FakeClock, MonotonicDuration};
     use crate::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
@@ -496,7 +496,7 @@ mod tests {
             CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
             UsageVector,
         },
-        transcripts::NormalizedUsageEvent,
+        transcripts::{AgyParser, NormalizedUsageEvent, ParserAdapter},
     };
 
     static COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -579,13 +579,17 @@ mod tests {
             .iter()
             .map(|event| {
                 let identity = canonical_identity(event);
+                let heuristic_algorithm_version = identity
+                    .heuristic_key
+                    .as_ref()
+                    .map(|_| HeuristicKey::ALGORITHM_VERSION.to_string());
                 PersistEvent {
                     event: event.clone(),
                     namespace: SourceNamespace::new("test"),
                     canonical_event_id: identity.canonical_event_id,
                     native_event_id: identity.native_event_id,
                     heuristic_key: identity.heuristic_key,
-                    heuristic_algorithm_version: None,
+                    heuristic_algorithm_version,
                     canonical_payload_digest: canonical_payload_digest(event),
                     relative_path: Some(event.source_file().to_string()),
                 }
@@ -640,6 +644,62 @@ mod tests {
             |row| row.get::<_, i64>(0),
         )
         .expect("component must be readable") as u64
+    }
+
+    /// The estimated parser's complete metadata survives the canonical store:
+    /// estimator and version in the event classification, parser version on
+    /// both rows, and the explicitly heuristic dedup identity with its own
+    /// algorithm version. The absent uncertainty is represented by the
+    /// estimator's documented no-interval contract, not a fabricated bound.
+    #[test]
+    fn agy_event_round_trips_estimator_and_heuristic_identity_metadata() {
+        let (_scratch, mut conn) = fixture_conn();
+        let source = "brain/session-a/.system_generated/logs/transcript_full.jsonl";
+        let parsed = AgyParser.parse(
+            r#"{"type":"PLANNER_RESPONSE","created_at":"2026-09-20T10:00:00Z","content":"abcdefgh"}"#,
+            &SourceLocation::new(source, 1),
+        );
+        assert!(parsed.quarantined().is_empty());
+        let pass = pass_of(
+            parsed.events().to_vec(),
+            UtcTimestamp::parse_rfc3339("2026-09-20T10:02:00Z").unwrap(),
+        );
+        land(&mut conn, &pass).unwrap();
+
+        let event: (String, String, String) = conn
+            .query_row(
+                "SELECT evidence_kind, source_provenance, parser_version FROM usage_event",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(event.0, "reconstructed:agy-character-count:1");
+        assert!(event.1.contains("model:antigravity"));
+        assert_eq!(event.2, "agy-1");
+
+        let occurrence: (Option<String>, Option<String>, String, Option<String>) = conn
+            .query_row(
+                "SELECT native_event_id, heuristic_key, identity_strength, \
+                        heuristic_algorithm_version FROM usage_occurrence",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(occurrence.0, None);
+        assert!(occurrence.1.is_some());
+        assert_eq!(occurrence.2, "heuristic");
+        assert_eq!(
+            occurrence.3.as_deref(),
+            Some(HeuristicKey::ALGORITHM_VERSION)
+        );
+        assert_eq!(
+            component_count(&conn, &pass.events[0].canonical_event_id, "input"),
+            34_492
+        );
+        assert_eq!(
+            component_count(&conn, &pass.events[0].canonical_event_id, "output"),
+            2
+        );
     }
 
     /// The unit test the bead names: one persisted pass advances the transcript

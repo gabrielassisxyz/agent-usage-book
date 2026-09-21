@@ -105,7 +105,7 @@ without `--session-id` the state is always `no_evidence`.
 dimensions? `--group-by` takes `day`, `session`, `project`, `repository`,
 `harness`, `model`, `task` or `account` and is repeatable, so
 `--group-by account --group-by day` nests days under each account. `harness`
-is the transcript namespace the config named (`claude-code`, `codex`, `pi`,
+is the transcript namespace the config named (`agy`, `claude-code`, `codex`, `pi`,
 `opencode`) and `model` is the model id the transcript stored; usage neither
 field names lands in the `unknown-harness` or `unknown-model` bucket.
 
@@ -870,7 +870,7 @@ never by those dimensions.
 transcripts on disk, under one generation?
 
 **Reads:** the configured `[[transcripts]]` sources, each with a `format` of
-`claude-code`, `codex`, `opencode` or `pi`. An `opencode` source names the
+`agy`, `claude-code`, `codex`, `opencode` or `pi`. An `opencode` source names the
 directory holding its session database with the pattern `opencode.db`; the
 database is opened read-only and parsed whole, never sliced by lines.
 
