@@ -206,6 +206,120 @@ fn every_attempt_references_run(repository: &Repository, n: i64, run_id: i64) {
 
 // --- the mixed-outcome batch ---------------------------------------------------
 
+/// What the mixed-outcome rendezvous observed, read by the test after the batch.
+#[derive(Debug, Default)]
+struct MixedOutcomeRendezvousState {
+    stalled_in_flight: bool,
+    success_saw_stalled_in_flight: bool,
+    success_completed: bool,
+    stalled_released_by_success: bool,
+}
+
+/// Shared by the transport and the clock of the mixed-outcome test, the same
+/// device as `IsolationRendezvous` below with a third account passing
+/// through. The stalled request is held in flight until the success request
+/// has completed, and the command budget only starts counting then, so a
+/// starved machine cannot spend the budget before the requests under test
+/// are issued. The authentication failure passes straight through: it is an
+/// immediate 401, it needs no coordination, and holding it would keep a
+/// worker from ever starting the stalled slot.
+struct MixedOutcomeBudgetRendezvous {
+    stalled_base: String,
+    success_base: String,
+    state: std::sync::Mutex<MixedOutcomeRendezvousState>,
+    changed: std::sync::Condvar,
+    budget_clock: std::sync::OnceLock<RealClock>,
+}
+
+impl MixedOutcomeBudgetRendezvous {
+    fn new(stalled_base: String, success_base: String) -> Self {
+        Self {
+            stalled_base,
+            success_base,
+            state: std::sync::Mutex::new(MixedOutcomeRendezvousState::default()),
+            changed: std::sync::Condvar::new(),
+            budget_clock: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn start_budget_clock(&self) {
+        self.budget_clock.get_or_init(RealClock::new);
+    }
+
+    /// The stalled request is held in flight until the success one has
+    /// completed, then sent to the stalled server where the real budget
+    /// clips it. Under serialized workers the success request never starts,
+    /// and the hold ends at the cap.
+    fn hold_stalled_request(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.stalled_in_flight = true;
+        self.changed.notify_all();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, ISOLATION_RENDEZVOUS_CAP, |state| {
+                !state.success_completed
+            })
+            .unwrap();
+        state.stalled_released_by_success = state.success_completed;
+        drop(state);
+        self.start_budget_clock();
+    }
+
+    fn await_stalled_request(&self) {
+        let state = self.state.lock().unwrap();
+        let (mut state, _) = self
+            .changed
+            .wait_timeout_while(state, ISOLATION_RENDEZVOUS_CAP, |state| {
+                !state.stalled_in_flight
+            })
+            .unwrap();
+        state.success_saw_stalled_in_flight = state.stalled_in_flight;
+    }
+
+    fn finish_success_request(&self, succeeded: bool) {
+        self.start_budget_clock();
+        let mut state = self.state.lock().unwrap();
+        state.success_completed = succeeded;
+        self.changed.notify_all();
+    }
+}
+
+impl HttpTransport for MixedOutcomeBudgetRendezvous {
+    fn send(
+        &self,
+        request: &HttpRequest,
+        budget: &CommandBudget,
+        clock: &impl Clock,
+    ) -> Result<HttpResponse, FailureClass> {
+        if request.url.starts_with(&self.stalled_base) {
+            self.hold_stalled_request();
+            return BlockingTransport.send(request, budget, clock);
+        }
+        if request.url.starts_with(&self.success_base) {
+            self.await_stalled_request();
+            let response = BlockingTransport.send(request, budget, clock);
+            self.finish_success_request(response.is_ok());
+            return response;
+        }
+        BlockingTransport.send(request, budget, clock)
+    }
+}
+
+/// Frozen at the zero instant until the rendezvous starts the budget clock,
+/// real time from then on. The wall clock is always real.
+impl Clock for MixedOutcomeBudgetRendezvous {
+    fn now(&self) -> UtcTimestamp {
+        RealClock::new().now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        match self.budget_clock.get() {
+            Some(clock) => clock.monotonic_now(),
+            None => FakeClock::new(UtcTimestamp::from_unix_nanos(0)).monotonic_now(),
+        }
+    }
+}
+
 /// A batch with one success, one authentication failure and one timeout
 /// persists three attempts, one observation, and publishes one projection.
 /// Each outcome is served by its own provider endpoint, so the script each
@@ -227,18 +341,53 @@ fn one_success_one_auth_failure_one_timeout_persists_three_attempts_one_observat
         batch_account("authfail", format!("{}/usage", refused.url())),
         batch_account("timeout", format!("{}/usage", stalled.url())),
     ];
+    let rendezvous = MixedOutcomeBudgetRendezvous::new(stalled.url(), measured.url());
 
     // An eight second budget: comfortably below the adapter's own ten second
     // read timeout, so the hang is still clipped by the budget rather than by
     // that timeout, which is the composed behaviour this test exists to
-    // prove. The command budget covers stage 1 and 2 as well as the request
-    // itself (it is the whole command's ceiling), and those stages commit
-    // several `synchronous = FULL` writes before any request is issued; a
-    // two second budget left that overhead no room to vary and made the
-    // fast accounts spuriously expire too.
-    let report = orchestrator(&repository, MonotonicDuration::from_seconds(8), 2)
-        .run(&accounts)
-        .expect("the batch must run");
+    // prove. The budget clock starts only once the success request has
+    // completed, so the eight seconds are measured from there rather than
+    // from before stage 1: stage 1 and 2 commit several `synchronous = FULL`
+    // writes before any request is issued, and a starved machine must be
+    // allowed to spend its own time on those without spending the budget the
+    // success request still needs. A two second budget left that overhead no
+    // room to vary and made the fast accounts spuriously expire too.
+    let report = SamplingOrchestrator {
+        repository: &repository,
+        transport: &rendezvous,
+        clock: &rendezvous,
+        trigger: Trigger::Manual,
+        configuration_fingerprint: "integration-fixture".to_string(),
+        holder: LeaseHolder::new("integration-test"),
+        lease_ttl: MonotonicDuration::from_seconds(60),
+        command_budget: MonotonicDuration::from_seconds(8),
+        max_concurrent_requests: 2,
+    }
+    .run(&accounts)
+    .expect("the batch must run");
+
+    let observed = rendezvous.state.lock().unwrap();
+    assert!(
+        observed.success_saw_stalled_in_flight,
+        "the success request must be issued while the stalled one is in flight: {observed:?}"
+    );
+    assert!(
+        observed.stalled_released_by_success,
+        "the success request must complete before the stalled one stops waiting: {observed:?}"
+    );
+    drop(observed);
+    assert_eq!(
+        measured.request_count(),
+        1,
+        "the measured server was reached"
+    );
+    assert_eq!(
+        refused.request_count(),
+        1,
+        "the refusing server was reached"
+    );
+    assert_eq!(stalled.request_count(), 1, "the stalled server was reached");
 
     assert_eq!(report.accounts.len(), 3);
     let success = &report.accounts[0];
@@ -624,6 +773,68 @@ fn a_provider_hanging_until_the_budget_expires_does_not_block_another_accounts_o
 
 // --- bounded concurrency, as the server records it -----------------------------
 
+/// The transport and clock of the bounded-concurrency test. The budget clock
+/// stays frozen until every request under test has completed, so the thirty
+/// second budget can never clip a request no matter how slowly a loaded
+/// machine schedules the workers: this test names the concurrency bound, not
+/// the budget, and the budget is incidental to it. The wall clock is always
+/// real, and the server still records the true overlap of the requests.
+struct BoundedConcurrencyBudgetRendezvous {
+    expected_completions: usize,
+    completed: std::sync::Mutex<usize>,
+    budget_clock: std::sync::OnceLock<RealClock>,
+}
+
+impl BoundedConcurrencyBudgetRendezvous {
+    fn new(expected_completions: usize) -> Self {
+        Self {
+            expected_completions,
+            completed: std::sync::Mutex::new(0),
+            budget_clock: std::sync::OnceLock::new(),
+        }
+    }
+
+    fn start_budget_clock(&self) {
+        self.budget_clock.get_or_init(RealClock::new);
+    }
+
+    fn note_completion(&self) {
+        let mut completed = self.completed.lock().unwrap();
+        *completed += 1;
+        if *completed >= self.expected_completions {
+            self.start_budget_clock();
+        }
+    }
+}
+
+impl HttpTransport for BoundedConcurrencyBudgetRendezvous {
+    fn send(
+        &self,
+        request: &HttpRequest,
+        budget: &CommandBudget,
+        clock: &impl Clock,
+    ) -> Result<HttpResponse, FailureClass> {
+        let response = BlockingTransport.send(request, budget, clock);
+        self.note_completion();
+        response
+    }
+}
+
+/// Frozen at the zero instant until the last request completes, real time
+/// from then on. The wall clock is always real.
+impl Clock for BoundedConcurrencyBudgetRendezvous {
+    fn now(&self) -> UtcTimestamp {
+        RealClock::new().now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        match self.budget_clock.get() {
+            Some(clock) => clock.monotonic_now(),
+            None => FakeClock::new(UtcTimestamp::from_unix_nanos(0)).monotonic_now(),
+        }
+    }
+}
+
 /// Bounded concurrency respected, asserted by the synthetic server recording
 /// no more than the configured number of simultaneous connections, and
 /// reaching the bound rather than running one at a time: four accounts, a
@@ -643,10 +854,26 @@ fn bounded_concurrency_is_recorded_by_the_synthetic_server() {
     let accounts: Vec<BatchAccount<AnthropicAdapter>> = (0..4)
         .map(|index| batch_account(&format!("bound{index}"), format!("{}/usage", server.url())))
         .collect();
+    let rendezvous = BoundedConcurrencyBudgetRendezvous::new(accounts.len());
 
-    let report = orchestrator(&repository, MonotonicDuration::from_seconds(30), 2)
-        .run(&accounts)
-        .expect("the batch must run");
+    // The thirty second budget never constrains this test: its clock starts
+    // only after the last request completes, so a starved machine can delay
+    // stage 1 and 2's writes and the workers themselves without spending a
+    // budget no request is racing. What the test asserts, the worker count
+    // and the server's own record of simultaneous connections, is unchanged.
+    let report = SamplingOrchestrator {
+        repository: &repository,
+        transport: &rendezvous,
+        clock: &rendezvous,
+        trigger: Trigger::Manual,
+        configuration_fingerprint: "integration-fixture".to_string(),
+        holder: LeaseHolder::new("integration-test"),
+        lease_ttl: MonotonicDuration::from_seconds(60),
+        command_budget: MonotonicDuration::from_seconds(30),
+        max_concurrent_requests: 2,
+    }
+    .run(&accounts)
+    .expect("the batch must run");
 
     assert_eq!(
         report.workers_spawned, 2,
