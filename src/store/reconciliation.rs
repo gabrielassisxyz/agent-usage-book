@@ -139,22 +139,41 @@ pub fn reconcile_candidate_from_store(
             Some(ActiveCalibration::Scalar(calibration)) => Some(calibration),
             Some(ActiveCalibration::PerKind(_)) | None => None,
         };
+    let cost_model = crate::store::cost_model::load_active_at(conn, knowledge_time)?;
     let calibration_health = if let Some(ref cal) = active_calibration {
         let facts = CalibrationFacts {
             plan_tier: cal.plan_tier().clone(),
             meter_semantics_id: cal.meter_semantics_id().clone(),
             billing_semantics_id: cal.billing_semantics_id().clone(),
         };
+        // The interval's credits are priced below under the cost model active
+        // at `knowledge_time`, so the calibration is judged against that model
+        // (`aub-fdh3`): a coefficient fitted under other billing semantics, or
+        // under a model that model superseded, would turn the residual into a
+        // comparison between two cost models. Supersession is asked only when
+        // the model in force differs from the calibration's own, because the
+        // record is not time-aware and a later supersession must not reach
+        // back into an interval its model still priced.
         let context = ApplicabilityContext {
             plan_tier: cal.plan_tier().clone(),
             meter_semantics_id: cal.meter_semantics_id().clone(),
-            billing_semantics_id: cal.billing_semantics_id().clone(),
+            billing_semantics_id: cost_model
+                .as_ref()
+                .map_or(cal.billing_semantics_id(), |model| {
+                    model.billing_semantics_id()
+                })
+                .clone(),
         };
+        let fitted_model_in_force = cost_model
+            .as_ref()
+            .is_none_or(|model| model.id() == cal.cost_model_id());
+        let cost_model_superseded = !fitted_model_in_force
+            && crate::store::cost_model::is_superseded(conn, cal.cost_model_id())?;
         let health_inputs = HealthInputs {
             calibration: &facts,
             context: &context,
             lifecycle: LifecycleState::Active,
-            cost_model_superseded: false,
+            cost_model_superseded,
             drift: None,
             // A calibration past its review still reconciles: the residual is
             // the evidence the review is made from, and spend and can-run are
@@ -168,8 +187,6 @@ pub fn reconcile_candidate_from_store(
     } else {
         None
     };
-
-    let cost_model = crate::store::cost_model::load_active_at(conn, knowledge_time)?;
 
     let mut stmt = conn
         .prepare(

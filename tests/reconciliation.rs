@@ -41,8 +41,8 @@ use agent_usage_book::store::calibration::{
 };
 use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt, start_meter_attempt};
 use agent_usage_book::store::meter_evidence::{
-    NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, insert_observation,
-    insert_response_evidence, insert_window,
+    NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow, ObservationRowId,
+    insert_observation, insert_response_evidence, insert_window,
 };
 use agent_usage_book::store::reconciliation::reconcile_candidate_from_store;
 use agent_usage_book::store::sample_run::{Trigger, start_sample_run};
@@ -108,6 +108,27 @@ fn insert_calibration(
     window: &str,
     fitted_micros: i64,
 ) {
+    insert_calibration_priced_under(
+        conn,
+        cal_id,
+        (provider, plan, window),
+        fitted_micros,
+        "cm-1",
+        "billing-v1",
+    );
+}
+
+/// [`insert_calibration`] fitted under a named cost model and billing
+/// semantics, for the tests that judge a calibration against the cost model
+/// in force (`aub-fdh3`). The scope is `(provider, plan, window)`.
+fn insert_calibration_priced_under(
+    conn: &rusqlite::Connection,
+    cal_id: &str,
+    (provider, plan, window): (&str, &str, &str),
+    fitted_micros: i64,
+    cost_model_id: &str,
+    billing_semantics_id: &str,
+) {
     let (training, validation) = calibration_evidence(cal_id);
     conn.execute(
         "INSERT INTO window_calibration_result (
@@ -122,7 +143,7 @@ fn insert_calibration(
             excluded_samples, activation_policy_version, aub_version, source_revision,
             valid_from, valid_until, knowledge_time
         ) VALUES (
-            ?1, ?2, ?3, ?4, 'meter-v1', 'billing-v1', 'cm-1',
+            ?1, ?2, ?3, ?4, 'meter-v1', ?8, ?9,
             ?5, 12000000, 4200, ?5 - 1000, ?5 + 1000, 90000000000, 'shifted-by-estimate', 40,
             1000, '0123456789abcdef', 3,
             ?6,
@@ -138,7 +159,9 @@ fn insert_calibration(
             window,
             fitted_micros,
             evidence_hex(&training),
-            evidence_hex(&validation)
+            evidence_hex(&validation),
+            billing_semantics_id,
+            cost_model_id
         ],
     )
     .expect("insert window_calibration_result");
@@ -787,15 +810,16 @@ fn integration_calibration_overprediction_produces_negative_residual() {
 // Integration: single-source calibration proof via shared calibration repository
 // ---------------------------------------------------------------------------
 
-#[test]
-fn integration_single_source_calibration_proof_updates_provenance_and_explained_change() {
-    let mut conn = fixture_db();
-    let window_key = WindowSemanticKey::new("five_hour");
-    let cost_model_id = CostModelId::new("cm-1");
-
+/// Seeds one account with two observations of `window_key`, received at 1,000
+/// and 2,000 ns and 100,000 ppm apart, through the store's own inserts: the
+/// interval the store-backed reconciliation tests reconcile.
+fn seed_proof_interval(
+    conn: &rusqlite::Connection,
+    window_key: &WindowSemanticKey,
+) -> (AccountId, ObservationRowId, ObservationRowId) {
     // 0. Set up account, sample run, policy snapshot, and attempts to satisfy foreign keys
     let account = observe_account(
-        &conn,
+        conn,
         "anthropic",
         "acct-proof",
         UtcTimestamp::from_unix_nanos(100),
@@ -803,7 +827,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("observe account");
 
     let run = start_sample_run(
-        &conn,
+        conn,
         Trigger::Manual,
         UtcTimestamp::from_unix_nanos(200),
         "reconciliation-test",
@@ -811,11 +835,11 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("start sample run");
 
     let snapshot =
-        resolve_policy_snapshot(&conn, account, UtcTimestamp::from_unix_nanos(300), &POLICY)
+        resolve_policy_snapshot(conn, account, UtcTimestamp::from_unix_nanos(300), &POLICY)
             .expect("resolve snapshot");
 
     let att1 = start_meter_attempt(
-        &conn,
+        conn,
         &NewMeterAttempt {
             run_id: run,
             account_id: account,
@@ -833,7 +857,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("att1 inserts");
 
     let att2 = start_meter_attempt(
-        &conn,
+        conn,
         &NewMeterAttempt {
             run_id: run,
             account_id: account,
@@ -852,7 +876,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
 
     // 1. Insert response evidence and observations in SQLite store
     let ev1 = insert_response_evidence(
-        &conn,
+        conn,
         &NewMeterResponseEvidence {
             attempt_id: att1,
             response_classification: "success".into(),
@@ -867,7 +891,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("ev1 inserts");
 
     let obs1_id = insert_observation(
-        &conn,
+        conn,
         &NewMeterObservation {
             attempt_id: att1,
             evidence_id: ev1,
@@ -887,7 +911,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("obs1 inserts");
 
     insert_window(
-        &conn,
+        conn,
         &NewMeterWindow {
             observation_id: obs1_id,
             semantic_key: window_key.clone(),
@@ -903,7 +927,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("win1 inserts");
 
     let ev2 = insert_response_evidence(
-        &conn,
+        conn,
         &NewMeterResponseEvidence {
             attempt_id: att2,
             response_classification: "success".into(),
@@ -918,7 +942,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("ev2 inserts");
 
     let obs2_id = insert_observation(
-        &conn,
+        conn,
         &NewMeterObservation {
             attempt_id: att2,
             evidence_id: ev2,
@@ -938,7 +962,7 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     .expect("obs2 inserts");
 
     insert_window(
-        &conn,
+        conn,
         &NewMeterWindow {
             observation_id: obs2_id,
             semantic_key: window_key.clone(),
@@ -952,6 +976,17 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
         },
     )
     .expect("win2 inserts");
+
+    (account, obs1_id, obs2_id)
+}
+
+#[test]
+fn integration_single_source_calibration_proof_updates_provenance_and_explained_change() {
+    let mut conn = fixture_db();
+    let window_key = WindowSemanticKey::new("five_hour");
+    let cost_model_id = CostModelId::new("cm-1");
+
+    let (account, obs1_id, obs2_id) = seed_proof_interval(&conn, &window_key);
 
     // 2. Insert and activate calibration 1: fitted = 100_000 micros per point
     insert_calibration(
@@ -1048,6 +1083,100 @@ fn integration_single_source_calibration_proof_updates_provenance_and_explained_
     let cal2_witness = WitnessId::WindowCalibration(WindowCalibrationId::new("wcr-proof-2"));
     assert!(res2.provenance().witnesses().contains(&cal2_witness));
     assert!(!res2.provenance().witnesses().contains(&cal1_witness));
+}
+
+/// The store-backed reconciliation judges its calibration against the cost
+/// model in force at the knowledge time (`aub-fdh3`): the interval's credits
+/// are priced under that model, so a calibration fitted under a model it has
+/// superseded, or under other billing semantics, is not the applicable current
+/// calibration the residual needs. The planted negatives are the same ledger
+/// at a knowledge time before the supersession, which still reconciles, and a
+/// calibration under matching semantics, which reconciles where the mismatched
+/// one does not.
+#[test]
+fn integration_store_reconciliation_judges_the_calibration_against_the_cost_model_in_force() {
+    use agent_usage_book::store::cost_model::{
+        activate as activate_cost_model, anthropic_claude_messages_incomplete_v1,
+        anthropic_claude_messages_v1,
+    };
+    let reconcile_at = |conn: &rusqlite::Connection,
+                        (account, start, end): (AccountId, ObservationRowId, ObservationRowId),
+                        knowledge: i64| {
+        reconcile_candidate_from_store(
+            conn,
+            account,
+            start,
+            end,
+            &WindowSemanticKey::new("five_hour"),
+            &CostModelId::new("unused"),
+            UtcTimestamp::from_unix_nanos(knowledge),
+            UtcTimestamp::from_unix_nanos(2_500),
+        )
+        .expect("the store reconciliation must answer")
+    };
+    let not_computed_for_calibration = |outcome: &ReconciliationOutcome| {
+        matches!(
+            outcome,
+            ReconciliationOutcome::NotComputed { failing_conditions }
+                if failing_conditions
+                    .contains(&EligibilityCondition::ApplicableCurrentCalibration)
+        )
+    };
+    let (actor, policy, verdict) = activation_parts();
+    let seed = |cal_id: &str, billing: &str| {
+        let mut conn = fixture_db();
+        let model = anthropic_claude_messages_v1(UtcTimestamp::from_unix_nanos(0));
+        activate_cost_model(&mut conn, &model, UtcTimestamp::from_unix_nanos(50), None)
+            .expect("the cost model activates");
+        let interval = seed_proof_interval(&conn, &WindowSemanticKey::new("five_hour"));
+        insert_calibration_priced_under(
+            &conn,
+            cal_id,
+            ("anthropic", "max", "five_hour"),
+            100_000,
+            model.id().as_str(),
+            billing,
+        );
+        let (training, validation) = calibration_evidence(cal_id);
+        activate(
+            &mut conn,
+            &WindowCalibrationId::new(cal_id),
+            UtcTimestamp::from_unix_nanos(500),
+            None,
+            &ActivationRequest {
+                actor: &actor,
+                policy: &policy,
+                training: &training,
+                validation: &validation,
+                contamination: &verdict,
+            },
+        )
+        .expect("the calibration activates");
+        (conn, model, interval)
+    };
+
+    // Superseded: current under the model it was fitted against, then not
+    // current once a successor supersedes that model, from the supersession on.
+    let (mut conn, model, interval) =
+        seed("cal-fdh3-superseded", "anthropic-messages-subscription-v1");
+    let before = reconcile_at(&conn, interval, 1_500);
+    assert!(before.as_computed().is_some(), "{before:?}");
+    activate_cost_model(
+        &mut conn,
+        &anthropic_claude_messages_incomplete_v1(UtcTimestamp::from_unix_nanos(0)),
+        UtcTimestamp::from_unix_nanos(3_000),
+        Some(model.id()),
+    )
+    .expect("the successor supersedes the model");
+    let after = reconcile_at(&conn, interval, 3_500);
+    assert!(not_computed_for_calibration(&after), "{after:?}");
+    let back_then = reconcile_at(&conn, interval, 1_500);
+    assert!(back_then.as_computed().is_some(), "{back_then:?}");
+
+    // Inapplicable: billing semantics other than the model in force.
+    let (conn, _, interval) = seed("cal-fdh3-inapplicable", "billing-other-v1");
+    let outcome = reconcile_at(&conn, interval, 1_500);
+    assert!(not_computed_for_calibration(&outcome), "{outcome:?}");
 }
 
 // ---------------------------------------------------------------------------
