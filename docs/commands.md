@@ -245,9 +245,14 @@ whether it is a scalar calibration or a per-kind one. Every refusal for a
 stored calibration that is not current exits 6 (`InsufficientEvidence`) after
 the report is printed, whatever made it not current: a passed review, a
 superseded cost model, a calibration whose semantics do not match the active
-cost model (`inapplicable`), or a per-kind calibration past review. `aub can-run`
-does the same when a constraining window's calibration, scalar or per-kind, is
-not current, and its error names every such window. `aub calibrate show` and
+cost model (`inapplicable`), or a per-kind calibration past review. A current
+calibration fitted under a cost model other than the active one refuses in the
+same class, naming both models. `aub can-run` does the same when a
+constraining window's calibration, scalar or per-kind, is not current, judged
+against the active cost model exactly as here, and its error names every such
+window. A window whose calibration is per-kind and current refuses naming it
+as per-kind, since it converts tokens of each kind rather than credits, and
+that refusal exits 0. `aub calibrate show` and
 `aub calibrate history` label a calibration with the same health these
 commands refuse by. With neither a calibration nor an estimate card the refusal
 names the missing calibration, and the exit stays 0.

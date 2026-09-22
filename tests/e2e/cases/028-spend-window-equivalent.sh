@@ -158,12 +158,12 @@ case_assertions() {
     assert_stdout_contains 8 "input"
 
     # A calibration that does not apply to the active cost model is not
-    # current, so the refusal exits in the not-current class (aub-ov2f).
+    # current, so the refusal exits in the not-current class (aub-ov2f). It is
+    # judged against the active model before any conversion (aub-fdh3), so the
+    # refusal names the health rather than each mismatched fact.
     assert_exit 6 9
     assert_json_field 9 "groups[0].window_equivalent.status" "unavailable"
-    assert_stdout_contains 9 "billing semantics match calibration"
-    assert_stdout_contains 9 "cost model matches calibration"
-    assert_stdout_contains 9 "calibration health: inapplicable"
+    assert_stdout_contains 9 "current calibration for provider anthropic and window seven_day: calibration health is inapplicable"
 
     assert_exit 0 10
     assert_stdout_contains 10 "calibration five_hour-fixture-calibration-2 active for window five_hour"
