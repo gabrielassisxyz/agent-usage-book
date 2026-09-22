@@ -2749,6 +2749,7 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
                 timestamp,
                 review_after: config.calibration.review_after,
                 health_refusal: std::cell::Cell::new(None),
+                cost_model_mismatch: std::cell::RefCell::new(None),
             });
     let mut report = assemble_spend(
         &conn,
@@ -2787,6 +2788,9 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
     let health_refusal = window_resolver
         .as_ref()
         .and_then(|resolver| resolver.health_refusal.get());
+    let cost_model_mismatch = window_resolver
+        .as_ref()
+        .and_then(|resolver| resolver.cost_model_mismatch.take());
     if let Some(failure) = refresh_failure {
         Err(Error::IngestIncomplete(failure))
     } else if !report.ingest.unreadable_files.is_empty() {
@@ -2798,6 +2802,12 @@ fn spend(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<()
         Err(spend_not_current_calibration_error(
             options.window_equivalent.as_deref().unwrap_or_default(),
             health,
+        ))
+    } else if let Some((fitted, active)) = cost_model_mismatch {
+        Err(spend_cost_model_mismatch_error(
+            options.window_equivalent.as_deref().unwrap_or_default(),
+            &fitted,
+            &active,
         ))
     } else {
         Ok(())
@@ -2814,6 +2824,22 @@ fn spend_not_current_calibration_error(
     Error::InsufficientEvidence(format!(
         "window equivalent refused: the stored calibration for window {window_key} is {}, not current",
         health.label()
+    ))
+}
+
+/// The exit for a window equivalent withheld because the stored calibration
+/// was fitted under a cost model other than the active one: the not-current
+/// class of [`spend_not_current_calibration_error`], since that calibration no
+/// longer prices what is in force either (`aub-fdh3`).
+fn spend_cost_model_mismatch_error(
+    window_key: &str,
+    fitted: &crate::domain::provenance::CostModelId,
+    active: &crate::domain::provenance::CostModelId,
+) -> Error {
+    Error::InsufficientEvidence(format!(
+        "window equivalent refused: the stored calibration for window {window_key} was fitted under cost model {}, not the active cost model {}",
+        fitted.as_str(),
+        active.as_str()
     ))
 }
 
@@ -2838,6 +2864,15 @@ struct SpendWindowResolver<'a> {
     /// here for the command to turn into a non-zero exit once the report is
     /// rendered: a figure withheld for review must not look like a clean run.
     health_refusal: std::cell::Cell<Option<crate::calibration::health::CalibrationHealth>>,
+    /// The fitted and the active cost model of a current calibration that
+    /// refused a group because the two differ, recorded for the same
+    /// not-current exit as `health_refusal` (`aub-fdh3`).
+    cost_model_mismatch: std::cell::RefCell<
+        Option<(
+            crate::domain::provenance::CostModelId,
+            crate::domain::provenance::CostModelId,
+        )>,
+    >,
 }
 
 impl SpendWindowResolver<'_> {
@@ -2853,8 +2888,14 @@ impl SpendWindowResolver<'_> {
     fn calibration_health(
         &self,
         calibration: &crate::store::calibration::WindowCalibration,
-    ) -> crate::calibration::health::CalibrationHealth {
-        stored_window_calibration_health(calibration, self.review_after, self.timestamp)
+    ) -> Result<crate::calibration::health::CalibrationHealth, Error> {
+        stored_window_calibration_health(
+            self.conn,
+            calibration,
+            self.active_cost_model,
+            self.review_after,
+            self.timestamp,
+        )
     }
 
     /// The refusal for a stored calibration that is not current, recorded so
@@ -3080,7 +3121,8 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
         // the review it is asking for.
         let health = calibration
             .as_ref()
-            .map(|calibration| self.calibration_health(calibration));
+            .map(|calibration| self.calibration_health(calibration))
+            .transpose()?;
         let calibration = match (spend_window_precedence(health), calibration) {
             (SpendWindowPrecedence::Calibrated, Some(calibration)) => calibration,
             (SpendWindowPrecedence::RefuseHealth(health), _) => {
@@ -3111,40 +3153,23 @@ impl WindowEquivalentResolver for SpendWindowResolver<'_> {
             model.billing_semantics_id().clone(),
             Some(model.id().clone()),
         );
-        let calibration_facts = crate::calibration::health::CalibrationFacts {
-            plan_tier: calibration.plan_tier().clone(),
-            meter_semantics_id: calibration.meter_semantics_id().clone(),
-            billing_semantics_id: calibration.billing_semantics_id().clone(),
-        };
-        let applicability = crate::calibration::health::ApplicabilityContext {
-            plan_tier: conversion_context.plan_tier.clone(),
-            meter_semantics_id: conversion_context.meter_semantics_id.clone(),
-            billing_semantics_id: conversion_context.billing_semantics_id.clone(),
-        };
-        let health_inputs = crate::calibration::health::HealthInputs {
-            calibration: &calibration_facts,
-            context: &applicability,
-            lifecycle: crate::calibration::health::LifecycleState::Active,
-            cost_model_superseded: crate::store::cost_model::is_superseded(self.conn, model.id())?,
-            // No drift finding is stored anywhere yet; aub-7j5u decides it.
-            drift: None,
-            review_due_at: Some(crate::store::calibration::review_due_at(
-                &calibration,
-                self.review_after,
-            )),
-        };
-        let health = crate::calibration::health::compute_health(&health_inputs, self.timestamp);
-        // A superseded cost model makes the calibration not current exactly as
-        // a passed review does, so it exits in the same class (`aub-ov2f`).
-        // `convert` still names the health among its refusal facts.
-        if health != crate::calibration::health::CalibrationHealth::Current {
-            self.health_refusal.set(Some(health));
+        // The precedence above already judged the calibration against this
+        // model and refused anything not current (`aub-fdh3`). A calibration
+        // fitted under another model that nothing superseded is still no
+        // figure to print, and `convert` refuses it by that fact; it exits in
+        // the same class as the health refusals, since it too is a stored
+        // calibration that no longer prices what is in force.
+        if calibration.cost_model_id() != model.id() {
+            self.cost_model_mismatch.replace(Some((
+                calibration.cost_model_id().clone(),
+                model.id().clone(),
+            )));
         }
         Ok(crate::calibration::conversion::convert(
             credits,
             &calibration,
             &conversion_context,
-            health,
+            crate::calibration::health::CalibrationHealth::Current,
         ))
     }
 }
@@ -7168,10 +7193,10 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     // reporting one.
     let plan_tier = "default";
 
+    let active_cost_model = crate::store::cost_model::load_active_at(&conn, timestamp)?;
     let GatheredWindowCalibrations {
         scalar: window_calibrations,
-        per_kind: per_kind_windows,
-        per_kind_not_current,
+        per_kind: per_kind_calibrations,
         not_current: not_current_calibrations,
     } = match &meter {
         crate::report::can_run::CanRunMeterReadiness::Fresh { windows, .. } => {
@@ -7181,6 +7206,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 &model,
                 plan_tier,
                 &account_config.provider,
+                active_cost_model.as_ref(),
                 config.calibration.review_after,
                 timestamp,
             )?
@@ -7189,8 +7215,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         | crate::report::can_run::CanRunMeterReadiness::AuthRequired => {
             GatheredWindowCalibrations {
                 scalar: std::collections::BTreeMap::new(),
-                per_kind: std::collections::BTreeSet::new(),
-                per_kind_not_current: std::collections::BTreeMap::new(),
+                per_kind: std::collections::BTreeMap::new(),
                 not_current: std::collections::BTreeMap::new(),
             }
         }
@@ -7204,7 +7229,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         &meter,
         &model,
         &window_calibrations,
-        &per_kind_windows,
+        &per_kind_calibrations,
         &config.models,
         timestamp,
     )?;
@@ -7238,7 +7263,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         model,
         meter,
         window_calibrations,
-        per_kind_not_current,
+        per_kind_calibrations,
         window_estimates,
         cost_model_missing_token_classes,
         // A plan-tier mismatch is realized through the calibration-health
@@ -7328,19 +7353,24 @@ fn can_run_not_current_calibration_exit(
 /// (`crate::calibration::health`) over whatever it finds. Absent entirely
 /// from the returned map means no calibration record exists for that window
 /// at all.
+///
+/// Takes eight arguments because the ledger, the windows, the model, the
+/// scope's plan tier and provider, the active cost model, the review horizon
+/// and the report instant are independent inputs of the one health decision.
+#[allow(clippy::too_many_arguments)]
 fn gather_window_calibrations(
     conn: &rusqlite::Connection,
     windows: &[crate::domain::window::MeterWindow],
     model: &crate::domain::window::ModelId,
     plan_tier: &str,
     provider: &str,
+    active_cost_model: Option<&crate::store::cost_model::CostModel>,
     review_after: MonotonicDuration,
     generated_at: UtcTimestamp,
 ) -> Result<GatheredWindowCalibrations, Error> {
     let mut result = std::collections::BTreeMap::new();
-    let mut per_kind = std::collections::BTreeSet::new();
+    let mut per_kind = std::collections::BTreeMap::new();
     let mut not_current = std::collections::BTreeMap::new();
-    let mut per_kind_not_current = std::collections::BTreeMap::new();
     for window in windows.iter().filter(|w| w.constrains(model)) {
         let scope = crate::store::calibration::CalibrationScope {
             provider: crate::store::cost_model::ProviderKey::new(provider),
@@ -7354,24 +7384,29 @@ fn gather_window_calibrations(
         let cal = match crate::store::calibration::load_active_at(conn, &scope, generated_at)? {
             None => continue,
             Some(crate::store::calibration::ActiveCalibration::PerKind(per_kind_cal)) => {
-                per_kind.insert(window.semantic_key().clone());
                 let health =
                     stored_per_kind_calibration_health(&per_kind_cal, review_after, generated_at);
                 if health != crate::calibration::health::CalibrationHealth::Current {
                     not_current.insert(window.semantic_key().clone(), health);
-                    per_kind_not_current.insert(
-                        window.semantic_key().clone(),
-                        crate::report::can_run::PerKindCalibrationNotCurrent {
-                            calibration_id: per_kind_cal.id.as_str().to_string(),
-                            health: map_calibration_health(health),
-                        },
-                    );
                 }
+                per_kind.insert(
+                    window.semantic_key().clone(),
+                    crate::report::can_run::PerKindCalibrationLookup {
+                        calibration_id: per_kind_cal.id.as_str().to_string(),
+                        health: map_calibration_health(health),
+                    },
+                );
                 continue;
             }
             Some(crate::store::calibration::ActiveCalibration::Scalar(cal)) => cal,
         };
-        let health = stored_window_calibration_health(&cal, review_after, generated_at);
+        let health = stored_window_calibration_health(
+            conn,
+            &cal,
+            active_cost_model,
+            review_after,
+            generated_at,
+        )?;
         if health != crate::calibration::health::CalibrationHealth::Current {
             not_current.insert(window.semantic_key().clone(), health);
         }
@@ -7390,25 +7425,31 @@ fn gather_window_calibrations(
     Ok(GatheredWindowCalibrations {
         scalar: result,
         per_kind,
-        per_kind_not_current,
         not_current,
     })
 }
 
-/// The health of one stored scalar window calibration, judged against its own
-/// scope, as `spend --window-equivalent` and `can-run` both read it before any
-/// cost model is in hand.
+/// The health of one stored scalar window calibration, as `spend
+/// --window-equivalent` and `can-run` both read it, judged against the active
+/// cost model (`aub-fdh3`).
 ///
-/// The applicability context mirrors the calibration's own scope rather than
-/// an independently tracked lifecycle: a genuine plan-tier or semantics
-/// mismatch surfaces through `load_active_at` itself returning nothing for a
-/// tier nobody fitted. The review instant is the fit time plus the configured
+/// Supersession is asked of the cost model the calibration was fitted under,
+/// the question `calibrate show` asks, so a calibration priced under a model
+/// that has since been replaced is `superseded` whichever model is active now.
+/// The billing semantics it must match are the active cost model's; with no
+/// active model there is nothing to compare, and the caller refuses for the
+/// missing model on its own. The plan tier and meter semantics mirror the
+/// calibration's own scope: a plan-tier mismatch surfaces through
+/// `load_active_at` itself returning nothing for a tier nobody fitted. The
+/// review instant is the fit time plus the configured
 /// `calibration.review_after` (`aub-6omr`, `aub-8pjw`).
 fn stored_window_calibration_health(
+    conn: &rusqlite::Connection,
     calibration: &crate::store::calibration::WindowCalibration,
+    active_cost_model: Option<&crate::store::cost_model::CostModel>,
     review_after: MonotonicDuration,
     now: UtcTimestamp,
-) -> crate::calibration::health::CalibrationHealth {
+) -> Result<crate::calibration::health::CalibrationHealth, Error> {
     let facts = crate::calibration::health::CalibrationFacts {
         plan_tier: calibration.plan_tier().clone(),
         meter_semantics_id: calibration.meter_semantics_id().clone(),
@@ -7417,14 +7458,21 @@ fn stored_window_calibration_health(
     let context = crate::calibration::health::ApplicabilityContext {
         plan_tier: calibration.plan_tier().clone(),
         meter_semantics_id: calibration.meter_semantics_id().clone(),
-        billing_semantics_id: calibration.billing_semantics_id().clone(),
+        billing_semantics_id: active_cost_model
+            .map_or(calibration.billing_semantics_id(), |model| {
+                model.billing_semantics_id()
+            })
+            .clone(),
     };
-    crate::calibration::health::compute_health(
+    Ok(crate::calibration::health::compute_health(
         &crate::calibration::health::HealthInputs {
             calibration: &facts,
             context: &context,
             lifecycle: crate::calibration::health::LifecycleState::Active,
-            cost_model_superseded: false,
+            cost_model_superseded: crate::store::cost_model::is_superseded(
+                conn,
+                calibration.cost_model_id(),
+            )?,
             // No drift finding is stored anywhere yet, and passive validation
             // defines none; aub-7j5u decides it.
             drift: None,
@@ -7434,7 +7482,7 @@ fn stored_window_calibration_health(
             )),
         },
         now,
-    )
+    ))
 }
 
 /// The health of one active per-kind calibration, as `spend
@@ -7459,18 +7507,17 @@ fn stored_per_kind_calibration_health(
 }
 
 /// What [`gather_window_calibrations`] found: the scalar lookups can-run
-/// bounds headroom with, the windows whose active calibration is per-kind, the
-/// per-kind ones among them that are not current, and the health of every
-/// stored calibration that is not current.
+/// bounds headroom with, the windows whose active calibration is per-kind with
+/// that calibration's health, and the health of every stored calibration that
+/// is not current.
 struct GatheredWindowCalibrations {
     scalar: std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
         crate::report::can_run::WindowCalibrationLookup,
     >,
-    per_kind: std::collections::BTreeSet<crate::domain::window::WindowSemanticKey>,
-    per_kind_not_current: std::collections::BTreeMap<
+    per_kind: std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
-        crate::report::can_run::PerKindCalibrationNotCurrent,
+        crate::report::can_run::PerKindCalibrationLookup,
     >,
     not_current: std::collections::BTreeMap<
         crate::domain::window::WindowSemanticKey,
@@ -7504,7 +7551,10 @@ fn gather_window_estimates(
         crate::domain::window::WindowSemanticKey,
         crate::report::can_run::WindowCalibrationLookup,
     >,
-    per_kind_calibrated: &std::collections::BTreeSet<crate::domain::window::WindowSemanticKey>,
+    per_kind_calibrated: &std::collections::BTreeMap<
+        crate::domain::window::WindowSemanticKey,
+        crate::report::can_run::PerKindCalibrationLookup,
+    >,
     models: &crate::config::ModelTable,
     generated_at: UtcTimestamp,
 ) -> Result<
@@ -7532,7 +7582,7 @@ fn gather_window_estimates(
 
     for window in windows.iter().filter(|w| w.constrains(model)) {
         if calibrations.contains_key(window.semantic_key())
-            || per_kind_calibrated.contains(window.semantic_key())
+            || per_kind_calibrated.contains_key(window.semantic_key())
         {
             continue;
         }
@@ -9145,12 +9195,19 @@ pub(crate) fn assemble_calibrate_show(
 /// The resolved `calibration.review_after`, for the calibrate reports that
 /// label health and otherwise read no configuration.
 fn resolved_calibration_review_after() -> Result<MonotonicDuration, Error> {
-    let env = crate::config::RealEnv;
-    let file_path = resolve_config_file_path(None, &env);
+    calibration_review_after_from(&crate::config::RealEnv)
+}
+
+/// [`resolved_calibration_review_after`] against a given environment, which
+/// names the configuration file and may override the key itself.
+fn calibration_review_after_from(
+    env: &dyn crate::config::EnvSource,
+) -> Result<MonotonicDuration, Error> {
+    let file_path = resolve_config_file_path(None, env);
     let file_contents = std::fs::read_to_string(&file_path).ok();
     let (config, _provenance) = crate::config::resolve(
         &crate::config::Overrides::new(),
-        &env,
+        env,
         file_contents.as_deref(),
         &file_path,
     )?;
@@ -12640,6 +12697,36 @@ mod tests {
         assert_eq!(resolve_config_file_path(None, &env), "/from/env.toml");
     }
 
+    /// The review horizon `calibrate show`, `history` and `compare` label
+    /// health by is the configured one, read from the file the environment
+    /// names (`aub-fdh3`). The planted negative is the same environment with
+    /// no such file, which resolves the thirty-day default: a hard-coded
+    /// thirty days passes that half and fails the first.
+    #[test]
+    fn calibration_review_after_reads_the_configured_horizon_not_the_default() {
+        let state = test_support::StateDir::new();
+        let file = state.path().join("aub.toml");
+        std::fs::write(&file, "[calibration]\nreview_after = \"7d\"\n")
+            .expect("the config file must write");
+        let env = FakeEnv::new()
+            .set("HOME", "/nonexistent")
+            .set("AUB_CONFIG_FILE", file.to_str().expect("a UTF-8 temp path"));
+        assert_eq!(
+            calibration_review_after_from(&env).expect("the configuration must resolve"),
+            MonotonicDuration::from_seconds(7 * 86_400)
+        );
+
+        let missing = state.path().join("absent.toml");
+        let env = FakeEnv::new().set("HOME", "/nonexistent").set(
+            "AUB_CONFIG_FILE",
+            missing.to_str().expect("a UTF-8 temp path"),
+        );
+        assert_eq!(
+            calibration_review_after_from(&env).expect("the configuration must resolve"),
+            MonotonicDuration::from_seconds(30 * 86_400)
+        );
+    }
+
     #[test]
     fn resolve_config_file_path_falls_back_to_the_non_identifying_default() {
         let env = FakeEnv::new().set("HOME", "/tmp/synthetic-home");
@@ -13607,6 +13694,7 @@ usage_evidence = "measured"
             timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(4_000),
             review_after: MonotonicDuration::from_seconds(30 * 86_400),
             health_refusal: std::cell::Cell::new(None),
+            cost_model_mismatch: std::cell::RefCell::new(None),
         };
         let usage = crate::domain::tokens::UsageVector::new(
             crate::domain::tokens::KnownTokenVector::new(
@@ -13679,13 +13767,17 @@ usage_evidence = "measured"
     #[test]
     fn stored_window_calibration_health_turns_review_due_at_the_configured_instant() {
         use crate::calibration::health::CalibrationHealth;
+        let (_dir, conn) = calibrate_fixture_db();
         let calibration = review_window_calibration(REVIEW_FIT_NANOS);
         let at = |offset: i64| {
             stored_window_calibration_health(
+                &conn,
                 &calibration,
+                None,
                 review_after_thirty_days(),
                 crate::domain::time::UtcTimestamp::from_unix_nanos(review_instant_nanos() + offset),
             )
+            .expect("the health must compute")
         };
         assert_eq!(at(-ONE_SECOND_NANOS), CalibrationHealth::Current);
         assert_eq!(at(0), CalibrationHealth::ReviewDue);
@@ -13712,8 +13804,11 @@ usage_evidence = "measured"
                 ),
                 review_after: review_after_thirty_days(),
                 health_refusal: std::cell::Cell::new(None),
+                cost_model_mismatch: std::cell::RefCell::new(None),
             };
-            resolver.calibration_health(&calibration)
+            resolver
+                .calibration_health(&calibration)
+                .expect("the health must compute")
         };
         assert_eq!(health_at(-ONE_SECOND_NANOS), CalibrationHealth::Current);
         assert_eq!(health_at(0), CalibrationHealth::ReviewDue);
@@ -13861,6 +13956,7 @@ usage_evidence = "measured"
                 ),
                 review_after: review_after_thirty_days(),
                 health_refusal: std::cell::Cell::new(None),
+                cost_model_mismatch: std::cell::RefCell::new(None),
             };
             let derivation = resolver
                 .resolve(Some("acct"), Some("anthropic"), None, None, &ov2f_usage())
@@ -13882,9 +13978,10 @@ usage_evidence = "measured"
         assert_eq!(missing, vec!["active cost model".to_string()]);
     }
 
-    /// A superseded cost model makes spend's second health check refuse, and
-    /// it records the same health refusal a review-due calibration does, so
-    /// both exit in one class (`aub-ov2f`). The planted negative is the same
+    /// A superseded cost model makes spend refuse by the calibration's health,
+    /// before any estimate or conversion (`aub-fdh3`), and it records the same
+    /// health refusal a review-due calibration does, so both exit in one class
+    /// (`aub-ov2f`). The planted negative is the same
     /// ledger before the supersession: the group converts and records nothing.
     #[test]
     fn spend_resolve_records_a_health_refusal_for_a_superseded_cost_model() {
@@ -13914,6 +14011,7 @@ usage_evidence = "measured"
                 timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(10_000),
                 review_after: review_after_thirty_days(),
                 health_refusal: std::cell::Cell::new(None),
+                cost_model_mismatch: std::cell::RefCell::new(None),
             };
             let derivation = resolver
                 .resolve(
@@ -13949,9 +14047,140 @@ usage_evidence = "measured"
         let (derivation, refusal) = resolve(&conn);
         assert_eq!(refusal, Some(CalibrationHealth::Superseded));
         assert!(
-            ov2f_missing(&derivation).contains(&"calibration health: superseded".to_string()),
+            ov2f_missing(&derivation).contains(
+                &"current calibration for provider anthropic and window five_hour: calibration health is superseded"
+                    .to_string()
+            ),
             "{:?}",
             ov2f_missing(&derivation)
+        );
+    }
+
+    /// A current calibration fitted under a cost model other than the active
+    /// one, which nothing superseded, refuses the group and is recorded for
+    /// the not-current exit (`aub-fdh3`); before, `convert` refused it and the
+    /// command exited 0. The planted negative is the same ledger with the
+    /// calibration's own model active: it converts and records nothing.
+    #[test]
+    fn spend_resolve_records_a_cost_model_mismatch_for_the_not_current_exit() {
+        use crate::store::cost_model::{
+            anthropic_claude_messages_incomplete_v1, anthropic_claude_messages_v1,
+        };
+        let (_dir, mut conn) = calibrate_fixture_db();
+        let at = crate::domain::time::UtcTimestamp::from_unix_nanos(1_000);
+        let model = anthropic_claude_messages_v1(at);
+        crate::store::cost_model::activate(&mut conn, &model, at, None)
+            .expect("the cost model activates");
+        seed_active_default_five_hour_calibration(
+            &mut conn,
+            2_000,
+            model.id().as_str(),
+            model.billing_semantics_id(),
+        );
+        let other = anthropic_claude_messages_incomplete_v1(at);
+        let book = crate::valuation::RateBook::default();
+        let credits = ov2f_credits();
+        let resolve = |active: &crate::store::cost_model::CostModel| {
+            let resolver = SpendWindowResolver {
+                conn: &conn,
+                active_cost_model: Some(active),
+                rate_cards: &book,
+                window_key: "five_hour",
+                timestamp: crate::domain::time::UtcTimestamp::from_unix_nanos(10_000),
+                review_after: review_after_thirty_days(),
+                health_refusal: std::cell::Cell::new(None),
+                cost_model_mismatch: std::cell::RefCell::new(None),
+            };
+            let derivation = resolver
+                .resolve(
+                    Some("acct"),
+                    Some("anthropic"),
+                    None,
+                    Some(&credits),
+                    &ov2f_usage(),
+                )
+                .expect("the resolver must answer");
+            (
+                derivation,
+                resolver.health_refusal.get(),
+                resolver.cost_model_mismatch.take(),
+            )
+        };
+
+        let (derivation, health, mismatch) = resolve(&model);
+        assert_eq!((health, mismatch), (None, None));
+        assert!(
+            matches!(
+                derivation,
+                crate::report::WindowEquivalentDerivation::Available(_)
+            ),
+            "{:?}",
+            ov2f_missing(&derivation)
+        );
+
+        let (derivation, health, mismatch) = resolve(&other);
+        assert_eq!(health, None);
+        assert_eq!(mismatch, Some((model.id().clone(), other.id().clone())));
+        assert!(
+            ov2f_missing(&derivation).contains(&"cost model matches calibration".to_string()),
+            "{:?}",
+            ov2f_missing(&derivation)
+        );
+        let error = spend_cost_model_mismatch_error("five_hour", model.id(), other.id());
+        assert_eq!(
+            error.exit_class(),
+            crate::error::ExitClass::InsufficientEvidence
+        );
+    }
+
+    /// The stored health spend and can-run read compares billing semantics
+    /// with the active cost model (`aub-fdh3`): a calibration fitted under
+    /// other semantics is `inapplicable`, where one fitted under the model's
+    /// own is `current` on the same ledger and at the same instant.
+    #[test]
+    fn stored_window_calibration_health_is_inapplicable_under_other_billing_semantics() {
+        use crate::calibration::health::CalibrationHealth;
+        let model = crate::store::cost_model::anthropic_claude_messages_v1(
+            crate::domain::time::UtcTimestamp::from_unix_nanos(1_000),
+        );
+        let health_under = |billing: &crate::domain::ids::BillingSemanticsId| {
+            let (_dir, mut conn) = calibrate_fixture_db();
+            seed_active_default_five_hour_calibration(
+                &mut conn,
+                2_000,
+                model.id().as_str(),
+                billing,
+            );
+            let scope = crate::store::calibration::CalibrationScope {
+                provider: crate::store::cost_model::ProviderKey::new("anthropic"),
+                plan_tier: crate::store::calibration::PlanTier::new("default"),
+                window_semantic_key: crate::domain::window::WindowSemanticKey::new("five_hour"),
+            };
+            let at = crate::domain::time::UtcTimestamp::from_unix_nanos(10_000);
+            let Some(crate::store::calibration::ActiveCalibration::Scalar(calibration)) =
+                crate::store::calibration::load_active_at(&conn, &scope, at)
+                    .expect("the calibration loads")
+            else {
+                panic!("the seeded calibration is scalar and active");
+            };
+            stored_window_calibration_health(
+                &conn,
+                &calibration,
+                Some(&model),
+                review_after_thirty_days(),
+                at,
+            )
+            .expect("the health must compute")
+        };
+        assert_eq!(
+            health_under(model.billing_semantics_id()),
+            CalibrationHealth::Current
+        );
+        assert_eq!(
+            health_under(&crate::domain::ids::BillingSemanticsId::new(
+                "other-billing-v1"
+            )),
+            CalibrationHealth::Inapplicable
         );
     }
 
@@ -13999,6 +14228,7 @@ usage_evidence = "measured"
                 ),
                 review_after: review_after_one_second(),
                 health_refusal: std::cell::Cell::new(None),
+                cost_model_mismatch: std::cell::RefCell::new(None),
             };
             let derivation = resolver
                 .resolve(Some("acct"), Some("anthropic"), None, None, &ov2f_usage())
@@ -14052,6 +14282,7 @@ usage_evidence = "measured"
                 &crate::domain::window::ModelId::new("claude-opus"),
                 "default",
                 "anthropic",
+                None,
                 review_after_one_second(),
                 crate::domain::time::UtcTimestamp::from_unix_nanos(
                     PER_KIND_REVIEW_INSTANT_NANOS + offset,
@@ -14067,9 +14298,9 @@ usage_evidence = "measured"
             Some(&CalibrationHealth::ReviewDue)
         );
         let stale = due
-            .per_kind_not_current
+            .per_kind
             .get(&key)
-            .expect("the per-kind window is recorded not current");
+            .expect("the per-kind window is recorded");
         assert_eq!(stale.calibration_id, "promoted-mvcand-1");
         assert_eq!(stale.health.label(), "review_due");
         match can_run_not_current_calibration_exit(true, &due.not_current) {
@@ -14084,7 +14315,13 @@ usage_evidence = "measured"
 
         let before = gather_at(-1);
         assert!(before.not_current.is_empty());
-        assert!(before.per_kind_not_current.is_empty());
+        assert_eq!(
+            before
+                .per_kind
+                .get(&key)
+                .map(|per_kind| per_kind.health.label()),
+            Some("current")
+        );
         assert!(can_run_not_current_calibration_exit(true, &before.not_current).is_ok());
     }
 
@@ -14182,6 +14419,7 @@ usage_evidence = "measured"
             &crate::domain::window::ModelId::new("claude-opus"),
             "default",
             "anthropic",
+            None,
             MonotonicDuration::from_seconds(30 * 86_400),
             crate::domain::time::UtcTimestamp::from_unix_nanos(4_000),
         )
@@ -14190,7 +14428,7 @@ usage_evidence = "measured"
         assert!(
             gathered
                 .per_kind
-                .contains(&WindowSemanticKey::new("five_hour"))
+                .contains_key(&WindowSemanticKey::new("five_hour"))
         );
     }
 

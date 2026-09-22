@@ -231,15 +231,33 @@ pub struct WindowCalibrationLookup {
     pub constraint: CalibratedWindowConstraint,
 }
 
-/// A constraining window whose active calibration is per-kind and not current
-/// (`aub-ov2f`). A per-kind calibration has no credits-per-point interval, so
+/// A constraining window whose active calibration is per-kind (`aub-ov2f`,
+/// `aub-fdh3`). A per-kind calibration has no credits-per-point interval, so
 /// it never becomes a [`WindowCalibrationLookup`]; this carries only what the
-/// refusal names, so a stale per-kind record refuses by its health rather
-/// than reading as a window with no calibration at all.
+/// refusal names, so a per-kind record refuses by its health when it is not
+/// current and by its shape when it is, and never reads as a window with no
+/// calibration at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct PerKindCalibrationNotCurrent {
+pub struct PerKindCalibrationLookup {
     pub calibration_id: String,
     pub health: CalibrationHealth,
+}
+
+/// Why a window whose active calibration is per-kind bounds no headroom: its
+/// health when that is not current, and otherwise its shape, since a per-kind
+/// calibration converts tokens of each kind rather than credits.
+fn per_kind_calibration_refusal(per_kind: &PerKindCalibrationLookup) -> String {
+    if per_kind.health != CalibrationHealth::Current {
+        return format!(
+            "calibration #{} health is {}, not current",
+            per_kind.calibration_id,
+            per_kind.health.label()
+        );
+    }
+    format!(
+        "calibration #{} is per-kind, and a per-kind calibration converts tokens of each kind, not credits, so it bounds no credit headroom",
+        per_kind.calibration_id
+    )
 }
 
 /// One window's percent-of-window rate cards, converted into the same credit
@@ -288,9 +306,9 @@ pub struct CanRunJoinInputs {
     pub model: ModelId,
     pub meter: CanRunMeterReadiness,
     pub window_calibrations: BTreeMap<WindowSemanticKey, WindowCalibrationLookup>,
-    /// Windows whose active calibration is per-kind and not current, consulted
-    /// only where `window_calibrations` holds no entry (`aub-ov2f`).
-    pub per_kind_not_current: BTreeMap<WindowSemanticKey, PerKindCalibrationNotCurrent>,
+    /// Windows whose active calibration is per-kind, consulted only where
+    /// `window_calibrations` holds no entry (`aub-ov2f`, `aub-fdh3`).
+    pub per_kind_calibrations: BTreeMap<WindowSemanticKey, PerKindCalibrationLookup>,
     /// The rate-card estimates available per window, consulted only where
     /// `window_calibrations` holds no entry at all (`aub-8vpc`).
     pub window_estimates: BTreeMap<WindowSemanticKey, WindowEstimate>,
@@ -418,16 +436,12 @@ pub fn compose_can_run_report(inputs: CanRunJoinInputs) -> CanRunReport {
                 // `Superseded`, `Inapplicable` or `Provisional` calibration produces
                 // a refusal naming that exact state.
                 for window in constraining {
-                    let per_kind_stale = inputs.per_kind_not_current.get(window.semantic_key());
+                    let per_kind = inputs.per_kind_calibrations.get(window.semantic_key());
                     match inputs.window_calibrations.get(window.semantic_key()) {
-                        None if let Some(stale) = per_kind_stale => {
+                        None if let Some(per_kind) = per_kind => {
                             missing.push(missing_fact(
                                 window.semantic_key().as_str(),
-                                format!(
-                                    "calibration #{} health is {}, not current",
-                                    stale.calibration_id,
-                                    stale.health.label()
-                                ),
+                                per_kind_calibration_refusal(per_kind),
                             ));
                         }
                         // Precedence (`aub-8vpc`): no calibration record at all
@@ -858,7 +872,7 @@ mod compose_tests {
                 observed_age: Some(MonotonicDuration::from_seconds(41)),
             },
             window_calibrations: calibrations,
-            per_kind_not_current: BTreeMap::new(),
+            per_kind_calibrations: BTreeMap::new(),
             window_estimates: BTreeMap::new(),
             cost_model_missing_token_classes: Vec::new(),
             plan_tier_mismatch: None,
@@ -1086,9 +1100,9 @@ mod compose_tests {
         let mut inputs = worked_example_inputs();
         let key = WindowSemanticKey::new("model-x:weekly");
         inputs.window_calibrations.remove(&key);
-        inputs.per_kind_not_current.insert(
+        inputs.per_kind_calibrations.insert(
             key,
-            PerKindCalibrationNotCurrent {
+            PerKindCalibrationLookup {
                 calibration_id: "mv-7".to_string(),
                 health: CalibrationHealth::ReviewDue,
             },
@@ -1104,6 +1118,38 @@ mod compose_tests {
             fact.reason,
             "calibration #mv-7 health is review_due, not current"
         );
+    }
+
+    /// A window whose active calibration is per-kind and current refuses
+    /// naming that calibration and its shape (`aub-fdh3`), not "no
+    /// calibration is recorded", which would be untrue, and not a health it
+    /// does not have.
+    #[test]
+    fn refusal_3_a_current_per_kind_calibration_names_its_shape() {
+        let mut inputs = worked_example_inputs();
+        let key = WindowSemanticKey::new("model-x:weekly");
+        inputs.window_calibrations.remove(&key);
+        inputs.per_kind_calibrations.insert(
+            key,
+            PerKindCalibrationLookup {
+                calibration_id: "mv-7".to_string(),
+                health: CalibrationHealth::Current,
+            },
+        );
+        let report = compose_can_run_report(inputs);
+        let fact = refused_of(&report)
+            .missing
+            .iter()
+            .find(|fact| fact.subject == "model-x:weekly")
+            .expect("expected a missing fact for the per-kind window")
+            .clone();
+        assert!(
+            fact.reason.starts_with("calibration #mv-7 is per-kind"),
+            "{}",
+            fact.reason
+        );
+        assert!(!fact.reason.contains("no calibration is recorded"));
+        assert!(!fact.reason.contains("not current"));
     }
 
     /// Unit, refusal 4 of 7: a cost model missing a token class refuses and

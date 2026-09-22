@@ -774,23 +774,13 @@ fn seed_task_identity(state: &StateDir) {
     .expect("the task kinds must insert");
 }
 
-/// Criterion (`aub-cab.6`): one seeded calibration identifier appears in
-/// `calibrate show`, calibrated spend-conversion provenance and can-run
-/// advice alike; append-only supersession moves all three in the same run;
-/// no source or configuration change happens between the two halves.
-///
-/// The spend half keeps the clean single-session shape (1,000,000 input
-/// tokens on account `spend`: 3.00 credits, exactly 10.0000 points at 30
-/// micros/point, 30.0000 at 10). The can-run history lives on account
-/// `work-primary` with three completed tasks, so one seeded repository
-/// drives all three consumers without the two workloads sharing a number.
-/// Every binary step points its endpoint at an unreachable port and the
-/// state directory carries no credential file, so the whole test runs
-/// without network or credentials.
-#[test]
-fn can_run_supersession_moves_all_three_consumers_together() {
-    let state = StateDir::new();
-
+/// Seeds everything `can-run --cached` needs to answer for account
+/// `work-primary` with no network and no credentials: the transcripts and
+/// tracker history of three completed tasks, their account markers, the
+/// published cost model and one fresh `five_hour` meter reading, under a
+/// configuration with `extra_config` appended. The spend-only session belongs
+/// to account `spend`. No calibration is seeded.
+fn seed_can_run_ledger(state: &StateDir, extra_config: &str) {
     let corpus = state.path().join("transcripts/claude-code/project");
     std::fs::create_dir_all(&corpus).unwrap();
     std::fs::create_dir_all(state.path().join("home")).unwrap();
@@ -823,12 +813,12 @@ fn can_run_supersession_moves_all_three_consumers_together() {
         state.path().join("transcripts/claude-code").display(),
         state.path().display(),
     );
-    std::fs::write(state.path().join("aub.toml"), config).unwrap();
-    seed_task_tracker(&state);
+    std::fs::write(state.path().join("aub.toml"), config + extra_config).unwrap();
+    seed_task_tracker(state);
 
-    run(&state, &["ingest", "transcripts"]);
-    run(&state, &["task", "ingest"]);
-    seed_task_identity(&state);
+    run(state, &["ingest", "transcripts"]);
+    run(state, &["task", "ingest"]);
+    seed_task_identity(state);
     // The spend session belongs to `spend`; the task sessions to
     // `work-primary`. Markers carry the logical account explicitly.
     for (session, account, observed) in [
@@ -866,10 +856,29 @@ fn can_run_supersession_moves_all_three_consumers_together() {
         .expect("the account marker must insert");
     }
     run(
-        &state,
+        state,
         &["cost-model", "activate", "anthropic_claude_messages_v1"],
     );
-    seed_meter_five_hour(&state);
+    seed_meter_five_hour(state);
+}
+
+/// Criterion (`aub-cab.6`): one seeded calibration identifier appears in
+/// `calibrate show`, calibrated spend-conversion provenance and can-run
+/// advice alike; append-only supersession moves all three in the same run;
+/// no source or configuration change happens between the two halves.
+///
+/// The spend half keeps the clean single-session shape (1,000,000 input
+/// tokens on account `spend`: 3.00 credits, exactly 10.0000 points at 30
+/// micros/point, 30.0000 at 10). The can-run history lives on account
+/// `work-primary` with three completed tasks, so one seeded repository
+/// drives all three consumers without the two workloads sharing a number.
+/// Every binary step points its endpoint at an unreachable port and the
+/// state directory carries no credential file, so the whole test runs
+/// without network or credentials.
+#[test]
+fn can_run_supersession_moves_all_three_consumers_together() {
+    let state = StateDir::new();
+    seed_can_run_ledger(&state, "");
 
     // First half: the conspicuous 30 micros/point coefficient from the
     // two-consumer test, so the spend arithmetic stays exactly comparable.
@@ -1076,4 +1085,284 @@ fn can_run_supersession_moves_all_three_consumers_together() {
 
     assert_ne!(spend_line_before, spend_line_after);
     assert_ne!(can_run_before, can_run_after);
+}
+
+/// Runs `can-run --cached` for `work-primary` against an unreachable
+/// endpoint, returning the whole output so a test can assert on a refusal's
+/// exit code as well as on its report.
+fn can_run_cached(state: &StateDir, format: &str) -> std::process::Output {
+    aub(state)
+        .args([
+            "can-run",
+            "--task-kind",
+            "task",
+            "--account",
+            "work-primary",
+            "--task-model",
+            "sonnet",
+            "--cached",
+            "--format",
+            format,
+        ])
+        .env("AUB_ANTHROPIC_ENDPOINT", "http://127.0.0.1:9")
+        .output()
+        .expect("the aub binary must be spawnable")
+}
+
+/// The first constraining window of a can-run JSON report, which a refused
+/// report does not carry. The report is the first document on stdout: a
+/// refusal that exits non-zero prints its error document after it.
+fn can_run_first_window(output: &std::process::Output) -> serde_json::Value {
+    let json: serde_json::Value = serde_json::Deserializer::from_slice(&output.stdout)
+        .into_iter()
+        .next()
+        .expect("can-run must emit a report")
+        .expect("can-run must emit valid JSON");
+    assert_eq!(json["command"], "can-run");
+    json["outcome"]["windows"][0].clone()
+}
+
+/// Criterion (`aub-fdh3`): can-run judges a stored calibration against the
+/// active cost model. Superseding the cost model the calibration was fitted
+/// under makes can-run refuse naming `superseded`, in the not-current exit
+/// class (6), with no headroom figure; the same ledger with the original cost
+/// model still active answers with the figure and exits 0. A health computed
+/// with supersession hard-coded to `false` keeps the calibration current and
+/// the exit at 0 here: the successor model also lacks a token class, which
+/// refuses the report on its own but is not a stored calibration's health.
+#[test]
+fn can_run_refuses_a_calibration_whose_cost_model_was_superseded() {
+    let state = StateDir::new();
+    seed_can_run_ledger(&state, "");
+    run(&state, &["__calibration-fixture", "five_hour", "30"]);
+
+    let before = can_run_cached(&state, "json");
+    assert_eq!(
+        before.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&before.stderr)
+    );
+    let window = can_run_first_window(&before);
+    assert_eq!(window["calibration_id"], "five_hour-fixture-calibration");
+    assert_eq!(window["headroom"]["lower"], "11400000");
+
+    run(
+        &state,
+        &[
+            "cost-model",
+            "activate",
+            "anthropic_claude_messages_incomplete_v1",
+        ],
+    );
+
+    let after = can_run_cached(&state, "text");
+    let stdout = String::from_utf8_lossy(&after.stdout);
+    let stderr = String::from_utf8_lossy(&after.stderr);
+    assert_eq!(after.status.code(), Some(6), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains(
+            "calibration #five_hour-fixture-calibration health is superseded, not current"
+        ),
+        "{stdout}"
+    );
+    assert!(stderr.contains("window five_hour: superseded"), "{stderr}");
+    assert!(!stdout.contains("headroom"), "{stdout}");
+
+    let after_json = can_run_cached(&state, "json");
+    assert_eq!(after_json.status.code(), Some(6));
+    assert_eq!(can_run_first_window(&after_json), serde_json::Value::Null);
+}
+
+/// Seeds and activates, through the store's own functions, a per-kind
+/// calibration for `anthropic/default/five_hour` fitted at 2,000 ns, so it is
+/// past any review horizon a real clock reads it under. The experiment is
+/// recorded on `work-primary`, whose meter reading is its baseline.
+fn seed_active_per_kind_calibration(state: &StateDir) {
+    use agent_usage_book::calibration::activation::{
+        ActivationActor, ActivationPolicy, ActivationRequest,
+    };
+    use agent_usage_book::calibration::contamination::{
+        ContaminationThresholds, ContaminationVerdict,
+    };
+    use agent_usage_book::domain::provenance::{CostModelId, EvidenceId, WindowCalibrationId};
+    use agent_usage_book::domain::tokens::TokenKind;
+    use agent_usage_book::store::calibration::{
+        ConditionNumber, EvidenceDigest, EvidenceFingerprint,
+    };
+    use agent_usage_book::store::calibration_controlled::{
+        ControlledExperimentId, ControlledExperimentRun, insert_begin,
+    };
+    use agent_usage_book::store::calibration_multivariate::{
+        MultivariateCandidate, MultivariateCandidateId, StoredKindCoefficient,
+        insert_multivariate_candidate,
+    };
+    use agent_usage_book::store::calibration_multivariate_result::{
+        MultivariateCalibration, activate_multivariate, insert_multivariate_result,
+    };
+    use agent_usage_book::store::cost_model::ValidityInterval;
+    use agent_usage_book::store::meter_evidence::ObservationRowId;
+
+    let ts = UtcTimestamp::from_unix_nanos;
+    let evidence = |tag: &str| -> std::collections::BTreeSet<EvidenceId> {
+        [EvidenceId::new(tag)].into_iter().collect()
+    };
+    let coefficients: Vec<StoredKindCoefficient> =
+        [(TokenKind::Input, 500_000), (TokenKind::Output, 1_000_000)]
+            .into_iter()
+            .map(|(kind, estimate)| StoredKindCoefficient {
+                kind,
+                estimate_micro_ppm_per_token: estimate,
+                std_error_micro_ppm_per_token: 1_000,
+                interval_low_micro_ppm_per_token: estimate - 2_000,
+                interval_high_micro_ppm_per_token: estimate + 2_000,
+            })
+            .collect();
+    let mut conn = connection::open(
+        &state.path().join(connection::LEDGER_DATABASE_FILE),
+        AccessMode::ReadWrite,
+        &PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1_000),
+        },
+    )
+    .expect("the ledger must already exist and open");
+    let baseline: i64 = conn
+        .query_row("SELECT id FROM meter_observation LIMIT 1", [], |row| {
+            row.get(0)
+        })
+        .expect("the meter reading is seeded");
+    let resolution = QuotaFractionPpm::new(10_000).unwrap();
+    let run = ControlledExperimentRun {
+        id: ControlledExperimentId::new("exp-fdh3-joint"),
+        account: "work-primary".to_string(),
+        provider: ProviderKey::new("anthropic"),
+        plan_tier: PlanTier::new("default"),
+        window_semantic_key: WindowSemanticKey::new("five_hour"),
+        cost_model_id: CostModelId::new("anthropic-claude-messages-v1"),
+        expected_token_kinds: vec![TokenKind::Input, TokenKind::Output],
+        baseline_observation_id: ObservationRowId::new(baseline),
+        baseline_quota_used: QuotaUsed::new(resolution),
+        baseline_resolution: ReportedResolution::new(resolution).unwrap(),
+        baseline_observed_at: ts(1_000),
+        baseline_plateau_started_at: ts(1_000),
+        contamination_thresholds: ContaminationThresholds::conservative_default(),
+        started_at: ts(1_000),
+        ended_at: None,
+        exclusivity_assertion: "reserved".to_string(),
+    };
+    insert_begin(&conn, &run).expect("the experiment begins");
+    insert_multivariate_candidate(
+        &mut conn,
+        &MultivariateCandidate {
+            id: MultivariateCandidateId::new("mvcand-fdh3"),
+            experiment: run.id.clone(),
+            provider: run.provider.clone(),
+            plan_tier: run.plan_tier.clone(),
+            window_semantic_key: run.window_semantic_key.clone(),
+            coefficients: coefficients.clone(),
+            condition_number: ConditionNumber::from_micros(4_000_000),
+            condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+            fit_residual_ppm: 120,
+            sample_count: 8,
+            inputs: EvidenceDigest::from_inputs(&evidence("training")),
+            statistical_method: "ols".to_string(),
+            statistical_parameters: "{}".to_string(),
+            phase_design: "design".to_string(),
+            validity: ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
+            knowledge_time: ts(2_000),
+        },
+    )
+    .expect("the joint candidate inserts");
+    insert_multivariate_result(
+        &mut conn,
+        &MultivariateCalibration {
+            id: WindowCalibrationId::new("promoted-mvcand-fdh3"),
+            candidate: MultivariateCandidateId::new("mvcand-fdh3"),
+            experiment: run.id.clone(),
+            provider: run.provider.clone(),
+            plan_tier: run.plan_tier.clone(),
+            window_semantic_key: run.window_semantic_key.clone(),
+            coefficients,
+            condition_number: ConditionNumber::from_micros(4_000_000),
+            condition_number_threshold: ConditionNumber::from_micros(30_000_000),
+            fit_residual: QuotaFractionPpm::new(120).unwrap(),
+            held_out_residual: QuotaFractionPpm::new(340).unwrap(),
+            validation_observations: 2,
+            sample_count: 8,
+            inputs: EvidenceDigest::from_inputs(&evidence("training")),
+            fitting_evidence: EvidenceFingerprint::from_inputs(&evidence("training")),
+            validation_evidence: EvidenceFingerprint::from_inputs(&evidence("validation")),
+            validation_method: "held-out-block-residual".to_string(),
+            validation_version: "v1".to_string(),
+            statistical_method: "ols".to_string(),
+            statistical_parameters: "{}".to_string(),
+            phase_design: "design".to_string(),
+            activation_policy_version: "promote-v1".to_string(),
+            aub_version: "0.1.0".to_string(),
+            source_revision: "abc1234".to_string(),
+            validity: ValidityInterval::new(ts(1_000), ts(2_000)).unwrap(),
+            fit_timestamp: ts(2_000),
+            knowledge_time: ts(2_500),
+        },
+    )
+    .expect("the per-kind result inserts");
+    let actor = ActivationActor::new("operator").unwrap();
+    let policy = ActivationPolicy::new(
+        "promote-v1",
+        Credits::from_micros(0),
+        ConditionNumber::from_micros(30_000_000),
+    )
+    .unwrap()
+    .with_max_quota_residual(QuotaFractionPpm::new(10_000).unwrap());
+    activate_multivariate(
+        &mut conn,
+        &WindowCalibrationId::new("promoted-mvcand-fdh3"),
+        ts(3_000),
+        None,
+        &ActivationRequest {
+            actor: &actor,
+            policy: &policy,
+            training: &evidence("training"),
+            validation: &evidence("validation"),
+            contamination: &ContaminationVerdict::clean(),
+        },
+    )
+    .expect("the per-kind result activates");
+}
+
+/// Criterion (`aub-fdh3`): can-run over an active per-kind calibration past
+/// its review instant, through the whole command. Under the default thirty-day
+/// horizon a calibration fitted in 1970 is due, so can-run refuses naming
+/// `review_due` and exits 6. The planted negative is the same ledger under a
+/// horizon no clock reaches: the calibration is current, the report says it
+/// is per-kind rather than that no calibration is recorded, and the exit is 0
+/// because nothing stored is asking for review.
+#[test]
+fn can_run_refuses_a_per_kind_calibration_past_review_through_the_command() {
+    let due = StateDir::new();
+    seed_can_run_ledger(&due, "");
+    seed_active_per_kind_calibration(&due);
+    let output = can_run_cached(&due, "text");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(6), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("calibration #promoted-mvcand-fdh3 health is review_due, not current"),
+        "{stdout}"
+    );
+    assert!(stderr.contains("window five_hour: review_due"), "{stderr}");
+
+    let current = StateDir::new();
+    seed_can_run_ledger(&current, "\n[calibration]\nreview_after = \"36500000d\"\n");
+    seed_active_per_kind_calibration(&current);
+    let output = can_run_cached(&current, "text");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("calibration #promoted-mvcand-fdh3 is per-kind"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("no calibration is recorded"), "{stdout}");
+    assert!(!stdout.contains("not current"), "{stdout}");
 }
