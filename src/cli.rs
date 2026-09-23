@@ -833,6 +833,46 @@ impl Command {
 
     /// The command's own options line for the per-command help block, where it
     /// has one.
+    /// Lines appended to the per-command help only. They carry the rules a
+    /// caller cannot infer from the flag list, and they stay out of the
+    /// top-level listing, which is one line per command by construction.
+    pub fn notes(self) -> &'static [&'static str] {
+        match self {
+            Command::Import => &[
+                "legacy-meter imports only what native sampling does not already cover: per account, readings at or after the earliest native meter attempt are skipped and reported as superseded_by_native.",
+                "legacy-meter session and account markers are exempt from that cutoff and import for the whole source, because native sampling produces no such marker.",
+                "legacy-meter quarantines a reading whose account no [[accounts]] entry names, with the reason unconfigured_account, and creates no account row for it.",
+            ],
+            Command::Status
+            | Command::Spend
+            | Command::Config
+            | Command::Export
+            | Command::LoggingFixture
+            | Command::StateCheck
+            | Command::ExitClass
+            | Command::AttemptCrashHook
+            | Command::ProjectionCrashHook
+            | Command::CostModel
+            | Command::RateCard
+            | Command::Backup
+            | Command::Ingest
+            | Command::Rebuild
+            | Command::Doctor
+            | Command::Coverage
+            | Command::Sample
+            | Command::Now
+            | Command::ClearDiagnostics
+            | Command::Drill
+            | Command::Task
+            | Command::Compare
+            | Command::CalibrationFixture
+            | Command::CanRun
+            | Command::Calibrate
+            | Command::Account
+            | Command::Statusline => &[],
+        }
+    }
+
     pub fn options_help(self) -> Option<&'static str> {
         match self {
             Command::Spend => Some(
@@ -1203,6 +1243,9 @@ pub fn command_help_text(command: Command) -> String {
         lines.push(format!("  refuses: {}", refused.join("; ")));
     }
     lines.push(format!("  format: {}", command.format_help()));
+    for note in command.notes() {
+        lines.push(format!("  note: {note}"));
+    }
     lines.join("\n")
 }
 
@@ -6264,6 +6307,15 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         "archive-v{}-g{}",
         backup.schema_version, backup.ledger_generation
     );
+    // The configured names decide which readings may become observations at
+    // all: a source line naming anything else is quarantined rather than
+    // turned into an account row nobody declared.
+    let configured_accounts: Vec<String> = config
+        .accounts
+        .iter()
+        .filter(|account| account.provider == "anthropic")
+        .map(|account| account.name.clone())
+        .collect();
     let timestamp = clock.now();
     let run = RunId::new(timestamp);
     let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
@@ -6275,8 +6327,13 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     let mut conn = open_ledger(clock)?;
-    let summary =
-        crate::store::legacy_meter_import::import(&mut conn, &source, &backup_id, timestamp)?;
+    let summary = crate::store::legacy_meter_import::import(
+        &mut conn,
+        &source,
+        &configured_accounts,
+        &backup_id,
+        timestamp,
+    )?;
     if summary.imported > 0 {
         crate::projection::publish(
             &conn,
@@ -6300,6 +6357,10 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
                 ("imported", &Quantity::new(summary.imported, "records")),
                 ("unchanged", &Quantity::new(summary.unchanged, "records")),
                 (
+                    "superseded_by_native",
+                    &Quantity::new(summary.superseded_by_native, "records"),
+                ),
+                (
                     "quarantined",
                     &Quantity::new(summary.quarantined, "records"),
                 ),
@@ -6307,12 +6368,13 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     println!(
-        "legacy-meter import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} quarantined={}",
+        "legacy-meter import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} superseded_by_native={} quarantined={}",
         source.content_digest,
         backup_id,
         source.records_read,
         summary.imported,
         summary.unchanged,
+        summary.superseded_by_native,
         summary.quarantined,
     );
     Ok(())
