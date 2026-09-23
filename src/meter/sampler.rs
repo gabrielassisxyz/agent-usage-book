@@ -63,6 +63,7 @@
 //!   resolves credentials, policy values and the concurrency bound, and
 //!   hands them over resolved
 
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::PoisonError;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -326,6 +327,10 @@ pub struct SamplingOrchestrator<'a, T, C> {
     pub command_budget: MonotonicDuration,
     /// The most requests one batch may keep in flight.
     pub max_concurrent_requests: usize,
+    /// The state directory the failed-response retained-body buffer lives
+    /// under (`aub-3i7c`): a parse failure during sampling retains its
+    /// already-sanitized body here for post-hoc diagnosis.
+    pub state_dir: PathBuf,
 }
 
 /// What one batch did, one entry per input account in input order.
@@ -966,6 +971,26 @@ where
                 }
             }
             ProviderObservation::AuthRequired(_) | ProviderObservation::Unreachable(_) => {
+                // aub-3i7c: a parse failure carries its already-sanitized body
+                // in `failed_body`; retain it in the count-bounded diagnostic
+                // buffer so an adapter misreading can be diagnosed after the
+                // fact. Retention is diagnostic material, not evidence: a
+                // write failure is logged and never changes the committed
+                // result or the command's exit class.
+                if let Some(body) = captured.failed_body.as_ref()
+                    && let Err(error) = crate::store::retention::store_retained_body(
+                        &self.state_dir,
+                        &item.account.provider_key,
+                        "meter",
+                        body,
+                        received_at,
+                    )
+                {
+                    eprintln!(
+                        "aub: cannot retain failed provider body for '{}': {error}",
+                        item.account.provider_key
+                    );
+                }
                 let result = NewMeterAttemptResult {
                     attempt_id: match row_id_of(attempt_id) {
                         Ok(row_id) => row_id,
@@ -1462,6 +1487,15 @@ mod tests {
         /// A valid Antigravity quota body, so the agy adapter measures
         /// (aub-iwkg: the refresh-path regression needs a second provider).
         AgySuccess,
+        /// A valid-JSON body missing the required `five_hour` window but
+        /// carrying an `authorization` field and a `Bearer` value, so the
+        /// adapter records `MissingRequiredField` with a sanitized
+        /// `failed_body` (aub-3i7c).
+        SecretsMissingField,
+        /// A transport-level timeout with no response bytes, so the adapter
+        /// records an unreachable timeout with no `failed_body` (aub-3i7c
+        /// planted negative).
+        TransportTimeout,
     }
 
     /// Barrier state for one generation of the scripted transport's
@@ -1643,6 +1677,12 @@ mod tests {
                     headers: Vec::new(),
                     body: b"definitely not json".to_vec(),
                 }),
+                Some(ScriptedOutcome::SecretsMissingField) => Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: SECRETS_MISSING_FIELD_BODY.as_bytes().to_vec(),
+                }),
+                Some(ScriptedOutcome::TransportTimeout) => Err(FailureClass::ReadTimeout),
                 Some(ScriptedOutcome::AgySuccess) => Ok(HttpResponse {
                     status: 200,
                     headers: Vec::new(),
@@ -1664,6 +1704,12 @@ mod tests {
     }
 
     const VALID_SUCCESS_BODY: &str = r#"{"five_hour":{"utilization":10.0,"resets_at":"2026-01-01T00:00:00.000Z"},"seven_day":{"utilization":20.0,"resets_at":"2026-01-08T00:00:00.000Z"}}"#;
+
+    /// A valid-JSON body missing the required `five_hour` window, carrying an
+    /// `authorization` field and a `Bearer` value so the sanitizer must redact
+    /// both (aub-3i7c). The adapter maps it to `MissingRequiredField` with a
+    /// `Some` sanitized `failed_body`.
+    const SECRETS_MISSING_FIELD_BODY: &str = r#"{"authorization":"super-secret-should-be-removed","note":"Bearer abc123-secret-token","seven_day":{"utilization":91.0,"resets_at":"2026-09-06T12:00:00.000Z"}}"#;
 
     /// A minimal valid Antigravity quota body (aub-iwkg): one group carrying
     /// the two required window kinds, so the agy adapter measures through
@@ -1766,6 +1812,11 @@ mod tests {
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 3,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         }
         .run(&accounts)
         .expect("the batch must run");
@@ -1882,6 +1933,11 @@ mod tests {
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 3,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         }
         .run(&accounts)
         .expect("the batch must run");
@@ -1940,6 +1996,304 @@ mod tests {
         );
     }
 
+    /// A parse failure during sampling retains its already-sanitized body
+    /// (aub-3i7c): one malformed account writes exactly one retained body,
+    /// and the stored bytes carry the `authorization` removal and the
+    /// `Bearer` redaction rather than the raw secrets.
+    #[test]
+    fn a_parse_failure_retains_its_sanitized_body() {
+        use crate::store::retention::count_retained_bodies;
+
+        /// A one-shot transport returning the secret-bearing missing-field
+        /// body, so the expected sanitized body comes from the real adapter
+        /// rather than from a reimplementation of its sanitizer.
+        struct SecretsBodyTransport;
+        impl HttpTransport for SecretsBodyTransport {
+            fn send(
+                &self,
+                _request: &HttpRequest,
+                _budget: &CommandBudget,
+                _clock: &impl Clock,
+            ) -> Result<HttpResponse, FailureClass> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: Vec::new(),
+                    body: SECRETS_MISSING_FIELD_BODY.as_bytes().to_vec(),
+                })
+            }
+        }
+
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let accounts = vec![batch_account("retaincase")];
+        transport.script("retaincase", ScriptedOutcome::SecretsMissingField);
+
+        let repository = Repository::new(&database_path, policy());
+        let report = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 1,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
+        }
+        .run(&accounts)
+        .expect("the batch must run");
+
+        let attempt = sampled(&report.accounts[0]);
+        assert_eq!(
+            attempt.outcome,
+            AttemptOutcome::Unreachable(FailureClass::MissingRequiredField),
+            "the secret body misses five_hour so the attempt is unreachable"
+        );
+
+        let state_dir = database_path.parent().expect("fixture db has a parent");
+        let (count, total_bytes) =
+            count_retained_bodies(state_dir).expect("the retained count must read");
+        assert_eq!(count, 1, "one parse failure retains one body");
+
+        let adapter = AnthropicAdapter::with_endpoint("http://retaincase.accounts.test/usage");
+        let expected = adapter
+            .observe_with_evidence(
+                &CredentialHandle::new("test-token"),
+                &MeterRequest::default(),
+                &SecretsBodyTransport,
+                &clock,
+            )
+            .failed_body
+            .expect("the secret body must produce a sanitized failed_body");
+        let text = String::from_utf8_lossy(&expected);
+        assert!(
+            !text.contains("super-secret-should-be-removed"),
+            "the authorization value must not survive: {text}"
+        );
+        assert!(
+            !text.contains("abc123-secret-token"),
+            "the Bearer value must not survive: {text}"
+        );
+        assert!(
+            text.contains("[REDACTED]"),
+            "redaction must be visible: {text}"
+        );
+        assert!(text.contains("seven_day"), "the quota body must survive");
+        let value: serde_json::Value =
+            serde_json::from_slice(&expected).expect("the sanitized body is JSON");
+        assert!(
+            value.get("authorization").is_none(),
+            "the authorization key is removed, not redacted"
+        );
+        assert_eq!(
+            value.get("note").and_then(|v| v.as_str()),
+            Some("[REDACTED]"),
+            "the Bearer value is redacted in place"
+        );
+        assert_eq!(
+            total_bytes,
+            expected.len() as u64,
+            "the retained bytes are the sanitized body, not the raw response"
+        );
+        assert_ne!(
+            total_bytes,
+            SECRETS_MISSING_FIELD_BODY.len() as u64,
+            "the raw body length differs, so equality distinguishes them"
+        );
+    }
+
+    /// Planted negatives beside the positive: a success and an unreachable
+    /// timeout with no body retain nothing (aub-3i7c).
+    #[test]
+    fn a_success_and_a_timeout_retain_nothing() {
+        use crate::store::retention::count_retained_bodies;
+
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let accounts = vec![batch_account("okcase"), batch_account("timeoutcase")];
+        transport.script("okcase", ScriptedOutcome::Success);
+        transport.script("timeoutcase", ScriptedOutcome::TransportTimeout);
+
+        let repository = Repository::new(&database_path, policy());
+        let report = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 2,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
+        }
+        .run(&accounts)
+        .expect("the batch must run");
+
+        assert_eq!(
+            sampled(&report.accounts[0]).outcome,
+            AttemptOutcome::Success,
+            "the success case measures"
+        );
+        assert_eq!(
+            sampled(&report.accounts[1]).outcome,
+            AttemptOutcome::Unreachable(FailureClass::ReadTimeout),
+            "the timeout case is unreachable with no body"
+        );
+
+        let state_dir = database_path.parent().expect("fixture db has a parent");
+        let (count, _) = count_retained_bodies(state_dir).expect("the retained count must read");
+        assert_eq!(count, 0, "neither negative retains a body");
+    }
+
+    /// An unwritable retention directory never changes the committed attempt:
+    /// the failure class the adapter reported is what the ledger keeps, and
+    /// the run still reports it (aub-3i7c).
+    #[test]
+    fn an_unwritable_retention_dir_leaves_the_attempt_result_untouched() {
+        use crate::store::meter_attempt::attempts_with_outcomes_for_account_between;
+        use crate::store::retention::count_retained_bodies;
+
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let accounts = vec![batch_account("unwritablecase")];
+        transport.script("unwritablecase", ScriptedOutcome::SecretsMissingField);
+
+        // A path the store can never create directories under (`/proc` is
+        // read-only), so the retain write fails while the ledger commit
+        // proceeds. No filesystem setup is needed, which also keeps this
+        // meter test free of file facilities the boundary rules forbid here.
+        let unwritable_state =
+            std::path::PathBuf::from(format!("/proc/aub-unwritable-{}", std::process::id()));
+
+        let repository = Repository::new(&database_path, policy());
+        let report = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 1,
+            state_dir: unwritable_state.clone(),
+        }
+        .run(&accounts)
+        .expect("the batch must run");
+
+        let attempt = sampled(&report.accounts[0]);
+        assert_eq!(
+            attempt.outcome,
+            AttemptOutcome::Unreachable(FailureClass::MissingRequiredField),
+            "the attempt keeps its parse-failure outcome"
+        );
+
+        let conn = open(&database_path, AccessMode::ReadWrite, &policy())
+            .expect("the fixture ledger must reopen");
+        let account_id = repository
+            .ensure_account("anthropic", "unwritablecase", clock.now())
+            .expect("the account row must exist");
+        let attempts = attempts_with_outcomes_for_account_between(
+            &conn,
+            account_id,
+            UtcTimestamp::from_unix_nanos(0),
+            UtcTimestamp::from_unix_nanos(i64::MAX / 2),
+        )
+        .expect("the coverage read must succeed");
+        let terminal = attempts[0].terminal.as_ref().expect("a terminal result");
+        assert_eq!(
+            terminal.error_classification.as_deref(),
+            Some("missing_required_field"),
+            "the stored classification is the adapter's own"
+        );
+
+        let (count, _) = count_retained_bodies(&unwritable_state).unwrap_or((0, 0));
+        assert_eq!(count, 0, "nothing is retained through an unwritable dir");
+    }
+
+    /// The count bound, exercised through the sampler rather than by calling
+    /// the store directly: 101 parse failures for one provider leave exactly
+    /// 100 retained, the oldest discarded (aub-3i7c).
+    #[test]
+    fn one_hundred_one_parse_failures_leave_one_hundred_retained_via_sampler() {
+        use crate::store::retention::count_retained_bodies;
+
+        let (_scratch_dir, database_path) = fixture_database();
+        let transport = ScriptedTransport::new(SharedClock::new());
+        let clock = transport.clock.clone();
+        let accounts: Vec<BatchAccount<AnthropicAdapter>> = (0..101)
+            .map(|index| batch_account(&format!("cap{index:03}")))
+            .collect();
+        for index in 0..101 {
+            transport.script(
+                &format!("cap{index:03}"),
+                ScriptedOutcome::SecretsMissingField,
+            );
+        }
+
+        let repository = Repository::new(&database_path, policy());
+        let report = SamplingOrchestrator {
+            repository: &repository,
+            transport: &transport,
+            clock: &clock,
+            trigger: Trigger::Timer,
+            configuration_fingerprint: "fixture".to_string(),
+            holder: LeaseHolder::new("test-holder"),
+            lease_ttl: MonotonicDuration::from_seconds(30),
+            command_budget: MonotonicDuration::from_seconds(30),
+            max_concurrent_requests: 10,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
+        }
+        .run(&accounts)
+        .expect("the batch must run");
+        assert_eq!(report.accounts.len(), 101, "every cap account samples");
+        for entry in &report.accounts {
+            assert_eq!(
+                sampled(entry).outcome,
+                AttemptOutcome::Unreachable(FailureClass::MissingRequiredField),
+            );
+        }
+
+        let state_dir = database_path.parent().expect("fixture db has a parent");
+        let (count, _) = count_retained_bodies(state_dir).expect("the retained count must read");
+        assert_eq!(count, 100, "the buffer holds the most recent 100");
+
+        // Sequences come through the shared scratch helper rather than
+        // spelling file facilities inside this module, which boundary rule
+        // 17 forbids even in test code.
+        let retained =
+            test_support::scratch_files::read_retained_bodies(state_dir, "anthropic", "meter");
+        let sequences: Vec<u64> = retained.iter().map(|(sequence, _)| *sequence).collect();
+        assert_eq!(sequences.len(), 100, "100 files survive");
+        assert_eq!(
+            *sequences.first().expect("a first sequence"),
+            2,
+            "the oldest (sequence 1) is discarded"
+        );
+        assert_eq!(
+            *sequences.last().expect("a last sequence"),
+            101,
+            "the newest (sequence 101) is kept"
+        );
+    }
+
     /// A pre-flight token refresh that was rejected overrides the failed
     /// attempt's classification with its own (aub-79gp): the sample still
     /// fails auth with the stale token, but the stored reason is
@@ -1972,6 +2326,11 @@ mod tests {
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 2,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         }
         .run(&accounts)
         .expect("the batch must run");
@@ -2033,6 +2392,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(30),
                 max_concurrent_requests: 2,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(&accounts)
             .expect("the batch must run")
@@ -2077,6 +2441,11 @@ mod tests {
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 2,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         }
         .run(std::slice::from_ref(&fresh))
         .expect("the first batch must run");
@@ -2099,6 +2468,11 @@ mod tests {
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 2,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         }
         .run(&accounts)
         .expect("the second batch must run");
@@ -2164,6 +2538,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(30),
                 max_concurrent_requests: 2,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(accounts)
             .expect("the batch must run")
@@ -2250,6 +2629,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(30),
                 max_concurrent_requests: 2,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(accounts)
             .expect("the batch must run")
@@ -2309,6 +2693,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(30),
                 max_concurrent_requests: 2,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(std::slice::from_ref(account))
             .expect("the batch must run")
@@ -2380,6 +2769,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(30),
                 max_concurrent_requests: 2,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(&accounts)
             .expect("the batch must run")
@@ -2426,6 +2820,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(30),
                 max_concurrent_requests: 2,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(&accounts)
             .expect("the batch must run")
@@ -2554,6 +2953,11 @@ mod tests {
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 1,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         };
 
         let started_at = clock.now();
@@ -2687,6 +3091,11 @@ mod tests {
                 lease_ttl: MonotonicDuration::from_seconds(30),
                 command_budget: MonotonicDuration::from_seconds(2),
                 max_concurrent_requests: 1,
+                state_dir: repository
+                    .database_path()
+                    .parent()
+                    .expect("fixture db has a parent")
+                    .to_path_buf(),
             }
             .run(&accounts)
             .expect("the batch must run")
@@ -2798,6 +3207,11 @@ mod tests {
                         lease_ttl: MonotonicDuration::from_seconds(30),
                         command_budget: MonotonicDuration::from_seconds(30),
                         max_concurrent_requests: 1,
+                        state_dir: repository
+                            .database_path()
+                            .parent()
+                            .expect("fixture db has a parent")
+                            .to_path_buf(),
                     }
                     .run(std::slice::from_ref(&account))
                     .expect("each batch must run")
@@ -3229,6 +3643,11 @@ credential. See https://developers.google.com/identity/sign-in/web/devconsole-pr
             lease_ttl: MonotonicDuration::from_seconds(30),
             command_budget: MonotonicDuration::from_seconds(30),
             max_concurrent_requests: 3,
+            state_dir: repository
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         }
         .run(accounts)
         .expect("the batch must run")

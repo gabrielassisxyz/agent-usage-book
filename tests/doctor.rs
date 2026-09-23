@@ -3400,3 +3400,93 @@ fn registry_reasons_contain_no_absolute_state_path() {
         );
     }
 }
+
+/// A parse failure during `aub sample` leaves a sanitized body that
+/// `aub doctor` reports and `aub clear-diagnostics` clears (aub-3i7c),
+/// end to end through a malformed anthropic fixture.
+#[test]
+fn a_parse_failure_during_sample_leaves_a_body_doctor_can_see_and_clear_can_clear() {
+    use agent_usage_book::store::retention::count_retained_bodies;
+    use test_support::synthetic_server::SyntheticServer;
+    use test_support::synthetic_server::script::ScriptedOutcome;
+
+    let state = StateDir::new();
+    let _conn = open_ledger(state.path());
+    drop(_conn);
+
+    let token_path = state.path().join("token.json");
+    fs::write(&token_path, r#"{"accessToken":"test-token"}"#).expect("write token");
+    let config_path = state.path().join("aub.toml");
+    let toml = format!(
+        "[state]\ndir = {:?}\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = {:?} }}\n",
+        state.path(),
+        token_path
+    );
+    fs::write(&config_path, &toml).expect("write config");
+    let home = state.path().join("home");
+    let _ = fs::create_dir_all(&home);
+
+    let fixture_path = format!(
+        "{}/tests/fixtures/meter/anthropic/missing-field.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
+    let fixture_body = fs::read(&fixture_path).expect("the missing-field fixture must exist");
+
+    let server = SyntheticServer::start(vec![ScriptedOutcome::MissingRequiredField {
+        status: 200,
+        headers: vec![("Content-Type".to_string(), "application/json".to_string())],
+        body: fixture_body,
+    }])
+    .expect("the synthetic server must start");
+
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_aub"))
+        .env("HOME", &home)
+        .env("AUB_CONFIG_FILE", &config_path)
+        .env("AUB_ANTHROPIC_ENDPOINT", server.url())
+        .args(["sample", "--account", "work-primary"])
+        .output()
+        .expect("aub sample must run");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.code().is_some(),
+        "aub sample must exit with a status: {stderr}"
+    );
+
+    let (count, _) = count_retained_bodies(state.path()).expect("the retained count must read");
+    assert_eq!(count, 1, "one parse failure during sample retains one body");
+
+    let (code, stdout, _) = run_aub(state.path(), &["doctor", "--format", "json"]);
+    assert_eq!(code, 0, "doctor must run: {stdout}");
+    assert!(
+        stdout.contains("retained bodies: 1"),
+        "doctor must report the retained body: {stdout}"
+    );
+
+    let (code, stdout, _) = run_aub(state.path(), &["clear-diagnostics", "--all"]);
+    assert_eq!(code, 0, "clear-diagnostics must run: {stdout}");
+    assert!(
+        stdout.contains("Cleared 1 retained body"),
+        "clear-diagnostics must clear the body: {stdout}"
+    );
+    assert_eq!(
+        count_retained_bodies(state.path())
+            .expect("the recount must read")
+            .0,
+        0,
+        "the buffer is empty after clearing"
+    );
+
+    let (code, stdout, _) = run_aub(state.path(), &["doctor", "--format", "json"]);
+    assert_eq!(code, 0, "doctor must run after clearing: {stdout}");
+    let doc: serde_json::Value = serde_json::from_str(&stdout).expect("doctor json must parse");
+    let checks = doc["checks"].as_array().expect("checks array");
+    let diag = checks
+        .iter()
+        .find(|c| c["name"] == "accumulated-diagnostic-material")
+        .expect("the diagnostic check must be present");
+    let reason = diag["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("retained bodies: 0 (0 bytes)"),
+        "doctor passes the retained count after clearing: {reason}"
+    );
+}

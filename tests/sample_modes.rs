@@ -142,6 +142,11 @@ fn if_due_records_supplied_marker_while_making_no_network_request() {
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget: MonotonicDuration::from_seconds(10),
         max_concurrent_requests: 4,
+        state_dir: repo
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     };
     let report = orchestrator.run(&initial_batch).unwrap();
     assert_eq!(report.accounts.len(), 1);
@@ -208,6 +213,11 @@ fn if_due_records_supplied_marker_while_making_no_network_request() {
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget: MonotonicDuration::from_seconds(10),
         max_concurrent_requests: 4,
+        state_dir: repo
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     };
 
     // This must NOT panic because the account is not due!
@@ -290,6 +300,11 @@ fn lease_loss_preserves_marker_without_calling_transport() {
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget: MonotonicDuration::from_seconds(10),
         max_concurrent_requests: 4,
+        state_dir: repo
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     };
 
     // PanicTransport must not be called when lease cannot be acquired
@@ -421,6 +436,11 @@ fn flag_matrix_proves_attempt_start_persisted_before_any_request() {
             lease_ttl: MonotonicDuration::from_seconds(60),
             command_budget: MonotonicDuration::from_seconds(10),
             max_concurrent_requests: 4,
+            state_dir: repo
+                .database_path()
+                .parent()
+                .expect("fixture db has a parent")
+                .to_path_buf(),
         };
 
         let report = orchestrator.run(&batch).unwrap();

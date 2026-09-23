@@ -1784,6 +1784,7 @@ pub(crate) fn sample_command(
         lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
         command_budget: config.sampling.command_budget,
         max_concurrent_requests: config.sampling.max_concurrent_requests,
+        state_dir: config.state.dir.clone(),
     };
 
     let run_result = orchestrator
@@ -5030,6 +5031,7 @@ fn forced_sampling_batch(
         lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
         command_budget: config.sampling.command_budget,
         max_concurrent_requests: config.sampling.max_concurrent_requests,
+        state_dir: config.state.dir.clone(),
     };
 
     orchestrator.run(&batch_accounts)
@@ -7164,6 +7166,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             lease_ttl: crate::domain::time::MonotonicDuration::from_seconds(60),
             command_budget: config.sampling.command_budget,
             max_concurrent_requests: config.sampling.max_concurrent_requests,
+            state_dir: config.state.dir.clone(),
         };
         let batch_report = orchestrator.run(&batch_accounts)?;
         sampling_disposition_error(&batch_report.accounts)?;
