@@ -1287,11 +1287,13 @@ pub fn task_report_json_with_explain(
         .map(|generation| generation.get().to_string())
         .unwrap_or_else(|| "null".to_string());
     let mut body = format!(
-        "\"ingestion_generation\":{ingestion_generation},\"task_id\":{},\"task_kind\":{},{},\"credits\":{},\"sessions\":[{sessions}]",
+        "\"ingestion_generation\":{ingestion_generation},\"task_id\":{},\"task_kind\":{},{},\"credits\":{},\"unresolved_claims\":{},\"ambiguous_claims\":{},\"sessions\":[{sessions}]",
         json_string(report.task_id.as_str()),
         task_kind_json(&report.task_kind),
         usage_vector_json(&report.usage),
         credits_json(&report.credits),
+        report.claim_resolution.unresolved,
+        report.claim_resolution.ambiguous,
     );
     if explain != ExplainMode::Off {
         body.push_str(&format!(
@@ -1317,7 +1319,7 @@ pub fn validate_task_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonC
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_TASK_REPORT_KEYS: [&str; 15] = [
+    const KNOWN_TASK_REPORT_KEYS: [&str; 17] = [
         "schema",
         "command",
         "run",
@@ -1332,6 +1334,8 @@ pub fn validate_task_report_json(json_str: &str) -> Result<ParsedEnvelope, JsonC
         "coverage",
         "evidence_quality",
         "credits",
+        "unresolved_claims",
+        "ambiguous_claims",
         "sessions",
     ];
     for key in obj.keys() {

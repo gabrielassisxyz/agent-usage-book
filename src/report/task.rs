@@ -14,10 +14,10 @@
 use std::collections::BTreeMap;
 
 use crate::attribution::report::{AttributableEvent, attribute_events};
-use crate::attribution::segment::{OverheadReason, SegmentTarget};
+use crate::attribution::segment::{ClaimResolutionCounts, OverheadReason, SegmentTarget};
 use crate::config::ModelTable;
 use crate::domain::credits::Credits;
-use crate::domain::ids::TaskId;
+use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace, TaskId};
 use crate::domain::provenance::{EvidenceId, QuerySemantics};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
@@ -44,7 +44,7 @@ pub fn assemble_task_report(
     let events = all_canonical_events(conn, models)?;
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let partial = !diagnostics.quarantined_by_class.is_empty();
-    let attributed = attribute_all(conn, &events)?;
+    let (attributed, claim_resolution) = attribute_all_with_resolution(conn, &events)?;
 
     let task_label = format!(
         "{}:{}",
@@ -88,6 +88,7 @@ pub fn assemble_task_report(
         usage,
         credits,
         sessions,
+        claim_resolution,
         usage_node,
         credits_node,
     ))
@@ -216,20 +217,54 @@ pub(crate) fn attribute_all(
     conn: &rusqlite::Connection,
     events: &[CanonicalSpendEvent],
 ) -> Result<BTreeMap<String, SegmentTarget>, Error> {
-    let boundaries = crate::store::task_event::read_boundaries(conn)?;
+    Ok(attribute_all_with_resolution(conn, events)?.0)
+}
+
+/// The same pass, with the claim-resolution counts the boundary scan produced
+/// on the way. Only the task report renders those counts, so the common
+/// caller above drops them rather than every caller carrying a tuple it
+/// ignores.
+fn attribute_all_with_resolution(
+    conn: &rusqlite::Connection,
+    events: &[CanonicalSpendEvent],
+) -> Result<(BTreeMap<String, SegmentTarget>, ClaimResolutionCounts), Error> {
+    let scan = crate::store::task_event::read_boundaries(conn)?;
     let attributable: Vec<AttributableEvent> = events
         .iter()
         .map(|event| AttributableEvent {
             canonical_id: event.canonical_id.clone(),
             occurred_at: event.occurred_at,
-            session_is_mapped: event.session != UNKNOWN_SESSION,
+            session: event_session(event),
             usage: known_vector(event),
         })
         .collect();
-    Ok(attribute_events(boundaries, true, &attributable)
+    let attributed = attribute_events(scan.boundaries, true, &attributable)
         .into_iter()
         .map(|attribution| (attribution.canonical_id, attribution.target))
-        .collect())
+        .collect();
+    Ok((attributed, scan.resolution))
+}
+
+/// The canonical event's own session identity, or `None` when it carried
+/// none. `session_source` and `session_native` are `Some` together exactly
+/// when the rendered label is not [`UNKNOWN_SESSION`], so this is the same
+/// mapped-ness test the attribution engine used before it needed the identity
+/// itself.
+///
+/// `pub(crate)`: `report::spend`'s `--group-by task` builds the same
+/// attributable events from the same rows and must select the timeline the
+/// same way, or the two commands would disagree about which claim governs an
+/// event.
+pub(crate) fn event_session(event: &CanonicalSpendEvent) -> Option<SessionId> {
+    let (source, native) = (
+        event.session_source.as_deref()?,
+        event.session_native.as_deref()?,
+    );
+    debug_assert_ne!(event.session, UNKNOWN_SESSION);
+    Some(SessionId::new(
+        SourceNamespace::new(source),
+        NativeSessionId::new(native),
+    ))
 }
 
 /// `pub(crate)`: shared with `aub-cab.4`'s can-run task-history gathering,
@@ -464,6 +499,171 @@ mod tests {
             occurred_at: at.to_string(),
             actor: None,
         }
+    }
+
+    fn claim_by(upstream_id: i64, task_native: &str, at: &str, actor: &str) -> TrackerEventRecord {
+        TrackerEventRecord {
+            upstream_id,
+            actor: Some(actor.to_string()),
+            ..claim(task_native, at)
+        }
+    }
+
+    /// The two session ids the parallel-lane fixture below uses. Their first
+    /// eight characters are what the tracker's actor strings carry, which is
+    /// the whole of the evidence binding a claim to a lane.
+    const LANE_A: &str = "aaaa1111-0000-4a11-9d2e-000000000001";
+    const LANE_B: &str = "bbbb2222-0000-4a11-9d2e-000000000002";
+
+    /// Criterion 2: two lanes, interleaved claims on two different beads.
+    /// Every one of A's events belongs to A's bead and none to B's, with
+    /// exact per-bead token counts.
+    ///
+    /// The difference from the shared-timeline result is asserted rather than
+    /// implied: under one tracker-wide timeline B's later claim would take
+    /// A's subsequent usage, putting session A in T2's own session breakdown
+    /// and moving 20 input tokens out of T1. Both are checked below, so the
+    /// test cannot pass by accident on a fixture where the two answers agree.
+    #[test]
+    fn two_lanes_claiming_two_beads_do_not_exchange_their_spend() {
+        let conn = open_test_ledger("task-report-parallel-lanes");
+        seed_session(&conn, LANE_A, None);
+        seed_session(&conn, LANE_B, None);
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        let hour = 3_600_000_000_000;
+
+        // A claims T1 at 01:00 and B claims T2 at 03:00. A keeps working
+        // through B's claim.
+        seed_canonical(&conn, "a1", day + 2 * hour, LANE_A, &[("input", 10)]);
+        seed_canonical(&conn, "a2", day + 4 * hour, LANE_A, &[("input", 20)]);
+        seed_canonical(&conn, "b1", day + 4 * hour, LANE_B, &[("input", 30)]);
+
+        crate::store::task_event::ingest(
+            &conn,
+            SourceNamespace::new("beads-a"),
+            &FixtureReader(vec![
+                claim_by(1, "T1", "2026-08-25T01:00:00Z", "drive-beads-aaaa1111"),
+                claim_by(2, "T2", "2026-08-25T03:00:00Z", "drive-beads-bbbb2222"),
+            ]),
+        )
+        .unwrap();
+
+        let generated_at = UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap();
+        let report_of = |native: &str| {
+            assemble_task_report(
+                &conn,
+                &TaskId::new(SourceNamespace::new("beads-a"), NativeTaskId::new(native)),
+                generated_at,
+                &crate::config::ModelTable::default(),
+            )
+            .unwrap()
+        };
+
+        let t1 = report_of("T1");
+        assert_eq!(
+            t1.usage.known().input().value(),
+            30,
+            "T1 holds both of lane A's events, including the one after B's claim"
+        );
+        assert_eq!(t1.sessions.len(), 1);
+        assert_eq!(t1.sessions[0].session.as_str(), format!("fixture:{LANE_A}"));
+
+        let t2 = report_of("T2");
+        assert_eq!(
+            t2.usage.known().input().value(),
+            30,
+            "T2 holds lane B's event and nothing of lane A's"
+        );
+        assert_eq!(
+            t2.sessions.len(),
+            1,
+            "the shared timeline would list lane A here too"
+        );
+        assert_eq!(t2.sessions[0].session.as_str(), format!("fixture:{LANE_B}"));
+    }
+
+    /// Criterion 3, end to end: a session-less actor governs the lane that has
+    /// no claim of its own, and is overruled on the lane that does.
+    #[test]
+    fn a_session_less_claim_governs_only_the_lane_with_no_claim_of_its_own() {
+        let conn = open_test_ledger("task-report-fallback");
+        seed_session(&conn, LANE_A, None);
+        seed_session(&conn, LANE_B, None);
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        let hour = 3_600_000_000_000;
+        seed_canonical(&conn, "a1", day + 4 * hour, LANE_A, &[("input", 11)]);
+        seed_canonical(&conn, "b1", day + 4 * hour, LANE_B, &[("input", 22)]);
+
+        crate::store::task_event::ingest(
+            &conn,
+            SourceNamespace::new("beads-a"),
+            &FixtureReader(vec![
+                claim_by(1, "T-human", "2026-08-25T01:00:00Z", "gabriel"),
+                claim_by(
+                    2,
+                    "T-lane-a",
+                    "2026-08-25T03:00:00Z",
+                    "drive-beads-aaaa1111",
+                ),
+            ]),
+        )
+        .unwrap();
+
+        let generated_at = UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap();
+        let report_of = |native: &str| {
+            assemble_task_report(
+                &conn,
+                &TaskId::new(SourceNamespace::new("beads-a"), NativeTaskId::new(native)),
+                generated_at,
+                &crate::config::ModelTable::default(),
+            )
+            .unwrap()
+        };
+
+        assert_eq!(
+            report_of("T-lane-a").usage.known().input().value(),
+            11,
+            "lane A's own claim wins over the session-less one at the same instant"
+        );
+        assert_eq!(
+            report_of("T-human").usage.known().input().value(),
+            22,
+            "only lane B, which claimed nothing itself, is governed by the fallback"
+        );
+    }
+
+    /// Criterion 5, at the assembly layer the renderers read: the two counts
+    /// reach the report, and they count different things.
+    #[test]
+    fn the_task_report_carries_the_unresolved_and_ambiguous_claim_counts() {
+        let conn = open_test_ledger("task-report-claim-counts");
+        seed_session(&conn, LANE_A, None);
+        seed_session(&conn, "aaaa1111-ffff-4a11-9d2e-000000000009", None);
+        let day = UtcDate::parse("2026-08-25").unwrap().start().unix_nanos();
+        seed_canonical(&conn, "a1", day, LANE_A, &[("input", 1)]);
+
+        crate::store::task_event::ingest(
+            &conn,
+            SourceNamespace::new("beads-a"),
+            &FixtureReader(vec![
+                // `aaaa1111` now prefixes two seeded sessions: ambiguous.
+                claim_by(1, "T1", "2026-08-25T01:00:00Z", "drive-beads-aaaa1111"),
+                claim_by(2, "T2", "2026-08-25T02:00:00Z", "gabriel"),
+                claim_by(3, "T3", "2026-08-25T03:00:00Z", "orchestrator"),
+            ]),
+        )
+        .unwrap();
+
+        let report = assemble_task_report(
+            &conn,
+            &TaskId::new(SourceNamespace::new("beads-a"), NativeTaskId::new("T1")),
+            UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+            &crate::config::ModelTable::default(),
+        )
+        .unwrap();
+
+        assert_eq!(report.claim_resolution.ambiguous, 1);
+        assert_eq!(report.claim_resolution.unresolved, 2);
     }
 
     #[test]

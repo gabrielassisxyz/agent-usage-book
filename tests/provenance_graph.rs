@@ -27,6 +27,7 @@
 
 use std::collections::BTreeSet;
 
+use agent_usage_book::attribution::segment::ClaimResolutionCounts;
 use agent_usage_book::config::CoverageFloor;
 use agent_usage_book::coverage::CoverageReport as EngineCoverageReport;
 use agent_usage_book::domain::attempt::AttemptId;
@@ -554,6 +555,7 @@ fn task_case() -> SeededCommand {
             Provenance::new(["cost-model-anthropic-messages-v1".to_string()]),
         )),
         vec![],
+        ClaimResolutionCounts::default(),
         usage_node,
         credits_node,
     );

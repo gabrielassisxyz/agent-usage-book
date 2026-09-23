@@ -1,6 +1,7 @@
 //! The `aub task` JSON contract tests (`aub-eu7.4`): each of the three
 //! subcommands' documents validates against its own versioned envelope.
 
+use agent_usage_book::attribution::segment::ClaimResolutionCounts;
 use agent_usage_book::attribution::{TaskIdentityState, TaskKind, TaskKindOrigin};
 use agent_usage_book::domain::credits::Credits;
 use agent_usage_book::domain::ids::TaskId as DomainTaskId;
@@ -130,6 +131,7 @@ fn every_task_kind_state_serializes_distinctly_and_validates() {
                 run: Some(NativeRunId::new("run-1")),
                 usage: usage(7),
             }],
+            ClaimResolutionCounts::default(),
             node(),
             node(),
         );
@@ -172,6 +174,7 @@ fn an_available_credit_derivation_validates_too() {
         usage(7),
         credits,
         vec![],
+        ClaimResolutionCounts::default(),
         node(),
         node(),
     );
@@ -197,6 +200,7 @@ fn task_report_explain_attaches_and_still_validates() {
         )
         .unwrap(),
         vec![],
+        ClaimResolutionCounts::default(),
         node(),
         node(),
     );
@@ -279,4 +283,51 @@ fn task_ingest_document_validates() {
     assert_eq!(parsed["events_already_present"], 1);
     assert_eq!(parsed["quarantines_inserted"], 1);
     assert_eq!(parsed["quarantines_already_present"], 0);
+}
+
+/// The unresolved and ambiguous claim counts reach the document, under their
+/// own keys and as numbers. The planted negative is the second report: the
+/// same shape with different counts must serialize differently, so the keys
+/// cannot be constants the renderer prints regardless of the report.
+#[test]
+fn the_task_report_document_carries_the_claim_resolution_counts() {
+    let report_with = |counts: ClaimResolutionCounts| {
+        TaskReport::new(
+            metadata(),
+            LogicalName::new("beads-a:aub-1"),
+            None,
+            usage(7),
+            Derivation::unavailable(
+                [RequiredFact::new("active cost model")],
+                Provenance::new(["cost-model:unavailable".to_string()]),
+            )
+            .unwrap(),
+            vec![],
+            counts,
+            node(),
+            node(),
+        )
+    };
+
+    let document = task_report_json_with_explain(
+        &report_with(ClaimResolutionCounts {
+            unresolved: 4,
+            ambiguous: 2,
+        }),
+        run(),
+        ExplainMode::Off,
+    );
+    validate_task_report_json(&document).expect("the counted document must validate");
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    assert_eq!(parsed["unresolved_claims"], 4);
+    assert_eq!(parsed["ambiguous_claims"], 2);
+
+    let none = task_report_json_with_explain(
+        &report_with(ClaimResolutionCounts::default()),
+        run(),
+        ExplainMode::Off,
+    );
+    let parsed: serde_json::Value = serde_json::from_str(&none).unwrap();
+    assert_eq!(parsed["unresolved_claims"], 0);
+    assert_eq!(parsed["ambiguous_claims"], 0);
 }

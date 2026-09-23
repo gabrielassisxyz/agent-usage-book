@@ -1422,17 +1422,17 @@ fn task_label_map(
     conn: &rusqlite::Connection,
     events: &[CanonicalSpendEvent],
 ) -> Result<BTreeMap<String, String>, Error> {
-    let boundaries = crate::store::task_event::read_boundaries(conn)?;
+    let scan = crate::store::task_event::read_boundaries(conn)?;
     let attributable: Vec<AttributableEvent> = events
         .iter()
         .map(|event| AttributableEvent {
             canonical_id: event.canonical_id.clone(),
             occurred_at: event.occurred_at,
-            session_is_mapped: event.session != crate::store::spend::UNKNOWN_SESSION,
+            session: crate::report::task::event_session(event),
             usage: known_vector(&event.components),
         })
         .collect();
-    let attributed = attribute_events(boundaries, true, &attributable);
+    let attributed = attribute_events(scan.boundaries, true, &attributable);
     Ok(attributed
         .into_iter()
         .map(|attribution| {

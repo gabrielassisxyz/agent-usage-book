@@ -6,12 +6,14 @@
 
 use rusqlite::params;
 
-use crate::attribution::segment::ClaimBoundary;
+use crate::attribution::segment::{
+    ClaimBoundary, ClaimResolutionCounts, ClaimSessionResolution, resolve_claim_session,
+};
 use crate::attribution::{
     TaskEvent, TaskEventKind, TaskEventQuarantine, TrackerEventReader, TrackerEventRecord,
     normalize_tracker_event,
 };
-use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
+use crate::domain::ids::{NativeTaskId, SessionId, SourceNamespace, TaskId};
 use crate::domain::time::{MonotonicDuration, UtcTimestamp};
 use crate::error::Error;
 use crate::store::connection::{self, AccessMode, PragmaPolicy};
@@ -126,6 +128,16 @@ pub fn open_tracker_database(path: &std::path::Path) -> Result<rusqlite::Connect
     )
 }
 
+/// Every boundary one scan read, and what the scan made of the actors behind
+/// them. The counts travel with the boundaries because they are two views of
+/// one pass: recomputing them anywhere else would mean resolving every actor
+/// twice and risking the two answers drifting apart.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct TaskBoundaryScan {
+    pub boundaries: Vec<ClaimBoundary>,
+    pub resolution: ClaimResolutionCounts,
+}
+
 /// Reads every durably ingested claim/release boundary, tracker-wide and
 /// ordered by occurrence, for the segmentation engine in
 /// [`crate::attribution::segment`]. A tracker event whose kind normalized to
@@ -134,10 +146,29 @@ pub fn open_tracker_database(path: &std::path::Path) -> Result<rusqlite::Connect
 /// in the segmentation engine: `segment::build_intervals` already documents
 /// that it ignores `Unknown` boundaries, and filtering here means a caller
 /// never constructs one only to have it silently ignored two layers down.
-pub fn read_boundaries(connection: &rusqlite::Connection) -> Result<Vec<ClaimBoundary>, Error> {
+///
+/// Each boundary's stored `agent_association` is resolved against the
+/// ledger's own session table here, at read time, by
+/// [`resolve_claim_session`]. Nothing about the resolution is persisted: the
+/// actor string and the session rows are both immutable inputs, so two reads
+/// of an unchanged ledger produce the same binding, and a session ingested
+/// later starts binding claims that were already on disk without any
+/// rewrite. The counts it returns are over every boundary row, claim and
+/// release alike, since a release that binds to no session governs the
+/// fallback timeline exactly as an unbound claim does.
+pub fn read_boundaries(connection: &rusqlite::Connection) -> Result<TaskBoundaryScan, Error> {
+    let known: Vec<SessionId> = crate::store::session::load_all_sessions(connection)?
+        .into_iter()
+        .map(|session| {
+            SessionId::new(
+                session.source().clone(),
+                session.native_session_id().clone(),
+            )
+        })
+        .collect();
     let mut statement = connection
         .prepare(
-            "SELECT task_source, task_native, occurred_at, event_kind \
+            "SELECT task_source, task_native, occurred_at, event_kind, agent_association \
              FROM task_event WHERE event_kind IN ('claim', 'release') \
              ORDER BY occurred_at",
         )
@@ -149,12 +180,13 @@ pub fn read_boundaries(connection: &rusqlite::Connection) -> Result<Vec<ClaimBou
                 row.get::<_, String>(1)?,
                 row.get::<_, i64>(2)?,
                 row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })
         .map_err(|error| Error::Store(format!("cannot query task boundaries: {error}")))?;
-    let mut boundaries = Vec::new();
+    let mut scan = TaskBoundaryScan::default();
     for row in rows {
-        let (task_source, task_native, occurred_at, event_kind) =
+        let (task_source, task_native, occurred_at, event_kind, agent_association) =
             row.map_err(|error| Error::Store(format!("cannot read task boundary row: {error}")))?;
         let kind = match event_kind.as_str() {
             "claim" => TaskEventKind::Claim,
@@ -165,16 +197,23 @@ pub fn read_boundaries(connection: &rusqlite::Connection) -> Result<Vec<ClaimBou
                 )));
             }
         };
-        boundaries.push(ClaimBoundary {
+        let resolution = resolve_claim_session(agent_association.as_deref(), &known);
+        scan.resolution.tally(&resolution);
+        scan.boundaries.push(ClaimBoundary {
             task_id: TaskId::new(
                 SourceNamespace::new(task_source),
                 NativeTaskId::new(task_native),
             ),
             occurred_at: UtcTimestamp::from_unix_nanos(occurred_at),
             kind,
+            agent_association,
+            session: match resolution {
+                ClaimSessionResolution::Session(session) => Some(session),
+                ClaimSessionResolution::Unresolved | ClaimSessionResolution::Ambiguous => None,
+            },
         });
     }
-    Ok(boundaries)
+    Ok(scan)
 }
 
 fn insert_event(connection: &rusqlite::Connection, event: &TaskEvent) -> Result<bool, Error> {
@@ -463,7 +502,7 @@ mod tests {
         ]);
         ingest(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
 
-        let boundaries = read_boundaries(&connection).unwrap();
+        let boundaries = read_boundaries(&connection).unwrap().boundaries;
 
         // The planted negative: a naive reader that forgot the `event_kind`
         // filter would return three rows, including the `commented` event
@@ -480,5 +519,117 @@ mod tests {
             UtcTimestamp::parse_rfc3339("2026-08-31T19:20:00Z").unwrap()
         );
         assert_eq!(boundaries[0].task_id.native().as_str(), "aub-1");
+        // The actor the tracker recorded travels with the boundary: without
+        // it there is nothing to resolve a session from two layers up.
+        assert_eq!(boundaries[0].agent_association.as_deref(), Some("agent-1"));
+    }
+
+    fn seed_session(connection: &rusqlite::Connection, native: &str) {
+        crate::store::session::insert_session(
+            connection,
+            &crate::store::session::NewSession {
+                source: SourceNamespace::new("claude-code"),
+                native_session_id: crate::domain::ids::NativeSessionId::new(native),
+                start: UtcTimestamp::from_unix_nanos(0),
+                end: None,
+                project_key: crate::sessions::ProjectKey::new("project-a"),
+                repository_key: crate::sessions::RepositoryKey::new("repository-a"),
+                working_directory: None,
+                parent_native_session_id: None,
+                run_id: None,
+            },
+        )
+        .unwrap();
+    }
+
+    fn claim_by(upstream_id: i64, actor: &str, occurred_at: &str) -> TrackerEventRecord {
+        TrackerEventRecord {
+            upstream_id,
+            task_native: "aub-1".into(),
+            event_type: "status_changed".into(),
+            old_value: Some("open".into()),
+            new_value: Some("in_progress".into()),
+            occurred_at: occurred_at.into(),
+            actor: Some(actor.into()),
+        }
+    }
+
+    #[test]
+    fn a_boundary_binds_to_the_session_its_actor_names() {
+        let (_scratch, connection) = fixture_connection();
+        seed_session(&connection, "c4ba2d16-8f0c-4a11-9d2e-000000000001");
+        ingest(
+            &connection,
+            SourceNamespace::new("beads-a"),
+            &FixtureReader(vec![claim_by(
+                1,
+                "drive-beads-c4ba2d16",
+                "2026-08-31T19:20:00Z",
+            )]),
+        )
+        .unwrap();
+
+        let scan = read_boundaries(&connection).unwrap();
+
+        assert_eq!(
+            scan.boundaries[0]
+                .session
+                .as_ref()
+                .map(|session| session.native().as_str().to_string()),
+            Some("c4ba2d16-8f0c-4a11-9d2e-000000000001".to_string())
+        );
+        assert_eq!(scan.resolution, ClaimResolutionCounts::default());
+    }
+
+    /// Criterion 4: a fragment fitting two sessions binds to neither and is
+    /// counted as ambiguous, with the exact count asserted. The unresolved
+    /// count stays at its own value so the two are not one bucket wearing two
+    /// names.
+    #[test]
+    fn an_actor_fitting_two_sessions_binds_to_neither_and_is_counted() {
+        let (_scratch, connection) = fixture_connection();
+        seed_session(&connection, "eb1b1539-aaaa-4a11-9d2e-000000000001");
+        seed_session(&connection, "eb1b1539-bbbb-4a11-9d2e-000000000002");
+        ingest(
+            &connection,
+            SourceNamespace::new("beads-a"),
+            &FixtureReader(vec![
+                claim_by(1, "implementer-eb1b1539", "2026-08-31T19:20:00Z"),
+                claim_by(2, "gabriel", "2026-08-31T19:30:00Z"),
+            ]),
+        )
+        .unwrap();
+
+        let scan = read_boundaries(&connection).unwrap();
+
+        assert_eq!(scan.boundaries.len(), 2);
+        assert!(
+            scan.boundaries
+                .iter()
+                .all(|boundary| boundary.session.is_none()),
+            "neither an ambiguous nor a session-less actor may bind to a session"
+        );
+        assert_eq!(scan.resolution.ambiguous, 1);
+        assert_eq!(scan.resolution.unresolved, 1);
+    }
+
+    /// Criterion 6, at the layer that could break it: the binding is derived
+    /// from immutable rows at read time, so a second ingest of the same
+    /// tracker leaves the scan byte-identical.
+    #[test]
+    fn a_second_ingest_of_the_same_tracker_leaves_the_scan_identical() {
+        let (_scratch, connection) = fixture_connection();
+        seed_session(&connection, "c4ba2d16-8f0c-4a11-9d2e-000000000001");
+        let reader = FixtureReader(vec![
+            claim_by(1, "drive-beads-c4ba2d16", "2026-08-31T19:20:00Z"),
+            claim_by(2, "gabriel", "2026-08-31T19:30:00Z"),
+        ]);
+        ingest(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
+        let first = read_boundaries(&connection).unwrap();
+
+        ingest(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
+        let second = read_boundaries(&connection).unwrap();
+
+        assert_eq!(first, second);
     }
 }
