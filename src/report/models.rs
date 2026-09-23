@@ -8,6 +8,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::attribution::account_segment::AccountEvidenceClass;
+use crate::attribution::segment::ClaimResolutionCounts;
 use crate::config::CoverageFloor;
 use crate::coverage::CoverageFraction;
 use crate::domain::attempt::AttemptOutcome;
@@ -1414,6 +1415,14 @@ pub struct TaskReport {
     pub usage: UsageVector,
     pub credits: Derivation<Credits>,
     pub sessions: Vec<TaskSessionUsage>,
+    /// How many of the tracker's claim and release boundaries failed to bind
+    /// to a session, split by reason. A boundary that binds governs only the
+    /// session that made it; one that does not joins a fallback timeline
+    /// applied wherever no session-scoped claim covers the instant. The two
+    /// counts are on the report because the difference between an attribution
+    /// built from bound claims and one riding on the fallback is invisible in
+    /// the totals themselves.
+    pub claim_resolution: ClaimResolutionCounts,
     pub provenance: ProvenanceGraph,
 }
 
@@ -1426,6 +1435,7 @@ impl TaskReport {
         usage: UsageVector,
         credits: Derivation<Credits>,
         sessions: Vec<TaskSessionUsage>,
+        claim_resolution: ClaimResolutionCounts,
         usage_node: ProvenanceNode,
         credits_node: ProvenanceNode,
     ) -> Self {
@@ -1450,6 +1460,7 @@ impl TaskReport {
             usage,
             credits,
             sessions,
+            claim_resolution,
             provenance,
         }
     }
@@ -1775,6 +1786,7 @@ mod tests {
                         provenance: crate::evidence::Provenance::new([]),
                     },
                     vec![],
+                    ClaimResolutionCounts::default(),
                     node(),
                     node(),
                 )),
@@ -2050,6 +2062,7 @@ mod tests {
                 provenance: crate::evidence::Provenance::new([]),
             },
             vec![],
+            ClaimResolutionCounts::default(),
             node(),
             node(),
         );

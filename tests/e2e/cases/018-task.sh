@@ -85,6 +85,12 @@ case_assertions() {
     assert_stdout_contains 3 "input 20 tokens"
     assert_stdout_contains 3 "output 8 tokens"
     assert_stdout_contains 3 "task kind: no tracker evidence"
+    # The claim's actor (`agent-1`) carries no eight-hex session fragment, so
+    # it binds to no session and governs through the fallback timeline. The
+    # report says so rather than leaving the reader to assume every claim
+    # bound.
+    assert_stdout_contains 3 "claim binding: 1 unresolved"
+    assert_stdout_contains 3 "0 ambiguous"
 
     # The overhead report shows the same task-attributed total the report
     # command computed independently, plus the before_first_claim bucket

@@ -116,7 +116,7 @@ fn gather_task_history_samples(
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let partial = !diagnostics.quarantined_by_class.is_empty();
     let attributed = crate::report::task::attribute_all(conn, &events)?;
-    let boundaries = crate::store::task_event::read_boundaries(conn)?;
+    let boundaries = crate::store::task_event::read_boundaries(conn)?.boundaries;
     let cost_model = crate::store::cost_model::load_active_at(conn, generated_at)?;
 
     let mut completed: BTreeSet<TaskIdWrapper> = BTreeSet::new();

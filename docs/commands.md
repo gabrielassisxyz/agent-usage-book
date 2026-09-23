@@ -281,6 +281,32 @@ a task total and a task-grouped spend row can never disagree. Usage outside
 every claim window is not dropped and not folded into a neighbouring task: it
 is reported under a named overhead bucket that says why it was unattributable.
 
+**A claim governs the session that made it.** The tracker records the actor
+behind each claim and release, and `aub` binds that actor to a session by its
+trailing eight hexadecimal characters, which is the session-id fragment the
+actor string carries. A bound claim builds a timeline for that session alone,
+so two lanes claiming two different beads at the same time no longer take each
+other's spend. A claim whose actor names no session - a person, a script's
+fixed name, or a fragment that fits more than one known session - joins one
+fallback timeline that applies to a session only where that session has no
+claim of its own covering the instant.
+
+`report TASK-ID` names how much of the attribution is riding on that fallback,
+in both output formats:
+
+- `unresolved_claims`: boundaries whose actor bound to no known session, on
+  the text report as the `unresolved` half of the `claim binding` line.
+- `ambiguous_claims`: boundaries whose fragment fitted more than one known
+  session and were therefore bound to none rather than to an arbitrary one, on
+  the text report as the `ambiguous` half of the same line.
+
+Both counts cover claim and release boundaries alike, since a release that
+binds to nothing steers the fallback timeline exactly as an unbound claim
+does. The binding is derived when the report is assembled, never stored, so
+re-running `aub task ingest` over an unchanged tracker leaves every number
+identical, and a session ingested later starts binding claims that were
+already on disk.
+
 ## `aub can-run`
 
 **Answers:** given a fresh or cached calibrated credit headroom and the

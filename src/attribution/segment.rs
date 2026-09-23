@@ -20,7 +20,7 @@
 use std::collections::HashMap;
 
 use crate::attribution::TaskEventKind;
-use crate::domain::ids::TaskId;
+use crate::domain::ids::{SessionId, TaskId};
 use crate::domain::time::UtcTimestamp;
 use crate::domain::tokens::{
     CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens,
@@ -92,11 +92,109 @@ pub enum SegmentTarget {
 /// [`TaskEventKind::Release`] create boundaries; a caller filters
 /// `TaskEventKind::Unknown` out before building this, since an
 /// unrecognized event kind carries no attribution meaning.
+///
+/// `agent_association` is the tracker's own actor string, carried verbatim,
+/// and `session` is what [`resolve_claim_session`] made of it. Both are kept:
+/// the resolution is derived at read time from the actor, never stored, so a
+/// boundary whose session is `None` still names the actor that could not be
+/// resolved.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClaimBoundary {
     pub task_id: TaskId,
     pub occurred_at: UtcTimestamp,
     pub kind: TaskEventKind,
+    pub agent_association: Option<String>,
+    pub session: Option<SessionId>,
+}
+
+/// The length of the session-id fragment an actor string carries. `bin/actor-id`
+/// builds an actor as `<role>-<first 8 hex of the session id>`, so eight is the
+/// whole of the evidence a claim offers about which session made it.
+const ACTOR_SESSION_SUFFIX_LEN: usize = 8;
+
+/// What a claim's actor string resolved to against the ledger's known
+/// sessions. The two non-matching outcomes are distinct on purpose: an actor
+/// that names no session at all (`gabriel`, a script's hardcoded name) and an
+/// actor whose fragment fits several sessions are different facts about the
+/// tracker, and the task report counts them separately so the share of
+/// attribution still riding on the fallback timeline is visible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimSessionResolution {
+    /// Exactly one known session matched.
+    Session(SessionId),
+    /// No session matched: the actor carries no session fragment, or the
+    /// fragment it carries matches nothing this ledger knows.
+    Unresolved,
+    /// More than one known session matched. Picking one of them would be
+    /// invention, so the claim is treated as session-less and counted.
+    Ambiguous,
+}
+
+/// Resolves one claim's actor string to the session that made the claim.
+///
+/// The rule: take the actor's trailing fragment after the last `-`; when that
+/// fragment is exactly eight hexadecimal characters, it matches a session
+/// whose native id it is a case-insensitive prefix of. A fragment matching
+/// more than one known session is not a match, because assigning the claim to
+/// an arbitrary one of them would attribute real spend on a coin flip.
+///
+/// Pure over `(actor, known)`: no clock, no connection, no ordering
+/// assumption about `known`. That is what lets the resolution be derived at
+/// report time from immutable rows and stay identical across repeated
+/// ingests.
+pub fn resolve_claim_session(actor: Option<&str>, known: &[SessionId]) -> ClaimSessionResolution {
+    let Some(actor) = actor else {
+        return ClaimSessionResolution::Unresolved;
+    };
+    let fragment = actor.rsplit('-').next().unwrap_or_default();
+    if fragment.len() != ACTOR_SESSION_SUFFIX_LEN
+        || !fragment.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return ClaimSessionResolution::Unresolved;
+    }
+    let needle = fragment.to_ascii_lowercase();
+    let mut matched: Option<&SessionId> = None;
+    for session in known {
+        if !session
+            .native()
+            .as_str()
+            .to_ascii_lowercase()
+            .starts_with(&needle)
+        {
+            continue;
+        }
+        if matched.is_some() {
+            return ClaimSessionResolution::Ambiguous;
+        }
+        matched = Some(session);
+    }
+    match matched {
+        Some(session) => ClaimSessionResolution::Session(session.clone()),
+        None => ClaimSessionResolution::Unresolved,
+    }
+}
+
+/// How many boundary rows failed to bind to a session, by reason. Reported
+/// rather than assumed: a ledger whose claims are mostly unresolved is still
+/// attributing spend, but through the fallback timeline, and a reader who
+/// cannot see that cannot tell the two situations apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ClaimResolutionCounts {
+    /// Boundary rows whose actor resolved to no known session.
+    pub unresolved: u64,
+    /// Boundary rows whose actor fragment fitted more than one known session.
+    pub ambiguous: u64,
+}
+
+impl ClaimResolutionCounts {
+    /// Folds one resolution outcome into the running counts.
+    pub fn tally(&mut self, resolution: &ClaimSessionResolution) {
+        match resolution {
+            ClaimSessionResolution::Session(_) => {}
+            ClaimSessionResolution::Unresolved => self.unresolved += 1,
+            ClaimSessionResolution::Ambiguous => self.ambiguous += 1,
+        }
+    }
 }
 
 /// One usage record to segment: a half-open time window `[start, end)` (a
@@ -460,6 +558,8 @@ mod tests {
             task_id,
             occurred_at: t(at),
             kind: TaskEventKind::Claim,
+            agent_association: None,
+            session: None,
         }
     }
 
@@ -468,7 +568,99 @@ mod tests {
             task_id,
             occurred_at: t(at),
             kind: TaskEventKind::Release,
+            agent_association: None,
+            session: None,
         }
+    }
+
+    fn known_session(native: &str) -> SessionId {
+        SessionId::new(
+            SourceNamespace::new("claude-code"),
+            crate::domain::ids::NativeSessionId::new(native),
+        )
+    }
+
+    #[test]
+    fn an_actor_s_trailing_hex_fragment_resolves_to_the_one_session_it_prefixes() {
+        let known = vec![
+            known_session("eb1b1539-8f0c-4a11-9d2e-000000000001"),
+            known_session("c4ba2d16-1111-4a11-9d2e-000000000002"),
+        ];
+        assert_eq!(
+            resolve_claim_session(Some("drive-beads-c4ba2d16"), &known),
+            ClaimSessionResolution::Session(known[1].clone())
+        );
+    }
+
+    /// The fragment is compared without regard to case, since the tracker's
+    /// actor and the session id are produced by two different tools.
+    #[test]
+    fn the_fragment_matches_the_session_id_case_insensitively() {
+        let known = vec![known_session("EB1B1539-8f0c-4a11-9d2e-000000000001")];
+        assert_eq!(
+            resolve_claim_session(Some("implementer-eb1b1539"), &known),
+            ClaimSessionResolution::Session(known[0].clone())
+        );
+    }
+
+    /// The near-identical negative to the positive above: the same shape of
+    /// actor, one hex digit different, resolves to nothing rather than to the
+    /// session it nearly matches.
+    #[test]
+    fn a_fragment_that_prefixes_no_known_session_is_unresolved() {
+        let known = vec![known_session("eb1b1539-8f0c-4a11-9d2e-000000000001")];
+        assert_eq!(
+            resolve_claim_session(Some("implementer-eb1b153a"), &known),
+            ClaimSessionResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn an_actor_with_no_hex_fragment_is_unresolved() {
+        let known = vec![known_session("eb1b1539-8f0c-4a11-9d2e-000000000001")];
+        for actor in ["gabriel", "orchestrator", "lane-7", "drive-beads-c4ba2d1"] {
+            assert_eq!(
+                resolve_claim_session(Some(actor), &known),
+                ClaimSessionResolution::Unresolved,
+                "{actor} carries no eight-hex session fragment"
+            );
+        }
+    }
+
+    #[test]
+    fn an_absent_or_empty_actor_is_unresolved() {
+        let known = vec![known_session("eb1b1539-8f0c-4a11-9d2e-000000000001")];
+        assert_eq!(
+            resolve_claim_session(None, &known),
+            ClaimSessionResolution::Unresolved
+        );
+        assert_eq!(
+            resolve_claim_session(Some(""), &known),
+            ClaimSessionResolution::Unresolved
+        );
+    }
+
+    #[test]
+    fn a_fragment_that_prefixes_two_known_sessions_is_ambiguous() {
+        let known = vec![
+            known_session("eb1b1539-aaaa-4a11-9d2e-000000000001"),
+            known_session("eb1b1539-bbbb-4a11-9d2e-000000000002"),
+        ];
+        assert_eq!(
+            resolve_claim_session(Some("implementer-eb1b1539"), &known),
+            ClaimSessionResolution::Ambiguous
+        );
+    }
+
+    #[test]
+    fn the_counts_separate_unresolved_from_ambiguous() {
+        let mut counts = ClaimResolutionCounts::default();
+        counts.tally(&ClaimSessionResolution::Session(known_session("a")));
+        counts.tally(&ClaimSessionResolution::Unresolved);
+        counts.tally(&ClaimSessionResolution::Unresolved);
+        counts.tally(&ClaimSessionResolution::Ambiguous);
+        assert_eq!(counts.unresolved, 2);
+        assert_eq!(counts.ambiguous, 1);
     }
 
     fn mapped_available() -> SegmentationContext {

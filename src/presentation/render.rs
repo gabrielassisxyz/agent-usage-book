@@ -2032,6 +2032,10 @@ pub fn render_task_report_with_explain(report: &TaskReport, explain: ExplainMode
     lines.push(kind_line);
     lines.push(format!("usage: {}", render_usage_line(&report.usage)));
     lines.push(format!("credits: {}", render_credits(&report.credits)));
+    lines.push(format!(
+        "claim binding: {} unresolved · {} ambiguous",
+        report.claim_resolution.unresolved, report.claim_resolution.ambiguous
+    ));
     if report.sessions.is_empty() {
         lines.push("sessions: none".to_string());
     } else {

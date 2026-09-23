@@ -1147,11 +1147,15 @@ fn row_21_task_boundary_ambiguous() {
                 task_id: task("T1"),
                 occurred_at: ts(0),
                 kind: TaskEventKind::Claim,
+                agent_association: None,
+                session: None,
             },
             ClaimBoundary {
                 task_id: task("T2"),
                 occurred_at: ts(35),
                 kind: TaskEventKind::Claim,
+                agent_association: None,
+                session: None,
             },
         ],
         usage: vec![UsageWindow {

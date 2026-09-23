@@ -185,6 +185,8 @@ mod tests {
                 task_id: task.clone(),
                 occurred_at: UtcTimestamp::from_unix_nanos(0),
                 kind: TaskEventKind::Claim,
+                agent_association: None,
+                session: None,
             }],
             usage: vec![UsageWindow {
                 start: Some(UtcTimestamp::from_unix_nanos(1)),
