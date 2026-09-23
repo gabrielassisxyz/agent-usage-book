@@ -6248,15 +6248,18 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         file_contents.as_deref(),
         &file_path,
     )?;
-    let backup_path =
-        crate::backup::backup_resolve_archive_path(std::path::Path::new(&backup_path))?;
-    let backup =
-        crate::backup::verify_archive(&backup_path, config.sampling.request_timeout, clock)?;
-    if false && !backup.verified {
-        return Err(Error::Store(
-            "legacy import requires a verified backup archive".into(),
-        ));
-    }
+    let backup = crate::backup::backup_resolve_archive_path(std::path::Path::new(&backup_path))
+        .and_then(|path| {
+            crate::backup::verify_archive(&path, config.sampling.request_timeout, clock)
+        });
+    let backup = match backup {
+        Ok(backup) if backup.verified => backup,
+        _ => {
+            return Err(Error::Store(
+                "legacy import requires a verified backup archive".into(),
+            ));
+        }
+    };
     let backup_id = format!(
         "archive-v{}-g{}",
         backup.schema_version, backup.ledger_generation

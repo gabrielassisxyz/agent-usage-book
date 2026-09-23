@@ -1,7 +1,10 @@
 //! Integration tests for legacy meter series import (aub-fon.1, PLAN.md sections 12.6, 32, 33).
 
+use agent_usage_book::backup::{BackupSummary, create_archive, verify_archive};
 use agent_usage_book::config::CoverageFloor;
-use agent_usage_book::domain::time::{MeasurementBasis, MonotonicDuration, UtcTimestamp};
+use agent_usage_book::domain::time::{
+    FakeClock, MeasurementBasis, MonotonicDuration, UtcTimestamp,
+};
 use agent_usage_book::legacy_meter::read_source;
 use agent_usage_book::presentation::{Style, render_coverage_report};
 use agent_usage_book::report::coverage::{
@@ -21,6 +24,137 @@ fn open_migrated_ledger(state: &StateDir) -> Connection {
     // The schema comes from the cross-process template cache (aub-yr9c) instead
     // of a per-fixture migration replay.
     test_support::open_migrated(&path, &policy)
+}
+
+fn verified_legacy_meter_archive(state: &StateDir) -> BackupSummary {
+    let clock = FakeClock::new(UtcTimestamp::from_unix_nanos(1_000_000_000));
+    let timeout = MonotonicDuration::from_millis(1000);
+    let archive = create_archive(
+        state.path(),
+        &state.path().join("verified-archive"),
+        timeout,
+        &clock,
+    )
+    .expect("legacy import fixture backup must be created");
+    assert!(archive.verified, "legacy import fixture backup must verify");
+    let verified = verify_archive(&archive.destination, timeout, &clock)
+        .expect("legacy import fixture backup must independently verify");
+    assert!(verified.verified);
+    archive
+}
+
+struct LegacyMeterBackupFixture {
+    state: StateDir,
+    conn: Connection,
+    archive: std::path::PathBuf,
+    source: std::path::PathBuf,
+}
+
+impl LegacyMeterBackupFixture {
+    fn new() -> Self {
+        let state = StateDir::new();
+        let mut conn = open_migrated_ledger(&state);
+        let source = state.path().join("source.jsonl");
+        let existing_row = sample_legacy_jsonl_20_rows()
+            .lines()
+            .next()
+            .unwrap()
+            .replace("sess-01", "existing-session");
+        std::fs::write(&source, existing_row).unwrap();
+        import(
+            &mut conn,
+            &read_source(&source).unwrap(),
+            "previous-backup",
+            UtcTimestamp::from_unix_nanos(0),
+        )
+        .unwrap();
+        let archive = verified_legacy_meter_archive(&state).destination;
+        std::fs::write(&source, sample_legacy_jsonl_20_rows()).unwrap();
+        std::fs::write(state.path().join("config.toml"), "").unwrap();
+        Self {
+            state,
+            conn,
+            archive,
+            source,
+        }
+    }
+
+    fn truncate_archive(&self) {
+        let database = std::fs::OpenOptions::new()
+            .write(true)
+            .open(
+                self.archive
+                    .join(agent_usage_book::backup::ARCHIVE_DATABASE_FILE),
+            )
+            .unwrap();
+        let original_length = database.metadata().unwrap().len();
+        assert!(original_length > 0);
+        database.set_len(original_length / 2).unwrap();
+    }
+
+    fn import(&self) -> std::process::Output {
+        std::process::Command::new(env!("CARGO_BIN_EXE_aub"))
+            .env("HOME", self.state.path().join("home"))
+            .env("AUB_STATE_DIR", self.state.path())
+            .env("AUB_CONFIG_FILE", self.state.path().join("config.toml"))
+            .args(["import", "legacy-meter", "--source"])
+            .arg(&self.source)
+            .arg("--backup")
+            .arg(&self.archive)
+            .output()
+            .expect("legacy import command must run")
+    }
+
+    fn row_counts(&self) -> (i64, i64, i64) {
+        self.conn
+            .query_row(
+                "SELECT (SELECT count(*) FROM legacy_meter_import),
+                        (SELECT count(*) FROM meter_attempt),
+                        (SELECT count(*) FROM session_account_marker)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap()
+    }
+}
+
+#[test]
+fn cli_import_accepts_verified_backup() {
+    let fixture = LegacyMeterBackupFixture::new();
+    assert_eq!(fixture.row_counts(), (1, 1, 1));
+    let output = fixture.import();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("imported=20"));
+    assert_eq!(fixture.row_counts(), (2, 21, 21));
+}
+
+#[test]
+fn cli_import_rejects_truncated_backup_with_store_error() {
+    let fixture = LegacyMeterBackupFixture::new();
+    fixture.truncate_archive();
+    let output = fixture.import();
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("legacy import requires a verified backup archive"),
+        "missing verified-backup refusal: {stderr}"
+    );
+    assert!(output.stdout.is_empty());
+}
+
+#[test]
+fn cli_refusal_preserves_legacy_meter_row_counts() {
+    let fixture = LegacyMeterBackupFixture::new();
+    fixture.truncate_archive();
+    let before = fixture.row_counts();
+    assert_eq!(before, (1, 1, 1));
+    let output = fixture.import();
+    assert_eq!(
+        fixture.row_counts(),
+        before,
+        "refused import changed legacy_meter_import, meter_attempt or session_account_marker"
+    );
+    assert_eq!(output.status.code(), Some(5), "{output:?}");
 }
 
 fn sample_legacy_jsonl_20_rows() -> &'static str {
@@ -60,8 +194,13 @@ fn integration_importer_run_twice_is_idempotent_asserting_exact_counts() {
     assert_eq!(parsed.records.len(), 20);
 
     let import_time = UtcTimestamp::from_unix_nanos(1_000_000_000);
-    let first = import(&mut conn, &parsed, "backup-archive-1", import_time)
-        .expect("first import must succeed");
+    let backup = verified_legacy_meter_archive(&state);
+    let backup_id = format!(
+        "archive-v{}-g{}",
+        backup.schema_version, backup.ledger_generation
+    );
+    let first =
+        import(&mut conn, &parsed, &backup_id, import_time).expect("first import must succeed");
     assert_eq!(first.imported, 20);
     assert_eq!(first.unchanged, 0);
     assert_eq!(first.quarantined, 0);
@@ -81,8 +220,8 @@ fn integration_importer_run_twice_is_idempotent_asserting_exact_counts() {
     assert_eq!(markers_count_1, 20);
 
     // Re-run over exactly the same source
-    let repeated = import(&mut conn, &parsed, "backup-archive-1", import_time)
-        .expect("repeated import must succeed");
+    let repeated =
+        import(&mut conn, &parsed, &backup_id, import_time).expect("repeated import must succeed");
     assert_eq!(repeated.imported, 0);
     assert_eq!(repeated.unchanged, 20);
     assert_eq!(repeated.quarantined, 0);

@@ -54,6 +54,7 @@ case_steps() {
 case_assertions() {
     assert_exit 0 1
     assert_exit 0 2
+    assert_stdout_contains 2 "backup: verified=true"
 
     assert_exit 0 3
     assert_stdout_contains 3 "source_digest="
@@ -78,7 +79,7 @@ case_assertions() {
     assert_stdout_contains 5 "quarantined=1"
 
     assert_exit 5 6
-    assert_stderr_contains 6 "backup"
+    assert_stderr_contains 6 "legacy import requires a verified backup archive"
 
     assert_exit 0 7
     assert_stdout_contains 7 "2|2|2|1"
