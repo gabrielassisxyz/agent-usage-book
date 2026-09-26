@@ -1068,6 +1068,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn a_deliberately_dropped_event_fails_the_conservation_assertion() {
         let inputs = AccountSegmentationInputs {
             markers: vec![],
