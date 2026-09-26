@@ -195,7 +195,7 @@ impl DiagnosticEvent {
             Self::MeterSpoolDrained => "applied, already_applied, quarantined",
             Self::ProjectionRead => "state",
             Self::LegacyMeterImported => {
-                "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined"
+                "source_digest, verified_backup_id, records_read, imported, unchanged, superseded_by_native, quarantined"
             }
             Self::SeedArchiveImported => {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome"
