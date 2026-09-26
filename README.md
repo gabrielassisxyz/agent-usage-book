@@ -82,6 +82,27 @@ pattern = "opencode.db"
 format = "opencode"
 ```
 
+Every task tracker `aub task ingest` reads is a `[[trackers]]` entry, and each
+carries the source name its events are keyed under, so a bead id from one
+repository is never conflated with the same id in another:
+
+```toml
+[[trackers]]
+name = "agent-usage-book"
+kind = "local"
+path = "/path/to/repositories/agent-usage-book/.beads"
+
+[[trackers]]
+name = "kernl"
+kind = "local"
+path = "/path/to/kernl/.beads"
+```
+
+`name` is the identity the ledger keys the tracker's history on, so it is
+configured rather than derived from the path, and two entries must not share
+one name. The full shape and the refusal rules are in
+[docs/commands.md](docs/commands.md).
+
 `aub spend` reports today by default; `--since YYYY-MM-DD` and `--days N` widen the
 window. Repeat `--group-by day|session|project|repository` for nested subtotals and set
 `--refresh auto|never|force` to control transcript ingest. `--format json` emits the

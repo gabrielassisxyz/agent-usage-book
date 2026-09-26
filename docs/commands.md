@@ -268,10 +268,11 @@ card would otherwise have matched.
 ## `aub task`
 
 **Answers:** which task or named overhead bucket consumed this usage, by
-temporal segmentation of the issue tracker's claim history? `ingest` lands the
-tracker's claim and release events, `report TASK-ID` totals one task across
-every session that contributed to it, and `overhead` reports the usage that
-belonged to no claim, bucketed by the reason it belonged to none.
+temporal segmentation of the issue tracker's claim history? `ingest` lands
+every configured tracker's claim and release events, each under its own
+source name, `report TASK-ID` totals one task across every session that
+contributed to it, and `overhead` reports the usage that belonged to no claim,
+bucketed by the reason it belonged to none.
 
 **Refuses:** to manage issues. The tracker database is opened read-only and is
 never written to; `aub` reads a claim history it did not produce and has no way
@@ -306,6 +307,19 @@ does. The binding is derived when the report is assembled, never stored, so
 re-running `aub task ingest` over an unchanged tracker leaves every number
 identical, and a session ingested later starts binding claims that were
 already on disk.
+
+**`ingest` reads every configured tracker.** The `[[trackers]]` array below
+describes each tracker `aub` reads; one machine holds several, and a bead id
+from one repository is a different task from the same id in another. Each
+event is keyed under its tracker's `name`, so the two histories cannot
+conflate, and `report TASK-ID` names the tracker in the id's source half
+(`repo-a:aub-1`). The text report is one line per tracker; `--format json`
+carries the run's totals plus a `trackers` entry per configured tracker. A
+tracker whose `beads.db` is missing or unreadable is reported as failed for
+that tracker while the others still ingest, and the command's exit class is
+then that failure's (class 5 when a database would not open, class 8 when
+events could not be read); the report itself still lists every tracker,
+including the failed one.
 
 ## `aub can-run`
 
@@ -675,6 +689,42 @@ reach it. Give the service an `EnvironmentFile=` of its own (for example
 `~/.config/aub/env`, mode 0600, one `NAME=value` line per secret; systemd
 does not read `export` lines) and wire it into the unit with
 `EnvironmentFile=%h/.config/aub/env`.
+
+### `[[trackers]]`: which task trackers `aub task ingest` reads
+
+One machine runs several trackers, and the task history `aub` reports covers
+all of them, each under its own source name:
+
+```toml
+[[trackers]]
+name = "agent-usage-book"
+kind = "local"
+path = "/home/user/repositories/agent-usage-book/.beads"
+
+[[trackers]]
+name = "kernl"
+kind = "local"
+path = "/home/user/kernl/.beads"
+```
+
+`name` is the source namespace every event that tracker contributes is keyed
+under: `tracker_source` and `task_source` in the ledger, and the source half
+of the `TASK-ID` a task report reads (`agent-usage-book:aub-1`). It is
+configured rather than derived from the path, so moving a repository does not
+silently start a second series: the name is the identity the ledger keys the
+tracker's history on, and a name that changed would strand it.
+
+Two entries must not share one name - the name is the namespace, so two
+trackers under one name would conflate their histories in the ledger, which
+is exactly what per-tracker names exist to prevent; the config refuses the
+file naming both indexes. `kind` is the operator's label for the tracker
+brand. `path` is the tracker's own directory; `beads.db` beneath it is opened
+read-only, and the tracker itself is never written to. A section written as
+the singular `[tracker]` table is refused naming `[[trackers]]`: the plural
+is the shape, and a silent one-entry fallback would accept yesterday's file
+while every tracker beyond the first stayed uningested with nothing to say
+why. With no `[[trackers]]` at all, `task ingest` has nothing to read and
+says so; nothing else in `aub` reads this section.
 
 ## `aub export`
 

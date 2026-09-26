@@ -47,7 +47,8 @@ root = "$corpus"
 pattern = "**/*.jsonl"
 format = "claude-code"
 
-[tracker]
+[[trackers]]
+name = "beads"
 kind = "local"
 path = "$tracker_dir"
 EOT
@@ -76,7 +77,7 @@ case_assertions() {
     assert_exit 0 1
 
     assert_exit 0 2
-    assert_stdout_contains 2 "task ingest: events_inserted=1 events_already_present=0 quarantines_inserted=0 quarantines_already_present=0"
+    assert_stdout_contains 2 "task ingest beads: events_inserted=1 events_already_present=0 quarantines_inserted=0 quarantines_already_present=0"
 
     # Only the post-claim event (m2) is attributed to the task; the
     # pre-claim event (m1) must not appear in its total.

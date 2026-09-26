@@ -806,7 +806,7 @@ fn seed_can_run_ledger(state: &StateDir, extra_config: &str) {
     // two accounts name different (equally absent) paths because two logical
     // accounts must not share one credential source (aub-iwkg).
     let config = format!(
-        "state.dir = \"{}\"\n\n[[accounts]]\nname = \"spend\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token.json\" }}\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token-work.json\" }}\n\n[task_distribution]\nmin_samples = 3\n\n[[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\npattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n\n[tracker]\nkind = \"local\"\npath = \"{}/tracker\"\n",
+        "state.dir = \"{}\"\n\n[[accounts]]\nname = \"spend\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token.json\" }}\n\n[[accounts]]\nname = \"work-primary\"\nprovider = \"anthropic\"\ncredential = {{ kind = \"file\", path = \"{}/creds/token-work.json\" }}\n\n[task_distribution]\nmin_samples = 3\n\n[[transcripts]]\nname = \"claude-code\"\nroot = \"{}\"\npattern = \"**/*.jsonl\"\nformat = \"claude-code\"\n\n[[trackers]]\nname = \"beads\"\nkind = \"local\"\npath = \"{}/tracker\"\n",
         state.path().display(),
         state.path().display(),
         state.path().display(),
