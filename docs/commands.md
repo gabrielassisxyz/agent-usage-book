@@ -335,10 +335,19 @@ or `size:M`, otherwise `l`), verification (`local`, `gate`, `external`),
 specification (`closed`, `open`), and the critical override. If either verification
 or specification is missing or invalid, both default to `gate/open`. A bare
 `critical` or `difficulty:critical` label selects one shared critical cell
-regardless of the other axes. `--task-kind TYPE` remains descriptive metadata;
-it does not filter the historical samples. This command currently accepts no
-task labels or bead ID, so it requests the conservative unlabeled cell
-`l/gate/open`, with `critical=false`.
+regardless of the other axes. `--task-kind TYPE` remains descriptive metadata; it does not filter the
+historical samples. Pass a bead id instead (`aub can-run <bead-id>
+--account NAME --task-model MODEL`) and the routing cell is derived from that
+bead's own identity row, the same derivation the distribution groups by, so
+the answer states the cell the bead was compared against. A bead id and
+`--task-kind` together are a usage error naming both. A bare id must match
+exactly one configured tracker; an id in no tracker names the trackers
+searched, an id in more than one names both and asks for the
+`<source>/<id>` form, which is also accepted. A bead with no `task_identity`
+row is refused with a message naming `aub task ingest`, in the usage exit
+class. Both the text and JSON answers carry the derived cell (`history_group`
+and `history_level`) and the source bead id (`bead: <source>/<id>` in text,
+`bead_id` in JSON; null for the `--task-kind` form).
 
 The first population with at least `task_distribution.min_samples` eligible
 completed tasks wins: the full cell, then its `(breadth, critical)` parent,

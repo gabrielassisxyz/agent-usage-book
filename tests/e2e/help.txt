@@ -136,7 +136,7 @@ can-run:
   answers: given a fresh or cached calibrated credit headroom and the historical cost of this task kind, can the proposed task run now?
   refuses: --model (can-run names the proposed model with --task-model; --model is status's own reporting-scope selector); --no-color (can-run prints no color)
   format: text | json
-  options: --task-kind TYPE --account NAME --task-model MODEL [--cached]
+  options: [BEAD-ID | --task-kind TYPE] --account NAME --task-model MODEL [--cached]
 
 calibrate:
   answers: what is the state of the controlled calibration experiment, and what quota window capacity is fitted from recorded meter observations?

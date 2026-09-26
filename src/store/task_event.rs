@@ -128,6 +128,59 @@ pub fn open_tracker_database(path: &std::path::Path) -> Result<rusqlite::Connect
     )
 }
 
+/// Whether an already-open tracker database carries this native bead id, in
+/// its `issues` table or its `events` table. Every query failure means "not
+/// found here" rather than an error: bead-id resolution reports the miss, it
+/// never fails the command, and a tracker whose schema holds neither table
+/// simply never matches.
+pub fn tracker_contains_bead(tracker_conn: &rusqlite::Connection, native: &str) -> bool {
+    for query in [
+        "SELECT 1 FROM issues WHERE id = ?1 LIMIT 1",
+        "SELECT 1 FROM events WHERE issue_id = ?1 LIMIT 1",
+    ] {
+        if let Ok(mut statement) = tracker_conn.prepare(query)
+            && statement.query_row([native], |_| Ok(())).is_ok()
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Builds a minimal beads-tracker database at `dest` for tests: an `issues`
+/// table and an `events` table holding exactly the given native ids, each
+/// with one claim event. `#[cfg(test)]`: production never writes a tracker
+/// database, it only reads one.
+#[cfg(test)]
+pub(crate) fn create_tracker_fixture(
+    dest: &std::path::Path,
+    natives: &[&str],
+) -> Result<(), Error> {
+    let conn = connection::open(
+        dest,
+        AccessMode::ReadWrite,
+        &PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(100),
+        },
+    )?;
+    conn.execute_batch(
+        "CREATE TABLE issues (id TEXT PRIMARY KEY, issue_type TEXT NOT NULL DEFAULT 'task');
+         CREATE TABLE events (id INTEGER PRIMARY KEY, issue_id TEXT NOT NULL, event_type TEXT NOT NULL, actor TEXT, old_value TEXT, new_value TEXT, created_at TEXT NOT NULL);",
+    )
+    .map_err(|error| Error::Store(format!("cannot create tracker fixture: {error}")))?;
+    for (index, native) in natives.iter().enumerate() {
+        conn.execute("INSERT INTO issues (id) VALUES (?1)", [native])
+            .map_err(|error| Error::Store(format!("cannot seed tracker fixture: {error}")))?;
+        conn.execute(
+            "INSERT INTO events (id, issue_id, event_type, actor, old_value, new_value, created_at)
+             VALUES (?1, ?2, 'status_changed', 'agent-1', 'open', 'in_progress', '2026-08-25T10:00:00Z')",
+            params![(index * 2 + 1) as i64, native],
+        )
+        .map_err(|error| Error::Store(format!("cannot seed tracker fixture: {error}")))?;
+    }
+    Ok(())
+}
+
 /// Every boundary one scan read, and what the scan made of the actors behind
 /// them. The counts travel with the boundaries because they are two views of
 /// one pass: recomputing them anywhere else would mean resolving every actor

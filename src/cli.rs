@@ -916,7 +916,7 @@ impl Command {
             Command::Now => Some("[--session-id SESSION]"),
             Command::Status => Some("--refresh | --session-id SESSION"),
             Command::CanRun => {
-                Some("--task-kind TYPE --account NAME --task-model MODEL [--cached]")
+                Some("[BEAD-ID | --task-kind TYPE] --account NAME --task-model MODEL [--cached]")
             }
             Command::Account => Some("list | rename PROVIDER OLD NEW"),
             Command::CostModel => Some("list | activate MODEL-ID"),
@@ -7215,31 +7215,34 @@ fn compare_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
     }
 }
 
-/// `aub can-run --task-kind TYPE --account NAME --model MODEL [--cached]`
-/// (`aub-cab.4`): joins a fresh (default) or cached persisted meter sample,
-/// each constraining window's calibration health, the active cost model's
-/// token-class coverage and the historical distribution for `TYPE` into one
-/// advisory, refusing a quantitative answer and naming every missing
-/// prerequisite when any of the seven conditions PLAN.md 26.6 names is not
-/// met. A refusal is a normal, successful outcome: this function returns
-/// `Err` only for a usage or store failure, never for a refused advisory.
-fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
-    let timestamp = clock.now();
-    let run = RunId::new(timestamp);
-    let command = LogicalName::new("can-run");
-    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
-    logger
-        .emit(
-            timestamp,
-            DiagnosticEvent::RunStarted,
-            &[("command", &command)],
-        )
-        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+/// What `aub can-run` was asked to advise about: one bead from the ledger,
+/// named by its native id, or one task kind named by hand (`aub-og69`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CanRunBeadOrKind {
+    BeadId(String),
+    TaskKind(String),
+}
 
+/// The parsed `aub can-run` argument surface: what to advise about, which
+/// model the advice is evaluated for, and whether to reuse the persisted
+/// meter reading instead of sampling fresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CanRunBeadOrKindArgs {
+    target: CanRunBeadOrKind,
+    model: String,
+    cached: bool,
+}
+
+/// Parses the `aub can-run` argument surface without touching the store, so
+/// the shape is testable without a ledger: one positional bead id at most,
+/// `--task-kind` kept for the by-hand form, the two mutually exclusive, and
+/// `--task-model` required either way.
+fn parse_can_run_bead_or_kind_args(rest: &[String]) -> Result<CanRunBeadOrKindArgs, Error> {
     let mut task_kind_raw: Option<String> = None;
+    let mut bead_raw: Option<String> = None;
     let mut model_raw: Option<String> = None;
     let mut cached = false;
-    let mut args = invocation.rest.iter();
+    let mut args = rest.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--task-kind" => {
@@ -7276,25 +7279,169 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
                 model_raw = Some(val.to_string());
             }
             "--cached" => cached = true,
-            other => {
+            other if other.starts_with('-') => {
                 return Err(Error::Usage(format!(
                     "unknown argument: {other}; run aub can-run --help for options"
                 )));
             }
+            other => {
+                if bead_raw.is_some() {
+                    return Err(Error::Usage(format!(
+                        "can-run takes one bead id, got another positional argument: {other}"
+                    )));
+                }
+                bead_raw = Some(other.to_string());
+            }
         }
     }
 
-    let task_kind_raw =
-        task_kind_raw.ok_or_else(|| Error::Usage("can-run requires --task-kind TYPE".into()))?;
-    crate::attribution::TaskKind::parse(&task_kind_raw)
-        .ok_or_else(|| Error::Usage(format!("unknown task kind '{task_kind_raw}'")))?;
+    let target = match (bead_raw, task_kind_raw) {
+        (Some(bead), Some(kind)) => {
+            return Err(Error::Usage(format!(
+                "can-run accepts a bead id or --task-kind, not both (got bead '{bead}' and --task-kind '{kind}')"
+            )));
+        }
+        (Some(bead), None) => CanRunBeadOrKind::BeadId(bead),
+        (None, Some(kind)) => {
+            crate::attribution::TaskKind::parse(&kind)
+                .ok_or_else(|| Error::Usage(format!("unknown task kind '{kind}'")))?;
+            CanRunBeadOrKind::TaskKind(kind)
+        }
+        (None, None) => {
+            return Err(Error::Usage(
+                "can-run requires a bead id or --task-kind TYPE".into(),
+            ));
+        }
+    };
+    let model =
+        model_raw.ok_or_else(|| Error::Usage("can-run requires --task-model MODEL".into()))?;
+    Ok(CanRunBeadOrKindArgs {
+        target,
+        model,
+        cached,
+    })
+}
+
+/// Lists configured tracker names for a usage error, so a bead that matched
+/// nowhere names every tracker that was searched.
+fn can_run_tracker_name_list(trackers: &[crate::config::TrackerConfig]) -> String {
+    if trackers.is_empty() {
+        return "none ([[trackers]] has no entries)".to_string();
+    }
+    trackers
+        .iter()
+        .map(|tracker| tracker.name.clone())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether one configured tracker's own database carries this native bead id.
+/// A tracker that cannot be opened simply does not match: resolution reports
+/// the miss, it never fails the command.
+fn tracker_db_contains_bead(tracker: &crate::config::TrackerConfig, native: &str) -> bool {
+    let Ok(conn) = crate::store::task_event::open_tracker_database(&tracker.path.join("beads.db"))
+    else {
+        return false;
+    };
+    crate::store::task_event::tracker_contains_bead(&conn, native)
+}
+
+/// Resolves a `can-run` bead-id argument to its namespaced [`TaskId`] over the
+/// configured trackers (`aub-og69`): a `<source>/<id>` argument names its
+/// tracker directly, while a bare id must match exactly one tracker. No
+/// match, or more than one, is a usage error naming what was searched.
+fn resolve_can_run_bead_id(
+    trackers: &[crate::config::TrackerConfig],
+    raw: &str,
+) -> Result<crate::domain::ids::TaskId, Error> {
+    if let Some((source, native)) = raw.split_once('/') {
+        if source.is_empty() || native.is_empty() {
+            return Err(Error::Usage(format!(
+                "bead id must be <source>/<id> or a bare id, got {raw:?}"
+            )));
+        }
+        let Some(tracker) = trackers.iter().find(|tracker| tracker.name == source) else {
+            return Err(Error::Usage(format!(
+                "unknown tracker source '{source}' for bead {raw:?}; configured trackers: {}",
+                can_run_tracker_name_list(trackers)
+            )));
+        };
+        if !tracker_db_contains_bead(tracker, native) {
+            return Err(Error::Usage(format!(
+                "bead '{native}' matches no issue in tracker '{source}'; searched trackers: {}",
+                can_run_tracker_name_list(trackers)
+            )));
+        }
+        return Ok(crate::domain::ids::TaskId::new(
+            crate::domain::ids::SourceNamespace::new(source),
+            crate::domain::ids::NativeTaskId::new(native),
+        ));
+    }
+    let mut matches: Vec<String> = Vec::new();
+    for tracker in trackers {
+        if tracker_db_contains_bead(tracker, raw) {
+            matches.push(tracker.name.clone());
+        }
+    }
+    match matches.len() {
+        0 => Err(Error::Usage(format!(
+            "bead '{raw}' matches no configured tracker; searched: {}",
+            can_run_tracker_name_list(trackers)
+        ))),
+        1 => Ok(crate::domain::ids::TaskId::new(
+            crate::domain::ids::SourceNamespace::new(matches.pop().expect("one match above")),
+            crate::domain::ids::NativeTaskId::new(raw),
+        )),
+        _ => Err(Error::Usage(format!(
+            "bead '{raw}' matches {} trackers ({}); use <source>/<id> to name one (for example, {}/{raw})",
+            matches.len(),
+            matches.join(", "),
+            matches[0]
+        ))),
+    }
+}
+
+/// The refusal for a bead whose identity row is missing: never ingested, or
+/// ingested before its labels existed. Names `aub task ingest` in the usage
+/// class, never the evidence class and never the conservative cell.
+fn can_run_missing_identity_error(qualified: &str) -> Error {
+    Error::Usage(format!(
+        "bead '{qualified}' has no task_identity row; run `aub task ingest` to ingest its tracker history, then retry"
+    ))
+}
+/// `aub can-run [BEAD-ID | --task-kind TYPE] --account NAME --task-model MODEL [--cached]`
+/// (`aub-cab.4`): joins a fresh (default) or cached persisted meter sample,
+/// each constraining window's calibration health, the active cost model's
+/// token-class coverage and the historical distribution for the task into one
+/// advisory, refusing a quantitative answer and naming every missing
+/// prerequisite when any of the seven conditions PLAN.md 26.6 names is not
+/// met. A refusal is a normal, successful outcome: this function returns
+/// `Err` only for a usage or store failure, never for a refused advisory.
+///
+/// A bead id names the task through the ledger: the routing cell is derived
+/// from that bead's own identity row, the same derivation the distribution
+/// groups by, so the answer describes the population the bead belongs to
+/// instead of one the caller classified by hand.
+fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let timestamp = clock.now();
+    let run = RunId::new(timestamp);
+    let command = LogicalName::new("can-run");
+    let mut logger = DiagnosticLogger::new(io::stderr(), level, run.clone());
+    logger
+        .emit(
+            timestamp,
+            DiagnosticEvent::RunStarted,
+            &[("command", &command)],
+        )
+        .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
+
+    let parsed = parse_can_run_bead_or_kind_args(&invocation.rest)?;
+    let model = crate::domain::window::ModelId::new(&parsed.model);
+    let cached = parsed.cached;
     let account_name = invocation
         .account
         .as_deref()
         .ok_or_else(|| Error::Usage("can-run requires --account NAME".into()))?;
-    let model_raw =
-        model_raw.ok_or_else(|| Error::Usage("can-run requires --task-model MODEL".into()))?;
-    let model = crate::domain::window::ModelId::new(&model_raw);
 
     let env = crate::config::RealEnv;
     let file_path = resolve_config_file_path(None, &env);
@@ -7480,9 +7627,38 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         start: UtcTimestamp::from_unix_nanos(0),
         end: timestamp,
     };
+    // The historical population the answer is compared against: the
+    // conservative unlabeled cell for the by-hand `--task-kind` form, or the
+    // bead's own derived cell for the bead-id form. The identity row is what
+    // the distribution was built from, so the tracker database is never
+    // re-read for labels here; a bead with no identity row names
+    // `aub task ingest` instead of silently taking the conservative cell.
+    let (task_kind_raw, task_cell, task_bead) = match &parsed.target {
+        CanRunBeadOrKind::TaskKind(kind) => (
+            kind.clone(),
+            crate::report::can_run_evidence::TaskRoutingCell::default(),
+            None,
+        ),
+        CanRunBeadOrKind::BeadId(raw) => {
+            let task_id = resolve_can_run_bead_id(&config.trackers, raw)?;
+            let qualified = format!(
+                "{}/{}",
+                task_id.source().as_str(),
+                task_id.native().as_str()
+            );
+            let identity = crate::store::task_identity::read_task_identity(&conn, &task_id)?
+                .ok_or_else(|| can_run_missing_identity_error(&qualified))?;
+            let kind = identity
+                .kind
+                .map(|kind| kind.as_str().to_owned())
+                .unwrap_or_else(|| "unknown".to_owned());
+            let cell = crate::report::can_run_evidence::TaskRoutingCell::from_identity(&identity);
+            (kind, cell, Some(qualified))
+        }
+    };
     let group_report = crate::report::gather_task_history_group_report(
         &conn,
-        crate::report::can_run_evidence::TaskRoutingCell::default(),
+        task_cell,
         period,
         timestamp,
         &config.task_distribution,
@@ -7530,7 +7706,8 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
         // than a silently skipped one.
         provenance: crate::report::ProvenanceGraph::default(),
     };
-    let report = crate::report::can_run::compose_can_run_report(inputs);
+    let mut report = crate::report::can_run::compose_can_run_report(inputs);
+    report.task_bead = task_bead;
 
     match invocation.format {
         OutputFormat::Text => {
@@ -16510,5 +16687,382 @@ provider = "codex"
         assert_eq!(credits_per_point_from_estimate(3_000_000, 0), None);
         // 1 * 100 / 300 = 0.333..., rounds to 0: an infinite headroom, refused.
         assert_eq!(credits_per_point_from_estimate(1, 300), None);
+    }
+
+    /// The `can-run` usage line carries the bead-id form alongside the
+    /// by-hand form (`aub-og69`): `aub can-run --help` renders from this
+    /// same string, so pinning it here pins the help output too.
+    #[test]
+    fn can_run_options_help_carries_the_bead_id_form() {
+        let options = Command::CanRun
+            .options_help()
+            .expect("can-run documents its options");
+        assert!(options.contains("BEAD-ID"), "{options}");
+        assert!(options.contains("--task-kind"), "{options}");
+        assert!(options.contains("--task-model"), "{options}");
+    }
+
+    /// `aub can-run` takes the bead as a positional id: one positional parses
+    /// to the bead form, while `--task-kind` keeps parsing to the by-hand
+    /// form with the same required `--task-model` (`aub-og69`).
+    #[test]
+    fn can_run_bead_id_parses_as_a_positional_and_task_kind_keeps_working() {
+        let parsed =
+            parse_can_run_bead_or_kind_args(&strings(&["aub-1", "--task-model", "sonnet"]))
+                .expect("a positional bead id parses");
+        assert_eq!(parsed.target, CanRunBeadOrKind::BeadId("aub-1".to_string()));
+        assert_eq!(parsed.model, "sonnet");
+        assert!(!parsed.cached);
+
+        let parsed = parse_can_run_bead_or_kind_args(&strings(&[
+            "--task-kind",
+            "task",
+            "--task-model=sonnet",
+            "--cached",
+        ]))
+        .expect("the by-hand form keeps working");
+        assert_eq!(
+            parsed.target,
+            CanRunBeadOrKind::TaskKind("task".to_string())
+        );
+        assert!(parsed.cached);
+
+        let parsed =
+            parse_can_run_bead_or_kind_args(&strings(&["repo-a/aub-1", "--task-model", "opus"]))
+                .expect("the qualified form parses");
+        assert_eq!(
+            parsed.target,
+            CanRunBeadOrKind::BeadId("repo-a/aub-1".to_string())
+        );
+    }
+
+    /// A bead id and `--task-kind` together are a usage error naming both
+    /// (`aub-og69`); the planted negative is a parser that silently prefers
+    /// one, which would answer about a different population than the caller
+    /// named.
+    #[test]
+    fn can_run_bead_id_with_task_kind_names_both() {
+        let message = usage_message(parse_can_run_bead_or_kind_args(&strings(&[
+            "aub-1",
+            "--task-kind",
+            "task",
+            "--task-model",
+            "sonnet",
+        ])));
+        assert!(
+            message.contains("aub-1") && message.contains("--task-kind"),
+            "{message}"
+        );
+
+        let message = usage_message(parse_can_run_bead_or_kind_args(&strings(&[
+            "--task-model",
+            "sonnet",
+        ])));
+        assert!(
+            message.contains("--task-kind") && message.contains("bead id"),
+            "{message}"
+        );
+
+        let message = usage_message(parse_can_run_bead_or_kind_args(&strings(&[
+            "aub-1",
+            "aub-2",
+            "--task-model",
+            "sonnet",
+        ])));
+        assert!(message.contains("one bead id"), "{message}");
+
+        let message = usage_message(parse_can_run_bead_or_kind_args(&strings(&["aub-1"])));
+        assert!(message.contains("--task-model"), "{message}");
+
+        let message = usage_message(parse_can_run_bead_or_kind_args(&strings(&[
+            "aub-1",
+            "--task-model",
+            "sonnet",
+            "--bogus",
+        ])));
+        assert!(message.contains("--bogus"), "{message}");
+    }
+
+    fn can_run_bead_id_scratch(tag: &str) -> std::path::PathBuf {
+        static CAN_RUN_BEAD_ID_COUNTER: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let suffix = CAN_RUN_BEAD_ID_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "aub-can-run-bead-id-{tag}-{suffix}-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn can_run_bead_id_tracker(
+        dir: &std::path::Path,
+        name: &str,
+        beads: &[&str],
+    ) -> crate::config::TrackerConfig {
+        let tracker_dir = dir.join(name);
+        std::fs::create_dir_all(&tracker_dir).unwrap();
+        crate::store::task_event::create_tracker_fixture(&tracker_dir.join("beads.db"), beads)
+            .unwrap();
+        crate::config::TrackerConfig {
+            name: name.to_string(),
+            kind: "local".to_string(),
+            path: tracker_dir,
+        }
+    }
+
+    fn can_run_bead_id_ledger(dir: &std::path::Path) -> rusqlite::Connection {
+        crate::store::test_schema::open_migrated(
+            &dir.join("ledger.db"),
+            &crate::store::connection::PragmaPolicy {
+                busy_timeout: crate::domain::time::MonotonicDuration::from_millis(100),
+            },
+        )
+    }
+
+    #[derive(Clone)]
+    struct CanRunBeadTaskReader(Vec<crate::attribution::TrackerTaskRecord>);
+
+    impl crate::attribution::TrackerTaskReader for CanRunBeadTaskReader {
+        fn read_tasks(&self) -> Result<Vec<crate::attribution::TrackerTaskRecord>, Error> {
+            Ok(self.0.clone())
+        }
+    }
+
+    /// Seeds one identity row through the real candidate evidence path: the
+    /// given labels are the tracker's own, so the row carries exactly what
+    /// ingest would have derived. An empty label set mirrors a bead without
+    /// that label.
+    fn seed_can_run_bead_identity(
+        conn: &rusqlite::Connection,
+        source: &str,
+        native: &str,
+        labels: &[&str],
+    ) {
+        let reader = CanRunBeadTaskReader(vec![crate::attribution::TrackerTaskRecord {
+            native: native.to_owned(),
+            issue_type: "task".to_owned(),
+            labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+        }]);
+        crate::store::task_identity::ingest_task_kind_candidates(
+            conn,
+            crate::domain::ids::SourceNamespace::new(source),
+            &reader,
+        )
+        .unwrap();
+        crate::store::task_identity::rebuild_task_identities(
+            conn,
+            &crate::attribution::TaskKindMapping::default_v1(),
+        )
+        .unwrap();
+    }
+
+    /// Resolution over two trackers: a bare id in both is an ambiguous usage
+    /// error naming both and asking for `<source>/<id>`, which then resolves;
+    /// an id in neither names the trackers searched (`aub-og69`).
+    #[test]
+    fn can_run_bead_id_resolution_matches_one_tracker_or_names_the_miss() {
+        let dir = can_run_bead_id_scratch("resolution");
+        let repo_a = can_run_bead_id_tracker(&dir, "repo-a", &["aub-1", "aub-2"]);
+        let repo_b = can_run_bead_id_tracker(&dir, "repo-b", &["aub-1", "aub-9"]);
+        let trackers = vec![repo_a, repo_b];
+
+        let message = usage_message(resolve_can_run_bead_id(&trackers, "aub-1"));
+        assert!(
+            message.contains("repo-a") && message.contains("repo-b"),
+            "{message}"
+        );
+        assert!(message.contains("<source>/<id>"), "{message}");
+
+        let resolved =
+            resolve_can_run_bead_id(&trackers, "repo-b/aub-1").expect("qualified resolves");
+        assert_eq!(resolved.source().as_str(), "repo-b");
+        assert_eq!(resolved.native().as_str(), "aub-1");
+
+        let resolved =
+            resolve_can_run_bead_id(&trackers, "aub-9").expect("unique bare id resolves");
+        assert_eq!(resolved.source().as_str(), "repo-b");
+        assert_eq!(resolved.native().as_str(), "aub-9");
+
+        let message = usage_message(resolve_can_run_bead_id(&trackers, "aub-nope"));
+        assert!(
+            message.contains("aub-nope")
+                && message.contains("repo-a")
+                && message.contains("repo-b"),
+            "{message}"
+        );
+
+        let message = usage_message(resolve_can_run_bead_id(&trackers, "repo-z/aub-1"));
+        assert!(
+            message.contains("repo-z") && message.contains("repo-a"),
+            "{message}"
+        );
+
+        let message = usage_message(resolve_can_run_bead_id(&trackers, "repo-a/aub-9"));
+        assert!(
+            message.contains("aub-9") && message.contains("repo-a"),
+            "{message}"
+        );
+    }
+
+    /// The derived cell comes from the ledger identity row: a labeled bead
+    /// lands in its own cell rather than the conservative default, and an
+    /// unlabeled bead lands exactly in the default, so the bead form and the
+    /// by-hand form agree there (`aub-og69`). The planted negative puts a
+    /// second bead in another cell and asserts the reported cell moves with
+    /// the labels.
+    #[test]
+    fn can_run_bead_id_derivation_reads_the_identity_cell() {
+        use crate::report::can_run_evidence::{
+            TaskHistoryGroup, TaskRoutingBreadth, TaskRoutingCell,
+        };
+        let dir = can_run_bead_id_scratch("derivation");
+        let conn = can_run_bead_id_ledger(&dir);
+        seed_can_run_bead_identity(
+            &conn,
+            "repo-b",
+            "aub-9",
+            &["size:S", "verify:local", "spec:closed"],
+        );
+        seed_can_run_bead_identity(&conn, "repo-b", "aub-plain", &[]);
+        seed_can_run_bead_identity(
+            &conn,
+            "repo-b",
+            "aub-other",
+            &["size:XL", "verify:external", "spec:open"],
+        );
+
+        let task_id = crate::domain::ids::TaskId::new(
+            crate::domain::ids::SourceNamespace::new("repo-b"),
+            crate::domain::ids::NativeTaskId::new("aub-9"),
+        );
+        let row = crate::store::task_identity::read_task_identity(&conn, &task_id)
+            .unwrap()
+            .expect("the seeded identity reads back");
+        let cell = TaskRoutingCell::from_identity(&row);
+        assert_eq!(
+            cell.group(),
+            TaskHistoryGroup::Cell {
+                breadth: TaskRoutingBreadth::SmallMedium,
+                verify: crate::attribution::TaskVerify::Local,
+                spec: crate::attribution::TaskSpec::Closed,
+            }
+        );
+        assert_ne!(cell, TaskRoutingCell::default());
+
+        let plain_id = crate::domain::ids::TaskId::new(
+            crate::domain::ids::SourceNamespace::new("repo-b"),
+            crate::domain::ids::NativeTaskId::new("aub-plain"),
+        );
+        let plain_row = crate::store::task_identity::read_task_identity(&conn, &plain_id)
+            .unwrap()
+            .expect("the unlabeled identity reads back");
+        assert_eq!(
+            TaskRoutingCell::from_identity(&plain_row),
+            TaskRoutingCell::default()
+        );
+
+        let other_id = crate::domain::ids::TaskId::new(
+            crate::domain::ids::SourceNamespace::new("repo-b"),
+            crate::domain::ids::NativeTaskId::new("aub-other"),
+        );
+        let other_row = crate::store::task_identity::read_task_identity(&conn, &other_id)
+            .unwrap()
+            .expect("the second identity reads back");
+        let other_cell = TaskRoutingCell::from_identity(&other_row);
+        assert_ne!(other_cell.group(), cell.group());
+        assert_eq!(other_cell.group().level(), "cell");
+    }
+
+    /// A bead with no identity row refuses in the usage class naming
+    /// `aub task ingest`, never the evidence class (`aub-og69`).
+    #[test]
+    fn can_run_bead_id_without_identity_names_ingest_in_the_usage_class() {
+        let dir = can_run_bead_id_scratch("missing-identity");
+        let conn = can_run_bead_id_ledger(&dir);
+        let missing = crate::domain::ids::TaskId::new(
+            crate::domain::ids::SourceNamespace::new("repo-a"),
+            crate::domain::ids::NativeTaskId::new("aub-2"),
+        );
+        assert!(
+            crate::store::task_identity::read_task_identity(&conn, &missing)
+                .unwrap()
+                .is_none()
+        );
+        match can_run_missing_identity_error("repo-a/aub-2") {
+            Error::Usage(message) => assert!(message.contains("aub task ingest"), "{message}"),
+            other @ (Error::Internal(_)
+            | Error::AuthRequired(_)
+            | Error::RemoteUnavailable(_)
+            | Error::Store(_)
+            | Error::InsufficientEvidence(_)
+            | Error::ThresholdNotMet(_)
+            | Error::IngestIncomplete(_)) => {
+                panic!("missing identity must be a usage error, got {other:?}")
+            }
+        }
+    }
+
+    /// The derived cell and its source bead id travel on both surfaces: the
+    /// text rendering names the bead, and the JSON envelope carries both the
+    /// bead id and the history group (`aub-og69`). The planted negative
+    /// clears the bead and asserts both surfaces stop naming it, so the
+    /// `--task-kind` form stays byte-identical.
+    #[test]
+    fn can_run_bead_id_appears_in_text_and_json_output() {
+        use crate::report::can_run_evidence::{TaskHistoryGroup, TaskRoutingCell};
+        let metadata = crate::report::models::ReportMetadata::new(
+            crate::domain::time::UtcTimestamp::from_unix_nanos(1_000_000_000),
+            crate::domain::time::UtcTimestamp::from_unix_nanos(1_000_000_000),
+            crate::report::models::LedgerGeneration::new(1),
+            None,
+        );
+        let refused = crate::report::can_run::CanRunOutcome::Refused(
+            crate::report::can_run::CanRunRefusalReport {
+                verdict: crate::advice::verdict::CanRunVerdictLabel::InsufficientEvidence,
+                missing: vec![crate::advice::verdict::CanRunMissingFact {
+                    subject: "task".to_string(),
+                    reason: "too few historical tasks".to_string(),
+                }],
+                attribution_quality: None,
+            },
+        );
+        let mut report = crate::report::can_run::CanRunReport::new(
+            metadata,
+            "task",
+            "work-primary",
+            "sonnet",
+            refused,
+            crate::report::ProvenanceGraph::default(),
+        );
+        report.task_bead = Some("repo-b/aub-9".to_string());
+        let group = TaskHistoryGroup::Cell {
+            breadth: crate::report::can_run_evidence::TaskRoutingBreadth::SmallMedium,
+            verify: crate::attribution::TaskVerify::Local,
+            spec: crate::attribution::TaskSpec::Closed,
+        };
+        assert_ne!(group, TaskRoutingCell::default().group());
+
+        let text = crate::presentation::render::render_can_run_report(&report);
+        assert!(text.contains("bead: repo-b/aub-9"), "{text}");
+
+        let run =
+            crate::logging::RunId::new(crate::domain::time::UtcTimestamp::from_unix_nanos(42));
+        let json = crate::presentation::json::can_run_json(&report, group, run);
+        crate::presentation::json::validate_can_run_report_json(&json)
+            .expect("the bead form validates its own contract");
+        let value: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert_eq!(value["bead_id"], "repo-b/aub-9");
+        assert_eq!(value["history_level"], "cell");
+        assert_eq!(value["history_group"]["breadth"], "sm");
+
+        report.task_bead = None;
+        let plain_text = crate::presentation::render::render_can_run_report(&report);
+        assert!(!plain_text.contains("bead:"), "{plain_text}");
+        let run =
+            crate::logging::RunId::new(crate::domain::time::UtcTimestamp::from_unix_nanos(43));
+        let plain_json = crate::presentation::json::can_run_json(&report, group, run);
+        let plain: serde_json::Value = serde_json::from_str(&plain_json).expect("valid JSON");
+        assert!(plain["bead_id"].is_null(), "{plain}");
     }
 }

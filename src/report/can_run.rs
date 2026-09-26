@@ -178,6 +178,10 @@ pub enum CanRunOutcome {
 pub struct CanRunReport {
     pub metadata: ReportMetadata,
     pub task_kind: String,
+    /// The qualified bead id (`<source>/<native>`) the caller named, when the
+    /// answer was requested for a bead (`aub-og69`) rather than for a
+    /// `--task-kind`. `None` keeps the `--task-kind` form byte-identical.
+    pub task_bead: Option<String>,
     pub account: String,
     pub model: String,
     pub outcome: CanRunOutcome,
@@ -196,6 +200,7 @@ impl CanRunReport {
         Self {
             metadata,
             task_kind: task_kind.into(),
+            task_bead: None,
             account: account.into(),
             model: model.into(),
             outcome,
