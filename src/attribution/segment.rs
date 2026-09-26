@@ -886,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     fn a_deliberately_dropped_window_fails_the_conservation_assertion() {
         // Builds a result that omits one input window's usage, the way a
         // bug that silently drops an event would, and proves the debug
