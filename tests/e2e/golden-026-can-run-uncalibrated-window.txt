@@ -1,3 +1,4 @@
+history: level=cell group=l/gate/open critical=false
 assessment: UNKNOWN
 reason: no calibration is recorded for this window
 

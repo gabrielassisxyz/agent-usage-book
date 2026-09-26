@@ -2038,13 +2038,18 @@ pub fn clear_diagnostics_json(
 }
 
 /// Serializes a can-run report under the JSON envelope.
-pub fn can_run_json(report: &CanRunReport, run: RunId) -> String {
-    can_run_json_with_explain(report, run, ExplainMode::Off)
+pub fn can_run_json(
+    report: &CanRunReport,
+    history_group: crate::report::can_run_evidence::TaskHistoryGroup,
+    run: RunId,
+) -> String {
+    can_run_json_with_explain(report, history_group, run, ExplainMode::Off)
 }
 
 /// Serializes a can-run report under the JSON envelope, optionally including explain provenance.
 pub fn can_run_json_with_explain(
     report: &CanRunReport,
+    history_group: crate::report::can_run_evidence::TaskHistoryGroup,
     run: RunId,
     explain: ExplainMode,
 ) -> String {
@@ -2190,13 +2195,15 @@ pub fn can_run_json_with_explain(
     };
 
     let mut body = format!(
-        "\"task_kind\":{},\"account\":{},\"model\":{},\"limiting_window\":{},\"outcome\":{},\"provenance\":{}",
+        "\"task_kind\":{},\"account\":{},\"model\":{},\"limiting_window\":{},\"outcome\":{},\"provenance\":{},\"history_group\":{},\"history_level\":{}",
         json_string(&report.task_kind),
         json_string(&report.account),
         json_string(&report.model),
         limiting_window_json,
         outcome_json,
-        provenance_part
+        provenance_part,
+        can_run_history_group_json(history_group),
+        json_string(history_group.level()),
     );
 
     if explain != ExplainMode::Off {
@@ -2207,6 +2214,64 @@ pub fn can_run_json_with_explain(
     }
 
     JsonEnvelope::new("can-run", run, report.metadata.clone()).to_json_with(&body)
+}
+
+fn can_run_history_group_json(group: crate::report::can_run_evidence::TaskHistoryGroup) -> String {
+    use crate::report::can_run_evidence::TaskHistoryGroup;
+    match group {
+        TaskHistoryGroup::Cell {
+            breadth,
+            verify,
+            spec,
+        } => format!(
+            "{{\"breadth\":{},\"verify\":{},\"spec\":{},\"critical\":false}}",
+            json_string(breadth.as_str()),
+            json_string(verify.as_str()),
+            json_string(spec.as_str()),
+        ),
+        TaskHistoryGroup::Critical => "{\"critical\":true}".to_owned(),
+        TaskHistoryGroup::BreadthCritical { breadth, critical } => format!(
+            "{{\"breadth\":{},\"critical\":{critical}}}",
+            json_string(breadth.as_str()),
+        ),
+        TaskHistoryGroup::AllTasks => "{}".to_owned(),
+    }
+}
+
+fn validate_can_run_history_group(
+    obj: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), JsonContractError> {
+    let group = &obj["history_group"];
+    let valid = match obj["history_level"].as_str() {
+        Some("cell") if group["critical"] == true => {
+            group.as_object().is_some_and(|key| key.len() == 1)
+        }
+        Some("cell") => {
+            group.as_object().is_some_and(|key| key.len() == 4)
+                && matches!(group["breadth"].as_str(), Some("sm" | "l"))
+                && matches!(
+                    group["verify"].as_str(),
+                    Some("local" | "gate" | "external")
+                )
+                && matches!(group["spec"].as_str(), Some("closed" | "open"))
+                && group["critical"] == false
+        }
+        Some("breadth_critical") => {
+            group.as_object().is_some_and(|key| key.len() == 2)
+                && matches!(group["breadth"].as_str(), Some("sm" | "l"))
+                && group["critical"].is_boolean()
+        }
+        Some("all_tasks") => group.as_object().is_some_and(|key| key.is_empty()),
+        _ => false,
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(JsonContractError::InvalidFormat {
+            field: "history_group",
+            message: "expected a routing group matching history_level".to_owned(),
+        })
+    }
 }
 
 /// Validates a serialized can-run report against its contract.
@@ -2225,7 +2290,7 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
             message: "expected object".to_string(),
         })?;
 
-    const KNOWN_CAN_RUN_KEYS: [&str; 14] = [
+    const KNOWN_CAN_RUN_KEYS: [&str; 16] = [
         "schema",
         "command",
         "run",
@@ -2234,6 +2299,8 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
         "ledger_generation",
         "ingestion_generation",
         "task_kind",
+        "history_group",
+        "history_level",
         "account",
         "model",
         "limiting_window",
@@ -2248,11 +2315,21 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
         }
     }
 
-    for required in ["task_kind", "account", "model", "outcome", "provenance"] {
+    for required in [
+        "task_kind",
+        "history_group",
+        "history_level",
+        "account",
+        "model",
+        "outcome",
+        "provenance",
+    ] {
         if !obj.contains_key(required) {
             return Err(JsonContractError::MissingField(required));
         }
     }
+
+    validate_can_run_history_group(obj)?;
 
     let outcome_obj = obj
         .get("outcome")
@@ -3450,7 +3527,8 @@ mod tests {
         let run = RunId::new(UtcTimestamp::from_unix_nanos(42));
 
         let ready_report = compose_can_run_report(inputs.clone());
-        let ready_json = can_run_json(&ready_report, run.clone());
+        let history_group = crate::report::can_run_evidence::TaskRoutingCell::default().group();
+        let ready_json = can_run_json(&ready_report, history_group, run.clone());
         validate_can_run_report_json(&ready_json).expect("ready report validates its own contract");
         let value: serde_json::Value =
             serde_json::from_str(&ready_json).expect("valid JSON expected");
@@ -3486,7 +3564,7 @@ mod tests {
             ),
         );
         let estimated_report = compose_can_run_report(estimated_inputs);
-        let estimated_json = can_run_json(&estimated_report, run.clone());
+        let estimated_json = can_run_json(&estimated_report, history_group, run.clone());
         validate_can_run_report_json(&estimated_json)
             .expect("estimated report validates its own contract");
         let estimated: serde_json::Value =
@@ -3516,7 +3594,7 @@ mod tests {
             reason: crate::domain::freshness::StaleReason::AgeExceeded,
         };
         let refused_report = compose_can_run_report(stale_inputs);
-        let refused_json = can_run_json(&refused_report, run);
+        let refused_json = can_run_json(&refused_report, history_group, run);
         validate_can_run_report_json(&refused_json)
             .expect("refused report validates its own contract");
         let refused_value: serde_json::Value =

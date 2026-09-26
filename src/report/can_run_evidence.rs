@@ -50,7 +50,7 @@
 //! history: from the epoch to the report's `generated_at`. A narrower
 //! configured window is a later, separate decision.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use crate::advice::historical_distribution::{
     AttributionCoverage, DistributionVerdict, ExclusionCounts, GroupHistoryReport,
@@ -62,56 +62,235 @@ use crate::attribution::account_segment::{
     AccountEvidenceClass, AccountSegmentationInputs, AccountUsageEvent, assign,
 };
 use crate::attribution::segment::{OverheadReason, SegmentTarget};
-use crate::attribution::{TaskIdentityState, TaskKind};
+use crate::attribution::{TaskSize, TaskSpec, TaskVerify};
 use crate::config::ModelTable;
 use crate::domain::ids::{NativeSessionId, SessionId, SourceNamespace, TaskId};
 use crate::domain::time::UtcTimestamp;
 use crate::error::Error;
 use crate::evidence::Derivation;
 use crate::store::spend::CanonicalSpendEvent;
+use crate::store::task_identity::TaskIdentityRow;
 
-/// Every completed task of `task_kind` in `period`, joined into one
-/// [`GroupHistoryReport`]. Never through new SQL outside `src/store`: the
-/// canonical event scan, the segmentation join and the account-marker lookup
-/// are the same store functions `aub task report` and `aub spend` already
-/// call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskRoutingBreadth {
+    SmallMedium,
+    Large,
+}
+
+impl TaskRoutingBreadth {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SmallMedium => "sm",
+            Self::Large => "l",
+        }
+    }
+}
+
+/// Dispatcher axes before the critical override collapses them into one cell.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct TaskRoutingCell {
+    pub breadth: TaskRoutingBreadth,
+    pub verify: TaskVerify,
+    pub spec: TaskSpec,
+    pub critical: bool,
+}
+
+impl Default for TaskRoutingCell {
+    fn default() -> Self {
+        Self {
+            breadth: TaskRoutingBreadth::Large,
+            verify: TaskVerify::Gate,
+            spec: TaskSpec::Open,
+            critical: false,
+        }
+    }
+}
+
+impl TaskRoutingCell {
+    pub fn from_identity(identity: &TaskIdentityRow) -> Self {
+        let breadth = match identity.size {
+            Some(TaskSize::S | TaskSize::M) => TaskRoutingBreadth::SmallMedium,
+            Some(TaskSize::L | TaskSize::XL) | None => TaskRoutingBreadth::Large,
+        };
+        // The dispatcher treats an incomplete verify/spec pair as gate/open.
+        let (verify, spec) = match (identity.verify, identity.spec) {
+            (Some(verify), Some(spec)) => (verify, spec),
+            _ => (TaskVerify::Gate, TaskSpec::Open),
+        };
+        Self {
+            breadth,
+            verify,
+            spec,
+            critical: identity.routing_critical,
+        }
+    }
+
+    pub fn group(self) -> TaskHistoryGroup {
+        if self.critical {
+            TaskHistoryGroup::Critical
+        } else {
+            TaskHistoryGroup::Cell {
+                breadth: self.breadth,
+                verify: self.verify,
+                spec: self.spec,
+            }
+        }
+    }
+
+    fn parent(self) -> TaskHistoryGroup {
+        TaskHistoryGroup::BreadthCritical {
+            breadth: self.breadth,
+            critical: self.critical,
+        }
+    }
+}
+
+/// The selected historical population. Its variant also names the fallback level.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TaskHistoryGroup {
+    Cell {
+        breadth: TaskRoutingBreadth,
+        verify: TaskVerify,
+        spec: TaskSpec,
+    },
+    Critical,
+    BreadthCritical {
+        breadth: TaskRoutingBreadth,
+        critical: bool,
+    },
+    AllTasks,
+}
+
+impl TaskHistoryGroup {
+    pub fn level(self) -> &'static str {
+        match self {
+            Self::Cell { .. } | Self::Critical => "cell",
+            Self::BreadthCritical { .. } => "breadth_critical",
+            Self::AllTasks => "all_tasks",
+        }
+    }
+
+    fn contains(self, cell: TaskRoutingCell) -> bool {
+        match self {
+            Self::Cell { .. } | Self::Critical => cell.group() == self,
+            Self::BreadthCritical { breadth, critical } => {
+                cell.breadth == breadth && cell.critical == critical
+            }
+            Self::AllTasks => true,
+        }
+    }
+}
+
+impl std::fmt::Display for TaskHistoryGroup {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Cell {
+                breadth,
+                verify,
+                spec,
+            } => write!(
+                f,
+                "{}/{}/{} critical=false",
+                breadth.as_str(),
+                verify.as_str(),
+                spec.as_str()
+            ),
+            Self::Critical => f.write_str("critical=true"),
+            Self::BreadthCritical { breadth, critical } => {
+                write!(f, "{} critical={critical}", breadth.as_str())
+            }
+            Self::AllTasks => f.write_str("all tasks"),
+        }
+    }
+}
+
+/// Selects the first routing population with enough eligible completed tasks.
 pub fn gather_task_history_group_report(
     conn: &rusqlite::Connection,
-    task_kind: TaskKind,
+    cell: TaskRoutingCell,
     period: SelectionPeriod,
     generated_at: UtcTimestamp,
     config: &HistoricalDistributionConfig,
     models: &ModelTable,
-) -> Result<GroupHistoryReport<TaskKind>, Error> {
-    let samples = gather_task_history_samples(conn, task_kind, period, generated_at, models)?;
-    let mut reports = build_group_reports(samples, period, config);
-    Ok(reports
-        .remove(&task_kind)
-        .unwrap_or_else(|| GroupHistoryReport {
-            group: task_kind,
-            period,
-            sample_count: 0,
-            exclusions: ExclusionCounts::default(),
-            attribution: AttributionCoverage {
-                fraction: crate::attribution::quality::AttributionFraction::new(0, 0),
-                floor: config.attribution_floor,
-            },
-            verdict: DistributionVerdict::InsufficientEvidence {
-                min_samples: config.min_samples,
-            },
-        }))
+) -> Result<GroupHistoryReport<TaskHistoryGroup>, Error> {
+    let samples = gather_task_history_samples(conn, period, generated_at, models)?;
+    Ok(select_task_history_group(&samples, cell, period, config))
 }
 
-/// Builds one [`TaskHistorySample`] per completed task of `task_kind` whose
+fn task_cell_reports(
+    samples: &[TaskHistorySample<TaskRoutingCell>],
+    period: SelectionPeriod,
+    config: &HistoricalDistributionConfig,
+) -> BTreeMap<TaskHistoryGroup, GroupHistoryReport<TaskHistoryGroup>> {
+    build_group_reports(
+        samples
+            .iter()
+            .map(|sample| task_sample_in_group(sample, sample.group.group())),
+        period,
+        config,
+    )
+}
+
+fn task_sample_in_group(
+    sample: &TaskHistorySample<TaskRoutingCell>,
+    group: TaskHistoryGroup,
+) -> TaskHistorySample<TaskHistoryGroup> {
+    TaskHistorySample {
+        group,
+        pricing: sample.pricing.clone(),
+        account_evidence: sample.account_evidence,
+        segmentation_complete: sample.segmentation_complete,
+    }
+}
+
+fn select_task_history_group(
+    samples: &[TaskHistorySample<TaskRoutingCell>],
+    cell: TaskRoutingCell,
+    period: SelectionPeriod,
+    config: &HistoricalDistributionConfig,
+) -> GroupHistoryReport<TaskHistoryGroup> {
+    let mut reports = task_cell_reports(samples, period, config);
+    if let Some(report) = reports.remove(&cell.group())
+        && report.sample_count >= config.min_samples
+    {
+        return report;
+    }
+    for group in [cell.parent(), TaskHistoryGroup::AllTasks] {
+        let matching = samples
+            .iter()
+            .filter(|sample| group.contains(sample.group))
+            .map(|sample| task_sample_in_group(sample, group));
+        let report = build_group_reports(matching, period, config)
+            .remove(&group)
+            .unwrap_or_else(|| GroupHistoryReport {
+                group,
+                period,
+                sample_count: 0,
+                exclusions: ExclusionCounts::default(),
+                attribution: AttributionCoverage {
+                    fraction: crate::attribution::quality::AttributionFraction::new(0, 0),
+                    floor: config.attribution_floor,
+                },
+                verdict: DistributionVerdict::InsufficientEvidence {
+                    min_samples: config.min_samples,
+                },
+            });
+        if report.sample_count >= config.min_samples || group == TaskHistoryGroup::AllTasks {
+            return report;
+        }
+    }
+    unreachable!("the all-tasks level always returns a report")
+}
+
+/// Builds one [`TaskHistorySample`] per completed task whose
 /// release boundary falls in `period`. A task with no attributed usage at all
 /// contributes no sample: there is nothing to price or classify.
 fn gather_task_history_samples(
     conn: &rusqlite::Connection,
-    task_kind: TaskKind,
     period: SelectionPeriod,
     generated_at: UtcTimestamp,
     models: &ModelTable,
-) -> Result<Vec<TaskHistorySample<TaskKind>>, Error> {
+) -> Result<Vec<TaskHistorySample<TaskRoutingCell>>, Error> {
     let events = crate::report::task::all_canonical_events(conn, models)?;
     let diagnostics = crate::store::spend::diagnostics(conn)?;
     let partial = !diagnostics.quarantined_by_class.is_empty();
@@ -152,18 +331,10 @@ fn gather_task_history_samples(
     let mut samples = Vec::new();
     for TaskIdWrapper(task_id) in &completed {
         let identity = crate::store::task_identity::read_task_identity(conn, task_id)?;
-        let Some(identity) = identity else {
-            continue;
-        };
-        if identity.state != TaskIdentityState::Resolved {
-            continue;
-        }
-        let Some(kind) = identity.kind else {
-            continue;
-        };
-        if kind != task_kind {
-            continue;
-        }
+        let cell = identity
+            .as_ref()
+            .map(TaskRoutingCell::from_identity)
+            .unwrap_or_default();
 
         let task_events: Vec<&CanonicalSpendEvent> = events
             .iter()
@@ -200,7 +371,7 @@ fn gather_task_history_samples(
             task_account_evidence_class(conn, &task_events, &mut markers_by_session)?;
 
         samples.push(TaskHistorySample {
-            group: task_kind,
+            group: cell,
             pricing,
             account_evidence,
             segmentation_complete,
@@ -291,6 +462,7 @@ impl Ord for TaskIdWrapper {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attribution::{TaskKind, TaskKindMapping, TrackerTaskReader, TrackerTaskRecord};
     use crate::attribution::{TrackerEventReader, TrackerEventRecord};
     use crate::domain::ids::SourceNamespace;
     use crate::domain::time::{MonotonicDuration, UtcDate};
@@ -468,14 +640,350 @@ mod tests {
         UtcDate::parse(date).unwrap().start().unix_nanos()
     }
 
-    /// Done-when (`aub-cab.4`): a completed task of the requested kind, with
-    /// clean measured usage and explicit account attribution, produces exactly
-    /// one eligible sample priced through the active cost model.
+    struct RoutingTaskReader(Vec<TrackerTaskRecord>);
+
+    impl TrackerTaskReader for RoutingTaskReader {
+        fn read_tasks(&self) -> Result<Vec<TrackerTaskRecord>, Error> {
+            Ok(self.0.clone())
+        }
+    }
+
+    fn seed_routing_identity(
+        conn: &rusqlite::Connection,
+        native: &str,
+        kind: &str,
+        labels: &[&str],
+    ) -> TaskIdentityRow {
+        crate::store::task_identity::ingest_task_kind_candidates(
+            conn,
+            SourceNamespace::new("beads-a"),
+            &RoutingTaskReader(vec![TrackerTaskRecord {
+                native: native.to_owned(),
+                issue_type: kind.to_owned(),
+                labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+            }]),
+        )
+        .unwrap();
+        crate::store::task_identity::rebuild_task_identities(conn, &TaskKindMapping::default_v1())
+            .unwrap();
+        crate::store::task_identity::read_task_identity(
+            conn,
+            &TaskId::new(
+                SourceNamespace::new("beads-a"),
+                crate::domain::ids::NativeTaskId::new(native),
+            ),
+        )
+        .unwrap()
+        .unwrap()
+    }
+
+    fn routing_history_period() -> SelectionPeriod {
+        SelectionPeriod {
+            start: UtcTimestamp::from_unix_nanos(0),
+            end: UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
+        }
+    }
+
+    fn routing_history_config() -> HistoricalDistributionConfig {
+        HistoricalDistributionConfig {
+            central_low: crate::advice::historical_distribution::Percentile::new(25).unwrap(),
+            central_high: crate::advice::historical_distribution::Percentile::new(75).unwrap(),
+            upper: crate::advice::historical_distribution::Percentile::new(90).unwrap(),
+            min_samples: 12,
+            quantile_method: crate::advice::historical_distribution::QuantileMethod::NearestRank,
+            attribution_floor: crate::attribution::quality::AttributionQualityFloor::new(0.80)
+                .unwrap(),
+        }
+    }
+
+    fn routing_history_sample(cell: TaskRoutingCell) -> TaskHistorySample<TaskRoutingCell> {
+        TaskHistorySample {
+            group: cell,
+            pricing: TaskPricing::Priced {
+                credits: crate::domain::credits::Credits::from_micros(1000),
+                quality: crate::evidence::EvidenceQuality::Measured,
+            },
+            account_evidence: AccountEvidenceClass::ExplicitLauncherOrHook,
+            segmentation_complete: true,
+        }
+    }
+
     #[test]
-    fn a_completed_task_of_the_requested_kind_produces_one_priced_eligible_sample() {
+    fn routing_cells_preserve_four_populations_and_exact_counts() {
+        let mut conn = open_test_ledger("four-routing-cells");
+        let populations: [(&[&str], usize, TaskHistoryGroup); 4] = [
+            (
+                &["size:S", "verify:local", "spec:closed"],
+                1,
+                TaskHistoryGroup::Cell {
+                    breadth: TaskRoutingBreadth::SmallMedium,
+                    verify: TaskVerify::Local,
+                    spec: TaskSpec::Closed,
+                },
+            ),
+            (
+                &["size:M", "verify:external", "spec:open"],
+                2,
+                TaskHistoryGroup::Cell {
+                    breadth: TaskRoutingBreadth::SmallMedium,
+                    verify: TaskVerify::External,
+                    spec: TaskSpec::Open,
+                },
+            ),
+            (
+                &["size:XL", "verify:local", "spec:open"],
+                3,
+                TaskHistoryGroup::Cell {
+                    breadth: TaskRoutingBreadth::Large,
+                    verify: TaskVerify::Local,
+                    spec: TaskSpec::Open,
+                },
+            ),
+            (
+                &[],
+                4,
+                TaskHistoryGroup::Cell {
+                    breadth: TaskRoutingBreadth::Large,
+                    verify: TaskVerify::Gate,
+                    spec: TaskSpec::Open,
+                },
+            ),
+        ];
+        let mut index = 0;
+        for (labels, count, _) in &populations {
+            for _ in 0..*count {
+                let native = format!("routing-{index}");
+                seed_session(&conn, &native);
+                seed_marker(&conn, &native, "work", 0);
+                let at =
+                    UtcTimestamp::parse_rfc3339(&format!("2026-08-25T{index:02}:30:00Z")).unwrap();
+                seed_canonical(&conn, &native, at.unix_nanos(), &native, &[("input", 1000)]);
+                crate::store::task_event::ingest(
+                    &conn,
+                    SourceNamespace::new("beads-a"),
+                    &FixtureReader(vec![
+                        tracker_event(
+                            index * 2 + 1,
+                            &native,
+                            Some("open"),
+                            Some("in_progress"),
+                            &format!("2026-08-25T{index:02}:00:00Z"),
+                        ),
+                        tracker_event(
+                            index * 2 + 2,
+                            &native,
+                            Some("in_progress"),
+                            Some("closed"),
+                            &format!("2026-08-25T{index:02}:50:00Z"),
+                        ),
+                    ]),
+                )
+                .unwrap();
+                seed_routing_identity(
+                    &conn,
+                    &native,
+                    if index % 2 == 0 { "task" } else { "bug" },
+                    labels,
+                );
+                index += 1;
+            }
+        }
+        crate::store::cost_model::seed_initial_cost_model(
+            &mut conn,
+            UtcTimestamp::from_unix_nanos(0),
+        )
+        .unwrap();
+        let period = routing_history_period();
+        let samples =
+            gather_task_history_samples(&conn, period, period.end, &ModelTable::default()).unwrap();
+        let reports = task_cell_reports(&samples, period, &routing_history_config());
+        assert_eq!(reports.len(), 4, "one group per routing cell");
+        for (_, count, key) in populations {
+            assert_eq!(reports[&key].sample_count, count, "{key}");
+            assert_eq!(reports[&key].exclusions.total(), 0);
+        }
+    }
+
+    #[test]
+    fn routing_cell_derivation_defaults_missing_and_invalid_axes() {
+        let conn = open_test_ledger("routing-defaults");
+        let cases: &[(&[&str], TaskRoutingBreadth, TaskVerify, TaskSpec)] = &[
+            (
+                &[],
+                TaskRoutingBreadth::Large,
+                TaskVerify::Gate,
+                TaskSpec::Open,
+            ),
+            (
+                &["verify:local", "spec:closed"],
+                TaskRoutingBreadth::Large,
+                TaskVerify::Local,
+                TaskSpec::Closed,
+            ),
+            (
+                &["size:small", "verify:local", "spec:closed"],
+                TaskRoutingBreadth::Large,
+                TaskVerify::Local,
+                TaskSpec::Closed,
+            ),
+            (
+                &["size:S", "spec:closed"],
+                TaskRoutingBreadth::SmallMedium,
+                TaskVerify::Gate,
+                TaskSpec::Open,
+            ),
+            (
+                &["size:M", "verify:bad", "spec:closed"],
+                TaskRoutingBreadth::SmallMedium,
+                TaskVerify::Gate,
+                TaskSpec::Open,
+            ),
+            (
+                &["size:L", "verify:local"],
+                TaskRoutingBreadth::Large,
+                TaskVerify::Gate,
+                TaskSpec::Open,
+            ),
+            (
+                &["size:XL", "verify:local", "spec:bad"],
+                TaskRoutingBreadth::Large,
+                TaskVerify::Gate,
+                TaskSpec::Open,
+            ),
+        ];
+        for (index, (labels, breadth, verify, spec)) in cases.iter().enumerate() {
+            let identity =
+                seed_routing_identity(&conn, &format!("defaults-{index}"), "task", labels);
+            assert_eq!(
+                TaskRoutingCell::from_identity(&identity),
+                TaskRoutingCell {
+                    breadth: *breadth,
+                    verify: *verify,
+                    spec: *spec,
+                    critical: false,
+                },
+                "{labels:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn both_critical_labels_override_every_other_routing_axis() {
+        let conn = open_test_ledger("critical-routing");
+        let labels: &[&[&str]] = &[
+            &[
+                "size:S",
+                "verify:local",
+                "spec:closed",
+                "difficulty:critical",
+            ],
+            &["size:XL", "verify:external", "spec:open", "critical"],
+            &["size:M", "difficulty:mechanical", "difficulty:critical"],
+        ];
+        let mut samples = Vec::new();
+        for (index, labels) in labels.iter().enumerate() {
+            let identity =
+                seed_routing_identity(&conn, &format!("critical-{index}"), "bug", labels);
+            let cell = TaskRoutingCell::from_identity(&identity);
+            assert_eq!(cell.group(), TaskHistoryGroup::Critical, "{labels:?}");
+            samples.push(routing_history_sample(cell));
+        }
+        let reports = task_cell_reports(
+            &samples,
+            routing_history_period(),
+            &routing_history_config(),
+        );
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[&TaskHistoryGroup::Critical].sample_count, 3);
+        let noncritical = seed_routing_identity(
+            &conn,
+            "not-critical",
+            "task",
+            &["Critical", "difficulty:Critical"],
+        );
+        assert!(!TaskRoutingCell::from_identity(&noncritical).critical);
+    }
+
+    #[test]
+    fn routing_history_ladder_uses_eligible_counts_at_eleven_and_twelve() {
+        let cell = TaskRoutingCell {
+            breadth: TaskRoutingBreadth::SmallMedium,
+            verify: TaskVerify::Local,
+            spec: TaskSpec::Closed,
+            critical: false,
+        };
+        let sibling = TaskRoutingCell {
+            verify: TaskVerify::External,
+            ..cell
+        };
+        let period = routing_history_period();
+        let config = routing_history_config();
+        assert_eq!(config.min_samples, 12);
+        let mut samples = vec![routing_history_sample(cell); 11];
+        samples.push(routing_history_sample(sibling));
+        let parent = select_task_history_group(&samples, cell, period, &config);
+        assert_eq!(
+            parent.group,
+            TaskHistoryGroup::BreadthCritical {
+                breadth: TaskRoutingBreadth::SmallMedium,
+                critical: false
+            }
+        );
+        assert_eq!(parent.group.level(), "breadth_critical");
+        assert_eq!(parent.sample_count, 12);
+        assert!(matches!(
+            parent.verdict,
+            DistributionVerdict::Distribution { .. }
+        ));
+
+        let mut excluded = routing_history_sample(cell);
+        excluded.account_evidence = AccountEvidenceClass::Unattributed;
+        samples.push(excluded);
+        let still_parent = select_task_history_group(&samples, cell, period, &config);
+        assert_eq!(
+            still_parent.group, parent.group,
+            "an ineligible twelfth cell sample cannot stop fallback"
+        );
+        assert_eq!(still_parent.exclusions.unknown_account_attribution, 1);
+        assert!(
+            still_parent.attribution.fraction.ppm() < parent.attribution.fraction.ppm(),
+            "an excluded sample lowers the group's attributed fraction"
+        );
+
+        samples.push(routing_history_sample(cell));
+        let full = select_task_history_group(&samples, cell, period, &config);
+        assert_eq!(full.group, cell.group());
+        assert_eq!(full.group.level(), "cell");
+        assert_eq!(full.sample_count, 12);
+
+        let mut all_samples = vec![routing_history_sample(cell); 11];
+        all_samples.push(routing_history_sample(TaskRoutingCell {
+            breadth: TaskRoutingBreadth::Large,
+            ..cell
+        }));
+        let all = select_task_history_group(&all_samples, cell, period, &config);
+        assert_eq!(all.group, TaskHistoryGroup::AllTasks);
+        assert_eq!(all.group.level(), "all_tasks");
+        assert_eq!(all.sample_count, 12);
+        assert!(matches!(
+            all.verdict,
+            DistributionVerdict::Distribution { .. }
+        ));
+        all_samples.pop();
+        let insufficient = select_task_history_group(&all_samples, cell, period, &config);
+        assert_eq!(insufficient.group, TaskHistoryGroup::AllTasks);
+        assert!(matches!(
+            insufficient.verdict,
+            DistributionVerdict::InsufficientEvidence { min_samples: 12 }
+        ));
+    }
+
+    #[test]
+    fn a_completed_task_produces_one_priced_eligible_sample() {
         let mut conn = open_test_ledger("eligible");
         seed_session(&conn, "s1");
         let day = day_nanos("2026-08-25");
+        seed_marker(&conn, "s1", "work", day + 1);
         let one_hour = 3_600_000_000_000;
         seed_canonical(&conn, "e1", day + one_hour, "s1", &[("input", 1000)]);
         crate::store::task_event::ingest(
@@ -512,7 +1020,6 @@ mod tests {
         };
         let samples = gather_task_history_samples(
             &conn,
-            TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &crate::config::ModelTable::default(),
@@ -523,16 +1030,18 @@ mod tests {
         assert!(matches!(samples[0].pricing, TaskPricing::Priced { .. }));
         assert_eq!(
             samples[0].account_evidence,
-            AccountEvidenceClass::Unattributed,
-            "no account marker was seeded, so the session resolves unattributed"
+            AccountEvidenceClass::ExplicitLauncherOrHook,
+            "the seeded marker makes this task eligible"
+        );
+        assert_eq!(
+            crate::advice::historical_distribution::ineligibility_reason(&samples[0]),
+            None
         );
         assert!(samples[0].segmentation_complete);
     }
 
-    /// Planted negative: a task of a *different* kind never enters the
-    /// requested kind's sample list, even though it is otherwise eligible.
     #[test]
-    fn a_task_of_a_different_kind_is_excluded_entirely() {
+    fn a_bug_enters_the_same_unlabelled_cell_as_a_task() {
         let mut conn = open_test_ledger("different-kind");
         seed_session(&conn, "s1");
         let day = day_nanos("2026-08-25");
@@ -572,13 +1081,13 @@ mod tests {
         };
         let samples = gather_task_history_samples(
             &conn,
-            TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &crate::config::ModelTable::default(),
         )
         .unwrap();
-        assert!(samples.is_empty(), "{samples:?}");
+        assert_eq!(samples.len(), 1, "{samples:?}");
+        assert_eq!(samples[0].group, TaskRoutingCell::default());
     }
 
     /// A task never claimed and released (no release boundary at all) is not
@@ -616,7 +1125,6 @@ mod tests {
         };
         let samples = gather_task_history_samples(
             &conn,
-            TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &crate::config::ModelTable::default(),
@@ -664,7 +1172,6 @@ mod tests {
         };
         let samples = gather_task_history_samples(
             &conn,
-            TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &crate::config::ModelTable::default(),
@@ -676,9 +1183,9 @@ mod tests {
 
     /// `gather_task_history_group_report` synthesizes an
     /// `InsufficientEvidence` report, never a panic or a fabricated
-    /// distribution, for a kind with zero completed tasks in the store.
+    /// distribution, with zero completed tasks in the store.
     #[test]
-    fn a_kind_with_zero_completed_tasks_reports_insufficient_evidence_not_a_panic() {
+    fn zero_completed_tasks_reports_insufficient_evidence_not_a_panic() {
         let conn = open_test_ledger("zero-tasks");
         let period = SelectionPeriod {
             start: UtcTimestamp::from_unix_nanos(0),
@@ -695,7 +1202,7 @@ mod tests {
         };
         let report = gather_task_history_group_report(
             &conn,
-            TaskKind::Task,
+            TaskRoutingCell::default(),
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &config,
@@ -703,6 +1210,8 @@ mod tests {
         )
         .unwrap();
         assert_eq!(report.sample_count, 0);
+        assert_eq!(report.group, TaskHistoryGroup::AllTasks);
+        assert_eq!(report.group.level(), "all_tasks");
         assert!(matches!(
             report.verdict,
             DistributionVerdict::InsufficientEvidence { min_samples: 12 }
@@ -756,7 +1265,6 @@ mod tests {
         };
         let samples = gather_task_history_samples(
             &conn,
-            TaskKind::Task,
             period,
             UtcTimestamp::parse_rfc3339("2026-08-26T00:00:00Z").unwrap(),
             &crate::config::ModelTable::default(),

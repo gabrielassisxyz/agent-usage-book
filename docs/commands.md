@@ -310,11 +310,35 @@ already on disk.
 ## `aub can-run`
 
 **Answers:** given a fresh or cached calibrated credit headroom and the
-historical cost of `--task-kind TYPE`, can `--task-model MODEL` run now under
+historical cost of the task's routing group, can `--task-model MODEL` run now under
 `--account NAME`? By default the command performs and persists one fresh
 meter sample for the account first, the same sampler path `aub sample
 --account` uses, before advising; `--cached` uses the newest persisted
 reading instead, but only while it still satisfies the freshness policy.
+
+History groups by the dispatcher's routing cell: breadth (`sm` for `size:S`
+or `size:M`, otherwise `l`), verification (`local`, `gate`, `external`),
+specification (`closed`, `open`), and the critical override. If either verification
+or specification is missing or invalid, both default to `gate/open`. A bare
+`critical` or `difficulty:critical` label selects one shared critical cell
+regardless of the other axes. `--task-kind TYPE` remains descriptive metadata;
+it does not filter the historical samples. This command currently accepts no
+task labels or bead ID, so it requests the conservative unlabeled cell
+`l/gate/open`, with `critical=false`.
+
+The first population with at least `task_distribution.min_samples` eligible
+completed tasks wins: the full cell, then its `(breadth, critical)` parent,
+then all completed tasks. The default minimum is 12. Eligibility and attribution
+quality checks still apply at every level; falling back does not admit estimated
+or unattributed samples. An empty history reports insufficient evidence.
+
+Every JSON answer, including a refusal, carries `history_level` (`cell`,
+`breadth_critical`, or `all_tasks`) and `history_group`. A noncritical cell key
+is `{"breadth":"l","verify":"gate","spec":"open","critical":false}`;
+the critical cell key is `{"critical":true}`. A parent key contains only
+`breadth` and `critical`; the all-tasks key is `{}`. Text output names the
+same selected level and group. A fallback answer describes that broader
+population, rather than claiming cell-specific evidence.
 
 Headroom follows the same precedence as `aub spend --window-equivalent`: a
 current calibration answers, a window with no calibration recorded at all
@@ -330,7 +354,8 @@ few historical tasks, or mostly unattributable task records, produces a
 refusal naming every one that applies in the same invocation rather than the
 first one found, and a refusal exits `0` with the refusal rendered, not a
 usage error, except that a refusal a not-current stored calibration took part
-in exits `6` (`InsufficientEvidence`) after the report. It never substitutes a global average task cost, a different
+in exits `6` (`InsufficientEvidence`) after the report. The named all-tasks fallback
+uses the same empirical quantiles and minimum sample requirement. It never substitutes a different
 plan tier's calibration, an estimated-token session, a stale meter reading,
 or an API-list-price conversion for a number it cannot justify.
 

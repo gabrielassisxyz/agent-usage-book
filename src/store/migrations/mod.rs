@@ -159,6 +159,9 @@ mod migration_0044;
 #[path = "0045_codex_subagent_parent.rs"]
 pub(crate) mod migration_0045;
 
+#[path = "0046_task_routing_axes.rs"]
+mod migration_0046;
+
 /// Every migration this binary knows, in version order.
 ///
 /// The framework is exercised by its own tests with synthetic registries; this
@@ -210,5 +213,6 @@ pub fn registry() -> Vec<Migration> {
         migration_0043::migration(),
         migration_0044::migration(),
         migration_0045::migration(),
+        migration_0046::migration(),
     ]
 }
