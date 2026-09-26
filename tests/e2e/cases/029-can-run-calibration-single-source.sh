@@ -62,7 +62,8 @@ root = "$STATE_DIR/transcripts/claude-code"
 pattern = "**/*.jsonl"
 format = "claude-code"
 
-[tracker]
+[[trackers]]
+name = "beads"
 kind = "local"
 path = "$STATE_DIR/tracker"
 CFG_EOF

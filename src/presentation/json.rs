@@ -28,7 +28,7 @@ use crate::problem_code::ProblemCode;
 use crate::report::{
     ActiveActivityState, CanRunOutcome, CanRunReport, CoverageReport, LedgerGeneration,
     LivenessGap, ProvenanceGraph, ReportMetadata, SpendReport, StatusReport, TaskIdentityRow,
-    TaskIngestReport, TaskOverheadReport, TaskReport,
+    TaskIngestReport, TaskIngestTrackerOutcome, TaskOverheadReport, TaskReport,
 };
 use crate::transcripts::TranscriptDriftReport;
 
@@ -1463,14 +1463,41 @@ pub fn validate_task_overhead_json(json_str: &str) -> Result<ParsedEnvelope, Jso
 }
 
 /// The task ingest summary under the envelope: events ingested, quarantined
-/// and unchanged.
+/// and unchanged, plus one entry per configured tracker naming where its
+/// counts came from (`aub-y5q9`). A failed tracker contributes no counts and
+/// carries its error instead, so a failure is never rendered as a zero.
 pub fn task_ingest_json(
     summary: &TaskIngestReport,
     run: RunId,
     metadata: ReportMetadata,
 ) -> String {
+    let trackers = summary
+        .trackers
+        .iter()
+        .map(|tracker| match &tracker.outcome {
+            TaskIngestTrackerOutcome::Ingested {
+                events_inserted,
+                events_already_present,
+                quarantines_inserted,
+                quarantines_already_present,
+            } => format!(
+                "{{\"name\":{},\"events_inserted\":{},\"events_already_present\":{},\"quarantines_inserted\":{},\"quarantines_already_present\":{}}}",
+                json_string(&tracker.name),
+                events_inserted,
+                events_already_present,
+                quarantines_inserted,
+                quarantines_already_present,
+            ),
+            TaskIngestTrackerOutcome::Failed(reason) => format!(
+                "{{\"name\":{},\"error\":{}}}",
+                json_string(&tracker.name),
+                json_string(reason),
+            ),
+        })
+        .collect::<Vec<_>>()
+        .join(",");
     let body = format!(
-        "\"events_inserted\":{},\"events_already_present\":{},\"quarantines_inserted\":{},\"quarantines_already_present\":{}",
+        "\"events_inserted\":{},\"events_already_present\":{},\"quarantines_inserted\":{},\"quarantines_already_present\":{},\"trackers\":[{trackers}]",
         summary.events_inserted,
         summary.events_already_present,
         summary.quarantines_inserted,
@@ -1494,7 +1521,7 @@ pub fn validate_task_ingest_json(json_str: &str) -> Result<ParsedEnvelope, JsonC
             field: "root",
             message: "expected object".to_string(),
         })?;
-    const KNOWN_TASK_INGEST_KEYS: [&str; 10] = [
+    const KNOWN_TASK_INGEST_KEYS: [&str; 11] = [
         "schema",
         "command",
         "run",
@@ -1505,6 +1532,7 @@ pub fn validate_task_ingest_json(json_str: &str) -> Result<ParsedEnvelope, JsonC
         "events_already_present",
         "quarantines_inserted",
         "quarantines_already_present",
+        "trackers",
     ];
     for key in obj.keys() {
         if !KNOWN_TASK_INGEST_KEYS.contains(&key.as_str()) {
@@ -1516,12 +1544,89 @@ pub fn validate_task_ingest_json(json_str: &str) -> Result<ParsedEnvelope, JsonC
         "events_already_present",
         "quarantines_inserted",
         "quarantines_already_present",
+        "trackers",
     ] {
         if !obj.contains_key(required) {
             return Err(JsonContractError::MissingField(required));
         }
     }
+    let trackers = obj
+        .get("trackers")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "trackers",
+            message: "expected array".to_string(),
+        })?;
+    if trackers.is_empty() {
+        return Err(JsonContractError::InvalidFormat {
+            field: "trackers",
+            message: "expected at least one tracker entry".to_string(),
+        });
+    }
+    for entry in trackers {
+        validate_task_ingest_tracker_entry(entry)?;
+    }
     Ok(parsed)
+}
+
+/// One `trackers[]` entry: a name plus either the four ingested counts or an
+/// error, never both. A failed tracker must say why; an ingested one must
+/// carry its own counts rather than leaning on the envelope's totals.
+fn validate_task_ingest_tracker_entry(entry: &serde_json::Value) -> Result<(), JsonContractError> {
+    let entry = entry
+        .as_object()
+        .ok_or_else(|| JsonContractError::InvalidFormat {
+            field: "trackers[]",
+            message: "expected object".to_string(),
+        })?;
+    const KNOWN_TRACKER_ENTRY_KEYS: [&str; 6] = [
+        "name",
+        "error",
+        "events_inserted",
+        "events_already_present",
+        "quarantines_inserted",
+        "quarantines_already_present",
+    ];
+    for key in entry.keys() {
+        if !KNOWN_TRACKER_ENTRY_KEYS.contains(&key.as_str()) {
+            return Err(JsonContractError::UnexpectedField(key.clone()));
+        }
+    }
+    match entry.get("name") {
+        Some(serde_json::Value::String(name)) if !name.is_empty() => {}
+        _ => {
+            return Err(JsonContractError::InvalidFormat {
+                field: "trackers[].name",
+                message: "expected a non-empty string".to_string(),
+            });
+        }
+    }
+    let counts_present = [
+        "events_inserted",
+        "events_already_present",
+        "quarantines_inserted",
+        "quarantines_already_present",
+    ]
+    .iter()
+    .all(|key| matches!(entry.get(*key), Some(serde_json::Value::Number(_))));
+    let counts_absent = [
+        "events_inserted",
+        "events_already_present",
+        "quarantines_inserted",
+        "quarantines_already_present",
+    ]
+    .iter()
+    .all(|key| entry.get(*key).is_none());
+    let error_present =
+        matches!(entry.get("error"), Some(serde_json::Value::String(error)) if !error.is_empty());
+    if !((error_present && counts_absent) || (!error_present && counts_present)) {
+        return Err(JsonContractError::InvalidFormat {
+            field: "trackers[]",
+            message: "expected an error or the four ingested counts, never both and neither"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// The inner fields of a serialized object, for splicing one object's members into

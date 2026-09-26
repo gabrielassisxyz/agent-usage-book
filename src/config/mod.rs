@@ -30,7 +30,7 @@
 //! the full four-level order and are
 //! individually provenance-tracked, since those are the keys
 //! whose default this project actually defends (`aub-zxf`'s decision). `accounts`,
-//! `transcripts`, `tracker`, `layout` and `valuation.default_rate_book` are populated from the
+//! `transcripts`, `trackers`, `layout` and `valuation.default_rate_book` are populated from the
 //! file (or left absent) without flag/environment overrides: overriding a
 //! heterogeneous list, or a credential shape that varies by its own `kind` field,
 //! through one `--set` string is not a well-formed operation, and the adapters that
@@ -627,9 +627,21 @@ pub struct TranscriptConfig {
     pub usage_evidence: Option<String>,
 }
 
+/// One configured task tracker (`aub-y5q9`). A machine reads more than one
+/// tracker, so `aub task ingest` walks every entry, each under its own
+/// source name.
 #[derive(Debug, Clone)]
 pub struct TrackerConfig {
+    /// The source namespace every event this tracker contributes carries into
+    /// `tracker_source` and `task_source`. Configured rather than derived from
+    /// the path, so moving a repository does not silently start a second
+    /// series: the name is the identity the ledger keys the tracker's history
+    /// on, and a name that changed would strand it.
+    pub name: String,
+    /// The operator's label for the tracker brand. `task ingest` reads the
+    /// same event schema from every configured tracker, so this stays a label.
     pub kind: String,
+    /// The tracker's own directory; `beads.db` beneath it is opened read-only.
     pub path: PathBuf,
 }
 
@@ -675,7 +687,9 @@ pub struct Config {
     /// Which vendor and priced model a stored model id is valued against
     /// (`aub-28py`), in the order the file listed the rules.
     pub models: ModelTable,
-    pub tracker: Option<TrackerConfig>,
+    /// Every tracker `aub task ingest` reads, in the file's own order
+    /// (`aub-y5q9`), each under its own source name.
+    pub trackers: Vec<TrackerConfig>,
     pub valuation: ValuationConfig,
     pub backup: BackupConfig,
     pub drill: DrillConfig,
@@ -711,7 +725,7 @@ const KNOWN_SECTIONS: &[&str] = &[
     "accounts",
     "transcripts",
     "models",
-    "tracker",
+    "trackers",
     "valuation",
     "backup",
     "drill",
@@ -766,7 +780,7 @@ const CREDENTIAL_FILE_KEYS: &[&str] = &["kind", "path"];
 const CREDENTIAL_ENV_KEYS: &[&str] = &["kind", "name"];
 const TRANSCRIPT_KEYS: &[&str] = &["name", "root", "pattern", "format", "usage_evidence"];
 const MODEL_KEYS: &[&str] = &["pattern", "vendor", "model", "name"];
-const TRACKER_KEYS: &[&str] = &["kind", "path"];
+const TRACKER_KEYS: &[&str] = &["name", "kind", "path"];
 const VALUATION_KEYS: &[&str] = &["default_rate_book"];
 const BACKUP_KEYS: &[&str] = &[
     "review_after",
@@ -853,6 +867,28 @@ fn validate_distinct_credential_sources(accounts: &[AccountConfig]) -> Result<()
                 return Err(Error::Usage(format!(
                     "accounts '{}' and '{}' share one {source}: two logical accounts must not read one credential source; give each account its own source or remove one account",
                     first.name, second.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Two configured trackers resolving to one source name (`aub-y5q9`). The
+/// name is the namespace every event is keyed under, so two entries that
+/// share one name would conflate the two trackers' histories in the ledger -
+/// exactly the collision per-tracker source names exist to prevent. The
+/// failure belongs to configuration, where it is a usage error naming both
+/// indexes, rather than to the first ingest, where it would be silently
+/// dropped rows.
+fn validate_distinct_tracker_names(trackers: &[TrackerConfig]) -> Result<(), Error> {
+    for (index, first) in trackers.iter().enumerate() {
+        for (offset, second) in trackers[index + 1..].iter().enumerate() {
+            if first.name == second.name {
+                return Err(Error::Usage(format!(
+                    "trackers[{index}] and trackers[{}] both use the name '{}': each tracker's events are keyed under its own name, so two entries must not share one",
+                    index + 1 + offset,
+                    first.name
                 )));
             }
         }
@@ -952,6 +988,60 @@ fn validate_sampling_schedule(
 /// file rather than only the sections this bead resolves scalar-by-scalar, so a typo
 /// anywhere in the file is caught here rather than silently ignored.
 fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Error> {
+    // The trackers shape is decided before the section-name walk: a singular
+    // `[tracker]` table is not a known section, so the generic walk would
+    // report an unknown key without saying what the plural shape is, which is
+    // the one thing the error exists to say (aub-y5q9).
+    match table.get("trackers") {
+        Some(toml::Value::Array(entries)) => {
+            for (index, entry) in entries.iter().enumerate() {
+                let Some(entry) = entry.as_table() else {
+                    return Err(Error::Usage(format!(
+                        "trackers[{index}]: every entry must be a table with name, kind and path"
+                    )));
+                };
+                check_keys(entry, TRACKER_KEYS, "trackers[]", file_display)?;
+                for key in ["name", "kind", "path"] {
+                    match entry.get(key) {
+                        Some(toml::Value::String(_)) => {}
+                        Some(_) => {
+                            return Err(Error::Usage(format!("trackers[].{key} must be a string")));
+                        }
+                        None => {
+                            return Err(missing_key_error(
+                                &format!("trackers[{index}].{key}"),
+                                file_display,
+                            ));
+                        }
+                    }
+                }
+                if entry
+                    .get("name")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    return Err(Error::Usage(format!(
+                        "trackers[{index}].name must be a non-empty string: it is the source namespace every event this tracker contributes is keyed under"
+                    )));
+                }
+            }
+        }
+        Some(_) => {
+            return Err(Error::Usage(
+                "trackers must be an array of tables ([[trackers]] with name, kind and path); [tracker] names one tracker, and task ingest reads every configured tracker"
+                    .to_string(),
+            ));
+        }
+        None => {}
+    }
+    if let Some(toml::Value::Table(_)) = table.get("tracker") {
+        return Err(Error::Usage(
+            "[tracker] is not a valid section; write [[trackers]], one entry per tracker, each with name, kind and path"
+                .to_string(),
+        ));
+    }
+
     check_keys(table, KNOWN_SECTIONS, "", file_display)?;
 
     if let Some(t) = table.get("state").and_then(toml::Value::as_table) {
@@ -983,9 +1073,6 @@ fn validate_known_keys(table: &toml::Table, file_display: &str) -> Result<(), Er
     }
     if let Some(t) = table.get("reconciliation").and_then(toml::Value::as_table) {
         check_keys(t, RECONCILIATION_KEYS, "reconciliation", file_display)?;
-    }
-    if let Some(t) = table.get("tracker").and_then(toml::Value::as_table) {
-        check_keys(t, TRACKER_KEYS, "tracker", file_display)?;
     }
     if let Some(t) = table.get("valuation").and_then(toml::Value::as_table) {
         check_keys(t, VALUATION_KEYS, "valuation", file_display)?;
@@ -2002,28 +2089,48 @@ pub fn resolve(
         provenance.set("valuation.default_rate_book", ConfigSource::File);
     }
 
-    let tracker = match file
+    let trackers: Vec<TrackerConfig> = file
         .as_ref()
-        .and_then(|t| t.get("tracker"))
-        .and_then(toml::Value::as_table)
-    {
-        Some(t) => {
-            let kind = t
-                .get("kind")
-                .and_then(toml::Value::as_str)
-                .ok_or_else(|| missing_key_error("tracker.kind", &file_display))?;
-            let path = t.get("path").and_then(toml::Value::as_str).unwrap_or("");
-            provenance.set("tracker.kind", ConfigSource::File);
-            // Tracked alongside the kind (aub-ukh5): `aub config` prints every
-            // key the resolver knows, and the tracker path is one of them.
-            provenance.set("tracker.path", ConfigSource::File);
-            Some(TrackerConfig {
-                kind: kind.to_string(),
-                path: PathBuf::from(path),
-            })
-        }
-        None => None,
-    };
+        .and_then(|t| t.get("trackers"))
+        .and_then(toml::Value::as_array)
+        .map(|entries| {
+            entries
+                .iter()
+                .enumerate()
+                .map(|(index, entry)| {
+                    let entry = entry.as_table().ok_or_else(|| {
+                        Error::Usage(format!(
+                            "trackers[{index}]: every entry must be a table with name, kind and path"
+                        ))
+                    })?;
+                    // Shape errors are already refused by `validate_known_keys`;
+                    // this read is the typed projection of what it validated.
+                    let field = |key: &str| -> Result<String, Error> {
+                        entry
+                            .get(key)
+                            .and_then(toml::Value::as_str)
+                            .map(str::to_string)
+                            .ok_or_else(|| {
+                                missing_key_error(
+                                    &format!("trackers[{index}].{key}"),
+                                    &file_display,
+                                )
+                            })
+                    };
+                    Ok(TrackerConfig {
+                        name: field("name")?,
+                        kind: field("kind")?,
+                        path: PathBuf::from(field("path")?),
+                    })
+                })
+                .collect::<Result<Vec<_>, Error>>()
+        })
+        .transpose()?
+        .unwrap_or_default();
+    validate_distinct_tracker_names(&trackers)?;
+    if !trackers.is_empty() {
+        provenance.set("trackers", ConfigSource::File);
+    }
 
     let accounts: Vec<AccountConfig> = file
         .as_ref()
@@ -2221,7 +2328,7 @@ pub fn resolve(
             accounts,
             transcripts,
             models,
-            tracker,
+            trackers,
             valuation,
             backup,
             drill,
@@ -2288,6 +2395,7 @@ impl Config {
                     push_transcript_provenance_rows(&mut rows, &self.transcripts, source);
                 }
                 "models" => push_model_provenance_rows(&mut rows, &self.models, source),
+                "trackers" => push_tracker_provenance_rows(&mut rows, &self.trackers, source),
                 "projects" => {
                     push_alias_provenance_rows(&mut rows, "projects", &self.projects, source)
                 }
@@ -2413,8 +2521,6 @@ impl Config {
             "anthropic.refresh" => self.anthropic.refresh.to_string(),
             "anthropic.statusline" => self.anthropic.statusline.to_string(),
             "antigravity.refresh" => self.antigravity.refresh.to_string(),
-            "tracker.kind" => self.tracker.as_ref()?.kind.clone(),
-            "tracker.path" => self.tracker.as_ref()?.path.display().to_string(),
             "valuation.default_rate_book" => self.valuation.default_rate_book.clone()?,
             "layout.repositories" => self.layout.repositories.as_ref()?.display().to_string(),
             "layout.worktrees" => self.layout.worktrees.as_ref()?.display().to_string(),
@@ -2504,6 +2610,27 @@ fn render_account_credential(kind: &str, detail: &str) -> String {
         format!("{kind}:")
     } else {
         format!("{kind}:{detail}")
+    }
+}
+
+/// One tracker's expanded rows (aub-y5q9): name, kind and path, in key order.
+/// All three are required keys, so the group never omits one.
+fn push_tracker_provenance_rows(
+    rows: &mut Vec<ConfigProvenanceRow>,
+    trackers: &[TrackerConfig],
+    source: ConfigSource,
+) {
+    for (index, tracker) in trackers.iter().enumerate() {
+        let base = format!("trackers[{index}]");
+        let mut entry = vec![
+            (format!("{base}.kind"), tracker.kind.clone()),
+            (format!("{base}.name"), tracker.name.clone()),
+            (format!("{base}.path"), tracker.path.display().to_string()),
+        ];
+        entry.sort();
+        for (key, value) in entry {
+            rows.push(ConfigProvenanceRow { key, value, source });
+        }
     }
 }
 
@@ -3068,26 +3195,130 @@ model = \"glm-5.3-flash\"
     // --- missing required key: checked in both directions --------------------------
 
     #[test]
-    fn a_tracker_section_with_no_kind_is_a_missing_key_error_naming_the_file() {
-        let file = "[tracker]\npath = \"~/work/.tracker\"\n";
+    fn a_trackers_entry_with_no_kind_is_a_missing_key_error_naming_the_file_and_index() {
+        let file = "[[trackers]]\nname = \"beads\"\npath = \"~/work/.tracker\"\n";
         let err = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap_err();
         assert_eq!(err.exit_class(), crate::error::ExitClass::Usage);
         let message = err.to_string();
-        assert!(message.contains("tracker.kind"), "{message}");
+        assert!(message.contains("trackers[0].kind"), "{message}");
         assert!(message.contains("/test/aub.toml"), "{message}");
     }
 
     #[test]
-    fn a_tracker_section_with_a_kind_resolves_successfully() {
-        let file = "[tracker]\nkind = \"local\"\npath = \"~/work/.tracker\"\n";
-        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
-        assert_eq!(config.tracker.unwrap().kind, "local");
+    fn a_trackers_entry_missing_its_name_names_the_index() {
+        let file = "[[trackers]]\nkind = \"local\"\npath = \"~/work/.tracker\"\n\n[[trackers]]\nname = \"kernl\"\nkind = \"local\"\npath = \"~/work/kernl\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("trackers[0].name"), "{message}");
     }
 
     #[test]
-    fn no_tracker_section_at_all_is_not_a_missing_key_error() {
+    fn a_trackers_entry_missing_its_path_names_the_index() {
+        let file = "[[trackers]]\nname = \"kernl\"\nkind = \"local\"\n\n[[trackers]]\nname = \"beads\"\nkind = \"local\"\npath = \"~/work/.tracker\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("trackers[0].path"), "{message}");
+    }
+
+    #[test]
+    fn a_second_trackers_entry_missing_a_key_names_its_own_index() {
+        let file = "[[trackers]]\nname = \"beads\"\nkind = \"local\"\npath = \"~/work/.tracker\"\n\n[[trackers]]\nname = \"kernl\"\npath = \"~/work/kernl\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("trackers[1].kind"), "{message}");
+    }
+
+    /// The negative that keeps the old spelling from re-entering: a singular
+    /// `[tracker]` table is a config error naming the plural shape, never a
+    /// silent one-entry fallback. No ledger row was ever ingested under the
+    /// old namespace, so there is no compatibility to preserve.
+    #[test]
+    fn a_singular_tracker_table_is_rejected_naming_the_plural() {
+        let file = "[tracker]\nname = \"beads\"\nkind = \"local\"\npath = \"~/work/.tracker\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("[[trackers]]"), "{message}");
+    }
+
+    #[test]
+    fn a_trackers_section_with_two_entries_resolves_in_the_files_order() {
+        let file = "[[trackers]]\nname = \"agent-usage-book\"\nkind = \"local\"\npath = \"~/work/aub\"\n\n[[trackers]]\nname = \"kernl\"\nkind = \"local\"\npath = \"~/work/kernl\"\n";
+        let (config, _) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        assert_eq!(config.trackers.len(), 2);
+        assert_eq!(config.trackers[0].name, "agent-usage-book");
+        assert_eq!(config.trackers[0].kind, "local");
+        assert_eq!(config.trackers[1].name, "kernl");
+        assert_eq!(config.trackers[1].path, PathBuf::from("~/work/kernl"));
+    }
+
+    /// An empty name would key nothing: the ledger refuses a zero-length
+    /// `tracker_source` at insert time, so the config refuses it where the
+    /// mistake is made, naming the index.
+    #[test]
+    fn an_empty_tracker_name_is_refused_naming_the_index() {
+        let file = "[[trackers]]\nname = \"\"\nkind = \"local\"\npath = \"~/work/.tracker\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("trackers[0].name"), "{message}");
+    }
+
+    /// Two entries sharing one name would conflate the two trackers' event
+    /// histories in the ledger, which is exactly the collision per-tracker
+    /// source names exist to prevent. The refusal names both indexes.
+    #[test]
+    fn two_trackers_with_one_name_are_rejected_naming_both_indexes() {
+        let file = "[[trackers]]\nname = \"beads\"\nkind = \"local\"\npath = \"~/work/a\"\n\n[[trackers]]\nname = \"beads\"\nkind = \"local\"\npath = \"~/work/b\"\n";
+        let message = resolve_with(Overrides::new(), plain_env(), Some(file))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("trackers[0]"), "{message}");
+        assert!(message.contains("trackers[1]"), "{message}");
+        assert!(message.contains("'beads'"), "{message}");
+    }
+
+    /// `aub config` expands the array one row group per entry, every row from
+    /// the file, so a misresolved tracker is visible in the printed rows
+    /// rather than only in a command's behaviour.
+    #[test]
+    fn the_config_rows_expand_one_group_per_tracker() {
+        let file = "[[trackers]]\nname = \"agent-usage-book\"\nkind = \"local\"\npath = \"~/work/aub\"\n\n[[trackers]]\nname = \"kernl\"\nkind = \"local\"\npath = \"~/work/kernl\"\n";
+        let (config, provenance) = resolve_with(Overrides::new(), plain_env(), Some(file)).unwrap();
+        let rows = config.provenance_rows(&provenance);
+        let tracker_rows: Vec<(&str, &str, ConfigSource)> = rows
+            .iter()
+            .filter_map(|row| {
+                if row.key.starts_with("trackers[") {
+                    Some((row.key.as_str(), row.value.as_str(), row.source))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(
+            tracker_rows,
+            vec![
+                ("trackers[0].kind", "local", ConfigSource::File),
+                ("trackers[0].name", "agent-usage-book", ConfigSource::File),
+                ("trackers[0].path", "~/work/aub", ConfigSource::File),
+                ("trackers[1].kind", "local", ConfigSource::File),
+                ("trackers[1].name", "kernl", ConfigSource::File),
+                ("trackers[1].path", "~/work/kernl", ConfigSource::File),
+            ]
+        );
+    }
+
+    /// No `[[trackers]]` at all stays legal: a machine that reads no tracker
+    /// configures none, and `task ingest` is the only command that refuses on
+    /// the empty list.
+    #[test]
+    fn no_trackers_section_at_all_is_not_a_missing_key_error() {
         let (config, _) = resolve_with(Overrides::new(), plain_env(), None).unwrap();
-        assert!(config.tracker.is_none());
+        assert!(config.trackers.is_empty());
     }
 
     // --- the concurrency bound ------------------------------------------------------

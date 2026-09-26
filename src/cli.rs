@@ -3741,10 +3741,10 @@ fn config_boxed_section_key_width(
 }
 
 /// Whether a boxed section uses the scalar key/value/source row shape
-/// (aub-34ik): everything except the two array sections with their own
-/// multi-column lines.
+/// (aub-34ik): everything except the three array sections with their own
+/// multi-column lines (`trackers` joined with `aub-y5q9`).
 fn config_boxed_is_scalar_section(section: &str) -> bool {
-    section != "accounts" && section != "transcripts"
+    section != "accounts" && section != "transcripts" && section != "trackers"
 }
 
 /// The value column's single offset for the whole box (aub-34ik): the
@@ -3915,6 +3915,18 @@ fn config_boxed_render_with_width(
             .chain(std::iter::once(1));
         (names.max().unwrap_or(0) + 2, formats.max().unwrap_or(0) + 2)
     };
+    let (tracker_name_width, tracker_kind_width) = {
+        let names = fields
+            .iter()
+            .filter(|field| field.section == "trackers" && field.key == "name")
+            .map(|field| field.value.chars().count());
+        let kinds = fields
+            .iter()
+            .filter(|field| field.section == "trackers" && field.key == "kind")
+            .map(|field| field.value.chars().count())
+            .chain(std::iter::once(1));
+        (names.max().unwrap_or(0) + 2, kinds.max().unwrap_or(0) + 2)
+    };
     let mut lines = vec![boxed_top(&title, width), boxed_blank(width)];
     for (section_index, section) in sections.iter().enumerate() {
         lines.push(boxed_body(&style.paint(style.bold(), section), width));
@@ -4078,6 +4090,54 @@ fn config_boxed_render_with_width(
                         width,
                     ));
                 }
+            }
+        } else if section == "trackers" {
+            // One line per tracker (`aub-y5q9`): the source name its events
+            // are keyed under, the kind and the directory `beads.db` is read
+            // from. All three keys are required, so the main line holds the
+            // whole entry and no sub-line is ever needed.
+            let mut indexes: Vec<usize> = fields
+                .iter()
+                .filter(|field| field.section == "trackers")
+                .filter_map(|field| field.index)
+                .collect();
+            indexes.sort_unstable();
+            indexes.dedup();
+            for index in indexes {
+                let by_key = |key: &str| {
+                    fields.iter().find(|field| {
+                        field.section == "trackers"
+                            && field.index == Some(index)
+                            && field.key == key
+                    })
+                };
+                let name = by_key("name")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("");
+                let kind = by_key("kind").map(|field| field.value.as_str());
+                let path = by_key("path")
+                    .map(|field| field.value.as_str())
+                    .unwrap_or("");
+                let source = by_key("name")
+                    .or_else(|| by_key("path"))
+                    .map(|field| field.source)
+                    .unwrap_or(crate::config::ConfigSource::Default);
+                lines.push(boxed_body(
+                    &config_boxed_list_line(
+                        name,
+                        kind.unwrap_or("-"),
+                        path,
+                        source,
+                        ConfigBoxedLineLayout {
+                            name_width: tracker_name_width,
+                            second_width: tracker_kind_width,
+                            area,
+                            home,
+                            style,
+                        },
+                    ),
+                    width,
+                ));
             }
         } else {
             for field in config_boxed_section_fields(&fields, section) {
@@ -10525,23 +10585,39 @@ fn task_command(clock: &impl Clock, level: Level, invocation: &Invocation) -> Re
     }
 }
 
-/// Carries the store's tracker-ingest summary across the presentation boundary as
-/// a report model, which is the only shape a renderer is allowed to see.
+/// Carries the store's tracker-ingest summaries across the presentation
+/// boundary as a report model, which is the only shape a renderer is allowed
+/// to see. The four top-level counts are the totals across the trackers that
+/// ingested; each tracker's own outcome travels beside them (`aub-y5q9`).
 fn task_ingest_report(
-    summary: &crate::store::task_event::IngestSummary,
+    trackers: &[crate::report::TaskIngestTrackerReport],
 ) -> crate::report::TaskIngestReport {
-    crate::report::TaskIngestReport {
-        events_inserted: summary.events_inserted,
-        events_already_present: summary.events_already_present,
-        quarantines_inserted: summary.quarantines_inserted,
-        quarantines_already_present: summary.quarantines_already_present,
+    let mut totals = crate::report::TaskIngestReport::default();
+    for tracker in trackers {
+        if let crate::report::TaskIngestTrackerOutcome::Ingested {
+            events_inserted,
+            events_already_present,
+            quarantines_inserted,
+            quarantines_already_present,
+        } = &tracker.outcome
+        {
+            totals.events_inserted += events_inserted;
+            totals.events_already_present += events_already_present;
+            totals.quarantines_inserted += quarantines_inserted;
+            totals.quarantines_already_present += quarantines_already_present;
+        }
     }
+    totals.trackers = trackers.to_vec();
+    totals
 }
 
-/// `aub task ingest`: runs the Beads tracker adapter and reports events
-/// ingested, quarantined and unchanged. The tracker database is opened
-/// read-only and is never written to: `aub` reads task-claim history, it
-/// never manages issues.
+/// `aub task ingest`: runs the Beads tracker adapter over every configured
+/// tracker and reports events ingested, quarantined and unchanged, per
+/// tracker and under each tracker's own source name (`aub-y5q9`). A tracker
+/// database is opened read-only and is never written to: `aub` reads
+/// task-claim history, it never manages issues. A tracker that cannot be
+/// read is reported as failed for that tracker while the others still
+/// ingest; the command's exit class is then the failure's.
 fn task_ingest_command(
     clock: &impl Clock,
     level: Level,
@@ -10574,27 +10650,61 @@ fn task_ingest_command(
         file_contents.as_deref(),
         &file_path,
     )?;
-    let tracker = config.tracker.as_ref().ok_or_else(|| {
-        Error::Usage("no [tracker] source is configured; task ingest has nothing to read".into())
-    })?;
-    let tracker_conn =
-        crate::store::task_event::open_tracker_database(&tracker.path.join("beads.db"))?;
-    let reader = crate::store::task_event::BeadsEventReader::new(&tracker_conn);
+    if config.trackers.is_empty() {
+        return Err(Error::Usage(
+            "no [[trackers]] entry is configured; task ingest has nothing to read".into(),
+        ));
+    }
     let ledger_conn = open_ledger(clock)?;
-    let summary = crate::store::task_event::ingest(
-        &ledger_conn,
-        crate::domain::ids::SourceNamespace::new("beads"),
-        &reader,
-    )?;
+    let mut tracker_reports = Vec::with_capacity(config.trackers.len());
+    let mut failures: Vec<Error> = Vec::new();
+    for tracker in &config.trackers {
+        match ingest_one_tracker(&ledger_conn, tracker) {
+            Ok(summary) => {
+                tracker_reports.push(crate::report::TaskIngestTrackerReport {
+                    name: tracker.name.clone(),
+                    outcome: crate::report::TaskIngestTrackerOutcome::Ingested {
+                        events_inserted: summary.events_inserted,
+                        events_already_present: summary.events_already_present,
+                        quarantines_inserted: summary.quarantines_inserted,
+                        quarantines_already_present: summary.quarantines_already_present,
+                    },
+                });
+            }
+            Err(error) => {
+                tracker_reports.push(crate::report::TaskIngestTrackerReport {
+                    name: tracker.name.clone(),
+                    outcome: crate::report::TaskIngestTrackerOutcome::Failed(error.to_string()),
+                });
+                failures.push(error);
+            }
+        }
+    }
+    let report = task_ingest_report(&tracker_reports);
 
     match invocation.format {
-        OutputFormat::Text => println!(
-            "task ingest: events_inserted={} events_already_present={} quarantines_inserted={} quarantines_already_present={}",
-            summary.events_inserted,
-            summary.events_already_present,
-            summary.quarantines_inserted,
-            summary.quarantines_already_present,
-        ),
+        OutputFormat::Text => {
+            for tracker in &report.trackers {
+                match &tracker.outcome {
+                    crate::report::TaskIngestTrackerOutcome::Ingested {
+                        events_inserted,
+                        events_already_present,
+                        quarantines_inserted,
+                        quarantines_already_present,
+                    } => println!(
+                        "task ingest {}: events_inserted={} events_already_present={} quarantines_inserted={} quarantines_already_present={}",
+                        tracker.name,
+                        events_inserted,
+                        events_already_present,
+                        quarantines_inserted,
+                        quarantines_already_present,
+                    ),
+                    crate::report::TaskIngestTrackerOutcome::Failed(reason) => {
+                        println!("task ingest {}: failed: {reason}", tracker.name);
+                    }
+                }
+            }
+        }
         OutputFormat::Json => {
             let metadata = ReportMetadata::new(
                 timestamp,
@@ -10606,15 +10716,59 @@ fn task_ingest_command(
             );
             println!(
                 "{}",
-                crate::presentation::json::task_ingest_json(
-                    &task_ingest_report(&summary),
-                    run,
-                    metadata,
-                )
+                crate::presentation::json::task_ingest_json(&report, run, metadata)
             );
         }
     }
-    Ok(())
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        // The per-tracker detail is already on stdout; this error is the exit
+        // class's reason, naming every failed tracker. `IngestIncomplete`
+        // outranks `Store` because both leave the run's contract unmet and
+        // class 8 names that state directly, while `Store` names one possible
+        // cause of it; a run whose only failures are unopenable databases
+        // keeps the class opening the database produces.
+        let detail = failures
+            .iter()
+            .map(|error| error.to_string())
+            .collect::<Vec<_>>()
+            .join("; ");
+        if failures
+            .iter()
+            .any(|error| matches!(error, Error::IngestIncomplete(_)))
+        {
+            Err(Error::IngestIncomplete(format!(
+                "task ingest: {} of {} configured trackers failed: {detail}",
+                failures.len(),
+                config.trackers.len(),
+            )))
+        } else {
+            Err(Error::Store(format!(
+                "task ingest: {} of {} configured trackers failed: {detail}",
+                failures.len(),
+                config.trackers.len(),
+            )))
+        }
+    }
+}
+
+/// Ingests one configured tracker's events under its own source name. The
+/// only failure classes this store path produces are `Store` (the database
+/// would not open, an insert refused) and `IngestIncomplete` (the events
+/// could not be read), both of which name the tracker in their message.
+fn ingest_one_tracker(
+    ledger_conn: &rusqlite::Connection,
+    tracker: &crate::config::TrackerConfig,
+) -> Result<crate::store::task_event::IngestSummary, Error> {
+    let tracker_conn =
+        crate::store::task_event::open_tracker_database(&tracker.path.join("beads.db"))?;
+    let reader = crate::store::task_event::BeadsEventReader::new(&tracker_conn);
+    crate::store::task_event::ingest(
+        ledger_conn,
+        crate::domain::ids::SourceNamespace::new(&tracker.name),
+        &reader,
+    )
 }
 
 /// `aub task report TASK-ID`: the task's total usage, resolved task-kind

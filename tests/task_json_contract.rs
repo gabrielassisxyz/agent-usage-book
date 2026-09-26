@@ -23,7 +23,8 @@ use agent_usage_book::presentation::render::ExplainMode;
 use agent_usage_book::report::provenance::{ProvenanceNode, ValueArithmetic};
 use agent_usage_book::report::{
     IngestionGeneration, LedgerGeneration, ReportMetadata, SharePpm, TaskIdentityRow,
-    TaskIngestReport, TaskOverheadBucket, TaskOverheadReport, TaskReport, TaskSessionUsage,
+    TaskIngestReport, TaskIngestTrackerOutcome, TaskIngestTrackerReport, TaskOverheadBucket,
+    TaskOverheadReport, TaskReport, TaskSessionUsage,
 };
 
 fn run() -> RunId {
@@ -280,7 +281,8 @@ fn an_unexpected_key_is_refused() {
 }
 
 /// `aub task ingest`'s document reports the same four counts the text
-/// rendering does, and validates.
+/// rendering does, and validates. With no per-tracker detail the totals are
+/// the document's whole story, which is the single-tracker shape.
 #[test]
 fn task_ingest_document_validates() {
     let summary = TaskIngestReport {
@@ -288,6 +290,15 @@ fn task_ingest_document_validates() {
         events_already_present: 1,
         quarantines_inserted: 1,
         quarantines_already_present: 0,
+        trackers: vec![TaskIngestTrackerReport {
+            name: "beads-a".to_string(),
+            outcome: TaskIngestTrackerOutcome::Ingested {
+                events_inserted: 3,
+                events_already_present: 1,
+                quarantines_inserted: 1,
+                quarantines_already_present: 0,
+            },
+        }],
     };
     let document = task_ingest_json(&summary, run(), metadata());
     validate_task_ingest_json(&document).expect("the task ingest document must validate");
@@ -297,6 +308,124 @@ fn task_ingest_document_validates() {
     assert_eq!(parsed["events_already_present"], 1);
     assert_eq!(parsed["quarantines_inserted"], 1);
     assert_eq!(parsed["quarantines_already_present"], 0);
+}
+
+/// One entry per configured tracker, each naming the source its counts came
+/// from (`aub-y5q9`). Two trackers' entries carry their own counts, so a
+/// conflation of one tracker's events with the other's is visible in the
+/// document rather than only in the totals.
+#[test]
+fn task_ingest_document_reports_one_entry_per_tracker() {
+    let summary = TaskIngestReport {
+        events_inserted: 5,
+        events_already_present: 2,
+        quarantines_inserted: 0,
+        quarantines_already_present: 1,
+        trackers: vec![
+            TaskIngestTrackerReport {
+                name: "agent-usage-book".to_string(),
+                outcome: TaskIngestTrackerOutcome::Ingested {
+                    events_inserted: 3,
+                    events_already_present: 2,
+                    quarantines_inserted: 0,
+                    quarantines_already_present: 0,
+                },
+            },
+            TaskIngestTrackerReport {
+                name: "kernl".to_string(),
+                outcome: TaskIngestTrackerOutcome::Ingested {
+                    events_inserted: 2,
+                    events_already_present: 0,
+                    quarantines_inserted: 0,
+                    quarantines_already_present: 1,
+                },
+            },
+        ],
+    };
+    let document = task_ingest_json(&summary, run(), metadata());
+    validate_task_ingest_json(&document).expect("the task ingest document must validate");
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    let trackers = parsed["trackers"].as_array().unwrap();
+    assert_eq!(trackers.len(), 2);
+    assert_eq!(trackers[0]["name"], "agent-usage-book");
+    assert_eq!(trackers[0]["events_inserted"], 3);
+    assert_eq!(trackers[0]["events_already_present"], 2);
+    assert_eq!(trackers[1]["name"], "kernl");
+    assert_eq!(trackers[1]["quarantines_already_present"], 1);
+    assert_eq!(parsed["events_inserted"], 5);
+}
+
+/// A failed tracker carries its error and no counts: an entry that rendered
+/// the four counts as zeros beside an error would print a measurement of
+/// nothing next to the reason nothing was measured.
+#[test]
+fn a_failed_tracker_entry_carries_an_error_and_no_counts() {
+    let summary = TaskIngestReport {
+        events_inserted: 2,
+        events_already_present: 0,
+        quarantines_inserted: 0,
+        quarantines_already_present: 0,
+        trackers: vec![
+            TaskIngestTrackerReport {
+                name: "agent-usage-book".to_string(),
+                outcome: TaskIngestTrackerOutcome::Ingested {
+                    events_inserted: 2,
+                    events_already_present: 0,
+                    quarantines_inserted: 0,
+                    quarantines_already_present: 0,
+                },
+            },
+            TaskIngestTrackerReport {
+                name: "kernl".to_string(),
+                outcome: TaskIngestTrackerOutcome::Failed(
+                    "cannot open database \"/home/u/.beads/beads.db\"".to_string(),
+                ),
+            },
+        ],
+    };
+    let document = task_ingest_json(&summary, run(), metadata());
+    validate_task_ingest_json(&document).expect("the task ingest document must validate");
+    let parsed: serde_json::Value = serde_json::from_str(&document).unwrap();
+    let trackers = parsed["trackers"].as_array().unwrap();
+    assert_eq!(trackers[1]["name"], "kernl");
+    assert!(trackers[1]["error"].is_string());
+    assert!(trackers[1].get("events_inserted").is_none());
+}
+
+/// The negative a validator without the exclusivity rule would miss: an
+/// entry holding both an error and counts is not a document this command
+/// produces, so the contract refuses it rather than leaving the reader to
+/// guess which half is true.
+#[test]
+fn a_tracker_entry_holding_both_an_error_and_counts_is_refused() {
+    let summary = TaskIngestReport {
+        events_inserted: 2,
+        events_already_present: 0,
+        quarantines_inserted: 0,
+        quarantines_already_present: 0,
+        trackers: vec![TaskIngestTrackerReport {
+            name: "agent-usage-book".to_string(),
+            outcome: TaskIngestTrackerOutcome::Ingested {
+                events_inserted: 2,
+                events_already_present: 0,
+                quarantines_inserted: 0,
+                quarantines_already_present: 0,
+            },
+        }],
+    };
+    let document = task_ingest_json(&summary, run(), metadata());
+    // Splice an `error` into the one ingested entry: a shape the builder
+    // cannot produce, refused by the validator.
+    let spliced = document.replace(
+        "\"name\":\"agent-usage-book\",\"events_inserted\":2",
+        "\"error\":\"x\",\"name\":\"agent-usage-book\",\"events_inserted\":2",
+    );
+    assert!(
+        serde_json::from_str::<serde_json::Value>(&spliced).is_ok(),
+        "the splice must stay parseable: {document}"
+    );
+    assert!(validate_task_ingest_json(&spliced).is_err());
+    assert!(validate_task_ingest_json(&document).is_ok());
 }
 
 /// The unresolved and ambiguous claim counts reach the document, under their

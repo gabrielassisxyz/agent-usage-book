@@ -410,6 +410,85 @@ mod tests {
         assert_eq!(count, 2);
     }
 
+    /// Two trackers whose `events.id` sequences both start at 1 and which
+    /// both carry a native id the other also has (`aub-y5q9`). Each ingests
+    /// under its own configured name, so all four events land and the two
+    /// identities stay distinct. The negative lives in the same test: the
+    /// same records ingested under one shared name collide on
+    /// `(tracker_source, tracker_event_id)`, the second tracker's rows are
+    /// silently dropped, and the row-count difference is the failure this
+    /// bead's per-tracker names exist to prevent.
+    #[test]
+    fn colliding_event_ids_from_two_trackers_ingest_distinct_rows_under_their_own_names() {
+        let fixture = || {
+            FixtureReader(vec![
+                record(
+                    1,
+                    "aub-1",
+                    "status_changed",
+                    Some("open"),
+                    Some("in_progress"),
+                    "2026-08-31T19:11:34Z",
+                ),
+                record(
+                    2,
+                    "aub-1",
+                    "status_changed",
+                    Some("in_progress"),
+                    Some("closed"),
+                    "2026-08-31T19:12:34Z",
+                ),
+            ])
+        };
+
+        let (_scratch, connection) = fixture_connection();
+        let first = ingest(
+            &connection,
+            SourceNamespace::new("agent-usage-book"),
+            &fixture(),
+        )
+        .unwrap();
+        let second = ingest(&connection, SourceNamespace::new("kernl"), &fixture()).unwrap();
+        assert_eq!(first.events_inserted, 2);
+        assert_eq!(second.events_inserted, 2);
+
+        let total: i64 = connection
+            .query_row("SELECT COUNT(*) FROM task_event", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total, 4);
+        let identities: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_event WHERE task_source = 'agent-usage-book'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(identities, 2);
+        let second_identities: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM task_event WHERE task_source = 'kernl'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(second_identities, 2);
+
+        // The same fixture under one shared name: the second tracker's event
+        // ids collide on `(tracker_source, tracker_event_id)` and are dropped
+        // by `ON CONFLICT DO NOTHING`, so half the history is missing. The
+        // difference from the per-name case above is the assertion.
+        let (_shared_scratch, shared) = fixture_connection();
+        ingest(&shared, SourceNamespace::new("beads"), &fixture()).unwrap();
+        let collided = ingest(&shared, SourceNamespace::new("beads"), &fixture()).unwrap();
+        assert_eq!(collided.events_inserted, 0);
+        assert_eq!(collided.events_already_present, 2);
+        let shared_total: i64 = shared
+            .query_row("SELECT COUNT(*) FROM task_event", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(shared_total, 2);
+        assert_ne!(shared_total, total);
+    }
+
     #[test]
     fn the_tracker_reader_interface_exposes_reads_only() {
         fn accepts_reader(_: &dyn TrackerEventReader) {}

@@ -935,6 +935,61 @@ mod tests {
         assert!(error.to_string().contains("UNIQUE"));
     }
 
+    /// Two trackers carrying the same native id, candidates and identity
+    /// both (`aub-y5q9`): under their own configured names the identity
+    /// table holds one row per tracker, and the same evidence ingested under
+    /// one shared name holds fewer rows - the difference is the assertion,
+    /// because one shared name conflates the two tasks into one identity.
+    #[test]
+    fn the_same_native_id_from_two_trackers_resolves_into_distinct_identity_rows() {
+        let fixture = || FixtureReader(vec![record("aub-1", "task", &[])]);
+
+        let (_scratch, connection) = fixture_connection();
+        ingest_task_kind_candidates(
+            &connection,
+            SourceNamespace::new("agent-usage-book"),
+            &fixture(),
+        )
+        .unwrap();
+        ingest_task_kind_candidates(&connection, SourceNamespace::new("kernl"), &fixture())
+            .unwrap();
+        let rebuilt = rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
+        assert_eq!(rebuilt.identities_written, 2);
+        let agent_usage_book = TaskId::new(
+            SourceNamespace::new("agent-usage-book"),
+            NativeTaskId::new("aub-1"),
+        );
+        let kernl = TaskId::new(SourceNamespace::new("kernl"), NativeTaskId::new("aub-1"));
+        let first_row = read_task_identity(&connection, &agent_usage_book)
+            .unwrap()
+            .expect("the first tracker's task must resolve");
+        let second_row = read_task_identity(&connection, &kernl)
+            .unwrap()
+            .expect("the second tracker's task must resolve");
+        assert_eq!(first_row.kind, Some(TaskKind::Task));
+        assert_eq!(second_row.kind, Some(TaskKind::Task));
+
+        // The same evidence under one shared name: the candidates collide on
+        // `(task_source, task_native, origin, raw_value)`, so only the first
+        // tracker's evidence lands and one identity row is written - fewer
+        // rows for the same two trackers, which is the conflation per-tracker
+        // names prevent.
+        let (_shared_scratch, shared) = fixture_connection();
+        ingest_task_kind_candidates(&shared, SourceNamespace::new("beads"), &fixture()).unwrap();
+        let collided =
+            ingest_task_kind_candidates(&shared, SourceNamespace::new("beads"), &fixture())
+                .unwrap();
+        assert_eq!(collided.candidates_inserted, 0);
+        assert_eq!(collided.candidates_already_present, 1);
+        let shared_rebuild =
+            rebuild_task_identities(&shared, &TaskKindMapping::default_v1()).unwrap();
+        assert_eq!(shared_rebuild.identities_written, 1);
+        assert_ne!(
+            shared_rebuild.identities_written,
+            rebuilt.identities_written
+        );
+    }
+
     #[test]
     fn rebuild_replaces_the_derived_state_and_round_trips() {
         let (_scratch, connection) = fixture_connection();
