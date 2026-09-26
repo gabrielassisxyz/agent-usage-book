@@ -11834,6 +11834,58 @@ mod tests {
         }
     }
 
+    /// `aub import seed-archive --help` and `docs/commands.md` both carry the
+    /// cutoff, the count it reports and the flag that decides where a vendor's
+    /// readings land. The planted negative: a check that only asked for the
+    /// word `superseded_by_native` somewhere would pass against the
+    /// legacy-meter note alone, so each assertion names the seed-archive
+    /// sentence it belongs to.
+    #[test]
+    fn seed_archive_help_and_docs_state_the_cutoff_and_its_count() {
+        let help = command_help_text(Command::Import);
+        assert!(
+            help.contains("--vendor-account VENDOR=ACCOUNT"),
+            "the usage line must carry the mapping flag: {help}"
+        );
+        let seed_notes: Vec<&str> = help
+            .lines()
+            .filter(|line| line.starts_with("  note: seed-archive"))
+            .collect();
+        assert!(
+            seed_notes
+                .iter()
+                .any(|note| note.contains("earliest native meter attempt")
+                    && note.contains("superseded_by_native")),
+            "a seed-archive note must state the cutoff and the count it reports: {seed_notes:?}"
+        );
+        assert!(
+            seed_notes
+                .iter()
+                .any(|note| note.contains("discarded_unmapped_vendor")),
+            "a seed-archive note must state what an unmapped vendor becomes: {seed_notes:?}"
+        );
+
+        let docs = include_str!("../docs/commands.md");
+        let seed = docs
+            .split("### `aub import seed-archive`")
+            .nth(1)
+            .expect("the seed importer must keep its own section in the command docs")
+            .split("\n## ")
+            .next()
+            .expect("the section must end at the next top-level heading");
+        for required in [
+            "earliest native meter attempt",
+            "superseded_by_native",
+            "--vendor-account VENDOR=ACCOUNT",
+            "discarded_unmapped_vendor",
+        ] {
+            assert!(
+                seed.contains(required),
+                "the seed-archive section must state {required:?}"
+            );
+        }
+    }
+
     #[test]
     fn status_and_now_command_surface_documents_the_session_alias() {
         let help = help_text();
