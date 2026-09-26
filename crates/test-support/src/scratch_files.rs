@@ -51,3 +51,45 @@ pub fn pin_mtime(path: &Path, unix_seconds: u64) {
         .set_modified(UNIX_EPOCH + Duration::from_secs(unix_seconds))
         .expect("scratch file mtime must be settable");
 }
+
+/// Reads retained diagnostic bodies for one provider and source, returning
+/// each record's sequence and body bytes sorted by sequence.
+///
+/// A meter test asserts on retained bodies through here rather than spelling
+/// `std::fs` inside `src/meter/`, for the same reason every other scratch
+/// helper lives here: boundary rule 17 reads the meter module's source as
+/// text, test modules included, so even a read-only directory listing inside
+/// `src/meter/` fails the gate.
+pub fn read_retained_bodies(
+    state_dir: &Path,
+    provider: &str,
+    source: &str,
+) -> Vec<(u64, Vec<u8>)> {
+    let dir = state_dir
+        .join(
+            agent_usage_book::store::retention::RETAINED_BODIES_DIR_NAME,
+        )
+        .join(provider)
+        .join(source);
+    let mut out: Vec<(u64, Vec<u8>)> = Vec::new();
+    let Ok(entries) = fs::read_dir(&dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) != Some("json") {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(record) =
+            agent_usage_book::store::retention::RetainedBodyRecord::from_json(&text)
+        else {
+            continue;
+        };
+        out.push((record.sequence, record.body_bytes));
+    }
+    out.sort_by_key(|(sequence, _)| *sequence);
+    out
+}

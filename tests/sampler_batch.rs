@@ -161,6 +161,11 @@ fn orchestrator<'a>(
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget,
         max_concurrent_requests,
+        state_dir: repository
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     }
 }
 
@@ -363,6 +368,11 @@ fn one_success_one_auth_failure_one_timeout_persists_three_attempts_one_observat
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget: MonotonicDuration::from_seconds(8),
         max_concurrent_requests: 2,
+        state_dir: repository
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     }
     .run(&accounts)
     .expect("the batch must run");
@@ -699,6 +709,11 @@ fn a_provider_hanging_until_the_budget_expires_does_not_block_another_accounts_o
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget: MonotonicDuration::from_seconds(8),
         max_concurrent_requests: 2,
+        state_dir: repository
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     }
     .run(&accounts)
     .expect("the batch must run");
@@ -871,6 +886,11 @@ fn bounded_concurrency_is_recorded_by_the_synthetic_server() {
         lease_ttl: MonotonicDuration::from_seconds(60),
         command_budget: MonotonicDuration::from_seconds(30),
         max_concurrent_requests: 2,
+        state_dir: repository
+            .database_path()
+            .parent()
+            .expect("fixture db has a parent")
+            .to_path_buf(),
     }
     .run(&accounts)
     .expect("the batch must run");
