@@ -3048,6 +3048,9 @@ pub fn render_can_run_report(report: &crate::report::CanRunReport) -> String {
         crate::report::CanRunOutcome::Ready(ready) => {
             let mut out = String::new();
             out.push_str(&format!("can-run: {}\n", report.task_kind));
+            if let Some(bead) = &report.task_bead {
+                out.push_str(&format!("bead: {bead}\n"));
+            }
             out.push_str(&format!("account: {}\n", report.account));
             out.push_str(&format!("model: {}\n\n", report.model));
 
@@ -3152,7 +3155,11 @@ pub fn render_can_run_report(report: &crate::report::CanRunReport) -> String {
             out
         }
         crate::report::CanRunOutcome::Refused(refused) => {
-            let mut out = format!("assessment: {}\n", refused.verdict.as_str());
+            let mut out = String::new();
+            if let Some(bead) = &report.task_bead {
+                out.push_str(&format!("bead: {bead}\n"));
+            }
+            out.push_str(&format!("assessment: {}\n", refused.verdict.as_str()));
             if refused.missing.len() == 1 && refused.attribution_quality.is_none() {
                 out.push_str(&format!("reason: {}\n", refused.missing[0].reason));
             } else {

@@ -2300,8 +2300,13 @@ pub fn can_run_json_with_explain(
     };
 
     let mut body = format!(
-        "\"task_kind\":{},\"account\":{},\"model\":{},\"limiting_window\":{},\"outcome\":{},\"provenance\":{},\"history_group\":{},\"history_level\":{}",
+        "\"task_kind\":{},\"bead_id\":{},\"account\":{},\"model\":{},\"limiting_window\":{},\"outcome\":{},\"provenance\":{},\"history_group\":{},\"history_level\":{}",
         json_string(&report.task_kind),
+        report
+            .task_bead
+            .as_deref()
+            .map(json_string)
+            .unwrap_or_else(|| "null".to_string()),
         json_string(&report.account),
         json_string(&report.model),
         limiting_window_json,
@@ -2395,7 +2400,7 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
             message: "expected object".to_string(),
         })?;
 
-    const KNOWN_CAN_RUN_KEYS: [&str; 16] = [
+    const KNOWN_CAN_RUN_KEYS: [&str; 17] = [
         "schema",
         "command",
         "run",
@@ -2404,6 +2409,7 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
         "ledger_generation",
         "ingestion_generation",
         "task_kind",
+        "bead_id",
         "history_group",
         "history_level",
         "account",
@@ -2435,6 +2441,16 @@ pub fn validate_can_run_report_json(json_str: &str) -> Result<ParsedEnvelope, Js
     }
 
     validate_can_run_history_group(obj)?;
+
+    if let Some(bead_id) = obj.get("bead_id")
+        && !bead_id.is_string()
+        && !bead_id.is_null()
+    {
+        return Err(JsonContractError::InvalidFormat {
+            field: "bead_id",
+            message: "expected a qualified bead id string or null".to_string(),
+        });
+    }
 
     let outcome_obj = obj
         .get("outcome")
