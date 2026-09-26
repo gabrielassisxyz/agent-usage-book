@@ -77,8 +77,7 @@ pub struct TaskEventQuarantine {
     pub reason: &'static str,
 }
 
-/// The closed vocabulary of task kinds, one variant per resolvable grouping
-/// key over historical tasks.
+/// The closed vocabulary of descriptive task kinds.
 ///
 /// The vocabulary is grounded on what the Beads tracker actually writes in its
 /// categorical identity column (verified against this repository's tracker on
@@ -204,6 +203,57 @@ impl TaskDifficulty {
     }
 }
 
+/// The verification scope asserted by a tracker label.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TaskVerify {
+    Local,
+    Gate,
+    External,
+}
+
+impl TaskVerify {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => "local",
+            Self::Gate => "gate",
+            Self::External => "external",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "local" => Some(Self::Local),
+            "gate" => Some(Self::Gate),
+            "external" => Some(Self::External),
+            _ => None,
+        }
+    }
+}
+
+/// Whether the task specification is settled before implementation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub enum TaskSpec {
+    Closed,
+    Open,
+}
+
+impl TaskSpec {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "closed" => Some(Self::Closed),
+            "open" => Some(Self::Open),
+            _ => None,
+        }
+    }
+}
+
 /// Where one task-kind candidate came from, and the precedence rank that
 /// decides disagreements between candidates for the same task.
 ///
@@ -314,8 +364,8 @@ pub fn emit_task_kind_candidates(
 /// [`TaskKindOrigin::rank`]. The version is persisted with every resolved
 /// identity so a rebuild under a newer mapping is distinguishable from the
 /// result of the older one, and re-running a rebuild under an unchanged
-/// mapping is a no-op on the persisted state. The kind, size and difficulty
-/// entries remain independent even though they share one rebuild version.
+/// mapping is a no-op on the persisted state. Classification axes remain
+/// independent even though they share one rebuild version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskKindMapping {
     version: u32,
@@ -400,6 +450,14 @@ impl TaskKindMapping {
 
     pub fn normalize_difficulty(&self, raw: &str) -> Option<TaskDifficulty> {
         self.difficulty_entries.get(raw).copied()
+    }
+
+    pub fn normalize_verify(&self, raw: &str) -> Option<TaskVerify> {
+        TaskVerify::parse(raw.strip_prefix("verify:")?)
+    }
+
+    pub fn normalize_spec(&self, raw: &str) -> Option<TaskSpec> {
+        TaskSpec::parse(raw.strip_prefix("spec:")?)
     }
 
     /// Returns a copy with one additional size label interpretation. This is
@@ -568,6 +626,24 @@ impl ResolvedTaskDifficulty {
     }
 }
 
+/// A routing label's resolved value or explicit unresolved evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedTaskRoutingAxis<T> {
+    Resolved { value: T, evidence: String },
+    Unknown { evidence: String },
+    Conflict { evidence: String },
+}
+
+impl<T> ResolvedTaskRoutingAxis<T> {
+    pub fn state(&self) -> TaskIdentityState {
+        match self {
+            Self::Resolved { .. } => TaskIdentityState::Resolved,
+            Self::Unknown { .. } => TaskIdentityState::Unknown,
+            Self::Conflict { .. } => TaskIdentityState::Conflict,
+        }
+    }
+}
+
 impl TaskIdentityState {
     /// The state label persisted alongside the identity row.
     pub fn state_label(self) -> &'static str {
@@ -624,7 +700,7 @@ pub fn resolve_task_kind(
     let evidence = render_evidence(candidates);
     let mut asserted: Vec<(u8, TaskKind)> = candidates
         .iter()
-        .filter(|candidate| !is_size_or_difficulty_label(&candidate.raw_value))
+        .filter(|candidate| !is_task_classification_label(&candidate.raw_value))
         .filter_map(|candidate| {
             mapping
                 .normalize(&candidate.raw_value)
@@ -758,8 +834,55 @@ pub fn resolve_task_difficulty(
     }
 }
 
-fn is_size_or_difficulty_label(raw: &str) -> bool {
-    raw.starts_with("size:") || raw.starts_with("difficulty:")
+pub fn resolve_task_verify(
+    candidates: &[TaskKindCandidate],
+    mapping: &TaskKindMapping,
+) -> ResolvedTaskRoutingAxis<TaskVerify> {
+    resolve_task_routing_axis(candidates, "verify:", |raw| mapping.normalize_verify(raw))
+}
+
+pub fn resolve_task_spec(
+    candidates: &[TaskKindCandidate],
+    mapping: &TaskKindMapping,
+) -> ResolvedTaskRoutingAxis<TaskSpec> {
+    resolve_task_routing_axis(candidates, "spec:", |raw| mapping.normalize_spec(raw))
+}
+
+fn resolve_task_routing_axis<T: Ord + Copy>(
+    candidates: &[TaskKindCandidate],
+    prefix: &str,
+    normalize: impl Fn(&str) -> Option<T>,
+) -> ResolvedTaskRoutingAxis<T> {
+    let relevant: Vec<_> = candidates
+        .iter()
+        .filter(|candidate| {
+            matches!(candidate.origin, TaskKindOrigin::TrackerLabel(_))
+                && candidate.raw_value.starts_with(prefix)
+        })
+        .cloned()
+        .collect();
+    let evidence = render_evidence(&relevant);
+    let asserted: std::collections::BTreeSet<_> = relevant
+        .iter()
+        .filter_map(|candidate| normalize(&candidate.raw_value))
+        .collect();
+    if asserted.len() > 1 {
+        return ResolvedTaskRoutingAxis::Conflict { evidence };
+    }
+    match asserted.first() {
+        Some(value) => ResolvedTaskRoutingAxis::Resolved {
+            value: *value,
+            evidence,
+        },
+        None => ResolvedTaskRoutingAxis::Unknown { evidence },
+    }
+}
+
+fn is_task_classification_label(raw: &str) -> bool {
+    ["size:", "difficulty:", "verify:", "spec:"]
+        .iter()
+        .any(|prefix| raw.starts_with(prefix))
+        || raw == "critical"
 }
 
 /// Renders candidate evidence deterministically: sorted by rank, provenance
@@ -1347,6 +1470,95 @@ mod tests {
             assert_eq!(TaskKindOrigin::from_provenance_id(&id), Some(origin));
         }
         assert_eq!(TaskKindOrigin::from_provenance_id("freeform:thing"), None);
+    }
+
+    #[test]
+    fn routing_axis_normalizers_accept_only_exact_label_values() {
+        let mapping = TaskKindMapping::default_v1();
+        for (raw, expected) in [
+            ("verify:local", TaskVerify::Local),
+            ("verify:gate", TaskVerify::Gate),
+            ("verify:external", TaskVerify::External),
+        ] {
+            assert_eq!(mapping.normalize_verify(raw), Some(expected), "{raw}");
+        }
+        for raw in [
+            "verify:Local",
+            "verify:GATE",
+            "verify:External",
+            "Verify:local",
+            "verify:remote",
+            "verify: local",
+            "verify:local ",
+            "local",
+            "",
+        ] {
+            assert_eq!(mapping.normalize_verify(raw), None, "{raw}");
+        }
+        for (raw, expected) in [
+            ("spec:closed", TaskSpec::Closed),
+            ("spec:open", TaskSpec::Open),
+        ] {
+            assert_eq!(mapping.normalize_spec(raw), Some(expected), "{raw}");
+        }
+        for raw in [
+            "spec:Closed",
+            "spec:OPEN",
+            "Spec:open",
+            "spec:unknown",
+            "spec: open",
+            "spec:open ",
+            "open",
+            "",
+        ] {
+            assert_eq!(mapping.normalize_spec(raw), None, "{raw}");
+        }
+    }
+
+    #[test]
+    fn routing_axis_resolution_keeps_unknown_and_conflicting_evidence() {
+        let mapping = TaskKindMapping::default_v1();
+        let candidates = |labels: &[&str]| {
+            emit_task_kind_candidates(
+                SourceNamespace::new("beads-a"),
+                TrackerTaskRecord {
+                    native: "routing-axes".to_owned(),
+                    issue_type: "task".to_owned(),
+                    labels: labels.iter().map(|label| (*label).to_owned()).collect(),
+                },
+            )
+        };
+        let unknown = candidates(&["verify:LOCAL", "spec:Closed"]);
+        assert_eq!(
+            resolve_task_verify(&unknown, &mapping),
+            ResolvedTaskRoutingAxis::Unknown {
+                evidence: "tracker_label:verify:LOCAL=verify:LOCAL".to_owned(),
+            }
+        );
+        assert_eq!(
+            resolve_task_spec(&unknown, &mapping),
+            ResolvedTaskRoutingAxis::Unknown {
+                evidence: "tracker_label:spec:Closed=spec:Closed".to_owned(),
+            }
+        );
+        let mut conflicting =
+            candidates(&["verify:local", "verify:gate", "spec:open", "spec:closed"]);
+        let verify = resolve_task_verify(&conflicting, &mapping);
+        let spec = resolve_task_spec(&conflicting, &mapping);
+        assert!(matches!(verify, ResolvedTaskRoutingAxis::Conflict { .. }));
+        assert!(matches!(spec, ResolvedTaskRoutingAxis::Conflict { .. }));
+        conflicting.reverse();
+        assert_eq!(resolve_task_verify(&conflicting, &mapping), verify);
+        assert_eq!(resolve_task_spec(&conflicting, &mapping), spec);
+        let field = task_kind_candidate(
+            "routing-axes",
+            TaskKindOrigin::TrackerField("type".to_owned()),
+            "verify:local",
+        );
+        assert!(matches!(
+            resolve_task_verify(&[field], &mapping),
+            ResolvedTaskRoutingAxis::Unknown { .. }
+        ));
     }
 
     #[test]

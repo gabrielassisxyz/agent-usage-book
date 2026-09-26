@@ -1109,6 +1109,68 @@ fn can_run_cached(state: &StateDir, format: &str) -> std::process::Output {
         .expect("the aub binary must be spawnable")
 }
 
+#[test]
+fn can_run_json_names_the_selected_routing_group_on_ready_and_refused_answers() {
+    let state = StateDir::new();
+    seed_can_run_ledger(&state, "");
+    let read_report = || {
+        let output = can_run_cached(&state, "json");
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let json = String::from_utf8(output.stdout).unwrap();
+        agent_usage_book::presentation::json::validate_can_run_report_json(&json).unwrap();
+        serde_json::from_str::<serde_json::Value>(&json).unwrap()
+    };
+    let refused = read_report();
+    assert_eq!(refused["outcome"]["status"], "refused");
+    assert_eq!(refused["history_level"], "cell");
+    let full_key =
+        serde_json::json!({"breadth": "l", "verify": "gate", "spec": "open", "critical": false});
+    assert_eq!(refused["history_group"], full_key);
+    assert_eq!(refused["task_kind"], "task");
+    run(&state, &["__calibration-fixture", "five_hour", "30"]);
+    let ready = read_report();
+    assert_eq!(ready["outcome"]["status"], "ready");
+    assert_eq!(ready["history_level"], "cell");
+    assert_eq!(ready["history_group"], full_key);
+    assert_eq!(ready["outcome"]["task_evidence"]["sample_count"], 3);
+
+    let conn = connection::open(
+        &state.path().join(connection::LEDGER_DATABASE_FILE),
+        AccessMode::ReadWrite,
+        &PragmaPolicy {
+            busy_timeout: MonotonicDuration::from_millis(1000),
+        },
+    )
+    .unwrap();
+    conn.execute("UPDATE task_identity SET verify = 'local', verify_state = 'resolved', spec = 'closed', spec_state = 'resolved'", []).unwrap();
+    let parent = read_report();
+    assert_eq!(parent["outcome"]["status"], "ready");
+    assert_eq!(parent["history_level"], "breadth_critical");
+    assert_eq!(
+        parent["history_group"],
+        serde_json::json!({"breadth": "l", "critical": false})
+    );
+    conn.execute(
+        "UPDATE task_identity SET size = 'S', size_state = 'resolved'",
+        [],
+    )
+    .unwrap();
+    let all = read_report();
+    assert_eq!(all["outcome"]["status"], "ready");
+    assert_eq!(all["history_level"], "all_tasks");
+    assert_eq!(all["history_group"], serde_json::json!({}));
+    let text = can_run_cached(&state, "text");
+    assert!(
+        String::from_utf8(text.stdout)
+            .unwrap()
+            .contains("history: level=all_tasks group=all tasks")
+    );
+}
+
 /// The first constraining window of a can-run JSON report, which a refused
 /// report does not carry. The report is the first document on stdout: a
 /// refusal that exits non-zero prints its error document after it.

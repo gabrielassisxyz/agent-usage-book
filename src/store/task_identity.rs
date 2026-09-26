@@ -16,10 +16,11 @@ use std::collections::BTreeMap;
 use rusqlite::params;
 
 use crate::attribution::{
-    ResolvedTaskDifficulty, ResolvedTaskKind, ResolvedTaskSize, TaskDifficulty, TaskIdentityState,
-    TaskKind, TaskKindCandidate, TaskKindMapping, TaskKindOrigin, TaskSize, TrackerTaskReader,
-    TrackerTaskRecord, emit_task_kind_candidates, resolve_task_difficulty, resolve_task_kind,
-    resolve_task_size,
+    ResolvedTaskDifficulty, ResolvedTaskKind, ResolvedTaskRoutingAxis, ResolvedTaskSize,
+    TaskDifficulty, TaskIdentityState, TaskKind, TaskKindCandidate, TaskKindMapping,
+    TaskKindOrigin, TaskSize, TaskSpec, TaskVerify, TrackerTaskReader, TrackerTaskRecord,
+    emit_task_kind_candidates, resolve_task_difficulty, resolve_task_kind, resolve_task_size,
+    resolve_task_spec, resolve_task_verify,
 };
 use crate::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
 use crate::error::Error;
@@ -175,16 +176,17 @@ pub fn rebuild_task_identities(
         .map_err(|error| Error::Store(format!("cannot clear task identities: {error}")))?;
     let mut written = 0u64;
     for (task_source, task_native, candidates) in &groups {
-        let resolved_kind = resolve_task_kind(candidates, mapping);
-        let resolved_size = resolve_task_size(candidates, mapping);
-        let resolved_difficulty = resolve_task_difficulty(candidates, mapping);
         insert_identity_with_classification(
             &transaction,
             task_source,
             task_native,
-            resolved_kind,
-            resolved_size,
-            resolved_difficulty,
+            TaskIdentityClassification {
+                kind: resolve_task_kind(candidates, mapping),
+                size: resolve_task_size(candidates, mapping),
+                difficulty: resolve_task_difficulty(candidates, mapping),
+                verify: resolve_task_verify(candidates, mapping),
+                spec: resolve_task_spec(candidates, mapping),
+            },
             mapping.version(),
         )?;
         written += 1;
@@ -263,28 +265,42 @@ pub(crate) fn insert_identity(
         connection,
         task_source,
         task_native,
-        resolved,
-        ResolvedTaskSize::Unknown {
-            evidence: String::new(),
-        },
-        ResolvedTaskDifficulty::Unknown {
-            evidence: String::new(),
+        TaskIdentityClassification {
+            kind: resolved,
+            size: ResolvedTaskSize::Unknown {
+                evidence: String::new(),
+            },
+            difficulty: ResolvedTaskDifficulty::Unknown {
+                evidence: String::new(),
+            },
+            verify: ResolvedTaskRoutingAxis::Unknown {
+                evidence: String::new(),
+            },
+            spec: ResolvedTaskRoutingAxis::Unknown {
+                evidence: String::new(),
+            },
         },
         normalization_version,
     )
+}
+
+struct TaskIdentityClassification {
+    kind: ResolvedTaskKind,
+    size: ResolvedTaskSize,
+    difficulty: ResolvedTaskDifficulty,
+    verify: ResolvedTaskRoutingAxis<TaskVerify>,
+    spec: ResolvedTaskRoutingAxis<TaskSpec>,
 }
 
 fn insert_identity_with_classification(
     connection: &rusqlite::Connection,
     task_source: &str,
     task_native: &str,
-    resolved_kind: ResolvedTaskKind,
-    resolved_size: ResolvedTaskSize,
-    resolved_difficulty: ResolvedTaskDifficulty,
+    classification: TaskIdentityClassification,
     normalization_version: u32,
 ) -> Result<(), Error> {
-    let kind_state = resolved_kind.state().state_label();
-    let (kind, winner, kind_evidence) = match resolved_kind {
+    let kind_state = classification.kind.state().state_label();
+    let (kind, winner, kind_evidence) = match classification.kind {
         ResolvedTaskKind::Resolved {
             kind,
             winner,
@@ -294,15 +310,15 @@ fn insert_identity_with_classification(
             (None, None, evidence)
         }
     };
-    let size_state = resolved_size.state().state_label();
-    let (size, size_evidence) = match resolved_size {
+    let size_state = classification.size.state().state_label();
+    let (size, size_evidence) = match classification.size {
         ResolvedTaskSize::Resolved { size, evidence, .. } => (Some(size.as_str()), evidence),
         ResolvedTaskSize::Unknown { evidence } | ResolvedTaskSize::Conflict { evidence } => {
             (None, evidence)
         }
     };
-    let difficulty_state = resolved_difficulty.state().state_label();
-    let (difficulty, difficulty_evidence) = match resolved_difficulty {
+    let difficulty_state = classification.difficulty.state().state_label();
+    let (difficulty, difficulty_evidence) = match classification.difficulty {
         ResolvedTaskDifficulty::Resolved {
             difficulty,
             evidence,
@@ -311,13 +327,20 @@ fn insert_identity_with_classification(
         ResolvedTaskDifficulty::Unknown { evidence }
         | ResolvedTaskDifficulty::Conflict { evidence } => (None, evidence),
     };
+    let verify_state = classification.verify.state().state_label();
+    let (verify, verify_evidence) =
+        task_routing_axis_columns(classification.verify, TaskVerify::as_str);
+    let spec_state = classification.spec.state().state_label();
+    let (spec, spec_evidence) = task_routing_axis_columns(classification.spec, TaskSpec::as_str);
     connection
         .execute(
             "INSERT INTO task_identity (
                 task_source, task_native, state, kind, winner_origin,
                 evidence, normalization_version, size_state, size, size_evidence,
-                difficulty_state, difficulty, difficulty_evidence
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                difficulty_state, difficulty, difficulty_evidence,
+                verify_state, verify, verify_evidence, spec_state, spec, spec_evidence
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                      ?14, ?15, ?16, ?17, ?18, ?19)",
             params![
                 task_source,
                 task_native,
@@ -332,10 +355,27 @@ fn insert_identity_with_classification(
                 difficulty_state,
                 difficulty,
                 difficulty_evidence,
+                verify_state,
+                verify,
+                verify_evidence,
+                spec_state,
+                spec,
+                spec_evidence,
             ],
         )
         .map(|_| ())
         .map_err(|error| Error::Store(format!("cannot insert task identity: {error}")))
+}
+
+fn task_routing_axis_columns<T>(
+    resolved: ResolvedTaskRoutingAxis<T>,
+    as_str: fn(T) -> &'static str,
+) -> (Option<&'static str>, String) {
+    match resolved {
+        ResolvedTaskRoutingAxis::Resolved { value, evidence } => (Some(as_str(value)), evidence),
+        ResolvedTaskRoutingAxis::Unknown { evidence }
+        | ResolvedTaskRoutingAxis::Conflict { evidence } => (None, evidence),
+    }
 }
 
 /// One task's persisted identity, read back from the ledger.
@@ -353,6 +393,14 @@ pub struct TaskIdentityRow {
     pub difficulty_state: TaskIdentityState,
     pub difficulty: Option<TaskDifficulty>,
     pub difficulty_evidence: String,
+    pub verify_state: TaskIdentityState,
+    pub verify: Option<TaskVerify>,
+    pub verify_evidence: String,
+    pub spec_state: TaskIdentityState,
+    pub spec: Option<TaskSpec>,
+    pub spec_evidence: String,
+    /// Exact critical label presence overrides routing even when difficulty conflicts.
+    pub routing_critical: bool,
 }
 
 /// Reads one task's identity, or `None` when the task has none (either never
@@ -366,7 +414,15 @@ pub fn read_task_identity(
         .prepare(
             "SELECT state, kind, winner_origin, evidence, normalization_version,
                     size_state, size, size_evidence,
-                    difficulty_state, difficulty, difficulty_evidence
+                    difficulty_state, difficulty, difficulty_evidence,
+                    verify_state, verify, verify_evidence, spec_state, spec, spec_evidence,
+                    EXISTS (
+                        SELECT 1 FROM task_kind_candidate AS candidate
+                        WHERE candidate.task_source = task_identity.task_source
+                          AND candidate.task_native = task_identity.task_native
+                          AND candidate.raw_value IN ('critical', 'difficulty:critical')
+                          AND candidate.origin = 'tracker_label:' || candidate.raw_value
+                    )
              FROM task_identity
              WHERE task_source = ?1 AND task_native = ?2",
         )
@@ -387,6 +443,13 @@ pub fn read_task_identity(
                     row.get::<_, String>(8)?,
                     row.get::<_, Option<String>>(9)?,
                     row.get::<_, String>(10)?,
+                    row.get::<_, String>(11)?,
+                    row.get::<_, Option<String>>(12)?,
+                    row.get::<_, String>(13)?,
+                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(15)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, bool>(17)?,
                 ))
             },
         )
@@ -405,6 +468,13 @@ pub fn read_task_identity(
         difficulty_state,
         difficulty,
         difficulty_evidence,
+        verify_state,
+        verify,
+        verify_evidence,
+        spec_state,
+        spec,
+        spec_evidence,
+        routing_critical,
     )) = rows.pop()
     else {
         return Ok(None);
@@ -450,6 +520,19 @@ pub fn read_task_identity(
         difficulty.as_deref(),
         TaskDifficulty::parse,
     )?;
+    let verify_state = TaskIdentityState::parse(&verify_state).ok_or_else(|| {
+        Error::Store(format!(
+            "task identity carries an unknown verify state label: {verify_state}"
+        ))
+    })?;
+    let verify =
+        parse_identity_axis_value("verify", verify_state, verify.as_deref(), TaskVerify::parse)?;
+    let spec_state = TaskIdentityState::parse(&spec_state).ok_or_else(|| {
+        Error::Store(format!(
+            "task identity carries an unknown spec state label: {spec_state}"
+        ))
+    })?;
+    let spec = parse_identity_axis_value("spec", spec_state, spec.as_deref(), TaskSpec::parse)?;
     Ok(Some(TaskIdentityRow {
         task_id: task_id.clone(),
         state,
@@ -463,6 +546,13 @@ pub fn read_task_identity(
         difficulty_state,
         difficulty,
         difficulty_evidence,
+        verify_state,
+        verify,
+        verify_evidence,
+        spec_state,
+        spec,
+        spec_evidence,
+        routing_critical,
     }))
 }
 

@@ -12,7 +12,7 @@
 
 use agent_usage_book::attribution::{
     TaskDifficulty, TaskIdentityState, TaskKind, TaskKindMapping, TaskKindOrigin, TaskSize,
-    TrackerTaskReader,
+    TaskSpec, TaskVerify, TrackerTaskReader,
 };
 use agent_usage_book::domain::ids::{NativeTaskId, SourceNamespace, TaskId};
 use agent_usage_book::domain::time::{FakeClock, MonotonicDuration, UtcTimestamp};
@@ -538,6 +538,96 @@ fn the_persisted_identity_refuses_state_labels_it_cannot_parse() {
     assert_eq!(
         TaskIdentityState::parse("resolved"),
         Some(TaskIdentityState::Resolved)
+    );
+}
+
+#[test]
+fn routing_labels_round_trip_without_rewriting_candidates() {
+    let (_scratch, connection) = state_db("routing-labels");
+    let tracker = fixture_tracker();
+    tracker
+        .execute_batch(
+            "INSERT INTO labels VALUES
+         ('aub-1', 'verify:local'), ('aub-1', 'spec:closed'),
+         ('aub-2', 'verify:gate'), ('aub-2', 'spec:open'),
+         ('aub-3', 'verify:external'), ('aub-3', 'spec:closed'),
+         ('aub-4', 'verify:LOCAL'), ('aub-4', 'spec:Closed'),
+         ('aub-5', 'verify:local'), ('aub-5', 'verify:gate'),
+         ('aub-5', 'spec:open'), ('aub-5', 'spec:closed'),
+         ('aub-6', 'critical'),
+         ('aub-7', 'difficulty:mechanical'), ('aub-7', 'difficulty:critical');",
+        )
+        .unwrap();
+    let reader = BeadsTaskKindReader::new(&tracker);
+    ingest_task_kind_candidates(&connection, SourceNamespace::new("beads-a"), &reader).unwrap();
+    let snapshot = || {
+        connection.prepare(
+        "SELECT task_native, origin, raw_value FROM task_kind_candidate ORDER BY task_native, origin, raw_value",
+    ).unwrap().query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)))
+        .unwrap().collect::<Result<Vec<_>, _>>().unwrap()
+    };
+    let before = snapshot();
+    rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
+    for (native, verify, spec) in [
+        ("aub-1", TaskVerify::Local, TaskSpec::Closed),
+        ("aub-2", TaskVerify::Gate, TaskSpec::Open),
+        ("aub-3", TaskVerify::External, TaskSpec::Closed),
+    ] {
+        let identity = read_task_identity(&connection, &task("beads-a", native))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.verify_state, TaskIdentityState::Resolved);
+        assert_eq!(identity.verify, Some(verify));
+        assert_eq!(identity.spec_state, TaskIdentityState::Resolved);
+        assert_eq!(identity.spec, Some(spec));
+        assert!(
+            identity
+                .verify_evidence
+                .contains(&format!("verify:{}", verify.as_str()))
+        );
+        assert!(
+            identity
+                .spec_evidence
+                .contains(&format!("spec:{}", spec.as_str()))
+        );
+    }
+    let unknown = read_task_identity(&connection, &task("beads-a", "aub-4"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (unknown.verify_state, unknown.verify),
+        (TaskIdentityState::Unknown, None)
+    );
+    assert_eq!(
+        (unknown.spec_state, unknown.spec),
+        (TaskIdentityState::Unknown, None)
+    );
+    assert!(unknown.verify_evidence.contains("verify:LOCAL"));
+    assert!(unknown.spec_evidence.contains("spec:Closed"));
+    let conflict = read_task_identity(&connection, &task("beads-a", "aub-5"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (conflict.verify_state, conflict.verify),
+        (TaskIdentityState::Conflict, None)
+    );
+    assert_eq!(
+        (conflict.spec_state, conflict.spec),
+        (TaskIdentityState::Conflict, None)
+    );
+    for native in ["aub-6", "aub-7"] {
+        assert!(
+            read_task_identity(&connection, &task("beads-a", native))
+                .unwrap()
+                .unwrap()
+                .routing_critical
+        );
+    }
+    rebuild_task_identities(&connection, &TaskKindMapping::default_v1()).unwrap();
+    assert_eq!(
+        before,
+        snapshot(),
+        "routing normalization must leave raw candidates untouched"
     );
 }
 

@@ -1357,6 +1357,66 @@ fn populated_attempt_fixture_carries_one_start_without_a_terminal_result() {
         .expect("the fixture must retain one collector-interruption row");
 }
 
+#[test]
+fn routing_axis_migration_adds_six_columns_and_preserves_existing_rows() {
+    let migrations = registry();
+    let db = FixtureDb::new("routing-axes");
+    let (mut conn, _) = open_populated_fixture(&db, &migrations, 45).unwrap();
+    let before = row_count(&conn, "task_identity").unwrap();
+    assert!(before > 0);
+    migrate_forward_one_step(&mut conn, &migrations, 46, &db.backup_path()).unwrap();
+    for column in [
+        "verify",
+        "verify_state",
+        "verify_evidence",
+        "spec",
+        "spec_state",
+        "spec_evidence",
+    ] {
+        assert!(
+            column_exists(&conn, "task_identity", column),
+            "missing routing column {column}"
+        );
+    }
+    let unknown: i64 = conn.query_row(
+        "SELECT COUNT(*) FROM task_identity WHERE verify IS NULL AND verify_state = 'unknown'
+         AND verify_evidence = '' AND spec IS NULL AND spec_state = 'unknown' AND spec_evidence = ''",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        unknown, before,
+        "old identities must keep explicit unknown routing axes"
+    );
+    for (axis, value) in [
+        ("verify", "local"),
+        ("verify", "gate"),
+        ("verify", "external"),
+        ("spec", "closed"),
+        ("spec", "open"),
+    ] {
+        conn.execute(
+            &format!("UPDATE task_identity SET {axis} = ?1, {axis}_state = 'resolved'"),
+            [value],
+        )
+        .unwrap();
+        assert!(
+            conn.execute(&format!("UPDATE task_identity SET {axis} = 'invalid'"), [])
+                .is_err()
+        );
+        assert!(
+            conn.execute(&format!("UPDATE task_identity SET {axis} = NULL"), [])
+                .is_err()
+        );
+        assert!(
+            conn.execute(
+                &format!("UPDATE task_identity SET {axis}_state = 'unknown'"),
+                []
+            )
+            .is_err()
+        );
+    }
+}
+
 /// Integration: the matrix applies every migration forward from every prior
 /// schema version against a populated fixture database, with post-migration
 /// integrity and foreign-key checking after every step. Performance: the full

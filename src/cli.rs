@@ -7049,7 +7049,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
 
     let task_kind_raw =
         task_kind_raw.ok_or_else(|| Error::Usage("can-run requires --task-kind TYPE".into()))?;
-    let task_kind = crate::attribution::TaskKind::parse(&task_kind_raw)
+    crate::attribution::TaskKind::parse(&task_kind_raw)
         .ok_or_else(|| Error::Usage(format!("unknown task kind '{task_kind_raw}'")))?;
     let account_name = invocation
         .account
@@ -7244,7 +7244,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     };
     let group_report = crate::report::gather_task_history_group_report(
         &conn,
-        task_kind,
+        crate::report::can_run_evidence::TaskRoutingCell::default(),
         period,
         timestamp,
         &config.task_distribution,
@@ -7282,7 +7282,7 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
             period.start.utc_date().iso(),
             period.end.utc_date().iso()
         ),
-        attribution_group: task_kind_raw,
+        attribution_group: format!("{}: {}", group_report.group.level(), group_report.group),
         ample_margin_multiple: config.can_run.ample_margin_multiple,
         headroom_bound: config.can_run.headroom_bound,
         // No per-field provenance graph is assembled in this first wiring:
@@ -7297,13 +7297,20 @@ fn can_run_command(clock: &impl Clock, level: Level, invocation: &Invocation) ->
     match invocation.format {
         OutputFormat::Text => {
             println!(
-                "{}",
+                "history: level={} group={}\n{}",
+                group_report.group.level(),
+                group_report.group,
                 crate::presentation::render::render_can_run_report(&report)
             )
         }
         OutputFormat::Json => println!(
             "{}",
-            crate::presentation::json::can_run_json_with_explain(&report, run, invocation.explain)
+            crate::presentation::json::can_run_json_with_explain(
+                &report,
+                group_report.group,
+                run,
+                invocation.explain
+            )
         ),
     }
     logger
