@@ -17,6 +17,7 @@ use crate::error::Error;
 use crate::legacy_meter::{LegacyMeterRecord, ParsedLegacyMeterSource};
 
 use super::account;
+use super::ingest_quarantine::{self, NewQuarantineItem};
 use super::ledger_generation;
 use super::meter_attempt::{self, DueReason, NewMeterAttempt, NewMeterAttemptResult};
 use super::meter_evidence::{self, NewMeterObservation, NewMeterResponseEvidence, NewMeterWindow};
@@ -31,23 +32,60 @@ const MARKER_SOURCE: &str = "legacy_meter_series";
 const ADAPTER_VERSION: &str = "legacy-meter-import-v1";
 const PROVIDER_CONTRACT: &str = "legacy-quota-ledger-jsonl-v1";
 const METER_SEMANTICS: &str = "legacy-account-windows-v1";
+const SESSION_NAMESPACE: &str = "legacy-meter";
+
+/// The parser name recorded on every quarantine row this importer writes.
+pub const QUARANTINE_PARSER: &str = "legacy-meter";
+
+/// The failure class of a source line naming an account no `[[accounts]]`
+/// entry configures. Such a line is neither malformed nor importable: creating
+/// an account row for it would invent an account the operator never declared.
+pub const UNCONFIGURED_ACCOUNT_FAILURE_CLASS: &str = "unconfigured_account";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImportSummary {
     pub imported: u64,
     pub unchanged: u64,
+    /// Readings at or after their account's native cutoff. They are classified
+    /// on every run, so the figure is a property of the source and the ledger
+    /// rather than of how often the import has been attempted.
+    pub superseded_by_native: u64,
     pub quarantined: u64,
 }
 
-/// Writes every parseable source row and its marker in one transaction. The
-/// `(source_digest, source_line)` key is the idempotence boundary: rerunning
-/// exactly the same source cannot create a second observation or marker.
+/// Writes the source rows native sampling does not already cover, and every
+/// row's marker, in one transaction. The `(source_digest, source_line)` key is
+/// the idempotence boundary for a fully imported row; a marker imported past
+/// the cutoff has no row there, so its own identity in `session_account_marker`
+/// is what a rerun recognises.
+///
+/// Three rules decide what a row becomes, and all three exist because the
+/// legacy series overlaps the live one in time:
+///
+/// - **Cutoff.** Per account, the earliest native `meter_attempt` start. A
+///   reading at or after it is already measured by the sampler, and importing
+///   it would lay a second, disagreeing series over the first. Legacy contracts
+///   are excluded from the cutoff, so a previous import of either legacy source
+///   never becomes its own cutoff.
+/// - **Markers are exempt.** A session-to-account marker is evidence native
+///   sampling does not produce at all, so it imports for the whole series.
+/// - **An unconfigured account is quarantined**, never invented. `configured_accounts`
+///   carries the `[[accounts]]` names for this provider.
 pub fn import(
     conn: &mut Connection,
     source: &ParsedLegacyMeterSource,
+    configured_accounts: &[String],
     verified_backup_id: &str,
     imported_at: UtcTimestamp,
 ) -> Result<ImportSummary, Error> {
+    let configured: std::collections::BTreeSet<&str> =
+        configured_accounts.iter().map(String::as_str).collect();
+    let unconfigured_records = source
+        .records
+        .iter()
+        .filter(|record| !configured.contains(record.account.as_str()))
+        .count() as u64;
+    let quarantined = source.records_quarantined + unconfigured_records;
     let tx = conn
         .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
         .map_err(|error| Error::Store(format!("cannot open legacy import transaction: {error}")))?;
@@ -60,7 +98,7 @@ pub fn import(
             verified_backup_id,
             imported_at.unix_nanos(),
             source.records_read as i64,
-            source.records_quarantined as i64,
+            quarantined as i64,
         ],
     )
     .map_err(|error| Error::Store(format!("cannot record legacy import provenance: {error}")))?;
@@ -71,7 +109,33 @@ pub fn import(
     let mut run = None;
     let mut imported = 0;
     let mut unchanged = 0;
+    let mut superseded_by_native = 0;
+    let mut rows_written = 0;
+    let mut cutoffs: std::collections::BTreeMap<&str, Option<UtcTimestamp>> =
+        std::collections::BTreeMap::new();
     for record in &source.records {
+        if !configured.contains(record.account.as_str()) {
+            quarantine_unconfigured_account(&tx, &source.content_digest, record, imported_at)?;
+            continue;
+        }
+        let cutoff = match cutoffs.get(record.account.as_str()) {
+            Some(cutoff) => *cutoff,
+            None => {
+                let cutoff = native_cutoff_for_account(&tx, &record.account)?;
+                cutoffs.insert(record.account.as_str(), cutoff);
+                cutoff
+            }
+        };
+        if cutoff.is_some_and(|cutoff| record.timestamp >= cutoff) {
+            superseded_by_native += 1;
+            if !marker_exists(&tx, record)? {
+                let account_id =
+                    account::observe_account(&tx, PROVIDER, &record.account, record.timestamp)?;
+                insert_record_marker(&tx, record, account_id)?;
+                rows_written += 1;
+            }
+            continue;
+        }
         if imported_record_exists(&tx, &source.content_digest, record.source_line)? {
             unchanged += 1;
             continue;
@@ -91,8 +155,9 @@ pub fn import(
         };
         import_record(&tx, run_id, &source.content_digest, record)?;
         imported += 1;
+        rows_written += 1;
     }
-    if imported > 0 {
+    if rows_written > 0 {
         ledger_generation::advance(&tx)?;
     }
     tx.commit()
@@ -100,8 +165,86 @@ pub fn import(
     Ok(ImportSummary {
         imported,
         unchanged,
-        quarantined: source.records_quarantined,
+        superseded_by_native,
+        quarantined,
     })
+}
+
+/// The earliest native meter attempt for an account, or `None` when the
+/// sampler has never reached it. Both legacy contracts are excluded: a row an
+/// importer wrote is history, not coverage, and letting it stand as a cutoff
+/// would make a second import of the same source import nothing.
+fn native_cutoff_for_account(
+    conn: &Connection,
+    account_name: &str,
+) -> Result<Option<UtcTimestamp>, Error> {
+    let Some(account_id) = account::account_id_by_identity(conn, PROVIDER, account_name)? else {
+        return Ok(None);
+    };
+    conn.query_row(
+        "SELECT MIN(request_started_at) FROM meter_attempt
+         WHERE account_id = ?1 AND provider_contract_id NOT IN (?2, ?3)",
+        params![
+            account_id.value(),
+            PROVIDER_CONTRACT,
+            super::seed_archive_import::PROVIDER_CONTRACT,
+        ],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map(|nanos| nanos.map(UtcTimestamp::from_unix_nanos))
+    .map_err(|error| Error::Store(format!("cannot read the native meter cutoff: {error}")))
+}
+
+/// Whether this source line's marker is already stored. A marker imported past
+/// the cutoff has no `legacy_meter_import_record` row to key on, so its own
+/// columns carry its identity.
+fn marker_exists(conn: &Connection, record: &LegacyMeterRecord) -> Result<bool, Error> {
+    conn.query_row(
+        "SELECT 1 FROM session_account_marker
+         WHERE marker_source = ?1 AND session_source = ?2 AND session_native = ?3
+           AND observed_at = ?4 AND source_ordering_key = ?5 AND logical_account = ?6",
+        params![
+            MARKER_SOURCE,
+            SESSION_NAMESPACE,
+            record.session_id,
+            record.timestamp.unix_nanos(),
+            record.source_line as i64,
+            record.account,
+        ],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+    .map_err(|error| Error::Store(format!("cannot read legacy marker identity: {error}")))
+}
+
+/// Records a source line whose account no `[[accounts]]` entry names. The
+/// quarantine is keyed by digest and line, so the same line recurring on a
+/// rerun updates one row rather than adding a second.
+fn quarantine_unconfigured_account(
+    conn: &Connection,
+    source_digest: &str,
+    record: &LegacyMeterRecord,
+    observed_at: UtcTimestamp,
+) -> Result<(), Error> {
+    use sha2::{Digest, Sha256};
+    let identity = format!("{source_digest}|{}|{}", record.source_line, record.account);
+    ingest_quarantine::record_quarantine(
+        conn,
+        &NewQuarantineItem {
+            // The source is named by digest, never by path: the importer's
+            // output and its durable rows must not carry a filesystem location.
+            source_file: format!("legacy-meter:{source_digest}"),
+            byte_offset: None,
+            line_number: Some(record.source_line),
+            parser: QUARANTINE_PARSER.to_owned(),
+            failure_class: UNCONFIGURED_ACCOUNT_FAILURE_CLASS.to_owned(),
+            excerpt_hash: format!("{:x}", Sha256::digest(identity.as_bytes())),
+            excerpt: None,
+            observed_at,
+        },
+    )?;
+    Ok(())
 }
 
 fn imported_record_exists(
@@ -213,11 +356,30 @@ fn import_record(
             },
         )?;
     }
+    let marker_id = insert_record_marker(conn, record, account_id)?;
+    conn.execute(
+        "INSERT INTO legacy_meter_import_record (source_digest, source_line, observation_id, marker_id)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![source_digest, record.source_line as i64, observation_id.value(), marker_id.value()],
+    )
+    .map_err(|error| Error::Store(format!("cannot record legacy import row identity: {error}")))?;
+    Ok(())
+}
+
+/// The session-to-account marker a source line carries. Written for every
+/// configured line, on both sides of the cutoff, because it is evidence native
+/// sampling does not produce: it names the account a session ran under, and
+/// nothing later can reconstruct that.
+fn insert_record_marker(
+    conn: &Connection,
+    record: &LegacyMeterRecord,
+    account_id: account::AccountId,
+) -> Result<session_account_marker::MarkerId, Error> {
     let session_id = crate::domain::ids::SessionId::new(
-        crate::domain::ids::SourceNamespace::new("legacy-meter"),
+        crate::domain::ids::SourceNamespace::new(SESSION_NAMESPACE),
         crate::domain::ids::NativeSessionId::new(record.session_id.clone()),
     );
-    let marker_id = session_account_marker::insert_marker(
+    session_account_marker::insert_marker(
         conn,
         &NewSessionAccountMarker {
             session_id,
@@ -229,14 +391,7 @@ fn import_record(
             run_id: None,
             evidence_designation: EvidenceDesignation::ExplicitLauncherOrHook,
         },
-    )?;
-    conn.execute(
-        "INSERT INTO legacy_meter_import_record (source_digest, source_line, observation_id, marker_id)
-         VALUES (?1, ?2, ?3, ?4)",
-        params![source_digest, record.source_line as i64, observation_id.value(), marker_id.value()],
     )
-    .map_err(|error| Error::Store(format!("cannot record legacy import row identity: {error}")))?;
-    Ok(())
 }
 
 fn legacy_policy() -> ResolvedSamplingPolicy {
@@ -349,10 +504,23 @@ mod tests {
         );
         let imported_at = UtcTimestamp::from_unix_nanos(1_000);
 
-        let first = import(&mut conn, &source(), "backup-verified-1", imported_at)
-            .expect("first import must succeed");
-        let repeated = import(&mut conn, &source(), "backup-verified-1", imported_at)
-            .expect("identical import must succeed");
+        let configured = vec!["primary".to_owned()];
+        let first = import(
+            &mut conn,
+            &source(),
+            &configured,
+            "backup-verified-1",
+            imported_at,
+        )
+        .expect("first import must succeed");
+        let repeated = import(
+            &mut conn,
+            &source(),
+            &configured,
+            "backup-verified-1",
+            imported_at,
+        )
+        .expect("identical import must succeed");
 
         assert_eq!(first.imported, 1);
         assert_eq!(repeated.imported, 0);

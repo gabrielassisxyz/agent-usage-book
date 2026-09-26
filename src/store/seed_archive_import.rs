@@ -39,7 +39,11 @@ use crate::store::{ledger_generation, sample_run};
 
 const PROVIDER: &str = "anthropic";
 const ADAPTER_VERSION: &str = "quota-axi-seed-archive-v1";
-const PROVIDER_CONTRACT: &str = "quota-axi-seed-archive-v1";
+/// The provider contract every seed-archive row carries. Public because the
+/// legacy meter importer must recognise it as legacy rather than native
+/// sampling when it computes its cutoff, and a second spelling of the same
+/// string would be silently wrong.
+pub const PROVIDER_CONTRACT: &str = "quota-axi-seed-archive-v1";
 const METER_SEMANTICS: &str = "legacy-account-windows-v1";
 const MARKER_SOURCE: &str = "seed_capture";
 const SESSION_NAMESPACE: &str = "seed-capture";
@@ -148,6 +152,7 @@ pub fn import(
     Ok(ImportSummary {
         imported,
         unchanged,
+        superseded_by_native: 0,
         quarantined: source.records_quarantined,
     })
 }

@@ -62,6 +62,7 @@ pub fn import(
         return Ok(ImportSummary {
             imported: 0,
             unchanged: if source.records_read > 0 { 1 } else { 0 },
+            superseded_by_native: 0,
             quarantined: source.records_quarantined,
         });
     }
@@ -89,6 +90,7 @@ pub fn import(
         return Ok(ImportSummary {
             imported: 0,
             unchanged: 0,
+            superseded_by_native: 0,
             quarantined: source.records_quarantined,
         });
     };
@@ -122,6 +124,7 @@ pub fn import(
     Ok(ImportSummary {
         imported: 1,
         unchanged: 0,
+        superseded_by_native: 0,
         quarantined: source.records_quarantined,
     })
 }

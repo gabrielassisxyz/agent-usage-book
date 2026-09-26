@@ -1205,6 +1205,38 @@ by what the ledger recorded, never by asking a provider directly.
 `--backup VERIFIED_ARCHIVE`, and refuses a blanket scan: only the explicitly
 named source is imported, never everything a directory happens to contain.
 
+### `aub import legacy-meter`: the cutoff, the exemption and the quarantine
+
+The legacy quota-ledger series overlaps the live one in time, because the
+pre-`aub` status-line hook kept writing after native sampling started. Three
+rules keep that overlap from becoming a second, disagreeing history.
+
+**The cutoff is per account and is the earliest native meter attempt.** Any
+reading at or after that instant is already measured by the sampler, so it is
+skipped and reported as `superseded_by_native=N`. The two importer contracts,
+`legacy-quota-ledger-jsonl-v1` and `quota-axi-seed-archive-v1`, are excluded
+from the cutoff: a row an importer wrote is history, not sampling coverage,
+and counting it would make every later import of the same source a no-op. An
+account the sampler has never reached has no cutoff and imports in full.
+
+**Session and account markers are exempt from the cutoff.** A marker names
+the account a session ran under, which native sampling does not record at all
+and nothing later can reconstruct, so every source line carrying a session id
+and a configured account contributes its marker on both sides of the cutoff.
+The observation, the attempt and the window rows are what the cutoff stops.
+
+**A reading whose account no `[[accounts]]` entry names is quarantined**, with
+parser `legacy-meter`, failure class `unconfigured_account` and the source
+line number, and it adds to the run's `quarantined=N` count. No account row is
+created for it: the alternative is inventing an account the operator never
+declared, from a name a defunct hook happened to write. The source is named in
+the quarantine by content digest, never by path.
+
+Rerunning the same source changes none of these counts. A fully imported line
+is recognised by its `(source_digest, source_line)` identity, a marker past
+the cutoff by its own columns, and a quarantined line updates its existing row
+rather than adding a second.
+
 ## `aub statusline`
 
 **Answers:** what did the status line's payload say each account's meter
