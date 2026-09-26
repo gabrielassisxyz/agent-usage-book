@@ -1375,12 +1375,45 @@ impl SharePpm {
 /// of the same name, and deliberately so: the store owns what happened against the
 /// tracker connection, this owns what is reported, and presentation may only see
 /// the second. [`IngestReport`] carries the same split for the same reason.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// The four counts are the run's totals across the trackers that ingested;
+/// [`TaskIngestTrackerReport`] carries the per-tracker detail the same run
+/// reported (`aub-y5q9`).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct TaskIngestReport {
     pub events_inserted: u64,
     pub events_already_present: u64,
     pub quarantines_inserted: u64,
     pub quarantines_already_present: u64,
+    /// One entry per configured tracker, in the file's own order.
+    pub trackers: Vec<TaskIngestTrackerReport>,
+}
+
+/// One configured tracker's outcome in a `aub task ingest` run, as the
+/// renderer sees it (`aub-y5q9`). The two variants are exhaustive so a
+/// renderer must match both: a tracker whose database could not be read
+/// carries its reason and no counts, never zeros that read as a measurement
+/// of nothing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskIngestTrackerOutcome {
+    Ingested {
+        events_inserted: u64,
+        events_already_present: u64,
+        quarantines_inserted: u64,
+        quarantines_already_present: u64,
+    },
+    /// Why nothing was read from this tracker: the open failure, the read
+    /// failure or the write failure the store reported, rendered verbatim.
+    Failed(String),
+}
+
+/// One configured tracker's outcome in a `aub task ingest` run.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskIngestTrackerReport {
+    /// The tracker's configured source name, the namespace its events land
+    /// under.
+    pub name: String,
+    pub outcome: TaskIngestTrackerOutcome,
 }
 
 /// One session's contribution to a task's total usage, for `aub task
