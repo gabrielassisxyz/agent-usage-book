@@ -30,7 +30,10 @@ use super::session_account_marker::{
 const PROVIDER: &str = "anthropic";
 const MARKER_SOURCE: &str = "legacy_meter_series";
 const ADAPTER_VERSION: &str = "legacy-meter-import-v1";
-const PROVIDER_CONTRACT: &str = "legacy-quota-ledger-jsonl-v1";
+/// The provider contract every legacy quota-ledger row carries. Public for the
+/// same reason the seed archive's is: the other importer must recognise it as
+/// legacy rather than native sampling when it computes its cutoff.
+pub const PROVIDER_CONTRACT: &str = "legacy-quota-ledger-jsonl-v1";
 const METER_SEMANTICS: &str = "legacy-account-windows-v1";
 const SESSION_NAMESPACE: &str = "legacy-meter";
 

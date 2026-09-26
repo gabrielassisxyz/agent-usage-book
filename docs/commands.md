@@ -1237,6 +1237,41 @@ is recognised by its `(source_digest, source_line)` identity, a marker past
 the cutoff by its own columns, and a quarantined line updates its existing row
 rather than adding a second.
 
+### `aub import seed-archive`: the cutoff, the vendor mapping and the assertion
+
+The seed archive is the capture the external timer wrote before `aub` existed,
+and it kept writing after native sampling started, so it overlaps the live
+series exactly as the legacy quota ledger does.
+
+**The cutoff is per target account and is the earliest native meter attempt**,
+the same rule and the same exclusions as `legacy-meter`: a reading at or after
+that instant is skipped and reported as `superseded_by_native=N`, and an
+account the sampler has never reached imports in full. A superseded reading
+writes nothing, so rerunning the same source reports the same counts and leaves
+`meter_attempt`, `meter_observation` and `session_account_marker` at the same
+cardinalities.
+
+**One source line carries a reading per vendor**, because the capture recorded
+every vendor the tool answered for, and `--vendor-account VENDOR=ACCOUNT`
+(repeatable) says which configured account each vendor's readings belong to.
+The mapping is a flag rather than an inference: the line's own `account` label
+names the vendor the capture was invoked for, not an account, and one provider
+commonly has several configured accounts that the capture cannot tell apart.
+The named account must exist in `[[accounts]]` and must be declared under the
+provider that vendor reads (`claude` under `anthropic`, `codex` under `codex`);
+anything else is a usage error before the first write. A vendor with no mapping
+is discarded and reported as `discarded_unmapped_vendor=N`, which is what keeps
+a capture label from becoming an account row nobody declared.
+
+**A reading whose account is an operator assertion says so.** A codex reading
+from 2026-08-31 onward cannot be attributed from the capture alone, because the
+second codex account did not exist before that date and the codex weekly window
+is rolling. Those readings import with the response classification
+`seed_capture_operator_asserted_account` instead of `seed_capture`, and their
+session marker carries the `conservative_temporal_inference` rank rather than
+`launcher_or_hook`, so a later reader can separate the measured segment from
+the asserted one without knowing the date.
+
 ## `aub statusline`
 
 **Answers:** what did the status line's payload say each account's meter

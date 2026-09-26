@@ -13,7 +13,9 @@ use agent_usage_book::seed_archive::{SeedArchiveRecord, read_source};
 use agent_usage_book::store::connection::{AccessMode, LEDGER_DATABASE_FILE, PragmaPolicy, open};
 use agent_usage_book::store::migrate::run_migrations;
 use agent_usage_book::store::migrations::registry;
-use agent_usage_book::store::seed_archive_import::import;
+use agent_usage_book::store::seed_archive_import::{
+    OPERATOR_ASSERTED_ACCOUNT_CLASSIFICATION, SeedVendorAccount, SeedVendorAccountMap, import,
+};
 use agent_usage_book::store::{account, meter_attempt, meter_evidence, sample_run};
 use rusqlite::Connection;
 use test_support::StateDir;
@@ -32,6 +34,105 @@ fn open_migrated_ledger(state: &StateDir) -> Connection {
     )
     .expect("scratch ledger must migrate");
     conn
+}
+
+/// The vendor mapping every case in this file imports under. The operator's own
+/// mapping is a command line, not a compiled default, so each case states the
+/// account names it asserts on.
+fn vendor_map(pairs: &[(&str, &str, &str)]) -> SeedVendorAccountMap {
+    let mut map = SeedVendorAccountMap::new();
+    for (vendor, provider, account) in pairs {
+        map.insert(
+            vendor,
+            SeedVendorAccount {
+                provider: (*provider).to_string(),
+                account: (*account).to_string(),
+            },
+        );
+    }
+    map
+}
+
+fn claude_to(account: &str) -> SeedVendorAccountMap {
+    vendor_map(&[("claude", "anthropic", account)])
+}
+
+/// Records one native meter attempt, so the account acquires a cutoff. The
+/// contract is a real native one, which is the whole point: the cutoff query
+/// excludes only the two importer contracts.
+fn record_native_attempt(
+    conn: &mut Connection,
+    provider: &str,
+    account_name: &str,
+    at: UtcTimestamp,
+) {
+    use agent_usage_book::store::meter_attempt::{DueReason, NewMeterAttempt};
+    use agent_usage_book::store::sample_run::Trigger;
+    use agent_usage_book::store::sampling_policy_snapshot::{
+        ResolvedSamplingPolicy, resolve_policy_snapshot,
+    };
+    let account_id = account::observe_account(conn, provider, account_name, at).unwrap();
+    let policy = resolve_policy_snapshot(
+        conn,
+        account_id,
+        at,
+        &ResolvedSamplingPolicy {
+            ordinary_cadence: MonotonicDuration::from_seconds(300),
+            freshness_horizon: MonotonicDuration::from_seconds(300),
+            reset_edge_policy: "none".to_string(),
+            retry_backoff_policy: "none".to_string(),
+            command_budget: MonotonicDuration::from_seconds(60),
+            policy_algorithm_version: "native-test-policy-v1".to_string(),
+        },
+    )
+    .unwrap();
+    let run_id =
+        sample_run::start_sample_run(conn, Trigger::Timer, at, "native-test-run-v1").unwrap();
+    meter_attempt::start_meter_attempt(
+        conn,
+        &NewMeterAttempt {
+            run_id,
+            account_id,
+            provider: provider.to_string(),
+            request_started_at: at,
+            credential_context_id: None,
+            policy_snapshot_id: policy,
+            due_at: at,
+            due_reason: DueReason::OrdinaryCadence,
+            due_basis: None,
+            provider_contract_id: if provider == "codex" {
+                "openai-codex-rollout-rate-limits-v1".to_string()
+            } else {
+                "anthropic-oauth-usage-limits-v1".to_string()
+            },
+            meter_semantics_id: "native-test-semantics-v1".to_string(),
+        },
+    )
+    .unwrap();
+}
+
+/// One source line carrying several vendors, which is the shape of every real
+/// seed line: the capture asked one tool and recorded every vendor it answered
+/// for.
+fn multi_vendor_seed_line(received_at: &str, claude_pct: f64, codex_pct: f64) -> String {
+    format!(
+        r#"{{"received_at":"{received_at}","account":"claude","tool":"aub-meter","tool_version":"0.1.0","plan":"pro","reading":{{"generatedAt":"{received_at}","providers":[{{"provider":"claude","plan":"pro","windows":[{{"id":"five_hour","percentUsed":{claude_pct},"resetsAt":"2026-09-01T05:00:00Z","windowSeconds":18000}},{{"id":"seven_day","percentUsed":{claude_pct},"resetsAt":"2026-09-05T16:00:00Z","windowSeconds":604800}}]}},{{"provider":"codex","plan":"plus","windows":[{{"id":"five_hour","percentUsed":{codex_pct},"resetsAt":"2026-09-01T05:00:00Z","windowSeconds":18000}},{{"id":"seven_day","percentUsed":{codex_pct},"resetsAt":"2026-09-05T16:00:00Z","windowSeconds":604800}}]}},{{"provider":"cursor","windows":[{{"id":"five_hour","percentUsed":1,"resetsAt":"2026-09-01T05:00:00Z","windowSeconds":18000}}]}},{{"provider":"copilot","windows":[{{"id":"five_hour","percentUsed":2,"resetsAt":"2026-09-01T05:00:00Z","windowSeconds":18000}}]}},{{"provider":"grok","windows":[{{"id":"five_hour","percentUsed":3,"resetsAt":"2026-09-01T05:00:00Z","windowSeconds":18000}}]}},{{"provider":"kimi","windows":[{{"id":"five_hour","percentUsed":4,"resetsAt":"2026-09-01T05:00:00Z","windowSeconds":18000}}]}}]}}}}"#
+    )
+}
+
+fn row_counts(conn: &Connection) -> (i64, i64, i64) {
+    let attempts = conn
+        .query_row("SELECT count(*) FROM meter_attempt", [], |r| r.get(0))
+        .unwrap();
+    let observations = conn
+        .query_row("SELECT count(*) FROM meter_observation", [], |r| r.get(0))
+        .unwrap();
+    let markers = conn
+        .query_row("SELECT count(*) FROM session_account_marker", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    (attempts, observations, markers)
 }
 
 fn sample_seed_record_json(
@@ -61,14 +162,14 @@ fn sample_seed_jsonl_20_rows() -> String {
         lines.push(sample_seed_record_json(
             &rec,
             &gen_time,
-            "primary",
+            "claude",
             10.0 + i as f64,
             20.0 + i as f64,
         ));
     }
     lines.push(sample_seed_failure_json(
         "2026-08-26T03:54:00Z",
-        "primary",
+        "claude",
         "spawn_failed",
     ));
     for i in 10..19 {
@@ -77,14 +178,14 @@ fn sample_seed_jsonl_20_rows() -> String {
         lines.push(sample_seed_record_json(
             &rec,
             &gen_time,
-            "primary",
+            "claude",
             15.0 + i as f64,
             25.0 + i as f64,
         ));
     }
     lines.push(sample_seed_failure_json(
         "2026-08-26T04:54:00Z",
-        "primary",
+        "claude",
         "empty_output",
     ));
     lines.join("\n") + "\n"
@@ -103,8 +204,14 @@ fn integration_importer_run_twice_is_idempotent_asserting_exact_counts() {
     assert_eq!(parsed.records.len(), 20);
 
     let import_time = UtcTimestamp::from_unix_nanos(1_000_000_000);
-    let first = import(&mut conn, &parsed, "backup-archive-1", import_time)
-        .expect("first import must succeed");
+    let first = import(
+        &mut conn,
+        &parsed,
+        &claude_to("primary"),
+        "backup-archive-1",
+        import_time,
+    )
+    .expect("first import must succeed");
     assert_eq!(first.imported, 20);
     assert_eq!(first.unchanged, 0);
     assert_eq!(first.quarantined, 0);
@@ -125,8 +232,14 @@ fn integration_importer_run_twice_is_idempotent_asserting_exact_counts() {
     assert_eq!(markers_count_1, 18);
 
     // Re-run over exactly the same source
-    let repeated = import(&mut conn, &parsed, "backup-archive-1", import_time)
-        .expect("repeated import must succeed");
+    let repeated = import(
+        &mut conn,
+        &parsed,
+        &claude_to("primary"),
+        "backup-archive-1",
+        import_time,
+    )
+    .expect("repeated import must succeed");
     assert_eq!(repeated.imported, 0);
     assert_eq!(repeated.unchanged, 20);
     assert_eq!(repeated.quarantined, 0);
@@ -160,6 +273,7 @@ fn integration_sanitized_seed_fixtures_reconcile_success_and_failure_counts() {
     let summary = import(
         &mut conn,
         &parsed,
+        &claude_to("primary"),
         "backup-sanitized-fixture",
         UtcTimestamp::from_unix_nanos(100),
     )
@@ -241,11 +355,11 @@ fn unit_seed_failure_records_import_as_attempted_and_failed_distinguishable_from
         sample_seed_record_json(
             "2026-08-26T03:00:00Z",
             "2026-08-26T02:59:58Z",
-            "primary",
+            "claude",
             10.0,
             20.0
         ),
-        sample_seed_failure_json("2026-08-26T03:06:00Z", "primary", "spawn_failed"),
+        sample_seed_failure_json("2026-08-26T03:06:00Z", "claude", "spawn_failed"),
     );
     std::fs::write(&source_path, jsonl).unwrap();
 
@@ -253,6 +367,7 @@ fn unit_seed_failure_records_import_as_attempted_and_failed_distinguishable_from
     import(
         &mut conn,
         &parsed,
+        &claude_to("primary"),
         "backup-fail-check",
         UtcTimestamp::from_unix_nanos(100),
     )
@@ -330,7 +445,7 @@ fn unit_declared_measurement_basis_matches_seed_format_document() {
     let gen_ts = "2026-08-26T02:59:58Z";
     std::fs::write(
         &source_path,
-        sample_seed_record_json(rec_ts, gen_ts, "primary", 12.0, 34.0) + "\n",
+        sample_seed_record_json(rec_ts, gen_ts, "claude", 12.0, 34.0) + "\n",
     )
     .unwrap();
 
@@ -343,6 +458,7 @@ fn unit_declared_measurement_basis_matches_seed_format_document() {
     import(
         &mut conn,
         &parsed,
+        &claude_to("primary"),
         "backup-basis",
         UtcTimestamp::from_unix_nanos(100),
     )
@@ -384,12 +500,12 @@ fn unit_malformed_or_partial_trailing_record_quarantined_with_reason() {
     let line1 = sample_seed_record_json(
         "2026-08-26T03:00:00Z",
         "2026-08-26T02:59:58Z",
-        "primary",
+        "claude",
         10.0,
         20.0,
     );
     let line2 = "not valid json in the middle";
-    let line3 = sample_seed_failure_json("2026-08-26T03:06:00Z", "primary", "spawn_failed");
+    let line3 = sample_seed_failure_json("2026-08-26T03:06:00Z", "claude", "spawn_failed");
     let line4 = "{\"received_at\":\"2026-08-26T03:12:00Z\",\"account\":\"primary\""; // partial trailing line
 
     let content = format!("{line1}\n{line2}\n{line3}\n{line4}");
@@ -422,7 +538,7 @@ fn integration_coverage_over_seed_interval_uses_seed_cadence_as_denominator() {
         for m in (0..60).step_by(6) {
             let ts_str = format!("2026-08-{:02}T{:02}:{:02}:00Z", day, hour, m);
             lines.push(sample_seed_record_json(
-                &ts_str, &ts_str, "primary", 10.0, 20.0,
+                &ts_str, &ts_str, "claude", 10.0, 20.0,
             ));
         }
     }
@@ -434,6 +550,7 @@ fn integration_coverage_over_seed_interval_uses_seed_cadence_as_denominator() {
     import(
         &mut conn,
         &parsed,
+        &claude_to("primary"),
         "backup-cadence",
         UtcTimestamp::from_unix_nanos(100),
     )
@@ -497,12 +614,14 @@ fn operational_reconcile_real_seed_archive_counts() {
     let window_start = UtcTimestamp::parse_rfc3339("2026-08-26T02:55:36Z").unwrap();
     let window_end = UtcTimestamp::parse_rfc3339("2026-08-29T02:55:36Z").unwrap();
 
+    // One line yields one record per vendor now, so the per-line figure this
+    // bead reconciles against is the count of one vendor's records.
     let records_in_window: Vec<_> = parsed
         .records
         .iter()
         .filter(|r| {
             let at = r.received_at();
-            at >= window_start && at <= window_end
+            r.vendor() == "claude" && at >= window_start && at <= window_end
         })
         .collect();
 
@@ -529,4 +648,292 @@ fn operational_reconcile_real_seed_archive_counts() {
         failures_in_window, 0,
         "failure count in 72h window must match seed verification bead aub-d41.3 (0)"
     );
+}
+
+/// The cutoff, with a planted negative either side of it: a reading one second
+/// before the earliest native attempt imports, and the reading at exactly that
+/// instant does not. Equality is the whole question, so a test that only
+/// straddled it by a minute would pass against `>` as well as `>=`.
+#[test]
+fn integration_straddling_source_imports_only_the_readings_before_the_native_cutoff() {
+    let state = StateDir::new();
+    let mut conn = open_migrated_ledger(&state);
+    let cutoff = UtcTimestamp::parse_rfc3339("2026-09-04T12:00:00Z").unwrap();
+    record_native_attempt(&mut conn, "anthropic", "primary", cutoff);
+
+    let source_path = state.path().join("straddle.jsonl");
+    let before_far = "2026-09-04T11:54:00Z";
+    let before_one_second = "2026-09-04T11:59:59Z";
+    let exactly_at = "2026-09-04T12:00:00Z";
+    let after = "2026-09-04T12:06:00Z";
+    let lines: Vec<String> = [before_far, before_one_second, exactly_at, after]
+        .iter()
+        .map(|at| sample_seed_record_json(at, at, "claude", 10.0, 20.0))
+        .collect();
+    std::fs::write(&source_path, lines.join("\n") + "\n").unwrap();
+
+    let parsed = read_source(&source_path).unwrap();
+    assert_eq!(parsed.records.len(), 4);
+
+    let summary = import(
+        &mut conn,
+        &parsed,
+        &claude_to("primary"),
+        "backup-straddle",
+        UtcTimestamp::from_unix_nanos(100),
+    )
+    .unwrap();
+
+    assert_eq!(summary.imported, 2, "only the readings strictly before T");
+    assert_eq!(summary.superseded_by_native, 2);
+    assert_eq!(summary.unchanged, 0);
+    assert_eq!(summary.discarded_unmapped_vendor, 0);
+
+    let imported_times: Vec<i64> = conn
+        .prepare("SELECT received_at FROM meter_observation ORDER BY received_at")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        imported_times,
+        vec![
+            UtcTimestamp::parse_rfc3339(before_far)
+                .unwrap()
+                .unix_nanos(),
+            UtcTimestamp::parse_rfc3339(before_one_second)
+                .unwrap()
+                .unix_nanos(),
+        ],
+        "the reading one second before the cutoff imports and the one at it does not",
+    );
+
+    // A superseded reading writes nothing at all, so a rerun has the same rows
+    // to find and the same classification to report.
+    let counts_after_first = row_counts(&conn);
+    let repeated = import(
+        &mut conn,
+        &parsed,
+        &claude_to("primary"),
+        "backup-straddle",
+        UtcTimestamp::from_unix_nanos(200),
+    )
+    .unwrap();
+    assert_eq!(repeated.imported, 0);
+    assert_eq!(repeated.unchanged, 2);
+    assert_eq!(repeated.superseded_by_native, 2);
+    assert_eq!(row_counts(&conn), counts_after_first);
+}
+
+/// The pre-existing behaviour, asserted rather than assumed: with no native
+/// attempt for the target account there is no cutoff, and every valid reading
+/// imports however late it is.
+#[test]
+fn integration_without_native_attempts_every_valid_reading_still_imports() {
+    let state = StateDir::new();
+    let mut conn = open_migrated_ledger(&state);
+    let source_path = state.path().join("no-native.jsonl");
+    let lines: Vec<String> = [
+        "2026-09-04T11:54:00Z",
+        "2026-09-04T12:00:00Z",
+        "2026-09-30T23:00:00Z",
+    ]
+    .iter()
+    .map(|at| sample_seed_record_json(at, at, "claude", 10.0, 20.0))
+    .collect();
+    std::fs::write(&source_path, lines.join("\n") + "\n").unwrap();
+
+    let parsed = read_source(&source_path).unwrap();
+    let summary = import(
+        &mut conn,
+        &parsed,
+        &claude_to("primary"),
+        "backup-no-native",
+        UtcTimestamp::from_unix_nanos(100),
+    )
+    .unwrap();
+
+    assert_eq!(summary.imported, 3);
+    assert_eq!(summary.superseded_by_native, 0);
+    assert_eq!(meter_evidence::count_observations(&conn).unwrap(), 3);
+}
+
+/// A claude reading lands under the account the mapping names, and the label the
+/// capture wrote becomes no account of its own.
+#[test]
+fn integration_claude_readings_land_under_the_mapped_account_and_invent_no_account() {
+    let state = StateDir::new();
+    let mut conn = open_migrated_ledger(&state);
+    let source_path = state.path().join("mapped.jsonl");
+    std::fs::write(
+        &source_path,
+        multi_vendor_seed_line("2026-08-27T03:00:00Z", 11.0, 22.0) + "\n",
+    )
+    .unwrap();
+
+    let parsed = read_source(&source_path).unwrap();
+    let summary = import(
+        &mut conn,
+        &parsed,
+        &claude_to("claude-target"),
+        "backup-mapped",
+        UtcTimestamp::from_unix_nanos(100),
+    )
+    .unwrap();
+
+    assert_eq!(summary.imported, 1, "only the claude entry is mapped");
+    assert_eq!(
+        summary.discarded_unmapped_vendor, 5,
+        "codex, cursor, copilot, grok and kimi have no mapping here",
+    );
+    assert!(
+        account::account_id_by_identity(&conn, "anthropic", "claude-target")
+            .unwrap()
+            .is_some(),
+        "the mapped account carries the reading",
+    );
+    assert!(
+        account::account_id_by_identity(&conn, "anthropic", "claude")
+            .unwrap()
+            .is_none(),
+        "the capture's own account label must not become an account row",
+    );
+    let logical: String = conn
+        .query_row(
+            "SELECT logical_account FROM session_account_marker",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        logical, "claude",
+        "the marker keeps the label the capture wrote, resolved to the mapped account",
+    );
+}
+
+/// The codex entries of the same lines import under their own account, bounded by
+/// their own cutoff, and say in the evidence row which segment is an operator
+/// assertion. The unmapped vendors stay discarded, counted rather than silent.
+#[test]
+fn integration_codex_entries_import_under_their_own_account_with_asserted_provenance() {
+    let state = StateDir::new();
+    let mut conn = open_migrated_ledger(&state);
+    let codex_cutoff = UtcTimestamp::parse_rfc3339("2026-09-04T00:00:00Z").unwrap();
+    record_native_attempt(&mut conn, "codex", "codex-target", codex_cutoff);
+
+    let source_path = state.path().join("codex.jsonl");
+    let measured = "2026-08-30T03:00:00Z";
+    let asserted = "2026-08-31T00:00:00Z";
+    let past_cutoff = "2026-09-04T00:00:00Z";
+    let lines: Vec<String> = [measured, asserted, past_cutoff]
+        .iter()
+        .map(|at| multi_vendor_seed_line(at, 11.0, 22.0))
+        .collect();
+    std::fs::write(&source_path, lines.join("\n") + "\n").unwrap();
+
+    let parsed = read_source(&source_path).unwrap();
+    assert_eq!(
+        parsed.records.len(),
+        18,
+        "three lines of six vendor entries each",
+    );
+
+    let summary = import(
+        &mut conn,
+        &parsed,
+        &vendor_map(&[
+            ("claude", "anthropic", "claude-target"),
+            ("codex", "codex", "codex-target"),
+        ]),
+        "backup-codex",
+        UtcTimestamp::from_unix_nanos(100),
+    )
+    .unwrap();
+
+    // claude has no native attempt, so all three of its readings import; codex
+    // has one at 2026-09-04, so its third reading is superseded.
+    assert_eq!(summary.imported, 5);
+    assert_eq!(summary.superseded_by_native, 1);
+    assert_eq!(
+        summary.discarded_unmapped_vendor, 12,
+        "four unmapped vendors on each of three lines",
+    );
+    for vendor in ["cursor", "copilot", "grok", "kimi"] {
+        let rows: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM account WHERE provider_key = ?1 OR logical_name = ?1",
+                [vendor],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(rows, 0, "{vendor} must leave no account row");
+    }
+
+    let codex_account = account::account_id_by_identity(&conn, "codex", "codex-target")
+        .unwrap()
+        .expect("the codex account carries its own readings");
+    let classifications: Vec<(i64, String)> = conn
+        .prepare(
+            "SELECT e.received_at, e.response_classification
+             FROM meter_response_evidence e
+             JOIN meter_observation o ON o.evidence_id = e.id
+             WHERE o.account_id = ?1
+             ORDER BY e.received_at",
+        )
+        .unwrap()
+        .query_map([codex_account.value()], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        classifications,
+        vec![
+            (
+                UtcTimestamp::parse_rfc3339(measured).unwrap().unix_nanos(),
+                "seed_capture".to_string(),
+            ),
+            (
+                UtcTimestamp::parse_rfc3339(asserted).unwrap().unix_nanos(),
+                OPERATOR_ASSERTED_ACCOUNT_CLASSIFICATION.to_string(),
+            ),
+        ],
+        "the segment from 2026-08-31 onward is recorded as an operator assertion",
+    );
+
+    let designations: Vec<String> = conn
+        .prepare(
+            "SELECT evidence_designation FROM session_account_marker
+             WHERE resolved_account_id = ?1 ORDER BY observed_at",
+        )
+        .unwrap()
+        .query_map([codex_account.value()], |r| r.get(0))
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        designations,
+        vec![
+            "launcher_or_hook".to_string(),
+            "conservative_temporal_inference".to_string(),
+        ],
+        "the asserted reading's marker drops to the inference rank",
+    );
+
+    let counts_after_first = row_counts(&conn);
+    let repeated = import(
+        &mut conn,
+        &parsed,
+        &vendor_map(&[
+            ("claude", "anthropic", "claude-target"),
+            ("codex", "codex", "codex-target"),
+        ]),
+        "backup-codex",
+        UtcTimestamp::from_unix_nanos(200),
+    )
+    .unwrap();
+    assert_eq!(repeated.imported, 0);
+    assert_eq!(repeated.unchanged, 5);
+    assert_eq!(repeated.superseded_by_native, 1);
+    assert_eq!(row_counts(&conn), counts_after_first);
 }
