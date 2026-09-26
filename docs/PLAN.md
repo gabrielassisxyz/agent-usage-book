@@ -13,7 +13,7 @@ It does not collapse those quantities into one number. It gives them one chain o
 custody, one attribution model, one provenance system, and explicitly versioned
 conversion witnesses where one axis must be related to another.
 
-**Status:** pre-implementation design
+**Status:** implemented design; last reconciled against the running system on 2026-09-26
 **Language:** Rust, edition 2024
 **Form:** single-shot CLI binary; no daemon, server, container, or async runtime
 **Purpose:** one trustworthy ledger for LLM consumption, joining reconstructible token spend with irrecoverable provider quota observations

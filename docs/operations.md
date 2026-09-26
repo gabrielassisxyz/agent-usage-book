@@ -94,7 +94,108 @@ re-verification on a schedule against the review horizon. Do this before
 anything depends on the state directory surviving; quota history cannot be
 reconstructed once it is gone.
 
-## 6. Know the recovery procedure before it is needed
+## 6. Importing pre-aub history
+
+Skip this section on a machine that never measured quota before `aub`. Nothing
+below it depends on this step.
+
+A machine that did holds up to two series `aub` never wrote: the quota ledger
+the pre-`aub` status-line hook appended to, and the seed capture an external
+timer archived through the design period, which exists precisely so the design
+period would not leave a permanent hole in the meter history (`PLAN.md`'s
+[Phase -1](PLAN.md#phase--1-preserve-quota-before-writing-rust) and [Phase
+4](PLAN.md#phase-4-legacy-series-import)). Both are irreplaceable: no provider
+will answer for last month again. Import them once, and import them here,
+after step 5, because each importer refuses to write until it has verified a
+backup archive.
+
+**The backup comes first, and it is the archive both commands name.** Create or
+pick a verified one (step 5, [docs/backup.md](backup.md)); the imports read the
+`--backup` path themselves and refuse with the store exit class when it does
+not verify, so an import that went wrong is always recoverable to the state the
+archive holds.
+
+```sh
+ARCHIVE="$(cat "$BACKUP_DESTINATION/newest-verified")"
+/abs/path/to/aub backup verify "$ARCHIVE"
+```
+
+**Import the legacy quota ledger.** One named source file, never a directory
+scan:
+
+```sh
+/abs/path/to/aub import legacy-meter \
+    --source /path/to/legacy-quota-ledger.jsonl \
+    --backup "$ARCHIVE"
+```
+
+**Import the seed capture.** One line of that capture carries a reading per
+vendor, and nothing in it says which configured account each vendor's readings
+belong to, so the mapping is spelled out: `--vendor-account VENDOR=ACCOUNT`,
+repeatable, with `claude` under an `anthropic` account and `codex` under a
+`codex` one. A vendor left unmapped is discarded rather than turned into an
+account nobody declared.
+
+```sh
+/abs/path/to/aub import seed-archive \
+    --source /path/to/seed-capture.jsonl \
+    --backup "$ARCHIVE" \
+    --vendor-account claude=primary \
+    --vendor-account codex=work
+```
+
+### The counts each import prints, and which of them to expect
+
+Both commands print one line of counts and emit the same fields as a
+diagnostic. `records_read` is what the source held; `imported` and `unchanged`
+are what became ledger rows on this run and on an earlier one; the rest are the
+three ways a record is deliberately not imported.
+
+- **`superseded_by_native=N` is the number to expect to be large**, and it is
+  the healthy outcome rather than a loss. Both legacy writers kept running after
+  native sampling started, so the tail of each source overlaps a series `aub`
+  measured itself. The cutoff is per account and is that account's earliest
+  native meter attempt: a reading at or after it is already measured and is
+  skipped. On a machine whose sampler has been running for weeks, expect almost
+  every reading from the day native sampling began onward to land here, and
+  expect `imported` to cover the stretch before it. An account the sampler has
+  never reached has no cutoff and imports in full, so `superseded_by_native=0`
+  there is also correct. Session and account markers from the legacy meter are
+  exempt from the cutoff and import on both sides of it, because native
+  sampling records no such marker and nothing later can reconstruct one.
+- **`quarantined=N` should be small, and every one of them is a question.** A
+  line that will not parse, and a legacy-meter reading whose account no
+  `[[accounts]]` entry names, are quarantined with the parser, the failure class
+  (`unconfigured_account` for the latter) and the source line number, and no
+  account row is invented for them. A nonzero count on a machine whose config is
+  complete usually means an account was renamed at some point: add or rename the
+  `[[accounts]]` entry (`aub account rename`, and section 4's reference) and
+  rerun the same source. Quarantine is not a write that has to be undone.
+- **`discarded_unmapped_vendor=N`, seed archive only**, counts readings of a
+  vendor no `--vendor-account` named. Expect it to be a multiple of the lines
+  read whenever the old capture answered for vendors this ledger has no adapter
+  for.
+
+Rerunning the same source is safe and is the normal way to fix a mapping: a
+fully imported line is recognised by its source digest and line number, so the
+second run reports `imported=0` with the same `unchanged`, `superseded_by_native`
+and `quarantined` counts, and leaves the attempt, observation and marker
+cardinalities exactly where they were. Neither command prints the source path,
+in its output or in its diagnostics; the source is named by content digest.
+[docs/commands.md](commands.md#aub-import) carries the full rule set, including
+the operator-asserted account classification a codex reading from 2026-08-31
+onward imports under.
+
+**Then retire the two legacy writers.** The seed-capture timer and the legacy
+status-line hook are what keep writing into the series that was just imported,
+and leaving either runnable recreates the defect this project exists to remove:
+a confident number from a tool nobody is maintaining. Retirement is its own
+procedure, on bead `aub-n27.8`, and its last step is removing the obsolete
+binary or hook from the ordinary `PATH` rather than announcing that it is
+deprecated. Until that is done, expect each later import of the same source to
+report a growing `superseded_by_native`.
+
+## 7. Know the recovery procedure before it is needed
 
 [docs/recovery.md](recovery.md) is the ordered restore procedure for a
 damaged state directory, built against the archive step 5 produces. It
@@ -162,7 +263,7 @@ systemctl --user start aub-sample.timer aub-meter-capture.timer
 ```
 
 
-## 7. Read a failure by its exit code and problem code first
+## 8. Read a failure by its exit code and problem code first
 
 A script or a timer should never need to parse prose to learn what went
 wrong. [docs/exit-classes.md](exit-classes.md) is the nine stable process

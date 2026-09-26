@@ -8,12 +8,45 @@ from one source instead of from several tools that quietly disagree.
 
 ## Status
 
-Early. The harness, the licence obligations and the correctness rules are in place, and
-the first half of the measurement exists: `aub spend` refreshes and reads the canonical
-ledger built from agy, Claude Code, Codex, opencode and pi transcripts. It groups token
-vectors by day, session, project and repository, preserving evidence qualification and
-provenance at every subtotal. Quota is not measured yet: `aub status` renders every
-configured account as never observed until the sampler lands. There is no release yet.
+Implemented and in daily use on the machine it was built for, ahead of a first tag.
+
+What is live:
+
+- **Quota.** An external timer invokes `aub sample --due`, the provider adapters
+  (Anthropic, Codex, agy, opencode, Ollama) record every attempt and every response as
+  durable evidence, and `aub status` renders the recorded windows per account from the
+  published projection: a bar per window, the percent used, the burn rate, the reset in
+  local time, and how old the observation behind the reading is. It never touches the
+  network unless asked with `--refresh`, and a stale or auth-required account renders as
+  that, with exit 0.
+- **Spend.** `aub spend` refreshes and reads the canonical ledger built from agy, Claude
+  Code, Codex, opencode and pi transcripts, grouping token vectors by day, session,
+  project, repository, harness, model, task or account, and preserving evidence
+  qualification and provenance at every subtotal.
+- **Task attribution.** `aub task ingest` reads every configured tracker's claim history
+  read-only, `aub task report` totals one task across the sessions that contributed to
+  it, and usage that belonged to no claim is reported under a named overhead bucket
+  rather than folded into a neighbouring task.
+- **Coverage, backup and diagnosis.** `aub coverage` answers whether the sampler
+  attempted what the policy owed and whether those attempts observed; `aub backup` and
+  `aub drill` create, verify and rehearse the restore of the state directory; `aub
+  doctor` reports health, drift and integrity; `aub import` lands pre-`aub` history with
+  explicit legacy provenance.
+- **Advice.** `aub can-run` compares the empirical cost of comparable finished tasks
+  against the headroom measured now, and refuses, naming every missing prerequisite at
+  once, rather than guessing.
+
+What is not live:
+
+- **No active window calibration.** `aub calibrate fit` and `aub calibrate passive`
+  write candidates from recorded observations and never promote one; activating a
+  candidate is a deliberate operator step. Until a window carries a current active
+  calibration, `aub can-run` and `aub spend --window-equivalent` price its headroom from
+  the dated rate cards and label it `(estimated)`, or refuse when a recorded calibration
+  is not current.
+- **No release.** There is no tag and no published archive yet; the first one is gated on
+  `bin/release-criteria` reporting every criterion in
+  [docs/release-criteria.md](docs/release-criteria.md) as passing.
 
 ## Why it exists
 
@@ -38,7 +71,11 @@ buys are about **units and freshness**, not about speed:
   requests in scoped threads cover that, and a runtime would be carried for nothing.
 - **Cost forecasting and budget enforcement.** Measuring what happened is a different
   problem from predicting what will, and mixing them would make the measurement layer
-  answerable for a guess.
+  answerable for a guess. `aub can-run` is not an exception to that: it reports the
+  empirical range of comparable finished tasks against quota measured now, and forecasts
+  neither a duration nor future spend (PLAN.md section 26, "no duration forecasting"). It
+  also enforces nothing, since it advises and never refuses a run on the operator's
+  behalf.
 - **Provider coverage for its own sake.** An endpoint is added when work is actually
   being routed through it.
 
@@ -124,8 +161,8 @@ cron units, an example session-start hook, and the full reasoning are in
 ## Documentation
 
 [docs/operations.md](docs/operations.md) is the operator's entry point: everything above,
-plus the backup policy and the recovery procedure, in the order a fresh machine needs
-them.
+plus the backup policy, the import of any pre-`aub` history, and the recovery procedure,
+in the order a fresh machine needs them.
 
 - [docs/commands.md](docs/commands.md): what each command answers, and what it refuses.
 - [docs/scheduling.md](docs/scheduling.md): the scheduler and hook setup, with working
