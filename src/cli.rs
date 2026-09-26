@@ -842,6 +842,9 @@ impl Command {
                 "legacy-meter imports only what native sampling does not already cover: per account, readings at or after the earliest native meter attempt are skipped and reported as superseded_by_native.",
                 "legacy-meter session and account markers are exempt from that cutoff and import for the whole source, because native sampling produces no such marker.",
                 "legacy-meter quarantines a reading whose account no [[accounts]] entry names, with the reason unconfigured_account, and creates no account row for it.",
+                "seed-archive applies the same cutoff, per target account: a reading at or after that account's earliest native meter attempt is skipped and reported as superseded_by_native, and an account the sampler has never reached imports in full.",
+                "seed-archive reads every vendor of a source line, and --vendor-account VENDOR=ACCOUNT says which configured account that vendor's readings belong to. A vendor with no mapping is discarded and reported as discarded_unmapped_vendor, so no account is invented from a capture label.",
+                "seed-archive records a codex reading from 2026-08-31 onward as an operator assertion about the account rather than a measurement of it, in the evidence classification and in the marker's evidence rank.",
             ],
             Command::Status
             | Command::Spend
@@ -892,7 +895,7 @@ impl Command {
                 Some("--since DURATION (default 24h), --severe; --account is shared")
             }
             Command::Import => Some(
-                "legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE | legacy-calibration --source PATH --backup VERIFIED_ARCHIVE",
+                "legacy-meter --source PATH --backup VERIFIED_ARCHIVE | seed-archive --source PATH --backup VERIFIED_ARCHIVE [--vendor-account VENDOR=ACCOUNT (repeatable)] | legacy-calibration --source PATH --backup VERIFIED_ARCHIVE",
             ),
             Command::Sample => Some(
                 "--due | --account NAME | --if-due | --session-id SESSION | --run-id RUN | --require-success",
@@ -6445,7 +6448,9 @@ fn import_legacy_meter(clock: &impl Clock, level: Level, rest: &[String]) -> Res
 /// `aub import seed-archive` is administrative: it accepts the seed archive format,
 /// verifies a recovery archive before it writes, and names the source only by digest.
 fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Result<(), Error> {
-    let (source_path, backup_path) = seed_archive_import_flags(rest)?;
+    let flags = seed_archive_import_flags(rest)?;
+    let (source_path, backup_path, vendor_accounts) =
+        (flags.source, flags.backup, flags.vendor_accounts);
     let source =
         crate::seed_archive::read_source(std::path::Path::new(&source_path)).map_err(|error| {
             Error::IngestIncomplete(format!("cannot read seed archive source: {error}"))
@@ -6468,6 +6473,7 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
             "seed archive import requires a verified backup archive".into(),
         ));
     }
+    let vendor_account_map = resolve_seed_vendor_accounts(&vendor_accounts, &config.accounts)?;
     let backup_id = format!(
         "archive-v{}-g{}",
         backup.schema_version, backup.ledger_generation
@@ -6483,8 +6489,13 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     let mut conn = open_ledger(clock)?;
-    let summary =
-        crate::store::seed_archive_import::import(&mut conn, &source, &backup_id, timestamp)?;
+    let summary = crate::store::seed_archive_import::import(
+        &mut conn,
+        &source,
+        &vendor_account_map,
+        &backup_id,
+        timestamp,
+    )?;
     if summary.imported > 0 {
         crate::projection::publish(
             &conn,
@@ -6517,6 +6528,14 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
                 ("imported", &Quantity::new(summary.imported, "records")),
                 ("unchanged", &Quantity::new(summary.unchanged, "records")),
                 (
+                    "superseded_by_native",
+                    &Quantity::new(summary.superseded_by_native, "records"),
+                ),
+                (
+                    "discarded_unmapped_vendor",
+                    &Quantity::new(summary.discarded_unmapped_vendor, "records"),
+                ),
+                (
                     "quarantined",
                     &Quantity::new(summary.quarantined, "records"),
                 ),
@@ -6525,12 +6544,14 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     println!(
-        "seed-archive import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} quarantined={} terminal_outcome={}",
+        "seed-archive import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} superseded_by_native={} discarded_unmapped_vendor={} quarantined={} terminal_outcome={}",
         source.content_digest,
         backup_id,
         source.records_read,
         summary.imported,
         summary.unchanged,
+        summary.superseded_by_native,
+        summary.discarded_unmapped_vendor,
         summary.quarantined,
         terminal_outcome,
     );
@@ -6678,7 +6699,23 @@ fn legacy_meter_import_flags(rest: &[String]) -> Result<(String, String), Error>
     }
 }
 
-fn seed_archive_import_flags(rest: &[String]) -> Result<(String, String), Error> {
+/// The seed import's parsed command line.
+#[derive(Debug, PartialEq, Eq)]
+struct SeedArchiveImportFlags {
+    source: String,
+    backup: String,
+    /// `(vendor, account)` in the order the operator spelled them, still
+    /// unresolved against `[[accounts]]`.
+    vendor_accounts: Vec<(String, String)>,
+}
+
+/// The seed import's own flags, including the repeatable
+/// `--vendor-account VENDOR=NAME`. The vendor mapping is a flag rather than an
+/// inference because one source line carries several vendors and a provider
+/// commonly has several configured accounts: the capture says which vendor a
+/// reading is of, and nothing in it says which of that provider's accounts was
+/// being read.
+fn seed_archive_import_flags(rest: &[String]) -> Result<SeedArchiveImportFlags, Error> {
     if rest.first().map(String::as_str) != Some("seed-archive") {
         return Err(Error::Usage(
             "import requires the `seed-archive` subcommand".into(),
@@ -6686,20 +6723,93 @@ fn seed_archive_import_flags(rest: &[String]) -> Result<(String, String), Error>
     }
     let mut source = None;
     let mut backup = None;
+    let mut vendor_accounts = Vec::new();
     let mut args = rest[1..].iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--source" => source = args.next().cloned(),
             "--backup" => backup = args.next().cloned(),
+            "--vendor-account" => {
+                let pair = args.next().ok_or_else(|| {
+                    Error::Usage("--vendor-account requires VENDOR=ACCOUNT".into())
+                })?;
+                let (vendor, account) = pair.split_once('=').ok_or_else(|| {
+                    Error::Usage(format!(
+                        "--vendor-account expects VENDOR=ACCOUNT, got {pair:?}"
+                    ))
+                })?;
+                if vendor.trim().is_empty() || account.trim().is_empty() {
+                    return Err(Error::Usage(format!(
+                        "--vendor-account expects VENDOR=ACCOUNT, got {pair:?}"
+                    )));
+                }
+                vendor_accounts.push((vendor.trim().to_string(), account.trim().to_string()));
+            }
             other => return Err(Error::Usage(format!("unknown import argument: {other}"))),
         }
     }
     match (source, backup) {
-        (Some(source), Some(backup)) => Ok((source, backup)),
+        (Some(source), Some(backup)) => Ok(SeedArchiveImportFlags {
+            source,
+            backup,
+            vendor_accounts,
+        }),
         _ => Err(Error::Usage(
             "import seed-archive requires --source PATH and --backup VERIFIED_ARCHIVE".into(),
         )),
     }
+}
+
+/// The provider a seed vendor's readings belong under. A vendor with no entry
+/// has no adapter in this ledger, so naming it is a usage error rather than a
+/// silently ignored mapping.
+fn seed_vendor_provider(vendor: &str) -> Option<&'static str> {
+    match vendor {
+        "claude" => Some("anthropic"),
+        "codex" => Some("codex"),
+        _ => None,
+    }
+}
+
+/// Resolves `--vendor-account` against `[[accounts]]`. The named account must
+/// exist and must be declared under the provider the vendor reads, so a typo
+/// cannot attach one vendor's readings to another vendor's account.
+fn resolve_seed_vendor_accounts(
+    pairs: &[(String, String)],
+    accounts: &[crate::config::AccountConfig],
+) -> Result<crate::store::seed_archive_import::SeedVendorAccountMap, Error> {
+    use crate::store::seed_archive_import::{SeedVendorAccount, SeedVendorAccountMap};
+    let mut map = SeedVendorAccountMap::new();
+    for (vendor, account_name) in pairs {
+        let vendor = crate::seed_archive::canonical_vendor(vendor);
+        let provider = seed_vendor_provider(&vendor).ok_or_else(|| {
+            Error::Usage(format!(
+                "--vendor-account names the vendor {vendor:?}, which no provider in this ledger reads"
+            ))
+        })?;
+        let configured = accounts
+            .iter()
+            .find(|account| &account.name == account_name)
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "--vendor-account names the account {account_name:?}, which no [[accounts]] entry configures"
+                ))
+            })?;
+        if configured.provider != provider {
+            return Err(Error::Usage(format!(
+                "--vendor-account maps the vendor {vendor:?} to the account {account_name:?}, which is configured under provider {:?} rather than {provider:?}",
+                configured.provider
+            )));
+        }
+        map.insert(
+            &vendor,
+            SeedVendorAccount {
+                provider: provider.to_string(),
+                account: account_name.clone(),
+            },
+        );
+    }
+    Ok(map)
 }
 
 fn legacy_calibration_import_flags(rest: &[String]) -> Result<(String, String), Error> {
@@ -11878,6 +11988,58 @@ mod tests {
         }
     }
 
+    /// `aub import seed-archive --help` and `docs/commands.md` both carry the
+    /// cutoff, the count it reports and the flag that decides where a vendor's
+    /// readings land. The planted negative: a check that only asked for the
+    /// word `superseded_by_native` somewhere would pass against the
+    /// legacy-meter note alone, so each assertion names the seed-archive
+    /// sentence it belongs to.
+    #[test]
+    fn seed_archive_help_and_docs_state_the_cutoff_and_its_count() {
+        let help = command_help_text(Command::Import);
+        assert!(
+            help.contains("--vendor-account VENDOR=ACCOUNT"),
+            "the usage line must carry the mapping flag: {help}"
+        );
+        let seed_notes: Vec<&str> = help
+            .lines()
+            .filter(|line| line.starts_with("  note: seed-archive"))
+            .collect();
+        assert!(
+            seed_notes
+                .iter()
+                .any(|note| note.contains("earliest native meter attempt")
+                    && note.contains("superseded_by_native")),
+            "a seed-archive note must state the cutoff and the count it reports: {seed_notes:?}"
+        );
+        assert!(
+            seed_notes
+                .iter()
+                .any(|note| note.contains("discarded_unmapped_vendor")),
+            "a seed-archive note must state what an unmapped vendor becomes: {seed_notes:?}"
+        );
+
+        let docs = include_str!("../docs/commands.md");
+        let seed = docs
+            .split("### `aub import seed-archive`")
+            .nth(1)
+            .expect("the seed importer must keep its own section in the command docs")
+            .split("\n## ")
+            .next()
+            .expect("the section must end at the next top-level heading");
+        for required in [
+            "earliest native meter attempt",
+            "superseded_by_native",
+            "--vendor-account VENDOR=ACCOUNT",
+            "discarded_unmapped_vendor",
+        ] {
+            assert!(
+                seed.contains(required),
+                "the seed-archive section must state {required:?}"
+            );
+        }
+    }
+
     #[test]
     fn status_and_now_command_surface_documents_the_session_alias() {
         let help = help_text();
@@ -13712,6 +13874,106 @@ usage_evidence = "measured"
             clear_options.contains("--all"),
             "clear-diagnostics must keep --all: {clear_options}"
         );
+    }
+
+    /// The vendor mapping reaches the importer as the operator spelled it, and a
+    /// pair with no `=` is a usage error rather than a silently ignored flag.
+    #[test]
+    fn seed_archive_flags_carry_repeatable_vendor_accounts() {
+        let flags = seed_archive_import_flags(&strings(&[
+            "seed-archive",
+            "--source",
+            "/tmp/seed",
+            "--backup",
+            "/tmp/archive",
+            "--vendor-account",
+            "claude=gmail-account",
+            "--vendor-account",
+            "codex=codex-account",
+        ]))
+        .expect("the seed flags must parse");
+        assert_eq!(flags.source, "/tmp/seed");
+        assert_eq!(flags.backup, "/tmp/archive");
+        assert_eq!(
+            flags.vendor_accounts,
+            vec![
+                ("claude".to_string(), "gmail-account".to_string()),
+                ("codex".to_string(), "codex-account".to_string()),
+            ],
+        );
+
+        let error = seed_archive_import_flags(&strings(&[
+            "seed-archive",
+            "--source",
+            "/tmp/seed",
+            "--backup",
+            "/tmp/archive",
+            "--vendor-account",
+            "claude",
+        ]))
+        .expect_err("a pair with no = must refuse");
+        assert_eq!(error.exit_class(), crate::error::ExitClass::Usage);
+    }
+
+    /// The mapping is validated against `[[accounts]]` before anything is
+    /// written: the account must be configured, and under the provider the
+    /// vendor actually reads.
+    #[test]
+    fn seed_archive_vendor_accounts_resolve_only_against_the_configured_provider() {
+        let file = r#"
+[[accounts]]
+name = "anthropic-account"
+provider = "anthropic"
+
+[[accounts]]
+name = "codex-account"
+provider = "codex"
+"#;
+        let (config, _provenance) = crate::config::resolve(
+            &crate::config::Overrides::new(),
+            &crate::config::FakeEnv::new().set("HOME", "/nonexistent-home"),
+            Some(file),
+            "test-config.toml",
+        )
+        .expect("the fixture config must resolve");
+
+        let resolved = resolve_seed_vendor_accounts(
+            &[
+                ("claude".to_string(), "anthropic-account".to_string()),
+                ("codex".to_string(), "codex-account".to_string()),
+            ],
+            &config.accounts,
+        )
+        .expect("both mappings name a configured account of the right provider");
+        assert_eq!(
+            resolved.get("claude").map(|target| target.account.as_str()),
+            Some("anthropic-account"),
+        );
+        assert_eq!(
+            resolved.get("codex").map(|target| target.provider.as_str()),
+            Some("codex"),
+        );
+
+        let crossed = resolve_seed_vendor_accounts(
+            &[("claude".to_string(), "codex-account".to_string())],
+            &config.accounts,
+        )
+        .expect_err("a vendor must not map onto another provider's account");
+        assert_eq!(crossed.exit_class(), crate::error::ExitClass::Usage);
+
+        let missing = resolve_seed_vendor_accounts(
+            &[("claude".to_string(), "not-configured".to_string())],
+            &config.accounts,
+        )
+        .expect_err("an unconfigured account must refuse");
+        assert_eq!(missing.exit_class(), crate::error::ExitClass::Usage);
+
+        let unknown_vendor = resolve_seed_vendor_accounts(
+            &[("cursor".to_string(), "anthropic-account".to_string())],
+            &config.accounts,
+        )
+        .expect_err("a vendor no provider reads must refuse");
+        assert_eq!(unknown_vendor.exit_class(), crate::error::ExitClass::Usage);
     }
 
     #[test]

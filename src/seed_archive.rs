@@ -19,6 +19,11 @@ use crate::legacy_meter::LegacyWindow;
 pub struct SeedArchiveSuccessRecord {
     pub source_file: String,
     pub source_line: u64,
+    /// The canonical vendor of the `reading.providers[]` entry this record was
+    /// built from. One source line carries several vendors, and each one is a
+    /// reading of a different account, so the vendor is what decides where the
+    /// record lands rather than the line's own `account` label.
+    pub vendor: String,
     pub received_at: UtcTimestamp,
     pub generated_at: UtcTimestamp,
     pub generated_at_original: String,
@@ -36,6 +41,10 @@ pub struct SeedArchiveSuccessRecord {
 pub struct SeedArchiveFailureRecord {
     pub source_file: String,
     pub source_line: u64,
+    /// The canonical vendor of the line's own `account` label. A failed capture
+    /// carries no `reading`, so the line label is the only vendor evidence it
+    /// has.
+    pub vendor: String,
     pub received_at: UtcTimestamp,
     pub account: String,
     pub tool: Option<String>,
@@ -79,6 +88,13 @@ impl SeedArchiveRecord {
             Self::Failure(r) => &r.account,
         }
     }
+
+    pub fn vendor(&self) -> &str {
+        match self {
+            Self::Success(r) => &r.vendor,
+            Self::Failure(r) => &r.vendor,
+        }
+    }
 }
 
 /// A record quarantined due to parsing errors or partial write.
@@ -87,6 +103,19 @@ pub struct SeedArchiveQuarantine {
     pub source_file: String,
     pub source_line: u64,
     pub reason: String,
+}
+
+/// The vendor label a seed source spells, reduced to the one spelling the rest
+/// of the importer keys on. The capture tool wrote `anthropic` in its early
+/// files and `claude` afterwards, and both name the same vendor; nothing else
+/// is rewritten, so an unrecognised label stays itself and finds no mapping.
+pub fn canonical_vendor(label: &str) -> String {
+    let lowered = label.trim().to_ascii_lowercase();
+    if lowered == "anthropic" {
+        "claude".to_string()
+    } else {
+        lowered
+    }
 }
 
 /// Parsed seed archive source contents.
@@ -249,7 +278,7 @@ fn parse_file_content(
         let is_last = Some(line_idx) == last_non_empty_index;
 
         match parse_record_line(file_name, source_line, line, is_last) {
-            Ok(record) => records.push(record),
+            Ok(line_records) => records.extend(line_records),
             Err(reason) => {
                 records_quarantined += 1;
                 quarantined.push(SeedArchiveQuarantine {
@@ -264,12 +293,16 @@ fn parse_file_content(
     (records, records_read, records_quarantined, quarantined)
 }
 
+/// Every reading one source line carries, one record per `reading.providers[]`
+/// entry. The line's own `account` label decides nothing here: it is kept on
+/// each record as the label the capture wrote, and the entry's own vendor is
+/// what an importer resolves to an account.
 fn parse_record_line(
     file_name: &str,
     source_line: u64,
     line: &str,
     is_last: bool,
-) -> Result<SeedArchiveRecord, String> {
+) -> Result<Vec<SeedArchiveRecord>, String> {
     let value: serde_json::Value = serde_json::from_str(line).map_err(|_| {
         if is_last {
             "partial_trailing_line".to_string()
@@ -336,16 +369,17 @@ fn parse_record_line(
     if let Some(failure) = failure_opt {
         match failure {
             "spawn_failed" | "non_zero_exit" | "empty_output" => {
-                Ok(SeedArchiveRecord::Failure(SeedArchiveFailureRecord {
+                Ok(vec![SeedArchiveRecord::Failure(SeedArchiveFailureRecord {
                     source_file: file_name.to_string(),
                     source_line,
+                    vendor: canonical_vendor(&account),
                     received_at,
                     account,
                     tool,
                     tool_version,
                     failure_classification: failure.to_string(),
                     exit_code: exit_code_opt,
-                }))
+                })])
             }
             _ => Err("unknown_failure_class".to_string()),
         }
@@ -358,16 +392,17 @@ fn parse_record_line(
         } else {
             "non_zero_exit"
         };
-        Ok(SeedArchiveRecord::Failure(SeedArchiveFailureRecord {
+        Ok(vec![SeedArchiveRecord::Failure(SeedArchiveFailureRecord {
             source_file: file_name.to_string(),
             source_line,
+            vendor: canonical_vendor(&account),
             received_at,
             account,
             tool,
             tool_version,
             failure_classification: classification.to_string(),
             exit_code: Some(code),
-        }))
+        })])
     } else {
         Err("unrecognized_seed_record_shape".to_string())
     }
@@ -383,7 +418,7 @@ fn parse_success_record(
     tool_version: Option<String>,
     plan_fallback: Option<String>,
     reading_val: &serde_json::Value,
-) -> Result<SeedArchiveRecord, String> {
+) -> Result<Vec<SeedArchiveRecord>, String> {
     let (reading_obj, raw_reading): (serde_json::Map<String, serde_json::Value>, String) =
         match reading_val {
             serde_json::Value::String(s) => {
@@ -415,45 +450,66 @@ fn parse_success_record(
         .and_then(|v| v.as_array())
         .ok_or_else(|| "missing_providers".to_string())?;
 
-    // Match provider by account name or provider field
-    let provider_entry = providers
-        .iter()
-        .find(|p| {
-            p.get("provider")
-                .and_then(|v| v.as_str())
-                .map(|p_name| {
-                    p_name.eq_ignore_ascii_case(&account)
-                        || (account.eq_ignore_ascii_case("primary")
-                            && p_name.eq_ignore_ascii_case("claude"))
-                        || (account.eq_ignore_ascii_case("claude")
-                            && p_name.eq_ignore_ascii_case("claude"))
-                })
-                .unwrap_or(false)
-        })
-        .or_else(|| {
-            if providers.len() == 1 {
-                providers.first()
-            } else {
-                None
-            }
-        })
-        .ok_or_else(|| "provider_not_found".to_string())?;
+    // Every entry becomes a record. The line's `account` label names only the
+    // vendor the capture tool was invoked for; the other entries are readings
+    // of other vendors' accounts, and discarding them here is what lost the
+    // pre-native codex history the first time around.
+    let mut records = Vec::with_capacity(providers.len());
+    for provider_entry in providers {
+        let provider_obj = provider_entry
+            .as_object()
+            .ok_or_else(|| "provider_not_an_object".to_string())?;
 
-    let provider_obj = provider_entry
-        .as_object()
-        .ok_or_else(|| "provider_not_an_object".to_string())?;
+        let vendor_label = provider_obj
+            .get("provider")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|label| !label.is_empty())
+            .ok_or_else(|| "missing_provider_name".to_string())?;
 
-    let plan = provider_obj
-        .get("plan")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .or(plan_fallback);
+        let plan = provider_obj
+            .get("plan")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .or_else(|| plan_fallback.clone());
 
-    let windows_arr = provider_obj
-        .get("windows")
-        .and_then(|v| v.as_array())
-        .ok_or_else(|| "missing_windows".to_string())?;
+        let windows_arr = provider_obj
+            .get("windows")
+            .and_then(|v| v.as_array())
+            .ok_or_else(|| "missing_windows".to_string())?;
 
+        let windows = parse_provider_windows(windows_arr, generated_at)?;
+
+        records.push(SeedArchiveRecord::Success(SeedArchiveSuccessRecord {
+            source_file: file_name.to_string(),
+            source_line,
+            vendor: canonical_vendor(vendor_label),
+            received_at,
+            generated_at,
+            generated_at_original: generated_at_str.to_string(),
+            account: account.clone(),
+            plan,
+            tool: tool.clone(),
+            tool_version: tool_version.clone(),
+            windows,
+            raw_reading: raw_reading.clone(),
+            measurement_basis: MeasurementBasis::ProviderObserved,
+        }));
+    }
+
+    if records.is_empty() {
+        return Err("no_provider_entries".to_string());
+    }
+
+    Ok(records)
+}
+
+/// One provider entry's window array. Split out because a line now carries
+/// several entries and each parses its windows the same way.
+fn parse_provider_windows(
+    windows_arr: &[serde_json::Value],
+    generated_at: UtcTimestamp,
+) -> Result<Vec<LegacyWindow>, String> {
     let mut windows = Vec::new();
     for w_val in windows_arr {
         let w_obj = w_val
@@ -507,21 +563,7 @@ fn parse_success_record(
             nominal_duration_nanos,
         });
     }
-
-    Ok(SeedArchiveRecord::Success(SeedArchiveSuccessRecord {
-        source_file: file_name.to_string(),
-        source_line,
-        received_at,
-        generated_at,
-        generated_at_original: generated_at_str.to_string(),
-        account,
-        plan,
-        tool,
-        tool_version,
-        windows,
-        raw_reading,
-        measurement_basis: MeasurementBasis::ProviderObserved,
-    }))
+    Ok(windows)
 }
 
 fn parse_reset_timestamp(value: &serde_json::Value) -> Option<UtcTimestamp> {
