@@ -116,9 +116,22 @@ fn plan_header_status_is_an_implemented_design_with_its_reconciliation_date() {
         line.contains("implemented"),
         "PLAN status must say the design is implemented: {line}"
     );
-    let has_date = line
-        .split_whitespace()
-        .any(|word| word.len() == 10 && word.starts_with("2026-") && word.matches('-').count() == 2);
+    // An ISO date, matched by shape rather than by a year this test would have to
+    // be edited to outlive.
+    let has_date = line.split_whitespace().any(|word| {
+        let word = word.trim_end_matches(['.', ',']);
+        let bytes = word.as_bytes();
+        word.len() == 10
+            && bytes[4] == b'-'
+            && bytes[7] == b'-'
+            && word.chars().enumerate().all(|(i, c)| {
+                if i == 4 || i == 7 {
+                    c == '-'
+                } else {
+                    c.is_ascii_digit()
+                }
+            })
+    });
     assert!(
         has_date,
         "PLAN status must carry the date it was last reconciled: {line}"

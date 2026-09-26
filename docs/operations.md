@@ -110,15 +110,19 @@ after step 5, because each importer refuses to write until it has verified a
 backup archive.
 
 **The backup comes first, and it is the archive both commands name.** Create or
-pick a verified one (step 5, [docs/backup.md](backup.md)); the imports read the
-`--backup` path themselves and refuse with the store exit class when it does
-not verify, so an import that went wrong is always recoverable to the state the
-archive holds.
+pick a verified one (step 5, [docs/backup.md](backup.md)), so that an import
+that went wrong is always recoverable to the state that archive holds.
 
 ```sh
-ARCHIVE="$(cat "$BACKUP_DESTINATION/newest-verified")"
+ARCHIVE="$BACKUP_DESTINATION/$(cat "$BACKUP_DESTINATION/newest-verified")"
 /abs/path/to/aub backup verify "$ARCHIVE"
 ```
+
+The pointer file holds the archive's directory name, not a path, so it is
+read relative to the destination root. `verify` printing `verified=true` is
+the precondition both imports check for themselves anyway, and an archive
+that does not verify refuses the import with the store exit class before
+anything is written.
 
 **Import the legacy quota ledger.** One named source file, never a directory
 scan:
