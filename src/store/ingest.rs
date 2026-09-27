@@ -142,6 +142,25 @@ pub struct PersistOutcome {
 /// valid rows would discard work to enforce a number.
 pub const WRITER_SLOT_BUDGET_PER_BATCH: MonotonicDuration = MonotonicDuration::from_millis(5_000);
 
+/// Deletes one reparsed file's earlier occurrences, by source file.
+///
+/// Spelled once so the persist path and the query-plan test cannot drift
+/// apart: the test reads this constant and asserts its plan searches through
+/// `idx_usage_occurrence_source_file`. `pub` rather than `pub(crate)` because
+/// the query-plan test lives under `tests/` and an integration binary can
+/// only read public items.
+pub const INGEST_WHOLE_FILE_OCCURRENCE_DELETE_SQL: &str =
+    "DELETE FROM usage_occurrence WHERE source_file = ?1";
+
+/// Deletes canonical events left with no occurrence at all.
+///
+/// Spelled once for the same reason as the whole-file delete above: the test
+/// asserts the correlated subquery searches `usage_occurrence` through
+/// `idx_usage_occurrence_event_id`.
+pub const INGEST_ORPHANED_EVENT_DELETE_SQL: &str = "DELETE FROM usage_event WHERE NOT EXISTS (
+                     SELECT 1 FROM usage_occurrence o WHERE o.event_id = usage_event.id
+                 )";
+
 /// Lands one parse batch in the rebuildable materialization tables.
 ///
 /// The write lock is taken before anything is touched, so a pass that starts
@@ -176,7 +195,7 @@ pub fn persist_ingest_batch(
     for source_file in &pass.whole_file_sources {
         rows_replaced += tx
             .execute(
-                "DELETE FROM usage_occurrence WHERE source_file = ?1",
+                INGEST_WHOLE_FILE_OCCURRENCE_DELETE_SQL,
                 params![source_file],
             )
             .map_err(|e| {
@@ -191,12 +210,7 @@ pub fn persist_ingest_batch(
     // single batch.
     if !pass.whole_file_sources.is_empty() {
         rows_replaced += tx
-            .execute(
-                "DELETE FROM usage_event WHERE NOT EXISTS (
-                     SELECT 1 FROM usage_occurrence o WHERE o.event_id = usage_event.id
-                 )",
-                [],
-            )
+            .execute(INGEST_ORPHANED_EVENT_DELETE_SQL, [])
             .map_err(|e| Error::Store(format!("cannot drop orphaned canonical events: {e}")))?;
     }
 
@@ -207,9 +221,12 @@ pub fn persist_ingest_batch(
     let mut components_written: u64 = 0;
     // How many of `pass.events`, in order, this call actually landed. Bounded
     // by `max_batch_seconds` below (`aub-mh1c`) as well as by the caller's own
-    // count and file bounds, so no single transaction can hold the writer
-    // slot past this budget however slow the per-event cost turns out to be.
-    // A cutoff always leaves at least one event landed, so the caller's retry
+    // count and file bounds, so the per-event loop yields the writer slot
+    // between events: the bound applies between events, never mid-item. The
+    // two deletes above run before the first budget check and are kept short
+    // by the `0023` indexes (`idx_usage_occurrence_source_file`,
+    // `idx_usage_occurrence_event_id`), pinned by the query-plan test. A
+    // cutoff always leaves at least one event landed, so the caller's retry
     // with the remainder is guaranteed to make progress.
     let mut events_processed: usize = 0;
 

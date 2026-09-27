@@ -30,8 +30,11 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use agent_usage_book::domain::time::{Clock, MonotonicDuration, RealClock};
+use agent_usage_book::domain::time::{
+    Clock, FakeClock, MonotonicDuration, MonotonicInstant, RealClock, UtcTimestamp,
+};
 use agent_usage_book::store::connection::{AccessMode, PragmaPolicy, open};
+use agent_usage_book::store::ingest::{IngestPass, PersistEvent, persist_ingest_batch};
 
 fn scratch(tag: &str) -> PathBuf {
     let dir =
@@ -79,9 +82,11 @@ fn wall_clock_slot_allowance(
 /// shape: the whole run in one transaction, however long that takes). Mirrors
 /// `persist_ingest_batch`'s own loop shape: at least one item always lands
 /// before the wall-clock check can close a transaction, so the writer always
-/// makes progress. `on_commit` is called after every transaction commits,
-/// with that transaction's own real held duration, so a caller can both
-/// assert on it and use it to synchronize a concurrent attempt.
+/// makes progress. `on_commit` is called after every transaction commits with
+/// two durations: how long the transaction held the slot from acquiring it to
+/// the start of `commit` (what the loop controls), and how long the commit
+/// itself then took (what the loop cannot shorten), so a caller can assert on
+/// the first while naming the second.
 ///
 /// Returns the largest per-item wall-clock cost the run observed (each item's
 /// sleep plus its insert, timed together), so the caller builds its allowance
@@ -92,7 +97,7 @@ fn run_stub_ingest(
     item_count: u64,
     per_item_cost: Duration,
     max_batch_seconds: Option<MonotonicDuration>,
-    on_commit: impl FnMut(Duration),
+    on_commit: impl FnMut(Duration, Duration),
 ) -> Duration {
     run_wall_clock_stub_with_schedule(
         conn,
@@ -112,7 +117,7 @@ fn run_wall_clock_stub_with_schedule(
     item_count: u64,
     mut item_cost: impl FnMut(u64) -> Duration,
     max_batch_seconds: Option<MonotonicDuration>,
-    mut on_commit: impl FnMut(Duration),
+    mut on_commit: impl FnMut(Duration, Duration),
 ) -> Duration {
     let clock = RealClock::new();
     let mut landed = 0u64;
@@ -128,7 +133,7 @@ fn run_wall_clock_stub_with_schedule(
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .expect("the stub writer must acquire the slot");
         let slot_start = clock.monotonic_now();
-        let wall_start = Instant::now();
+        let acquired = Instant::now();
         let mut landed_this_transaction = 0u64;
         while landed < item_count {
             if landed_this_transaction > 0
@@ -149,8 +154,13 @@ fn run_wall_clock_stub_with_schedule(
             landed += 1;
             landed_this_transaction += 1;
         }
+        // What the loop controls ends here: the hold runs from acquiring the
+        // slot to the start of the commit. The commit's own fsync follows and
+        // is reported separately, because the loop cannot shorten it (`aub-p7o9`).
+        let hold = acquired.elapsed();
+        let commit_start = Instant::now();
         tx.commit().unwrap();
-        on_commit(wall_start.elapsed());
+        on_commit(hold, commit_start.elapsed());
         if landed >= item_count {
             break;
         }
@@ -179,6 +189,12 @@ fn stub_db(tag: &str) -> (PathBuf, rusqlite::Connection) {
 /// (`aub-mh1c`). This needs no concurrent reader to observe: the writer's own
 /// measured hold is the proof.
 ///
+/// The hold runs from acquiring the slot to the start of `commit`, never
+/// past it: the commit's own fsync is what the loop cannot shorten, so it is
+/// recorded beside the hold rather than scored against the allowance
+/// (`aub-p7o9`, after three landing gates and one Actions run went red with
+/// the per-item cost steady and all the excess in the commit).
+///
 /// The allowance is the bound plus the largest per-item cost measured during
 /// this run plus a fixed scheduling slack. Under IO pressure an item costs
 /// more than its configured sleep (the write waits behind a disk queue, the
@@ -194,16 +210,17 @@ fn no_transaction_holds_the_slot_past_the_bound_plus_one_item() {
     let bound = MonotonicDuration::from_millis(150);
     let slack = WALL_CLOCK_SCHEDULING_SLACK; // scheduling slop, not the mechanism
     let mut holds = Vec::new();
-    let observed_max_item = run_stub_ingest(&mut writer, 15, per_item, Some(bound), |held| {
-        holds.push(held);
-    });
+    let observed_max_item =
+        run_stub_ingest(&mut writer, 15, per_item, Some(bound), |hold, commit| {
+            holds.push((hold, commit));
+        });
     let allowance = wall_clock_slot_allowance(bound, observed_max_item, slack);
     let mut max_seen = Duration::ZERO;
-    for held in holds {
-        max_seen = max_seen.max(held);
+    for (hold, commit) in holds {
+        max_seen = max_seen.max(hold);
         assert!(
-            held <= allowance,
-            "one transaction held the slot {held:?}, over the {bound:?} bound plus observed one-item cost {observed_max_item:?} plus slack {slack:?} (allowance {allowance:?})"
+            hold <= allowance,
+            "one transaction held the slot {hold:?} (commit took {commit:?}), over the {bound:?} bound plus observed one-item cost {observed_max_item:?} plus slack {slack:?} (allowance {allowance:?})"
         );
     }
     assert!(
@@ -255,7 +272,7 @@ fn wall_clock_slot_allowance_uses_the_largest_observed_item_cost() {
         9,
         |i| schedule[(i as usize) % schedule.len()],
         Some(bound),
-        |_| {},
+        |_, _| {},
     );
     assert!(
         observed >= scheduled_largest,
@@ -278,9 +295,9 @@ fn without_a_bound_the_whole_run_lands_in_one_unbounded_transaction() {
     let item_count = 15u64;
     let mut commits = 0u64;
     let mut only_duration = Duration::ZERO;
-    run_stub_ingest(&mut writer, item_count, per_item, None, |held| {
+    run_stub_ingest(&mut writer, item_count, per_item, None, |hold, _| {
         commits += 1;
-        only_duration = held;
+        only_duration = hold;
     });
     assert_eq!(commits, 1, "with no bound the whole run is one transaction");
     assert!(
@@ -320,7 +337,7 @@ fn a_waiting_connection_is_served_once_the_wall_clock_bound_is_in_place() {
         15,
         Duration::from_millis(80),
         Some(MonotonicDuration::from_millis(150)),
-        |_held| {
+        |_, _| {
             if let Some(tx) = fire_tx.take() {
                 let _ = tx.send(());
             }
@@ -355,11 +372,174 @@ fn a_waiting_connection_is_refused_without_the_wall_clock_bound() {
             .map(|tx| tx.commit().unwrap())
     });
 
-    run_stub_ingest(&mut writer, 15, Duration::from_millis(80), None, |_held| {});
+    run_stub_ingest(&mut writer, 15, Duration::from_millis(80), None, |_, _| {});
 
     let result = waiter.join().unwrap();
     assert!(
         result.is_err(),
         "a waiting connection must be refused when nothing bounds the writer's transaction"
+    );
+}
+
+/// One strong-identity persist event for the production-function bound test
+/// below, built through the shared identity framework exactly the
+/// orchestrator builds them, so the batch under test carries rows the real
+/// path would produce.
+fn production_persist_event(id: &str, file: &str, occurred_nanos: i64) -> PersistEvent {
+    use agent_usage_book::dedup::{canonical_identity, canonical_payload_digest};
+    use agent_usage_book::domain::ids::{NativeSessionId, SessionId, SourceNamespace};
+    use agent_usage_book::domain::tokens::{
+        CacheReadTokens, CacheWriteTokens, InputTokens, KnownTokenVector, OutputTokens, UsageVector,
+    };
+    use agent_usage_book::evidence::{CoverageCompleteness, EvidenceQuality, Provenance};
+    use agent_usage_book::transcripts::NormalizedUsageEvent;
+    use agent_usage_book::transcripts::parser::{
+        EvidenceClassification, ParserVersion, STRONG_IDENTITY_PREFIX,
+    };
+
+    let event = NormalizedUsageEvent::new(
+        UsageVector::new(
+            KnownTokenVector::new(
+                InputTokens::new(10),
+                OutputTokens::new(5),
+                CacheReadTokens::new(0),
+                CacheWriteTokens::new(0),
+            ),
+            std::collections::BTreeMap::new(),
+            CoverageCompleteness::Complete,
+            EvidenceQuality::Measured,
+        ),
+        EvidenceClassification::Reported,
+        Provenance::new(vec![
+            file.to_string(),
+            format!("{STRONG_IDENTITY_PREFIX}{id}"),
+        ]),
+        ParserVersion::new("test-1"),
+    )
+    .with_occurred_at(UtcTimestamp::from_unix_nanos(occurred_nanos))
+    .with_session(SessionId::new(
+        SourceNamespace::new("test"),
+        NativeSessionId::new("s1"),
+    ));
+    let identity = canonical_identity(&event);
+    PersistEvent {
+        event: event.clone(),
+        namespace: SourceNamespace::new("test"),
+        canonical_event_id: identity.canonical_event_id,
+        native_event_id: identity.native_event_id,
+        heuristic_key: identity.heuristic_key,
+        heuristic_algorithm_version: None,
+        canonical_payload_digest: canonical_payload_digest(&event),
+        relative_path: Some(file.to_string()),
+    }
+}
+
+/// A clock that advances by a fixed step every time its monotonic time is
+/// read, so the production persist loop's own per-event check sees
+/// wall-clock time pass without a real sleep.
+struct ProductionTickingClock {
+    state: std::cell::Cell<FakeClock>,
+    step: MonotonicDuration,
+}
+
+impl ProductionTickingClock {
+    fn new(step: MonotonicDuration) -> Self {
+        Self {
+            state: std::cell::Cell::new(FakeClock::new(UtcTimestamp::from_unix_nanos(0))),
+            step,
+        }
+    }
+}
+
+impl Clock for ProductionTickingClock {
+    fn now(&self) -> UtcTimestamp {
+        self.state.get().now()
+    }
+
+    fn monotonic_now(&self) -> MonotonicInstant {
+        let mut clock = self.state.get();
+        let instant = clock.monotonic_now();
+        clock.advance(self.step);
+        self.state.set(clock);
+        instant
+    }
+}
+
+/// `persist_ingest_batch` itself stops at the wall-clock bound (`aub-p7o9`),
+/// not only the stub above: with an injected clock that advances past
+/// `max_batch_seconds` mid-batch, the call lands at least one event, stops
+/// before the rest, and the outcome reports how many landed so the caller can
+/// retry with the remainder. The stub test stays, since it proves the
+/// concurrent-reader side this production-function test does not.
+#[test]
+fn persist_ingest_batch_stops_at_the_wall_clock_bound_mid_batch() {
+    let dir = scratch("production-bound");
+    let db_path = dir.join("ledger.db");
+    let mut conn = test_support::open_migrated(&db_path, &policy(Duration::from_secs(30)));
+
+    let events = vec![
+        production_persist_event("m1", "corpus/a.jsonl", 1_000),
+        production_persist_event("m2", "corpus/a.jsonl", 2_000),
+        production_persist_event("m3", "corpus/b.jsonl", 3_000),
+    ];
+    let total = events.len();
+    let pass = IngestPass {
+        events,
+        sessions: Vec::new(),
+        watermarks: Vec::new(),
+        quarantined: Vec::new(),
+        collisions: Vec::new(),
+        whole_file_sources: Vec::new(),
+        created_at: UtcTimestamp::from_unix_nanos(1_000_000),
+    };
+
+    // The clock advances a full second on every read against a 500 ms bound.
+    // The loop never checks before the first event, so one always lands; the
+    // check before the second already reads past the budget and cuts there.
+    let clock = ProductionTickingClock::new(MonotonicDuration::from_millis(1_000));
+    let outcome = persist_ingest_batch(
+        &mut conn,
+        &pass,
+        &clock,
+        MonotonicDuration::from_millis(500),
+    )
+    .expect("the bounded production batch must land");
+    let landed =
+        (outcome.events_written.value() + outcome.events_already_ingested.value()) as usize;
+    assert!(
+        landed >= 1 && landed < total,
+        "the wall-clock bound must cut the production batch after at least one event but before the rest: landed={landed} of total={total}"
+    );
+
+    // The caller's retry carries only the events the first call never
+    // reached; a clock that never advances and a generous budget let it land.
+    let remaining = IngestPass {
+        events: pass.events[landed..].to_vec(),
+        sessions: Vec::new(),
+        watermarks: Vec::new(),
+        quarantined: Vec::new(),
+        collisions: Vec::new(),
+        whole_file_sources: Vec::new(),
+        created_at: UtcTimestamp::from_unix_nanos(1_000_000),
+    };
+    let remainder = total - landed;
+    let second = persist_ingest_batch(
+        &mut conn,
+        &remaining,
+        &FakeClock::new(UtcTimestamp::from_unix_nanos(0)),
+        MonotonicDuration::from_seconds(2),
+    )
+    .expect("the retry must land");
+    assert_eq!(
+        second.events_written.value() as usize,
+        remainder,
+        "the retry must land exactly the remainder the first call reported: landed={landed} remainder={remainder} of total={total}"
+    );
+    let stored: i64 = conn
+        .query_row("SELECT COUNT(*) FROM usage_event", [], |row| row.get(0))
+        .expect("the event count must be readable");
+    assert_eq!(
+        stored as usize, total,
+        "every event lands exactly once across the cut-short call and its retry: stored={stored} total={total}"
     );
 }
