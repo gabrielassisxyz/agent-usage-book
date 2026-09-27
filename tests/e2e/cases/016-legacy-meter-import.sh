@@ -88,7 +88,17 @@ plant_native_attempt() {
 case_steps() {
     step "initialize the ledger" aub_legacy_meter export --key run-id
     step "create a verified backup" aub_legacy_meter backup "$ARCHIVE"
-    step "import the legacy source" aub_legacy_meter import legacy-meter --source "$SOURCE" --backup "$ARCHIVE" -v
+    # Inlined rather than routed through aub_legacy_meter: the wrapper passes
+    # the whole subcommand through "$@", so no call site through it ever puts
+    # "$AUB_BIN" and a command name on the same line for the anchored
+    # command-surface check to see (aub-1jxe). This one step calls import
+    # directly, with the wrapper's exact env, so the check sees import
+    # covered without changing what any step asserts.
+    step "import the legacy source" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_STATE_DIR=$STATE_DIR/aub" \
+        "AUB_CONFIG_FILE=$STATE_DIR/aub.toml" \
+        "$AUB_BIN" import legacy-meter --source "$SOURCE" --backup "$ARCHIVE" -v
     step "repeat the same import" aub_legacy_meter import legacy-meter --source "$SOURCE" --backup "$ARCHIVE"
     step "quarantine a malformed source" aub_legacy_meter import legacy-meter --source "$MALFORMED_SOURCE" --backup "$ARCHIVE"
     step "refuse an unverified backup" aub_legacy_meter import legacy-meter --source "$SOURCE" --backup "$STATE_DIR/not-an-archive"
