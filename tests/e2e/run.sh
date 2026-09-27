@@ -1011,6 +1011,7 @@ CASE_ID="001-prose"
 case_steps() { step "status is discussed"; }
 case_assertions() { :; }
 CASE
+    printf 'status\n' >"$surface"
     if out="$(CASES_DIR="$prose" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
         echo "self-test: prose-only status mention was accepted as coverage" >&2
         rm -rf "$tmp"
