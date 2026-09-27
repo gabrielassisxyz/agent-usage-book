@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# guard-inventory-stamp (aub-kzmj): the gate fails when the guard inventory
+# holds rows no recorded run covers.
+#
+# docs/guard-inventory.md carries a last-run record in two parts: the
+# full-run stamp (a count the runner rewrites on every all-scope pass) and a
+# list of rows replayed singly since (one line per --only GUARD-OK the stamp
+# does not reach). Rows land appended, so a new row sits beyond the stamp's
+# count until its owning lane replays it singly or someone re-runs the whole
+# inventory. Without this check that staleness is invisible: the runner's
+# consistency mode checks the stamp's shape, never its count, and nothing
+# else invokes the runner at all. That is what happened on 2026-09-21, when
+# rows c-35 through c-38 landed after the stamp and no gate noticed.
+#
+# The comparison is text-only: no tracker, no build, seconds. It runs
+# bin/guard-mutations --check-stamp, which fails naming every uncovered row
+# id with both numbers (table rows, stamp count) and the remedy (--only the
+# row, or a full run). The stamp covers the first N table rows in file
+# order; the count-only stamp cannot tell a removed-plus-added row pair
+# apart, and that case stays visible in review.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+# check_tree <root>: judge one tree. Green prints the coverage line; every
+# failure line names the uncovered row, because the red must be attributable
+# to the lane whose row has no recorded run.
+check_tree() {
+    local root="$1"
+    ( cd "$root" && bin/guard-mutations --check-stamp )
+}
+
+# --- self-tests --------------------------------------------------------------
+# The live comparison above is judged by the gate; these scenarios prove the
+# comparison discriminates, on scratch trees rather than against this
+# repository's own history. A planted extra row with the stamp left behind is
+# red naming the row; a stamp rewritten to the scratch table's own count is
+# green; and the neutered rule lets the red scenario through, which is what
+# makes the red the rule's work and not an incidental failure of the script.
+
+build_scenario() {
+    # A scratch tree holding a copy of the real inventory, inside a git
+    # checkout so the runner resolves its live root to the scratch tree.
+    local dir="$scratch/$1"
+    mkdir -p "$dir/bin" "$dir/docs"
+    cp -- "$repo_root/bin/guard-mutations" "$dir/bin/guard-mutations"
+    cp -- "$repo_root/docs/guard-inventory.md" "$dir/docs/guard-inventory.md"
+    git -C "$dir" init -q -b main 2>/dev/null || git -C "$dir" init -q
+    printf '%s\n' "$dir"
+}
+
+table_row_count() {
+    awk -F'\t' '
+        /^```tsv/ { in_block = 1; next }
+        in_block && /^```/ { in_block = 0; next }
+        in_block && /^(sh|c|e|syn)-[0-9a-z-]+\t/ { n++ }
+        END { print n+0 }
+    ' "$1/docs/guard-inventory.md"
+}
+
+plant_probe_row() {
+    # Insert one probe row as the last row of the tsv block: appended after
+    # the closing fence it would not be a table row at all.
+    local dir="$1" tmp_new="$1/docs/guard-inventory.md.new"
+    awk '
+        /^```tsv/ { in_block = 1; print; next }
+        in_block && /^```/ {
+            printf "sh-zz-probe-selftest\taub-kzmj\tshell\tbin/guard-mutations --check-stamp\tneuter\tbin/checks/81-guard-inventory-stamp\t\t\tred probe\tbin/checks/70-quantity-inventory\t0\tevery pub struct/enum\n"
+            in_block = 0; print; next
+        }
+        { print }
+    ' "$dir/docs/guard-inventory.md" >"$tmp_new" && mv "$tmp_new" "$dir/docs/guard-inventory.md"
+}
+
+expect_red() {
+    # $1 = scenario dir, $2 = label, $3 = extended regex the failure must match.
+    local dir="$1" label="$2" want_re="$3" out rc
+    out="$(check_tree "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "guard-inventory-stamp self-test: $label: expected red, was green" >&2
+        return 1
+    fi
+    if ! printf '%s\n' "$out" | grep -Eq -- "$want_re"; then
+        echo "guard-inventory-stamp self-test: $label: red without the expected signature ($want_re):" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    return 0
+}
+
+expect_green() {
+    local dir="$1" label="$2" out rc
+    out="$(check_tree "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "guard-inventory-stamp self-test: $label: expected green, was red:" >&2
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    return 0
+}
+
+run_self_tests() {
+    local fail=0 dir out rc
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-guard-stamp-XXXXXX")" || return 1
+    trap 'rm -rf "$scratch"' EXIT
+
+    # Red: one row appended with the stamp left behind, the scenario the
+    # whole check exists for. The failure must name the row and the remedy.
+    dir="$(build_scenario red-new-row)"
+    plant_probe_row "$dir"
+    grep -qF 'sh-zz-probe-selftest' "$dir/docs/guard-inventory.md" || {
+        echo "guard-inventory-stamp self-test: the probe-row append changed nothing" >&2
+        return 1
+    }
+    expect_red "$dir" "a new row with the stamp left behind" \
+        "sh-zz-probe-selftest" || fail=1
+    out="$(check_tree "$dir" 2>&1 || true)"
+    case "$out" in
+        *"--only <guard>"*) : ;;
+        *) echo "guard-inventory-stamp self-test: the red scenario named no remedy" >&2
+           fail=1 ;;
+    esac
+
+    # Green: the stamp rewritten to the scratch table's own count.
+    dir="$(build_scenario green-restamped)"
+    restamp_to="$(table_row_count "$dir")"
+    sed -i "s/scope all, [0-9][0-9]* rows/scope all, $restamp_to rows/" "$dir/docs/guard-inventory.md"
+    grep -q "scope all, $restamp_to rows" "$dir/docs/guard-inventory.md" || {
+        echo "guard-inventory-stamp self-test: the restamp changed nothing" >&2
+        return 1
+    }
+    sed -i '/^Replayed singly since: /d' "$dir/docs/guard-inventory.md"
+    expect_green "$dir" "a stamp rewritten to the scratch table count" || fail=1
+
+    # The mutation proof: the same red tree, first under the intact rule
+    # (red), then under a check whose line 2 is an early return (green). The
+    # pair is what makes the red above the rule's work and not an incidental
+    # defect, and it is exercised here against a scratch tree, never against
+    # this repository's own history.
+    dir="$(build_scenario red-neutered-rule)"
+    plant_probe_row "$dir"
+    cp "$script_dir/81-guard-inventory-stamp" "$scratch/neutered-check"
+    sed -i '2i exit 0' "$scratch/neutered-check"
+    chmod +x "$scratch/neutered-check"
+    out="$(check_tree "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "guard-inventory-stamp self-test: the intact rule passed its own red scenario; the tree is wrong:" >&2
+        printf '%s\n' "$out" >&2
+        fail=1
+    fi
+    out="$("$scratch/neutered-check" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "guard-inventory-stamp self-test: the neutered rule still fires on the red scenario:" >&2
+        printf '%s\n' "$out" >&2
+        fail=1
+    fi
+
+    if [ "$fail" -ne 0 ]; then
+        return 1
+    fi
+    echo "guard-inventory-stamp: self-tests ok: a new row is red naming the row and the remedy, a restamp is green, the neutered rule passes the red scenario."
+    return 0
+}
+
+# Argument mode judges one tree and stops there; the embedded self-tests run
+# against scratch trees only in the live path, after the gate's own comparison
+# has passed.
+main() {
+    if [ "$#" -gt 0 ]; then
+        check_tree "$1"
+        return $?
+    fi
+
+    local fail=0
+    check_tree "$repo_root" || fail=1
+    if [ "$fail" -eq 0 ]; then
+        run_self_tests || fail=1
+    fi
+    if [ "$fail" -ne 0 ]; then
+        echo "==> guard-inventory-stamp FAILED" >&2
+    fi
+    return "$fail"
+}
+
+main "$@"
+exit "$?"

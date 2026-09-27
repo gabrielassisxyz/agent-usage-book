@@ -33,6 +33,7 @@ declared_checks=(
     78-pane-work-cycle
     80-batch-verify-close
     80-gate-coverage
+    81-guard-inventory-stamp
     82-identity-privacy-scan
     85-status-latency-budget
 )

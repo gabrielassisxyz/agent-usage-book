@@ -18,21 +18,33 @@
 #   bin/guard-mutations [--scope shell|cargo|e2e|all] [--only GUARD]
 #                       [--budget-seconds N] [--inventory PATH]
 #   bin/guard-mutations --check-consistency [--inventory PATH]
+#   bin/guard-mutations --check-stamp [--inventory PATH]
 #   bin/guard-mutations --self-test
 #   bin/guard-mutations --list [--inventory PATH]
 #
 # Modes:
 #   run (default)   replay rows; on a full-scope pass, stamp the last-run line
-#                   in the live inventory document
+#                   in the live inventory document and clear the singly-replayed
+#                   list; on a --only GUARD-OK for a row the stamp does not
+#                   count, append that row to the singly-replayed list
 #   --check-consistency
 #                   structural checks over every row, plus the bead scan when a
 #                   tracker is present: every bead whose acceptance text matches
 #                   a can-fail marker must own a row or an exclusion entry.
 #                   Without a tracker the bead scan is SKIPPED out loud, never
 #                   silently passed.
+#   --check-stamp   no tracker, no build, seconds: fail naming every table row
+#                   that neither the full-run stamp's count nor the
+#                   singly-replayed list covers, and every singly-replayed id
+#                   that names no row. The stamp covers the first N table rows
+#                   in file order; rows land appended, so anything beyond it
+#                   needs a singly-replayed line. This is what gate check 81
+#                   runs. It never runs the consistency mode's bead scan: that
+#                   half needs the tracker, which a CI runner does not have.
 #   --self-test     runner mechanics against a synthetic repo (dirty refusal,
 #                   dead, wrong-signature, sibling-break, budget, stale scratch,
-#                   consistency); seconds, no toolchain needed
+#                   consistency, stamp behind/equal/singly-replayed, --only
+#                   round-trip); seconds, no toolchain needed
 #
 # Safety:
 #   - mutations land only in the scratch copy; the runner refuses to start
@@ -67,6 +79,7 @@ while [ "$#" -gt 0 ]; do
         --budget-seconds) BUDGET="${2:-}"; shift 2 ;;
         --inventory) INVENTORY="${2:-}"; shift 2 ;;
         --check-consistency) MODE="consistency"; shift ;;
+        --check-stamp) MODE="checkstamp"; shift ;;
         --self-test) MODE="selftest"; shift ;;
         --list) MODE="list"; shift ;;
         -h|--help)
@@ -499,6 +512,13 @@ mode_run() {
             ERROR*) errors=$((errors + 1)) ;;
             SKIPPED*) skipped=$((skipped + 1)) ;;
         esac
+        case "$result" in
+            GUARD-OK*)
+                if [ -n "$ONLY" ]; then
+                    maybe_record_singly "$ONLY"
+                fi
+                ;;
+        esac
     done <<<"$selected"
 
     echo "guard-mutations: $ok ok, $dead dead, $mismatch mismatched, $errors errors, $skipped skipped, of $total rows"
@@ -516,7 +536,128 @@ stamp_last_run() {
     local today
     today="$(date -u +%F)"
     sed -i "s/^Last successful full run:.*/Last successful full run: $today (bin\/guard-mutations, scope all, $total rows)/" "$INVENTORY"
+    # A full-scope pass replays every row, so the singly-replayed list it
+    # supersedes goes away with the rewrite.
+    sed -i '/^Replayed singly since: /d' "$INVENTORY"
     echo "guard-mutations: stamped last successful full run $today in $INVENTORY (commit it with the run)"
+}
+
+# --- stamp coverage ----------------------------------------------------------
+# The last-run record has two parts: the full-run stamp (a count) and the
+# singly-replayed list (named rows). The stamp covers the first N table rows
+# in file order; rows land appended, so a row beyond the stamp's count needs
+# a singly-replayed line from a --only GUARD-OK. Known limit, accepted: the
+# stamp counts rows rather than naming them, so a removed row plus an added
+# row in one change keeps the count; a removed row stays visible in review.
+
+stamp_row_count() {
+    sed -n 's/^Last successful full run: .*scope all, \([0-9][0-9]*\) rows).*$/\1/p' "$INVENTORY" | head -1
+}
+
+singly_ids() {
+    grep -E '^Replayed singly since: [^[:space:]]+ [0-9]{4}-[0-9]{2}-[0-9]{2}$' "$INVENTORY" 2>/dev/null | awk '{ print $4 }' | sort -u
+}
+
+# maybe_record_singly GUARD: after a --only GUARD-OK, append the row to the
+# singly-replayed list when the stamp's count does not reach it. Rows the
+# stamp already counts need no line; a repeat replay leaves the one line.
+maybe_record_singly() {
+    local guard="$1" stamp_n idx today
+    stamp_n="$(stamp_row_count)"
+    if [ -z "$stamp_n" ]; then
+        stamp_n=0
+    fi
+    idx="$(read_inventory_rows | awk -F'\t' -v g="$guard" '$1 == g { print NR; exit }')"
+    if [ -z "$idx" ]; then
+        return 0
+    fi
+    if [ "$idx" -le "$stamp_n" ]; then
+        return 0
+    fi
+    if grep -qF "Replayed singly since: $guard " "$INVENTORY" 2>/dev/null; then
+        echo "guard-mutations: $guard already recorded as replayed singly; leaving the line in place"
+        return 0
+    fi
+    today="$(date -u +%F)"
+    sed -i "/^Last successful full run:/a Replayed singly since: $guard $today" "$INVENTORY"
+    echo "guard-mutations: recorded singly replay of $guard on $today in $INVENTORY (commit it with the landing)"
+}
+
+# mode_checkstamp: no tracker, no build, seconds. Pass when every table row
+# is counted by the stamp (first N in file order) or named in the
+# singly-replayed list. Fail naming every id that is neither, and every
+# singly-replayed id that names no row, with both numbers and the remedy.
+mode_checkstamp() {
+    local rows table_count stamp_n fail=0
+    rows="$(read_inventory_rows)"
+    if [ -z "$rows" ]; then
+        echo "guard-mutations --check-stamp: FAIL: no rows parsed from $INVENTORY" >&2
+        return 1
+    fi
+    table_count="$(printf '%s\n' "$rows" | grep -c . || true)"
+    stamp_n="$(stamp_row_count)"
+    if [ -z "$stamp_n" ]; then
+        if grep -q '^Last successful full run: none yet' "$INVENTORY" 2>/dev/null; then
+            stamp_n=0
+        else
+            echo "guard-mutations --check-stamp: FAIL: last-run line missing or malformed in $INVENTORY" >&2
+            echo "guard-mutations --check-stamp: remedy: run a full pass with bin/guard-mutations --scope all to stamp it." >&2
+            return 1
+        fi
+    fi
+
+    local ids singly bad uncovered s
+    ids="$(printf '%s\n' "$rows" | awk -F'\t' '{ print $1 }' | sort -u)"
+    singly="$(singly_ids)"
+
+    bad=""
+    if [ -n "$singly" ]; then
+        while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            if ! printf '%s\n' "$ids" | grep -qxF "$s"; then
+                bad="${bad}${s}
+"
+            fi
+        done <<<"$singly"
+    fi
+    if [ -n "$bad" ]; then
+        echo "guard-mutations --check-stamp: FAIL: singly-replayed entries name no inventory row:" >&2
+        while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            echo "  $s" >&2
+        done <<<"$bad"
+        echo "guard-mutations --check-stamp: remedy: delete the stale line, or run a full pass with bin/guard-mutations --scope all, which clears the list." >&2
+        fail=1
+    fi
+
+    uncovered="$(printf '%s\n' "$rows" | awk -F'\t' -v n="$stamp_n" 'NR > n { print $1 }')"
+    if [ -n "$singly" ] && [ -n "$uncovered" ]; then
+        while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            uncovered="$(printf '%s\n' "$uncovered" | grep -vxF "$s" || true)"
+        done <<<"$singly"
+    fi
+    if [ -n "$uncovered" ]; then
+        local n_uncovered
+        n_uncovered="$(printf '%s\n' "$uncovered" | grep -c . || true)"
+        echo "guard-mutations --check-stamp: FAIL: $n_uncovered inventory row(s) covered by neither the full-run stamp nor the singly-replayed list:" >&2
+        while IFS= read -r s; do
+            [ -n "$s" ] || continue
+            echo "  $s" >&2
+        done <<<"$uncovered"
+        echo "guard-mutations --check-stamp: table has $table_count rows, stamp counts $stamp_n." >&2
+        echo "guard-mutations --check-stamp: remedy: replay each uncovered row with bin/guard-mutations --only <guard>, or re-run the full inventory with bin/guard-mutations --scope all." >&2
+        fail=1
+    fi
+
+    if [ "$fail" -eq 0 ]; then
+        local n_singly=0
+        if [ -n "$singly" ]; then
+            n_singly="$(printf '%s\n' "$singly" | grep -c . || true)"
+        fi
+        echo "guard-mutations --check-stamp: ok: $table_count table rows covered (stamp counts $stamp_n, $n_singly singly-replayed)."
+    fi
+    return "$fail"
 }
 
 # --- consistency mode --------------------------------------------------------
@@ -737,17 +878,72 @@ EOF
     out="$(cd "$repo" && bash "$SCRIPT" --check-consistency --inventory "$inv" 2>&1)"
     case "$out" in *"duplicate guard id syn-dup"*) : ;; *) echo "self-test: duplicate guard was not caught: $out" >&2; fail=1 ;; esac
 
+    # 6. stamp coverage: behind fails naming the row and the remedy, equal
+    # passes, and a row covered only by a singly-replayed line passes.
+    local stamp_inv="$t/stamp.md"
+    {
+        printf '# stamp fixture\n\n'
+        printf 'Last successful full run: 2026-09-27 (bin/guard-mutations, scope all, 1 rows)\n\n'
+        printf '```tsv\n'
+        printf 'guard\tbeads\tscope\tcommand\tmut\ttarget\tmut_arg\tmut_arg2\texpect_re\tsibling\tsib_expect\tsib_re\n'
+        printf 'syn-stamp-ok\taub-selftest\tshell\t./test.sh\tappend\tdata.txt\tMARK\t\tguard fired\t./test2.sh\t0\tguard2 silent\n'
+        printf 'syn-stamp-new\taub-selftest\tshell\t./test.sh\tappend\tdata.txt\tMARK\t\tguard fired\t./test2.sh\t0\tguard2 silent\n'
+        printf '```\n'
+    } >"$stamp_inv"
+
+    out="$(cd "$repo" && bash "$SCRIPT" --check-stamp --inventory "$stamp_inv" 2>&1)"
+    rc=$?
+    case "$rc" in 1) : ;; *) echo "self-test: stamp-behind did not fail (rc=$rc): $out" >&2; fail=1 ;; esac
+    case "$out" in *syn-stamp-new*) : ;; *) echo "self-test: stamp-behind did not name syn-stamp-new: $out" >&2; fail=1 ;; esac
+    case "$out" in *"--only <guard>"*) : ;; *) echo "self-test: stamp-behind named no remedy: $out" >&2; fail=1 ;; esac
+
+    local stamp_eq="$t/stamp-eq.md"
+    sed 's/scope all, 1 rows/scope all, 2 rows/' "$stamp_inv" >"$stamp_eq"
+    grep -q 'scope all, 2 rows' "$stamp_eq" || { echo "self-test: could not build the stamp-equal fixture" >&2; fail=1; }
+    out="$(cd "$repo" && bash "$SCRIPT" --check-stamp --inventory "$stamp_eq" 2>&1)"
+    rc=$?
+    case "$rc" in 0) : ;; *) echo "self-test: stamp-equal did not pass (rc=$rc): $out" >&2; fail=1 ;; esac
+
+    local stamp_singly="$t/stamp-singly.md"
+    cp "$stamp_inv" "$stamp_singly"
+    sed -i '/^Last successful full run:/a Replayed singly since: syn-stamp-new 2026-09-27' "$stamp_singly"
+    grep -qF 'Replayed singly since: syn-stamp-new' "$stamp_singly" || { echo "self-test: could not build the singly fixture" >&2; fail=1; }
+    out="$(cd "$repo" && bash "$SCRIPT" --check-stamp --inventory "$stamp_singly" 2>&1)"
+    rc=$?
+    case "$rc" in 0) : ;; *) echo "self-test: singly-replayed did not pass (rc=$rc): $out" >&2; fail=1 ;; esac
+
+    # 7. --only round-trip: a GUARD-OK replay of a row the stamp does not
+    # count appends the singly line, and a full-scope pass clears it while
+    # restamping.
+    local stamp_live="$t/stamp-live.md"
+    cp "$stamp_inv" "$stamp_live"
+    out="$(selftest_run stamponly "$stamp_live" "syn-stamp-new")"
+    case "$out" in *GUARD-OK*) : ;; *) echo "self-test: --only replay was not ok: $out" >&2; fail=1 ;; esac
+    grep -qF 'Replayed singly since: syn-stamp-new' "$stamp_live" || { echo "self-test: --only replay appended no singly line" >&2; fail=1; }
+    out="$(cd "$repo" && bash "$SCRIPT" --check-stamp --inventory "$stamp_live" 2>&1)"
+    rc=$?
+    case "$rc" in 0) : ;; *) echo "self-test: the singly line did not satisfy the stamp check (rc=$rc): $out" >&2; fail=1 ;; esac
+    out="$(selftest_run stampfull "$stamp_live")"
+    rc=$?
+    case "$rc" in 0) : ;; *) echo "self-test: full pass over the stamp fixture failed (rc=$rc): $out" >&2; fail=1 ;; esac
+    grep -q 'scope all, 2 rows' "$stamp_live" || { echo "self-test: full pass did not restamp: $out" >&2; fail=1; }
+    if grep -qF 'Replayed singly since:' "$stamp_live"; then
+        echo "self-test: full pass did not clear the singly list" >&2
+        fail=1
+    fi
+
     if [ "$fail" -ne 0 ]; then
         echo "guard-mutations self-test FAILED" >&2
         return 1
     fi
-    echo "guard-mutations self-test: mechanics ok (ok/dead/mismatch/budget/dirty/stale/consistency)."
+    echo "guard-mutations self-test: mechanics ok (ok/dead/mismatch/budget/dirty/stale/consistency/stamp/only-round-trip)."
 }
 
 # --- dispatch ----------------------------------------------------------------
 
 case "$MODE" in
     consistency) mode_consistency ;;
+    checkstamp) mode_checkstamp ;;
     selftest) mode_selftest ;;
     list) read_inventory_rows | awk -F'\t' '{ printf "%-8s %-6s %s\n", $1, $3, $2 }' ;;
     run) mode_run ;;

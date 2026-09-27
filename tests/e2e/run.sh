@@ -751,7 +751,12 @@ check_consistency() {
         case "$command" in
             ''|\#*) continue ;;
         esac
-        if ! grep -qF -- "$command" "$CASES_DIR"/*.sh 2>/dev/null; then
+        # Anchored coverage: a command counts as covered only when a case
+        # file invokes "$AUB_BIN", optionally followed by -v flags, then
+        # the command as a whole word. A bare substring test once counted
+        # prose, flag values and subcommand arguments as cases.
+        anchored_re='"\$AUB_BIN"([[:space:]]+-v)*[[:space:]]+'"${command}"'([[:space:]]|$)'
+        if ! grep -qE -- "$anchored_re" "$CASES_DIR"/*.sh 2>/dev/null; then
             echo "consistency: no end-to-end case for command '$command'" >&2
             missing=1
         fi
@@ -967,7 +972,8 @@ FAKE
 }
 
 # self_test_consistency: a command covered by a case passes; the same surface
-# with an uncovered command added fails, naming it.
+# with an uncovered command added fails, naming it; a file that only mentions
+# the command in prose fails, naming it; a flagged invocation passes.
 self_test_consistency() {
     local tmp cases surface
     tmp="$(mktemp -d)"
@@ -976,7 +982,9 @@ self_test_consistency() {
     cat >"$cases/001-x.sh" <<'CASE'
 CASE_ID="001-x"
 # exercises: status
-case_steps() { :; }
+case_steps() {
+    step "x" "$AUB_BIN" status
+}
 case_assertions() { :; }
 CASE
     surface="$tmp/surface.txt"
@@ -991,6 +999,42 @@ CASE
     printf 'status\nspend\n' >"$surface"
     if (CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency >/dev/null 2>&1); then
         echo "self-test: consistency check missed an uncovered command" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+
+    local prose="$tmp/prose" out
+    mkdir -p "$prose"
+    cat >"$prose/001-prose.sh" <<'CASE'
+CASE_ID="001-prose"
+# the status command renders the projection; this case only talks about it
+case_steps() { step "status is discussed"; }
+case_assertions() { :; }
+CASE
+    if out="$(CASES_DIR="$prose" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+        echo "self-test: prose-only status mention was accepted as coverage" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *"no end-to-end case for command 'status'"*) : ;;
+        *) echo "self-test: the prose-only failure did not name status: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+
+    local flagged="$tmp/flagged"
+    mkdir -p "$flagged"
+    cat >"$flagged/001-flagged.sh" <<'CASE'
+CASE_ID="001-flagged"
+case_steps() {
+    step "verbose status" "$AUB_BIN" -v status
+}
+case_assertions() { :; }
+CASE
+    printf 'status\n' >"$surface"
+    if ! (CASES_DIR="$flagged" SURFACE_FILE="$surface" check_consistency >/dev/null 2>&1); then
+        echo "self-test: consistency check failed a flagged invocation" >&2
         rm -rf "$tmp"
         return 1
     fi

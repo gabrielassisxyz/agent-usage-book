@@ -65,7 +65,17 @@ run below is recorded as pass or fail only.
 
 Last successful full run: 2026-09-21 (bin/guard-mutations, scope all, 82 rows)
 
-The runner rewrites this line itself on a full-scope pass.
+The runner rewrites this line itself on a full-scope pass, and deletes any
+Replayed singly since lines below it. A Replayed singly since line records
+one row the stamp count does not reach that was replayed singly since with a
+GUARD-OK result: bin/guard-mutations --only <guard> appends one under the
+stamp, dated, and a full-scope pass clears the list when it rewrites the
+stamp. The gate (bin/checks/81-guard-inventory-stamp, through
+bin/guard-mutations --check-stamp) requires every table row to be counted by
+the stamp or named in the list. The stamp covers the first N table rows in
+file order, and rows land appended, so a row beyond the stamp needs its
+singly line. The count-only stamp cannot tell a removed row plus an added
+row apart; that case stays visible in review.
 
 ## Machine-readable inventory
 
@@ -176,6 +186,8 @@ sh-35	aub-migration-bumps-e2e-schema-pin-un2g	shell	bin/checks/80-gate-coverage 
 c-36	aub-a56a	cargo	cargo test --lib store::connection::tests::opening_a_second_connection_keeps_the_first_connections_shared_lock	python	src/store/connection.rs	import pathlib; p=pathlib.Path("src/store/connection.rs"); t=p.read_text(); old="    let held = handles"; assert t.count(old)==1; new="    let _probe = File::open(path).unwrap();"+chr(10)+old; p.write_text(t.replace(old,new,1))		opening a second connection released the first connection's shared lock	cargo test --lib store::connection::tests::probe_database_header_refuses_leaf_btree_page_at_offset_zero	0	test result:
 c-37	aub-i2i9	cargo	cargo test --test antigravity_token_refresh extracting_client_material_from_a_large_binary_does_not_hold_it_in_memory	replace	src/auth/token_endpoint.rs	const AGY_SCAN_CHUNK_BYTES: usize = 1 << 20;	const AGY_SCAN_CHUNK_BYTES: usize = 64 * 1024 * 1024;	aub peaked at .*bound	cargo test --test antigravity_token_refresh a_rejected_client_pairing_records_refresh_configuration_failed	0	test result:
 c-39	aub-p7o9	cargo	cargo test --test ingest_delete_index_plan	replace	src/store/migrations/0023_usage_occurrence_ingest_indexes.rs	CREATE INDEX idx_usage_occurrence_event_id ON usage_occurrence (event_id);\nCREATE INDEX idx_usage_occurrence_source_file ON usage_occurrence (source_file);		idx_usage_occurrence_source_file|idx_usage_occurrence_event_id	cargo test --lib domain::tokens	0	test result: ok
+sh-38	aub-kzmj	shell	bin/guard-mutations --check-stamp --inventory "$SCRATCH/docs/guard-inventory.md"	python	docs/guard-inventory.md	import re\np = "docs/guard-inventory.md"\nls = open(p).read().split(chr(10))\nn = 0\nfor l in ls:\n    if l.startswith("sh-38" + chr(9)):\n        break\n    if re.match("^(sh|c|e|syn)-[0-9a-z-]+", l) and chr(9) in l:\n        n = n + 1\nt = chr(10).join(ls)\nt = re.sub("(?m)^Last successful full run:.*", "Last successful full run: 2000-01-01 (bin/guard-mutations, scope all, " + str(n) + " rows)", t, count=1)\nopen(p, "w").write(t)		sh-38	bin/checks/70-quantity-inventory	0	every pub struct/enum
+sh-39	aub-kzmj	shell	tests/e2e/run.sh --self-test	sed	tests/e2e/run.sh	s|grep -qE -- "\$anchored_re"|grep -qF -- "\$command"|		prose-only status mention was accepted	bin/checks/70-quantity-inventory	0	every pub struct/enum
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness
