@@ -63,7 +63,7 @@ run below is recorded as pass or fail only.
 
 ## Last successful full run
 
-Last successful full run: 2026-09-21 (bin/guard-mutations, scope all, 82 rows)
+Last successful full run: 2026-09-27 (bin/guard-mutations, scope all, 89 rows)
 
 The runner rewrites this line itself on a full-scope pass, and deletes any
 Replayed singly since lines below it. A Replayed singly since line records
