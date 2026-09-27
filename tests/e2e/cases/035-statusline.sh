@@ -51,7 +51,8 @@ statusline_step() {
             "HOME=$STATE_DIR/home"
             "AUB_CONFIG_FILE=$STATE_DIR/aub.toml"
             "AUB_STATE_DIR=$STATE_DIR"
-            "SHALLOW_PROFILE=$profile")
+            "SHALLOW_PROFILE=$profile"
+            "AUB_BIN=$AUB_BIN")
     else
         # Not naming the variable is not enough: env passes the calling
         # shell's own SHALLOW_PROFILE through, and the profile-less render
@@ -63,9 +64,14 @@ statusline_step() {
             -u SHALLOW_PROFILE
             "HOME=$STATE_DIR/home"
             "AUB_CONFIG_FILE=$STATE_DIR/aub.toml"
-            "AUB_STATE_DIR=$STATE_DIR")
+            "AUB_STATE_DIR=$STATE_DIR"
+            "AUB_BIN=$AUB_BIN")
     fi
-    step "$name" "${env_args[@]}" sh -c 'cat "$1" | "$2" statusline' _ "$payload" "$AUB_BIN"
+    # A step's own stdin is always /dev/null (see step() in run.sh), so the
+    # payload can only reach the binary through a shell that opens the file
+    # itself. AUB_BIN travels as an env var rather than a positional
+    # parameter (aub-utyl) so the invocation below reads directly.
+    step "$name" "${env_args[@]}" sh -c '"$AUB_BIN" statusline < "'"$payload"'"'
 }
 
 case_steps() {
