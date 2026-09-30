@@ -146,6 +146,13 @@ pub struct AnthropicStatuslineSource {
     /// and the line is ignored. One definition in the sampling policy, read
     /// here, never a second copy of the cadence inside the adapter.
     pub fresh_window: MonotonicDuration,
+    /// Try the endpoint before the line on this tick (`aub-zygi`). Set by
+    /// the caller when the account's newest full reading is a freshness
+    /// horizon old: a line reading is a window subset that never displaces
+    /// a full one, so an account in constant use would otherwise never get
+    /// one. The line still answers when the endpoint does not measure, so an
+    /// expired stored token keeps reading the line as before.
+    pub endpoint_first: bool,
 }
 
 /// One provider-defined constraint kind an adapter requires in a successful

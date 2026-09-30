@@ -127,6 +127,24 @@ impl Default for AnthropicAdapter {
     }
 }
 
+/// Whether a tick must take the endpoint even though a fresh status line
+/// exists (`aub-zygi`). A status-line reading is a window subset that never
+/// displaces a full reading, so an account Claude Code renders all day would
+/// otherwise keep its last full reading until it ages out and renders stale.
+/// Due when there is no full reading, or when the newest one is at least one
+/// freshness horizon old.
+pub fn full_reading_due(
+    newest_full: Option<UtcTimestamp>,
+    now: UtcTimestamp,
+    horizon: MonotonicDuration,
+) -> bool {
+    let Some(newest_full) = newest_full else {
+        return true;
+    };
+    let age = i128::from(now.unix_nanos()) - i128::from(newest_full.unix_nanos());
+    age >= i128::from(horizon.as_nanos())
+}
+
 impl AnthropicAdapter {
     pub const DEFAULT_ENDPOINT: &'static str = "https://api.anthropic.com/api/oauth/usage";
     pub const ANTHROPIC_BETA_HEADER: &'static str = "oauth-2025-04-20";
@@ -1009,9 +1027,19 @@ impl ProviderAdapter for AnthropicAdapter {
         // its expiry. A reading from the line is also the fresher one, so a
         // credential problem is allowed to surface through the endpoint path
         // it actually belongs to: when no fresh line exists.
-        if let Some(source) = &request.anthropic_statusline
-            && let Some(captured) = self.observe_statusline(credential, source, transport, clock)
-        {
+        let Some(source) = &request.anthropic_statusline else {
+            return self.observe_endpoint(credential, request, transport, clock);
+        };
+        if source.endpoint_first {
+            let endpoint = self.observe_endpoint(credential, request, transport, clock);
+            if matches!(endpoint.observation, ProviderObservation::Measured(_)) {
+                return endpoint;
+            }
+            return self
+                .observe_statusline(credential, source, transport, clock)
+                .unwrap_or(endpoint);
+        }
+        if let Some(captured) = self.observe_statusline(credential, source, transport, clock) {
             return captured;
         }
         self.observe_endpoint(credential, request, transport, clock)
@@ -1397,6 +1425,23 @@ mod tests {
         assert!(!endpoint.is_statusline_sourced());
         assert_eq!(endpoint.source_measurement_basis(), None);
         assert!(!endpoint.window_set_is_subset());
+    }
+
+    #[test]
+    fn a_full_reading_is_due_once_the_newest_one_is_a_horizon_old() {
+        let horizon = MonotonicDuration::from_seconds(720);
+        let now = UtcTimestamp::from_unix_nanos(10_000_000_000_000);
+        let at_age = |nanos: i64| Some(UtcTimestamp::from_unix_nanos(now.unix_nanos() - nanos));
+        let horizon_nanos = horizon.as_nanos() as i64;
+
+        assert!(full_reading_due(None, now, horizon), "no full reading");
+        assert!(!full_reading_due(at_age(horizon_nanos - 1), now, horizon));
+        assert!(full_reading_due(at_age(horizon_nanos), now, horizon));
+        assert!(full_reading_due(at_age(horizon_nanos + 1), now, horizon));
+        assert!(
+            !full_reading_due(at_age(-1), now, horizon),
+            "a reading dated ahead of the tick is not old"
+        );
     }
 
     #[test]
