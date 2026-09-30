@@ -153,6 +153,32 @@ fn last_successful_observation(
     }))
 }
 
+/// When the account's newest full reading was received, over the same walk
+/// and the same contract test [`last_successful_observation`] uses, or `None`
+/// when that walk holds no full reading (`aub-zygi`). The sampler asks this
+/// to decide whether a fresh status line may stand in for the endpoint: a
+/// full reading the walk cannot reach is one the projection cannot render
+/// either, so both answers must come from one definition.
+pub fn newest_full_observation_received_at(
+    conn: &Connection,
+    account_id: AccountId,
+) -> Result<Option<crate::domain::time::UtcTimestamp>, Error> {
+    let mut received_at = None;
+    meter_evidence::visit_newest_observations_for_account(
+        conn,
+        account_id,
+        SUCCESSFUL_OBSERVATION_SCAN_CAP,
+        |observation| {
+            if observation.provider_contract_id.as_str() == ANTHROPIC_STATUSLINE_CONTRACT_ID {
+                return ControlFlow::Continue(());
+            }
+            received_at = Some(observation.received_at);
+            ControlFlow::Break(())
+        },
+    )?;
+    Ok(received_at)
+}
+
 /// Test support shared by this module's tests and by the projection module's
 /// mapping tests: a seeded scratch database with one account, one run and one
 /// policy snapshot, plus the helpers to run attempts and terminal bundles
@@ -590,6 +616,40 @@ mod tests {
                 .observation
                 .attempt_id,
             full_attempt
+        );
+    }
+
+    #[test]
+    fn the_newest_full_reading_time_skips_newer_statusline_subsets() {
+        let mut fixture = fixture("newest-full-time");
+        let full_attempt = fixture.start_attempt();
+        fixture.commit_success_bundle(full_attempt);
+        let subset_attempt = fixture.start_attempt();
+        fixture.commit_statusline_success_bundle(subset_attempt);
+
+        let states = account_meter_states(&fixture.conn).unwrap();
+        let full = &states[0].last_success.as_ref().unwrap().observation;
+        assert_eq!(full.attempt_id, full_attempt);
+        assert_eq!(
+            newest_full_observation_received_at(&fixture.conn, fixture.account_id).unwrap(),
+            Some(full.received_at)
+        );
+    }
+
+    #[test]
+    fn the_newest_full_reading_time_is_absent_without_a_full_reading() {
+        let mut fixture = fixture("newest-full-absent");
+        assert_eq!(
+            newest_full_observation_received_at(&fixture.conn, fixture.account_id).unwrap(),
+            None,
+            "no attempts at all"
+        );
+        let subset_attempt = fixture.start_attempt();
+        fixture.commit_statusline_success_bundle(subset_attempt);
+        assert_eq!(
+            newest_full_observation_received_at(&fixture.conn, fixture.account_id).unwrap(),
+            None,
+            "status-line subsets only"
         );
     }
 

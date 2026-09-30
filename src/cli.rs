@@ -1799,13 +1799,42 @@ pub(crate) fn sample_command(
             },
         )?;
 
+        let mut request = meter_request_for_account(acc, &config);
+        if request.anthropic_statusline.is_some() {
+            let newest_full = match crate::store::account::account_id_by_identity(
+                &conn,
+                &acc.provider,
+                &acc.name,
+            )? {
+                Some(account_id) => {
+                    crate::store::projection_source::newest_full_observation_received_at(
+                        &conn, account_id,
+                    )?
+                }
+                None => None,
+            };
+            if crate::meter::anthropic::full_reading_due(
+                newest_full,
+                clock.now(),
+                config.freshness.meter,
+            ) {
+                request.anthropic_statusline = None;
+                if invocation.verbosity > 0 {
+                    eprintln!(
+                        "sample: account={} statusline bypassed: newest full reading is at least one freshness horizon old",
+                        acc.name
+                    );
+                }
+            }
+        }
+
         batch_accounts.push(crate::meter::sampler::BatchAccount {
             name: crate::store::sampling_lease::AccountName::new(&acc.name),
             provider_key: acc.provider.clone(),
             adapter,
             credential: credential_handle,
             credential_context_id,
-            request: meter_request_for_account(acc, &config),
+            request,
             policy: resolved_policy,
             reset_edge_lead: config.sampling.reset_edge_lead,
             retry_after_cap: config.sampling.retry_after_cap,
