@@ -64,6 +64,7 @@ run below is recorded as pass or fail only.
 ## Last successful full run
 
 Last successful full run: 2026-09-27 (bin/guard-mutations, scope all, 89 rows)
+Replayed singly since: sh-40 2026-09-30
 
 The runner rewrites this line itself on a full-scope pass, and deletes any
 Replayed singly since lines below it. A Replayed singly since line records
@@ -188,6 +189,7 @@ c-37	aub-i2i9	cargo	cargo test --test antigravity_token_refresh extracting_clien
 c-39	aub-p7o9	cargo	cargo test --test ingest_delete_index_plan	replace	src/store/migrations/0023_usage_occurrence_ingest_indexes.rs	CREATE INDEX idx_usage_occurrence_event_id ON usage_occurrence (event_id);\nCREATE INDEX idx_usage_occurrence_source_file ON usage_occurrence (source_file);		idx_usage_occurrence_source_file|idx_usage_occurrence_event_id	cargo test --lib domain::tokens	0	test result: ok
 sh-38	aub-kzmj	shell	bin/guard-mutations --check-stamp --inventory "$SCRATCH/docs/guard-inventory.md"	python	docs/guard-inventory.md	import re\np = "docs/guard-inventory.md"\nls = open(p).read().split(chr(10))\nn = 0\nfor l in ls:\n    if l.startswith("sh-38" + chr(9)):\n        break\n    if re.match("^(sh|c|e|syn)-[0-9a-z-]+", l) and chr(9) in l:\n        n = n + 1\nt = chr(10).join(ls)\nt = re.sub("(?m)^Last successful full run:.*", "Last successful full run: 2000-01-01 (bin/guard-mutations, scope all, " + str(n) + " rows)", t, count=1)\nopen(p, "w").write(t)		sh-38	bin/checks/70-quantity-inventory	0	every pub struct/enum
 sh-39	aub-kzmj	shell	tests/e2e/run.sh --self-test	sed	tests/e2e/run.sh	s|grep -qE -- "\$anchored_re"|grep -qF -- "\$command"|		prose-only status mention was accepted	bin/checks/70-quantity-inventory	0	every pub struct/enum
+sh-40	aub-pbx4.1	shell	bin/checks/86-file-size-ratchet	replace	src/cli.rs	#[cfg(test)]	const _GUARD_PROBE_0: u8 = 0;\nconst _GUARD_PROBE_1: u8 = 0;\nconst _GUARD_PROBE_2: u8 = 0;\nconst _GUARD_PROBE_3: u8 = 0;\nconst _GUARD_PROBE_4: u8 = 0;\nconst _GUARD_PROBE_5: u8 = 0;\nconst _GUARD_PROBE_6: u8 = 0;\nconst _GUARD_PROBE_7: u8 = 0;\nconst _GUARD_PROBE_8: u8 = 0;\nconst _GUARD_PROBE_9: u8 = 0;\n#[cfg(test)]	src/cli\.rs grew past its ceiling	bin/checks/70-quantity-inventory	0	every pub struct/enum
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness

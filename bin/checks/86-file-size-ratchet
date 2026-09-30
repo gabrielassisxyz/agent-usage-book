@@ -1,0 +1,248 @@
+#!/usr/bin/env bash
+# aub-pbx4.1: the file-size convention, enforced as a ratchet.
+#
+# A file at or under the threshold may not cross it, and a file already above it
+# may not grow past the ceiling recorded here. A flat limit was rejected by the
+# audit aub-pbx4: no file in this crate was created near 2,500 lines, they all
+# grew there, so a flat limit would ship with three exemptions and never fire.
+#
+# WHY non-test lines only: any whole-file measure is satisfied by moving a test
+# module to a sibling file, which changes nothing a reader experiences. Five of
+# the crate's eight largest files would have complied that way.
+#
+# WHY code lines only: a dense WHY-comment is the opposite of the problem this
+# check exists to catch, so a line whose first non-whitespace is `//` does not
+# count, and neither does a blank one.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+THRESHOLD=2500
+
+# The ceiling list: every file above the threshold, with the count it may not
+# exceed. Ceilings move down, never up. A bead that wants one raised has misread
+# this check: the answer is a split, or an argued edit to the audit's decision.
+#
+# Recorded on the tree this check first had to pass on. The audit's own table was
+# measured at 217f835, and two of its three numbers were already stale by 187 and
+# 376 lines when this check was written, because render.rs and json.rs kept
+# growing while the ratchet did not exist yet. Only src/cli.rs moved the right
+# way over the same span, from 8306 down to 2706, when the split beads landed.
+builtin_ceilings() {
+    cat <<'CEILINGS'
+src/cli.rs	2706
+src/presentation/render.rs	3043
+src/presentation/json.rs	3052
+CEILINGS
+}
+
+# count_code_lines FILE: non-test code lines. The count stops at the file's
+# first column-zero `#[cfg(test)]`; a file without one is counted whole. The
+# grep is the audit's own counting command.
+count_code_lines() {
+    awk '/^#\[cfg\(test\)\]/ { exit } { print }' "$1" | grep -vcE '^\s*(//|$)'
+}
+
+# ceiling_of SPEC FILE: the recorded ceiling, or nothing when the file is not
+# on the list.
+ceiling_of() {
+    awk -F'\t' -v want="$2" '$1 == want { print $2; exit }' "$1"
+}
+
+# ratchet_ok ROOT SPEC: the whole rule over one tree. Every failure is named on
+# stderr with the numbers that decided it, because "a file is too big" without
+# the count is not actionable.
+ratchet_ok() {
+    local root="$1" spec="$2" fail=0 file ceiling count
+
+    # A ceiling cannot outlive its file. Without this the list quietly stops
+    # meaning anything: the file is gone, nothing is measured, and the entry
+    # still reads as coverage.
+    while IFS=$'\t' read -r file ceiling; do
+        [ -n "$file" ] || continue
+        if [ ! -f "$root/$file" ]; then
+            echo "file-size-ratchet: ceiling names a file that does not exist: $file (ceiling $ceiling)" >&2
+            fail=1
+        fi
+    done <"$spec"
+
+    while IFS= read -r file; do
+        [ -n "$file" ] || continue
+        count="$(count_code_lines "$root/$file")"
+        ceiling="$(ceiling_of "$spec" "$file")"
+        if [ -n "$ceiling" ]; then
+            if [ "$count" -gt "$ceiling" ]; then
+                echo "file-size-ratchet: $file grew past its ceiling: $count non-test code lines, ceiling $ceiling" >&2
+                fail=1
+            fi
+        elif [ "$count" -gt "$THRESHOLD" ]; then
+            echo "file-size-ratchet: $file crossed the threshold: $count non-test code lines, threshold $THRESHOLD" >&2
+            fail=1
+        fi
+    done < <(cd "$root" && find src -type f -name '*.rs' | sort)
+
+    [ "$fail" -eq 0 ]
+}
+
+# --- self-test ---------------------------------------------------------------
+# Every case builds a throwaway tree and never reads the real src/. The positive
+# and the negative of each pair differ only in the dimension under test, which is
+# what proves the check reads the threshold rather than the file.
+
+emit_code_lines() {  # $1 = how many, $2 = constant-name prefix
+    local n="$1" prefix="$2" i=0
+    while [ "$i" -lt "$n" ]; do
+        printf 'const %s_%d: u8 = 0;\n' "$prefix" "$i"
+        i=$((i + 1))
+    done
+}
+
+emit_interleaved() {  # $1 = code lines, $2 = comment lines
+    local code="$1" comments="$2" i=0 j=0
+    while [ "$i" -lt "$code" ]; do
+        printf 'const C_%d: u8 = 0;\n' "$i"
+        if [ "$j" -lt "$comments" ]; then
+            printf '// a comment line, which does not count\n'
+            j=$((j + 1))
+        fi
+        i=$((i + 1))
+    done
+    while [ "$j" -lt "$comments" ]; do
+        printf '// a comment line, which does not count\n'
+        j=$((j + 1))
+    done
+}
+
+scratch_tree() {  # $1 = scratch base, $2 = name; prints the tree root
+    local root="$1/$2"
+    mkdir -p "$root/src"
+    printf '%s\n' "$root"
+}
+
+selftest() {
+    local base fail=0 root spec out
+    base="$(mktemp -d "${TMPDIR:-/tmp}/aub-file-size-ratchet-XXXXXX")"
+
+    # Case 1a, positive: a file one code line under the threshold passes.
+    root="$(scratch_tree "$base" at-threshold)"
+    spec="$root/ceilings.tsv"
+    : >"$spec"
+    emit_code_lines 2499 A >"$root/src/big.rs"
+    if ! out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: 2499 code lines was refused: $out" >&2
+        fail=1
+    fi
+
+    # Case 1b, the negative of that pair: one more code line, same file.
+    root="$(scratch_tree "$base" over-threshold)"
+    spec="$root/ceilings.tsv"
+    : >"$spec"
+    emit_code_lines 2501 A >"$root/src/big.rs"
+    if out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: 2501 code lines was accepted" >&2
+        fail=1
+    else
+        case "$out" in
+            *"src/big.rs crossed the threshold: 2501 non-test code lines, threshold 2500"*) : ;;
+            *) echo "file-size-ratchet self-test: the crossing was not named with both numbers: $out" >&2
+               fail=1 ;;
+        esac
+    fi
+
+    # Case 2, planted negative: the same 2499 lines plus a 3000-line test
+    # module. A whole-file count fails this, which is the point of the check.
+    root="$(scratch_tree "$base" test-module)"
+    spec="$root/ceilings.tsv"
+    : >"$spec"
+    { emit_code_lines 2499 A; printf '#[cfg(test)]\nmod tests {\n'; emit_code_lines 3000 T; printf '}\n'; } >"$root/src/big.rs"
+    if ! out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: a 3000-line test module tripped the check: $out" >&2
+        fail=1
+    fi
+
+    # Case 3, planted negative: 1000 comment lines interleaved with the same
+    # 2499 code lines.
+    root="$(scratch_tree "$base" comments)"
+    spec="$root/ceilings.tsv"
+    : >"$spec"
+    emit_interleaved 2499 1000 >"$root/src/big.rs"
+    if ! out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: 1000 comment lines tripped the check: $out" >&2
+        fail=1
+    fi
+
+    # Case 4: a file on the ceiling list, one code line past its ceiling.
+    root="$(scratch_tree "$base" ceiling-growth)"
+    spec="$root/ceilings.tsv"
+    printf 'src/cli.rs\t2706\n' >"$spec"
+    emit_code_lines 2707 A >"$root/src/cli.rs"
+    if out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: growth past a ceiling was accepted" >&2
+        fail=1
+    else
+        case "$out" in
+            *"src/cli.rs grew past its ceiling: 2707 non-test code lines, ceiling 2706"*) : ;;
+            *) echo "file-size-ratchet self-test: the ceiling growth was not named: $out" >&2
+               fail=1 ;;
+        esac
+    fi
+
+    # Case 5: the same file 100 lines shorter passes without editing the
+    # ceiling, so a split lands in one commit rather than two.
+    root="$(scratch_tree "$base" ceiling-shrink)"
+    spec="$root/ceilings.tsv"
+    printf 'src/cli.rs\t2706\n' >"$spec"
+    emit_code_lines 2606 A >"$root/src/cli.rs"
+    if ! out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: a shrunk file was refused: $out" >&2
+        fail=1
+    fi
+
+    # Case 6: a ceiling naming a file that is not there.
+    root="$(scratch_tree "$base" stale-ceiling)"
+    spec="$root/ceilings.tsv"
+    printf 'src/gone.rs\t2706\n' >"$spec"
+    emit_code_lines 10 A >"$root/src/kept.rs"
+    if out="$(ratchet_ok "$root" "$spec" 2>&1)"; then
+        echo "file-size-ratchet self-test: a ceiling naming a missing file was accepted" >&2
+        fail=1
+    else
+        case "$out" in
+            *"ceiling names a file that does not exist: src/gone.rs"*) : ;;
+            *) echo "file-size-ratchet self-test: the stale ceiling was not named: $out" >&2
+               fail=1 ;;
+        esac
+    fi
+
+    rm -rf "$base"
+    if [ "$fail" -eq 0 ]; then
+        echo "file-size-ratchet self-test: threshold, test-module exemption, comment exemption, ceiling growth, ceiling shrink and stale ceiling all behave."
+    fi
+    [ "$fail" -eq 0 ]
+}
+
+selftest_only=0
+case "${1:-}" in
+    --selftest) selftest_only=1 ;;
+esac
+
+rc=0
+if ! selftest; then
+    echo "==> file-size-ratchet FAILED (self-test)" >&2
+    rc=1
+fi
+
+if [ "$rc" -eq 0 ] && [ "$selftest_only" -eq 0 ]; then
+    live_spec="$(mktemp "${TMPDIR:-/tmp}/aub-file-size-ceilings-XXXXXX")"
+    builtin_ceilings >"$live_spec"
+    if ratchet_ok "$repo_root" "$live_spec"; then
+        echo "file-size-ratchet: no file under src/ is over its ceiling or past the ${THRESHOLD}-line threshold."
+    else
+        echo "==> file-size-ratchet FAILED (split the file named above; the ceilings in this check move down, never up)" >&2
+        rc=1
+    fi
+    rm -f "$live_spec"
+fi
+
+exit "$rc"

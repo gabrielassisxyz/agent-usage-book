@@ -109,9 +109,10 @@ bin/slop-guard
 
 `bin/ci` is the full gate: toolchain identity, format (`cargo fmt`), lint (`cargo clippy`),
 test, dependency audit, boundary rules and their selftest, prose guard (`bin/slop-guard`), e2e,
-quantity inventory, commit protocol, pane work cycle, batch-verify close, and gate
-coverage. It is the exact thing CI runs, so green locally means green in CI, which is
-true only because the first check refuses to let the rest run under a different compiler.
+quantity inventory, commit protocol, pane work cycle, batch-verify close, gate coverage,
+and file size ratchet. It is the exact thing CI runs, so green locally means green in CI,
+which is true only because the first check refuses to let the rest run under a different
+compiler.
 
 **The pane runs a named subset, and the subset is chosen by measurement rather than by
 category.** Those three commands are what a pane runs before moving a bead to
@@ -144,6 +145,24 @@ isolation `bin/ci` sets up.** A binary out of `target/` can be another pane's bu
 **Beyond that subset, no pane builds, and it is enforced.** See *Swarm operations*: the
 orchestrator kills per-agent test and full-build processes every tick, because N agents
 building the same crate is the bottleneck the wave model exists to remove.
+
+## File Size: a Ratchet at 2,500 Code Lines
+
+**No `.rs` file under `src/` may exceed 2,500 non-test code lines**, and
+`bin/checks/86-file-size-ratchet` enforces it.
+
+- **It counts code lines, not comment lines.** A line counts unless it is blank or its first
+  non-whitespace is `//`. A dense WHY-comment is the opposite of the problem this rule
+  exists to catch, so it must not push a file toward a split.
+- **It counts non-test lines only.** The count stops at the file's first column-zero
+  `#[cfg(test)]`; a file without one is counted whole. Any whole-file measure is satisfied by
+  moving a test module to a sibling file, which changes nothing a reader experiences, and
+  five of the crate's eight largest files would have complied that way.
+- **It is a ratchet, not a flat limit.** A file at or under the threshold may not cross it, and
+  a file already above it may not grow past the ceiling recorded in the check. Those ceilings
+  move down, never up: the answer to a ceiling in the way is a split, not a larger number. A
+  flat limit would have shipped with three exemptions and never fired, because no file in this
+  crate was created near 2,500 lines and they all grew there.
 
 ## Testing
 
