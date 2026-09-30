@@ -22,16 +22,31 @@ session. Say exactly what would be removed, and wait for the answer. Under one s
 tree a deletion also destroys work belonging to a pane that is still running, and none of
 it is recoverable.
 
-## RULE 2: NO WORKTREES, ONE SHARED TREE
+## RULE 2: THE DELIVERY MODE COMES FROM THE BRIEF
 
-No pane creates a worktree. No pane creates a branch of its own. Every agent works in the
-same checkout, on the same branch, and coordinates through the three protections below
-rather than through filesystem isolation. The reasoning, and what replaces the isolation,
-is in *Coordination under one shared tree*.
+How work reaches `main` is decided by the brief of the task, never by this file alone. Two
+modes exist, and an agent is in exactly one of them:
 
-`bin/worktree` is tracked here anyway, because the repo harness installs one copy of it in
-every repository it manages. It is not for panes. Nothing in this file ever calls it, and a
-pane that reaches for it because it is sitting there has broken this rule.
+- **Default mode: worktree, own branch, pull request.** With no brief, or a brief that says
+  nothing about delivery, create a worktree with `bin/worktree new <type>/<kebab-desc>`,
+  commit on that branch, push it, open a pull request, and let CI be the gate; the pull
+  request merges when green and the worktree is removed afterwards. This is the mode an
+  orchestrator that lands one task at a time uses, and the mode a session with nobody else
+  in the tree uses.
+- **Shared-tree mode: one checkout, `main`, no branch of your own.** Selected only by a swarm
+  brief that says so. Every agent then works in the same checkout, on the same branch, and
+  coordinates through the three protections in *Coordination under one shared tree* rather
+  than through filesystem isolation. Every sentence in this file that speaks of panes, of
+  the shared index, of reservations or of pushing to `main` after each commit belongs to
+  this mode and is silent in the other.
+
+The two modes exist because the swarm and the single-lane paths were measured to need
+different isolation: branch-per-agent is merge hell for eight panes editing one crate at
+once, and a shared tree is a trap for one agent that nobody else is coordinating with. The
+brief is where that choice is already made, so the contract follows it instead of fixing one.
+
+`bin/worktree` is the tool of the default mode. In shared-tree mode nothing in this file
+calls it, and a pane that reaches for it because it is sitting there has broken this rule.
 
 ## Irreversible Git and Filesystem Actions - DO NOT EVER BREAK GLASS
 
@@ -46,13 +61,15 @@ Before assuming a commit was lost, check rather than repair:
 
 ## Git Branch: ONLY `main`, NEVER `master`
 
-`main` is the default branch and the only branch this repository has. Panes commit to it
-and push, with no branch of their own and no pull request in the path. This is the method's
-own position, adopted whole: branch-per-agent is merge hell, and a logical conflict between
+`main` is the default branch and the only long-lived branch this repository has; `master`
+is never created. In the default mode a task branch exists from its worktree until its
+pull request merges, and nothing else lives beside `main`. In shared-tree mode panes commit
+to `main` and push, with no branch of their own: that is the method's own position for a
+swarm, adopted whole, because branch-per-agent is merge hell, and a logical conflict between
 two beads surfaces faster when both land on one branch than when they sit in two.
 
-CI runs on every push to `main`, so the gate sits between a commit and the branch anyone
-else reads either way.
+CI runs on every push to `main` and on every pull request, so the gate sits between a
+commit and the branch anyone else reads in both modes.
 
 **An earlier version of this section described a shared feature branch reaching `main` as
 one reviewable pull request after the hardening gate.** That branch was never created. Every
@@ -457,8 +474,10 @@ Agents want to build, to prove their work. The model is enforced, not requested.
 
 ## Coordination Under One Shared Tree
 
-Under one shared tree two panes editing one file clobber each other and nothing reports
-it, so the three protections below are conditions of implementing at all. **A pane that
+This section applies in shared-tree mode only (Rule 2); in the default mode the branch is
+the isolation, and none of it is required. Under one shared tree two panes editing one file
+clobber each other and nothing reports it, so the three protections below are conditions of
+implementing at all. **A pane that
 cannot verify all three does not edit: it names the one that is down and stops.**
 
 | protection | what it covers | how a pane gets it |
@@ -600,6 +619,10 @@ are not set up. Verify, do not assume.
    that does not refuse is not installed.
 
 ### Picking up work
+
+These steps are the shared-tree mode's. In the default mode the equivalent of step 1 is
+`bin/worktree new <type>/<kebab-desc>` from a fresh `origin/main`, and steps 2 to 4 do not
+apply.
 
 1. Confirm the working tree and the branch. Do not create or switch to another.
 2. Register with Agent Mail and use the name it assigns as the actor everywhere below.
@@ -784,14 +807,20 @@ A session is not finished until the work is visible to everyone else.
 
 1. File the remaining work as beads rather than as prose in a message.
 2. Release every reservation you still hold.
-3. Run the gate your phase allows. **During a wave that is `cargo check` and nothing more**,
-   because the orchestrator kills per-agent builds every tick and a `bin/ci` started here
-   dies mid-run; proof is the batch-verify pass's job, and a bead reaching `batch_pending`
-   is what asks for it. `bin/ci` is the right closing gate only outside a wave, when no
-   orchestrator is reaping and the tree is yours.
-4. Commit with the path-scoped form from *Committing into a shared index*, then push.
+3. Run the gate your phase allows. In the default mode that is the pane-local subset
+   before every commit (`cargo check -p agent-usage-book`, `cargo fmt --check`,
+   `bin/slop-guard`) and CI on the pull request as the full gate; run `bin/ci` yourself
+   only when the brief asks for it. In shared-tree mode, **during a wave that is `cargo
+   check` and nothing more**, because the orchestrator kills per-agent builds every tick
+   and a `bin/ci` started here dies mid-run; proof is the batch-verify pass's job, and a
+   bead reaching `batch_pending` is what asks for it. `bin/ci` is the right closing gate
+   only outside a wave, when no orchestrator is reaping and the tree is yours.
+4. Commit, then push. In the default mode: commit on your branch, push it, open the pull
+   request with the bead id in its title, and stop; the merge happens when CI is green,
+   and the worktree is removed after it. In shared-tree mode: commit with the path-scoped
+   form from *Committing into a shared index*, then push to `main`.
 
-   **If the push is rejected because the branch moved, merge. Never rebase.**
+   **If a push to `main` is rejected because the branch moved, merge. Never rebase.**
 
    ```bash
    git fetch origin && git merge origin/main
