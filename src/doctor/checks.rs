@@ -1585,10 +1585,13 @@ fn subscription_identity_change(ctx: &DoctorContext) -> CheckOutcome {
                         ));
                     } else {
                         refusing.push(format!(
-                            "{}: subscription changed from '{}' to '{}' (change id={}); readings refused, see docs/subscription-identity-change.md",
+                            "{}: subscription changed from '{}' to '{}' (change id={}); readings refused; if only the label changed run `aub account accept-identity {} {} {}`, otherwise see docs/subscription-identity-change.md",
                             account.name,
                             previous,
                             event.current_identity,
+                            event.row_id.value(),
+                            account.provider,
+                            account.name,
                             event.row_id.value(),
                         ));
                     }

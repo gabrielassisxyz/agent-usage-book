@@ -918,7 +918,9 @@ impl Command {
             Command::CanRun => {
                 Some("[BEAD-ID | --task-kind TYPE] --account NAME --task-model MODEL [--cached]")
             }
-            Command::Account => Some("list | rename PROVIDER OLD NEW"),
+            Command::Account => {
+                Some("list | rename PROVIDER OLD NEW | accept-identity PROVIDER NAME CHANGE_ID")
+            }
             Command::CostModel => Some("list | activate MODEL-ID"),
             Command::Statusline => None,
             Command::LoggingFixture
@@ -11190,8 +11192,9 @@ fn account_command(clock: &impl Clock, invocation: &Invocation) -> Result<(), Er
     match subcommand {
         Some("list") => account_list_command(clock),
         Some("rename") => account_rename_command(clock, invocation),
+        Some("accept-identity") => account_accept_identity_command(clock, invocation),
         other => Err(Error::Usage(format!(
-            "account requires a subcommand (list | rename), got {other:?}"
+            "account requires a subcommand (list | rename | accept-identity), got {other:?}"
         ))),
     }
 }
@@ -11331,6 +11334,51 @@ fn account_rename_command(clock: &impl Clock, invocation: &Invocation) -> Result
     println!(
         "account rename: {provider} '{old_name}' -> '{new_name}' (account {})",
         account_id.value()
+    );
+    Ok(())
+}
+
+/// `aub account accept-identity PROVIDER NAME CHANGE_ID`: accepts the change
+/// `aub doctor` names as the same subscription (aub-8yaz), for a credential
+/// that was relabelled rather than replaced. A different subscription still
+/// takes a rename; see docs/subscription-identity-change.md.
+fn account_accept_identity_command(
+    clock: &impl Clock,
+    invocation: &Invocation,
+) -> Result<(), Error> {
+    let rest = &invocation.rest;
+    let usage = "account accept-identity requires PROVIDER NAME CHANGE_ID";
+    let provider = rest
+        .get(1)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Usage(usage.to_string()))?;
+    let name = rest
+        .get(2)
+        .map(String::as_str)
+        .ok_or_else(|| Error::Usage(usage.to_string()))?;
+    let change_id = rest
+        .get(3)
+        .ok_or_else(|| Error::Usage(usage.to_string()))?
+        .parse::<i64>()
+        .map_err(|_| Error::Usage(format!("{usage}; CHANGE_ID must be an integer")))?;
+    if rest.len() > 4 {
+        return Err(Error::Usage(format!(
+            "{usage}, got {} extra argument(s)",
+            rest.len() - 4
+        )));
+    }
+
+    let mut conn = open_ledger(clock)?;
+    let established = crate::store::subscription_identity::accept_change(
+        &mut conn,
+        provider,
+        name,
+        crate::store::subscription_identity::SubscriptionChangeRowId::new(change_id),
+        clock.now(),
+    )?;
+    println!(
+        "account accept-identity: {provider} '{name}' change {change_id} accepted (established row {})",
+        established.value()
     );
     Ok(())
 }
@@ -14310,6 +14358,36 @@ provider = "codex"
                 "expected the trailing extra argument refused, got {msg}"
             ),
             other => panic!("expected Error::Usage, got {other:?}"),
+        }
+    }
+
+    /// `aub account accept-identity` refuses a missing, non-integer or extra
+    /// positional before it opens the ledger.
+    #[test]
+    fn account_accept_identity_refuses_malformed_positionals() {
+        let invocation = |rest: &[&str]| Invocation {
+            command: Command::Account,
+            format: OutputFormat::Text,
+            verbosity: 0,
+            explain: ExplainMode::Off,
+            account: None,
+            model: None,
+            no_color: false,
+            rest: rest.iter().map(|arg| arg.to_string()).collect(),
+        };
+        for rest in [
+            &["accept-identity"][..],
+            &["accept-identity", "anthropic", "primary"][..],
+            &["accept-identity", "anthropic", "primary", "seven"][..],
+            &["accept-identity", "anthropic", "primary", "7", "extra"][..],
+        ] {
+            match account_command(&RealClock::new(), &invocation(rest)) {
+                Err(Error::Usage(msg)) => assert!(
+                    msg.contains("PROVIDER NAME CHANGE_ID"),
+                    "expected the positionals named for {rest:?}, got {msg}"
+                ),
+                other => panic!("expected Error::Usage for {rest:?}, got {other:?}"),
+            }
         }
     }
 

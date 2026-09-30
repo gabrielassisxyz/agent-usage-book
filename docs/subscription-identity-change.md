@@ -58,16 +58,30 @@ change on any of these paths.
    The next tick matches the established identity and sampling resumes on
    its own; the change row stays as the history of the gap, and `aub
    doctor` passes with a historical note once a newer observation exists.
-4. If the switch was deliberate (the old subscription is gone and the new
+4. If the subscription did not change and only its label did, accept the
+   change (aub-8yaz): `aub account accept-identity PROVIDER NAME CHANGE_ID`.
+   This is the common Anthropic case. Claude writes `rateLimitTier` at
+   login and never updates it, so an account upgraded after its last
+   login carries a stale tier, gets established under it, and reads as a
+   change at the next login. Before accepting, confirm the two identities
+   are one account: ask whoever owns the login, or compare a window's
+   `quota_used_ppm` with another credential path known to be that account.
+   Acceptance appends an `established` row carrying the change's
+   identity. The change row stays, the next tick stores readings under the
+   same logical name, and `aub doctor` passes. Only the account's newest
+   history row can be accepted, so a stale change id can never
+   re-establish an identity a later change already superseded.
+5. If the switch was deliberate (the old subscription is gone and the new
    one is what this machine should meter), do not keep sampling it under
    the old name: that re-creates the silent seam this detection exists to
    end, with one subscription's consumption filed under another's name.
    Rename instead: replace the account stanza with a fresh logical name
    for the new subscription and remove the old one. The new name
    establishes on its first tick; the old name's history stays intact and
-   queryable. There is deliberately no in-place re-acknowledgement: a
-   logical name denotes one subscription epoch.
-5. Two accounts must never share one credential path. If the rename left
+   queryable. Do not use `accept-identity` for this case: a logical name
+   denotes one subscription, and accepting a genuinely different one files
+   its consumption under the old one's name.
+6. Two accounts must never share one credential path. If the rename left
    the old and the new stanza pointing at the same file, configuration
    resolution refuses it before anything samples.
 

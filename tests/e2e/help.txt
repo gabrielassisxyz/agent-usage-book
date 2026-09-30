@@ -148,7 +148,7 @@ account:
   answers: which accounts has the ledger recorded, and how do I rename one without losing its history?
   refuses: --format (account prints one operational result or a plain listing); --explain (account derives no quantity); --account (account takes PROVIDER OLD NEW positionally, not the shared selector); --model (account takes no model); --no-color (account prints no color)
   format: text only: account prints one operational result or a plain listing
-  options: list | rename PROVIDER OLD NEW
+  options: list | rename PROVIDER OLD NEW | accept-identity PROVIDER NAME CHANGE_ID
 
 statusline:
   answers: what did the status line's payload say each account's meter windows were, without the renderer knowing?

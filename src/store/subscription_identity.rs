@@ -203,6 +203,69 @@ pub fn changes_for_account(
         .map_err(|e| Error::Store(format!("cannot read the subscription history: {e}")))
 }
 
+/// Accepts a recorded `changed` row as the same subscription (aub-8yaz): a
+/// new `established` row carrying the change's identity, so the gate stores
+/// that identity's readings under the account's existing logical name.
+///
+/// The case this exists for is a relabelled credential rather than a new
+/// subscription: Claude writes `rateLimitTier` at login and never updates
+/// it, so an account upgraded after its last login is established under a
+/// stale tier, and the next login reads as a change. Only the account's
+/// newest row may be accepted; accepting an older change would re-establish
+/// an identity a later row already superseded.
+pub fn accept_change(
+    conn: &mut rusqlite::Connection,
+    provider_key: &str,
+    logical_name: &str,
+    change_id: SubscriptionChangeRowId,
+    now: UtcTimestamp,
+) -> Result<SubscriptionChangeRowId, Error> {
+    let tx = conn
+        .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+        .map_err(|e| Error::Store(format!("cannot start the acceptance transaction: {e}")))?;
+    let account_id =
+        crate::store::account::account_id_by_identity(&tx, provider_key, logical_name)?
+            .ok_or_else(|| {
+                Error::Usage(format!(
+                    "no account named '{logical_name}' is recorded for provider '{provider_key}'"
+                ))
+            })?;
+    let latest = latest_for_account(&tx, account_id)?.ok_or_else(|| {
+        Error::Usage(format!(
+            "account '{logical_name}' has no subscription history to accept"
+        ))
+    })?;
+    if latest.row_id != change_id {
+        return Err(Error::Usage(format!(
+            "change id {} is not the newest subscription-history row for '{logical_name}' (newest is {}); only the newest change can be accepted",
+            change_id.value(),
+            latest.row_id.value()
+        )));
+    }
+    if latest.kind != SubscriptionChangeKind::Changed {
+        return Err(Error::Usage(format!(
+            "change id {} is an establishment, not a change; there is nothing to accept",
+            change_id.value()
+        )));
+    }
+    let established = insert_change(
+        &tx,
+        &NewSubscriptionChange {
+            account_id,
+            kind: SubscriptionChangeKind::Established,
+            previous_identity: None,
+            current_identity: latest.current_identity,
+            detecting_attempt_id: latest.detecting_attempt_id,
+            previous_observation_id: None,
+            detected_at: now,
+        },
+    )?;
+    crate::store::ledger_generation::advance(&tx)?;
+    tx.commit()
+        .map_err(|e| Error::Store(format!("cannot commit the acceptance: {e}")))?;
+    Ok(established)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -389,6 +452,159 @@ mod tests {
         let history = changes_for_account(&conn, fixture.account_id).unwrap();
         assert_eq!(history.len(), 2);
         assert_eq!(history[1].kind, SubscriptionChangeKind::Changed);
+    }
+
+    /// An account established under a stale tier whose next login read as a
+    /// change: the shape `accept_change` exists for.
+    fn relabelled_history(
+        fixture: &Fixture,
+        conn: &rusqlite::Connection,
+    ) -> (SubscriptionChangeRowId, SubscriptionChangeRowId) {
+        let established = insert_change(
+            conn,
+            &NewSubscriptionChange {
+                account_id: fixture.account_id,
+                kind: SubscriptionChangeKind::Established,
+                previous_identity: None,
+                current_identity: "anthropic:max:max_5x".to_string(),
+                detecting_attempt_id: fixture.attempt_id,
+                previous_observation_id: None,
+                detected_at: UtcTimestamp::from_unix_nanos(3_000),
+            },
+        )
+        .unwrap();
+        let changed = insert_change(
+            conn,
+            &NewSubscriptionChange {
+                account_id: fixture.account_id,
+                kind: SubscriptionChangeKind::Changed,
+                previous_identity: Some("anthropic:max:max_5x".to_string()),
+                current_identity: "anthropic:max:max_20x".to_string(),
+                detecting_attempt_id: fixture.attempt_id,
+                previous_observation_id: None,
+                detected_at: UtcTimestamp::from_unix_nanos(4_000),
+            },
+        )
+        .unwrap();
+        (established, changed)
+    }
+
+    #[test]
+    fn accepting_the_newest_change_establishes_its_identity() {
+        let fixture = fixture();
+        let mut conn = reopen(&fixture.database_path);
+        let (_, changed) = relabelled_history(&fixture, &conn);
+        let generation_before = crate::store::ledger_generation::current(&conn).unwrap();
+
+        let accepted = accept_change(
+            &mut conn,
+            "anthropic",
+            "work",
+            changed,
+            UtcTimestamp::from_unix_nanos(5_000),
+        )
+        .unwrap();
+
+        assert_eq!(
+            established_identity_for_account(&conn, fixture.account_id).unwrap(),
+            Some("anthropic:max:max_20x".to_string())
+        );
+        let history = changes_for_account(&conn, fixture.account_id).unwrap();
+        assert_eq!(history.len(), 3, "the changed row stays as history");
+        assert_eq!(history[1].kind, SubscriptionChangeKind::Changed);
+        assert_eq!(history[2].row_id, accepted);
+        assert_eq!(history[2].kind, SubscriptionChangeKind::Established);
+        assert_eq!(history[2].detecting_attempt_id, fixture.attempt_id);
+        assert_eq!(history[2].detected_at, UtcTimestamp::from_unix_nanos(5_000));
+        assert_ne!(
+            crate::store::ledger_generation::current(&conn).unwrap(),
+            generation_before
+        );
+    }
+
+    fn assert_refused_without_writing(
+        fixture: &Fixture,
+        conn: &mut rusqlite::Connection,
+        provider: &str,
+        name: &str,
+        change_id: SubscriptionChangeRowId,
+    ) {
+        let before = changes_for_account(conn, fixture.account_id).unwrap();
+        let refused = accept_change(
+            conn,
+            provider,
+            name,
+            change_id,
+            UtcTimestamp::from_unix_nanos(9_000),
+        );
+        assert!(
+            matches!(refused, Err(Error::Usage(_))),
+            "expected a usage refusal, got {refused:?}"
+        );
+        assert_eq!(
+            changes_for_account(conn, fixture.account_id).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn accepting_refuses_an_establishment_row() {
+        let fixture = fixture();
+        let mut conn = reopen(&fixture.database_path);
+        let established = insert_change(
+            &conn,
+            &NewSubscriptionChange {
+                account_id: fixture.account_id,
+                kind: SubscriptionChangeKind::Established,
+                previous_identity: None,
+                current_identity: "anthropic:max:max_20x".to_string(),
+                detecting_attempt_id: fixture.attempt_id,
+                previous_observation_id: None,
+                detected_at: UtcTimestamp::from_unix_nanos(3_000),
+            },
+        )
+        .unwrap();
+        assert_refused_without_writing(&fixture, &mut conn, "anthropic", "work", established);
+    }
+
+    #[test]
+    fn accepting_refuses_a_change_that_is_no_longer_the_newest_row() {
+        let fixture = fixture();
+        let mut conn = reopen(&fixture.database_path);
+        let (_, changed) = relabelled_history(&fixture, &conn);
+        // A second, different subscription arrived after the first change:
+        // both rows are `changed`, so only the newest-row guard stands
+        // between the older one and a superseded establishment.
+        insert_change(
+            &conn,
+            &NewSubscriptionChange {
+                account_id: fixture.account_id,
+                kind: SubscriptionChangeKind::Changed,
+                previous_identity: Some("anthropic:max:max_5x".to_string()),
+                current_identity: "anthropic:pro:default_claude_ai".to_string(),
+                detecting_attempt_id: fixture.attempt_id,
+                previous_observation_id: None,
+                detected_at: UtcTimestamp::from_unix_nanos(4_500),
+            },
+        )
+        .unwrap();
+        assert_refused_without_writing(&fixture, &mut conn, "anthropic", "work", changed);
+    }
+
+    #[test]
+    fn accepting_refuses_an_unknown_account_or_change_id() {
+        let fixture = fixture();
+        let mut conn = reopen(&fixture.database_path);
+        let (_, changed) = relabelled_history(&fixture, &conn);
+        assert_refused_without_writing(&fixture, &mut conn, "anthropic", "other", changed);
+        assert_refused_without_writing(&fixture, &mut conn, "codex", "work", changed);
+        assert_refused_without_writing(
+            &fixture,
+            &mut conn,
+            "anthropic",
+            "work",
+            SubscriptionChangeRowId::new(changed.value() + 100),
+        );
     }
 
     #[test]
