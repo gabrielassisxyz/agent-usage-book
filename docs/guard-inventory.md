@@ -65,6 +65,7 @@ run below is recorded as pass or fail only.
 
 Last successful full run: 2026-09-27 (bin/guard-mutations, scope all, 89 rows)
 Replayed singly since: sh-40 2026-09-30
+Replayed singly since: c-44 2026-09-30
 
 The runner rewrites this line itself on a full-scope pass, and deletes any
 Replayed singly since lines below it. A Replayed singly since line records
