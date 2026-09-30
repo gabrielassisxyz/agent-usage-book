@@ -87,6 +87,7 @@ pub enum DurableClass {
     MeterCalibrationExclusion,
     MeterWindowSetChange,
     MeterSubscriptionChange,
+    CalibrationControlledRun,
 
     // Core SQLite tables: Versioned interpretation
     MeterObservation,
@@ -125,7 +126,6 @@ pub enum DurableClass {
     // Core SQLite tables: Disposable
     SamplingLease,
     SessionHeartbeat,
-    CalibrationControlledRun,
 
     // Non-table persisted artifacts
     StatusProjection,
@@ -159,7 +159,17 @@ impl DurableClass {
             | Self::MeterWindowAnomaly
             | Self::MeterCalibrationExclusion
             | Self::MeterWindowSetChange
-            | Self::MeterSubscriptionChange => DurableClassCategory::Irreplaceable,
+            | Self::MeterSubscriptionChange
+            // Irreplaceable rather than any other durable category because the
+            // row is the premise of a controlled experiment, not a derivation of
+            // one: the baseline observation, the plan tier and the operator's
+            // exclusivity assertion are what was true when `calibrate begin`
+            // ran, and no later re-derivation can recover them. Migration
+            // `0030_calibration_controlled_run` says the same thing at the
+            // database, documenting the table as immutable append-only evidence
+            // and installing `calibration_controlled_run_no_delete`, a
+            // `BEFORE DELETE` trigger that raises `ABORT`.
+            | Self::CalibrationControlledRun => DurableClassCategory::Irreplaceable,
 
             Self::SamplingPolicySnapshot
             | Self::MeterObservation
@@ -196,7 +206,6 @@ impl DurableClass {
 
             Self::SamplingLease
             | Self::SessionHeartbeat
-            | Self::CalibrationControlledRun
             | Self::StatusProjection
             | Self::PendingObservationSpool
             | Self::RetainedProviderBody => DurableClassCategory::Disposable,
@@ -239,7 +248,8 @@ impl DurableClass {
             | Self::MeterWindowAnomaly
             | Self::MeterCalibrationExclusion
             | Self::MeterWindowSetChange
-            | Self::MeterSubscriptionChange => RetentionRule::Forever,
+            | Self::MeterSubscriptionChange
+            | Self::CalibrationControlledRun => RetentionRule::Forever,
 
             Self::SessionAccountMarker => RetentionRule::ForeverUnlessExplicitlyPurged,
 
@@ -262,9 +272,7 @@ impl DurableClass {
             },
 
             Self::StatusProjection => RetentionRule::SingleCurrentFile,
-            Self::SamplingLease | Self::SessionHeartbeat | Self::CalibrationControlledRun => {
-                RetentionRule::TransientLease
-            }
+            Self::SamplingLease | Self::SessionHeartbeat => RetentionRule::TransientLease,
             Self::PendingObservationSpool => RetentionRule::EphemeralStaging,
             Self::RetainedProviderBody => RetentionRule::CountBounded { max_entries: 100 },
         }
@@ -1316,7 +1324,168 @@ mod tests {
             .collect()
     }
 
+    /// Removes every single-quoted SQL literal, so a keyword scan reads a
+    /// statement's structure and never the prose of a diagnostic message. A
+    /// doubled `''` inside a literal toggles off and straight back on, which
+    /// leaves the scan inside the literal where it belongs.
+    fn without_string_literals(sql: &str) -> String {
+        let mut out = String::with_capacity(sql.len());
+        let mut in_literal = false;
+        for ch in sql.chars() {
+            match (in_literal, ch) {
+                (false, '\'') => in_literal = true,
+                (false, c) => out.push(c),
+                (true, '\'') => in_literal = false,
+                (true, _) => {}
+            }
+        }
+        out
+    }
+
+    /// True when this trigger's SQL refuses every `DELETE` on its table.
+    ///
+    /// The condition is deliberately narrow: `BEFORE DELETE`, a `RAISE(ABORT ...)`
+    /// in the body, and no condition keyword between the `ON` clause and the end
+    /// of the body. A trigger that aborts only some rows still permits deletes,
+    /// so it is no evidence that the table is non-prunable and is skipped rather
+    /// than assumed.
+    fn refuses_every_delete(sql: &str) -> bool {
+        let normalized = without_string_literals(sql)
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_uppercase();
+        let Some((_, after_on)) = normalized.split_once("BEFORE DELETE ON") else {
+            return false;
+        };
+        let Some((head, body)) = after_on.split_once(" BEGIN ") else {
+            return false;
+        };
+        let raises_abort = body.replace(' ', "").contains("RAISE(ABORT");
+        let conditional = ["WHEN ", "WHERE ", "CASE ", "IIF("]
+            .iter()
+            .any(|kw| head.contains(kw) || body.contains(kw));
+        raises_abort && !conditional
+    }
+
+    /// Every table in the live schema whose `BEFORE DELETE` trigger refuses
+    /// every delete, read from `sqlite_master` rather than from a list here, so
+    /// a table that grows such a trigger later is covered with no edit.
+    fn tables_refusing_every_delete(conn: &Connection) -> BTreeSet<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT tbl_name, sql FROM sqlite_master \
+                 WHERE type = 'trigger' AND sql IS NOT NULL \
+                 ORDER BY tbl_name, name",
+            )
+            .expect("trigger list query must prepare");
+        let triggers: Vec<(String, String)> = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("trigger list query must run")
+            .map(|r| r.expect("trigger row must be readable"))
+            .collect();
+        triggers
+            .into_iter()
+            .filter(|(_, sql)| refuses_every_delete(sql))
+            .map(|(table, _)| table)
+            .collect()
+    }
+
+    /// Tables that refuse every delete at the schema and are still classified
+    /// prunable by the taxonomy, each naming the bug bead that will reclassify
+    /// it.
+    ///
+    /// Empty at `aub-lfsv`: `calibration_controlled_run` was the only offender
+    /// and this bead fixed it. An entry belongs here only once its own bug bead
+    /// exists, so the debt stays visible instead of the assertion being
+    /// weakened.
+    const PRUNABLE_DESPITE_DELETE_REFUSAL: &[(&str, &str)] = &[];
+
     // --- internal-consistency tests -----------------------------------------
+    /// The taxonomy may not call a table prunable while the schema refuses
+    /// every delete on it. Nothing prunes such a table today, so nothing has
+    /// been lost; the first pruner, rebuild sweep or restore check that trusts
+    /// the taxonomy would plan a delete the database aborts.
+    ///
+    /// The offender set comes from the live schema, so the next table to grow a
+    /// delete refusal is covered without this test changing. A refusing table
+    /// with no `DurableClass` at all fails here too, naming the table: an
+    /// unclassified table is exactly how the taxonomy and the schema drift
+    /// apart. The planted negative is row `c-44` of `docs/guard-inventory.md`,
+    /// which reverts `calibration_controlled_run` to `Disposable` /
+    /// `TransientLease` and turns this red naming the table.
+    #[test]
+    fn no_table_that_refuses_every_delete_is_classified_prunable() {
+        let db = TestDb::new();
+        let conn = db.open_migrated();
+
+        let refusing = tables_refusing_every_delete(&conn);
+        // Without this the scan could match nothing and the assertion below
+        // would pass over an empty set, which is a test that cannot fail.
+        assert!(
+            refusing.contains("calibration_controlled_run"),
+            "migration 0030 installs an unconditional delete refusal on \
+             calibration_controlled_run; the scan found {refusing:?}"
+        );
+
+        let mut offenders = Vec::new();
+        for table in &refusing {
+            if PRUNABLE_DESPITE_DELETE_REFUSAL
+                .iter()
+                .any(|(allowed, _)| allowed == table)
+            {
+                continue;
+            }
+            match DurableClass::from_table_name(table) {
+                None => offenders.push(format!(
+                    "{table}: refuses every DELETE but carries no DurableClass in the taxonomy"
+                )),
+                Some(class) if class.is_prunable() => offenders.push(format!(
+                    "{table}: refuses every DELETE but {class:?} is classified {:?} / {:?}, \
+                     which is prunable",
+                    class.category(),
+                    class.retention_rule()
+                )),
+                Some(_) => {}
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "the retention taxonomy disagrees with the schema on {} table(s):\n{}",
+            offenders.len(),
+            offenders.join("\n")
+        );
+    }
+
+    /// The scan reads a trigger's structure, not its diagnostic message, and it
+    /// treats a conditional abort as no evidence at all. The live schema
+    /// carries no conditional `BEFORE DELETE` trigger, so the discriminating
+    /// cases exist only here: the third case differs from the second in the one
+    /// forbidden dimension, a `WHEN` clause, and must not be reported.
+    #[test]
+    fn the_delete_refusal_scan_reads_structure_and_skips_conditional_aborts() {
+        assert!(
+            !refuses_every_delete(
+                "CREATE TRIGGER t BEFORE UPDATE ON x BEGIN \
+                 SELECT RAISE(ABORT, 'x is append-only: DELETE refused'); END"
+            ),
+            "a BEFORE UPDATE trigger says nothing about deletes"
+        );
+        assert!(
+            refuses_every_delete(
+                "CREATE TRIGGER t BEFORE DELETE ON x BEGIN \
+                 SELECT RAISE(ABORT, 'refused when it matters, where it matters'); END"
+            ),
+            "condition words inside the message are prose, not a condition"
+        );
+        assert!(
+            !refuses_every_delete(
+                "CREATE TRIGGER t BEFORE DELETE ON x WHEN OLD.locked = 1 BEGIN \
+                 SELECT RAISE(ABORT, 'refused when it matters, where it matters'); END"
+            ),
+            "a conditional abort still permits deletes and is no evidence"
+        );
+    }
 
     #[test]
     fn every_prune_target_maps_only_to_rebuildable_or_disposable() {
