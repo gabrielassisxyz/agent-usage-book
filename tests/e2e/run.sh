@@ -1046,19 +1046,24 @@ CASE
 
 # self_test_duplicate_case: --check-consistency refuses a cases directory in which
 # two files share a leading number or resolve to the same case id, and accepts one
-# where every case is uniquely named. The scratch directories are off any main
-# ref, so the grandfather set is empty and every collision is treated as new.
+# where every case is uniquely named. The number rule runs only where a main ref
+# resolves, and a pull-request checkout has none (aub-lx66), so these checks run
+# against a planted repository whose main holds one empty commit: the grandfather
+# set is empty and every collision is treated as new, whatever this checkout holds.
 self_test_duplicate_case() {
-    local tmp cases surface out
+    local tmp cases surface out planted
     tmp="$(mktemp -d)"
     surface="$tmp/surface.txt"
     : >"$surface"
+    planted="$tmp/planted"
+    git init -q -b main "$planted"
+    git -C "$planted" -c user.email=t@example.test -c user.name=t commit -q --allow-empty -m "empty main"
 
     cases="$tmp/numbered"
     mkdir -p "$cases"
     printf '# case\ncase_steps() { :; }\n' >"$cases/033-a.sh"
     printf '# case\ncase_steps() { :; }\n' >"$cases/033-b.sh"
-    if out="$(CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+    if out="$(REPO_ROOT="$planted" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
         echo "self-test: a duplicate case number was accepted" >&2
         rm -rf "$tmp"
         return 1
@@ -1074,7 +1079,7 @@ self_test_duplicate_case() {
     mkdir -p "$cases"
     printf 'CASE_ID=same\ncase_steps() { :; }\n' >"$cases/aub-x-one.sh"
     printf 'CASE_ID=same\ncase_steps() { :; }\n' >"$cases/aub-x-two.sh"
-    if out="$(CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+    if out="$(REPO_ROOT="$planted" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
         echo "self-test: a duplicate CASE_ID was accepted" >&2
         rm -rf "$tmp"
         return 1
@@ -1091,7 +1096,7 @@ self_test_duplicate_case() {
     printf 'CASE_ID=aub-x-alpha\ncase_steps() { :; }\n' >"$cases/aub-x-alpha.sh"
     printf '# case\ncase_steps() { :; }\n' >"$cases/041-beta.sh"
     printf '# case\ncase_steps() { :; }\n' >"$cases/042-gamma.sh"
-    if ! (CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency >/dev/null 2>&1); then
+    if ! (REPO_ROOT="$planted" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency >/dev/null 2>&1); then
         echo "self-test: a uniquely named cases directory was rejected" >&2
         rm -rf "$tmp"
         return 1
