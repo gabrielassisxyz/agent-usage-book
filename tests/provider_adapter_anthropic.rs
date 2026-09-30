@@ -620,9 +620,18 @@ mod statusline_reader {
                 record_path: record_path.to_path_buf(),
                 // The ordinary cadence every freshness case is held to.
                 fresh_window: MonotonicDuration::from_seconds(300),
+                endpoint_first: false,
             }),
             ..MeterRequest::default()
         }
+    }
+
+    fn endpoint_first_request(record_path: &std::path::Path) -> MeterRequest {
+        let mut request = request(record_path);
+        if let Some(source) = request.anthropic_statusline.as_mut() {
+            source.endpoint_first = true;
+        }
+        request
     }
 
     fn clock() -> FakeClock {
@@ -636,6 +645,7 @@ mod statusline_reader {
     /// committed sanitized fixtures, named by `endpoint_fixture`.
     struct StatuslineTransport {
         endpoint_fixture: &'static str,
+        endpoint_status: u16,
         endpoint_calls: Cell<usize>,
     }
 
@@ -643,7 +653,15 @@ mod statusline_reader {
         fn serving_endpoint_from_fixture(name: &'static str) -> Self {
             Self {
                 endpoint_fixture: name,
+                endpoint_status: 200,
                 endpoint_calls: Cell::new(0),
+            }
+        }
+
+        fn refusing_the_endpoint_with(status: u16) -> Self {
+            Self {
+                endpoint_status: status,
+                ..Self::serving_endpoint_from_fixture("limits-success.json")
             }
         }
     }
@@ -671,7 +689,7 @@ mod statusline_reader {
             }
             self.endpoint_calls.set(self.endpoint_calls.get() + 1);
             Ok(HttpResponse {
-                status: 200,
+                status: self.endpoint_status,
                 headers: Vec::new(),
                 body: read_fixture(self.endpoint_fixture),
             })
@@ -745,6 +763,71 @@ mod statusline_reader {
             Some(UtcTimestamp::from_unix_nanos(
                 SEVEN_DAY_RESET * 1_000_000_000
             ))
+        );
+    }
+
+    #[test]
+    fn an_endpoint_first_tick_takes_the_endpoint_despite_a_fresh_line() {
+        let state = StateDir::new();
+        let path = record_file(&state, &record_line());
+        let transport = StatuslineTransport::serving_endpoint_from_fixture("limits-success.json");
+        let reading = expect_measured(
+            AnthropicAdapter::new()
+                .observe_with_evidence(
+                    &test_credential(),
+                    &endpoint_first_request(&path),
+                    &transport,
+                    &clock(),
+                )
+                .observation,
+        );
+        assert_eq!(
+            reading.provider_contract_id.as_str(),
+            AnthropicAdapter::LIMITS_CONTRACT_ID,
+            "a due full reading comes from the endpoint even while the line is fresh"
+        );
+        assert_eq!(transport.endpoint_calls.get(), 1);
+    }
+
+    #[test]
+    fn an_endpoint_first_tick_falls_back_to_a_fresh_line_when_the_endpoint_refuses() {
+        let state = StateDir::new();
+        let path = record_file(&state, &record_line());
+        let transport = StatuslineTransport::refusing_the_endpoint_with(401);
+        let reading = expect_measured(
+            AnthropicAdapter::new()
+                .observe_with_evidence(
+                    &test_credential(),
+                    &endpoint_first_request(&path),
+                    &transport,
+                    &clock(),
+                )
+                .observation,
+        );
+        assert_eq!(
+            reading.provider_contract_id.as_str(),
+            AnthropicAdapter::STATUSLINE_CONTRACT_ID,
+            "an expired stored token still reads the line, as it did before the endpoint was tried first"
+        );
+        assert_eq!(transport.endpoint_calls.get(), 1);
+    }
+
+    #[test]
+    fn an_endpoint_first_tick_with_no_line_reports_the_endpoint_refusal() {
+        let state = StateDir::new();
+        let path = state.path().join("statusline").join("gmail.jsonl");
+        let transport = StatuslineTransport::refusing_the_endpoint_with(401);
+        let observation = AnthropicAdapter::new()
+            .observe_with_evidence(
+                &test_credential(),
+                &endpoint_first_request(&path),
+                &transport,
+                &clock(),
+            )
+            .observation;
+        assert!(
+            matches!(observation, ProviderObservation::AuthRequired(_)),
+            "with nothing to fall back to, the endpoint's own conclusion stands: {observation:?}"
         );
     }
 

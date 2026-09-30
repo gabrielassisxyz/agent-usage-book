@@ -1559,6 +1559,8 @@ fn anthropic_statusline_source(
             .join(crate::statusline::RECORD_DIR_NAME)
             .join(format!("{}.jsonl", account.name)),
         fresh_window: config.sampling.default_interval,
+        // Decided per tick by `sample_command`, which holds the ledger.
+        endpoint_first: false,
     })
 }
 
@@ -1801,27 +1803,32 @@ pub(crate) fn sample_command(
 
         let mut request = meter_request_for_account(acc, &config);
         if request.anthropic_statusline.is_some() {
-            let newest_full = match crate::store::account::account_id_by_identity(
-                &conn,
-                &acc.provider,
-                &acc.name,
-            )? {
-                Some(account_id) => {
-                    crate::store::projection_source::newest_full_observation_received_at(
-                        &conn, account_id,
-                    )?
+            // A hint, not a gate: a ledger this lookup cannot read keeps the
+            // line as the source, and the sampler's own reads report the
+            // store failure under the exit class they own.
+            let newest_full =
+                crate::store::account::account_id_by_identity(&conn, &acc.provider, &acc.name)
+                    .and_then(|account_id| match account_id {
+                        Some(account_id) => {
+                            crate::store::projection_source::newest_full_observation_received_at(
+                                &conn, account_id,
+                            )
+                        }
+                        None => Ok(None),
+                    });
+            if let Ok(newest_full) = newest_full
+                && crate::meter::anthropic::full_reading_due(
+                    newest_full,
+                    clock.now(),
+                    config.freshness.meter,
+                )
+            {
+                if let Some(source) = request.anthropic_statusline.as_mut() {
+                    source.endpoint_first = true;
                 }
-                None => None,
-            };
-            if crate::meter::anthropic::full_reading_due(
-                newest_full,
-                clock.now(),
-                config.freshness.meter,
-            ) {
-                request.anthropic_statusline = None;
                 if invocation.verbosity > 0 {
                     eprintln!(
-                        "sample: account={} statusline bypassed: newest full reading is at least one freshness horizon old",
+                        "sample: account={} endpoint first: newest full reading is at least one freshness horizon old",
                         acc.name
                     );
                 }

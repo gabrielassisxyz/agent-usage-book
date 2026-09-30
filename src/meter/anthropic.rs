@@ -1027,9 +1027,19 @@ impl ProviderAdapter for AnthropicAdapter {
         // its expiry. A reading from the line is also the fresher one, so a
         // credential problem is allowed to surface through the endpoint path
         // it actually belongs to: when no fresh line exists.
-        if let Some(source) = &request.anthropic_statusline
-            && let Some(captured) = self.observe_statusline(credential, source, transport, clock)
-        {
+        let Some(source) = &request.anthropic_statusline else {
+            return self.observe_endpoint(credential, request, transport, clock);
+        };
+        if source.endpoint_first {
+            let endpoint = self.observe_endpoint(credential, request, transport, clock);
+            if matches!(endpoint.observation, ProviderObservation::Measured(_)) {
+                return endpoint;
+            }
+            return self
+                .observe_statusline(credential, source, transport, clock)
+                .unwrap_or(endpoint);
+        }
+        if let Some(captured) = self.observe_statusline(credential, source, transport, clock) {
             return captured;
         }
         self.observe_endpoint(credential, request, transport, clock)
