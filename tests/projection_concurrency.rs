@@ -263,36 +263,103 @@ fn function_body(source: &str, declaration: &str) -> String {
     rest[..end].to_string()
 }
 
-fn assert_status_performs_only_the_status_contract() {
-    let source = include_str!("../src/cli.rs");
-    let status_body = [
-        function_body(source, "fn status("),
-        function_body(source, "fn projection_accounts("),
-        function_body(source, "fn status_clock_skew_envelope("),
-    ]
-    .concat();
+/// Every `.rs` source file of the `cli` module, paired with its repository-relative
+/// path: `src/cli.rs` when it exists, plus every file under `src/cli/`. The invariant
+/// below is about the status path, not about one file, so it resolves the module the
+/// way the shell boundary rules do through
+/// `bin/checks/boundary-rules/lib/module-files.sh`. `include_str!("../src/cli.rs")`
+/// would keep the slicer pointed at a file a declaration had left (aub-pbx4.2).
+fn cli_module_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    if root.join("src/cli.rs").is_file() {
+        paths.push(root.join("src/cli.rs"));
+    }
+    collect_rs_files(&root.join("src/cli"), &mut paths);
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "the cli module must have at least one source file: neither src/cli.rs nor src/cli/ exists"
+    );
+    paths
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{relative} must be readable: {error}"));
+            (relative, source)
+        })
+        .collect()
+}
 
-    for forbidden in [
-        "rusqlite",
-        "Connection",
-        "store::connection",
-        "store::migrate",
-        "transcripts::",
-        "calibration",
-        "rate_book",
-        "ureq",
-        "reqwest",
-        "http",
-        "spool",
-        "fs::write",
-        "OpenOptions",
-        "create_dir",
-        "remove_file",
+/// Recursively collects `.rs` files under `dir` into `out`. A missing directory
+/// contributes nothing, which is the ordinary case for a module that is a flat file.
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The body of `declaration` from whichever file of the `cli` module declares it, with
+/// that file's path so a failure names where the forbidden reference is. A declaration
+/// present in no file of the module panics rather than contributing an empty body: an
+/// absent subject must be louder than a clean one.
+fn cli_function_body(sources: &[(String, String)], declaration: &str) -> (String, String) {
+    for (path, source) in sources {
+        if source.contains(declaration) {
+            return (path.clone(), function_body(source, declaration));
+        }
+    }
+    let paths: Vec<&str> = sources.iter().map(|(path, _)| path.as_str()).collect();
+    panic!("the cli module must declare {declaration}, in one of {paths:?}");
+}
+
+fn assert_status_performs_only_the_status_contract() {
+    let sources = cli_module_sources();
+    // Each body is scanned on its own rather than concatenated with its path, because a
+    // path stitched into the scanned text is itself a source of matches: a status path
+    // extracted into `src/cli/http.rs` would trip the `http` needle below on its own
+    // file name.
+    for declaration in [
+        "fn status(",
+        "fn projection_accounts(",
+        "fn status_clock_skew_envelope(",
     ] {
-        assert!(
-            !status_body.contains(forbidden),
-            "the status function's source must not reference {forbidden}: the status contract allows only configuration resolution, one bounded projection read, freshness computation and formatting"
-        );
+        let (path, status_body) = cli_function_body(&sources, declaration);
+        for forbidden in [
+            "rusqlite",
+            "Connection",
+            "store::connection",
+            "store::migrate",
+            "transcripts::",
+            "calibration",
+            "rate_book",
+            "ureq",
+            "reqwest",
+            "http",
+            "spool",
+            "fs::write",
+            "OpenOptions",
+            "create_dir",
+            "remove_file",
+        ] {
+            assert!(
+                !status_body.contains(forbidden),
+                "the status function's source must not reference {forbidden}, found in {declaration} in {path}: the status contract allows only configuration resolution, one bounded projection read, freshness computation and formatting"
+            );
+        }
     }
 }
 

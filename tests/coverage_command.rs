@@ -789,18 +789,69 @@ fn the_coverage_pipeline_performs_no_network_operation() {
     let _ = transport;
 }
 
-/// The command's orchestration file may read the local store, but it may not
+/// Every `.rs` source file of the `cli` module, paired with its repository-relative
+/// path: `src/cli.rs` when it exists, plus every file under `src/cli/`. A module may
+/// exist as a flat file, a directory, or both, and the guard below reads the union
+/// rather than one literal path because `include_str!("../src/cli.rs")` would keep
+/// passing over half the code the moment any of it moved into `src/cli/`, with nothing
+/// saying so (aub-pbx4.2). The shell boundary rules resolve the same set through
+/// `bin/checks/boundary-rules/lib/module-files.sh`.
+fn cli_module_sources() -> Vec<(String, String)> {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let mut paths = Vec::new();
+    if root.join("src/cli.rs").is_file() {
+        paths.push(root.join("src/cli.rs"));
+    }
+    collect_rs_files(&root.join("src/cli"), &mut paths);
+    paths.sort();
+    assert!(
+        !paths.is_empty(),
+        "the cli module must have at least one source file: neither src/cli.rs nor src/cli/ exists"
+    );
+    paths
+        .into_iter()
+        .map(|path| {
+            let relative = path
+                .strip_prefix(root)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .into_owned();
+            let source = std::fs::read_to_string(&path)
+                .unwrap_or_else(|error| panic!("{relative} must be readable: {error}"));
+            (relative, source)
+        })
+        .collect()
+}
+
+/// Recursively collects `.rs` files under `dir` into `out`. A missing directory
+/// contributes nothing, which is the ordinary case for a module that is a flat file.
+fn collect_rs_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_rs_files(&path, out);
+        } else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// The command's orchestration module may read the local store, but it may not
 /// acquire the HTTP port. The panic transport above proves that port is a live
 /// tripwire; this structural check binds it to the coverage command's actual
 /// entry surface, where a future request would otherwise bypass the fixture.
 #[test]
 fn the_coverage_command_never_acquires_the_http_port() {
-    let cli_source = include_str!("../src/cli.rs");
-    for forbidden in ["HttpTransport", "execute_single", "ureq::"] {
-        assert!(
-            !cli_source.contains(forbidden),
-            "aub coverage must not acquire the HTTP port: found {forbidden} in src/cli.rs"
-        );
+    for (path, source) in cli_module_sources() {
+        for forbidden in ["HttpTransport", "execute_single", "ureq::"] {
+            assert!(
+                !source.contains(forbidden),
+                "aub coverage must not acquire the HTTP port: found {forbidden} in {path}"
+            );
+        }
     }
 }
 

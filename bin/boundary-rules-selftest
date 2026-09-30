@@ -209,11 +209,22 @@ fi
 # several lines, the shape the old needle assumed and went stale against. This runs
 # only rule 19 over a synthetic mini-tree, so the wrapped shape is exercised without
 # paying a second full-tree scenario for it.
-wrap_dir="$scratch/rule19-status-wrapped"
-mkdir -p "$wrap_dir/bin/checks/boundary-rules" "$wrap_dir/src"
-cp -a "$repo_root/bin/checks/45-boundary-rules" "$wrap_dir/bin/checks/45-boundary-rules"
-cp -a "$repo_root/bin/checks/boundary-rules/19-status-no-store-connection" \
-    "$wrap_dir/bin/checks/boundary-rules/"
+#
+# The mini-tree carries lib/module-files.sh as well as the rule: since aub-pbx4.2 the
+# rule resolves its sources through that helper, so a mini-tree without it would fail
+# for a reason no scenario planted.
+make_rule19_minitree() {
+    local dir="$scratch/$1"
+    mkdir -p "$dir/bin/checks/boundary-rules/lib" "$dir/src"
+    cp -a "$repo_root/bin/checks/45-boundary-rules" "$dir/bin/checks/45-boundary-rules"
+    cp -a "$repo_root/bin/checks/boundary-rules/19-status-no-store-connection" \
+        "$dir/bin/checks/boundary-rules/"
+    cp -a "$repo_root/bin/checks/boundary-rules/lib/module-files.sh" \
+        "$dir/bin/checks/boundary-rules/lib/"
+    printf '%s\n' "$dir"
+}
+
+wrap_dir="$(make_rule19_minitree rule19-status-wrapped)"
 cat > "$wrap_dir/src/cli.rs" <<'EOF'
 fn projection_accounts() -> Result<(), Error> { Ok(()) }
 fn status(
@@ -235,6 +246,49 @@ if planter_out="$(plant_store_edge "$wrap_dir/src/cli.rs" 2>&1)"; then
 else
     fail_planted_nothing "rule19-status-wrapped" "$planter_out"
 fi
+
+# ... and the same plant must be caught when the declaration lives in a file of the
+# cli DIRECTORY rather than in src/cli.rs. This is the case the rule's literal
+# file="src/cli.rs" could not see: a status path extracted into src/cli/ left the rule
+# scanning a file the declaration had left, and the rule stayed green over nothing
+# (aub-pbx4.2). The failure must name the nested file, not the module root.
+nested_dir="$(make_rule19_minitree rule19-status-nested)"
+mkdir -p "$nested_dir/src/cli"
+cat > "$nested_dir/src/cli.rs" <<'EOF'
+pub mod status_workflow;
+fn unrelated_later() {}
+EOF
+cat > "$nested_dir/src/cli/status_workflow.rs" <<'EOF'
+fn projection_accounts() -> Result<(), Error> { Ok(()) }
+fn status(clock: &impl Clock, level: Level, invocation: &Invocation) -> Result<(), Error> {
+    let _ = clock;
+    Ok(())
+}
+fn unrelated_later() {}
+EOF
+if planter_out="$(plant_store_edge "$nested_dir/src/cli/status_workflow.rs" 2>&1)"; then
+    out="$("$nested_dir/bin/checks/45-boundary-rules" 2>&1)"
+    rc=$?
+    assert_exit "rule19-status-nested [19-status-no-store-connection] exits 1" 1 "$rc"
+    assert_contains "rule19-status-nested names rule" "19-status-no-store-connection" "$out"
+    assert_contains "rule19-status-nested names file" "src/cli/status_workflow.rs" "$out"
+else
+    fail_planted_nothing "rule19-status-nested" "$planter_out"
+fi
+
+# ... and a cli module declaring none of the three must exit 2, never 0. A rule that
+# reports success over a subject it could not find is the failure mode the nested case
+# above was silently in: its verdict would be indistinguishable from a clean status
+# path (aub-pbx4.2).
+absent_dir="$(make_rule19_minitree rule19-status-absent)"
+cat > "$absent_dir/src/cli.rs" <<'EOF'
+fn statusline_command(clock: &impl Clock) -> Result<(), Error> { Ok(()) }
+fn status_refresh_attempts(clock: &impl Clock) -> Result<(), Error> { Ok(()) }
+EOF
+out="$("$absent_dir/bin/checks/boundary-rules/19-status-no-store-connection" 2>&1)"
+rc=$?
+assert_exit "rule19-status-absent exits 2" 2 "$rc"
+assert_contains "rule19-status-absent names the missing declarations" "fn status(" "$out"
 
 # --- rule 13 (aub-8av3): the rule reads a failed `cargo tree` as an unexamined
 # tree, never as a clean one. Direct invocations over the manifest copies, one
