@@ -20,7 +20,7 @@ cd "$(git rev-parse --show-toplevel)"
 # `command -v X || exit 0` guard would turn the gate off on exactly the machine that
 # lacks the tool, and still report green.
 fail=0
-for b in cargo cargo-audit git; do
+for b in cargo cargo-audit git sha256sum; do
     if ! command -v "$b" >/dev/null 2>&1; then
         echo "missing: $b" >&2
         fail=1
@@ -62,10 +62,15 @@ fi
 # disk is one machine's arrangement, and a CI runner has no such mount. An explicit
 # CARGO_TARGET_DIR still wins for anyone who wants a different arrangement, and the path is
 # derived from the checkout either way, so repeated runs in one worktree reuse their build.
+# Its key is the checkout basename plus the first 12 hexadecimal characters of the SHA-256
+# of its resolved absolute path. The path component keeps it unique when same-named
+# treehouse slots run in parallel, while the basename keeps build directories recognizable.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
     build_root=/mnt/build
     [ -d "$build_root" ] || build_root="${TMPDIR:-/tmp}"
-    CARGO_TARGET_DIR="$build_root/cargo-target-worktrees/$(basename "$PWD")"
+    checkout_path="$(pwd -P)"
+    checkout_hash="$(printf '%s' "$checkout_path" | sha256sum | awk '{print substr($1, 1, 12)}')"
+    CARGO_TARGET_DIR="$build_root/cargo-target-worktrees/$(basename "$checkout_path")-$checkout_hash"
     export CARGO_TARGET_DIR
 fi
 echo "==> building in $CARGO_TARGET_DIR"
