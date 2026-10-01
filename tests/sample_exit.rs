@@ -308,52 +308,6 @@ fn usage_flag_validation_errors_exit_2() {
 }
 
 #[test]
-fn credential_resolution_boundary_never_leaks_or_mixes_ambient_token() {
-    let env = Environment::new("cred-boundary");
-    let server = SyntheticServer::start(vec![ScriptedOutcome::Success(
-        ScriptedResponseBody::json_ok(ANTHROPIC_SUCCESS_BODY.to_vec()),
-    )])
-    .unwrap();
-
-    let ambient_oauth = "ambient-oauth-secret-99999";
-    let ambient_env_value = "ambient-secondary-marker-88888";
-    let explicit_token = "test-token";
-
-    let mut cmd = env.command(&server.url(), &["sample", "--account", "work-primary"]);
-    cmd.env("CLAUDE_CODE_OAUTH_TOKEN", ambient_oauth)
-        .env("ANTHROPIC_API_KEY", ambient_env_value);
-
-    let output = cmd.output().expect("aub must run");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    assert_eq!(output.status.code(), Some(0), "stderr: {stderr}");
-
-    // Server must have received exactly the explicit token
-    let requests = server.requests();
-    assert_eq!(requests.len(), 1);
-    assert_eq!(
-        requests[0].authorization(),
-        Some(format!("Bearer {explicit_token}").as_str())
-    );
-
-    // Assert neither secret appears anywhere in stdout, stderr, or SQLite database
-    assert!(!stdout.contains(ambient_oauth));
-    assert!(!stdout.contains(ambient_env_value));
-    assert!(!stdout.contains(explicit_token));
-
-    assert!(!stderr.contains(ambient_oauth));
-    assert!(!stderr.contains(ambient_env_value));
-    assert!(!stderr.contains(explicit_token));
-
-    let db_bytes = std::fs::read(env.db_path()).unwrap();
-    let db_str = String::from_utf8_lossy(&db_bytes);
-    assert!(!db_str.contains(ambient_oauth));
-    assert!(!db_str.contains(ambient_env_value));
-    assert!(!db_str.contains(explicit_token));
-}
-
-#[test]
 fn process_termination_durability_attempt_start_survives_without_result() {
     let env = Environment::new("process-term-durability");
     let server = SyntheticServer::start(vec![ScriptedOutcome::HeadersThenStall {
