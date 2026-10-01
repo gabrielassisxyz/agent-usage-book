@@ -26,19 +26,63 @@
 # (`025-now-account-switch-boundary.sh` does the same for
 # `session_account_marker`).
 #
-# What this case does not cover: a policy-classified missing-model-window case
-# (`aub-eun.15`) needs a second sample whose response drops a previously
-# present window, which needs a second stub-server fixture and a second
-# forced sample layered onto the same account; left for a follow-up case
-# rather than seeded thin here.
+# What this case also covers (aub-igbq): the policy-classified
+# missing-required-window case (`aub-eun.15`). A second stub-server fixture
+# answers the limits contract's full window set once, then a second fixture
+# with the required `session` kind dropped; a second forced `aub sample`
+# lands the refused reading on the same account and `aub can-run` refuses
+# with the typed malformed-response reason while the ledger keeps the
+# `missing_required_field` classification. The optional-window directions
+# (disappearing or reappearing `weekly_scoped` changing nothing) are pinned
+# by `tests/can_run_window_policy.rs` instead, where ledger comparison is
+# cheaper than a third and fourth stub fixture here.
 
 CASE_ID="026-can-run"
-CASE_DESCRIPTION="aub can-run selects the limiting window by calibrated headroom rather than percentage, refuses an uncalibrated window without hiding the calibrated ones, and refuses a stale meter, all as a normal exit 0."
+CASE_DESCRIPTION="aub can-run selects the limiting window by calibrated headroom rather than percentage, refuses an uncalibrated window without hiding the calibrated ones, refuses a stale meter, and refuses a reading whose required window is missing, all as a normal exit 0."
 
 CONFIG=""
 LEDGER_DB=""
 SERVER_PID=""
 PORT=""
+
+# Starts the stub HTTP server serving FIXTURE and refreshes PORT/SERVER_PID.
+# Used by the missing-required-window follow-up, which needs two different
+# bodies layered onto one account; the worked-example server above stays
+# inline so its steps do not move.
+start_stub_server() {
+    rm -f "$STATE_DIR/port.txt"
+    python3 -c "
+import http.server, socketserver, sys
+port_file, fixture = sys.argv[1], sys.argv[2]
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        with open(fixture, 'rb') as f:
+            data = f.read()
+        self.send_response(200)
+        self.send_header('Content-Type', 'application/json')
+        self.send_header('Content-Length', str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+    def log_message(self, format, *args):
+        pass
+httpd = socketserver.TCPServer(('127.0.0.1', 0), Handler)
+with open(port_file, 'w') as pf:
+    pf.write(str(httpd.server_address[1]))
+httpd.serve_forever()
+" "$STATE_DIR/port.txt" "$1" &
+    SERVER_PID=$!
+
+    local count=0
+    while [ ! -s "$STATE_DIR/port.txt" ]; do
+        sleep 0.05
+        count=$((count + 1))
+        if [ "$count" -gt 60 ]; then
+            echo "timed out waiting for stub server" >&2
+            exit 1
+        fi
+    done
+    PORT=$(cat "$STATE_DIR/port.txt")
+}
 
 case_preconditions() {
     require_command "$AUB_BIN"
@@ -53,8 +97,12 @@ case_preconditions() {
     echo '{"accessToken":"test-token"}' > "$STATE_DIR/creds/token.json"
     # Two logical accounts need two credential sources (aub-iwkg refuses a
     # shared path at configuration time); the same material under a second
-    # path keeps the stubbed sampling behavior unchanged.
+    # path keeps the stubbed sampling behavior unchanged. The
+    # missing-required-window follow-up (aub-igbq) gets a third account of
+    # its own, so the limits-contract samples never mix window sets with
+    # the legacy-shape readings on work-primary.
     echo '{"accessToken":"test-token"}' > "$STATE_DIR/creds/token-stale.json"
+    echo '{"accessToken":"test-token"}' > "$STATE_DIR/creds/token-limits.json"
 
     cat > "$CONFIG" <<CFG_EOF
 state.dir = "$STATE_DIR"
@@ -68,6 +116,11 @@ credential = { kind = "file", path = "$STATE_DIR/creds/token.json" }
 name = "stale-primary"
 provider = "anthropic"
 credential = { kind = "file", path = "$STATE_DIR/creds/token-stale.json" }
+
+[[accounts]]
+name = "limits-primary"
+provider = "anthropic"
+credential = { kind = "file", path = "$STATE_DIR/creds/token-limits.json" }
 
 [task_distribution]
 min_samples = 3
@@ -233,6 +286,62 @@ case_steps() {
     step "can-run-worked-example-json" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
         "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
         "$AUB_BIN" can-run --task-kind task --account work-primary --task-model sonnet --cached --format json
+
+    # 13-17. The missing-required-window follow-up (aub-igbq, aub-eun.15).
+    # Two limits-contract fixtures, written here rather than checked in:
+    # the full window set once, then the same set with the required
+    # `session` kind dropped. Both forced samples land on limits-primary,
+    # whose limits windows never mix with work-primary's legacy readings.
+    cat > "$STATE_DIR/limits-full.json" <<'JSON_EOF'
+{"limits": [
+  {"kind": "session", "percent": 8.0, "severity": "normal", "resets_at": "2099-01-01T00:00:00.000Z", "scope": null, "is_active": true},
+  {"kind": "weekly_all", "percent": 21.0, "severity": "warning", "resets_at": "2099-01-01T00:00:00.000Z", "scope": null, "is_active": true},
+  {"kind": "weekly_scoped", "percent": 24.0, "severity": "critical", "resets_at": "2099-01-01T00:00:00.000Z", "scope": {"model": "sonnet"}, "is_active": true}
+]}
+JSON_EOF
+    cat > "$STATE_DIR/limits-required-dropped.json" <<'JSON_EOF'
+{"limits": [
+  {"kind": "weekly_all", "percent": 21.0, "severity": "warning", "resets_at": "2099-01-01T00:00:00.000Z", "scope": null, "is_active": true},
+  {"kind": "weekly_scoped", "percent": 24.0, "severity": "critical", "resets_at": "2099-01-01T00:00:00.000Z", "scope": {"model": "sonnet"}, "is_active": true}
+]}
+JSON_EOF
+    start_stub_server "$STATE_DIR/limits-full.json"
+
+    # 13. The full limits set lands a successful reading on limits-primary.
+    step "sample-limits-full" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
+        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:$PORT" \
+        "$AUB_BIN" sample --account limits-primary
+
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+    start_stub_server "$STATE_DIR/limits-required-dropped.json"
+
+    # 14. The required `session` kind dropped: the reading is refused, and
+    #    --require-success surfaces the typed missing-required-field reason.
+    step "sample-limits-required-dropped" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
+        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:$PORT" \
+        "$AUB_BIN" sample --account limits-primary --require-success
+
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+    SERVER_PID=""
+
+    # 15-16. can-run over the refused reading: exit 0 with a refusal naming
+    #    the malformed provider response, in text and in JSON, against an
+    #    unreachable endpoint so neither step can have fetched anything live.
+    step "can-run-missing-required" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
+        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
+        "$AUB_BIN" can-run --task-kind task --account limits-primary --task-model sonnet --cached
+    step "can-run-missing-required-json" env "HOME=$STATE_DIR/home" "AUB_CONFIG_FILE=$CONFIG" \
+        "AUB_ANTHROPIC_ENDPOINT=http://127.0.0.1:9" \
+        "$AUB_BIN" can-run --task-kind task --account limits-primary --task-model sonnet --cached --format json
+
+    # 17. The ledger keeps the typed classification for the refused attempt.
+    step "limits-required-ledger" sqlite3 "$LEDGER_DB" "
+        SELECT outcome || '/' || failure_class || '/' || sanitized_error_classification
+        FROM meter_attempt_result ORDER BY attempt_id DESC LIMIT 1;
+    "
 }
 
 case_assertions() {
@@ -283,4 +392,22 @@ case_assertions() {
     assert_json_field 12 outcome.assessment MARGINAL
     assert_json_field 12 outcome.windows[0].headroom.lower 20800000
     assert_json_field 12 outcome.windows[0].headroom.upper 20800000
+
+    assert_exit 0 13
+    assert_stdout_contains 13 "outcome=success"
+
+    assert_exit 4 14
+    assert_stderr_contains 14 "MissingRequiredField"
+
+    assert_exit 0 15
+    assert_stdout_contains 15 "assessment: UNKNOWN"
+    assert_stdout_contains 15 "the provider's response could not be parsed"
+
+    assert_exit 0 16
+    assert_json_field 16 outcome.status refused
+    assert_json_field 16 outcome.missing[0].subject meter
+    assert_json_field 16 outcome.missing[0].reason "the provider's response could not be parsed"
+
+    assert_exit 0 17
+    assert_stdout_contains 17 "unreachable/missing_required_field/missing_required_field"
 }
