@@ -1135,6 +1135,55 @@ self_test_duplicate_case() {
     echo "self-test: duplicate case detection ok"
 }
 
+# self_test_no_main_ref: on a checkout with no main ref, as on a depth-one
+# pull_request checkout, check_consistency names the missing ref and skips
+# the case-number rule with a visible line instead of failing, while the
+# case-id rule still runs. A refless scratch repository stands in for the
+# checkout, so this holds whatever refs the real checkout has (aub-o1oc).
+self_test_no_main_ref() {
+    local tmp cases surface out refless
+    tmp="$(mktemp -d)"
+    surface="$tmp/surface.txt"
+    : >"$surface"
+    refless="$tmp/refless"
+    git init -q "$refless"
+
+    cases="$tmp/numbered"
+    mkdir -p "$cases"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/033-a.sh"
+    printf '# case\ncase_steps() { :; }\n' >"$cases/033-b.sh"
+    if ! out="$(REPO_ROOT="$refless" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+        echo "self-test: the case-number rule failed without a main ref instead of skipping: $out" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *"no main ref"*) : ;;
+        *) echo "self-test: the skip did not name the missing main ref: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+
+    cases="$tmp/idclash"
+    mkdir -p "$cases"
+    printf 'CASE_ID=same\ncase_steps() { :; }\n' >"$cases/aub-x-one.sh"
+    printf 'CASE_ID=same\ncase_steps() { :; }\n' >"$cases/aub-x-two.sh"
+    if out="$(REPO_ROOT="$refless" CASES_DIR="$cases" SURFACE_FILE="$surface" check_consistency 2>&1)"; then
+        echo "self-test: a duplicate CASE_ID was accepted without a main ref" >&2
+        rm -rf "$tmp"
+        return 1
+    fi
+    case "$out" in
+        *aub-x-one.sh*aub-x-two.sh*|*aub-x-two.sh*aub-x-one.sh*) : ;;
+        *) echo "self-test: the duplicate-CASE_ID message did not name both files: $out" >&2
+           rm -rf "$tmp"
+           return 1 ;;
+    esac
+
+    rm -rf "$tmp"
+    echo "self-test: no-main-ref skip ok"
+}
+
 # self_test_summary_parseback: summary.json, timeline.txt and manifest.json all
 # describe the same run and agree with each other and with the files on disk.
 self_test_summary_parseback() {
@@ -1446,6 +1495,7 @@ self_test() {
     self_test_golden || overall=1
     self_test_consistency || overall=1
     self_test_duplicate_case || overall=1
+    self_test_no_main_ref || overall=1
     self_test_summary_parseback || overall=1
     self_test_timeout_and_signal || overall=1
     self_test_self_sufficient_build || overall=1
