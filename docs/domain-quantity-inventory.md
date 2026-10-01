@@ -125,6 +125,12 @@ quantity, documented here with its reason for exclusion:
 - `WindowPresenceChange`: tag enum recording whether a window identity appeared in or disappeared from the current observation relative to the previous one, an input to `classify_window_set_change`, not a measured quantity.
 - `WindowReading`: a composite input to `classify_window_transition` grouping one window's already-typed used fraction, reset state and measurement instant for one observation; a grouping of other quantities' outputs, not itself a validated quantity with a smart constructor of its own.
 
+### Per-account selection signal (`selection.rs`)
+- `SelectionWindow`: the formula's view of one window grouping its stored used fraction, reset state and nominal duration with the report-time burn; a composite input built by `SelectionWindow::new` or `SelectionWindow::from_meter`, not a validated quantity of its own (`aub-vkv7`).
+- `Runway`: tag enum with exactly four outcomes (through reset, projected exhaustion, exhausted now, unknown), not a measured quantity. It has no `Default` and no free-standing formatting trait; `as_str` is an inherent method for the stable JSON spelling.
+- `Confidence`: tag enum with exactly two outcomes (early, established), not a measured quantity; `as_str` is the stable JSON spelling, not a formatting trait.
+- `Selection`: the composite output grouping the spend scalar with the runway, usable seconds and confidence that qualify it; a grouping of the derivation's outputs, not a validated quantity with a smart constructor of its own.
+
 ### Authoritative surface comparison (`authoritative_comparison.rs`)
 - `AuthoritativeComparisonVerdict`: tag enum with exactly two outcomes (agrees within granularity, unresolved mismatch), not a measured quantity. It has no `Default` and no free-standing formatting trait; `as_str` is an inherent method for the stable database spelling.
 - `DocumentedGranularity`: a thin newtype over `QuotaFractionPpm` carrying the smallest difference the provider's authoritative surface is able to express. Private representation, a public smart constructor, no `Default`, no `Display`. It delegates its numeric bound to `QuotaFractionPpm`, so it has no dedicated compile-fail fixture of its own.
