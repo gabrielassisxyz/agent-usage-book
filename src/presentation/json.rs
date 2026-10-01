@@ -719,7 +719,7 @@ pub fn status_json_with_explain(report: &StatusReport, run: RunId, explain: Expl
     let accounts = report
         .accounts
         .iter()
-        .map(status_account_json)
+        .map(|account| status_account_json(account, report.metadata.generated_at))
         .collect::<Vec<_>>()
         .join(",");
     let mut body = format!("\"accounts\":[{accounts}]");
@@ -3075,7 +3075,7 @@ fn window_scope_label(scope: &WindowScope) -> String {
 /// context the reading was computed under, when it was computed from a
 /// projection. The scopes the reading included are always named, so a
 /// consumer can see which windows the number is the minimum over.
-fn status_account_json(account: &crate::report::MeterAccount) -> String {
+fn status_account_json(account: &crate::report::MeterAccount, now: UtcTimestamp) -> String {
     let mut fields = vec![format!(
         "\"account\":{}",
         json_string(account.account.as_str())
@@ -3152,7 +3152,9 @@ fn status_account_json(account: &crate::report::MeterAccount) -> String {
             .join(",");
         fields.push(format!("\"windows\":[{windows}]"));
     }
-    format!("{{{}}}", fields.join(","))
+    // The per-account selection signal (aub-vkv7), closed beside this file so
+    // this module stays under its size ceiling.
+    super::selection_json::close_account_object(fields, account, now)
 }
 
 /// One `accounts[].windows[]` entry: the provider's stored inputs for the

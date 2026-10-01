@@ -20,6 +20,7 @@ pub mod quota;
 pub mod rate_card;
 pub mod render;
 pub mod rows;
+pub mod selection;
 pub mod time;
 pub mod tokens;
 pub mod window;

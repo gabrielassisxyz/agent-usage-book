@@ -266,8 +266,14 @@ fn a_reading_without_window_context_stays_the_plain_shape() {
     );
     assert_eq!(
         sorted,
-        vec!["account", "freshness", "latest_attempt", "remaining"],
-        "no selector context, no selector fields"
+        vec![
+            "account",
+            "freshness",
+            "latest_attempt",
+            "remaining",
+            "selection"
+        ],
+        "no selector context, no selector fields (selection always travels)"
     );
 }
 
@@ -327,7 +333,8 @@ fn the_observation_age_is_machine_readable_beside_the_freshness_variant() {
             "freshness",
             "latest_attempt",
             "observation_age_nanos",
-            "remaining"
+            "remaining",
+            "selection"
         ],
         "the age joins the account field set exactly: {keys:?}"
     );
