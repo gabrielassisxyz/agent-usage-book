@@ -1336,118 +1336,474 @@ fn integration_one_unit_unexplained_discrepancy_fails_harness() {
 }
 
 // ---------------------------------------------------------------------------
-// Acceptance Criterion 7 & Operational Test:
-// Opt-in run over a representative multi-week corpus records its content identity
-// and discrepancy classification on this bead.
+// Multi-week differential with corpus-derived expectations (aub-wsjq).
+//
+// The default-suite test below runs the real `aub spend --format json` binary
+// over tests/fixtures/differential/multi_week_corpus/ and derives the legacy
+// side from the same corpus with an independent parse written here. Neither
+// side is a literal: a change in the corpus, in aub's spend, or in the
+// harness classifier fails the test instead of passing against stale numbers.
+//
+// Legacy model (what the legacy tools count, per record class):
+// - Records under a `subagents/` directory are invisible to legacy (legacy
+//   never discovered nested transcripts) and count fully toward
+//   NewlyDiscoveredSubagents.
+// - Legacy sums every line including replayed ones while aub keeps the last
+//   line per message id, so ReplayRemoval equals the superseded lines'
+//   tokens.
+// - Legacy never reports cache_write, so CacheWriteVisibility equals aub's
+//   measured cache writes. This is also the classifier's automatic arm, so no
+//   explicit rule below carries a cache_write component.
+// - Legacy's codex parser counts reasoning_output_tokens as output while aub
+//   reports model output only, so ParserCorrection equals the negated
+//   reasoning tokens.
+// - Legacy's cumulative importer swaps input and output of a record ingested
+//   after a cache-write record in the same file (inversion bug), so LegacyBug
+//   equals the swapped-minus-original delta of that record.
+// The derivation reads the JSONL files directly and never calls the harness
+// classifier or aub's transcript parser. Replayed lines in this corpus carry
+// no reasoning and no cache-write; the derivation sums those per line, so a
+// corpus change adding either to a replayed line fails the test instead of
+// passing silently.
+//
+// Operational mode: set AUB_DIFFERENTIAL_LEGACY_BIN to a real legacy
+// executable to run the same comparison against that tool. The executable
+// must accept `--since YYYY-MM-DD --days N <corpus-dir>` and print the legacy
+// spend JSON schema the harness parses (a `periods` array of period, input,
+// output, cache_read, cache_write and total). Without the variable the
+// operational test prints one skip line and passes, so a skip is never
+// silent.
+//
+// Report artifact: the JSON report is written to a temporary directory, or to
+// the path named by AUB_DIFFERENTIAL_REPORT_PATH. The variable must name a
+// path outside the repository; the test refuses otherwise. Either way
+// `cargo test` never writes under the repository.
 // ---------------------------------------------------------------------------
+
+/// Raw per-record token counts read straight from one corpus line.
+#[derive(Debug, Clone, Copy, Default)]
+struct CorpusRecord {
+    input: u64,
+    output: u64,
+    cache_read: u64,
+    cache_write: u64,
+    reasoning: u64,
+}
+
+/// One independently derived legacy expectation for a single day.
+struct DerivedDayExpectation {
+    legacy: TokenUsage,
+    /// (category, delta, reason) triples; deltas never carry cache_write,
+    /// which the classifier's automatic arm accounts for instead.
+    rules: Vec<(DiscrepancyCategory, TokenDelta, String)>,
+}
+
+fn add_delta(acc: &mut TokenDelta, other: &TokenDelta) {
+    acc.input += other.input;
+    acc.output += other.output;
+    acc.cache_read += other.cache_read;
+    acc.cache_write += other.cache_write;
+    acc.total += other.total;
+}
+
+fn neg_record_delta(rec: &CorpusRecord) -> TokenDelta {
+    TokenDelta {
+        input: -(rec.input as i64),
+        output: -(rec.output as i64),
+        cache_read: -(rec.cache_read as i64),
+        cache_write: 0,
+        total: -((rec.input + rec.output + rec.cache_read) as i64),
+    }
+}
+
+/// Derives the legacy side of the multi-week comparison straight from the
+/// corpus files, under the legacy model documented in the header above.
+/// Reads each JSONL line as a plain JSON value: never the harness classifier,
+/// never aub's transcript parser.
+fn derive_legacy_expectations(corpus: &Path) -> BTreeMap<String, DerivedDayExpectation> {
+    let mut files = Vec::new();
+    collect_files_recursive(corpus, &mut files).expect("list multi-week corpus");
+    files.sort();
+
+    struct DayAcc {
+        legacy: TokenUsage,
+        subagents: TokenDelta,
+        replay: TokenDelta,
+        parser: TokenDelta,
+        bug: TokenDelta,
+        /// message id -> legacy contributions in encounter order, for replay detection.
+        /// Subagent records never enter this map: legacy saw nothing to replay.
+        by_id: BTreeMap<String, Vec<CorpusRecord>>,
+    }
+
+    let mut days: BTreeMap<String, DayAcc> = BTreeMap::new();
+
+    for file in &files {
+        if file.extension().and_then(|e| e.to_str()) != Some("jsonl") {
+            continue;
+        }
+        let text = fs::read_to_string(file)
+            .unwrap_or_else(|e| panic!("read corpus file {}: {e}", file.display()));
+        let is_subagent = file.to_string_lossy().contains("subagents");
+        let mut seen_cache_write_in_file = false;
+        for (line_no, line) in text.lines().enumerate() {
+            if line.trim().is_empty() {
+                continue;
+            }
+            let v: Value = serde_json::from_str(line).unwrap_or_else(|e| {
+                panic!("parse {} line {} as JSON: {e}", file.display(), line_no + 1)
+            });
+            // Lines without usage carry no tokens (for example codex session
+            // metadata) and contribute to neither side.
+            let (rec, id) = if let Some(usage) = v.get("message").and_then(|m| m.get("usage")) {
+                let get = |field: &str| usage.get(field).and_then(Value::as_u64).unwrap_or(0);
+                let rec = CorpusRecord {
+                    input: get("input_tokens"),
+                    output: get("output_tokens"),
+                    cache_read: get("cache_read_input_tokens"),
+                    cache_write: get("cache_creation_input_tokens"),
+                    reasoning: 0,
+                };
+                let id = v
+                    .get("message")
+                    .and_then(|m| m.get("id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("{}:{}", file.display(), line_no));
+                (rec, id)
+            } else if let Some(counts) = v
+                .get("payload")
+                .and_then(|p| p.get("info"))
+                .and_then(|i| i.get("total_token_usage"))
+            {
+                let get = |field: &str| counts.get(field).and_then(Value::as_u64).unwrap_or(0);
+                let rec = CorpusRecord {
+                    input: get("input_tokens"),
+                    output: get("output_tokens"),
+                    cache_read: get("cached_input_tokens"),
+                    cache_write: get("cache_write_input_tokens"),
+                    reasoning: get("reasoning_output_tokens"),
+                };
+                (rec, format!("{}:{}", file.display(), line_no))
+            } else {
+                continue;
+            };
+            let day = v
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "corpus usage line without timestamp: {} line {}",
+                        file.display(),
+                        line_no + 1
+                    )
+                });
+            assert!(
+                day.len() >= 10,
+                "corpus timestamp has no day part: {} line {}",
+                file.display(),
+                line_no + 1
+            );
+            let day = day[..10].to_string();
+
+            let acc = days.entry(day.clone()).or_insert_with(|| DayAcc {
+                legacy: TokenUsage::default(),
+                subagents: TokenDelta::default(),
+                replay: TokenDelta::default(),
+                parser: TokenDelta::default(),
+                bug: TokenDelta::default(),
+                by_id: BTreeMap::new(),
+            });
+
+            if is_subagent {
+                // Legacy never discovered nested transcripts.
+                let d = TokenDelta {
+                    input: rec.input as i64,
+                    output: rec.output as i64,
+                    cache_read: rec.cache_read as i64,
+                    cache_write: 0,
+                    total: (rec.input + rec.output + rec.cache_read) as i64,
+                };
+                add_delta(&mut acc.subagents, &d);
+                if rec.cache_write > 0 {
+                    seen_cache_write_in_file = true;
+                }
+                continue;
+            }
+
+            // Legacy's codex parser counts reasoning as output.
+            let mut legacy_rec = rec;
+            if rec.reasoning > 0 {
+                legacy_rec.output += rec.reasoning;
+                let d = TokenDelta {
+                    input: 0,
+                    output: -(rec.reasoning as i64),
+                    cache_read: 0,
+                    cache_write: 0,
+                    total: -(rec.reasoning as i64),
+                };
+                add_delta(&mut acc.parser, &d);
+            }
+            // Legacy's cumulative importer inverts a record ingested after a
+            // cache-write record in the same file.
+            if seen_cache_write_in_file {
+                let swapped = CorpusRecord {
+                    input: legacy_rec.output,
+                    output: legacy_rec.input,
+                    ..legacy_rec
+                };
+                let d = TokenDelta {
+                    input: rec.input as i64 - swapped.input as i64,
+                    output: rec.output as i64 - swapped.output as i64,
+                    cache_read: 0,
+                    cache_write: 0,
+                    total: (rec.input as i64 + rec.output as i64)
+                        - (swapped.input as i64 + swapped.output as i64),
+                };
+                add_delta(&mut acc.bug, &d);
+                legacy_rec = swapped;
+            }
+            // Legacy never reports cache_write.
+            legacy_rec.cache_write = 0;
+            acc.legacy = TokenUsage::new(
+                acc.legacy.input + legacy_rec.input,
+                acc.legacy.output + legacy_rec.output,
+                acc.legacy.cache_read + legacy_rec.cache_read,
+                acc.legacy.cache_write,
+            );
+            acc.by_id.entry(id).or_default().push(legacy_rec);
+            if rec.cache_write > 0 {
+                seen_cache_write_in_file = true;
+            }
+        }
+    }
+
+    // Legacy sums every line including replayed ones; the replay category is
+    // the superseded (all but last) contribution per message id and day.
+    let mut out = BTreeMap::new();
+    for (day, mut acc) in days {
+        let mut replay = TokenDelta::default();
+        for records in acc.by_id.values() {
+            for superseded in records.iter().take(records.len().saturating_sub(1)) {
+                add_delta(&mut replay, &neg_record_delta(superseded));
+            }
+        }
+        acc.replay = replay;
+        let mut rules = Vec::new();
+        if !acc.subagents.is_zero() {
+            rules.push((
+                DiscrepancyCategory::NewlyDiscoveredSubagents,
+                acc.subagents,
+                "legacy did not discover nested subagent transcripts".to_string(),
+            ));
+        }
+        if !acc.replay.is_zero() {
+            rules.push((
+                DiscrepancyCategory::ReplayRemoval,
+                acc.replay,
+                "legacy counted replayed lines again; aub deduplicated".to_string(),
+            ));
+        }
+        if !acc.parser.is_zero() {
+            rules.push((
+                DiscrepancyCategory::ParserCorrection,
+                acc.parser,
+                "legacy codex parser counted reasoning tokens as output".to_string(),
+            ));
+        }
+        if !acc.bug.is_zero() {
+            rules.push((
+                DiscrepancyCategory::LegacyBug,
+                acc.bug,
+                "legacy cumulative differencing inversion bug".to_string(),
+            ));
+        }
+        out.insert(
+            day,
+            DerivedDayExpectation {
+                legacy: acc.legacy,
+                rules,
+            },
+        );
+    }
+    out
+}
+
+fn derived_rules_for_harness(
+    derived: &BTreeMap<String, DerivedDayExpectation>,
+) -> Vec<DiscrepancyRule> {
+    let mut rules = Vec::new();
+    for (day, exp) in derived {
+        for (category, delta, reason) in &exp.rules {
+            rules.push(DiscrepancyRule {
+                period: day.clone(),
+                category: *category,
+                delta: *delta,
+                reason: reason.clone(),
+            });
+        }
+    }
+    rules
+}
+
+fn create_multi_week_config(state: &StateDir, corpus: &Path) -> PathBuf {
+    let cfg_path = state.path().join("aub.toml");
+    let content = format!(
+        r#"
+[[transcripts]]
+name = "claude-code"
+root = "{}"
+pattern = "**/*.jsonl"
+format = "claude-code"
+
+[[transcripts]]
+name = "codex"
+root = "{}"
+pattern = "**/*.jsonl"
+format = "codex"
+"#,
+        corpus.join("claude-code").display(),
+        corpus.join("codex").display()
+    );
+    fs::write(&cfg_path, content).expect("write aub.toml");
+    cfg_path
+}
+
+fn multi_week_aub_args() -> Vec<String> {
+    vec![
+        "spend".to_string(),
+        "--since".to_string(),
+        "2026-08-03".to_string(),
+        "--days".to_string(),
+        "28".to_string(),
+        "--group-by".to_string(),
+        "day".to_string(),
+        "--refresh".to_string(),
+        "force".to_string(),
+        "--format".to_string(),
+        "json".to_string(),
+    ]
+}
+
+/// Runs the real `aub spend --format json` binary over the multi-week corpus
+/// and parses its per-day output. This is the same binary invocation the
+/// end-to-end harness runner performs, minus the legacy process.
+fn run_aub_spend_over_multi_week_corpus(
+    aub_bin: &Path,
+    config: &Path,
+    state: &StateDir,
+) -> BTreeMap<String, TokenUsage> {
+    let output = Command::new(aub_bin)
+        .args(multi_week_aub_args())
+        .env("AUB_CONFIG_FILE", config)
+        .env("AUB_STATE_DIR", state.path())
+        .output()
+        .expect("spawn aub spend over multi-week corpus");
+    assert!(
+        output.status.success(),
+        "aub spend over multi-week corpus failed: status {:?} stderr: {}",
+        output.status.code(),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("aub spend output must be UTF-8");
+    parse_aub_json(&stdout).expect("parse aub spend output over multi-week corpus")
+}
+
+/// The one line the operational test prints when no real legacy executable is
+/// configured, so a skip is never silent.
+fn operational_skip_line() -> String {
+    "SKIP operational_multi_week_against_real_legacy_tool: \
+     AUB_DIFFERENTIAL_LEGACY_BIN is not set, so the real-legacy comparison \
+     did not run (set it to a legacy spend executable to opt in)"
+        .to_string()
+}
+
 #[test]
-fn operational_multi_week_corpus_records_identity_and_classification() {
+fn multi_week_differential_expectations_derive_from_corpus() {
     let corpus = multi_week_corpus_path();
     let digest = compute_corpus_content_digest(&corpus).expect("multi-week digest");
-    assert!(!digest.is_empty());
+    assert!(
+        !digest.is_empty(),
+        "multi-week corpus digest must not be empty"
+    );
 
-    // Build multi-week periods across the 4 weeks
+    // Legacy side: independent parse of the corpus files.
+    let derived = derive_legacy_expectations(&corpus);
+    assert!(
+        !derived.is_empty(),
+        "derivation must yield at least one day from the multi-week corpus"
+    );
+    let rules = derived_rules_for_harness(&derived);
+
+    // Aub side: the real binary over the same corpus.
+    let aub_bin = PathBuf::from(env!("CARGO_BIN_EXE_aub"));
+    let state = StateDir::new();
+    let config = create_multi_week_config(&state, &corpus);
+    let aub_periods = run_aub_spend_over_multi_week_corpus(&aub_bin, &config, &state);
+
+    let mut day_keys: BTreeSet<String> = BTreeSet::new();
+    day_keys.extend(aub_periods.keys().cloned());
+    day_keys.extend(derived.keys().cloned());
+
     let mut periods = Vec::new();
-
-    // Week 1 (2026-08-03): cache write visibility (5000 tokens)
-    let w1_cmp = classify_period_discrepancy(
-        "2026-08-03",
-        &TokenUsage::new(2000, 800, 4000, 5000),
-        &TokenUsage::new(2000, 800, 4000, 0),
-        &[],
-    );
-    periods.push(w1_cmp);
-
-    // Week 1 (2026-08-05): newly discovered subagents (600 in, 300 out)
-    let w1_sub_rule = [DiscrepancyRule {
-        period: "2026-08-05".to_string(),
-        category: DiscrepancyCategory::NewlyDiscoveredSubagents,
-        delta: TokenDelta {
-            input: 600,
-            output: 300,
-            cache_read: 0,
-            cache_write: 0,
-            total: 900,
-        },
-        reason: "discovered nested subagent transcript".to_string(),
-    }];
-    let w1_sub = classify_period_discrepancy(
-        "2026-08-05",
-        &TokenUsage::new(600, 300, 0, 0),
-        &TokenUsage::new(0, 0, 0, 0),
-        &w1_sub_rule,
-    );
-    periods.push(w1_sub);
-
-    // Week 2 (2026-08-10): replay removal (legacy double-counted replay: +400 output)
-    let w2_rep_rule = [DiscrepancyRule {
-        period: "2026-08-10".to_string(),
-        category: DiscrepancyCategory::ReplayRemoval,
-        delta: TokenDelta {
-            input: 0,
-            output: -400,
-            cache_read: 0,
-            cache_write: 0,
-            total: -400,
-        },
-        reason: "legacy double counted replayed stream; aub deduplicated".to_string(),
-    }];
-    let w2_rep = classify_period_discrepancy(
-        "2026-08-10",
-        &TokenUsage::new(1500, 700, 1000, 0),
-        &TokenUsage::new(1500, 1100, 1000, 0),
-        &w2_rep_rule,
-    );
-    periods.push(w2_rep);
-
-    // Week 3 (2026-08-17): cache write visibility + parser correction
-    let w3_parser_rule = [DiscrepancyRule {
-        period: "2026-08-17".to_string(),
-        category: DiscrepancyCategory::ParserCorrection,
-        delta: TokenDelta {
-            input: 50,
-            output: 20,
-            cache_read: 0,
-            cache_write: 0,
-            total: 70,
-        },
-        reason: "parser correction on format drift record".to_string(),
-    }];
-    let w3_cmp = classify_period_discrepancy(
-        "2026-08-17",
-        &TokenUsage::new(1200, 600, 2500, 4000),
-        &TokenUsage::new(1150, 580, 2500, 0),
-        &w3_parser_rule,
-    );
-    periods.push(w3_cmp);
-
-    // Week 4 (2026-08-24): legacy bug off-by-one difference (15 tokens)
-    let w4_bug_rule = [DiscrepancyRule {
-        period: "2026-08-24".to_string(),
-        category: DiscrepancyCategory::LegacyBug,
-        delta: TokenDelta {
-            input: 10,
-            output: 5,
-            cache_read: 0,
-            cache_write: 0,
-            total: 15,
-        },
-        reason: "legacy cumulative differencing inversion bug".to_string(),
-    }];
-    let w4_bug = classify_period_discrepancy(
-        "2026-08-24",
-        &TokenUsage::new(1000, 500, 0, 0),
-        &TokenUsage::new(990, 495, 0, 0),
-        &w4_bug_rule,
-    );
-    periods.push(w4_bug);
+    for day in &day_keys {
+        let aub = aub_periods.get(day).copied().unwrap_or_default();
+        let legacy = derived.get(day).map(|e| e.legacy).unwrap_or_default();
+        periods.push(classify_period_discrepancy(day, &aub, &legacy, &rules));
+    }
 
     let report = generate_differential_report(digest.clone(), periods);
 
-    // Assert that every discrepancy was classified with zero unclassified remaining
+    // Per day and per category, the harness report must equal the derivation.
+    // The cache-write category has no explicit rule: the classifier accounts
+    // for it automatically, so its expectation is the automatic arm.
+    for cmp in &report.periods {
+        let exp = derived.get(&cmp.period);
+        for cat in DiscrepancyCategory::ALL {
+            let mut actual = TokenDelta::default();
+            for e in cmp
+                .classified_explanations
+                .iter()
+                .filter(|e| e.category == cat)
+            {
+                add_delta(&mut actual, &e.delta);
+            }
+            let mut expected = TokenDelta::default();
+            if cat == DiscrepancyCategory::CacheWriteVisibility {
+                let legacy_write = exp.map(|e| e.legacy.cache_write).unwrap_or(0);
+                if legacy_write == 0 && cmp.aub.cache_write > 0 {
+                    expected.cache_write = cmp.aub.cache_write as i64;
+                    expected.total = cmp.aub.cache_write as i64;
+                }
+            } else if let Some(e) = exp {
+                for (_, d, _) in e.rules.iter().filter(|(c, _, _)| *c == cat) {
+                    add_delta(&mut expected, d);
+                }
+            }
+            assert_eq!(
+                actual,
+                expected,
+                "week {} category {}: harness delta {:?} != derived {:?}",
+                cmp.period,
+                cat.name(),
+                actual,
+                expected
+            );
+        }
+        assert!(
+            cmp.unclassified_delta.is_zero(),
+            "week {} has unclassified delta {:?} (aub {:?} vs legacy {:?})",
+            cmp.period,
+            cmp.unclassified_delta,
+            cmp.aub,
+            cmp.legacy
+        );
+    }
+
     assert_eq!(
         report.unclassified.count, 0,
-        "must have zero unclassified discrepancies"
+        "multi-week run must have zero unclassified discrepancies, got {:?}",
+        report.unclassified
     );
     assert!(
         report.is_retirement_ready(),
@@ -1455,21 +1811,125 @@ fn operational_multi_week_corpus_records_identity_and_classification() {
     );
     assert_eq!(report.corpus_content_digest, digest);
 
-    // Verify all 5 categories are represented
     for cat in DiscrepancyCategory::ALL {
-        let acc = report.category_breakdown.get(&cat).unwrap();
+        let acc = report
+            .category_breakdown
+            .get(&cat)
+            .unwrap_or_else(|| panic!("category {} missing from breakdown", cat.name()));
         assert!(
             acc.absolute_tokens > 0,
-            "category {} must have positive accounting in multi-week corpus",
+            "category {} must have positive accounting in multi-week corpus (absolute 0 tokens)",
             cat.name()
         );
     }
 
-    // Persist recorded report output to fixture artifact
-    let report_path = repo_root().join("tests/fixtures/differential/multi_week_report.json");
+    // The report artifact leaves the repository alone: a temporary directory,
+    // or an explicit path outside the repository.
+    let artifact_path = match std::env::var("AUB_DIFFERENTIAL_REPORT_PATH") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => {
+            std::env::temp_dir().join(format!("aub-multi-week-report-{}.json", std::process::id()))
+        }
+    };
+    assert!(
+        !artifact_path.starts_with(repo_root()),
+        "report artifact must not land under the repository, got {}",
+        artifact_path.display()
+    );
+    if let Some(parent) = artifact_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        fs::create_dir_all(parent).expect("create report artifact parent");
+    }
     let json_text = serde_json::to_string_pretty(&report.to_json_value()).unwrap();
-    fs::write(&report_path, &json_text).expect("write multi_week_report.json");
-    assert!(report_path.is_file(), "report artifact must exist");
+    fs::write(&artifact_path, &json_text).expect("write multi-week report artifact");
+    assert!(
+        artifact_path.is_file(),
+        "report artifact must exist at {}",
+        artifact_path.display()
+    );
+    println!(
+        "multi-week differential report: {}",
+        artifact_path.display()
+    );
+}
+
+#[test]
+fn integration_operational_mode_skip_line_without_legacy_bin() {
+    if std::env::var_os("AUB_DIFFERENTIAL_LEGACY_BIN").is_some() {
+        println!(
+            "operator opted in via AUB_DIFFERENTIAL_LEGACY_BIN, \
+             so the skip line cannot be observed in this run"
+        );
+        return;
+    }
+    let line = operational_skip_line();
+    assert!(
+        line.contains("AUB_DIFFERENTIAL_LEGACY_BIN"),
+        "skip line must name the variable, got: {line}"
+    );
+    assert!(
+        line.to_uppercase().contains("SKIP"),
+        "skip line must say it was skipped, got: {line}"
+    );
+    println!("{line}");
+}
+
+#[test]
+fn operational_multi_week_against_real_legacy_tool() {
+    let legacy_bin = match std::env::var("AUB_DIFFERENTIAL_LEGACY_BIN") {
+        Ok(v) if !v.trim().is_empty() => PathBuf::from(v),
+        _ => {
+            println!("{}", operational_skip_line());
+            return;
+        }
+    };
+
+    let corpus = multi_week_corpus_path();
+    let state = StateDir::new();
+    let config = create_multi_week_config(&state, &corpus);
+    let aub_bin = PathBuf::from(env!("CARGO_BIN_EXE_aub"));
+    let aub_args = multi_week_aub_args();
+    let aub_envs = [
+        ("AUB_CONFIG_FILE", config.to_str().unwrap()),
+        ("AUB_STATE_DIR", state.path().to_str().unwrap()),
+    ];
+    let legacy_args = vec![
+        "--since".to_string(),
+        "2026-08-03".to_string(),
+        "--days".to_string(),
+        "28".to_string(),
+        corpus.to_string_lossy().to_string(),
+    ];
+    let derived = derive_legacy_expectations(&corpus);
+    let rules = derived_rules_for_harness(&derived);
+
+    match run_differential_executables(
+        &aub_bin,
+        &aub_args,
+        &aub_envs,
+        &legacy_bin,
+        &legacy_args,
+        &[],
+        &corpus,
+        &rules,
+        "multi-week-operational",
+        Duration::from_secs(60),
+    ) {
+        Ok((report, _)) => {
+            println!("{}", report.render_text());
+            assert!(
+                report.is_retirement_ready(),
+                "operational comparison against {} must be retirement ready",
+                legacy_bin.display()
+            );
+        }
+        Err(log) => panic!(
+            "operational comparison against {} failed: {}",
+            legacy_bin.display(),
+            log.outcome
+        ),
+    }
 }
 
 // ---------------------------------------------------------------------------
