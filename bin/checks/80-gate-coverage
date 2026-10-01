@@ -26,6 +26,7 @@ declared_checks=(
     56-migration-schema-pin
     57-release-criteria-selftest
     58-release-guard-selftest
+    59-shipped-migration-digest
     60-e2e
     65-synthetic-adapter-absent-from-release
     70-quantity-inventory
