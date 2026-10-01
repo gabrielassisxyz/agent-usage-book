@@ -6534,7 +6534,9 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         &backup_id,
         timestamp,
     )?;
-    if summary.imported > 0 {
+    // A correction moves the preference selector, so the projection a reader
+    // sees is stale until it is republished.
+    if summary.imported > 0 || summary.reinterpreted > 0 {
         crate::projection::publish(
             &conn,
             &crate::projection::projection_path_in(&config.state.dir),
@@ -6544,6 +6546,10 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         "quarantined"
     } else if summary.imported > 0 {
         "imported"
+    } else if summary.reinterpreted > 0 {
+        // A run that only corrects earlier interpretations wrote rows, so it is
+        // neither `unchanged` nor `empty`.
+        "reinterpreted"
     } else if summary.unchanged > 0 {
         "unchanged"
     } else {
@@ -6566,6 +6572,10 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
                 ("imported", &Quantity::new(summary.imported, "records")),
                 ("unchanged", &Quantity::new(summary.unchanged, "records")),
                 (
+                    "reinterpreted",
+                    &Quantity::new(summary.reinterpreted, "records"),
+                ),
+                (
                     "superseded_by_native",
                     &Quantity::new(summary.superseded_by_native, "records"),
                 ),
@@ -6582,12 +6592,13 @@ fn import_seed_archive(clock: &impl Clock, level: Level, rest: &[String]) -> Res
         )
         .map_err(|error| Error::Internal(format!("write diagnostic: {error}")))?;
     println!(
-        "seed-archive import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} superseded_by_native={} discarded_unmapped_vendor={} quarantined={} terminal_outcome={}",
+        "seed-archive import: source_digest={} verified_backup_id={} records_read={} imported={} unchanged={} reinterpreted={} superseded_by_native={} discarded_unmapped_vendor={} quarantined={} terminal_outcome={}",
         source.content_digest,
         backup_id,
         source.records_read,
         summary.imported,
         summary.unchanged,
+        summary.reinterpreted,
         summary.superseded_by_native,
         summary.discarded_unmapped_vendor,
         summary.quarantined,

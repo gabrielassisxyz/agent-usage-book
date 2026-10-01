@@ -4,7 +4,7 @@
 # second historical timeline.
 
 CASE_ID="018-seed-archive-import"
-CASE_DESCRIPTION="Seed archive imports only after backup verification and only what native sampling does not cover, remains idempotent, quarantines malformed rows, discards a vendor it has no account for, and never prints the source path."
+CASE_DESCRIPTION="Seed archive imports only after backup verification and only what native sampling does not cover, stores a window the capture reported with no reset as an unstarted window, remains idempotent, quarantines malformed rows, discards a vendor it has no account for, and never prints the source path."
 
 SOURCE=""
 MALFORMED_SOURCE=""
@@ -36,8 +36,11 @@ state.dir = "$STATE_DIR/aub"
 name = "primary"
 provider = "anthropic"
 EOF
+    # The first reading's third window carries no `resetsAt`: the capture omits
+    # it for a window that has not started, and the importer must store that as
+    # an unstarted window rather than as an instant it computed itself.
     cat > "$SOURCE" <<'JSONL'
-{"received_at":"2026-08-26T03:00:00Z","account":"claude","tool":"aub-meter","tool_version":"0.1.0","plan":"pro","reading":{"generatedAt":"2026-08-26T02:59:58Z","providers":[{"provider":"claude","windows":[{"id":"five_hour","percentUsed":10,"resetsAt":"2026-08-26T05:00:00Z","windowSeconds":18000},{"id":"seven_day","percentUsed":20,"resetsAt":"2026-09-02T00:00:00Z","windowSeconds":604800}]}]}}
+{"received_at":"2026-08-26T03:00:00Z","account":"claude","tool":"aub-meter","tool_version":"0.1.0","plan":"pro","reading":{"generatedAt":"2026-08-26T02:59:58Z","providers":[{"provider":"claude","windows":[{"id":"five_hour","percentUsed":10,"resetsAt":"2026-08-26T05:00:00Z","windowSeconds":18000},{"id":"seven_day","percentUsed":20,"resetsAt":"2026-09-02T00:00:00Z","windowSeconds":604800},{"id":"opus_weekly","percentUsed":0,"windowSeconds":604800}]}]}}
 {"received_at":"2026-08-26T03:06:00Z","account":"claude","tool":"aub-meter","tool_version":"0.1.0","failure":"spawn_failed","exit_code":1}
 not-json
 JSONL
@@ -68,6 +71,7 @@ case_steps() {
     # contract is a native one, which is the only property the cutoff reads.
     step "plant a native meter attempt" sqlite3 "$STATE_DIR/aub/ledger.db" "INSERT INTO meter_attempt (run_id, account_id, provider, request_started_at, policy_snapshot_id, due_at, due_reason, provider_contract_id, meter_semantics_id) SELECT (SELECT id FROM sample_run ORDER BY id LIMIT 1), (SELECT id FROM account ORDER BY id LIMIT 1), 'anthropic', CAST(strftime('%s','2026-08-26 03:03:00') AS INTEGER) * 1000000000, (SELECT id FROM sampling_policy_snapshot ORDER BY id LIMIT 1), CAST(strftime('%s','2026-08-26 03:03:00') AS INTEGER) * 1000000000, 'ordinary_cadence', 'anthropic-oauth-usage-limits-v1', 'native-e2e-semantics-v1';"
     step "import only the readings before the native cutoff" aub_seed import seed-archive --source "$STRADDLING_SOURCE" --backup "$ARCHIVE" --vendor-account claude=primary
+    step "read how the unstarted window was stored" sqlite3 "$STATE_DIR/aub/ledger.db" "SELECT semantic_key, reset_state, COALESCE(CAST(resets_at AS TEXT), 'null') FROM meter_window WHERE semantic_key = 'opus_weekly';"
 }
 
 case_assertions() {
@@ -85,6 +89,8 @@ case_assertions() {
     assert_stderr_contains 3 "\"records_read\":{\"value\":3"
     assert_stderr_contains 3 "\"imported\":{\"value\":2"
     assert_stderr_contains 3 "\"unchanged\":{\"value\":0"
+    assert_stderr_contains 3 "\"reinterpreted\":{\"value\":0"
+    assert_stdout_contains 3 "reinterpreted=0"
     assert_stderr_contains 3 "\"quarantined\":{\"value\":1"
     assert_stderr_contains 3 "\"terminal_outcome\":\"imported\""
     if grep -qF "$SOURCE" "$(step_dir 3)/stdout.txt" "$(step_dir 3)/stderr.txt"; then
@@ -122,4 +128,7 @@ case_assertions() {
     assert_stdout_contains 11 "records_read=2"
     assert_stdout_contains 11 "imported=1"
     assert_stdout_contains 11 "superseded_by_native=1"
+
+    assert_exit 0 12
+    assert_stdout_contains 12 "opus_weekly|not_started|null"
 }

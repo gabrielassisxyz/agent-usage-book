@@ -198,7 +198,7 @@ impl DiagnosticEvent {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, superseded_by_native, quarantined"
             }
             Self::SeedArchiveImported => {
-                "source_digest, verified_backup_id, records_read, imported, unchanged, superseded_by_native, discarded_unmapped_vendor, quarantined, terminal_outcome"
+                "source_digest, verified_backup_id, records_read, imported, unchanged, reinterpreted, superseded_by_native, discarded_unmapped_vendor, quarantined, terminal_outcome"
             }
             Self::LegacyCalibrationImported => {
                 "source_digest, verified_backup_id, records_read, imported, unchanged, quarantined, terminal_outcome"

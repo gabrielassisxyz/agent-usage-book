@@ -12,7 +12,21 @@ use sha2::{Digest, Sha256};
 use crate::domain::quota::{QuotaFractionPpm, QuotaUsed};
 use crate::domain::time::{MeasurementBasis, UtcTimestamp};
 use crate::error::Error;
-use crate::legacy_meter::LegacyWindow;
+
+/// One window of a seed capture, as the capture expressed it.
+///
+/// Separate from `LegacyWindow` because the two sources take opposite
+/// positions on a missing reset: the legacy importer quarantines the reading,
+/// while the seed capture omits `resetsAt` for a window that has not started
+/// yet, which the ledger already represents as a NULL reset. A shared
+/// non-optional field could only be satisfied by inventing an instant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeedArchiveWindow {
+    pub semantic_key: &'static str,
+    pub quota_used: QuotaUsed,
+    pub resets_at: Option<UtcTimestamp>,
+    pub nominal_duration_nanos: u64,
+}
 
 /// A successful seed capture record.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -31,7 +45,7 @@ pub struct SeedArchiveSuccessRecord {
     pub plan: Option<String>,
     pub tool: Option<String>,
     pub tool_version: Option<String>,
-    pub windows: Vec<LegacyWindow>,
+    pub windows: Vec<SeedArchiveWindow>,
     pub raw_reading: String,
     pub measurement_basis: MeasurementBasis,
 }
@@ -478,7 +492,7 @@ fn parse_success_record(
             .and_then(|v| v.as_array())
             .ok_or_else(|| "missing_windows".to_string())?;
 
-        let windows = parse_provider_windows(windows_arr, generated_at)?;
+        let windows = parse_provider_windows(windows_arr)?;
 
         records.push(SeedArchiveRecord::Success(SeedArchiveSuccessRecord {
             source_file: file_name.to_string(),
@@ -508,8 +522,7 @@ fn parse_success_record(
 /// several entries and each parses its windows the same way.
 fn parse_provider_windows(
     windows_arr: &[serde_json::Value],
-    generated_at: UtcTimestamp,
-) -> Result<Vec<LegacyWindow>, String> {
+) -> Result<Vec<SeedArchiveWindow>, String> {
     let mut windows = Vec::new();
     for w_val in windows_arr {
         let w_obj = w_val
@@ -539,15 +552,15 @@ fn parse_provider_windows(
             .unwrap_or(default_window_seconds);
 
         let nominal_duration_nanos = window_seconds.saturating_mul(1_000_000_000);
+        // A capture omits `resetsAt` for a window that has not started, and an
+        // absent instant is not an instant: the ledger's own representation of
+        // an unstarted window is a NULL reset, so the omission travels as one
+        // rather than as `generated_at` plus the nominal length.
         let resets_at = match w_obj.get("resetsAt") {
             Some(val) => {
-                parse_reset_timestamp(val).ok_or_else(|| "invalid_resets_at".to_string())?
+                Some(parse_reset_timestamp(val).ok_or_else(|| "invalid_resets_at".to_string())?)
             }
-            None => UtcTimestamp::from_unix_nanos(
-                generated_at
-                    .unix_nanos()
-                    .saturating_add(nominal_duration_nanos as i64),
-            ),
+            None => None,
         };
 
         let semantic_key = match id {
@@ -556,7 +569,7 @@ fn parse_provider_windows(
             other => Box::leak(other.to_string().into_boxed_str()),
         };
 
-        windows.push(LegacyWindow {
+        windows.push(SeedArchiveWindow {
             semantic_key,
             quota_used,
             resets_at,
@@ -602,4 +615,46 @@ fn sha256_hex(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn window_json(body: &str) -> Vec<serde_json::Value> {
+        vec![serde_json::from_str(body).expect("the fixture window must parse")]
+    }
+
+    #[test]
+    fn a_window_with_no_reset_parses_to_no_reset_instant() {
+        let windows = parse_provider_windows(&window_json(r#"{"id":"five_hour","percentUsed":0}"#))
+            .expect("a window with no resetsAt must parse");
+        assert_eq!(windows.len(), 1);
+        assert_eq!(windows[0].resets_at, None);
+        assert_eq!(windows[0].nominal_duration_nanos, 18_000 * 1_000_000_000);
+    }
+
+    /// The planted negative of the positive above: the two windows differ only
+    /// in whether `resetsAt` is present, so a parser that invented an instant
+    /// for the absent case would make the two indistinguishable.
+    #[test]
+    fn a_present_reset_is_carried_through_unchanged() {
+        let windows = parse_provider_windows(&window_json(
+            r#"{"id":"five_hour","percentUsed":0,"resetsAt":"2026-08-29T18:35:03Z"}"#,
+        ))
+        .expect("a window with a resetsAt must parse");
+        assert_eq!(
+            windows[0].resets_at,
+            UtcTimestamp::parse_rfc3339("2026-08-29T18:35:03Z")
+        );
+    }
+
+    #[test]
+    fn an_unparseable_reset_still_fails_the_line() {
+        let error = parse_provider_windows(&window_json(
+            r#"{"id":"five_hour","percentUsed":0,"resetsAt":"not-a-time"}"#,
+        ))
+        .expect_err("an unparseable resetsAt must not be treated as absent");
+        assert_eq!(error, "invalid_resets_at");
+    }
 }
