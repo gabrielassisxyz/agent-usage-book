@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# shipped-migration-digest (aub-aic9): a migration file that has already
+# shipped must not change in place. The 2026-09-27 compliance pass found that
+# aub-q7xt closed on a commit editing the already-shipped migration
+# 0013_meter_evidence_observation.rs instead of adding one: a ledger already
+# at schema 13 never re-ran it, and a production data-loss incident followed
+# minutes after the landing. aub-wu69 repaired it as the additive migration
+# 0025.
+#
+# Nothing else in the gate would catch a repeat:
+# 56-migration-schema-pin compares the highest migration number with the e2e
+# pin and passes when an existing migration is edited, and
+# tests/migration_matrix.rs rebuilds every schema from the current files, so
+# an edited migration looks normal to both.
+#
+# The rule is a committed digest list, not a history scan:
+# src/store/migrations/SHIPPED.sha256 holds one sha256sum line per NNNN_*.rs
+# file, in file-name order, so the check runs in a clone without history (a
+# release checkout, an archive, a depth-one pull-request checkout) and does
+# not depend on what origin/main points at. The digest covers the whole file,
+# including any in-file test module, so editing a test inside a shipped
+# migration is refused too and needs the same deliberate digest update;
+# hashing only the SQL would need a Rust parser in a shell check. The only
+# deliberate way to change a shipped file is to update its digest line in the
+# same diff, where a reviewer sees it and the commit message says why; the
+# normal way to change the schema is a new additive migration, which adds one
+# line. src/store/migrations/mod.rs is the registry every migration edits,
+# so it is never listed and never judged.
+set -uo pipefail
+
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd)"
+repo_root="$(cd -- "$script_dir/../.." && pwd)"
+
+MIGRATIONS_SUBDIR="src/store/migrations"
+DIGEST_NAME="SHIPPED.sha256"
+
+print_remedy() {
+    echo "shipped-migration-digest: remedy: land the schema change as a new additive migration (which adds one $DIGEST_NAME line), or update the $DIGEST_NAME line for the existing file deliberately, with the reason in the commit message" >&2
+}
+
+# check_tree <root>: judge one tree. Green prints one line; every failure
+# line names the migration file and the case (digest-mismatch,
+# listed-file-missing, unlisted-migration), because the red must be
+# attributable to the lane whose diff holds the edit.
+check_tree() {
+    local root="$1"
+    local migrations_dir="$root/$MIGRATIONS_SUBDIR"
+    local digest_file="$migrations_dir/$DIGEST_NAME"
+    local fail=0
+
+    if [ ! -d "$migrations_dir" ]; then
+        echo "shipped-migration-digest: FAIL: no migration directory at $MIGRATIONS_SUBDIR under $root" >&2
+        return 1
+    fi
+    if [ ! -f "$digest_file" ]; then
+        echo "shipped-migration-digest: FAIL: no committed digest list at $MIGRATIONS_SUBDIR/$DIGEST_NAME under $root" >&2
+        print_remedy
+        return 1
+    fi
+
+    # The digest shape first: one sha256sum line per entry, two spaces
+    # between hash and name, no duplicates. A malformed line fails here
+    # rather than passing a file it cannot judge.
+    local digest_names=()
+    local line lineno=0 name seen dup
+    while IFS= read -r line || [ -n "$line" ]; do
+        lineno=$((lineno + 1))
+        [ -z "$line" ] && continue
+        if [[ "$line" =~ ^([0-9a-f]{64})"  "([0-9]{4}_[^[:space:]/]+\.rs)$ ]]; then
+            name="${BASH_REMATCH[2]}"
+            dup=0
+            for seen in ${digest_names[@]+"${digest_names[@]}"}; do
+                if [ "$seen" = "$name" ]; then
+                    dup=1
+                    break
+                fi
+            done
+            if [ "$dup" -eq 1 ]; then
+                echo "shipped-migration-digest: FAIL: $MIGRATIONS_SUBDIR/$DIGEST_NAME lists $name twice" >&2
+                fail=1
+            else
+                digest_names+=("$name")
+            fi
+        else
+            echo "shipped-migration-digest: FAIL: $MIGRATIONS_SUBDIR/$DIGEST_NAME line $lineno is malformed (want sha256sum output '<64 hex>  NNNN_name.rs')" >&2
+            fail=1
+        fi
+    done < "$digest_file"
+
+    # Every NNNN_*.rs file must have a line and must match it. Anything else
+    # in the directory (mod.rs, the digest list itself) is not judged.
+    local path entry want_hash got_hash entry_count count
+    for path in "$migrations_dir"/[0-9][0-9][0-9][0-9]_*.rs; do
+        [ -f "$path" ] || continue
+        name="$(basename -- "$path")"
+        entry="$(awk -v want="$name" '$2 == want { print }' "$digest_file")"
+        if [ -z "$entry" ]; then
+            echo "shipped-migration-digest: FAIL (unlisted-migration): $MIGRATIONS_SUBDIR/$name exists with no line in $DIGEST_NAME" >&2
+            fail=1
+            continue
+        fi
+        entry_count="$(printf '%s\n' "$entry" | grep -c . || true)"
+        if [ "$entry_count" -gt 1 ]; then
+            echo "shipped-migration-digest: FAIL: $MIGRATIONS_SUBDIR/$DIGEST_NAME lists $name $entry_count times" >&2
+            fail=1
+            continue
+        fi
+        want_hash="${entry%% *}"
+        got_hash="$(sha256sum -- "$path")"
+        got_hash="${got_hash%% *}"
+        if [ "$got_hash" != "$want_hash" ]; then
+            echo "shipped-migration-digest: FAIL (digest-mismatch): $MIGRATIONS_SUBDIR/$name changed since it shipped (sha256 differs from its $DIGEST_NAME line)" >&2
+            fail=1
+        fi
+    done
+
+    # Every listed file must still exist.
+    for name in ${digest_names[@]+"${digest_names[@]}"}; do
+        if [ ! -f "$migrations_dir/$name" ]; then
+            echo "shipped-migration-digest: FAIL (listed-file-missing): $MIGRATIONS_SUBDIR/$name is listed in $DIGEST_NAME but the file is missing" >&2
+            fail=1
+        fi
+    done
+
+    if [ "$fail" -ne 0 ]; then
+        print_remedy
+        return 1
+    fi
+    count="$(printf '%s\n' "${digest_names[@]+"${digest_names[@]}"}" | grep -c . || true)"
+    echo "shipped-migration-digest: ok: every NNNN_*.rs file under $MIGRATIONS_SUBDIR matches its $DIGEST_NAME line ($count files)"
+    return 0
+}
+
+# --- self-tests --------------------------------------------------------------
+# The live comparison above is judged by the gate; these scenarios prove the
+# comparison discriminates, on scratch copies under TMPDIR rather than
+# against the real tree. Each scenario copies the real migrations directory
+# and generates that copy's own digest from its files, so the scenarios stay
+# hermetic: the passing case is green by construction even when the live
+# tree carries an unrelated mutation, and only the real comparison below
+# judges the committed digest list. Each case prints one PASS/FAIL line.
+
+build_scenario() {
+    # $1 = scenario name: prints the scenario directory.
+    local dir="$scratch/$1"
+    mkdir -p "$dir/$MIGRATIONS_SUBDIR"
+    cp -- "$repo_root/$MIGRATIONS_SUBDIR"/[0-9][0-9][0-9][0-9]_*.rs "$dir/$MIGRATIONS_SUBDIR/"
+    ( cd "$dir/$MIGRATIONS_SUBDIR" && sha256sum [0-9][0-9][0-9][0-9]_*.rs | LC_ALL=C sort -k 2 > "$DIGEST_NAME" )
+    printf '%s\n' "$dir"
+}
+
+expect_red() {
+    # $1 = scenario dir, $2 = case name, $3 = file the case breaks,
+    # $4 = extended regex the failure must match.
+    local dir="$1" case="$2" file="$3" want_re="$4" out rc
+    out="$("$script_dir/59-shipped-migration-digest" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ]; then
+        echo "shipped-migration-digest self-test: FAIL $case: expected red for $file, was green"
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    if ! printf '%s\n' "$out" | grep -Eq -- "$want_re"; then
+        echo "shipped-migration-digest self-test: FAIL $case: red without the expected signature for $file ($want_re)"
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    echo "shipped-migration-digest self-test: PASS $case: $file refused and named"
+    return 0
+}
+
+expect_green() {
+    # $1 = scenario dir, $2 = case name.
+    local dir="$1" case="$2" out rc
+    out="$("$script_dir/59-shipped-migration-digest" "$dir" 2>&1)"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "shipped-migration-digest self-test: FAIL $case: expected green, was red"
+        printf '%s\n' "$out" >&2
+        return 1
+    fi
+    echo "shipped-migration-digest self-test: PASS $case: every file matched its line"
+    return 0
+}
+
+highest_migration_number() {
+    # Prints the highest NNNN version among the real migration files.
+    local path name num best=0
+    for path in "$repo_root/$MIGRATIONS_SUBDIR"/[0-9][0-9][0-9][0-9]_*.rs; do
+        [ -f "$path" ] || continue
+        name="$(basename -- "$path")"
+        num=$((10#${name%%_*}))
+        if [ "$num" -gt "$best" ]; then
+            best="$num"
+        fi
+    done
+    printf '%s\n' "$best"
+}
+
+run_self_tests() {
+    local fail=0 dir probe_name probe_num
+    scratch="$(mktemp -d "${TMPDIR:-/tmp}/aub-shipped-digest-XXXXXX")" || return 1
+    trap 'rm -rf "$scratch"' EXIT
+
+    # Case 1: a listed file edited in place. The 0013 file is fixed here
+    # because it is the one the bead's history broke in place.
+    dir="$(build_scenario case-mismatch)"
+    printf '// probe line appended by the shipped-migration-digest self-test\n' \
+        >> "$dir/$MIGRATIONS_SUBDIR/0013_meter_evidence_observation.rs"
+    expect_red "$dir" "digest-mismatch" "0013_meter_evidence_observation.rs" \
+        "FAIL \(digest-mismatch\): .*0013_meter_evidence_observation\.rs" || fail=1
+
+    # Case 2: a listed file deleted.
+    dir="$(build_scenario case-missing)"
+    rm -- "$dir/$MIGRATIONS_SUBDIR/0014_session.rs"
+    expect_red "$dir" "listed-file-missing" "0014_session.rs" \
+        "FAIL \(listed-file-missing\): .*0014_session\.rs" || fail=1
+
+    # Case 3: a new migration with no digest line, the shape a schema bead
+    # lands before it adds its line.
+    dir="$(build_scenario case-unlisted)"
+    probe_num="$(highest_migration_number)"
+    probe_num=$((probe_num + 1))
+    probe_name="$(printf '%04d_zz_probe_migration.rs' "$probe_num")"
+    printf '// probe migration planted by the shipped-migration-digest self-test\n' \
+        > "$dir/$MIGRATIONS_SUBDIR/$probe_name"
+    expect_red "$dir" "unlisted-migration" "$probe_name" \
+        "FAIL \(unlisted-migration\): .*$probe_name" || fail=1
+
+    # Case 4: the untouched copy passes, mod.rs and the digest list itself
+    # judged by nobody.
+    dir="$(build_scenario case-passing)"
+    expect_green "$dir" "all-match" || fail=1
+
+    if [ "$fail" -ne 0 ]; then
+        return 1
+    fi
+    echo "shipped-migration-digest: self-tests ok: mismatch, missing and unlisted files fail named, the untouched copy passes."
+    return 0
+}
+
+# Argument mode judges one tree and stops there; the self-tests run on
+# scratch copies only in the live path, before the gate's own comparison.
+#
+# Wrapped in main because bash abandons the whole top-level command on an
+# arithmetic expansion error: with the dispatch at top level, an aborted
+# argument-mode run could fall through into live mode, whose self-tests call
+# this script with a tree argument again and recurse without bound. Inside
+# main the abort lands on the exit below with a nonzero status.
+main() {
+    if [ "$#" -gt 0 ]; then
+        check_tree "$1"
+        return $?
+    fi
+
+    local fail=0
+    run_self_tests || fail=1
+    if [ "$fail" -eq 0 ]; then
+        check_tree "$repo_root" || fail=1
+    fi
+    if [ "$fail" -ne 0 ]; then
+        echo "==> shipped-migration-digest FAILED" >&2
+    fi
+    return "$fail"
+}
+
+main "$@"
+exit $?
