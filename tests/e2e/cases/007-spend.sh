@@ -3,6 +3,22 @@
 # record, one pi session, one Codex session with a rate-limit-only record, and one
 # file last modified before the window. The counts, the replay count, the
 # quarantine count and the skip count are all asserted, in both renderings.
+#
+# The `--explain` steps prove the release binary's diagnostic surface over the
+# same replay corpus: ingestion generation 1 (the one force refresh in step 1),
+# five canonical records in the window (claude s-e2e-0, the claude s-e2e-1 replay
+# winner of 2026-08-25, claude s-e2e-1 of 2026-08-26, codex codex-e2e-1 as one
+# cumulative canonical, pi pi-e2e-1; the seven-day and today files fall outside
+# the window and the quarantined line plus the rate-limit-only record yield no
+# canonical event), zero durable replayed occurrences (the three replay lines of
+# msg_e2e_1 collapse to one occurrence row under the table's strong-identity
+# uniqueness, so the durable diagnostic reads 0; the in-memory dedup count is
+# not persisted), and two heuristic identities (the two codex token_count
+# records carry no strong identity, one per rollout file, each its own key; the
+# count is ledger-global, so the today rollout outside the window is included).
+# The canonical totals with `--explain` equal those without it. The final step
+# makes one transcript source unreadable after the successful ingest and proves
+# the refresh reports the failure while still printing the prior subtotal.
 
 CASE_ID="007-spend"
 CASE_DESCRIPTION="aub spend refreshes the canonical ledger and reports nested day, session, project and repository token subtotals."
@@ -108,6 +124,31 @@ case_steps() {
         "AUB_CONFIG_FILE=$CONFIG_FILE" \
         "$AUB_BIN" spend --days 2 --group-by harness --harness codex \
         --refresh never --format json
+    step "spend explain text" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_CONFIG_FILE=$CONFIG_FILE" \
+        "COLUMNS=200" \
+        "$AUB_BIN" spend --since 2026-08-25 --days 2 \
+        --group-by day --group-by session --group-by project --group-by repository \
+        --refresh never --explain
+    step "spend explain json" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_CONFIG_FILE=$CONFIG_FILE" \
+        "COLUMNS=200" \
+        "$AUB_BIN" spend --since 2026-08-25 --days 2 \
+        --group-by day --group-by session --group-by project --group-by repository \
+        --refresh never --explain --format json
+    # One transcript source fails after the successful ingest above: the next
+    # refresh must report the failure and keep the prior qualified subtotal.
+    # Inline shell, not a runner step: the spend invocation below is the step.
+    chmod 000 "$STATE_DIR/transcripts/pi/project-a/session.jsonl"
+    step "spend refresh with failing source" env \
+        "HOME=$STATE_DIR/home" \
+        "AUB_CONFIG_FILE=$CONFIG_FILE" \
+        "COLUMNS=200" \
+        "$AUB_BIN" spend --since 2026-08-25 --days 2 \
+        --group-by day --group-by session --group-by project --group-by repository \
+        --refresh force
 }
 
 case_assertions() {
@@ -192,4 +233,34 @@ case_assertions() {
     assert_json_field 6 "filters[0].excluded.sessions" "2"
     assert_json_field 6 "filters[0].excluded.events" "2"
     assert_json_field 6 "filters[0].excluded.unknown_events" "0"
+
+    # `--explain` over the replay corpus carries the three diagnostic groups
+    # while the canonical totals match the same query without it (step 1).
+    assert_exit 0 7
+    assert_stdout_matches 7 "^│  total +4\\.7k +2\\.1k +27\\.2k "
+    assert_stdout_contains 7 "generation 1"
+    assert_stdout_contains 7 "spend_canonical_records"
+    assert_stdout_contains 7 "spend_replayed_occurrences"
+    assert_stdout_contains 7 "spend_heuristic_identities"
+
+    # The JSON rendering pins the counts: generation 1, five canonical records
+    # in the window, zero durable replayed occurrences, two heuristic
+    # identities, and the same canonical group totals as step 2.
+    assert_exit 0 8
+    assert_json_field 8 "ingestion_generation" "1"
+    assert_json_field 8 "ingest.events_in_window" "5"
+    assert_json_field 8 "ingest.replayed_occurrences" "0"
+    assert_json_field 8 "ingest.heuristic_identities" "2"
+    assert_json_field 8 "groups[0].tokens.output.value" "2092"
+    assert_stdout_contains 8 "spend_canonical_records"
+    assert_stdout_contains 8 "spend_replayed_occurrences"
+    assert_stdout_contains 8 "spend_heuristic_identities"
+
+    # A failing source on refresh reports the failure and still prints the
+    # prior qualified subtotal from step 1.
+    assert_exit 8 9
+    assert_stdout_matches 9 "^│  total +4\\.7k +2\\.1k +27\\.2k "
+    assert_stdout_contains 9 "retained the prior canonical subtotal"
+    assert_stdout_contains 9 "unreadable:"
+    assert_stderr_contains 9 "retained the prior canonical subtotal"
 }
