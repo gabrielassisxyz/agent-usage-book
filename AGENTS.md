@@ -7,6 +7,8 @@
 > resuming. Compaction drops the behavioural contract silently, and an agent that lost it
 > keeps working as if it still had it.
 
+Repository lessons from past work live in `docs/lessons.md`; read it before starting a task.
+
 ---
 
 ## RULE 0: A DIRECT INSTRUCTION OVERRIDES THIS FILE
