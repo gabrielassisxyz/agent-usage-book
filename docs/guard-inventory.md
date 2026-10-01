@@ -64,6 +64,7 @@ run below is recorded as pass or fail only.
 ## Last successful full run
 
 Last successful full run: 2026-09-27 (bin/guard-mutations, scope all, 89 rows)
+Replayed singly since: c-41 2026-10-01
 Replayed singly since: sh-40 2026-09-30
 Replayed singly since: c-44 2026-09-30
 Replayed singly since: sh-37 2026-09-30
@@ -194,6 +195,7 @@ sh-39	aub-kzmj	shell	tests/e2e/run.sh --self-test	sed	tests/e2e/run.sh	s|grep -q
 sh-40	aub-pbx4.1	shell	bin/checks/86-file-size-ratchet	replace	src/cli.rs	#[cfg(test)]	const _GUARD_PROBE_0: u8 = 0;\nconst _GUARD_PROBE_1: u8 = 0;\nconst _GUARD_PROBE_2: u8 = 0;\nconst _GUARD_PROBE_3: u8 = 0;\nconst _GUARD_PROBE_4: u8 = 0;\nconst _GUARD_PROBE_5: u8 = 0;\nconst _GUARD_PROBE_6: u8 = 0;\nconst _GUARD_PROBE_7: u8 = 0;\nconst _GUARD_PROBE_8: u8 = 0;\nconst _GUARD_PROBE_9: u8 = 0;\n#[cfg(test)]	src/cli\.rs grew past its ceiling	bin/checks/70-quantity-inventory	0	every pub struct/enum
 c-44	aub-lfsv	cargo	cargo test --lib store::retention::tests::no_table_that_refuses_every_delete_is_classified_prunable	python	src/store/retention.rs	p = "src/store/retention.rs"\nt = open(p).read()\nNL = chr(10)\nsubs = [\n    ("            | Self::CalibrationControlledRun => DurableClassCategory::Irreplaceable,", "            => DurableClassCategory::Irreplaceable,"),\n    ("            Self::SamplingLease" + NL + "            | Self::SessionHeartbeat", "            Self::SamplingLease" + NL + "            | Self::CalibrationControlledRun" + NL + "            | Self::SessionHeartbeat"),\n    ("            | Self::CalibrationControlledRun => RetentionRule::Forever,", "            => RetentionRule::Forever,"),\n    ("            Self::SamplingLease | Self::SessionHeartbeat => RetentionRule::TransientLease,", "            Self::SamplingLease | Self::SessionHeartbeat | Self::CalibrationControlledRun => RetentionRule::TransientLease,"),\n]\nfor old, new in subs:\n    assert t.count(old) == 1, old\n    t = t.replace(old, new, 1)\nopen(p, "w").write(t)		calibration_controlled_run: refuses every DELETE	cargo test --lib store::retention::tests::taxonomy_covers_every_migrated_table_and_no_phantom	0	test result: ok
 sh-37	aub-aic9	shell	bin/checks/59-shipped-migration-digest	append	src/store/migrations/0013_meter_evidence_observation.rs	// guard probe		0013_meter_evidence_observation\.rs	bin/checks/70-quantity-inventory	0	every pub struct/enum
+c-41	aub-igbq	cargo	cargo test --test can_run_window_policy missing_required_window_makes_can_run_refuse_with_malformed_response	python	src/meter/anthropic.rs	p = 'src/meter/anthropic.rs'\nt = open(p).read()\nold = '    if required_window_kinds'\nassert t.count(old) == 1\nstart = t.index(old)\nend = t.index('return Err(FailureClass::MissingRequiredField);', start)\nclose = t.index('}', end)\nt = t[:start] + t[close+1:]\nopen(p, 'w').write(t)		the sample must report the refused attempt	cargo test --lib domain::failure::tests::every_failure_class_maps_to_exactly_one_stale_reason	0	test result: ok
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness
