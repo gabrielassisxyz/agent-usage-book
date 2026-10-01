@@ -31,7 +31,7 @@ THRESHOLD=2500
 # way over the same span, from 8306 down to 2706, when the split beads landed.
 builtin_ceilings() {
     cat <<'CEILINGS'
-src/cli.rs	2706
+src/cli.rs	2703
 src/presentation/render.rs	3043
 src/presentation/json.rs	3052
 CEILINGS
