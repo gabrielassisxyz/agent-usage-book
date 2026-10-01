@@ -195,6 +195,14 @@ format = "codex"
 
 /// Unit: the check is absent from cargo test and bin/ci as a gating requirement
 /// on host live files, preserving the headless rule.
+///
+/// aub-lqe.17 requires the drift check to stay out of `cargo test` and
+/// `bin/ci`, asserted by its invocation path. The property holds today but
+/// nothing guards it, so this test enumerates every occurrence of the drift
+/// flag across the gate paths and fails naming file and line on anything
+/// outside the allowlist. One invocation is legitimate: the e2e case over
+/// synthetic roots it builds itself, which never reads the host live
+/// transcripts.
 #[test]
 fn unit_check_absent_from_headless_ci_and_default_test_suite() {
     let doctor = agent_usage_book::cli::Command::Doctor;
@@ -205,6 +213,299 @@ fn unit_check_absent_from_headless_ci_and_default_test_suite() {
     assert_eq!(
         policy.verbosity,
         agent_usage_book::cli::FlagSupport::Accepted
+    );
+
+    assert_no_unallowlisted_drift_flag_in_gate_paths();
+    assert_no_unignored_default_root_drift_test();
+}
+
+/// The drift flag this test polices, written once as the single search needle.
+const DRIFT_FLAG: &str = "transcript-format-drift";
+
+/// The drift-check entry this test polices at the Rust level, built without
+/// ever writing the call text contiguously so this file's own implementation
+/// never reads as an invocation.
+const DRIFT_INVOKE_NEEDLE: &str = "detect_drift";
+
+/// Every gate path allowed to name the drift flag, each entry carrying the
+/// reason it never reads the host live transcripts.
+fn drift_flag_allowlist() -> Vec<(String, String)> {
+    vec![
+        (
+            "tests/e2e/cases/012-doctor-transcript-format-drift.sh".to_string(),
+            "the allowlisted e2e case invokes the drift check over synthetic roots it builds itself in case_preconditions, never the host live transcripts"
+                .to_string(),
+        ),
+        (
+            "tests/doctor_transcript_drift.rs".to_string(),
+            "this exclusion test: the flag text here is the search needle and the allowlist itself, and every drift invocation in this file points at synthetic StateDir roots or an empty config"
+                .to_string(),
+        ),
+    ]
+}
+
+/// The repository root the gate paths resolve against. `CARGO_MANIFEST_DIR` is
+/// a compile-time constant, so the scan follows the checkout under test into
+/// the guard-mutations scratch copy as well.
+fn gate_scan_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+}
+
+/// Recursively collects every file under `dir` into `out`, sorted for a stable
+/// failure message. A missing directory contributes nothing.
+fn collect_files_recursive(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries.flatten().map(|entry| entry.path()).collect();
+    paths.sort();
+    for path in paths {
+        if path.is_dir() {
+            collect_files_recursive(&path, out);
+        } else if path.is_file() {
+            out.push(path);
+        }
+    }
+}
+
+/// Collects the top-level files with extension `extension` directly under `dir`.
+fn collect_top_level_files_with_extension(
+    dir: &std::path::Path,
+    extension: &str,
+    out: &mut Vec<std::path::PathBuf>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| path.extension().and_then(|entry| entry.to_str()) == Some(extension))
+        .collect();
+    paths.sort();
+    out.extend(paths);
+}
+
+/// Fails naming file and line on every drift-flag occurrence in the gate paths
+/// that the allowlist does not cover. New gate checks other beads add under
+/// `bin/checks/` fall inside this scan set by design.
+fn assert_no_unallowlisted_drift_flag_in_gate_paths() {
+    let root = gate_scan_root();
+    let allowlist = drift_flag_allowlist();
+
+    let mut scanned: Vec<std::path::PathBuf> = Vec::new();
+    scanned.push(root.join("bin/ci"));
+    collect_files_recursive(&root.join("bin/checks"), &mut scanned);
+    collect_files_recursive(&root.join(".github/workflows"), &mut scanned);
+    collect_top_level_files_with_extension(&root.join("tests"), "rs", &mut scanned);
+    collect_top_level_files_with_extension(&root.join("tests/e2e/cases"), "sh", &mut scanned);
+    // tests/e2e/runs/ is deliberately never scanned: run logs record past
+    // output, not gate intent.
+
+    let mut violations = Vec::new();
+    for path in &scanned {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let allowed = allowlist
+            .iter()
+            .any(|(allowed_path, _)| allowed_path == &relative);
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                violations.push(format!("{relative}: unreadable ({error})"));
+                continue;
+            }
+        };
+        let text = String::from_utf8_lossy(&bytes);
+        for (index, line) in text.lines().enumerate() {
+            if line.contains(DRIFT_FLAG) && !allowed {
+                violations.push(format!("{}:{}: {}", relative, index + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "drift flag invoked outside the allowlist; aub-lqe.17 keeps the drift check out of the headless gate:\n{}",
+        violations.join("\n")
+    );
+}
+
+/// One function item found in an integration test file: its name, the 1-based
+/// line defining it, whether it carries the test attribute, whether it is
+/// ignored, and its body text.
+struct TestFileFunction {
+    name: String,
+    line: u64,
+    is_test: bool,
+    has_ignore: bool,
+    body: String,
+}
+
+/// Splits `text` into function items. A function starts at a line whose first
+/// non-whitespace is a function definition and ends at the first later line
+/// that is a lone closing brace at or above the definition indent, which
+/// closes top-level items at column zero and proptest inner items at their own
+/// indent alike.
+fn test_file_functions(text: &str) -> Vec<TestFileFunction> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut functions = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let trimmed = lines[index].trim_start();
+        let stripped = trimmed
+            .strip_prefix("pub(crate) fn ")
+            .or_else(|| trimmed.strip_prefix("pub fn "))
+            .or_else(|| trimmed.strip_prefix("fn "));
+        let Some(rest) = stripped else {
+            index += 1;
+            continue;
+        };
+        let indent = lines[index].len() - trimmed.len();
+        let name: String = rest
+            .chars()
+            .take_while(|c| c.is_alphanumeric() || *c == '_')
+            .collect();
+        // Attribute lines directly above the definition, skipping blanks and
+        // comments.
+        let mut is_test = false;
+        let mut has_ignore = false;
+        let mut cursor = index;
+        while cursor > 0 {
+            cursor -= 1;
+            let above = lines[cursor].trim();
+            if above.is_empty() || above.starts_with("//") {
+                continue;
+            }
+            if above.starts_with("#[") {
+                if above.contains("#[test]") {
+                    is_test = true;
+                }
+                if above.contains("ignore") {
+                    has_ignore = true;
+                }
+                continue;
+            }
+            break;
+        }
+        // The body runs to the lone closing brace at or above the definition
+        // indent. A lone brace inside a multi-line string literal would end
+        // the scan early, which can only drop markers and therefore only fail
+        // louder, never pass quieter.
+        let mut end = lines.len();
+        for (offset, line) in lines.iter().enumerate().skip(index + 1) {
+            let body_trimmed = line.trim();
+            if body_trimmed == "}" && line.len() - body_trimmed.len() <= indent {
+                end = offset + 1;
+                break;
+            }
+        }
+        functions.push(TestFileFunction {
+            name,
+            line: (index + 1) as u64,
+            is_test,
+            has_ignore,
+            body: lines[index..end].join("\n"),
+        });
+        index = end;
+    }
+    functions
+}
+
+/// A body invokes the drift check when it calls the entry by name. The call
+/// text is assembled from the needle so this file's own implementation never
+/// contains it contiguously.
+fn invokes_drift_check(body: &str) -> bool {
+    body.contains(&format!("{}(", DRIFT_INVOKE_NEEDLE))
+}
+
+/// A body carries an explicit opt-in environment variable gate.
+fn has_env_opt_in(body: &str) -> bool {
+    body.contains("std::env::") || body.contains("env::var") || body.contains("option_env!")
+}
+
+/// A body shows its roots are synthetic: temporary directories it built itself
+/// rather than the operator defaults.
+fn uses_synthetic_roots(body: &str) -> bool {
+    [
+        "StateDir",
+        "FakeEnv",
+        "tempfile",
+        "tempdir",
+        "config_from_toml",
+        "synthetic",
+    ]
+    .iter()
+    .any(|marker| body.contains(marker))
+}
+
+/// Fails on every integration test that invokes the drift check against the
+/// default roots while still running in the default suite: without `#[ignore]`
+/// or an explicit opt-in environment variable. Tests over synthetic roots they
+/// built themselves are not against the defaults and pass. A same-file helper
+/// that wraps the check lends its body to the test that calls it, so routing
+/// the invocation through a helper neither passes nor fails on its own.
+fn assert_no_unignored_default_root_drift_test() {
+    let root = gate_scan_root();
+    let tests_dir = root.join("tests");
+    let entries = std::fs::read_dir(&tests_dir).expect("tests dir must be readable");
+    let mut paths: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .filter(|path| path.extension().and_then(|entry| entry.to_str()) == Some("rs"))
+        .collect();
+    paths.sort();
+
+    let mut violations = Vec::new();
+    for path in &paths {
+        let relative = path
+            .strip_prefix(&root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let bytes = std::fs::read(path).expect("test file must be readable");
+        let text = String::from_utf8_lossy(&bytes);
+        let functions = test_file_functions(&text);
+        let helpers: Vec<&TestFileFunction> = functions
+            .iter()
+            .filter(|function| !function.is_test && invokes_drift_check(&function.body))
+            .collect();
+        for function in functions.iter().filter(|function| function.is_test) {
+            let calls_helper = helpers
+                .iter()
+                .any(|helper| function.body.contains(&format!("{}(", helper.name)));
+            if !invokes_drift_check(&function.body) && !calls_helper {
+                continue;
+            }
+            let mut effective = function.body.clone();
+            for helper in &helpers {
+                if function.body.contains(&format!("{}(", helper.name)) {
+                    effective.push_str(&helper.body);
+                }
+            }
+            if function.has_ignore {
+                continue;
+            }
+            if has_env_opt_in(&effective) {
+                continue;
+            }
+            if uses_synthetic_roots(&effective) {
+                continue;
+            }
+            violations.push(format!(
+                "{}:{}: test `{}` invokes the drift check without #[ignore] or an explicit opt-in environment variable; point it at synthetic roots it builds itself",
+                relative, function.line, function.name
+            ));
+        }
+    }
+    assert!(
+        violations.is_empty(),
+        "drift check reachable from the default test suite against default roots:\n{}",
+        violations.join("\n")
     );
 }
 

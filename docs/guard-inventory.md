@@ -65,6 +65,7 @@ run below is recorded as pass or fail only.
 
 Last successful full run: 2026-09-27 (bin/guard-mutations, scope all, 89 rows)
 Replayed singly since: c-41 2026-10-01
+Replayed singly since: c-43 2026-10-01
 Replayed singly since: c-40 2026-10-01
 Replayed singly since: c-42 2026-10-01
 Replayed singly since: sh-40 2026-09-30
@@ -200,6 +201,7 @@ sh-37	aub-aic9	shell	bin/checks/59-shipped-migration-digest	append	src/store/mig
 c-41	aub-igbq	cargo	cargo test --test can_run_window_policy missing_required_window_makes_can_run_refuse_with_malformed_response	python	src/meter/anthropic.rs	p = 'src/meter/anthropic.rs'\nt = open(p).read()\nold = '    if required_window_kinds'\nassert t.count(old) == 1\nstart = t.index(old)\nend = t.index('return Err(FailureClass::MissingRequiredField);', start)\nclose = t.index('}', end)\nt = t[:start] + t[close+1:]\nopen(p, 'w').write(t)		the sample must report the refused attempt	cargo test --lib domain::failure::tests::every_failure_class_maps_to_exactly_one_stale_reason	0	test result: ok
 c-40	aub-wsjq	cargo	cargo test --test differential_spend_harness multi_week_differential_expectations_derive_from_corpus	sed	tests/fixtures/differential/multi_week_corpus/codex/week4/session.jsonl	s/"reasoning_output_tokens":20/"reasoning_output_tokens":0/		parser correction	cargo test --test differential_spend_harness integration_harness_runs_over_deterministic_small_corpus	0	test result: ok
 c-42	aub-0ere	cargo	cargo test --test credential_boundary two_accounts_each_send_only_their_own_credential_and_own_their_observations -- --exact	replace	src/cli.rs	crate::auth::resolve(acc, &crate::auth::RealFs, invocation.verbosity > 0)?	crate::auth::resolve(target_accounts[0], &crate::auth::RealFs, invocation.verbosity > 0)?	surface=wire account=work-secondary marker=secondary token: request did not carry its own credential	cargo test --test credential_boundary credential_resolution_boundary_never_leaks_or_mixes_ambient_token -- --exact	0	test result: ok. 1 passed
+c-43	aub-16yf	cargo	cargo test --test doctor_transcript_drift unit_check_absent_from_headless_ci_and_default_test_suite	plant	bin/checks/99-zz-guard-probe-drift	#!/usr/bin/env bash\naub doctor --transcript-format-drift\n		99-zz-guard-probe-drift	cargo test --test doctor_transcript_drift integration_matching_corpus_produces_no_drift	0	test result: ok
 ```
 
 ## Fixture-to-bead map for the shared compile-fail harness
