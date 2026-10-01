@@ -1322,6 +1322,25 @@ anything else is a usage error before the first write. A vendor with no mapping
 is discarded and reported as `discarded_unmapped_vendor=N`, which is what keeps
 a capture label from becoming an account row nobody declared.
 
+**A window the capture reported with no `resetsAt` is stored with no reset.**
+The capture omits that field for a window that has not started, and the ledger
+already represents an unstarted window as a NULL reset, which is what the native
+adapters write. An earlier importer filled the gap with the reading's
+`generatedAt` plus the window's nominal length; that instant was never reported
+by anything and it is not written any more. A `resetsAt` that is present but
+unparseable still fails its line, because a value nobody can read is a defect in
+the capture rather than an absence.
+
+**A re-run corrects a reading an earlier interpretation got wrong**, and reports
+it as `reinterpreted=N`. The adapter version is part of every observation, so a
+re-run can tell a reading it imported under a superseded version from one it
+would write identically today. Where the two disagree, it writes a second
+interpretation of the evidence row already stored and points the selector of the
+current interpretation at it; the earlier interpretation stays exactly as it was
+written, and no evidence, observation or window row is ever updated or deleted.
+A reading the current interpretation already agrees with counts as
+`unchanged=N`, so a second re-run reports `reinterpreted=0`.
+
 **A reading whose account is an operator assertion says so.** A codex reading
 from 2026-08-31 onward cannot be attributed from the capture alone, because the
 second codex account did not exist before that date and the codex weekly window
