@@ -39,6 +39,16 @@ assert_contains() {
     return 0
 }
 
+assert_equals() {
+    local label="$1" expected="$2" actual="$3"
+    if [ "$expected" != "$actual" ]; then
+        echo "FAIL: $label: expected '$expected', got '$actual'" >&2
+        fail=1
+        return 1
+    fi
+    return 0
+}
+
 fresh_checks_dir() {
     local dir="$scratch/$1"
     mkdir -p "$dir"
@@ -53,6 +63,47 @@ exit $exit_code
 EOF
     chmod +x "$dir/$name"
 }
+
+target_dir_from_checkout() {
+    local checkout="$1" checks_dir="$2" output rc target
+    output="$(cd "$checkout" && env -u CARGO_TARGET_DIR CI_CHECKS_DIR="$checks_dir" "$ci_bin" 2>&1)"
+    rc=$?
+    assert_exit "target directory derivation in $checkout" 0 "$rc"
+    target="$(printf '%s\n' "$output" | sed -n 's/^==> building in //p')"
+    if [ -z "$target" ]; then
+        echo "FAIL: target directory derivation in $checkout: missing build directory line" >&2
+        printf '%s\n' "$output" >&2
+        fail=1
+        return 1
+    fi
+    printf '%s\n' "$target"
+}
+
+# --- Scenario 0: checkout paths, not basenames, key cargo target directories. ---
+dir="$(fresh_checks_dir target-directory-key)"
+make_check "$dir" "10-ok" 0
+checkout_a="$scratch/a/agent-usage-book"
+checkout_b="$scratch/b/agent-usage-book"
+mkdir -p "$checkout_a" "$checkout_b"
+git -C "$checkout_a" init --quiet
+git -C "$checkout_b" init --quiet
+
+target_a_first="$(target_dir_from_checkout "$checkout_a" "$dir")"
+target_a_second="$(target_dir_from_checkout "$checkout_a" "$dir")"
+target_b_first="$(target_dir_from_checkout "$checkout_b" "$dir")"
+target_b_second="$(target_dir_from_checkout "$checkout_b" "$dir")"
+assert_equals "same checkout target is stable" "$target_a_first" "$target_a_second"
+assert_equals "same checkout target is stable on second path" "$target_b_first" "$target_b_second"
+if [ "$target_a_first" = "$target_b_first" ]; then
+    echo "FAIL: same-named checkouts shared cargo target '$target_a_first'" >&2
+    fail=1
+fi
+
+explicit_target="$scratch/explicit-target"
+out="$(cd "$checkout_a" && CARGO_TARGET_DIR="$explicit_target" CI_CHECKS_DIR="$dir" "$ci_bin" 2>&1)"
+rc=$?
+assert_exit "explicit target directory" 0 "$rc"
+assert_contains "explicit target directory wins" "==> building in $explicit_target" "$out"
 
 # --- Scenario 1: every check passes -> bin/ci exits 0. ---
 dir="$(fresh_checks_dir all-pass)"

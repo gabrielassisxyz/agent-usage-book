@@ -79,50 +79,29 @@ def_ref="refs/remotes/origin/$def"
 
 slug() { printf '%s' "$1" | tr '/' '-'; }
 
-# Same rule as harness/fragments/cargo-build-root.sh:50-55: build somewhere on the fast
-# disk if it is mounted, else fall back to $TMPDIR/tmp. The task slug is what the fragment
-# derives from `basename "$PWD"` at build time, and `basename "$PWD"` of a worktree created
-# by `cmd_new` IS the task slug — so this needs no bookkeeping of its own to stay in sync.
+# Same rule as bin/ci: build somewhere on the fast disk if it is mounted, else fall back to
+# $TMPDIR/tmp. The key is the basename plus a hash of the resolved checkout path, so it stays
+# recognizable while same-named treehouse slots cannot share a target directory.
 cargo_target_dir_for() {
-    local task="$1" build_root="$CARGO_BUILD_ROOT_PROBE"
+    local checkout_path="$1" build_root="$CARGO_BUILD_ROOT_PROBE" checkout_hash
     [ -d "$build_root" ] || build_root="${TMPDIR:-/tmp}"
-    printf '%s/cargo-target-worktrees/%s' "$build_root" "$task"
+    checkout_hash="$(printf '%s' "$checkout_path" | sha256sum | awk '{print substr($1, 1, 12)}')"
+    printf '%s/cargo-target-worktrees/%s-%s' "$build_root" "$(basename "$checkout_path")" "$checkout_hash"
 }
 
-# The path above is keyed on the slug alone, not on the repo — so two repos with a
-# worktree of the same slug share one cargo target directory. True today of any OTHER
-# worktree still on disk under $WORKTREE_BASE, in any repo, once the one being removed is
-# already gone. A directory match is treated as a live worktree without asking git,
-# because only `cmd_new`/`git worktree add` ever create $WORKTREE_BASE/<repo>/<task>.
-cargo_target_collision() {
-    local task="$1" d
-    for d in "$WORKTREE_BASE"/*/"$task"; do
-        [ -d "$d" ] || continue
-        return 0
-    done
-    return 1
-}
-
-# Delete the cargo target this worktree's slug maps to, called only after `git worktree
-# remove` has already succeeded. Two things make the derived path untrustworthy rather than
-# just absent, and both are reasons to leave it alone instead of guessing: an explicit
-# CARGO_TARGET_DIR in this shell's environment means the fragment never ran the derivation
-# above in the first place, and a same-slug worktree still on disk elsewhere means the
-# directory is still live for someone else. A directory that is simply missing (any
-# non-Rust repo) is the common case and stays silent — this only speaks when there is
-# something to report.
+# Delete the cargo target this worktree's resolved path maps to, called only after `git
+# worktree remove` has already succeeded. An explicit CARGO_TARGET_DIR in this shell's
+# environment means the default derivation never ran, so leave the target alone rather than
+# guessing. A directory that is simply missing (any non-Rust repo) is the common case and
+# stays silent.
 remove_cargo_target() {
-    local task="$1" target size
+    local checkout_path="$1" target size
     if [ -n "${CARGO_TARGET_DIR:-}" ]; then
         echo "cargo target: CARGO_TARGET_DIR is set in this shell — the derived path would be a guess, leaving it alone" >&2
         return 0
     fi
-    target="$(cargo_target_dir_for "$task")"
+    target="$(cargo_target_dir_for "$checkout_path")"
     [ -d "$target" ] || return 0
-    if cargo_target_collision "$task"; then
-        echo "cargo target: another live worktree also maps to slug '$task' — leaving $target in place" >&2
-        return 0
-    fi
     size="$(du -sh "$target" 2>/dev/null | cut -f1)"
     rm -rf "$target"
     echo "removed cargo target: $target${size:+ ($size reclaimed)}"
@@ -567,8 +546,7 @@ usage: worktree rm <branch|task> [-f]
 
 Removes a worktree (git refuses if it has unsaved work; -f to force past it).
 The worktree's cargo build cache under cargo-target-worktrees goes with it,
-unless another live worktree shares the same slug or CARGO_TARGET_DIR is set
-in this shell — either way it is left in place, not guessed at.
+unless CARGO_TARGET_DIR is set in this shell — then it is left in place, not guessed at.
 EOF
                 exit 0
                 ;;
@@ -636,8 +614,9 @@ EOF
 
     # Read before removal, because afterwards the worktree is gone and the branch name is not
     # recoverable from the task name — slug() maps `/` to `-` and does not invert.
-    local held=""
+    local held="" checkout_path
     held="$(git -C "$dir" symbolic-ref --quiet --short HEAD 2>/dev/null || true)"
+    checkout_path="$(realpath -P "$dir")"
 
     # Everything tracked lives in the object store and survives this. Git-ignored files
     # do NOT: `git worktree remove` checks for dirty and untracked content but ignores
@@ -690,7 +669,7 @@ EOF
     # command after this point immune to the same trap.
     cd "$main_root"
     echo "removed $dir"
-    remove_cargo_target "$task"
+    remove_cargo_target "$checkout_path"
 
     # Removing the worktree leaves the branch, on purpose (the comment on prune-merged says
     # why the two are separate). What was missing is anyone SAYING so: the documented
