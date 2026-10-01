@@ -3152,47 +3152,9 @@ fn status_account_json(account: &crate::report::MeterAccount, now: UtcTimestamp)
             .join(",");
         fields.push(format!("\"windows\":[{windows}]"));
     }
-    // The per-account selection signal (aub-vkv7): one comparable scalar plus
-    // the runway and confidence that qualify it, derived from the windows
-    // above at the report instant. Always present; the scalar and the usable
-    // seconds travel only when the signal justifies them.
-    let selection_windows = account
-        .windows
-        .iter()
-        .map(|window| {
-            crate::domain::selection::SelectionWindow::new(
-                window.quota_used.as_ppm().get(),
-                window.reset_state,
-                window.nominal_duration,
-                window.rate,
-            )
-        })
-        .collect::<Vec<_>>();
-    let selection =
-        crate::domain::selection::compute_selection(&selection_windows, &account.reading, now);
-    fields.push(selection_json(&selection));
-    format!("{{{}}}", fields.join(","))
-}
-
-/// One `accounts[].selection` block: the runway and confidence labels with the
-/// spend scalar beside them when a window was measurable, and the usable
-/// runway seconds when the runway is finite. The scalar is absent, never zero
-/// or null, when unmeasurable, so a consumer never ranks on a placeholder.
-fn selection_json(selection: &crate::domain::selection::Selection) -> String {
-    let mut fields = vec![
-        format!("\"runway\":{}", json_string(selection.runway.as_str())),
-        format!(
-            "\"confidence\":{}",
-            json_string(selection.confidence.as_str())
-        ),
-    ];
-    if let Some(priority) = selection.spend_priority {
-        fields.push(format!("\"spend_priority\":{priority}"));
-    }
-    if let Some(secs) = selection.usable_runway_secs {
-        fields.push(format!("\"usable_runway_secs\":{secs}"));
-    }
-    format!("\"selection\":{{{}}}", fields.join(","))
+    // The per-account selection signal (aub-vkv7), closed beside this file so
+    // this module stays under its size ceiling.
+    super::selection_json::close_account_object(fields, account, now)
 }
 
 /// One `accounts[].windows[]` entry: the provider's stored inputs for the
