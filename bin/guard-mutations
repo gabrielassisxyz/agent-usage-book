@@ -44,7 +44,8 @@
 #   --self-test     runner mechanics against a synthetic repo (dirty refusal,
 #                   dead, wrong-signature, sibling-break, budget, stale scratch,
 #                   consistency, stamp behind/equal/singly-replayed, --only
-#                   round-trip); seconds, no toolchain needed
+#                   round-trip, scratch-inside refusal, target exclusion,
+#                   nested target kept); seconds, no toolchain needed
 #
 # Safety:
 #   - mutations land only in the scratch copy; the runner refuses to start
@@ -273,12 +274,15 @@ case_id_of() {
 # --- scratch construction ----------------------------------------------------
 
 build_scratch() {
+    if ! refuse_if_scratch_inside_live; then
+        return 1
+    fi
     if [ -d "$SCRATCH_BASE" ]; then
         echo "guard-mutations: removed scratch left by a previous run: $SCRATCH_BASE"
         rm -rf "$SCRATCH_BASE"
     fi
     mkdir -p "$SCRATCH" "$MUT_TARGET"
-    ( cd "$LIVE" && tar --exclude=.git -cf - . ) | ( cd "$SCRATCH" && tar -xf - )
+    ( cd "$LIVE" && tar --exclude=.git --exclude=./target -cf - . ) | ( cd "$SCRATCH" && tar -xf - )
     git -C "$SCRATCH" init -q -b main 2>/dev/null || git -C "$SCRATCH" init -q
     git -C "$SCRATCH" add -A
     git -C "$SCRATCH" -c user.email=guard-mutations@example.invalid -c user.name=guard-mutations commit -qm "pristine scratch snapshot"
@@ -309,6 +313,24 @@ reset_tree() {
     git -C "$SCRATCH" clean -fdq 2>/dev/null
     rm -rf "$MUT_TARGET/aub-test-schema-cache"
     true
+}
+
+# refuse_if_scratch_inside_live: the scratch base must never lie inside the
+# live tree it is copied from. A lane TMPDIR under <worktree>/target/tmp
+# otherwise makes each run copy the previous runs' scratch into the next
+# one, nesting one level deeper per run. Compared on realpath so a
+# symlinked TMPDIR cannot slip past the check.
+refuse_if_scratch_inside_live() {
+    local live_real base_real
+    live_real="$(realpath -m "$LIVE")"
+    base_real="$(realpath -m "$SCRATCH_BASE")"
+    case "$base_real" in
+        "$live_real"|"$live_real"/*)
+            echo "guard-mutations: refusing to run: scratch base $SCRATCH_BASE lies inside live tree $LIVE" >&2
+            return 1
+            ;;
+    esac
+    return 0
 }
 
 refuse_if_dirty() {
@@ -482,6 +504,9 @@ mode_run() {
         exit 2
     fi
 
+    if ! refuse_if_scratch_inside_live; then
+        exit 1
+    fi
     targets_file="$(mktemp "$SCRATCH_BASE-targets-XXXXXX" 2>/dev/null || mktemp "${TMPDIR:-/tmp}/guard-targets-XXXXXX")"
     printf '%s\n' "$selected" | awk -F'\t' '$6 != "" { print $6 }' | sort -u >"$targets_file"
     if ! refuse_if_dirty "$targets_file"; then
@@ -490,7 +515,9 @@ mode_run() {
     fi
     rm -f "$targets_file"
 
-    build_scratch
+    if ! build_scratch; then
+        exit 1
+    fi
 
     local total=0 ok=0 dead=0 mismatch=0 errors=0 skipped=0
     local starthne="$SECONDS" line result
@@ -932,11 +959,49 @@ EOF
         fail=1
     fi
 
+    # 8. a scratch base inside the live tree refuses: non-zero exit, a
+    # message naming both paths, and nothing created under that path.
+    mkdir -p "$repo/target"
+    live_of_repo="$(git -C "$repo" rev-parse --show-toplevel)"
+    out="$(cd "$repo" && SCRATCH_BASE_OVERRIDE="$repo/target/scratch-inside" bash "$SCRIPT" --inventory "$good_inv" --only "syn-ok" --budget-seconds 60 2>&1)"
+    rc=$?
+    case "$rc" in 0) echo "self-test: scratch inside live tree did not fail (rc=$rc): $out" >&2; fail=1 ;; *) : ;; esac
+    case "$out" in *"live tree $live_of_repo"*) : ;; *) echo "self-test: refusal did not name the live tree: $out" >&2; fail=1 ;; esac
+    case "$out" in *"$repo/target/scratch-inside"*) : ;; *) echo "self-test: refusal did not name the scratch base: $out" >&2; fail=1 ;; esac
+    if [ -n "$(find "$repo/target" -mindepth 1 2>/dev/null)" ]; then
+        echo "self-test: refused run left files under $repo/target" >&2
+        fail=1
+    fi
+    rm -rf "$repo/target"
+
+    # 9. a top-level target/ in the live tree is excluded from the scratch copy.
+    mkdir -p "$repo/target"
+    printf 'marker\n' >"$repo/target/marker.txt"
+    out="$(selftest_run excludetarget "$good_inv" "syn-ok")"; rc=$?
+    case "$rc" in 0) : ;; *) echo "self-test: run with a live target/ did not pass (rc=$rc): $out" >&2; fail=1 ;; esac
+    case "$out" in *GUARD-OK*) : ;; *) echo "self-test: run with a live target/ was not ok: $out" >&2; fail=1 ;; esac
+    if [ -e "$t/scratch-excludetarget/tree/target" ]; then
+        echo "self-test: top-level target/ was copied into the scratch tree" >&2
+        fail=1
+    fi
+    rm -rf "$repo/target"
+
+    # 10. a nested src/target/ is still copied: the exclusion is anchored.
+    mkdir -p "$repo/src/target"
+    printf 'keep\n' >"$repo/src/target/keep.txt"
+    out="$(selftest_run nestedtarget "$good_inv" "syn-ok")"; rc=$?
+    case "$rc" in 0) : ;; *) echo "self-test: run with a nested src/target/ did not pass (rc=$rc): $out" >&2; fail=1 ;; esac
+    if [ ! -f "$t/scratch-nestedtarget/tree/src/target/keep.txt" ]; then
+        echo "self-test: nested src/target/ was missing from the scratch tree" >&2
+        fail=1
+    fi
+    rm -rf "$repo/src"
+
     if [ "$fail" -ne 0 ]; then
         echo "guard-mutations self-test FAILED" >&2
         return 1
     fi
-    echo "guard-mutations self-test: mechanics ok (ok/dead/mismatch/budget/dirty/stale/consistency/stamp/only-round-trip)."
+    echo "guard-mutations self-test: mechanics ok (ok/dead/mismatch/budget/dirty/stale/consistency/stamp/only-round-trip/scratch-inside/target-exclusion/nested-target)."
 }
 
 # --- dispatch ----------------------------------------------------------------
