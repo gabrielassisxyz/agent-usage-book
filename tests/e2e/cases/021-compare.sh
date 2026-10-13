@@ -9,11 +9,15 @@ CASE_DESCRIPTION="aub compare records a comparison through the binary, lists unc
 
 LEDGER_DB=""
 OBS_ID=""
+READ_AT=""
 
 case_preconditions() {
     require_command "$AUB_BIN"
     require_command sqlite3
     LEDGER_DB="$STATE_DIR/ledger.db"
+    # One hour ago, so the comparison is fresh inside the 30-day
+    # adapter-semantics max age when doctor runs in step 6.
+    READ_AT="$(date -u -d '1 hour ago' +%Y-%m-%dT%H:%M:%SZ)"
 }
 
 case_steps() {
@@ -36,7 +40,7 @@ case_steps() {
         --surface "anthropic console" \
         --surface-percent 25 \
         --granularity-percent 1 \
-        --read-at "2026-09-04T12:00:00Z"
+        --read-at "$READ_AT"
 
     step "uncompared after recording is empty" env \
         "HOME=$STATE_DIR/home" \
@@ -50,7 +54,7 @@ case_steps() {
         --surface "anthropic console" \
         --surface-percent 25 \
         --granularity-percent 1 \
-        --read-at "2026-09-04T12:00:00Z"
+        --read-at "$READ_AT"
 
     step "doctor names the comparison age instead of reporting none exists" env \
         "HOME=$STATE_DIR/home" \
