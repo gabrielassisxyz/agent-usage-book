@@ -300,7 +300,7 @@ out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
 assert_exit "rule13-clean exits 0" 0 "$?"
 
 dir="$(make_scenario rule13-resolvable)"
-if planter_out="$(plant_cargo_dependency "$dir" tokio 1.53.1 2>&1)"; then
+if planter_out="$(plant_cargo_dependency "$dir" tokio "=1.53.1" 2>&1)"; then
     out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
     rc=$?
     assert_exit "rule13-resolvable exits 1" 1 "$rc"
