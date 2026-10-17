@@ -299,6 +299,14 @@ dir="$(make_scenario rule13-clean)"
 out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
 assert_exit "rule13-clean exits 0" 0 "$?"
 
+# --- rule 13 (aub-m8ds): the rule matches forbidden crates as crate entries
+# (`tokio v<digit>`), never as arbitrary text on the line. The scenario directory
+# itself contains "tokio", so `cargo tree` prints the local crate with a path
+# holding that word; the unmodified crate must still pass.
+dir="$(make_scenario rule13-path-tokio-clean)"
+out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"
+assert_exit "rule13-path-tokio-clean exits 0" 0 "$?"
+
 dir="$(make_scenario rule13-resolvable)"
 if planter_out="$(plant_cargo_dependency "$dir" tokio "=1.53.1" 2>&1)"; then
     out="$($dir/bin/checks/boundary-rules/13-no-async-runtime-dependency 2>&1)"

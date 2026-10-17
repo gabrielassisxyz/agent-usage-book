@@ -21,7 +21,7 @@ if ! dependency_tree="$(cargo tree 2>"$cargo_tree_stderr")"; then
     exit 1
 fi
 
-forbidden_matches="$(printf '%s\n' "$dependency_tree" | grep -E '\b(tokio|async-std|smol|actix-rt)\b' || true)"
+forbidden_matches="$(printf '%s\n' "$dependency_tree" | grep -E '(^|[[:space:]─│├└])(tokio|async-std|smol|actix-rt) v[0-9]' || true)"
 
 if [ -n "$forbidden_matches" ]; then
     echo "Forbidden async runtime detected in dependency tree:" >&2
