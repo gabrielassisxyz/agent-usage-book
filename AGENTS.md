@@ -109,6 +109,15 @@ cargo fmt --check
 bin/slop-guard
 ```
 
+The no `cargo test` / clippy-is-not-yours rule in this section applies in shared-tree
+mode only. A lane in the default mode (own worktree, own branch, pull request) runs the
+subset above plus a wider list before its last commit: `cargo clippy --all-targets -- -D warnings`,
+targeted `cargo test --lib <module>` / `cargo test --test <name>` for the modules it
+touched, and every affected e2e case under `tests/e2e/cases/` run alone by copying the
+case file into an empty directory and running `AUB_BIN=<release build> tests/e2e/run.sh --cases-dir <dir> --state-dir <tmp> --runs-dir <tmp>`.
+Find affected cases with `command grep -rl '<changed file name, key or command>' tests/e2e/cases/`.
+The full `bin/ci` stays the review's in both modes.
+
 `bin/ci` is the full gate: toolchain identity, format (`cargo fmt`), lint (`cargo clippy`),
 test, dependency audit, boundary rules and their selftest, prose guard (`bin/slop-guard`), e2e,
 quantity inventory, commit protocol, pane work cycle, batch-verify close, gate coverage,
@@ -333,7 +342,12 @@ panes at once is the bottleneck the whole model exists to remove.
    bin/slop-guard
    ```
 
-   No `cargo test`, no full build, no waiting on proof. Costs and the reason the subset is
+   No `cargo test`, no full build, no waiting on proof in shared-tree mode. A lane in the
+   default mode runs the wider default-mode list from *Compiler Checks* instead: `cargo clippy --all-targets -- -D warnings`,
+   targeted `cargo test --lib <module>` / `cargo test --test <name>`, and affected e2e
+   cases run alone (copy the case file into an empty directory, then `AUB_BIN=<release build> tests/e2e/run.sh --cases-dir <dir> --state-dir <tmp> --runs-dir <tmp>`,
+   found with `command grep -rl '<changed file name, key or command>' tests/e2e/cases/`).
+   Costs and the reason the subset is
    these three are in *Compiler Checks*.
 
    **One class of gate failure is invisible to you, and it is lint.** `cargo clippy` is not
@@ -341,7 +355,7 @@ panes at once is the bottleneck the whole model exists to remove.
    model exists to remove. So following this work-cycle to the letter will not surface a
    clippy failure before `batch_pending`, and you are not held responsible for one. The
    orchestrator catches and repairs lint in Phase 2, and no rework note ever returns a bead
-   for it.
+   for it. That lint hole applies in shared-tree mode only; a default-mode lane runs `cargo clippy --all-targets -- -D warnings` itself (see *Compiler Checks*).
 5. Commit, naming the bead id and the touched scope. The form to use, and the test to run
    before committing a shared file, are in *Committing into a shared index*.
 
@@ -830,8 +844,14 @@ A session is not finished until the work is visible to everyone else.
 2. Release every reservation you still hold.
 3. Run the gate your phase allows. In the default mode that is the pane-local subset
    before every commit (`cargo check -p agent-usage-book`, `cargo fmt --check`,
-   `bin/slop-guard`) and CI on the pull request as the full gate; run `bin/ci` yourself
-   only when the brief asks for it. In shared-tree mode, **during a wave that is `cargo
+   `bin/slop-guard`) plus the wider default-mode list from *Compiler Checks* before the
+   last commit (`cargo clippy --all-targets -- -D warnings`, targeted `cargo test --lib <module>` /
+   `cargo test --test <name>`, and affected e2e cases run alone by copying the case file
+   into an empty directory and running `AUB_BIN=<release build> tests/e2e/run.sh --cases-dir <dir> --state-dir <tmp> --runs-dir <tmp>`,
+   found with `command grep -rl '<changed file name, key or command>' tests/e2e/cases/`) and CI
+   on the pull request as the full gate; run `bin/ci` yourself
+   only when the brief asks for it. The no `cargo test` / clippy-is-not-yours rule applies
+   in shared-tree mode only. In shared-tree mode, **during a wave that is `cargo
    check` and nothing more**, because the orchestrator kills per-agent builds every tick
    and a `bin/ci` started here dies mid-run; proof is the batch-verify pass's job, and a
    bead reaching `batch_pending` is what asks for it. `bin/ci` is the right closing gate
